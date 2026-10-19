@@ -206,7 +206,9 @@ not codebase searching.
    - **`**Scope now:**` sets the working repo** for the early phases. When the
      placement names a worktree, the Delegation Context's paths and `verify.sh`
      package names refer to *that* checkout, not the primary — getting this wrong
-     sends every delegate to the wrong tree.
+     sends every delegate to the wrong tree. Write those paths relative to the
+     repository, never the worktree's absolute path or its branch: /unit:direct
+     reads both from git at dispatch, so a renamed worktree needs no plan edit.
    - **Open questions in the placement become phases or blockers**, never silent
      assumptions. A gate that reads "decide publish vs git-rev pin" is a decision
      the plan must surface, not resolve on its own.

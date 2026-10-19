@@ -185,7 +185,8 @@ def missing(commits: list[Commit]) -> list[str]:
 
 
 def visible(commits: list[Commit]) -> list[Visible]:
-    return [item for commit in reversed(commits) if needs_trailer(commit.subject, commit.files)
+    """Every visible change a checkpoint names, also one whose files are all Markdown and need no line."""
+    return [item for commit in reversed(commits) if commit.subject.startswith("checkpoint(")
             for item in entries(commit.message) if isinstance(item, Visible)]
 
 
@@ -240,6 +241,11 @@ def _plain(cell: str) -> str:
 def _cells(line: str) -> list[str]:
     """A table row's cells, still escaped as written."""
     return [cell.strip() for cell in _BOUNDARY.split(line.strip())[1:-1]]
+
+
+def row_id(row: str) -> str:
+    """A written row's id, such as C24."""
+    return _cells(row)[0]
 
 
 def read(path: Path) -> str:
@@ -420,7 +426,7 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
         return rows
 
     def what(rows: list[str]) -> str:
-        ids = [_cells(row)[0] for row in rows]
+        ids = [row_id(row) for row in rows]
         named = ids[0] if len(ids) == 1 else f"{ids[0]}–{ids[-1]}"
         if not merged:
             return f"add {named}"
@@ -560,7 +566,7 @@ def _run(options: CommandLine) -> int:
             rows = append_rows(_list(options), [Visible(_words("change", options.change),
                                                         _words("check", options.check))],
                                today(), options.merged.strip(), doc)
-            print(_cells(rows[0])[0])
+            print(row_id(rows[0]))
         case "show":
             waiting = pending(_list(options))
             print("\n\n".join(describe(row) for row in waiting) if waiting else "nothing to review")

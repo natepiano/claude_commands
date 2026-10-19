@@ -32,9 +32,9 @@
 # set pays its own dependency compile for that; the push gate still documents
 # the whole workspace.
 #
-# The lint stages — mend, fmt, clippy, doc — are gated by config/lint.conf (edit
-# it with /lint_config), so one switch silences a check across the fix pipeline
-# and every delegate phase. `lint` also always runs taplo fmt --check at the
+# The lint stages — mend, fmt, clippy fix, fmt, clippy judgment, doc — use
+# config/lint.conf (edit it with /lint_config). One switch controls a check in
+# the lint CLI and every delegate phase. `lint` also always runs taplo fmt --check at the
 # workspace root, using its taplo.toml. A phase runs all five; its unit director
 # runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
@@ -45,13 +45,15 @@
 # A delegate session remembers passes. With PLAN_DELEGATE_BOARD_DIR or
 # PLAN_DELEGATE_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
 # <session>/verify_cache/, keyed by the working tree its verdict was judged on,
-# the
-# arguments, rustc -vV, lint.conf, these scripts and the RUST*/CARGO_*/NEXTEST_*
-# environment. A plain `lint <package>` leaves the package out of the key:
+# the arguments, rustc -vV, lint.conf, verify.sh, invoke.sh and the
+# RUST*/CARGO_*/NEXTEST_* environment. A plain `lint <package>` leaves the package out of the key:
 # every lint stage but fmt covers the workspace, and fmt covers every member
 # that differs from HEAD, so one lint record answers for each package. A
-# `test --filter` key holds its names sorted, each once, so one set of names
-# finds one record whatever order a call gives them in. The same call on the
+# `test` key holds only the part of the tree its package is built from
+# (TREE_KEY_PY), so a second phase editing another member in the same worktree
+# neither drops the pass nor misses it. A `test --filter` key holds its names
+# sorted, each once, so one set of names finds one record whatever order a call
+# gives them in. The same call on the
 # same tree then prints that record and its log and exits 0 without the cargo
 # token: workers re-ran unchanged trees 416 times in the week to 2026-10-01. A
 # `test --filter` reuse prints one line instead, since iteration feedback needs
@@ -59,10 +61,12 @@
 # and replayed with its full output and exit status, since lint on an
 # unchanged tree fails the same way (one worker ran 12 in a row on 2026-10-01).
 # A failed `test` is never recorded (tests flake), nor a run cut short by a
-# usage error, the sandbox or a kill. The judged tree is the tree when the run
-# starts, or for `lint` the tree its last rewrite (mend --fix, then fmt) leaves
-# for taplo, clippy and rustdoc. A run that ends on any other tree records
-# nothing: an edit landed while it ran, and its verdict belongs to neither tree.
+# usage error, the sandbox or a kill. A lint failure is not recorded when the
+# third clippy fix and format pass still changed the tree. The judged tree is
+# the tree when the run starts, or for `lint` the tree invoke_clippy_fix and formatting leave
+# for clippy judgment and rustdoc. A run that ends on any other tree (for `test`,
+# any other part of it the package is built from) records nothing: an edit
+# landed while it ran, and its verdict belongs to neither tree.
 # A run outside a delegate session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
@@ -97,11 +101,16 @@
 #   verify.sh lint <package>               mend --fix, nightly fmt of the package
 #                                          and the members that differ from HEAD,
 #                                          workspace taplo fmt --check,
-#                                          workspace clippy on all targets with
-#                                          all features (warnings denied), then
+#                                          workspace clippy fix, fmt, then clippy
+#                                          judgment on all targets with all features
+#                                          (warnings denied), then
 #                                          rustdoc on the members that differ
 #                                          — cargo stages gated by config/lint.conf;
 #                                          taplo always checks TOML formatting
+#   verify.sh lint --workspace [--check]   the same gate with fmt over all members;
+#                                          emits style-lint tool boundaries for records
+#                                          --check reports mend findings and checks
+#                                          formatting without applying fixes
 #   … [--features <list>]                  check, test, and lint accept one trailing
 #                                          `--features a,b` when the Work Order names
 #                                          it. For lint, the list reaches mend and
@@ -128,8 +137,8 @@
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
 # single bottom layer, sourced below. This file adds only delegate scope rules
-# on top. Workspace-scope entry points (aliases, validate_ci, the fix pipeline,
-# release checks) use the lint CLI in that directory instead of this script.
+# on top. Shell aliases, validate_ci and release checks use the lint CLI in that
+# directory instead of this script.
 #
 # Exit codes: 2 = usage error or missing tooling; 3 = sandbox failure, re-run
 # the same command unsandboxed; anything else is the underlying tool status.
@@ -146,7 +155,7 @@ build_override_refusal "${BASH_SOURCE[0]}" delegate/verify.sh || exit 2
 PY="${HOME}/.claude/scripts/lib/py"
 
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
-# invoke_clippy, and the sandbox-failure detection all come from here.
+# invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
@@ -408,8 +417,19 @@ print("\n".join(sorted(changed)))
 # of every path that differs from it, staged, unstaged, deleted, or new and not
 # ignored; it writes no git objects. Any failure prints nothing, and an empty
 # key turns the record off for that run.
+#
+# A `test` key (argv starting `--package <name>`, cargo metadata on stdin)
+# holds only the paths that package's tests are built from: its own folder and
+# those of the members it depends on by path, transitively; every member's
+# Cargo.toml, since workspace feature resolution reads them all; and every path
+# outside the members (the root manifest, Cargo.lock, .cargo/). Each counts by
+# its git mode and blob id, from HEAD or from the file when it differs, so a
+# phase that edits or commits another member in the same worktree leaves the
+# key alone (two phases side by side, 2026-10-17). A test that reads a file in
+# an unrelated member's folder is not keyed on it.
 TREE_KEY_PY='
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -431,17 +451,84 @@ def content(path: bytes) -> bytes:
     return b"absent"
 
 
+# The ls-tree entry git would record for the file, so committing it unchanged
+# keeps the key; None when the file is gone.
+def blob(path: bytes) -> bytes | None:
+    if os.path.islink(path):
+        data, mode = os.readlink(path), b"120000"
+    elif os.path.isfile(path):
+        with open(path, "rb") as handle:
+            data = handle.read()
+        mode = b"100755" if os.access(path, os.X_OK) else b"100644"
+    else:
+        return None
+    return mode + b" blob " + hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest().encode()
+
+
+# The member folders the tests of `name` are built from, and every member
+# folder, deepest first.
+def package_roots(name: str) -> tuple[set[bytes], list[bytes]]:
+    meta = json.load(sys.stdin)
+    members = {
+        os.path.realpath(os.path.dirname(package["manifest_path"])).encode(): package
+        for package in meta["packages"]
+        if package["id"] in set(meta["workspace_members"])
+    }
+    pending = [root for root, package in members.items() if package["name"] == name]
+    if not pending:
+        sys.exit(1)
+    built = set()
+    while pending:
+        root = pending.pop()
+        if root in built:
+            continue
+        built.add(root)
+        for dependency in members[root]["dependencies"]:
+            if dependency.get("path"):
+                pending += [path for path in [os.path.realpath(dependency["path"]).encode()] if path in members]
+    return built, sorted(members, key=len, reverse=True)
+
+
 split = sys.argv.index("--")
+files = sys.argv[1:split]
+package = files[1] if files[:1] == ["--package"] else ""
+if package:
+    files = files[2:]
 # --no-optional-locks and git status, not git diff: diff rewrites a stat-dirty
 # index even with the flag (git 2.54), and the index of this worktree belongs to the
 # session working in it. Same paths: staged, unstaged, deleted, untracked.
 top = run("git", "--no-optional-locks", "rev-parse", "--show-toplevel").strip()
-key = hashlib.sha256(top + b"\0" + run("git", "--no-optional-locks", "-C", top, "rev-parse", "HEAD^{tree}"))
 status = run("git", "--no-optional-locks", "-C", top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
-for path in sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3}):
-    key.update(path + b"\0" + content(os.path.join(top, path)))
+changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3})
+if package:
+    built, members = package_roots(package)
+    real_top = os.path.realpath(top)
+
+    def counts(path: bytes) -> bool:
+        full = os.path.join(real_top, path)
+        owner = next((root for root in members if full.startswith(root + b"/")), None)
+        return owner is None or owner in built or full == os.path.join(owner, b"Cargo.toml")
+
+    entries = {}
+    for line in run("git", "--no-optional-locks", "-C", top, "ls-tree", "-r", "-z", "--full-tree", "HEAD").split(b"\0"):
+        if b"\t" in line:
+            entry, path = line.split(b"\t", 1)
+            entries[path] = entry
+    for path in changed:
+        entry = blob(os.path.join(top, path))
+        if entry is None:
+            _ = entries.pop(path, None)
+        else:
+            entries[path] = entry
+    key = hashlib.sha256(top + b"\0")
+    for path in sorted(filter(counts, entries)):
+        key.update(path + b"\0" + entries[path] + b"\0")
+else:
+    key = hashlib.sha256(top + b"\0" + run("git", "--no-optional-locks", "-C", top, "rev-parse", "HEAD^{tree}"))
+    for path in changed:
+        key.update(path + b"\0" + content(os.path.join(top, path)))
 key.update(run("rustc", "-vV"))
-for name in sys.argv[1:split]:
+for name in files:
     key.update(content(name.encode()))
 for word in sys.argv[split + 1 :]:
     key.update(b"\0" + word.encode())
@@ -644,6 +731,13 @@ while [[ $# -gt 0 ]]; do
                 echo 'verify.sh: --local needs a reason: --local "<why this test cannot pass on macOS>". Leave it off to run on the Mac.' >&2
                 exit 2
             fi
+            # A reservation passed as a --local reason is recorded nowhere and
+            # never ends; the Mac hold is the one way to keep tests off the Mac
+            # (user, 2026-10-18).
+            if [[ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" =~ (^|[^[:alpha:]])(reserve|reserved|reservation|hold|holds|held|blocked|claim|claims|busy|showrunner|ruling)([^[:alpha:]]|$) ]]; then
+                printf 'verify.sh: --local is only for a test that cannot pass on macOS, not to keep tests off the Mac ("%s"). To reserve the Mac, its holder runs /build:hold hold <why> target mac: tests then skip the Mac by themselves, /build:targets shows the hold, and it ends at its expiry. Leave --local off.\n' "$2" >&2
+                exit 2
+            fi
             LOCAL_ONLY=1
             LOCAL_REASON=$2
             shift 2
@@ -719,6 +813,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
 fi
 RUN_LOG=""
 VERDICT_KEY=""
+CLIPPY_FIX_LIMIT_REACHED=0
 RUN_STARTED=0
 CALL_NOTED=0
 TOKEN_WAIT_S=0
@@ -747,7 +842,7 @@ if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
 fi
 
 tree_key() {
-    local words=("$CMD" "${ARGS[@]}") names=() name
+    local words=("$CMD" "${ARGS[@]}") names=() name scope=()
     if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
         words=(lint)
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
@@ -767,9 +862,13 @@ tree_key() {
             words+=(--filter "$name")
         done < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort -u)
     fi
-    "$PY" -c "$TREE_KEY_PY" "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+    if [[ "$CMD" == test ]]; then
+        # Keyed on the package's own build, read from the call's metadata.
+        scope=(--package "${ARGS[0]}")
+    fi
+    "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
         "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
-        2>/dev/null || true
+        <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
 # note_event OUTCOME WAIT WALL BUILD SAVED STATUS: this call's one record in
@@ -1316,9 +1415,11 @@ record_mac_pass() {
 }
 
 # A failed lint is the tree's own answer unless the run never reached a
-# verdict: a usage or tooling error (2), the sandbox (3), or a kill.
+# verdict: a usage or tooling error (2), the sandbox (3), or a kill. A fix pass
+# that still changes the tree at the limit can leave more fixes for the next call.
 lint_failure_is_the_tree() {
     [[ "$CMD" == lint ]] || return 1
+    (( CLIPPY_FIX_LIMIT_REACHED == 0 )) || return 1
     (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
     (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
@@ -1360,6 +1461,10 @@ if [[ "$CMD" == final || ( "$CMD" == test && ( ${#ARGS[@]} -eq 1 \
     if ! "$PY" -c "$UNTESTED_EXAMPLES_PY" "$EXAMPLE_SCOPE" <<< "$GATE_METADATA"; then
         exit 2
     fi
+fi
+# A test record's key reads the package's dependencies from it (tree_key).
+if [[ "$CMD" == test && -n "${CACHE_DIR}" && -z "${GATE_METADATA}" ]]; then
+    GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
 fi
 
 if cache_lookup; then
@@ -1645,11 +1750,62 @@ case "$CMD" in
     lint)
         PKG="${1:?verify.sh lint <package>}"
         shift
+        CHECK_LINT=0
+        if [[ "${1:-}" == --check ]]; then
+            if [[ "$PKG" != --workspace ]]; then
+                echo 'verify.sh: lint --check requires --workspace' >&2
+                exit 2
+            fi
+            CHECK_LINT=1
+            shift
+        fi
         take_features "$@"
-        require_member "$PKG"
+        if [[ "$PKG" != --workspace ]]; then
+            require_member "$PKG"
+        fi
         require_taplo
-        # Order: mend rewrites first, fmt formats what mend wrote, then taplo
-        # checks TOML before clippy and rustdoc read the settled tree.
+        if (( CHECK_LINT )); then
+            # Judge all three tools even when an earlier one reports findings.
+            # Report mode never enters the rewrite paths of the package gate.
+            lint_status=0
+            if lint_config_enabled mend; then
+                echo 'style-lint: mend start'
+                if invoke_mend --workspace --fail-on-warn "${FEATURE_FLAGS[@]}"; then
+                    echo 'style-lint: mend passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice mend 'cargo mend --all-targets --workspace --fail-on-warn'
+            fi
+            if lint_config_enabled fmt; then
+                echo 'style-lint: rustfmt start'
+                if fmt_cargo --all --check; then
+                    echo 'style-lint: rustfmt passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice fmt 'cargo +nightly fmt --all --check'
+            fi
+            WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+                | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
+            if ! (cd "$WORKSPACE_ROOT" && run taplo fmt --check); then
+                lint_status=1
+            fi
+            if lint_config_enabled clippy; then
+                echo 'style-lint: clippy start'
+                if invoke_clippy --workspace --all-targets --all-features; then
+                    echo 'style-lint: clippy passed'
+                else
+                    lint_status=1
+                fi
+            else
+                lint_config_skip_notice clippy 'cargo clippy --workspace --all-targets --all-features'
+            fi
+            exit "$lint_status"
+        fi
+        # Order: mend, fmt, taplo, clippy fix, fmt, clippy judgment, rustdoc.
         # Cargo stages are gated by lint.conf; the Taplo check always runs.
         # mend passes --all-targets because it needs the test and example
         # targets to see every import and visibility site. It covers the
@@ -1657,6 +1813,7 @@ case "$CMD" in
         # --fix can also rewrite a member the phase did not edit, when this
         # phase's change left an item there unused or over-visible.
         if lint_config_enabled mend; then
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend start'
             MEND_LOG="$(mktemp)"
             # pipefail is set, so a failing mend fails the pipeline; the log
             # only decides which message names the failure.
@@ -1677,6 +1834,7 @@ case "$CMD" in
                 exit 1
             fi
             rm -f "$MEND_LOG"
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: mend passed'
         else
             lint_config_skip_notice mend "cargo mend --all-targets --workspace --fix"
         fi
@@ -1684,24 +1842,34 @@ case "$CMD" in
         # package and every member that differs from HEAD once mend has run.
         # Covering them all is what lets one lint record answer for each
         # package (tree_key).
-        FMT_SCOPE=(-p "$PKG")
-        FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
+        if [[ "$PKG" == --workspace ]]; then
+            FMT_SCOPE=(--all)
+        else
+            FMT_SCOPE=(-p "$PKG")
+            FMT_MEMBERS="$(cargo metadata --no-deps --format-version 1 \
             | "$PY" -c "$CHANGED_MEMBERS_PY" "")"
-        while IFS= read -r member; do
-            if [[ -n "$member" && "$member" != "$PKG" ]]; then
-                FMT_SCOPE+=(-p "$member")
-            fi
-        done <<< "$FMT_MEMBERS"
+            while IFS= read -r member; do
+                if [[ -n "$member" && "$member" != "$PKG" ]]; then
+                    FMT_SCOPE+=(-p "$member")
+                fi
+            done <<< "$FMT_MEMBERS"
+        fi
+        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+            echo 'style-lint: rustfmt start'
+        fi
         fmt_cargo "${FMT_SCOPE[@]}"
-        # The last rewrite is done: taplo, clippy and rustdoc judge this tree.
+        if [[ "$PKG" == --workspace ]] && lint_config_enabled fmt; then
+            echo 'style-lint: rustfmt passed'
+        fi
+        # Record the tree Taplo reads; clippy fix and fmt update the key below.
         if [[ -n "${RUN_LOG}" ]]; then
             VERDICT_KEY="$(tree_key)"
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
-        TAPLO_WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
+        WORKSPACE_ROOT="$(cargo metadata --no-deps --format-version 1 \
             | "$PY" -c 'import json, sys; print(json.load(sys.stdin)["workspace_root"])')"
-        if (cd "$TAPLO_WORKSPACE_ROOT" && run taplo fmt --check); then
+        if (cd "$WORKSPACE_ROOT" && run taplo fmt --check); then
             :
         else
             taplo_status=$?
@@ -1715,7 +1883,30 @@ case "$CMD" in
             fi
             exit "$taplo_status"
         fi
-        invoke_clippy --workspace --all-targets --all-features
+        if lint_config_enabled clippy; then
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
+            clippy_tree_before="$(tree_key)"
+            for ((clippy_fix_pass=1; clippy_fix_pass<=3; clippy_fix_pass++)); do
+                invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
+                fmt_cargo "${FMT_SCOPE[@]}"
+                clippy_tree_after="$(tree_key)"
+                if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
+                    break
+                fi
+                # An empty key cannot prove that the tree stopped changing.
+                if (( clippy_fix_pass == 3 )); then
+                    CLIPPY_FIX_LIMIT_REACHED=1
+                fi
+                clippy_tree_before="$clippy_tree_after"
+            done
+            if [[ -n "${RUN_LOG}" ]]; then
+                VERDICT_KEY="$(tree_key)"
+            fi
+            invoke_clippy --workspace --all-targets --all-features --keep-going
+            [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
+        else
+            invoke_clippy --workspace --all-targets --all-features
+        fi
         # Found after mend, so a member its --fix rewrote is documented too.
         FEATURE_MEMBER=""
         if [[ ${#FEATURE_FLAGS[@]} -gt 0 ]]; then

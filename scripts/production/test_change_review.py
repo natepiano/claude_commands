@@ -416,6 +416,13 @@ class RepositoryTest(unittest.TestCase):
         self.assertEqual(change_review.missing(commits), [])
         self.assertEqual(change_review.visible(commits), [Visible("The grid fades more gently", "Look across the floor")])
 
+    def test_a_markdown_only_checkpoint_needs_no_line_but_its_line_is_read(self) -> None:
+        _ = self.commit("a.md", "checkpoint(u): doc without a line")
+        checkpoint = self.commit("b.md", f"checkpoint(u): doc with a line\n\n{SEE}")
+        commits = change_review.unit_commits(self.repo, checkpoint, self.previous, "merge")
+        self.assertEqual(change_review.missing(commits), [])
+        self.assertEqual(change_review.visible(commits), [Visible("The grid fades more gently", "Look across the floor")])
+
     def test_a_checkpoint_without_a_line_is_refused_even_when_the_named_checkpoint_is_a_merge(self) -> None:
         _ = self.commit("a.py", "checkpoint(u): grid")
         _ = self.git("checkout", "-q", "-b", "side")

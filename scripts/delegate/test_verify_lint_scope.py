@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +17,10 @@ import unittest
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
+# A hang limit, not a speed check. One `verify.sh lint` call starts about 60 processes: 10 s at
+# load 75 on natedev, and over 30 s at load 160 (two merge gates went red at 30 s, 2026-10-18).
+# A real hang still fails, after this many seconds.
+HANG_SECONDS = 300
 
 
 class CargoInvocation(TypedDict):
@@ -63,12 +68,37 @@ if arguments[:1] == ["metadata"]:
     print(os.environ["TEST_METADATA"])
 elif arguments[:1] not in (["mend"], ["clippy"], ["doc"], ["+nightly"]):
     raise SystemExit("unexpected cargo invocation: " + repr(arguments))
-# A file changes while this stage runs: mend's own rewrite, or a writer's edit.
-if arguments[:1] == [os.environ.get("TEST_EDIT_DURING", "")]:
+# A file changes during mend or judgment, after any clippy fix.
+if arguments[:1] == [os.environ.get("TEST_EDIT_DURING", "")] and (
+    arguments[0] != "clippy" or "--fix" not in arguments
+):
     with Path(os.environ["PACKAGE_ROOT"], "src", "lib.rs").open("a", encoding="utf-8") as source:
         source.write("// changed during " + arguments[0] + "\n")
 if arguments[:1] == ["clippy"]:
+    source = Path(os.environ["PACKAGE_ROOT"], os.environ.get("TEST_FIX_FILE", "src/lib.rs"))
+    if "--fix" in arguments:
+        if "TEST_FIX_SOURCE" in os.environ:
+            source.write_text(os.environ["TEST_FIX_SOURCE"], encoding="utf-8")
+        steps = json.loads(os.environ.get("TEST_FIX_STEPS", "{}"))
+        before = source.read_text(encoding="utf-8") if source.exists() else ""
+        if before in steps:
+            source.write_text(steps[before], encoding="utf-8")
+        if "TEST_FIX_APPEND" in os.environ:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(os.environ["TEST_FIX_APPEND"])
+        raise SystemExit(int(os.environ.get("TEST_CLIPPY_FIX_STATUS", "0")))
+    if "TEST_CLIPPY_EXPECT_SOURCE" in os.environ:
+        if source.read_text(encoding="utf-8") != os.environ["TEST_CLIPPY_EXPECT_SOURCE"]:
+            raise SystemExit(101)
     raise SystemExit(int(os.environ.get("TEST_CLIPPY_STATUS", "0")))
+if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
+    events = [json.loads(line)["args"] for line in
+              Path(os.environ["TEST_CARGO_EVENTS"]).read_text(encoding="utf-8").splitlines()]
+    if any(args[:1] == ["clippy"] and "--fix" in args for args in events):
+        if "TEST_FMT_SOURCE" in os.environ:
+            Path(os.environ["PACKAGE_ROOT"], "src", "lib.rs").write_text(
+                os.environ["TEST_FMT_SOURCE"], encoding="utf-8",
+            )
 '''
 
 
@@ -91,6 +121,7 @@ raise SystemExit(status)
 
 GIT_STUB = r'''
 import os
+from pathlib import Path
 import sys
 
 arguments = sys.argv[1:]
@@ -112,6 +143,9 @@ elif "diff" in arguments and "--name-only" in arguments:
 elif "status" in arguments:
     if os.environ.get("TEST_GIT_DIRTY"):
         sys.stdout.write(" M src/lib.rs\0")
+    untracked = os.environ.get("TEST_GIT_UNTRACKED", "")
+    if untracked and Path(os.environ["PACKAGE_ROOT"], untracked).exists():
+        sys.stdout.write("?? " + untracked + "\0")
 elif "ls-files" not in arguments:
     raise SystemExit(1)
 '''
@@ -255,7 +289,7 @@ class VerifyLintScopeTests(unittest.TestCase):
         return subprocess.run(
             ["bash", str(VERIFY), *arguments], cwd=cwd,
             env={**self.environment, "TEST_TAPLO_STATUS": str(taplo_status)},
-            capture_output=True, text=True, check=False, timeout=30,
+            capture_output=True, text=True, check=False, timeout=HANG_SECONDS,
         )
 
     def taplo_calls(self) -> list[TaploInvocation]:
@@ -268,33 +302,159 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.assertEqual(self.taplo_calls(), [{"args": ["fmt", "--check"], "cwd": str(self.root)}])
 
     def calls(self, command: str) -> list[list[str]]:
+        return [args[1:] for args in self.cargo_calls() if args[:1] == [command]]
+
+    def cargo_calls(self) -> list[list[str]]:
         events = [cast(CargoInvocation, json.loads(line))
                   for line in self.events.read_text(encoding="utf-8").splitlines()]
-        return [event["args"][1:] for event in events if event["args"][:1] == [command]]
+        return [event["args"] for event in events]
+
+    def assert_fix_and_judgment_calls(self, *, fix_passes: int = 1) -> None:
+        scope = ["--workspace", "--all-targets", "--all-features", "--keep-going"]
+        self.assertEqual(self.calls("clippy"), [
+            ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+             *scope, "--", "-D", "warnings"],
+        ] * fix_passes + [[*scope, "--", "-D", "warnings"]])
+
+    def lint_stages(self) -> list[list[str]]:
+        return [args for args in self.cargo_calls()
+                if args[0] in ("clippy", "doc") or
+                (args[:2] == ["+nightly", "fmt"] and "--version" not in args)]
+
+    def test_unchanged_tree_runs_one_fix_pass_before_judgment_and_rustdoc(self) -> None:
+        result = self.verify("lint", "--workspace")
+        self.assert_fix_and_judgment_calls()
+        self.assertEqual(self.lint_stages(), [
+            ["+nightly", "fmt", "--all"],
+            ["clippy", *self.calls("clippy")[0]],
+            ["+nightly", "fmt", "--all"],
+            ["clippy", *self.calls("clippy")[1]],
+            ["doc", "--no-deps", "--jobs", "8", "-p", "sample"],
+        ])
+        self.assertIn("style-lint: clippy start", result.stdout.splitlines())
+        self.assertIn("style-lint: clippy passed", result.stdout.splitlines())
+
+    def test_fix_exposes_another_fix_before_the_first_judgment(self) -> None:
+        original = "pub fn sum(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n"
+        first_fix = original.replace("a * b + c", "a.mul_add(b, c)")
+        final_fix = first_fix.replace("pub fn", "pub const fn")
+        self.environment.update({
+            "TEST_GIT_DIRTY": "1",
+            "TEST_FIX_STEPS": json.dumps({original: first_fix, first_fix: final_fix}),
+            "TEST_CLIPPY_EXPECT_SOURCE": final_fix,
+        })
+        for cache_enabled in (False, True):
+            with self.subTest(cache_enabled=cache_enabled):
+                if cache_enabled:
+                    _ = self.enable_cache()
+                _ = (self.root / "src/lib.rs").write_text(original, encoding="utf-8")
+                _ = self.verify("lint", "sample")
+                # Two passes change the source; the third confirms no change.
+                self.assert_fix_and_judgment_calls(fix_passes=3)
+                self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), final_fix)
+                self.assertEqual(len(self.calls("doc")), 1)
+                self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
+                                 [["fmt", "-p", "sample"]] * 4)
+
+    def test_changing_tree_stops_after_three_fix_passes_and_failed_lint_runs_again(self) -> None:
+        cache = self.enable_cache()
+        self.environment.update({
+            "TEST_FIX_FILE": "src/fix-progress.rs",
+            "TEST_GIT_UNTRACKED": "src/fix-progress.rs",
+            "TEST_FIX_APPEND": "// fix pass\n",
+            "TEST_CLIPPY_STATUS": "101",
+        })
+        for call in (1, 2):
+            with self.subTest(call=call):
+                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                self.assertEqual(result.returncode, 101, result.stdout + result.stderr)
+                self.assertNotIn("FAIL (recorded)", result.stdout)
+                self.assert_fix_and_judgment_calls(fix_passes=3)
+                self.assertEqual(list(cache.glob("*.fail")), [])
+                self.assertEqual(self.calls("doc"), [])
+                self.assertEqual((self.root / "src/fix-progress.rs").read_text(encoding="utf-8"),
+                                 "// fix pass\n" * (3 * call))
+
+    def test_passing_judgment_at_fix_pass_limit_is_cached(self) -> None:
+        cache = self.dirty_cache()
+        self.environment["TEST_FIX_APPEND"] = "// fix pass\n"
+        _ = self.verify("lint", "sample")
+        self.assert_fix_and_judgment_calls(fix_passes=3)
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+
+        result = self.verify("lint", "sample")
+        self.assertIn("PASS (recorded)", result.stdout)
+        self.assertFalse(self.clippy_ran())
+
+    def test_failed_fix_still_formats_and_returns_judgment_status(self) -> None:
+        self.environment["TEST_CLIPPY_FIX_STATUS"] = "41"
+        for judgment_status in (0, 43):
+            with self.subTest(judgment_status=judgment_status):
+                self.environment["TEST_CLIPPY_STATUS"] = str(judgment_status)
+                result = self.invoke_verify("lint", "sample", cwd=self.root)
+                self.assertEqual(result.returncode, judgment_status, result.stdout + result.stderr)
+                self.assert_fix_and_judgment_calls()
+                stages = self.lint_stages()
+                self.assertEqual(stages[:4], [
+                    ["+nightly", "fmt", "-p", "sample"],
+                    ["clippy", *self.calls("clippy")[0]],
+                    ["+nightly", "fmt", "-p", "sample"],
+                    ["clippy", *self.calls("clippy")[1]],
+                ])
+                self.assertEqual(len(self.calls("doc")), 1 if judgment_status == 0 else 0)
+
+    def test_check_lint_only_judges_without_fixes(self) -> None:
+        _ = self.verify("lint", "--workspace", "--check")
+        self.assertEqual(self.calls("clippy"), [[
+            "--workspace", "--all-targets", "--all-features", "--", "-D", "warnings",
+        ]])
+        self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fail-on-warn"]])
+        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "--all", "--check"]])
+        self.assertEqual(self.calls("doc"), [])
+        self.assert_workspace_taplo_check()
+
+    def test_fixed_and_formatted_tree_is_cached(self) -> None:
+        cache = self.dirty_cache()
+        formatted = "pub fn value() -> u8 {\n    2\n}\n"
+        self.environment.update({
+            "TEST_FIX_SOURCE": "pub fn value()->u8{2}\n",
+            "TEST_FMT_SOURCE": formatted,
+        })
+        result = self.verify("lint", "sample")
+        self.assert_fix_and_judgment_calls(fix_passes=2)
+        self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), formatted)
+        self.assertNotIn("the tree changed while lint ran", result.stdout)
+        self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+
+        result = self.verify("lint", "sample")
+        self.assertIn("PASS (recorded)", result.stdout)
+        self.assertFalse(self.clippy_ran())
 
     def test_lint_matches_ci_and_preserves_other_stages(self) -> None:
         _ = self.verify("lint", "sample")
         self.assert_workspace_taplo_check()
-        self.assertEqual(self.calls("clippy"), [
-            ["--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
-        ])
+        self.assert_fix_and_judgment_calls()
         self.assertEqual(self.calls("mend"), [["--all-targets", "--workspace", "--fix"]])
-        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
+        self.assertEqual(self.calls("+nightly"), [
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+        ])
         self.assertEqual(self.calls("doc"), [["--no-deps", "--jobs", "8", "-p", "sample"]])
 
     def test_features_reach_mend_and_doc_but_do_not_narrow_clippy(self) -> None:
         _ = self.verify("lint", "sample", "--features", "a")
         self.assert_workspace_taplo_check()
-        self.assertEqual(self.calls("clippy"), [
-            ["--workspace", "--all-targets", "--all-features", "--", "-D", "warnings"]
-        ])
+        self.assert_fix_and_judgment_calls()
         self.assertEqual(self.calls("mend"), [[
             "--all-targets", "--workspace", "--fix", "--features", "sample/a"
         ]])
         self.assertEqual(self.calls("doc"), [[
             "--no-deps", "--jobs", "8", "-p", "sample", "--features", "sample/a"
         ]])
-        self.assertEqual(self.calls("+nightly"), [["fmt", "--version"], ["fmt", "-p", "sample"]])
+        self.assertEqual(self.calls("+nightly"), [
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+            ["fmt", "--version"], ["fmt", "-p", "sample"],
+        ])
 
     def test_example_keeps_its_single_target_and_required_features(self) -> None:
         for example, features in (("plain", []), ("featured", ["--features", "sample/a"])):
@@ -439,6 +599,90 @@ class VerifyLintScopeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS (recorded)", result.stdout)
         self.assertFalse(self.clippy_ran())
+
+
+@final
+class InvokeOutputTests(unittest.TestCase):
+    def function_body(self, name: str) -> str:
+        source = (SCRIPTS / "lint" / "invoke.sh").read_text(encoding="utf-8")
+        match = re.search(rf"^{name}\(\) [{{(]\n.*?^[}})]$", source, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, name)
+        assert match is not None
+        return match.group()
+
+    def shell(self, script: str, root: Path) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ, HOME=str(root), TMPDIR=str(root))
+        return subprocess.run(
+            ["bash", "-c", script], cwd=root, env=environment,
+            capture_output=True, text=True, check=False, timeout=HANG_SECONDS,
+        )
+
+    def command_stubs(self) -> str:
+        return r'''
+set -euo pipefail
+SANDBOX_SIGNATURE=not-a-sandbox-failure
+buildlog_step_compiles() { return 1; }
+buildlog_begin() { :; }
+buildlog_exec() { "$@"; }
+buildlog_finish_memory() { :; }
+buildlog_end() { :; }
+sweep_after_step() { :; }
+'''
+
+    def test_shell_libraries_use_no_named_descriptor_redirections(self) -> None:
+        for path in (SCRIPTS / "lint" / "invoke.sh", VERIFY):
+            with self.subTest(path=path):
+                self.assertNotRegex(path.read_text(encoding="utf-8"), r"\{[A-Za-z_][A-Za-z_0-9]*\}[<>]")
+
+    def test_ordinary_step_returns_command_status_when_tee_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "bin"
+            binary.mkdir()
+            tee = binary / "tee"
+            _ = tee.write_text("#!/bin/sh\ncat\nexit 7\n", encoding="utf-8")
+            tee.chmod(0o755)
+            for status in (0, 47):
+                with self.subTest(status=status):
+                    script = self.command_stubs() + self.function_body("run_once")
+                    script += f'\nexport PATH="$PWD/bin:$PATH"\nif run_once bash -c "exit {status}"; then result=0; else result=$?; fi\nexit "$result"\n'
+                    result = self.shell(script, root)
+                    self.assertEqual(result.returncode, status, result.stdout + result.stderr)
+
+    def test_clippy_fix_preserves_extra_lints_and_run_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = "set -euo pipefail\n"
+            script += self.function_body("invoke_clippy") + "\n"
+            script += self.function_body("invoke_clippy_fix") + r'''
+lint_config_enabled() { return 0; }
+run() { printf '%s\n' "$@"; return 47; }
+invoke_clippy_fix -p sample --lib -- -A clippy::type_complexity
+'''
+            result = self.shell(script, root)
+            self.assertEqual(result.returncode, 47, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "cargo", "clippy", "--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs",
+                "-p", "sample", "--lib", "--", "-D", "warnings", "-A", "clippy::type_complexity",
+            ])
+
+    def test_clippy_fix_off_prints_skip_notice_without_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = "set -euo pipefail\n"
+            script += self.function_body("invoke_clippy") + "\n"
+            script += self.function_body("invoke_clippy_fix") + r'''
+lint_config_enabled() { return 1; }
+lint_config_skip_notice() { printf 'SKIPPED: %s\n' "$2"; }
+run() { printf 'unexpected run\n'; return 99; }
+invoke_clippy_fix --workspace --all-targets --all-features --keep-going
+'''
+            result = self.shell(script, root)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), [
+                "SKIPPED: cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs"
+                + " --workspace --all-targets --all-features --keep-going",
+            ])
 
 
 if __name__ == "__main__":

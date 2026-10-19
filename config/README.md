@@ -31,13 +31,13 @@ Which lint checks run, everywhere they run: `cache`, `mend`, `style_review`,
 `clippy`, `doc`, `fmt`, under an `[operations]` section. Values are `on` or
 `off`; a missing key or missing file means `on`. One key per check with no
 per-consumer override — `clippy=off` means cargo clippy does not run in a
-`/unit:direct` phase, the lint CLI, or the fix pipeline.
+`/unit:direct` phase or the lint CLI.
 
 Use `/lint_config` to view or change them. Consumers read it on their
 next run, so a change is immediate:
 
 - `/unit:style_review` — the phase's main review or a run by hand
-- `scripts/lint/invoke.sh` — the lint CLI, fix pipeline, and
+- `scripts/lint/invoke.sh` — the lint CLI and
   `scripts/delegate/verify.sh`'s `lint` and `fmt` arms
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check

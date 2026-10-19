@@ -12,6 +12,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple, cast
@@ -23,12 +24,16 @@ if not __package__:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
-from scripts.delegate import progress_history
+from scripts.delegate import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
 from scripts.production.add_unit import Production, read_production
 from production_units import Refusal, cell_value, live_unit_table
 from scripts.production.merge_checkpoint import PromoteTo, promotion_from_doc
+
+# The finding_opened event schema uses these severities. Importing findings to
+# read its SEVERITIES also validates command-only convergence configuration.
+FINDING_SEVERITIES = ("blocker", "minor", "nit")
 
 
 class ProjectedEta(NamedTuple):
@@ -52,7 +57,10 @@ class NoEtaRange(NamedTuple):
 
 
 class StatedEta(NamedTuple):
-    """The latest target explicitly stated for a running phase."""
+    """A running phase's stated schedule, advanced to now when overdue.
+
+    The original promises remain in the phase's ETA trail.
+    """
 
     time: datetime
     range: EtaRange | NoEtaRange
@@ -108,7 +116,59 @@ class PhaseTimingNotPredicted(NamedTuple):
     """A future plan phase cannot yet be projected."""
 
 
-class DonePhase(NamedTuple):
+class PhaseNotFinished(NamedTuple):
+    """This phase has no recorded completion time."""
+
+
+class FinishDeltaUnavailable(NamedTuple):
+    """A finish cannot be compared with a stated ETA."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class PhaseHistory:
+    """Promises and work recorded across a plan phase's instances."""
+
+    first_eta: datetime | EtaNeverStated = EtaNeverStated()
+    moves: int = 0
+    eta_trail: list[tuple[datetime, datetime]] = field(default_factory=list)
+    finished_at: datetime | PhaseNotFinished = PhaseNotFinished()
+    delta_minutes: float | FinishDeltaUnavailable = FinishDeltaUnavailable()
+    fix_done: int = 0
+    fix_open_passes: int = 0
+    findings: dict[str, int] = field(default_factory=lambda: dict.fromkeys(FINDING_SEVERITIES, 0))
+
+    @property
+    def fix_running(self) -> int:
+        """Whether any fix pass is still open."""
+        return int(self.fix_open_passes > 0)
+
+    @property
+    def fix_rounds(self) -> int:
+        """All fix passes started, including parallel open passes."""
+        return self.fix_done + self.fix_open_passes
+
+
+class NoGate(NamedTuple):
+    """No production gate restricts the phase's prediction."""
+
+
+class TimedGate(NamedTuple):
+    """A production gate supplies the earliest possible start."""
+
+    gate: str
+    until: datetime
+    waits_on: str
+
+
+class UntimedGate(NamedTuple):
+    """A production gate has no known clearing time."""
+
+    gate: str
+    waits_on: str
+
+
+@dataclass(frozen=True)
+class DonePhase(PhaseHistory):
     """A plan phase marked done in the current plan."""
 
     phase: str
@@ -116,7 +176,8 @@ class DonePhase(NamedTuple):
     times: CompletedPhaseTiming | PhaseTimingNotRecorded
 
 
-class OpenPhase(NamedTuple):
+@dataclass(frozen=True)
+class OpenPhase(PhaseHistory):
     """A phase started but not finished in the newest run's events.
 
     This says nothing about whether the unit's session is still alive.
@@ -128,14 +189,18 @@ class OpenPhase(NamedTuple):
     progress: ReportedPhaseProgress | PhaseProgressNotReported
     eta: StatedEta | ProjectedEta | EtaUnavailable
     first_stated: FirstStatedEtaTarget | EtaNeverStated
+    instance_id: str
+    schedule_end: datetime | EtaUnavailable = EtaUnavailable()
 
 
-class TodoPhase(NamedTuple):
+@dataclass(frozen=True)
+class TodoPhase(PhaseHistory):
     """An unfinished plan phase that is not currently running."""
 
     phase: str
     title: str
     times: PredictedPhaseTiming | PhaseTimingNotPredicted
+    gate: NoGate | TimedGate | UntimedGate = NoGate()
 
 
 class NoOpenPhase(NamedTuple):
@@ -156,6 +221,13 @@ class PredictedFinish(NamedTuple):
 
 class UnknownFinish(NamedTuple):
     """The plan's completion time cannot yet be determined."""
+
+
+class GateBlockedFinish(NamedTuple):
+    """The plan cannot finish before an untimed production gate clears."""
+
+    gate: str
+    waits_on: str
 
 
 class CouldStart(NamedTuple):
@@ -186,7 +258,7 @@ class PhaseRecord(NamedTuple):
     updated: datetime
     current: OpenPhase | NoOpenPhase
     phases: list[DonePhase | OpenPhase | TodoPhase]
-    plan_finish: FinishedAt | PredictedFinish | UnknownFinish
+    plan_finish: FinishedAt | PredictedFinish | UnknownFinish | GateBlockedFinish
     parallel: ParallelCheck
 
 
@@ -343,7 +415,7 @@ def _text(value: object, default: str = "") -> str:
 
 
 def _state(session_dir: Path) -> dict[str, object]:
-    state_path = session_dir / progress_history.STATE_FILENAME
+    state_path = session_dir / plan_history.STATE_FILENAME
     try:
         text = state_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -473,28 +545,42 @@ def _newest_open_instance(
         )
     for instance in reversed(started):
         if instance.instance_id not in closed:
-            progress_event = _last_progress(runs, instance.instance_id)
-            stated_event = _latest_stated_eta(runs, instance.instance_id)
-            projection = _reported_eta(progress_event, instance.start)
-            if isinstance(stated_event, LatestStatedEtaEvent):
-                first_stated: FirstStatedEtaTarget | EtaNeverStated = (
-                    stated_event.first
-                )
-                eta: StatedEta | ProjectedEta | EtaUnavailable
-                if stated_event.eta.time.timestamp() > progress_history.now_epoch():
-                    eta = stated_event.eta
-                else:
-                    eta = projection
-            else:
-                first_stated = EtaNeverStated()
-                eta = projection
-            return OpenPhaseInstance(
-                phase=instance,
-                progress=_reported_progress(progress_event),
-                eta=eta,
-                first_stated=first_stated,
-            )
+            return _open_instance(runs, instance)
     return NoOpenPhase()
+
+
+def _open_instance(
+    runs: list[list[dict[str, object]]], instance: PhaseInstance
+) -> OpenPhaseInstance:
+    """Read progress and promises for one unfinished phase instance."""
+    progress_event = _last_progress(runs, instance.instance_id)
+    stated_event = _latest_stated_eta(runs, instance)
+    projection = _reported_eta(progress_event, instance.start)
+    if isinstance(stated_event, LatestStatedEtaEvent):
+        first_stated: FirstStatedEtaTarget | EtaNeverStated = (
+            stated_event.first
+        )
+        eta: StatedEta | ProjectedEta | EtaUnavailable
+        eta = stated_event.eta
+        now = datetime.fromtimestamp(plan_history.now_epoch(), UTC)
+        if eta.time < now:
+            delay = now - eta.time
+            eta_range = eta.range
+            if isinstance(eta_range, EtaRange):
+                eta_range = EtaRange(
+                    earliest=eta_range.earliest + delay,
+                    latest=eta_range.latest + delay,
+                )
+            eta = eta._replace(time=now, range=eta_range)
+    else:
+        first_stated = EtaNeverStated()
+        eta = projection
+    return OpenPhaseInstance(
+        phase=instance,
+        progress=_reported_progress(progress_event),
+        eta=eta,
+        first_stated=first_stated,
+    )
 
 
 def _open_phase_ids(runs: list[list[dict[str, object]]]) -> set[str]:
@@ -514,7 +600,7 @@ def _open_phase_ids(runs: list[list[dict[str, object]]]) -> set[str]:
 
 
 def _parallel_check(
-    phases: list[progress_history.PlanPhase], open_ids: set[str]
+    phases: list[plan_history.PlanPhase], open_ids: set[str]
 ) -> ParallelCheck:
     states = {
         phase["id"]: "done"
@@ -566,7 +652,7 @@ def _normalized_title(title: str) -> str:
 
 
 def _instances_by_phase(
-    phases: list[progress_history.PlanPhase],
+    phases: list[plan_history.PlanPhase],
     instances: list[PhaseInstance],
 ) -> list[list[PhaseInstance]]:
     by_title: dict[str, list[int]] = {}
@@ -638,7 +724,7 @@ def _last_progress(
         elapsed=(
             elapsed if elapsed is not None else ProgressElapsedTimeNotRecorded()
         ),
-        spread=progress_history.percent_spread(calibration),
+        spread=plan_history.percent_spread(calibration),
     )
 
 
@@ -664,12 +750,12 @@ def _reported_eta(
         elapsed_seconds = max(0, int((as_of - started).total_seconds()))
     else:
         elapsed_seconds = elapsed
-    band = progress_history.eta_band_seconds(
+    band = plan_history.eta_band_seconds(
         report.percent,
         elapsed_seconds,
         report.spread,
     )
-    if isinstance(band, progress_history.EtaProjectionUnavailable):
+    if isinstance(band, plan_history.EtaProjectionUnavailable):
         return EtaUnavailable()
     return ProjectedEta(
         time=as_of + timedelta(seconds=band.remaining),
@@ -702,48 +788,94 @@ def _repair_rounds_started_after(
     return sum(started > stated_at for started in starts.values())
 
 
+def _instance_eta_events(
+    runs: list[list[dict[str, object]]], instance: PhaseInstance
+) -> list[dict[str, object]]:
+    """Keep pre-start promises, but exclude other runs and earlier attempts."""
+    for events in runs:
+        start = next(
+            (
+                index
+                for index, event in enumerate(events)
+                if _text(event.get("event_type")) == "phase_started"
+                and _text(event.get("phase_instance_id")) == instance.instance_id
+            ),
+            -1,
+        )
+        last = len(events)
+        if start < 0:
+            # Run records also retain completions whose start event is absent.
+            start = next(
+                (index for index, event in enumerate(events)
+                 if _text(event.get("event_type")) == "phase_finished"
+                 and _text(event.get("phase_instance_id")) == instance.instance_id),
+                -1,
+            )
+            if start < 0:
+                continue
+            last = start + 1
+        first = 0
+        for index, event in enumerate(events[:start]):
+            if (
+                _text(event.get("phase_id")) == instance.phase
+                and _text(event.get("event_type")) in ("phase_started", "phase_finished")
+            ):
+                first = index + 1
+        for index in range(start + 1, last):
+            event = events[index]
+            if (
+                _text(event.get("event_type")) == "phase_started"
+                and _text(event.get("phase_id")) == instance.phase
+            ):
+                last = index
+                break
+        return [
+            event
+            for event in events[first:last]
+            if _text(event.get("event_type")) == "eta_stated"
+            and _text(event.get("eta_phase_id", event.get("phase_id"))) == instance.phase
+        ]
+    return []
+
+
 def _latest_stated_eta(
-    runs: list[list[dict[str, object]]], instance_id: str
+    runs: list[list[dict[str, object]]], instance: PhaseInstance
 ) -> LatestStatedEtaEvent | NoStatedEtaEvent:
     first: FirstStatedEtaTarget | EtaNeverStated = EtaNeverStated()
     latest: StatedEta | NoStatedEtaEvent = NoStatedEtaEvent()
-    for events in runs:
-        for event in events:
-            if (
-                _text(event.get("event_type")) != "eta_stated"
-                or _text(event.get("phase_instance_id")) != instance_id
-            ):
-                continue
-            time = _moment(event.get("eta_at"))
-            stated_at = _moment(event.get("timestamp_epoch"))
-            if time is None or stated_at is None:
-                continue
-            earliest = _moment(event.get("eta_earliest_at"))
-            latest_range = _moment(event.get("eta_latest_at"))
-            eta_range: EtaRange | NoEtaRange
-            if earliest is not None and latest_range is not None:
-                eta_range = EtaRange(earliest=earliest, latest=latest_range)
-            else:
-                eta_range = NoEtaRange()
-            stated = StatedEta(
-                time=time,
-                range=eta_range,
-                stated_at=stated_at,
-                basis=_text(event.get("basis")),
+    for event in _instance_eta_events(runs, instance):
+        time = _moment(event.get("eta_at"))
+        stated_at = _moment(event.get("timestamp_epoch"))
+        if time is None or stated_at is None:
+            continue
+        earliest = _moment(event.get("eta_earliest_at"))
+        latest_range = _moment(event.get("eta_latest_at"))
+        eta_range: EtaRange | NoEtaRange
+        if earliest is not None and latest_range is not None:
+            eta_range = EtaRange(earliest=earliest, latest=latest_range)
+        else:
+            eta_range = NoEtaRange()
+        stated = StatedEta(
+            time=time,
+            range=eta_range,
+            stated_at=stated_at,
+            basis=_text(event.get("basis")),
+        )
+        if isinstance(first, EtaNeverStated):
+            first = FirstStatedEtaTarget(
+                time=stated.time,
+                repair_rounds=_repair_rounds_started_after(
+                    runs, instance.instance_id, stated.stated_at
+                ),
             )
-            if isinstance(first, EtaNeverStated):
-                first = FirstStatedEtaTarget(
-                    time=stated.time,
-                    repair_rounds=_repair_rounds_started_after(runs, instance_id, stated.stated_at),
-                )
-            latest = stated
+        latest = stated
     if isinstance(latest, NoStatedEtaEvent) or isinstance(first, EtaNeverStated):
         return NoStatedEtaEvent()
     return LatestStatedEtaEvent(eta=latest, first=first)
 
 
 def _done_phase(
-    phase: progress_history.PlanPhase,
+    phase: plan_history.PlanPhase,
     instances: list[PhaseInstance],
 ) -> DonePhase:
     completed: list[tuple[PhaseInstance, InstanceFinished]] = []
@@ -757,23 +889,17 @@ def _done_phase(
             title=phase["title"],
             times=PhaseTimingNotRecorded(),
         )
-    last, last_finish = max(completed, key=lambda pair: pair[1].written_at)
-    title = _normalized_title(last.title)
-    kept = [
-        instance
-        for instance in instances
-        if _normalized_title(instance.title) == title
-    ]
+    last_finish = max(completed, key=lambda pair: pair[1].written_at)[1]
     seconds = sum(
         instance.finish.seconds
-        for instance in kept
+        for instance in instances
         if isinstance(instance.finish, InstanceFinished)
     )
     return DonePhase(
         phase=phase["id"],
         title=phase["title"],
         times=CompletedPhaseTiming(
-            start=min(instance.start for instance in kept),
+            start=min(instance.start for instance in instances),
             finish=last_finish.at,
             seconds=seconds,
         ),
@@ -782,9 +908,12 @@ def _done_phase(
 
 def _plan_finish(
     phases: list[DonePhase | OpenPhase | TodoPhase],
-) -> FinishedAt | PredictedFinish | UnknownFinish:
+) -> FinishedAt | PredictedFinish | UnknownFinish | GateBlockedFinish:
     if not phases:
         return UnknownFinish()
+    for phase in phases:
+        if isinstance(phase, TodoPhase) and isinstance(phase.gate, UntimedGate):
+            return GateBlockedFinish(phase.gate.gate, phase.gate.waits_on)
     if all(isinstance(phase, DonePhase) for phase in phases):
         finishes = [
             phase.times.finish
@@ -812,19 +941,197 @@ def _plan_finish(
     return UnknownFinish()
 
 
+def _phase_history(
+    runs: list[list[dict[str, object]]],
+    instances: list[PhaseInstance],
+    row: DonePhase | OpenPhase | TodoPhase,
+) -> PhaseHistory:
+    instance_ids = {instance.instance_id for instance in instances}
+    eta_events = {
+        id(event)
+        for instance in instances
+        for event in _instance_eta_events(runs, instance)
+    }
+    trail: list[tuple[datetime, datetime]] = []
+    fix_passes: set[str] = set()
+    finished_fixes: set[str] = set()
+    findings: dict[str, int] = dict.fromkeys(FINDING_SEVERITIES, 0)
+    for events in runs:
+        for index, event in enumerate(events):
+            if id(event) in eta_events:
+                target = _moment(event.get("eta_at"))
+                stated = _moment(event.get("timestamp_epoch"))
+                if target is not None and stated is not None:
+                    trail.append((target, stated))
+            if _text(event.get("phase_instance_id")) not in instance_ids:
+                continue
+            event_type = _text(event.get("event_type"))
+            if event_type == "pass_started" and event.get("pass_kind") == "fix":
+                fix_passes.add(_text(event.get("pass_instance_id")) or f"{id(events)}:{index}")
+            if event_type == "pass_finished":
+                finished_fixes.add(_text(event.get("pass_instance_id")))
+            if event_type == "finding_opened":
+                severity = _text(event.get("severity"))
+                if severity in findings:
+                    findings[severity] += 1
+    finished: datetime | PhaseNotFinished = PhaseNotFinished()
+    delta: float | FinishDeltaUnavailable = FinishDeltaUnavailable()
+    if isinstance(row, DonePhase) and isinstance(row.times, CompletedPhaseTiming):
+        finished = row.times.finish
+        if trail:
+            delta = (finished - trail[-1][0]).total_seconds() / 60
+    return PhaseHistory(
+        first_eta=trail[0][0] if trail else EtaNeverStated(),
+        moves=sum(previous[0] != current[0] for previous, current in zip(trail, trail[1:])),
+        eta_trail=trail,
+        finished_at=finished,
+        delta_minutes=delta,
+        fix_done=len(fix_passes & finished_fixes),
+        fix_open_passes=len(fix_passes - finished_fixes),
+        findings=findings,
+    )
+
+
+def _with_history(
+    row: DonePhase | OpenPhase | TodoPhase,
+    runs: list[list[dict[str, object]]],
+    instances: list[PhaseInstance],
+) -> DonePhase | OpenPhase | TodoPhase:
+    history = _phase_history(runs, instances, row)
+    return replace(
+        row,
+        first_eta=history.first_eta,
+        moves=history.moves,
+        eta_trail=history.eta_trail,
+        finished_at=history.finished_at,
+        delta_minutes=history.delta_minutes,
+        fix_done=history.fix_done,
+        fix_open_passes=history.fix_open_passes,
+        findings=history.findings,
+    )
+
+
+def _production_gates(plan_path: Path) -> dict[str, NoGate | TimedGate | UntimedGate]:
+    reference = _production_reference(plan_path)
+    if isinstance(reference, PlanOutsideProduction):
+        return {}
+    try:
+        document = _production_document(plan_path, reference)
+        lines = document.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError, Refusal):
+        return {}
+    gates: dict[str, NoGate | TimedGate | UntimedGate] = {}
+    in_gates = False
+    for line in lines:
+        if line.startswith("## "):
+            in_gates = line.strip() == "## Gates"
+            continue
+        if not in_gates or not line.lstrip().startswith("|"):
+            continue
+        cells = [
+            cell.strip().replace(r"\|", "|")
+            for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))
+        ]
+        if len(cells) != 4 or re.fullmatch(r"G\d+", cell_value(cells[0])) is None:
+            continue
+        gate, _, waits_on, clears = cells
+        gate = cell_value(gate)
+        if clears.casefold().startswith("cleared"):
+            gates[gate] = NoGate()
+            continue
+        match = re.search(r"\b\d{4}-\d{2}-\d{2} \d{2}:\d{2}\b", clears)
+        if match is not None:
+            try:
+                until = datetime.strptime(match.group(), "%Y-%m-%d %H:%M").replace(
+                    tzinfo=user_zone()
+                )
+            except ValueError:
+                pass
+            else:
+                gates[gate] = TimedGate(gate, until, waits_on)
+                continue
+        gates[gate] = UntimedGate(gate, waits_on)
+    return gates
+
+
 def build_plan(plan_path: Path) -> PhaseRecord:
     """Build one plan's phase view entirely from its durable events."""
     plan_path = plan_path.expanduser().resolve()
     try:
-        phases = progress_history.plan_phases(plan_path)
+        phases = plan_history.plan_phases(plan_path)
     except (OSError, UnicodeError) as error:
         raise NoPlan(f"Unable to read plan {plan_path}") from error
 
-    run_events = [_events(path) for path in progress_history.plan_runs(plan_path)]
+    run_events = [_events(path) for path in plan_history.plan_runs(plan_path)]
     instances = _phase_instances(run_events)
     open_instance = _newest_open_instance(run_events)
+    return _build_phase_record(
+        plan_path, phases, run_events, _instances_by_phase(phases, instances),
+        [open_instance] if isinstance(open_instance, OpenPhaseInstance) else [],
+    )
+
+
+def build_run(plan_path: Path, events: list[dict[str, object]]) -> PhaseRecord:
+    """Build a phase record from one run after its plan headings are gone.
+
+    Each recorded instance keeps its own row, including unfinished phases in
+    a closed run. Event titles and completion events replace plan headings.
+    """
+    run_events = [[event for event in events if event.get("event_type") != "run_finished"]]
+    instances = _phase_instances(run_events)
+    by_instance = {instance.instance_id: instance for instance in instances}
+    started_ids: set[str] = set()
+    finished_ids: set[str] = set()
+    finished: list[PhaseInstance] = []
+    for index, event in enumerate(run_events[0]):
+        instance_id = _text(event.get("phase_instance_id"))
+        event_type = _text(event.get("event_type"))
+        if event_type == "phase_started":
+            started_ids.add(instance_id)
+        if event_type != "phase_finished":
+            continue
+        finished_ids.add(instance_id)
+        at = _moment(event.get("timestamp_epoch"))
+        if at is None:
+            continue
+        seconds = _duration(event.get("phase_elapsed_seconds")) or 0
+        instance = by_instance.get(instance_id) if instance_id in started_ids else None
+        finished.append(PhaseInstance(
+            instance_id=instance_id,
+            phase=_text(event.get("phase_id")) or (instance.phase if instance else ""),
+            title=_text(event.get("phase_title")) or (instance.title if instance else ""),
+            start=instance.start if instance else at - timedelta(seconds=seconds),
+            finish=InstanceFinished(at=at, status="completed", seconds=seconds, written_at=index),
+        ))
+    opened = [instance for instance in instances if instance.instance_id not in finished_ids]
+    ordered = finished + opened
+    phases: list[plan_history.PlanPhase] = [
+        {"id": instance.phase, "title": instance.title,
+         "done": isinstance(instance.finish, InstanceFinished),
+         "depends_on": None, "blocked_by": ""}
+        for instance in ordered
+    ]
+    return _build_phase_record(
+        plan_path.expanduser().resolve(), phases, run_events,
+        [[instance] for instance in ordered],
+        [_open_instance(run_events, instance) for instance in opened],
+    )
+
+
+def _build_phase_record(
+    plan_path: Path,
+    phases: list[plan_history.PlanPhase],
+    run_events: list[list[dict[str, object]]],
+    assigned: list[list[PhaseInstance]],
+    open_instances: list[OpenPhaseInstance],
+) -> PhaseRecord:
+    """Apply the same timing and history rules to plan and run phase rows."""
+    open_instance = open_instances[-1] if open_instances else NoOpenPhase()
     open_ids = _open_phase_ids(run_events)
-    assigned = _instances_by_phase(phases, instances)
+    in_production = any(phase["blocked_by"] and not phase["done"] for phase in phases) and isinstance(
+        _production_reference(plan_path), ProductionReference
+    )
+    gates = _production_gates(plan_path) if in_production else {}
     current: OpenPhase | NoOpenPhase = NoOpenPhase()
     current_position: PlanPhasePosition | OutsidePlan = OutsidePlan()
     if isinstance(open_instance, OpenPhaseInstance):
@@ -836,40 +1143,67 @@ def build_plan(plan_path: Path) -> PhaseRecord:
                 current_position = PlanPhasePosition(offset=index)
                 break
     rows: list[DonePhase | OpenPhase | TodoPhase] = []
+    row_instances: list[list[PhaseInstance]] = []
     for index, phase in enumerate(phases):
+        title = _normalized_title(phase["title"])
         if (
             isinstance(current_position, PlanPhasePosition)
             and index == current_position.offset
             and isinstance(open_instance, OpenPhaseInstance)
         ):
-            recorded_title = _normalized_title(open_instance.phase.title)
-            related = [
-                instance
-                for instance in assigned[index]
-                if _normalized_title(instance.title) == recorded_title
+            title = _normalized_title(open_instance.phase.title)
+        elif phase["done"]:
+            completed = [
+                (instance, instance.finish) for instance in assigned[index]
+                if isinstance(instance.finish, InstanceFinished)
+                and instance.finish.status == "completed"
             ]
+            if completed:
+                last = max(completed, key=lambda pair: pair[1].written_at)[0]
+                title = _normalized_title(last.title)
+        related = [
+            instance for instance in assigned[index]
+            if _normalized_title(instance.title) == title
+        ]
+        row_instances.append(related)
+        row_open = next(
+            (candidate for candidate in open_instances if any(
+                instance.instance_id == candidate.phase.instance_id for instance in assigned[index]
+            )),
+            NoOpenPhase(),
+        )
+        if isinstance(row_open, OpenPhaseInstance):
             earliest = min(
                 (instance.start for instance in related),
-                default=open_instance.phase.start,
+                default=row_open.phase.start,
             )
             current = OpenPhase(
                 phase=phase["id"],
                 title=phase["title"],
                 started=earliest,
-                progress=open_instance.progress,
-                eta=open_instance.eta,
-                first_stated=open_instance.first_stated,
+                progress=row_open.progress,
+                eta=row_open.eta,
+                first_stated=row_open.first_stated,
+                instance_id=row_open.phase.instance_id,
             )
             rows.append(current)
             open_ids.add(phase["id"])
         elif phase["done"]:
-            rows.append(_done_phase(phase, assigned[index]))
+            rows.append(_done_phase(phase, related))
         else:
             rows.append(
                 TodoPhase(
                     phase=phase["id"],
                     title=phase["title"],
                     times=PhaseTimingNotPredicted(),
+                    gate=(
+                        gates.get(
+                            phase["blocked_by"],
+                            UntimedGate(phase["blocked_by"], "gate not found"),
+                        )
+                        if in_production and phase["blocked_by"]
+                        else NoGate()
+                    ),
                 )
             )
 
@@ -883,6 +1217,7 @@ def build_plan(plan_path: Path) -> PhaseRecord:
             progress=open_instance.progress,
             eta=open_instance.eta,
             first_stated=open_instance.first_stated,
+            instance_id=open_instance.phase.instance_id,
         )
 
     durations = [
@@ -904,41 +1239,63 @@ def build_plan(plan_path: Path) -> PhaseRecord:
         typical = UnknownDuration()
     gap_samples = _gap_samples(run_events)
     gap = int(statistics.median(gap_samples)) if gap_samples else 0
-    if isinstance(typical, TypicalDuration):
-        now = datetime.fromtimestamp(progress_history.now_epoch(), UTC)
-        gap_before_first = False
-        if isinstance(current, OpenPhase):
-            gap_before_first = True
-            if isinstance(current.eta, StatedEta | ProjectedEta):
-                previous_finish = current.eta.time
-            else:
-                previous_finish = max(
-                    now,
-                    current.started + timedelta(seconds=typical.seconds),
-                )
-        else:
-            previous_finish = now
-        for index, row in enumerate(rows):
-            if isinstance(row, DonePhase):
-                continue
-            if isinstance(row, OpenPhase):
-                continue
-            start = previous_finish
-            if gap_before_first:
-                start += timedelta(seconds=gap)
-            finish = start + timedelta(seconds=typical.seconds)
-            rows[index] = TodoPhase(
-                phase=row.phase,
-                title=row.title,
-                times=PredictedPhaseTiming(start=start, finish=finish),
+    now = datetime.fromtimestamp(plan_history.now_epoch(), UTC)
+    gap_before_first = isinstance(current, OpenPhase)
+    previous_finish = now
+    if isinstance(current, OpenPhase):
+        if isinstance(current.eta, StatedEta | ProjectedEta):
+            previous_finish = current.eta.time
+        elif isinstance(typical, TypicalDuration):
+            previous_finish = max(
+                now,
+                current.started + timedelta(seconds=typical.seconds),
             )
-            previous_finish = finish
-            gap_before_first = True
+    if isinstance(current, OpenPhase) and (
+        isinstance(current.eta, StatedEta | ProjectedEta)
+        or isinstance(typical, TypicalDuration)
+    ):
+        scheduled = replace(current, schedule_end=previous_finish)
+        rows = [scheduled if row is current else row for row in rows]
+        current = scheduled
+    blocked: UntimedGate | NoGate = NoGate()
+    for index, row in enumerate(rows):
+        if not isinstance(row, TodoPhase):
+            continue
+        if isinstance(blocked, NoGate) and isinstance(row.gate, UntimedGate):
+            blocked = row.gate
+        if isinstance(blocked, UntimedGate):
+            rows[index] = replace(row, times=PhaseTimingNotPredicted(), gate=blocked)
+            continue
+        if isinstance(typical, UnknownDuration):
+            continue
+        start = previous_finish
+        if gap_before_first:
+            start += timedelta(seconds=gap)
+        if isinstance(row.gate, TimedGate):
+            start = max(start, row.gate.until)
+        finish = start + timedelta(seconds=typical.seconds)
+        rows[index] = replace(row, times=PredictedPhaseTiming(start=start, finish=finish))
+        previous_finish = finish
+        gap_before_first = True
+
+    for index, row in enumerate(rows):
+        enriched = _with_history(row, run_events, row_instances[index])
+        rows[index] = enriched
+        if row is current and isinstance(enriched, OpenPhase):
+            current = enriched
+    if (
+        isinstance(current, OpenPhase)
+        and isinstance(current_position, OutsidePlan)
+        and isinstance(open_instance, OpenPhaseInstance)
+    ):
+        enriched = _with_history(current, run_events, [open_instance.phase])
+        if isinstance(enriched, OpenPhase):
+            current = enriched
 
     return PhaseRecord(
         plan=plan_path,
         updated=datetime.fromtimestamp(
-            progress_history.now_epoch(), UTC
+            plan_history.now_epoch(), UTC
         ),
         current=current,
         phases=rows,
@@ -955,7 +1312,7 @@ def build(session_dir: Path) -> PhaseRecord:
     if not plan_doc:
         raise NoState(f"Progress state does not name a plan in {session_dir}")
     working_dir = Path(working_dir_text) if working_dir_text else Path.cwd()
-    return build_plan(progress_history.resolve_plan_path(working_dir, plan_doc))
+    return build_plan(plan_history.resolve_plan_path(working_dir, plan_doc))
 
 
 def _clock(moment: datetime, zone: ZoneInfo) -> str:
@@ -975,7 +1332,7 @@ def _elapsed(seconds: int) -> str:
     return f"{hours}:{remainder // 60:02d}"
 
 
-def _row_status(row: DonePhase | OpenPhase | TodoPhase) -> str:
+def _row_status(row: DonePhase | OpenPhase | TodoPhase, zone: ZoneInfo) -> str:
     if isinstance(row, DonePhase):
         if isinstance(row.times, CompletedPhaseTiming):
             return f"done in {_elapsed(row.times.seconds)}"
@@ -984,6 +1341,10 @@ def _row_status(row: DonePhase | OpenPhase | TodoPhase) -> str:
         if isinstance(row.progress, ReportedPhaseProgress):
             return f"running, {row.progress.percent}%"
         return "running"
+    if isinstance(row.gate, TimedGate):
+        return f"gated until {row.gate.until.astimezone(zone):%a %d %b %H:%M}"
+    if isinstance(row.gate, UntimedGate):
+        return f"gated by {row.gate.gate}: {_cell_text(row.gate.waits_on)}"
     return (
         "predicted"
         if isinstance(row.times, PredictedPhaseTiming)
@@ -1065,6 +1426,8 @@ def render(record: PhaseRecord, zone: ZoneInfo) -> str:
         plan_finish = _clock(record.plan_finish.at, zone)
     elif isinstance(record.plan_finish, PredictedFinish):
         plan_finish = f"{_clock(record.plan_finish.at, zone)}, predicted"
+    elif isinstance(record.plan_finish, GateBlockedFinish):
+        plan_finish = f"after {record.plan_finish.gate}"
     summary.extend(
         [
             f"| Plan finish | {plan_finish} |",
@@ -1080,7 +1443,7 @@ def render(record: PhaseRecord, zone: ZoneInfo) -> str:
     for row in reversed(record.phases):
         start, finish = _row_clocks(row, zone)
         phase_table.append(
-            f"| {row.phase} | {row.title} | {_row_status(row)} | "
+            f"| {row.phase} | {row.title} | {_row_status(row, zone)} | "
             + f"{start} | {finish} |"
         )
     return "\n".join([heading, "", *summary, "", *phase_table])
@@ -1119,6 +1482,13 @@ def _json_phase(
         "start": start,
         "finish": finish,
         "seconds": seconds,
+        "first_eta": _iso(row.first_eta, zone) if isinstance(row.first_eta, datetime) else None,
+        "moves": row.moves,
+        "eta_trail": [[_iso(target, zone), _iso(stated, zone)] for target, stated in row.eta_trail],
+        "finished_at": _iso(row.finished_at, zone) if isinstance(row.finished_at, datetime) else None,
+        "delta_minutes": row.delta_minutes if isinstance(row.delta_minutes, float) else None,
+        "fix_rounds": row.fix_rounds,
+        "findings": row.findings,
     }
 
 
@@ -1273,15 +1643,17 @@ def _git_output(directory: Path, *arguments: str) -> str:
 
 
 def _production_document(plan_path: Path, reference: ProductionReference) -> Path:
-    root = Path(_git_output(plan_path.parent, "rev-parse", "--show-toplevel"))
     document = Path(reference.document).expanduser()
-    return document.resolve() if document.is_absolute() else (root / document).resolve()
+    if document.is_absolute():
+        return document.resolve()
+    root = Path(_git_output(plan_path.parent, "rev-parse", "--show-toplevel"))
+    return (root / document).resolve()
 
 
 def _phase_note_name(production: str, unit: str) -> str:
     name = unit
     try:
-        marked = unit_lookup.marked_units(production).get(unit)
+        marked = unit_lookup.marked_unit(production, unit)
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
             if marked.claude.name:
                 name = marked.claude.name
@@ -1590,6 +1962,38 @@ def prune(production_doc: Path) -> None:
         ):
             continue
         _ = _archive_note(candidate, vault_root, production.slug)
+
+
+def owned_notes(production: str, unit: str) -> list[Path]:
+    """The generated phase notes that name `unit` of `production` as their owner."""
+    owner = NoteOwnership(production=production, unit=unit)
+    return [candidate for candidate in sorted(_vault_root().glob("*/*.md")) if _note_ownership(candidate) == owner]
+
+
+def rename_unit(production: str, old: str, new: str) -> list[Path]:
+    """Point a renamed unit's generated phase notes at its new id, so prune keeps them.
+
+    Only the `unit:` key changes; the unit's next refresh rewrites the rest of each note.
+    """
+    renamed: list[Path] = []
+    for candidate in owned_notes(production, old):
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines(keepends=True)
+        except (OSError, UnicodeError) as error:
+            raise Refusal(f"cannot read phase note {candidate}: {error}") from error
+        end = next(index for index, line in enumerate(lines[1:], 1) if line.rstrip("\n") == "---")
+        lines[1:end] = [f"unit: {new}\n" if line.startswith("unit:") else line for line in lines[1:end]]
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=candidate.parent, prefix=f".{candidate.name}.", delete=False
+            ) as handle:
+                _ = handle.write("".join(lines))
+                os.fchmod(handle.fileno(), 0o644)
+            os.replace(handle.name, candidate)
+        except OSError as error:
+            raise Refusal(f"cannot write phase note {candidate}: {error}") from error
+        renamed.append(candidate)
+    return renamed
 
 
 def refresh(session_dir: Path) -> None:

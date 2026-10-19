@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # invoke.sh — sourced library holding every cargo invocation policy: canonical
-# flags, config/lint.conf gating, and macOS sandbox-failure detection. This is the single bottom layer. The lint CLI in
-# this directory is the public entry point (shell aliases, validate_ci.sh,
-# the fix pipeline and pre_release_checks.sh); delegate/verify.sh sources this
-# file directly and adds only its per-package scope rules on top. Nothing
+# flags, config/lint.conf gating, and macOS sandbox-failure detection.
+# The lint CLI in this directory serves shell aliases, validate_ci.sh and
+# pre_release_checks.sh. delegate/verify.sh sources this file directly and adds
+# only its per-package scope rules on top. Nothing
 # outside this directory composes policy flags like -D warnings or the nextest
 # profile.
 #
 # Callers own scope (--workspace vs -p <pkg>, target selection); this file
 # owns how each tool always runs once scoped.
+# invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
+# judges the result. Delegate verdict keys include this policy file.
 
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 LINT_INVOKE_SOURCED=1
@@ -513,6 +515,11 @@ invoke_clippy() {
         ${clippy_args[@]+"${clippy_args[@]}"}
 }
 
+# Use the same scope, lint arguments, gating, and run wrapper as judgment.
+invoke_clippy_fix() {
+    invoke_clippy --fix --allow-dirty --allow-staged --allow-no-vcs "$@"
+}
+
 invoke_mend() {
     if ! lint_config_enabled mend; then
         lint_config_skip_notice mend "cargo mend --workspace"
@@ -520,9 +527,8 @@ invoke_mend() {
     fi
     # RUSTC_WRAPPER cleared: a compiler cache replays cached output instead of
     # running rustc, which suppresses the diagnostics mend analyzes
-    # Scope comes from the caller (the lint CLI resolves it, or a caller like
-    # the fix pipeline passes --manifest-path). Forcing --workspace here silently
-    # overrode both: a per-project run linted the whole workspace instead.
+    # The caller sets the scope. The lint CLI resolves its scope before this
+    # call. Keep the caller's flags so targeted runs stay within that scope.
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }
 

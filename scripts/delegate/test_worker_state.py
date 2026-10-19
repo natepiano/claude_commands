@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.delegate.worker_state import worker_claim_lock, worker_ledger
+from scripts.delegate.worker_state import worker_claim_lock, worker_ledger, worker_record_path, worker_slot
 
 
 class WorkerStateTests(unittest.TestCase):
@@ -35,6 +35,28 @@ class WorkerStateTests(unittest.TestCase):
                 self.assertEqual(worker_ledger(run), run / "workers")
             self.assertEqual(sorted(path.name for path in run.iterdir()),
                              ["impl_claim_impl.json", "impl_worker_claim.lock", "impl_worker_impl.json", "seats", "workers"])
+
+    def test_a_repair_workers_record_moves_out_of_the_impl_slot_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            repair = {"name": "project-fix", "slot": "impl", "family": "codex", "model": "model", "worker_id": "thread-fix"}
+            _ = (run / "impl_worker_impl.json").write_text(json.dumps(repair))
+            with worker_claim_lock(run):
+                self.assertFalse((run / "impl_worker_impl.json").exists())
+                self.assertEqual(json.loads((run / "impl_worker_fix.json").read_text()), repair)
+            self.assertEqual(worker_record_path(run, "project-impl", "impl"), run / "impl_worker_impl.json")
+            self.assertEqual(worker_record_path(run, "project-fix", "impl"), run / "impl_worker_fix.json")
+            self.assertEqual(worker_record_path(run, "builder", "impl"), run / "impl_worker_impl.json")
+
+    def test_worker_slot_reads_the_slot_the_identity_was_recorded_under(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory)
+            _ = (run / "impl_worker_impl.json").write_text(json.dumps({"name": "project-impl", "slot": "impl"}))
+            _ = (run / "impl_worker_fix.json").write_text(json.dumps({"name": "project-fix", "slot": "impl"}))
+            _ = (run / "impl_worker_test.json").write_text("not json")
+            self.assertEqual(worker_slot(run, "project-impl"), "impl")
+            self.assertEqual(worker_slot(run, "project-fix"), "impl")
+            self.assertIsNone(worker_slot(run, "project-test"))
 
     def test_converted_lock_keeps_excluding_a_launcher_with_an_open_old_handle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

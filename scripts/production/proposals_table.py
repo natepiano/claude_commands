@@ -26,13 +26,13 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 import showrunners
-from add_unit import production_field
 from production_units import Refusal
-from issues import Issue, open_issues
+from issues import Issue
+from proposals_folder import open_proposals
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 import phase_table
-import progress_history
+from scripts.delegate import plan_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import unit_runs
@@ -43,8 +43,6 @@ BACKLOG_DIR = Path(os.environ.get("PLAN_BACKLOG_DIR") or Path.home() / ".local/s
 SESSION_ROOTS = unit_runs.run_roots()
 PENDING_NAME = "next_items_pending.md"
 # The Production Context line that names the issues folder a production files its proposals in.
-PROPOSALS_FIELD = "Proposals"
-PROPOSAL_TAG = "proposal"
 # A state says what the user can do, in their terms.
 REVIEW_STATE = "waiting for your review"
 # An add-on is the showrunner's to settle, not the user's (user, 2026-10-12).
@@ -119,20 +117,11 @@ def issue_state(issue: Issue) -> str:
     return f"approved, not started: {plan}" if plan else REVIEW_STATE
 
 
-def issue_rows(folder: Path) -> list[Row]:
-    """One row per open proposal issue in the folder, oldest first; its title is the file's name."""
+def issue_rows(found: list[Issue]) -> list[Row]:
+    """One row per open proposal issue, oldest first; its title is the file's name."""
     rows = [Row(issue.value("proposed_by") or NONE, issue.path.stem, issue.value("date_created") or NONE,
-                issue_state(issue)) for issue in open_issues(folder, PROPOSAL_TAG)]
+                issue_state(issue)) for issue in found]
     return sorted(rows, key=lambda row: (row.date, row.proposal))
-
-
-def issues_folder(doc: Path) -> Path | None:
-    """The folder the production doc's Proposals line names, or None when it names none."""
-    try:
-        folder = Path(production_field(read_lines(doc), PROPOSALS_FIELD)).expanduser()
-    except Refusal:
-        return None
-    return folder if folder.is_absolute() else worktree_of(doc) / folder
 
 
 def file_date(path: Path) -> str:
@@ -185,7 +174,7 @@ def unit_plans(plan: Path) -> list[Path]:
 def unit_add_on_rows(unit: str, plan: Path) -> list[Row]:
     rows: list[Row] = []
     for path in unit_plans(plan):
-        for run in progress_history.plan_runs(path):
+        for run in plan_history.plan_runs(path):
             rows.extend(row for root in SESSION_ROOTS for row in add_on_rows(unit, root / run.stem / PENDING_NAME))
     return rows
 
@@ -220,8 +209,7 @@ def table(rows: list[Row]) -> str:
 
 def open_rows(doc: Path, records: dict[str, object]) -> list[Row]:
     plans = unit_plan_paths(records)
-    folder = issues_folder(doc)
-    rows = issue_rows(folder) if folder is not None else []
+    rows = issue_rows(open_proposals(doc))
     rows += backlog_rows(BACKLOG_DIR)
     for unit, plan in plans.items():
         rows.extend(unit_add_on_rows(unit, plan))

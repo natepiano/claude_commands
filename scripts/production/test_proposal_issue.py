@@ -5,12 +5,15 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import sys
 import tempfile
 import unittest
 from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import proposal_issue
 from user_zone import user_zone
@@ -62,6 +65,85 @@ class ProposalIssueTests(unittest.TestCase):
 
     def text(self) -> str:
         return self.issue.read_text(encoding="utf-8")
+
+    def test_create_fills_template_and_protects_the_finding_batch(self) -> None:
+        template = self.root / "issue.yaml"
+        _ = template.write_text("---\narea: \"[[{{AREA}}]]\"\nproject: \"[[{{PROJECT}}]]\"\n"
+                                + "category: [\"[[issue structure#{{CATEGORY}}|{{CATEGORY}}]]\"]\n"
+                                + "proposed_by: \"{{PROPOSED_BY}}\"\nbacklog_goal: \"{{BACKLOG_GOAL}}\"\n"
+                                + "date_created: \"[[{{DATE}}]]\"\nstatus: open\ntags: [issue]\n---\n")
+        body = self.root / "body.md"
+        _ = body.write_text("# Findings\nBefore and after.\n")
+        issue = self.root / "new style issue.md"
+        arguments = ["create", str(issue), "--project", "alpha", "--short", "alpha", "--proposed-by", "sample-style",
+                     "--extra-tags", "style", "--findings", "b,a,a", "--body-file", str(body), "--template", str(template)]
+        ranking = "goal 1 - Ship Hana · alignment ⭐⭐ · impact ⭐⭐ · urgency ⭐ · effort ⭐"
+        for label, flags, expected in (("new style issue", [], ""),
+                                       ("ranked style issue", ["--proposed-ranking", ranking], ranking)):
+            with self.subTest(ranking=expected):
+                destination = self.root / (label + ".md")
+                command = [*arguments]
+                command[1] = str(destination)
+                code, _, err = self.run_cli(*command, *flags)
+                self.assertEqual(code, 0, err)
+                self.assertIn(f"\n\nProposed ranking: {expected}\n\n# Findings\nBefore and after.\n",
+                              destination.read_text())
+        from issues import frontmatter
+        fields = frontmatter(issue)
+        self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
+        self.assertEqual(fields["style_findings"], ["a", "b"])
+        self.assertEqual(fields["area"], ["unfiled"])
+        self.assertEqual(fields["category"], ["refactor"])
+        self.assertEqual(fields["backlog_goal"], [])
+        self.assertEqual(fields["project"], ["alpha"])
+        self.assertTrue(issue.read_text().split("---", 2)[2].lstrip().startswith("Proposed ranking:"))
+        original, stamp = issue.read_bytes(), issue.stat().st_mtime_ns
+        self.assertEqual(self.run_cli(*arguments)[0], 0)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        arguments[arguments.index("--findings") + 1] = "c"
+        self.assertEqual(self.run_cli(*arguments)[0], 2)
+        self.assertEqual(issue.read_bytes(), original)
+
+    def test_create_with_rules_writes_json_list_and_recovery_checks_only_findings(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        body = self.root / "body.md"
+        _ = body.write_text("# Keep rule lines\nRule: global:rust/names.md\n")
+        issue = self.root / "linked.md"
+        urls = "https://github.com/o/r/blob/main/b.md,https://github.com/o/r/blob/main/a.md"
+        args = ["create", str(issue), "--project", "sample", "--short", "s", "--proposed-by", "style",
+                "--findings", "one", "--rules", urls, "--template", str(template), "--body-file", str(body)]
+        code, _, error = self.run_cli(*args)
+        self.assertEqual(code, 0, error)
+        from issues import frontmatter
+        self.assertEqual(frontmatter(issue)["style_rules"], sorted(urls.split(",")))
+        original = issue.read_bytes()
+        args[args.index("--rules") + 1] = "https://github.com/o/r/blob/main/changed.md"
+        self.assertEqual(self.run_cli(*args)[0], 0)
+        self.assertEqual(issue.read_bytes(), original)
+
+    def test_rules_sets_list_preserving_other_keys_and_body_bytes(self) -> None:
+        url = "https://github.com/o/r/blob/main/rust/names.md"
+        for existing in ("", 'style_rules: ["old"]\n'):
+            with self.subTest(existing=existing):
+                original = ISSUE.replace("---\n# body", existing + "---\n# body").replace("\n", "\r\n")
+                _ = self.issue.write_bytes(original.encode())
+                code, _, error = self.run_cli("rules", str(self.issue), "--rules", url)
+                self.assertEqual(code, 0, error)
+                expected = original.replace('date_modified: "[[2026-10-01]]"', f"date_modified: {self.today()}")
+                line = f'style_rules: ["{url}"]\r\n'
+                expected = expected.replace(existing.replace("\n", "\r\n"), line) if existing else expected.replace("---\r\n# body", line + "---\r\n# body")
+                self.assertEqual(self.issue.read_bytes(), expected.encode())
+                stamp = self.issue.stat().st_mtime_ns
+                self.assertEqual(self.run_cli("rules", str(self.issue), "--rules", url)[0], 0)
+                self.assertEqual(self.issue.stat().st_mtime_ns, stamp)
+
+    def test_close_accepts_a_reason_instead_of_an_as_built_path(self) -> None:
+        code, _, err = self.run_cli("close", str(self.issue), "--reason", "declined: keep the API")
+        self.assertEqual(code, 0, err)
+        self.assertIn('reason: "declined: keep the API"', self.text())
+        self.assertIn("status: closed", self.text())
+        self.assertNotIn("as_built:", self.text())
 
     def test_approve_sets_three_fields_and_keeps_stage(self) -> None:
         code, out, _ = self.run_cli(

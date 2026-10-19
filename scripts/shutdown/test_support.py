@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import shlex
 import socket
 import sys
@@ -25,6 +26,7 @@ class ShutdownSendLeaf(StrEnum):
     DELIVER_MESSAGE = "settle._deliver_message"
     RETIRE_SHUTDOWN_MESSAGES = "settle._retire_shutdown_messages"
     RESTART_RETIRE = "restart._retire"
+    RESUME_CODEX_WORKERS = "restart._send_worker_resume"
     RUN_REMOTE = "remote.run_remote"
     LAUNCH_CONDUCTOR = "settle._launch_conductor"
     LAUNCH_REMOTE_CONTROL_FIXER = "remote_control.launch_fixer"
@@ -41,6 +43,9 @@ _REAL_LEAF_BINDINGS: dict[ShutdownSendLeaf, tuple[tuple[ModuleType, str, object]
         (settle, "_retire_shutdown_messages", settle._retire_shutdown_messages),  # pyright: ignore[reportPrivateUsage]
     ),
     ShutdownSendLeaf.RESTART_RETIRE: ((restart, "_retire", _REAL_RESTART_RETIRE),),
+    ShutdownSendLeaf.RESUME_CODEX_WORKERS: (
+        (restart, "_send_worker_resume", restart._send_worker_resume),  # pyright: ignore[reportPrivateUsage]
+    ),
     ShutdownSendLeaf.RUN_REMOTE: (
         (remote, "run_remote", remote.run_remote),
         (settle, "run_remote", remote.run_remote),
@@ -69,6 +74,11 @@ def linux_process_fixture(test: unittest.TestCase) -> None:
     _ = cast(object, test.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
 
 
+# One test past this prints every thread's stack and ends the run. A conductor loop that never
+# finishes (a fake that always fails, with its waits patched away) would otherwise grow without limit.
+TEST_TIME_LIMIT_SECONDS = 60
+
+
 class ShutdownTestCase(unittest.TestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -77,8 +87,12 @@ class ShutdownTestCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
         # Records and reports in these fixtures belong to natedev.
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
+        # Launch limits stay as written on a loaded machine.
+        _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
         self._send_leaf_hits.clear()
         # Run after patch cleanups, so caught assertions still fail the test.
         self.addCleanup(self._fail_send_leaf_hits)
@@ -86,6 +100,7 @@ class ShutdownTestCase(unittest.TestCase):
             ShutdownSendLeaf.DELIVER_MESSAGE: self._block_deliver_message,
             ShutdownSendLeaf.RETIRE_SHUTDOWN_MESSAGES: self._block_retire_shutdown_messages,
             ShutdownSendLeaf.RESTART_RETIRE: self._block_restart_retire,
+            ShutdownSendLeaf.RESUME_CODEX_WORKERS: self._block_worker_resume,
             ShutdownSendLeaf.RUN_REMOTE: self._block_run_remote,
             ShutdownSendLeaf.LAUNCH_CONDUCTOR: self._block_launch_conductor,
             ShutdownSendLeaf.RUN_NOTIFIER: self._block_run_notifier,
@@ -149,6 +164,13 @@ class ShutdownTestCase(unittest.TestCase):
             ShutdownSendLeaf.RUN_REMOTE,
             f"{remote.other_machine()}: shutdown.py {shlex.join(args)}",
         )
+
+    def _block_worker_resume(self, record: SessionShutdown) -> None:
+        if record["session"]["kind"] == "unit" and record.get("codex_seats"):
+            self._reached_send_leaf(
+                ShutdownSendLeaf.RESUME_CODEX_WORKERS,
+                f"session:{record['session']['session_id']}",
+            )
 
     def _block_launch_conductor(self, login: str, label: str, here: bool = True) -> Never:
         del label, here

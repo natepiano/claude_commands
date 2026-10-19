@@ -150,6 +150,18 @@ class MeshRunsTests(unittest.TestCase):
         _ = self.supervise(self.record([sys.executable, "-c", "pass"], done=str(done)))
         self.assertEqual(self.pending()["messages"], ["Stage 2: go"])
 
+    def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
+        script = "print('x' * 1_100_000)\nfor n in range(30): print(str(n) * 5_000)\nprint('last line')"
+        _ = self.supervise(self.record([sys.executable, "-c", script]))
+        message = cast(list[str], self.pending()["messages"])[0]
+        self.assertLess(len(message), mesh_runs.RESULT_TAIL_CHARS + 1_000)
+        self.assertIn(f"{'29' * 1_000} [cut: 8000 more characters]", message)
+        self.assertTrue(message.endswith("\nlast line"))
+        _ = self.supervise(self.record([sys.executable, "-c", "print('x' * 1_100_000)"]))
+        message = cast(list[str], self.pending()["messages"])[-1]
+        self.assertIn(f"{'x' * mesh_runs.RESULT_LINE_CHARS} [cut: 1098000 more characters]", message)
+        self.assertLess(len(message), mesh_runs.RESULT_TAIL_CHARS)
+
     # Criterion 3: the server and thread change between start and finish.
     def test_result_reaches_the_seats_current_thread_after_a_server_change(self) -> None:
         path = self.record([sys.executable, "-c", "pass"])

@@ -9,7 +9,6 @@ import io
 from contextlib import redirect_stdout
 import os
 import json
-import subprocess
 import sys
 import time
 from collections.abc import Iterable
@@ -41,7 +40,6 @@ from inventory import (
     parse_inventory,
 )
 import inventory as inventory_work
-import herdr
 import record as recovery_store
 from launch_permission import (
     LaunchPurpose,
@@ -81,6 +79,7 @@ class CommandLine(argparse.Namespace):
     account: str | None = None
     as_json: bool = False
     here: bool = False
+    also: str = ""
     only: str | None = None
     request_id: str = ""
     requested_by: str | None = None
@@ -96,6 +95,7 @@ class CommandLine(argparse.Namespace):
     why: str = ""
     move_id: str = ""
     refused: str = ""
+    auto: bool = False
     reset: datetime | None = None
     session_id: str = ""
     pid: int = 0
@@ -190,11 +190,9 @@ def _selected_account(requested: str | None) -> Account:
 def _host_text(host: Host) -> str:
     match host["kind"]:
         case "unit":
-            if host["session_host"] == "herdr":
-                return f"unit {host['production']}/{host['unit']} (herdr {host['session_name']})"
-            return f"unit {host['production']}/{host['unit']}"
-        case "tmux":
-            return f"tmux {host['tmux_session']}"
+            return f"unit {host['production']}/{host['unit']} (herdr {host['session_name']})"
+        case "legacy tmux" | "legacy tmux unit":
+            return f"{host['kind']} {host['session_name']} (manual recovery)"
         case "herdr":
             return f"herdr {host['herdr_session']}"
         case "ghostty" | "zed":
@@ -222,10 +220,18 @@ def _checkout_text(checkout: CheckoutState) -> str:
     return f"{name} {tracking}, {len(checkout['dirty'])} dirty"
 
 
-def _session_lines(session: Session) -> list[str]:
+def _session_lines(session: Session, report: Inventory) -> list[str]:
     summary = f"  {session['kind']} {session['name']} · {_host_text(session['host'])}"
     summary += f" · {session['status']} · {_checkout_text(session['checkout'])}"
     lines = [summary]
+    if session["host"]["kind"] in {"legacy tmux", "legacy tmux unit"}:
+        at = settle.record_time()
+        snapshot = recovery_store.RecoverySnapshot(machine=report["machine"], login=report["login"],
+            label=report["label"], taken_at=at, sessions=[])
+        entry = recovery_store.SnapshotClaudeSession(agent="claude", session=session, workers=[],
+            timers=[], last_seen=at, state="unresolved")
+        saved = recovery_store.snapshot_restore_record(snapshot, entry)
+        lines.append(f"    manual restart: {restart_work.legacy_resume_command(saved)}")
     for server in session["codex_servers"]:
         activity = (
             "busy: " + ", ".join(server["busy_workers"])
@@ -240,7 +246,7 @@ def _session_lines(session: Session) -> list[str]:
 def _inventory_lines(report: Inventory) -> list[str]:
     lines = [f"{report['machine']}:"]
     for session in report["sessions"]:
-        lines.extend(_session_lines(session))
+        lines.extend(_session_lines(session, report))
     lines.extend(
         f"  unknown account · {item['pid']} {item['name']} · {item['reason']}"
         for item in report["unattributed"]
@@ -388,7 +394,10 @@ def _shutdown_record_lines(
             return [
                 line
                 for record in outcome["records"]
-                for line in settle.status_record_lines(record, _observed_owner(record, observations), local_observation=local_observation)
+                for line in (["  " + settle.running_restart_line(record)]
+                             if record["progress"]["kind"] == "restart failed"
+                             and isinstance(_restart_failed_liveness(record, observations), restart_work.SessionLive)
+                             else settle.status_record_lines(record, _observed_owner(record, observations), local_observation=local_observation))
             ]
         case "unreachable":
             return [
@@ -506,56 +515,6 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
     return ResolvedSessions(tuple(result), report)
 
 
-def _tmux_free() -> int:
-    causes: list[str] = []
-    try:
-        result = subprocess.run(
-            [os.environ.get("SHUTDOWN_TMUX", "tmux"), "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, check=False, timeout=10,
-        )
-        names = result.stdout.splitlines()
-        detail = result.stderr.strip()
-        no_server = (not names and len(detail.splitlines()) == 1
-                     and (detail == "no server running" or detail.startswith("no server running on ")))
-        if result.returncode != 0 and not (result.returncode == 1 and no_server):
-            causes.append(f"tmux sessions unreadable: {detail or f'exit {result.returncode}'}")
-        for name in names:
-            causes.append(f"tmux session {name!r} is still registered; close it after moving its agents")
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        causes.append(f"tmux sessions unreadable: {error}")
-    try:
-        _ = herdr.live_sessions()
-    except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
-        causes.append(f"herdr sessions unreadable: {error}")
-    try:
-        observed = inventory_work.snapshot_inventory()
-        if isinstance(observed, inventory_work.PartialInventory):
-            causes.extend(f"inventory incomplete: {failure}" for failure in observed.failures)
-            if not observed.failures:
-                causes.append("inventory incomplete: no failure details were returned")
-        else:
-            for login, entries in observed.sessions.items():
-                for entry in entries:
-                    for owner in (entry["session"], *entry["workers"]):
-                        host = owner["host"]
-                        location = ""
-                        if host["kind"] == "tmux":
-                            location = f"tmux session {host['tmux_session']!r}"
-                        elif host["kind"] == "unit" and host["session_host"] == "tmux":
-                            location = f"tmux unit {host['production']}/{host['unit']} in session {host['session_name']!r}"
-                        elif host["kind"] == "unknown":
-                            location = "an unknown host; prove its host before removing tmux"
-                        if location:
-                            causes.append(f"{login}: {owner['name']} ({owner['session_id']}) uses {location}")
-    except (OSError, ValueError, subprocess.SubprocessError) as error:
-        causes.append(f"inventory unreadable: {error}")
-    if causes:
-        print("\n".join(causes))
-        return 1
-    print("nothing needs tmux")
-    return 0
-
-
 def _snapshot() -> int:
     observed = inventory_work.snapshot_inventory()
     at = settle.record_time()
@@ -664,8 +623,23 @@ def _forget(text: str, account: str = "") -> int:
 
 
 def _unresolved_snapshot_lines(login: str, only: tuple[str, ...] = ()) -> list[str]:
-    return [f"  {item['name']}: unresolved; last seen {_local_time(item['last_seen'])}"
-            for item in _unresolved_snapshot_status(login, only)]
+    snapshot = recovery_store.read_snapshot(login)
+    if isinstance(snapshot, recovery_store.NoRecoverySnapshot):
+        return []
+    lines: list[str] = []
+    for item in snapshot["sessions"]:
+        owner = item["session"]
+        if item["state"] != "unresolved" or (only and owner["session_id"] not in only):
+            continue
+        lines.append(f"  {owner['name']}: unresolved; last seen {_local_time(item['last_seen'])}")
+        if owner["host"]["kind"] in {"legacy tmux", "legacy tmux unit"}:
+            if item["agent"] == "codex":
+                command = restart_work.legacy_codex_command(item)
+            else:
+                saved = recovery_store.snapshot_restore_record(snapshot, item)
+                command = restart_work.legacy_resume_command(saved)
+            lines.append(f"    manual restart: {command}")
+    return lines
 
 
 def _unresolved_snapshot_status(login: str, only: tuple[str, ...] = ()) -> list[UnresolvedRecoverySession]:
@@ -698,7 +672,18 @@ def _remote_conductor_status(login: str) -> ConductorRunning | ConductorNotRunni
         return ConductorUnavailable(str(error))
 
 
-def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning | ConductorNotRunning | ConductorUnavailable) -> list[str]:
+def _restart_failed_liveness(saved: SessionShutdown, observations: tuple[Inventory, ...] = ()) -> restart_work.SessionLive | restart_work.SessionNotLive | restart_work.SessionLivenessUnknown:
+    if saved["machine"].casefold() == settle.local_machine().casefold():
+        return restart_work.restart_failed_liveness(saved)
+    for report in observations:
+        if report["machine"].casefold() == saved["machine"].casefold():
+            if any(owner["session_id"] == saved["session"]["session_id"] for owner in report["sessions"]):
+                return restart_work.SessionLive()
+    return restart_work.SessionLivenessUnknown(f"session liveness not confirmed on {saved['machine']}")
+
+
+def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning | ConductorNotRunning | ConductorUnavailable,
+                    observations: tuple[Inventory, ...] = ()) -> list[str]:
     lines: list[str] = []
     take_out: list[SessionShutdown] = []
     stop_now: list[SessionShutdown] = []
@@ -714,6 +699,12 @@ def _status_actions(records: list[SessionShutdown], ownership: ConductorRunning 
             lines.append(f"  conductor ownership unavailable: {ownership.reason}")
     for saved in records:
         progress = saved["progress"]["kind"]
+        if progress == "restart failed":
+            observed = _restart_failed_liveness(saved, observations)
+            if isinstance(observed, restart_work.SessionLive):
+                continue
+            if isinstance(observed, restart_work.SessionLivenessUnknown):
+                lines.append(f"  {saved['session']['name']}: liveness unknown: {observed.reason}")
         if progress in {"waiting", "ready", "held by usage limit", "reaping"}:
             take_out.append(saved)
             stop_now.append(saved)
@@ -776,6 +767,13 @@ def _follow_action(saved: SessionShutdown) -> str:
     progress = saved["progress"]
     kind = progress["kind"]
     place = f"in a terminal on {saved['machine']}"
+    liveness_reason = ""
+    if kind == "restart failed":
+        observed = _restart_failed_liveness(saved)
+        if isinstance(observed, restart_work.SessionLive):
+            return settle.running_restart_line(saved)
+        if isinstance(observed, restart_work.SessionLivenessUnknown):
+            liveness_reason = f"; liveness unknown: {observed.reason}"
     if progress["kind"] == "manual restart":
         return f"{saved['session']['name']}: {place}: {progress['command']}"
     verb = "now" if kind in {"stop failed", "waiting", "stopped", "already gone"} else "restart"
@@ -784,7 +782,7 @@ def _follow_action(saved: SessionShutdown) -> str:
         return f"{saved['session']['name']}: process identity lost; inspect its window before restarting; {place}: {command}"
     if kind == "waiting":
         return settle.holdout_line(saved)
-    return f"{saved['session']['name']}: {kind}; {place}: {command}"
+    return f"{saved['session']['name']}: {kind}{liveness_reason}; {place}: {command}"
 
 
 def follow(login: str, request_id: str) -> int:
@@ -899,19 +897,22 @@ def main(arguments: list[str] | None = None) -> int:
         usage="in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> [arguments]",
         epilog="Run in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> <account> [--only ID[,ID...]].\nFollow in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow <account> --request <request-id>.\nInternal fixer in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py remote-control <session-id> --pid <pid> --proc-start <start> --who <name> --session <session-name>.",
     )
+    # Commands without these flags still read them.
+    parser.set_defaults(also="", target="")
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{down,status,follow,now,cancel,restart,snapshot,tmux-free,forget,remote-control,launch-blocked}",
+        metavar="{down,status,follow,now,cancel,restart,snapshot,forget,remote-control,launch-blocked}",
     )
     _ = commands.add_parser("snapshot", help="save a read-only local recovery observation")
-    _ = commands.add_parser("tmux-free", help="check whether anything local still needs tmux")
     forget = commands.add_parser("forget", help="forget one local recovery entry or stopped session's restore")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
     _ = forget.add_argument("--account", help="account login or label containing this session")
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
     _ = down.add_argument("--here", action="store_true")
+    _ = down.add_argument("--also", metavar="MACHINE", default="",
+                          help="also stop the account on the other machine; a stop covers only this machine by default")
     _ = down.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     _ = down.add_argument("--restart", action="store_true")
     from typing import override
@@ -943,7 +944,9 @@ def main(arguments: list[str] | None = None) -> int:
                 raise argparse.ArgumentError(self, "--reset requires an aware ISO time") from error
             namespace.reset = reset
 
-    _ = down.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
+    origin = down.add_mutually_exclusive_group()
+    _ = origin.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
+    _ = origin.add_argument("--auto", action="store_true", help="move requested by an automatic account rule")
     _ = down.add_argument("--reset", action=AwareReset)
     _ = down.add_argument("--move-id", default="", help=argparse.SUPPRESS)
     _ = down.add_argument("--why", default="", help="reason for the account move")
@@ -982,6 +985,8 @@ def main(arguments: list[str] | None = None) -> int:
     now = commands.add_parser("now", help="stop without waiting for idle sessions")
     _ = now.add_argument("account", nargs="?")
     _ = now.add_argument("--here", action="store_true", help=argparse.SUPPRESS)
+    _ = now.add_argument("--also", metavar="MACHINE", default="",
+                         help="also stop the account on the other machine; a stop covers only this machine by default")
     _ = now.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     restart = commands.add_parser(
         "restart", help="bring back every session stopped for one account"
@@ -1157,9 +1162,16 @@ def _all_accounts(options: CommandLine) -> int:
     return status
 
 
+def _stop_here(options: CommandLine, ids: tuple[str, ...]) -> bool:
+    """Whether a stop stays on this machine.
+
+    Stopping a whole account covers only this machine unless --also names the other one.
+    Named sessions are stopped where they run, and a move keeps both machines in scope.
+    """
+    return options.here or not (options.also or ids or options.target)
+
+
 def _dispatch(options: CommandLine) -> int:
-    if options.command == "tmux-free":
-        return _tmux_free()
     if options.command in {"snapshot", "forget"}:
         try:
             return _snapshot() if options.command == "snapshot" else _forget(options.forget_name, options.account or "")
@@ -1283,6 +1295,9 @@ def _dispatch(options: CommandLine) -> int:
             return 2
         if options.command == "follow":
             return follow(selected.login, options.request_id)
+        if options.also and (options.also != other_machine() or options.here):
+            print(f"shutdown: --also names the other machine ({other_machine()}) and cannot join --here", file=sys.stderr)
+            return 2
         ids: tuple[str, ...] = ()
         down_report: Inventory | settle.InventoryNeeded = settle.InventoryNeeded()
         if options.command in {"down", "now", "cancel"} and options.only is not None:
@@ -1301,11 +1316,13 @@ def _dispatch(options: CommandLine) -> int:
             from scripts.accounts import accounts
             from scripts.accounts.refusals import KnownReset, NoResetKnown
             move_origin: accounts.MoveOrigin = accounts.HandOrigin()
-            if options.refused:
+            if options.auto:
+                move_origin = accounts.AutoOrigin()
+            elif options.refused:
                 move_origin = accounts.RefusalOrigin(cast(Literal["weekly", "five_hour", "unknown"], options.refused),
                     KnownReset(options.reset) if options.reset is not None else NoResetKnown())
             return settle.down(
-                selected, options.here, ids,
+                selected, _stop_here(options, ids), ids,
                 then="restart" if options.restart else "stop",
                 alerts="none" if options.no_alert else "user",
                 requested_by=options.requested_by, request_id=options.request_id,
@@ -1313,7 +1330,7 @@ def _dispatch(options: CommandLine) -> int:
                 origin=move_origin, move_id=options.move_id,
             )
         if options.command == "now":
-            return settle.now(selected, options.here, ids)
+            return settle.now(selected, _stop_here(options, ids), ids)
         if options.command == "cancel":
             return settle.cancel(selected, options.here, ids)
         status_ids = resolve_sessions(selected.login, _only_ids(options.only), here=options.here).session_ids if options.only is not None else ()
@@ -1339,7 +1356,7 @@ def _dispatch(options: CommandLine) -> int:
                 if outcome["kind"] == "records":
                     waiting = any(saved["progress"]["kind"] in {"waiting", "ready", "held by usage limit", "reaping"} for saved in outcome["records"])
                     ownership = (conductor_status(selected.login) if index == 0 else _remote_conductor_status(selected.login)) if waiting else ConductorNotRunning()
-                    record_lines.extend(_status_actions(outcome["records"], ownership))
+                    record_lines.extend(_status_actions(outcome["records"], ownership, observations))
                 if record_lines:
                     print("\n".join(record_lines))
                 if index == 0:

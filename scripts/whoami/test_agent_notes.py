@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Self, cast, override
 from unittest.mock import MagicMock, call, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import agent_notes
 import note_file
 import session_table
@@ -568,6 +570,27 @@ class AgentNotesTests(unittest.TestCase):
               patch.object(note_file, "read_notes", return_value=[])):
             agent_notes.main()
         self.assertEqual(blocked.call_args.kwargs["refused_at"], quota_alert.RefusalTimeUnknown())
+        self.assertEqual(blocked.call_args.kwargs["stopped"], quota_alert.StoppedCommandUnknown())
+
+    def test_blocked_cli_converts_stopped_worker_command_at_the_argument_boundary(self) -> None:
+        command = "codex_mesh follow --to impl --prompt 'finish the patch'"
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl", command]),
+              patch.object(agent_notes, "blocked", return_value=[]) as blocked,
+              patch.object(note_file, "read_notes", return_value=[])):
+            agent_notes.main()
+        blocked.assert_called_once()
+        self.assertEqual(blocked.call_args.kwargs["stopped"],
+                         quota_alert.StoppedWorkerCommand("own-director", "impl", command))
+
+    def test_blocked_cli_rejects_incomplete_stopped_context_before_reporting(self) -> None:
+        with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
+                  "workers@example.invalid", "codex1", "--stopped", "own-director", "impl"]),
+              patch.object(agent_notes, "blocked") as blocked,
+              redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exited):
+            agent_notes.main()
+        self.assertEqual(exited.exception.code, 2)
+        blocked.assert_not_called()
 
     def test_blocked_cli_rejects_naive_refusal_time_before_reporting(self) -> None:
         with (patch.object(sys, "argv", ["agent_notes.py", "blocked", str(self.root / ".codex"),
@@ -669,7 +692,7 @@ class AgentNotesTests(unittest.TestCase):
             self.assertEqual(watch.call_count, 1)
             self.assertEqual(watch.call_args.args[0], [workers_report])
 
-    def test_failed_selected_codex_read_preserves_activity_and_alert_acknowledgement(self) -> None:
+    def test_failed_selected_codex_read_preserves_activity_and_alert_episode(self) -> None:
         default = self.root / ".codex"
         selected = self.root / ".codex1"
         self.codex_login(default, "spare@example.com")
@@ -681,7 +704,7 @@ class AgentNotesTests(unittest.TestCase):
         self.select_workers("codex1")
         _ = agent_notes.write_note(workers, {"role": ("worker",)}, stamp={"date_modified": "fixture"})
         stamp = self.now.isoformat(timespec="seconds")
-        episode: quota_alert.Episode = {"since": stamp, "acknowledged": stamp, "last": {}}
+        episode: quota_alert.Episode = {"since": stamp, "last": {}}
         state: quota_alert.State = {"episodes": {"codex1": episode.copy()},
                                     "fallback": quota_alert.NoCodexQuotaFallback()}
         workers_report = Report("Codex", problem="Account unavailable", source=CodexHomeSource(selected))
@@ -854,6 +877,7 @@ class AgentNotesTests(unittest.TestCase):
             }}).encode())
 
         with (
+            patch.object(account, "process_config_dir", return_value=account.NoAccountSetting()),
             patch.object(agent_accounts, "executable", return_value="fixture-claude"),
             patch.object(subprocess, "run", side_effect=status),
             patch.object(urllib.request, "urlopen", side_effect=usage),
@@ -1100,6 +1124,44 @@ class AgentNotesTests(unittest.TestCase):
             report = agent_accounts.claude_live(named)
         self.assertEqual(report.quota_problem,
                          "Weekly quota: not read (stale token; a Claude session on this account refreshes it)")
+        self.assertIsInstance(report.weekly_read_skip, agent_accounts.StaleTokenSkip)
+
+    def test_stale_login_after_reset_is_persisted_without_inventing_usage_or_refreshing_the_token(self) -> None:
+        named = self.root / ".claude3"
+        named.mkdir()
+        login = "idle@example.invalid"
+        read = self.now - timedelta(days=2)
+        reset = self.now - timedelta(days=1)
+        note = self.note("claude3.md", login,
+            f"resets: {local_reset(reset)}\nweekly_remaining_usage: 10\nweekly_usage_checked_at: {read.isoformat()}\n")
+        usage_store.save([Report("Claude", email=login, quotas=[Quota("Weekly", 90, reset)])], read)
+        stored = usage_store.load()[login]
+        assert "weekly" in stored
+        before = stored["weekly"].copy()
+        credentials = named / ".credentials.json"
+        _ = credentials.write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "fixture-stale", "expiresAt": int((time.time() - 60) * 1000)}}))
+        credential_bytes = credentials.read_bytes()
+        with (patch.object(agent_accounts, "executable", return_value="fixture-claude"),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps({
+                  "loggedIn": True, "email": login, "authMethod": "claude.ai"}), "")) as auth,
+              patch.object(urllib.request, "urlopen", side_effect=AssertionError("stale token used for a read")),
+              patch.object(subprocess, "Popen", side_effect=AssertionError("token refresh launched")),
+              patch.object(account, "process_config_dir", return_value=account.NoAccountSetting())):
+            report = agent_accounts.claude_live(named)
+            _ = self.snapshot([report])
+        auth.assert_called_once()
+        self.assertEqual(auth.call_args.args[0], ("fixture-claude", "auth", "status"))
+        self.assertEqual(credentials.read_bytes(), credential_bytes)
+        held = usage_store.load()[login]
+        self.assertIsInstance(usage_store.weekly_read_skip(held), agent_accounts.StaleTokenSkip)
+        assert "weekly" in held
+        self.assertEqual(held["weekly"], before)
+        updated = read_note(note.path)
+        assert isinstance(updated, Note)
+        self.assertEqual(updated.get("weekly_remaining_usage"), "null")
+        self.assertEqual(updated.get("weekly_usage_checked_at"), read.isoformat())
+        self.assertEqual(updated.get("resets"), local_reset(reset))
 
     def test_named_credentials_never_fall_back_to_the_default_keychain(self) -> None:
         named = self.root / ".claude3"

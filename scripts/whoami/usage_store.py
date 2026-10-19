@@ -11,9 +11,9 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Literal, TypedDict, cast
 
-from agent_accounts import Quota, Report
+from agent_accounts import ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome
 from note_file import canonical_label
 
 
@@ -39,6 +39,36 @@ class StoredUsage(TypedDict, total=False):
     weekly: StoredWindow
     # Codex only: the credits that carry work once an allowance is used up.
     credits: StoredCredits
+    # The latest attempt skipped this login; successful reading timestamps stay unchanged.
+    weekly_read_skip: Literal["stale_token"]
+    # Identifies a later failed attempt even when authentication returns no login.
+    weekly_read_skip_directory: str
+    read_outcome: UsageReadOutcome
+
+
+
+class UsageReadings(dict[str, StoredUsage]):
+    """Last good readings and the login last read from each tool directory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.directory_logins: dict[str, str] = {}
+
+
+def directory_key(tool: str, directory: str) -> str:
+    """Keep tool identities separate without folding case-sensitive paths."""
+    return f"{tool}:{directory}"
+
+
+def weekly_read_skip(usage: StoredUsage) -> StaleTokenSkip | NoWeeklyReadSkip:
+    """Decode the latest attempt's skip reason without inspecting display text."""
+    return StaleTokenSkip() if usage.get("weekly_read_skip") == "stale_token" else NoWeeklyReadSkip()
+
+
+def latest_read_outcome(usage: StoredUsage) -> UsageReadOutcome:
+    """Old stores have no failed attempt unless they hold the legacy stale-token flag."""
+    return usage.get("read_outcome", UsageReadOutcome.STALE_TOKEN
+                     if isinstance(weekly_read_skip(usage), StaleTokenSkip) else UsageReadOutcome.OK)
 
 
 def key(tool: str, login: str) -> str:
@@ -97,17 +127,21 @@ def _credits(value: object) -> StoredCredits | None:
     return StoredCredits(balance=balance, at=at)
 
 
-def load() -> dict[str, StoredUsage]:
+def load() -> UsageReadings:
     """Every login's stored readings, keyed by `key`. Empty when the file cannot be read."""
     try:
         decoded = cast(object, json.loads(store_file().read_text(encoding="utf-8")))
     except (OSError, ValueError):
-        return {}
+        return UsageReadings()
     if not isinstance(decoded, dict):
-        return {}
-    stored: dict[str, StoredUsage] = {}
+        return UsageReadings()
+    stored = UsageReadings()
+    links = cast(dict[str, object], decoded).get("_directory_logins")
+    if isinstance(links, dict):
+        stored.directory_logins.update({directory: login for directory, login in
+            cast(dict[str, object], links).items() if isinstance(login, str) and login})
     for login, value in cast(dict[str, object], decoded).items():
-        if not isinstance(value, dict):
+        if login == "_directory_logins" or not isinstance(value, dict):
             continue
         held = cast(dict[str, object], value)
         usage = StoredUsage()
@@ -117,6 +151,21 @@ def load() -> dict[str, StoredUsage]:
             usage["weekly"] = weekly
         if (credits := _credits(held.get("credits"))) is not None:
             usage["credits"] = credits
+        if held.get("weekly_read_skip") == "stale_token":
+            usage["weekly_read_skip"] = "stale_token"
+            directory = held.get("weekly_read_skip_directory")
+            if isinstance(directory, str):
+                usage["weekly_read_skip_directory"] = directory
+        if "read_outcome" in held:
+            try:
+                usage["read_outcome"] = UsageReadOutcome(held["read_outcome"])
+            except (ValueError, TypeError):
+                usage["read_outcome"] = UsageReadOutcome.ERROR
+        # Accept links from the first Phase 75 format, but write only the directory map.
+        directory = held.get("read_source_directory") or held.get("weekly_read_skip_directory")
+        if isinstance(directory, str):
+            tool = "Codex" if login.startswith("codex:") else "Claude"
+            _ = stored.directory_logins.setdefault(directory_key(tool, directory), login)
         stored[login] = usage
     return stored
 
@@ -132,18 +181,53 @@ def _read(quota: Quota, checked_at: datetime) -> StoredWindow | None:
     )
 
 
-def merge(stored: dict[str, StoredUsage], reports: list[Report], checked_at: datetime) -> bool:
-    """Put each reading the Claude and Codex reports hold into `stored`. A refused read changes nothing.
+def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) -> bool:
+    """Save the latest attempt outcome, preserving last good numbers and times on failure.
 
     Returns whether anything changed.
     """
     changed = False
     for report in reports:
+        if report.tool not in ("Claude", "Codex"):
+            continue
+        directory = (str(report.source.directory) if isinstance(report.source, ClaudeDirectorySource)
+                     else str(report.source.home) if isinstance(report.source, CodexHomeSource) else "")
+        source_key = directory_key(report.tool, directory)
+        login = key(report.tool, report.email) if report.email else ""
+        if directory:
+            if not login:
+                login = stored.directory_logins.get(source_key, "")
+                if not login and isinstance(report.last_known_login, KnownUsageLogin):
+                    login = key(report.tool, report.last_known_login.login)
+            if login and stored.directory_logins.get(source_key) != login:
+                stored.directory_logins[source_key] = login
+                changed = True
+        if not login:
+            continue
+        usage = stored.setdefault(login, StoredUsage())
+        if isinstance(report.weekly_read_skip, StaleTokenSkip):
+            usage = stored.setdefault(login, StoredUsage())
+            if "weekly_read_skip" not in usage:
+                usage["weekly_read_skip"] = "stale_token"
+                changed = True
+            if isinstance(report.source, ClaudeDirectorySource):
+                directory = str(report.source.directory)
+                if usage.get("weekly_read_skip_directory") != directory:
+                    usage["weekly_read_skip_directory"] = directory
+                    changed = True
+        elif login in stored and "weekly_read_skip" in stored[login]:
+            del stored[login]["weekly_read_skip"]
+            _ = stored[login].pop("weekly_read_skip_directory", None)
+            changed = True
         weekly_quota = next((quota for quota in report.quotas if quota.label == "Weekly"), None)
         weekly = _read(weekly_quota, checked_at) if weekly_quota is not None else None
-        if report.tool not in ("Claude", "Codex") or not report.email or weekly is None:
+        outcome = (UsageReadOutcome.OK if weekly is not None else UsageReadOutcome.STALE_TOKEN
+                   if isinstance(report.weekly_read_skip, StaleTokenSkip) else report.usage_read_outcome)
+        if usage.get("read_outcome") != outcome:
+            usage["read_outcome"] = outcome
+            changed = True
+        if weekly is None:
             continue
-        usage = stored.setdefault(key(report.tool, report.email), StoredUsage())
         usage["weekly"] = weekly
         if report.credit_balance is not None:
             usage["credits"] = StoredCredits(
@@ -164,7 +248,10 @@ def merge(stored: dict[str, StoredUsage], reports: list[Report], checked_at: dat
 
 def write(stored: dict[str, StoredUsage]) -> None:
     """Replace the store in one step, readable by this user only."""
-    _replace(store_file(), json.dumps(stored, indent=1, sort_keys=True) + "\n")
+    encoded: dict[str, object] = dict(stored)
+    if isinstance(stored, UsageReadings) and stored.directory_logins:
+        encoded["_directory_logins"] = stored.directory_logins
+    _replace(store_file(), json.dumps(encoded, indent=1, sort_keys=True) + "\n")
 
 
 def _label_window(window: StoredWindow) -> LabelWindow | None:

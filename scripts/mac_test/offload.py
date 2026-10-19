@@ -43,12 +43,10 @@ NonBusyMacDeclineReason = Literal[
     "state",
     "unreachable",
     "mac_busy",
-    "battery",
     "disk",
     "copy",
 ]
 MacDeclineReason = NonBusyMacDeclineReason | Literal["busy"]
-MacPower = Literal["ac", "battery"]
 
 
 @dataclass(frozen=True)
@@ -260,7 +258,6 @@ class OffloadRequest:
 class ProbeSnapshot:
     """Mac availability values returned by one remote probe."""
 
-    power: MacPower
     free_gib: float
     hostname: str
 
@@ -825,11 +822,9 @@ def probe_script(repository: KnownRepository) -> str:
     return "\n".join(
         (
             f'mkdir -p "$HOME"/{mirror} || exit 1',
-            "case \"$(pmset -g batt | head -1)\" in "
-            + "*\"AC Power\"*) power=ac ;; *) power=battery ;; esac",
             "free_gib=$(df -g \"$HOME\" | awk 'NR == 2 {print $4}')",
-            "printf 'power=%s\\nfree_gib=%s\\nhost=%s\\nrc=0\\n' "
-            + '"$power" "$free_gib" "$(hostname -s)"',
+            "printf 'free_gib=%s\\nhost=%s\\nrc=0\\n' "
+            + '"$free_gib" "$(hostname -s)"',
         )
     )
 
@@ -844,17 +839,12 @@ def parse_probe(output: str) -> ProbeResult:
         return UNAVAILABLE_PROBE
     try:
         free_gib = float(values["free_gib"])
-        power = values["power"]
         hostname = values["host"]
     except (KeyError, ValueError):
         return UNAVAILABLE_PROBE
-    if (
-        not math.isfinite(free_gib)
-        or power not in ("ac", "battery")
-        or not hostname
-    ):
+    if not math.isfinite(free_gib) or not hostname:
         return UNAVAILABLE_PROBE
-    return ProbeSnapshot(power, free_gib, hostname)
+    return ProbeSnapshot(free_gib, hostname)
 
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
@@ -1242,8 +1232,6 @@ def claimed_run(
         if isinstance(probe, UnavailableProbe):
             write_backoff(time.time() + config.unreachable_backoff_s)
             return declined("unreachable", started)
-        if probe.power == "battery":
-            return declined("battery", started)
         if probe.free_gib < config.free_floor_gib:
             return declined("disk", started)
 

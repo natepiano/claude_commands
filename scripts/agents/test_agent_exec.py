@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import shlex
 import sys
 import tempfile
 from typing import TypedDict, cast, override
@@ -107,26 +106,6 @@ class ClaudeLauncherTests(unittest.TestCase):
                                         env=self.environment, cwd=self.home)
                 output = log.read_text() if launcher == "exec" else result.stdout
                 self.assertEqual(json.loads(output.splitlines()[0]), {"config": "", "memory": "", "token": ""})
-
-    def test_all_style_stage_launch_functions_select_the_caller_or_showrunners_account(self) -> None:
-        for filename, function in (("style-eval-all.sh", "run_style_agent"),
-                                   ("style-eval-review-all.sh", "run_review_agent"),
-                                   ("style-fix-worktrees.sh", "run_style_agent")):
-            source = (SCRIPTS / "fix" / filename).read_text()
-            start = source.index(function + "() {")
-            definition = source[start:source.index("\n}\n", start) + 3]
-            for caller, expected in (("claude1", "claude1"), ("", "claude3")):
-                with self.subTest(stage=filename, caller=caller):
-                    log = self.home / "style.log"
-                    environment = {**self.environment, "SCRIPT_DIR": str(SCRIPTS / "fix"),
-                                   "STYLE_AGENT": "claude", "STYLE_AGENT_MODEL": "", "STYLE_AGENT_EFFORT": ""}
-                    if caller:
-                        environment["CLAUDE_CONFIG_DIR"] = str(accounts.account_dir(caller))
-                    command = definition + "\n" + shlex.join([function, str(self.home), "review", str(log)])
-                    _ = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=True,
-                                       env=environment, cwd=self.home)
-                    self.assertEqual(json.loads(log.read_text().splitlines()[0]), {
-                        "config": str(accounts.account_dir(expected)), "memory": str(self.home / ".claude"), "token": ""})
 
     def test_background_agent_selects_the_caller_or_showrunners_before_launching(self) -> None:
         prompt = self.home / "background-prompt"

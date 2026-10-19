@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Stop hook: scan the assistant's just-emitted message for banned words.
+"""Stop hook: log banned words in the assistant's just-emitted message.
 
-If found, block with a reason so the agent must rewrite before ending the turn.
-Honors `stop_hook_active` to avoid infinite loops.
+The hook never blocks the reply and never asks for a rewrite. For each banned
+word it appends one line to `PROSE_LOG` and bumps the local counters. It prints
+nothing. A failure to write the log or the counters does not fail the hook.
+
+Each log line has four tab-separated fields: the local time with its offset,
+the session id, the stem, and an excerpt of the line that holds the match. The
+hook writes one line per stem per text line.
+
+The hook does not read `stop_hook_active`. It never blocks, so it cannot cause
+a loop, and a turn that another Stop hook blocked must still be logged.
 
 The Stop event payload includes `last_assistant_message` — the full text of the
 turn that just ended. Use it directly. Reading from `transcript_path` would
@@ -12,22 +20,57 @@ yet, so the file scan returns an empty string and the hook silently passes.
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from user_zone import user_zone  # noqa: E402
 from banned_words_lib import (
+    PROSE_LOG,
+    Violation,
     bump_counters,
     find_violations,
-    format_counter_totals,
     hooks_enabled,
     is_guide_reproduction,
 )
 
+EXCERPT_LIMIT = 120
+
 
 class StopPayload(TypedDict, total=False):
     last_assistant_message: str
-    stop_hook_active: bool
+    session_id: str
+
+
+def excerpt(line: str, match: str) -> str:
+    """Return at most `EXCERPT_LIMIT` characters of `line` with `match` in view.
+
+    Each run of whitespace becomes one space, so the excerpt has no tab or
+    newline. A long line is cut to a window around the match.
+    """
+    text = " ".join(line.split())
+    if len(text) <= EXCERPT_LIMIT:
+        return text
+    needle = " ".join(match.split())
+    found = text.lower().find(needle.lower())
+    if found < 0:
+        return text[:EXCERPT_LIMIT]
+    margin = max(0, (EXCERPT_LIMIT - len(needle)) // 2)
+    start = max(0, min(found - margin, len(text) - EXCERPT_LIMIT))
+    return text[start : start + EXCERPT_LIMIT]
+
+
+def append_log(session_id: str, violations: list[Violation]) -> None:
+    """Append one tab-separated line per violation to `PROSE_LOG`."""
+    stamp = datetime.now(user_zone()).isoformat(timespec="seconds")
+    lines = "".join(
+        f"{stamp}\t{session_id}\t{v.stem}\t{excerpt(v.line, v.match)}\n" for v in violations
+    )
+    PROSE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with PROSE_LOG.open("a", encoding="utf-8") as log:
+        _ = log.write(lines)
 
 
 def main() -> None:
@@ -39,52 +82,35 @@ def main() -> None:
     except json.JSONDecodeError:
         sys.exit(0)
 
-    if data.get("stop_hook_active"):
-        sys.exit(0)
-
     text: str = data.get("last_assistant_message", "") or ""
     if not text:
         sys.exit(0)
 
-    violations = find_violations(text)
-    if not violations:
+    seen: set[tuple[str, int]] = set()
+    unique: list[Violation] = []
+    for v in find_violations(text):
+        key = (v.stem, v.line_no)
+        if key not in seen:
+            seen.add(key)
+            unique.append(v)
+    if not unique:
         sys.exit(0)
 
-    seen: set[tuple[str, int]] = set()
-    stems_in_order: list[str] = []
-    lines_by_stem: dict[str, list[int]] = {}
-    for v in violations:
-        key = (v.stem, v.line_no)
-        if key in seen:
-            continue
-        seen.add(key)
-        if v.stem not in stems_in_order:
-            stems_in_order.append(v.stem)
-            lines_by_stem[v.stem] = []
-        lines_by_stem[v.stem].append(v.line_no)
-
+    stems = list(dict.fromkeys(v.stem for v in unique))
     # Skip messages that reproduce the banned-word list/machinery (analysis
     # reports, mechanism explanations, echoes of the loaded guide) so a single
     # such message does not bump every counter at once.
-    if is_guide_reproduction(text, len(stems_in_order)):
+    if is_guide_reproduction(text, len(stems)):
         sys.exit(0)
 
-    bumped = bump_counters(stems_in_order)
-    parts = [
-        f"{stem} (line{'s' if len(lines_by_stem[stem]) > 1 else ''} {', '.join(str(n) for n in lines_by_stem[stem])})"
-        for stem in stems_in_order
-    ]
-    flagged = ", ".join(parts)
-    # A Stop hook has no model-only output channel — its only text fields are
-    # `reason`, `systemMessage`, and `stopReason`, and `reason` is shown to both
-    # the user and the model (there is no `hookSpecificOutput.additionalContext`
-    # for Stop; that field is rejected by the schema). So `reason` carries the
-    # short summary the user wants — which word fired and the running local
-    # totals — and the verbose re-emit protocol lives as a standing agent
-    # instruction (CLAUDE.md / the forbidden-words guide), not per-fire text.
-    reason = f"⛔ banned word(s): {flagged}. Local totals: {format_counter_totals(bumped)}"
-
-    print(json.dumps({"decision": "block", "reason": reason}))
+    try:
+        append_log(data.get("session_id", "") or "", unique)
+    except (OSError, ValueError):
+        pass
+    try:
+        _ = bump_counters(stems)
+    except OSError:
+        pass
 
 
 if __name__ == "__main__":

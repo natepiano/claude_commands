@@ -37,10 +37,12 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
+from collections.abc import Mapping
 from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
+from scripts.delegate import plan_history
 from scripts.message import process_table, sessions
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
@@ -145,6 +147,8 @@ CAPACITY = "Selected model is at capacity. Please try a different model."
 STALE_SIGN_IN = ("Your access token could not be refreshed because you have since logged out or signed in to "
                  "another account. Please sign in again.")
 THREAD_ID = "thread-capacity-test"
+WRITE_POLICY: dict[str, object] = {"type": "dangerFullAccess"}
+READ_ONLY_POLICY: dict[str, object] = {"type": "readOnly", "networkAccess": False}
 
 
 def running_holder(session_id: str) -> sessions.SessionRecord:
@@ -324,6 +328,11 @@ class StubServerShutdownTests(unittest.TestCase):
         self.assertEqual(server.close_writer.fileno(), -1)
 
 
+def reported_stopped_context(report: MagicMock, index: int = -1) -> codex_mesh.RefusalCommandContext:
+    return cast(codex_mesh.RefusalCommandContext, cast(object,
+        report.call_args_list[index].kwargs.get("stopped", codex_mesh.REFUSAL_WITHOUT_COMMAND_EXIT)))
+
+
 class MeshCommandTests(unittest.TestCase):
     """Exercise the launcher and addressable verbs against a local app-server."""
 
@@ -362,7 +371,9 @@ class MeshCommandTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
-        self.session_dir = Path(self.temporary.name)
+        # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
+        self.session_dir = Path(self.temporary.name).resolve() / "run"
+        self.session_dir.mkdir()
         _ = (self.session_dir / "prompt.txt").write_text("Original delegate task", encoding="utf-8")
         self.outcomes = []
         self.turn_starts = 0
@@ -981,9 +992,11 @@ class MeshCommandTests(unittest.TestCase):
             if request.get("method") == "thread/compact/start":
                 armed[0] = True
             return frames
+        path = self.session_dir / codex_mesh.ROSTER_FILE
         def acquire(descriptor: int, operation: int) -> None:
-            path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
-            if armed[0] and operation == fcntl.LOCK_EX and path.name == codex_mesh.ROSTER_FILE:
+            # Matched by inode, not /proc/self/fd, which macOS lacks.
+            locks_roster = path.exists() and os.path.samestat(os.fstat(descriptor), path.stat())
+            if armed[0] and operation == fcntl.LOCK_EX and locks_roster:
                 armed[0] = False
                 with path.open("r+") as other:
                     flock(other.fileno(), fcntl.LOCK_EX)
@@ -1638,7 +1651,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.methods("turn/start")[0]["params"], {
             "threadId": THREAD_ID,
             "input": [{"type": "text", "text": "Original delegate task"}],
-            "model": "gpt-test", "effort": "high",
+            "model": "gpt-test", "effort": "high", "sandboxPolicy": WRITE_POLICY,
         })
 
     def test_follow_cwd_is_parsed_into_the_turn_cwd_destination(self) -> None:
@@ -1799,7 +1812,7 @@ class MeshCommandTests(unittest.TestCase):
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
         })
 
-    def test_follow_cli_without_new_flags_keeps_the_original_turn_request(self) -> None:
+    def test_follow_cli_without_new_flags_sends_the_seat_write_policy(self) -> None:
         cases: list[tuple[list[str], dict[str, object]]] = [
             ([], {}),
             (["--model", "gpt-test", "--effort", "high"], {"model": "gpt-test", "effort": "high"}),
@@ -1817,6 +1830,7 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual(starts[0]["params"], {
                     "threadId": THREAD_ID,
                     "input": [{"type": "text", "text": "Review the second worktree"}],
+                    "sandboxPolicy": WRITE_POLICY,
                     **overrides,
                 })
 
@@ -1844,8 +1858,38 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual(starts[0]["params"], {
                     "threadId": THREAD_ID,
                     "input": [{"type": "text", "text": "Review the second worktree"}],
+                    "sandboxPolicy": WRITE_POLICY,
                     **overrides,
                 })
+
+    def test_follow_after_a_read_only_follow_restores_the_write_policy(self) -> None:
+        policies: list[object] = []
+        for options in (["--read-only"], []):
+            self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "test"}})
+            self.server.requests.clear()
+
+            code, _output, errors = self.run_mesh(self.follow_cli(*options))
+
+            self.assertEqual((code, errors), (0, ""))
+            starts = self.methods("turn/start")
+            self.assertEqual(len(starts), 1)
+            policies.append(_as_test_dict(starts[0]["params"]).get("sandboxPolicy"))
+        self.assertEqual(policies, [READ_ONLY_POLICY, WRITE_POLICY])
+
+    def test_follow_without_read_only_keeps_a_standing_reviewer_read_only(self) -> None:
+        instructions = self.session_dir / "standing.txt"
+        _ = instructions.write_text("Review only.", encoding="utf-8")
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review",
+            "instructions_file": str(instructions),
+        }})
+
+        code, _output, errors = self.run_mesh(self.follow_cli())
+
+        self.assertEqual((code, errors), (0, ""))
+        starts = self.methods("turn/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(_as_test_dict(starts[0]["params"]).get("sandboxPolicy"), READ_ONLY_POLICY)
 
     def test_pool_verbs_report_server_failures_with_the_destination_name(self) -> None:
         cases = [
@@ -1880,6 +1924,170 @@ class MeshCommandTests(unittest.TestCase):
         code, errors = self.run_follow()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(ports, [self.server.port])
+
+    def test_paused_seat_can_be_claimed_and_followed_on_its_original_thread(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "paused", "role": "impl",
+            "paused_from": "running", "paused_turn": True,
+        }})
+        code, _output, errors = self.run_mesh(["can-follow", "--to", "worker", "--role", "impl"])
+        self.assertEqual((code, errors), (0, ""))
+        code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        record = self.worker_record()
+        self.assertEqual(record["thread_id"], THREAD_ID)
+        self.assertEqual(record["status"], "done")
+        self.assertNotIn("paused_from", record)
+        self.assertNotIn("paused_turn", record)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual([request["params"] for request in self.methods("thread/resume")],
+                         [{"threadId": THREAD_ID}])
+
+    def test_reopen_recovers_an_ended_thread_and_follow_resumes_it(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "ended", "role": "impl",
+            "launcher_pid": 99999999,
+        }})
+        marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
+        marker.touch()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.worker_record()["status"], "paused")
+        self.assertEqual(self.worker_record()["paused_from"], "ended")
+        self.assertIs(self.worker_record()["paused_turn"], False)
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)):
+            code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(len(self.methods("thread/resume")), 1)
+
+    def test_reopen_leaves_a_finished_runs_seat_ended(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "ended", "role": "impl",
+            "launcher_pid": 99999999,
+        }})
+        marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
+        marker.touch()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        state_path = self.session_dir / plan_history.STATE_FILENAME
+        _ = state_path.write_text(json.dumps({"status": "completed", "finished_at": 1760658000}))
+        before = self.roster()
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "skipped run: run finished (completed); worker stays ended\n")
+        self.assertEqual(self.roster(), before)
+        self.assertTrue(marker.exists())
+
+        _ = state_path.write_text(json.dumps({"status": "active"}))
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+        self.assertEqual(self.worker_record()["status"], "paused")
+        self.assertFalse(marker.exists())
+
+    def test_reopen_refuses_missing_thread_or_live_launcher_without_mutation(self) -> None:
+        for fields in ({"launcher_pid": os.getpid(), "thread_id": THREAD_ID},
+                       {"launcher_pid": 99999999}):
+            with self.subTest(fields=fields):
+                self.write_pool_roster({"worker": {"status": "ended", **fields}})
+                marker = codex_mesh._end_marker_path(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
+                marker.touch()
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertIn("worker", errors)
+                self.assertEqual(self.roster(), before)
+                self.assertTrue(marker.exists())
+
+    def test_reopen_recovers_orphaned_active_seats_only_after_the_server_is_gone(self) -> None:
+        for status in ("running", "starting"):
+            with self.subTest(status=status):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": status, "role": "impl",
+                    "turn_id": "interrupted-turn", "launcher_pid": 99999999,
+                }})
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertEqual(self.roster(), before)
+
+                server_record = self.session_dir / codex_mesh.SERVER_FILE
+                saved_server = server_record.read_text()
+                server_record.unlink()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+                self.assertEqual(self.worker_record()["status"], "paused")
+                self.assertEqual(self.worker_record()["paused_from"], status)
+                self.assertIs(self.worker_record()["paused_turn"], True)
+                resumes_before = len(self.methods("thread/resume"))
+                with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)):
+                    code, errors = self.run_follow()
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+                self.assertEqual(len(self.methods("thread/resume")), resumes_before + 1)
+                self.assertEqual(self.methods("thread/start"), [])
+                _ = server_record.write_text(saved_server)
+
+    def test_reopen_accepts_ended_seat_without_launcher_and_refuses_live_orphans(self) -> None:
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "ended"}})
+        code, _output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["status"], "paused")
+        for status in ("running", "starting"):
+            with self.subTest(status=status):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": status,
+                    "turn_id": "live-turn", "launcher_pid": os.getpid(),
+                }})
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertEqual(self.roster(), before)
+
+    def test_reopen_checks_the_seats_server_port_when_another_server_is_alive(self) -> None:
+        old_port = self.server.port + 1
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "running", "role": "impl",
+            "turn_id": "interrupted-turn", "launcher_pid": 99999999, "port": old_port,
+        }})
+        _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({
+            "servers": [{"pid": 99999999, "port": old_port}],
+        }))
+        code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output, "reopened worker; send its next turn with --to worker\n")
+        self.assertEqual(self.worker_record()["status"], "paused")
+        self.assertIs(self.worker_record()["paused_turn"], True)
+        self.assertTrue((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_reopen_refuses_a_live_retired_server_on_the_workers_port(self) -> None:
+        retired_path = self.session_dir / codex_mesh.RETIRED_FILE
+        _ = retired_path.write_text(json.dumps({
+            "servers": [{"pid": os.getpid(), "port": self.server.port}],
+        }))
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        for status in ("running", "starting"):
+            with self.subTest(status=status):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": status,
+                    "turn_id": "interrupted-turn", "launcher_pid": 99999999,
+                    "port": self.server.port,
+                }})
+                before = self.roster()
+                code, output, errors = self.run_mesh(["reopen", "--to", "worker"])
+                self.assertEqual((code, output), (2, ""))
+                self.assertEqual(len(errors.splitlines()), 1)
+                self.assertEqual(self.roster(), before)
+                self.assertTrue(retired_path.exists())
 
     def test_follow_reuses_a_done_thread_and_records_its_new_turn(self) -> None:
         code, errors = self.run_start()
@@ -2631,6 +2839,370 @@ class MeshCommandTests(unittest.TestCase):
         finally:
             client.close()
 
+    def assert_routing_then_exited_handoff(self, report: MagicMock) -> None:
+        self.assertEqual(report.call_count, 2)
+        self.assertIsInstance(reported_stopped_context(report, 0),
+                              codex_mesh.RefusalWithoutCommandExit)
+        stopped = reported_stopped_context(report, 1)
+        self.assertIsInstance(stopped, codex_mesh.CommandStoppedOnThread)
+        assert isinstance(stopped, codex_mesh.CommandStoppedOnThread)
+        self.assertEqual(stopped.session_dir, str(self.session_dir))
+
+    def prepare_stream_refusal_wait(self) -> agent_accounts.KnownCodexAccount:
+        source = self.prepare_refusing_account()
+        self.start_args_timeout = 2.0
+        original = self.respond
+        self.server.respond = lambda request: (self.quota_completion(request)
+            if request.get("method") == "turn/start" else original(request))
+        return source
+
+    def save_unresolved_refusal(self, source: agent_accounts.KnownCodexAccount) -> None:
+        now = datetime.now(timezone.utc)
+        refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
+            refusals.KnownWindow("five_hour"), refusals.KnownReset(now + timedelta(minutes=10)), now))
+
+    def assert_finished_quota_continuation_has_no_rerun(self, later_failure: str) -> None:
+        source = self.prepare_refusing_account()
+        self.start_args_timeout = 2.0
+        original = self.respond
+        commands: list[list[str]] = []
+        submissions = 0
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal submissions
+            if request.get("method") == "turn/start":
+                submissions += 1
+                if submissions == 1:
+                    return self.quota_completion(request)
+                if later_failure == "disconnect":
+                    self.server.close_after_turn_start = True
+                frames = original(request)
+                assert frames is not None
+                frames.insert(-1, _notice("item/completed", {"threadId": THREAD_ID,
+                    "turnId": "turn-1", "item": {"type": "agentMessage", "text": "recovered task finished"}}))
+                if later_failure == "capacity":
+                    frames += [
+                        _notice("turn/started", {"threadId": THREAD_ID, "turn": {"id": "later-task"}}),
+                        _notice("turn/completed", {"threadId": THREAD_ID,
+                            "turn": {"id": "later-task", "error": {"message": CAPACITY}}}),
+                    ]
+                return frames
+            return original(request)
+
+        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
+            commands.append(command)
+            # The quota handler has routed the refusal; its short wait has now expired.
+            now = datetime.now(timezone.utc)
+            refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
+                refusals.KnownWindow("five_hour"), refusals.KnownReset(now - timedelta(seconds=1)),
+                now - timedelta(minutes=19)))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.server.respond = respond
+        args = self.start_args()
+        args.resident = True
+        with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
+              patch.object(codex_mesh, "_launcher_sessions", return_value=()),
+              patch.object(codex_mesh, "CAPACITY_BUDGET_SECS", 0),
+              patch.object(subprocess, "run", side_effect=report),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            code = codex_mesh.command_start(args)
+        self.assertEqual(code, 1, errors.getvalue())
+        self.assertEqual(submissions, 2)
+        self.assertEqual(self.turn_inputs, ["Continue where you stopped."])
+        self.assertIn("recovered task finished", (self.session_dir / "worker.log").read_text())
+        self.assertEqual(len(commands), 1, commands)
+        self.assertFalse(any("--stopped" in command for command in commands))
+        self.assertIs(self.worker_record().get("continuation_owed"), False)
+        if later_failure == "timeout":
+            self.assertIn("no turn/completed within", errors.getvalue())
+        elif later_failure == "capacity":
+            self.assertEqual(self.worker_record()["status"], codex_mesh.CAPACITY_EXHAUSTED)
+            self.assertIn("capacity", errors.getvalue())
+        else:
+            self.assertEqual(self.worker_record()["status"], "failed")
+            self.assertTrue(errors.getvalue().strip())
+
+    def test_finished_quota_continuation_then_disconnect_sends_no_rerun(self) -> None:
+        self.assert_finished_quota_continuation_has_no_rerun("disconnect")
+
+    def test_finished_quota_continuation_then_timeout_sends_no_rerun(self) -> None:
+        self.assert_finished_quota_continuation_has_no_rerun("timeout")
+
+    def test_finished_quota_continuation_then_capacity_exhaustion_sends_no_rerun(self) -> None:
+        self.assert_finished_quota_continuation_has_no_rerun("capacity")
+
+    def assert_retried_quota_continuation_timeout(self, *, continuation_completed: bool) -> None:
+        source = self.prepare_refusing_account()
+        self.start_args_timeout = 2.0
+        original = self.respond
+        commands: list[list[str]] = []
+        recovery_reads: list[dict[str, object]] = []
+        submissions = 0
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal submissions
+            if request.get("method") == "turn/start":
+                submissions += 1
+                if submissions == 1:
+                    if continuation_completed:
+                        return self.quota_completion(request)
+                    return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+                self.outcomes = ["disconnect"]  # Accept the turn without a completion notification.
+                frames = original(request)
+                assert frames is not None
+                if continuation_completed:
+                    frames.append(_notice("item/completed", {"threadId": THREAD_ID,
+                        "turnId": "turn-1", "item": {
+                            "type": "agentMessage", "text": "recovered task finished without notification"}}))
+                else:
+                    self.live_turn = "turn-1"
+                return frames
+            if request.get("method") == "thread/read" and submissions == 2:
+                params = cast(dict[str, object], request["params"])
+                recovery_reads.append(params)
+                return [_reply(request, {"thread": {"id": THREAD_ID,
+                    "status": {"type": "idle" if continuation_completed else "active"},
+                    "turns": [{"id": "turn-1",
+                               "status": "completed" if continuation_completed else "inProgress"}]}})]
+            return original(request)
+
+        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
+            commands.append(command)
+            now = datetime.now(timezone.utc)
+            refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
+                refusals.KnownWindow("five_hour"), refusals.KnownReset(now - timedelta(seconds=1)),
+                now - timedelta(minutes=19)))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.server.respond = respond
+        args = self.start_args()
+        args.resident = True
+        with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
+              patch.object(codex_mesh, "_launcher_sessions", return_value=()),
+              patch.object(subprocess, "run", side_effect=report),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            code = codex_mesh.command_start(args)
+        self.assertEqual(code, 1, errors.getvalue())
+        self.assertIn("no turn/completed within", errors.getvalue())
+        self.assertEqual(submissions, 2)
+        self.assertEqual(self.turn_inputs, ["Continue where you stopped."])
+        handoffs = [command for command in commands if "--stopped" in command]
+        self.assertEqual(len(handoffs), 0 if continuation_completed else 1)
+        self.assertEqual(len(commands), 1 if continuation_completed else 2)
+        self.assertEqual(self.worker_record()["status"], "failed")
+        self.assertIs(self.worker_record().get("continuation_owed"), False)
+        if continuation_completed:
+            self.assertTrue(any(read.get("includeTurns") is True for read in recovery_reads))
+            self.assertIn("recovered task finished without notification",
+                          (self.session_dir / "worker.log").read_text())
+        else:
+            self.assertEqual(handoffs[0][handoffs[0].index("--stopped") + 1:],
+                             ["own-director", "worker", shlex.join(sys.argv)])
+
+    def test_idle_completed_quota_continuation_without_notification_then_timeout_sends_no_rerun(self) -> None:
+        self.assert_retried_quota_continuation_timeout(continuation_completed=True)
+
+    def test_submission_retry_continuation_still_live_at_timeout_sends_one_rerun(self) -> None:
+        self.assert_retried_quota_continuation_timeout(continuation_completed=False)
+
+    def test_failed_quota_continuation_then_completed_held_message_still_sends_one_rerun(self) -> None:
+        source = self.prepare_refusing_account()
+        self.start_args_timeout = 2.0
+        original = self.respond
+        deliver = codex_mesh._deliver_reply  # pyright: ignore[reportPrivateUsage]
+        commands: list[list[str]] = []
+        delivered: list[tuple[int, str]] = []
+        submissions = 0
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            nonlocal submissions
+            if request.get("method") == "turn/start":
+                submissions += 1
+                if submissions == 1:
+                    return self.quota_completion(request)
+                if submissions == 2:
+                    self.outcomes = ["failed"]
+            return original(request)
+
+        def reply(name: str, index: int, text: str, failure: str, summary_path: Path,
+                  reply_path: Path | None, log: TextIO) -> None:
+            deliver(name, index, text, failure, summary_path, reply_path, log)
+            delivered.append((index, failure))
+            if index == 2:
+                # Queue only after the accepted continuation has failed and released its submission lock.
+                _ = (self.session_dir / "worker.pending.json").write_text(json.dumps({
+                    "thread_id": THREAD_ID, "messages": ["Report the current date only"],
+                    "accepting_messages": True}))
+
+        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
+            commands.append(command)
+            now = datetime.now(timezone.utc)
+            refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
+                refusals.KnownWindow("five_hour"), refusals.KnownReset(now - timedelta(seconds=1)),
+                now - timedelta(minutes=19)))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.server.respond = respond
+        args = self.start_args()
+        args.resident = True
+        with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
+              patch.object(codex_mesh, "_launcher_sessions", return_value=()),
+              patch.object(codex_mesh, "_deliver_reply", side_effect=reply),
+              patch.object(subprocess, "run", side_effect=report),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            code = codex_mesh.command_start(args)
+        self.assertEqual(code, 1, errors.getvalue())
+        self.assertIn("no turn/completed within", errors.getvalue())
+        self.assertEqual(submissions, 3)
+        self.assertEqual(self.turn_inputs, ["Continue where you stopped.", "Report the current date only"])
+        self.assertIn((2, "ordinary failure"), delivered)
+        self.assertIn((3, ""), delivered)
+        handoffs = [command for command in commands if "--stopped" in command]
+        self.assertEqual(len(handoffs), 1, commands)
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(handoffs[0][handoffs[0].index("--stopped") + 1:],
+                         ["own-director", "worker", shlex.join(sys.argv)])
+        self.assertEqual(self.worker_record()["status"], "failed")
+        self.assertIs(self.worker_record().get("continuation_owed"), False)
+
+    def test_stream_refusal_timeout_hands_one_rerun_to_its_director_and_clears_continuation(self) -> None:
+        source = self.prepare_stream_refusal_wait()
+        commands: list[list[str]] = []
+
+        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
+            self.save_unresolved_refusal(source)
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
+              patch.object(codex_mesh, "_launcher_sessions", return_value=()),
+              patch.object(subprocess, "run", side_effect=report)):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1)
+        self.assertIn("no turn/completed within", errors)
+        handoffs = [command for command in commands if "--stopped" in command]
+        self.assertEqual(len(handoffs), 1)
+        self.assertEqual(handoffs[0][handoffs[0].index("--stopped") + 1:][:2], ["own-director", "worker"])
+        self.assertIs(self.worker_record().get("continuation_owed"), False)
+        self.assertEqual(self.worker_record()["status"], "failed")
+        self.assertEqual(len(self.methods("turn/start")), 1)
+
+    def test_replacement_thread_refusal_timeout_hands_one_rerun_to_its_director_and_clears_continuation(self) -> None:
+        target, replacement = self.prepare_workers_move()
+        self.start_args_timeout = 2.0
+        original = self.respond
+        commands: list[list[str]] = []
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/resume":
+                return [{"id": request["id"], "error": {"message": "thread cannot resume"}}]
+            if request.get("method") == "turn/start":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            return original(request)
+
+        def move_after_capacity_refusal(seconds: float) -> None:
+            self.wait(seconds)
+            self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+            self.next_thread_id = "replacement-thread"
+
+        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
+            self.assertEqual(Path(command[3]), target)
+            self.save_unresolved_refusal(agent_accounts.KnownCodexAccount(target, command[4], command[5]))
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        replacement.respond = respond
+        self.outcomes = ["capacity"]
+        with (patch.object(codex_mesh, "_capacity_sleep", side_effect=move_after_capacity_refusal),
+              patch.object(codex_mesh, "_stop_unused_with_lock_held", return_value=False),
+              patch.object(codex_mesh, "_post_board_status"),
+              patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
+              patch.object(codex_mesh, "_launcher_sessions", return_value=()),
+              patch.object(subprocess, "run", side_effect=report)):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1)
+        self.assertIn("replacement-thread: still live at the timeout", errors)
+        handoffs = [command for command in commands if "--stopped" in command]
+        self.assertEqual(len(handoffs), 1)
+        self.assertEqual(handoffs[0][handoffs[0].index("--stopped") + 1:],
+                         ["own-director", "worker", shlex.join(sys.argv)])
+        self.assertEqual(self.worker_record()["thread_id"], "replacement-thread")
+        self.assertIs(self.worker_record().get("continuation_owed"), False)
+        self.assertEqual(self.worker_record()["status"], "failed")
+        self.assertNotIn("launcher_pid", self.worker_record())
+        self.assertEqual([request["method"] for request in replacement.requests
+                          if request["method"] in ("thread/resume", "thread/start", "turn/start")],
+                         ["thread/resume", "thread/start", "turn/start"])
+
+    def test_markerless_stream_exit_keeps_its_launcher_director_after_the_failed_roster_write(self) -> None:
+        source = self.prepare_stream_refusal_wait()
+        launcher_pid, director_pid = os.getpid(), 700
+        table = {
+            launcher_pid: process_table.Process(launcher_pid, director_pid, "python3", "python3 codex_mesh.py start"),
+            director_pid: process_table.Process(director_pid, 1, "claude", "claude"),
+        }
+        director = sessions.SessionRecord(pid=director_pid, sessionId="launcher-director", name="director",
+            procStart="fixture-start", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        handoffs: list[list[str]] = []
+        routing_reports: list[list[str]] = []
+
+        def alive(pid: int) -> bool:
+            return pid in table
+
+        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
+            self.save_unresolved_refusal(source)
+            if "--stopped" in command:
+                self.assertEqual(self.worker_record()["status"], "failed")
+                self.assertNotIn("launcher_pid", self.worker_record())
+                handoffs.append(command[command.index("--stopped") + 1:])
+            else:
+                routing_reports.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (patch.object(codex_mesh, "_marker_sessions", return_value=[]),
+              patch.object(codex_mesh, "_pid_alive", side_effect=alive),
+              patch.object(process_table, "snapshot", return_value=table) as snapshot,
+              patch.object(sessions, "running_sessions", return_value=[director]),
+              patch.object(sessions, "process_start", return_value="fixture-start"),
+              patch.object(subprocess, "run", side_effect=report)):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1, errors)
+        snapshot.assert_called()
+        self.assertEqual(len(routing_reports), 1, errors)
+        self.assertEqual([handoff[:2] for handoff in handoffs], [["launcher-director", "worker"]])
+        self.assertIs(self.worker_record().get("continuation_owed"), False)
+
+    def test_old_command_exit_leaves_a_replacement_workers_thread_and_continuation_untouched(self) -> None:
+        source = self.prepare_refusing_account()
+        serving = codex_mesh.ServingCodexServer(self.server.port, os.getpid(), source.home, source, True)
+        replacement: dict[str, object] = {"thread_id": "replacement-thread", "status": "running",
+            "continuation_owed": True, "launcher_pid": 12345, "port": 4002}
+
+        def finish_old(_args: argparse.Namespace, _port: int, *, started_here: bool) -> codex_mesh.FailedWithThread:
+            self.assertTrue(started_here)
+            self.write_pool_roster({"worker": replacement})
+            return codex_mesh.FailedWithThread(THREAD_ID, USAGE_LIMIT, 10, serving, True, True,
+                pending_refusal=codex_mesh.PendingQuotaRefusal(serving, USAGE_LIMIT),
+                director=codex_mesh.KnownWorkerDirector("old-director"))
+
+        with (patch.object(codex_mesh, "_run_delegate", side_effect=finish_old),
+              patch.object(codex_mesh, "_marker_sessions", return_value=["old-director"]),
+              patch.object(codex_mesh, "_launcher_sessions", return_value=()),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as report):
+            code, errors = self.run_start()
+        self.assertEqual(code, 1, errors)
+        self.assertEqual(self.worker_record(), replacement)
+        report.assert_called_once()
+        command = cast(list[str], report.call_args.args[0])
+        self.assertEqual(command[command.index("--stopped") + 1:][:2], ["old-director", "worker"])
+
     def test_refusal_without_a_server_record_retains_an_unknown_account_at_the_selected_home(self) -> None:
         account = self.prepare_refusing_account()
         (self.session_dir / codex_mesh.SERVER_FILE).unlink()
@@ -2640,7 +3212,7 @@ class MeshCommandTests(unittest.TestCase):
         self.server.respond = respond
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_start()[0], 1)
-        report.assert_called_once()
+        self.assert_routing_then_exited_handoff(report)
         serving = cast(codex_mesh.CodexServingState, cast(object, report.call_args.args[1]))
         self.assertIsInstance(serving, codex_mesh.NotBoundCodexServer)
         self.assertIsInstance(serving.account, agent_accounts.UnknownCodexAccount)
@@ -2666,7 +3238,8 @@ class MeshCommandTests(unittest.TestCase):
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             code, _errors = self.run_start()
         self.assertEqual(code, 1)
-        report.assert_called_once()
+        self.assert_routing_then_exited_handoff(report)
+        self.assertEqual(cast(codex_mesh.CommandStoppedBeforeThread | codex_mesh.CommandStoppedOnThread, reported_stopped_context(report)).session_dir, str(self.session_dir))
         serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
         self.assertEqual(serving.account, account)
         self.assertEqual((serving.port, serving.pid, serving.home), (self.server.port, os.getpid(), account.home))
@@ -2691,7 +3264,7 @@ class MeshCommandTests(unittest.TestCase):
         self.server.respond = respond
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_start()[0], 1)
-        report.assert_called_once()
+        self.assert_routing_then_exited_handoff(report)
         self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
         self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).pid, os.getpid())
         self.assertEqual(agent_accounts.workers_home(), next_home)
@@ -2706,9 +3279,12 @@ class MeshCommandTests(unittest.TestCase):
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_follow()[0], 1)
         report.assert_called_once()
+        self.assertIsInstance(reported_stopped_context(report),
+                              codex_mesh.RefusalWithoutCommandExit)
+        self.assertTrue(self.worker_record().get("continuation_owed"))
         self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
 
-    def test_parked_message_turn_reports_its_refusing_account_once(self) -> None:
+    def test_parked_message_refusal_routes_then_hands_the_exited_command_back(self) -> None:
         account = self.prepare_refusing_account()
         original = self.respond
         starts = [0]
@@ -2735,13 +3311,30 @@ class MeshCommandTests(unittest.TestCase):
         args.timeout = 1
         with patch.object(codex_mesh.Client, "next_frame", park), \
                 patch.object(codex_mesh, "_report_quota_refusal") as report, contextlib.redirect_stderr(io.StringIO()):
-            _ = codex_mesh.command_start(args)
+            code = codex_mesh.command_start(args)
+        self.assertEqual(code, 1)
         self.assertEqual(starts[0], 2)
-        report.assert_called_once()
+        self.assert_routing_then_exited_handoff(report)
+        self.assertEqual(cast(codex_mesh.CommandStoppedOnThread, reported_stopped_context(report)).thread_id, THREAD_ID)
         self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
         self.assertIn("Parked task", str(self.methods("turn/start")[1]))
 
-    def test_submission_refusal_reports_the_serving_account_once(self) -> None:
+    def test_thread_start_refusal_reports_the_exited_command_context(self) -> None:
+        account = self.prepare_refusing_account()
+        original = self.respond
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/start":
+                return [{"id": request["id"], "error": {"message": USAGE_LIMIT}}]
+            return original(request)
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_report_quota_refusal") as report:
+            self.assertEqual(self.run_start()[0], 1)
+        report.assert_called_once()
+        self.assertIsInstance(reported_stopped_context(report), codex_mesh.CommandStoppedBeforeThread)
+        self.assertEqual(cast(codex_mesh.CommandStoppedBeforeThread | codex_mesh.CommandStoppedOnThread, reported_stopped_context(report)).session_dir, str(self.session_dir))
+        self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
+
+    def test_submission_refusal_routes_then_reports_the_exited_command(self) -> None:
         account = self.prepare_refusing_account()
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -2751,7 +3344,7 @@ class MeshCommandTests(unittest.TestCase):
         self.server.respond = respond
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_start()[0], 1)
-        report.assert_called_once()
+        self.assert_routing_then_exited_handoff(report)
         self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
 
     def test_failed_fork_preserves_the_account_without_reporting_a_turn_refusal(self) -> None:
@@ -2793,7 +3386,7 @@ class MeshCommandTests(unittest.TestCase):
         self.server.respond = respond
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_start()[0], 1)
-        report.assert_called_once()
+        self.assert_routing_then_exited_handoff(report)
         unknown = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account
         self.assertIsInstance(unknown, agent_accounts.UnknownCodexAccount)
         self.assertEqual(unknown.home, account.home)
@@ -2816,7 +3409,7 @@ class MeshCommandTests(unittest.TestCase):
         with patch.object(codex_mesh, "_capacity_sleep", side_effect=wait), \
                 patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_start()[0], 1)
-        report.assert_called_once()
+        self.assert_routing_then_exited_handoff(report)
         serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
         self.assertEqual(serving.home, target)
         self.assertIsInstance(serving.account, agent_accounts.KnownCodexAccount)
@@ -3057,6 +3650,38 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_swap_resumes_socketless_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=False, ended_run=True)
+
+    def test_account_move_between_marker_read_and_idle_check_resumes_same_thread(self) -> None:
+        target, new = self.prepare_running_account_swap()
+        self.server.hold_turn_completion = False
+        interrupted = False
+
+        def interrupt_after_marker_read(session_dir: str, name: str, thread_id: str) -> bool:
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                self.assertEqual(thread_id, THREAD_ID)
+                self.assertEqual(self.live_turn, "turn-1")
+                self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+                self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+                self.assertEqual(agent_accounts.workers_home(), target)
+                move = codex_mesh._interrupt_worker_for_account_move(  # pyright: ignore[reportPrivateUsage]
+                    session_dir, name, self.worker_record(), self.server.port, "codex1")
+                self.assertIsInstance(move, codex_mesh.InterruptedWorkerMove)
+                self.assertEqual(self.live_turn, "")
+            return False
+
+        with (patch.object(codex_mesh, "_waiting_on_detached_run", side_effect=interrupt_after_marker_read),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            code, errors = self.run_start()
+
+        self.assertTrue(interrupted)
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_account_move_continuation(new)
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertNotIn("idle with no completion notice", output.getvalue() + errors)
+        self.assertNotIn("no completion notice arrived", (self.session_dir / "worker.log").read_text())
 
     def test_sign_in_change_resumes_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=True, ended_run=True)
@@ -3450,6 +4075,8 @@ class MeshCommandTests(unittest.TestCase):
             outcome = codex_mesh._run_delegate(args, self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         report.assert_called_once()
+        self.assertIsInstance(reported_stopped_context(report),
+                              codex_mesh.RefusalWithoutCommandExit)
         starts = [request for request in new.requests if request.get("method") == "turn/start"]
         self.assertEqual(len(self.methods("turn/start")), 1)
         self.assertEqual(len(starts), 1)
@@ -3537,7 +4164,9 @@ class MeshCommandTests(unittest.TestCase):
                 "port": server.port, "pid": os.getpid(), "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
             }))
             return server.port
-        def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str) -> None:
+        def move_on_refusal(_name: str, serving: codex_mesh.CodexServingState, _detail: str, *,
+                            stopped: codex_mesh.RefusalCommandContext = codex_mesh.REFUSAL_WITHOUT_COMMAND_EXIT) -> None:
+            self.assertIsInstance(stopped, codex_mesh.RefusalWithoutCommandExit)
             next_label = "codex1" if serving.home != target else "codex2"
             self.request_workers_move(agent_accounts.codex_home_role_label(serving.home), next_label,
                                    "move-to-" + next_label)
@@ -3550,6 +4179,8 @@ class MeshCommandTests(unittest.TestCase):
             outcome = codex_mesh._run_delegate(self.start_args(), self.server.port, started_here=True)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(report.call_count, 2)
+        self.assertTrue(all(isinstance(call.kwargs.get("stopped", codex_mesh.REFUSAL_WITHOUT_COMMAND_EXIT),
+                                       codex_mesh.RefusalWithoutCommandExit) for call in report.call_args_list))
         final_starts = [request for request in recovered.requests if request.get("method") == "turn/start"]
         self.assertEqual(len(final_starts), 1)
         inputs = cast(list[dict[str, object]], cast(dict[str, object], final_starts[0]["params"])["input"])
@@ -3620,7 +4251,7 @@ class MeshCommandTests(unittest.TestCase):
         target, new = self.prepare_workers_move()
         stamp = datetime.now(timezone.utc).isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", cause="refusal", moved=["delegate"]))
+            fallback_at=stamp, owner="codex1", cause="refusal", why="Codex refused work for quota", moved=["delegate"]))
         self.request_workers_move("codex9", "codex1", "pending-among-routing")
         moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
             fallback_at=stamp, owner="codex1", restored=["delegate"], kept=[]))
@@ -3756,6 +4387,8 @@ class MeshCommandTests(unittest.TestCase):
             code, _errors = self.run_start()
         self.assertEqual(code, 0)
         report.assert_called_once()
+        self.assertIsInstance(reported_stopped_context(report),
+                              codex_mesh.RefusalWithoutCommandExit)
         self.assertEqual(len(self.methods("turn/start")), 2)
         self.assertEqual(self.turn_inputs, ["Continue where you stopped."])
         entries = moves.read_moves()
@@ -4629,6 +5262,66 @@ class MeshCommandTests(unittest.TestCase):
         self.assertIn("timed out", errors)
         self.assertEqual(self.methods("thread/start"), [])
 
+    def test_stop_pause_interrupts_live_work_drops_messages_and_preserves_threads(self) -> None:
+        entries: dict[str, object] = {
+            "working": {"thread_id": THREAD_ID, "status": "running", "turn_id": "live-turn", "role": "impl"},
+            "idle": {"thread_id": "idle-thread", "status": "done", "role": "review"},
+            "ended": {"thread_id": "ended-thread", "status": "ended", "role": "impl"},
+        }
+        self.write_pool_roster(entries)
+        self.live_turn = "live-turn"
+        self.thread_statuses["idle-thread"] = "idle"
+        self.queued = [{"id": "queued-task"}]
+        ended_marker = codex_mesh._end_marker_path(str(self.session_dir), "ended")  # pyright: ignore[reportPrivateUsage]
+        ended_marker.touch()
+        with patch.object(codex_mesh, "_reap") as reap:
+            code, _output, errors = self.run_mesh(["stop", "--pause"])
+        self.assertEqual((code, errors), (0, ""))
+        reap.assert_called_once_with(os.getpid())
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+        roster = self.roster()
+        for seat, previous, live in (("working", "running", True), ("idle", "done", False)):
+            paused = cast(dict[str, object], roster[seat])
+            self.assertEqual(paused["status"], "paused")
+            self.assertEqual(paused["paused_from"], previous)
+            self.assertIs(paused["paused_turn"], live)
+            self.assertFalse(codex_mesh._end_marker_path(str(self.session_dir), seat).exists())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(cast(dict[str, object], roster["working"])["thread_id"], THREAD_ID)
+        self.assertEqual(roster["ended"], entries["ended"])
+        self.assertTrue(ended_marker.exists())
+        self.assertEqual(self.queued, [])
+        interrupts = self.methods("turn/interrupt")
+        self.assertEqual(len(interrupts), 1)
+        self.assertEqual(cast(dict[str, object], interrupts[0]["params"]), {"threadId": THREAD_ID, "turnId": "live-turn"})
+
+    def test_launcher_completion_after_pause_cannot_overwrite_resume_metadata(self) -> None:
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "running", "role": "impl", "turn_id": "live-turn",
+        }})
+        self.live_turn = "live-turn"
+        with patch.object(codex_mesh, "_reap"):
+            code, _output, errors = self.run_mesh(["stop", "--pause"])
+        self.assertEqual((code, errors), (0, ""))
+        # An interrupted launcher's final completion/failure writes arrive after stop.
+        late_records: list[codex_mesh.FollowableRecord] = [
+            {"thread_id": THREAD_ID, "status": "done"},
+            {"thread_id": THREAD_ID, "status": "failed"},
+        ]
+        for late_record in late_records:
+            codex_mesh._update_roster(str(self.session_dir), "worker", late_record)  # pyright: ignore[reportPrivateUsage]
+            entry = self.worker_record()
+            self.assertEqual(entry["status"], "paused")
+            self.assertEqual(entry["paused_from"], "running")
+            self.assertIs(entry["paused_turn"], True)
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, True)):
+            code, errors = self.run_follow()
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertNotIn("paused_from", self.worker_record())
+        self.assertNotIn("paused_turn", self.worker_record())
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(len(self.methods("thread/resume")), 1)
+
     def test_end_interrupts_real_id_when_read_has_no_turn(self) -> None:
         """An active status without persisted turn uses a real id."""
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
@@ -5483,6 +6176,74 @@ class QuotaRefusalTests(unittest.TestCase):
                 self.assertIsNotNone(datetime.fromisoformat(command[9]).tzinfo)
 
 
+    def test_exited_refusal_handoff_prefers_marker_then_launcher_and_clears_only_its_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            identity = agent_accounts.KnownCodexAccount(folder / "codex", "serving@example.invalid", "codex1")
+            serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
+            argv = ["codex_mesh.py", "start", "--prompt", "a task with 'quotes' and spaces"]
+            for marked, launched, expected in ((["marker-director"], ("launcher-director",), "marker-director"),
+                                               ([], ("launcher-director",), "launcher-director"),
+                                               ([], (), ""), (["first", "second"], (), "")):
+                with self.subTest(marked=marked, launched=launched):
+                    _ = (folder / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+                        "worker": {"thread_id": THREAD_ID, "continuation_owed": True},
+                        "other": {"thread_id": "other-thread", "continuation_owed": True}}))
+                    with (patch.object(codex_mesh, "_marker_sessions", return_value=marked) as marker,
+                          patch.object(codex_mesh, "_launcher_sessions", return_value=launched) as launcher,
+                          patch.object(sys, "argv", argv), patch.object(subprocess, "run",
+                            return_value=subprocess.CompletedProcess([], 0, "", "")) as run):
+                        codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT, stopped=codex_mesh.CommandStoppedOnThread(str(folder), THREAD_ID))  # pyright: ignore[reportPrivateUsage]
+                    marker.assert_called_once_with(codex_mesh.SWEEP_ROOTS, folder)
+                    if marked:
+                        launcher.assert_not_called()
+                    else:
+                        launcher.assert_called_once_with(folder)
+                    command = cast(list[str], run.call_args.args[0])
+                    if expected:
+                        self.assertEqual(command[command.index("--stopped") + 1:],
+                                         [expected, "worker", shlex.join(argv)])
+                    else:
+                        self.assertNotIn("--stopped", command)
+                    roster = cast(dict[str, dict[str, object]], json.loads((folder / codex_mesh.ROSTER_FILE).read_text()))
+                    self.assertIs(roster["worker"]["continuation_owed"], False)
+                    self.assertIs(roster["other"]["continuation_owed"], True)
+
+    def test_before_thread_exit_uses_its_director_without_rewriting_a_roster(self) -> None:
+        identity = agent_accounts.KnownCodexAccount(Path("/fixture/codex"), "worker@example.invalid", "codex1")
+        serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
+        for director in (codex_mesh.KnownWorkerDirector("own-director"), codex_mesh.UnknownWorkerDirector()):
+            with (self.subTest(director=director),
+                  patch.object(codex_mesh, "_marker_sessions") as marker,
+                  patch.object(codex_mesh, "_launcher_sessions") as launcher,
+                  patch.object(codex_mesh, "_update_roster_if_expected") as update,
+                  patch.object(subprocess, "run",
+                      return_value=subprocess.CompletedProcess([], 0, "", "")) as run):
+                codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT,  # pyright: ignore[reportPrivateUsage]
+                    stopped=codex_mesh.CommandStoppedBeforeThread("/fixture/run", director))
+                marker.assert_not_called()
+                launcher.assert_not_called()
+                update.assert_not_called()
+                command = cast(list[str], run.call_args.args[0])
+                if isinstance(director, codex_mesh.KnownWorkerDirector):
+                    self.assertEqual(command[command.index("--stopped") + 1:],
+                                     ["own-director", "worker", shlex.join(sys.argv)])
+                else:
+                    self.assertNotIn("--stopped", command)
+
+    def test_waiting_refusal_handoff_does_not_resolve_a_director_or_clear_continuation(self) -> None:
+        identity = agent_accounts.KnownCodexAccount(Path("/fixture/codex"), "worker@example.invalid", "codex1")
+        serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
+        with (patch.object(codex_mesh, "_marker_sessions") as marker,
+              patch.object(codex_mesh, "_launcher_sessions") as launcher,
+              patch.object(codex_mesh, "_update_roster_if_expected") as update,
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run):
+            codex_mesh._report_quota_refusal("worker", serving, USAGE_LIMIT)  # pyright: ignore[reportPrivateUsage]
+        marker.assert_not_called()
+        launcher.assert_not_called()
+        update.assert_not_called()
+        self.assertNotIn("--stopped", cast(list[str], run.call_args.args[0]))
+
     def test_the_report_runs_the_blocked_verb_and_survives_its_failure(self) -> None:
         identity = agent_accounts.KnownCodexAccount(Path.home() / ".codex", "serving@example.invalid", "codex1")
         serving = codex_mesh.ServingCodexServer(4001, 99, identity.home, identity)
@@ -5595,6 +6356,7 @@ class MacCleanupTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
         _ = self.enterContext(patch.object(sys, "platform", "darwin"))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("unconfigured command")))
+        _ = self.enterContext(patch.object(codex_mesh, "user_zone", return_value=ZoneInfo("UTC")))
         _ = self.enterContext(patch.object(account, "mac_process_record", side_effect=AssertionError("no native process record")))
         _ = self.enterContext(patch.object(account, "process_codex_home", side_effect=AssertionError("no native environment")))
         _ = self.enterContext(patch.object(sessions, "process_start", side_effect=AssertionError("no native process start")))
@@ -5883,6 +6645,10 @@ class CodexDaemonCleanupTests(unittest.TestCase):
             return f"start-{pid}"
         _ = self.enterContext(patch.object(sessions, "process_start", side_effect=process_start))
         _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_tree", return_value={}))
+        _ = self.enterContext(patch.object(codex_mesh, "_list_family_processes", return_value=""))
+        _ = self.enterContext(patch.object(codex_mesh, "_process_session", return_value=codex_mesh.ProcessSession(1)))
+        _ = self.enterContext(patch.object(codex_mesh, "_daemon_process_state", return_value=codex_mesh.ProcessRunState.RUNNING))
+        _ = self.enterContext(patch.object(codex_mesh, "_process_terminal", return_value=codex_mesh.ProcessTerminal("??")))
 
     def test_sweep_lists_and_stops_only_signed_out_shared_home_daemons_and_their_descendants(self) -> None:
         settings = {
@@ -5899,11 +6665,11 @@ class CodexDaemonCleanupTests(unittest.TestCase):
             return account.MacProcessRecord((executable, "app-server", "daemon"), account.ProcessWithoutCodexHome(), Path(executable))
         parents = {101: 1, 102: 1, 103: 1, 104: 1, 105: 1, 201: 101, 202: 201, 203: 102, 999: 1}
         table = {pid: codex_mesh.FamilyProcess(parent, codex_mesh.ProcessIdentity(
-            pid, f"start-{pid}", ("/opt/bin/codex", "app-server", "daemon"), Path("/opt/bin/codex")))
+            pid, f"start-{pid}", ("/opt/bin/codex", "app-server", "daemon"), Path("/opt/bin/codex")), codex_mesh.ProcessSession(1))
                  for pid, parent in parents.items()}
         table[105] = codex_mesh.FamilyProcess(1, dataclasses.replace(
             cast(codex_mesh.ProcessIdentity, table[105].identity),
-            executable=Path("/Applications/ChatGPT.app/Contents/MacOS/codex")))
+            executable=Path("/Applications/ChatGPT.app/Contents/MacOS/codex")), codex_mesh.ProcessSession(1))
         def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread:
             return settings.get(pid, account.ProcessWithoutCodexHome())
         stopped: set[int] = set()
@@ -5995,6 +6761,51 @@ class CodexDaemonCleanupTests(unittest.TestCase):
         self.assertNotIn("106\tdaemon\t", output.getvalue())
         reap.assert_not_called()
 
+    def test_daemon_report_names_its_own_numbered_home(self) -> None:
+        target = codex_mesh.CodexDaemon(101, "start-101", ("codex", "app-server", "daemon"), Path("/opt/bin/codex"))
+        with (patch.object(codex_mesh, "_running_servers", return_value=[]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_running_daemons", return_value=[target]),
+              patch.object(account, "process_codex_home", return_value=account.ProcessCodexHome(self.home / ".codex1")),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=False)), 0)
+        row = next(line.split("\t") for line in output.getvalue().splitlines() if line.startswith("101\t"))
+        self.assertEqual(row[1:3], ["daemon", "in use"])
+        self.assertEqual(row[4], "~/.codex1")
+
+    def test_sweep_discovers_reports_and_resumes_a_stopped_shared_home_non_daemon(self) -> None:
+        arguments = ("codex", "--remote-control")
+        member = codex_mesh.UnclassifiedCodexProcess(201, "start-201", arguments, Path("/opt/bin/codex"))
+        stopped = {201}
+        signals: list[tuple[int, int]] = []
+        def state(pid: int) -> codex_mesh.ProcessRunState:
+            self.assertEqual(pid, 201)
+            return codex_mesh.ProcessRunState.STOPPED if pid in stopped else codex_mesh.ProcessRunState.RUNNING
+        def send_signal(pid: int, sig: int) -> None:
+            signals.append((pid, sig))
+            self.assertEqual((pid, sig), (201, signal.SIGCONT))
+            stopped.remove(pid)
+        with (patch.object(codex_mesh, "_running_servers", return_value=[]),
+              patch.object(codex_mesh, "_client_counts", return_value={}),
+              patch.object(codex_mesh, "_list_codex_processes", return_value="201 codex\n"),
+              patch.object(codex_mesh, "_running_daemons", side_effect=self.discover),
+              patch.object(codex_mesh, "_daemon_process_tree", return_value={
+                  201: codex_mesh.FamilyProcess(1, member, codex_mesh.ProcessSession(201))}),
+              patch.object(account, "mac_process_record", return_value=account.MacProcessRecord(
+                  arguments, account.ProcessWithoutCodexHome(), Path("/opt/bin/codex"))),
+              patch.object(account, "process_codex_home", return_value=account.ProcessWithoutCodexHome()),
+              patch.object(codex_mesh, "_daemon_process_state", side_effect=state),
+              patch.object(os, "kill", side_effect=send_signal),
+              contextlib.redirect_stdout(io.StringIO()) as output,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=True)), 0)
+        self.assertEqual(signals, [(201, signal.SIGCONT)])
+        self.assertEqual(stopped, set())
+        diagnostic = output.getvalue() + errors.getvalue()
+        self.assertIn("201", diagnostic)
+        self.assertIn("stopped", diagnostic)
+        self.assertIn("0 app-server(s)", output.getvalue())
+
     def test_linux_daemon_discovery_reads_cmdline_and_uses_the_same_home_and_login_verdict(self) -> None:
         with (patch.object(sys, "platform", "linux"),
               patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "101 codex\n", "")) as command,
@@ -6034,6 +6845,31 @@ class CodexDaemonCleanupTests(unittest.TestCase):
 
 @final
 class DaemonProcessStateTests(unittest.TestCase):
+    def test_session_reader_uses_the_kernel_id_and_tags_unreadable_sessions_on_both_platforms(self) -> None:
+        for platform in ("darwin", "linux"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(os, "getsid", return_value=101) as get_session):
+                self.assertEqual(codex_mesh._process_session(201), codex_mesh.ProcessSession(101))  # pyright: ignore[reportPrivateUsage]
+                get_session.assert_called_once_with(201)
+            for error, expected in ((ProcessLookupError("synthetic exit"), codex_mesh.SessionGone),
+                                    (PermissionError("synthetic denied"), codex_mesh.SessionUnread)):
+                with (self.subTest(platform=platform, error=type(error).__name__),
+                      patch.object(sys, "platform", platform), patch.object(os, "getsid", side_effect=error)):
+                    self.assertIsInstance(codex_mesh._process_session(201), expected)  # pyright: ignore[reportPrivateUsage]
+
+    def test_own_user_listing_preserves_the_complete_command_path_and_arguments_with_spaces(self) -> None:
+        arguments = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --profile-directory="Profile 2"'
+        for platform in ("darwin", "linux"):
+            with (self.subTest(platform=platform), patch.object(sys, "platform", platform),
+                  patch.object(os, "getuid", return_value=1000),
+                  patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                      [], 0, f"  201   101 {arguments}\n", "")) as command):
+                table = codex_mesh._own_process_table()  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(set(table), {201})
+            self.assertEqual((table[201].pid, table[201].parent, table[201].arguments), (201, 101, arguments))
+            self.assertEqual(cast(tuple[str, ...], command.call_args.args[0]),
+                             ("ps", "-u", "1000", "-o", "pid=,ppid=,args="))
+
     def test_mac_process_state_distinguishes_stopped_running_zombie_and_gone(self) -> None:
         cases = (("T+\n", 0, codex_mesh.ProcessRunState.STOPPED),
                  ("S\n", 0, codex_mesh.ProcessRunState.RUNNING),
@@ -6069,11 +6905,16 @@ class DaemonFamilySafetyTests(unittest.TestCase):
     identities: dict[int, codex_mesh.ProcessIdentity | codex_mesh.UnreadCodexProcess] = {}
     parents: dict[int, int] = {}
     starts: dict[int, str] = {}
+    process_sessions: dict[int, int] = {}
     stopped: set[int] = set()
     signals: list[tuple[int, int]] = []
     target = codex_mesh.CodexDaemon(101, "parent-start", ("codex", "app-server", "daemon"), Path("/opt/bin/codex"))
     child = codex_mesh.ProcessIdentity(201, "child-start", ("codex", "--remote-control"), Path("/opt/bin/codex"))
-    snapshot: Callable[[], dict[int, codex_mesh.FamilyProcess]] = staticmethod(codex_mesh._daemon_process_tree)  # pyright: ignore[reportPrivateUsage]
+    native_listing: Callable[[], str] = staticmethod(codex_mesh._list_family_processes)  # pyright: ignore[reportPrivateUsage]
+    discover: Callable[[], list[codex_mesh.DaemonTarget]] = staticmethod(codex_mesh._running_daemons)  # pyright: ignore[reportPrivateUsage]
+    native_session: Callable[[int], codex_mesh.ProcessSession | codex_mesh.SessionGone | codex_mesh.SessionUnread] = staticmethod(codex_mesh._process_session)  # pyright: ignore[reportPrivateUsage]
+    native_terminal: Callable[[int], codex_mesh.ProcessTerminal | codex_mesh.TerminalUnread] = staticmethod(codex_mesh._process_terminal)  # pyright: ignore[reportPrivateUsage]
+    snapshot: Callable[[int, Mapping[int, codex_mesh.ProcessIdentity], frozenset[int]], dict[int, codex_mesh.FamilyProcess]] = staticmethod(codex_mesh._daemon_process_tree)  # pyright: ignore[reportPrivateUsage]
 
     @override
     def setUp(self) -> None:
@@ -6086,6 +6927,10 @@ class DaemonFamilySafetyTests(unittest.TestCase):
         self.identities = {101: self.target, 201: self.child}
         self.parents = {101: 1, 201: 101}
         self.starts = {101: self.target.started, 201: self.child.started}
+        self.process_sessions = {101: 101, 201: 101}
+        _ = self.enterContext(patch.object(codex_mesh, "_process_session", side_effect=self.process_session))
+        _ = self.enterContext(patch.object(codex_mesh, "_process_terminal", return_value=codex_mesh.ProcessTerminal("??")))
+        _ = self.enterContext(patch.object(codex_mesh, "_list_family_processes", side_effect=self.listing))
         _ = self.enterContext(patch.object(sessions, "process_start", side_effect=self.starts.__getitem__))
         self.stopped = set()
         self.signals = []
@@ -6099,8 +6944,16 @@ class DaemonFamilySafetyTests(unittest.TestCase):
     def identity(self, pid: int) -> codex_mesh.ProcessIdentity | codex_mesh.UnreadCodexProcess:
         return self.identities.get(pid, codex_mesh.UnreadCodexProcess(pid, "process exited"))
 
-    def tree(self) -> dict[int, codex_mesh.FamilyProcess]:
-        return {pid: codex_mesh.FamilyProcess(parent, self.identities[pid]) for pid, parent in self.parents.items()}
+    def process_session(self, pid: int) -> codex_mesh.ProcessSession | codex_mesh.SessionUnread:
+        sid = self.process_sessions.get(pid, self.process_sessions.get(self.parents.get(pid, 1), pid))
+        return codex_mesh.ProcessSession(sid)
+
+    def listing(self) -> str:
+        return "".join(f"{pid} {parent} synthetic-process-{pid}\n" for pid, parent in self.parents.items())
+
+    def tree(self, *_arguments: object) -> dict[int, codex_mesh.FamilyProcess]:
+        return {pid: codex_mesh.FamilyProcess(parent, self.identities[pid], self.process_session(pid))
+                for pid, parent in self.parents.items()}
 
     def state(self, pid: int) -> codex_mesh.ProcessRunState:
         if pid not in self.parents:
@@ -6128,6 +6981,184 @@ class DaemonFamilySafetyTests(unittest.TestCase):
                                         (201, signal.SIGKILL), (101, signal.SIGKILL)])
         self.assertEqual(self.parents, {})
         self.assertEqual(self.stopped, set())
+
+    def test_sweep_reports_a_kept_daemons_stopped_shell_child_and_resumes_only_on_stop(self) -> None:
+        shell = dataclasses.replace(self.child, arguments=("sh", "helper"), executable=Path("/bin/sh"))
+        self.identities[201] = shell
+        self.identities[101] = codex_mesh.ProcessIdentity(
+            self.target.pid, self.target.started, self.target.arguments, self.target.executable)
+        for stop in (False, True):
+            self.stopped = {201}
+            self.signals = []
+            with (self.subTest(stop=stop),
+                  patch.object(codex_mesh, "_running_servers", return_value=[]),
+                  patch.object(codex_mesh, "_client_counts", return_value={}),
+                  patch.object(codex_mesh, "_list_codex_processes", return_value="101 codex\n201 sh\n"),
+                  patch.object(codex_mesh, "_running_daemons", side_effect=self.discover),
+                  patch.object(codex_mesh, "_daemon_record", return_value=self.target),
+                  patch.object(codex_mesh, "_daemon_process_tree", side_effect=self.snapshot),
+                  patch.object(codex_mesh, "_daemon_verdict", return_value=codex_mesh.ServerInUse("shared home has a login")),
+                  contextlib.redirect_stdout(io.StringIO()) as output,
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=stop)), 0)
+            diagnostic = output.getvalue() + errors.getvalue()
+            self.assertIn("201", diagnostic)
+            self.assertIn("stopped", diagnostic)
+            self.assertEqual(self.signals, [(201, signal.SIGCONT)] if stop else [])
+            self.assertEqual(self.stopped, set() if stop else {201})
+            self.assertEqual(set(self.parents), {101, 201})
+
+    def test_sweep_keeps_and_names_stopped_shell_members_with_unsafe_recovery_evidence(self) -> None:
+        shell = dataclasses.replace(self.child, arguments=("sh", "helper"), executable=Path("/bin/sh"))
+        cases = (
+            (dataclasses.replace(shell, executable=Path("/Applications/ChatGPT.app/Contents/MacOS/codex")),
+             account.ProcessWithoutCodexHome(), False),
+            (shell, account.ProcessCodexHome(self.home / ".codex1"), False),
+            (shell, account.ProcessEnvironmentUnread("synthetic denied"), False),
+            (codex_mesh.UnreadCodexProcess(201, "synthetic unread identity"), account.ProcessWithoutCodexHome(), False),
+            (shell, account.ProcessWithoutCodexHome(), True),
+        )
+        for identity, setting, changed in cases:
+            self.identities[201] = identity
+            self.stopped = {201}
+            self.signals = []
+            discovered = self.tree()
+            if changed:
+                self.identities[201] = dataclasses.replace(shell, started="replacement-start")
+            def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread:
+                return setting if pid == 201 else account.ProcessWithoutCodexHome()
+            with (self.subTest(identity=identity, setting=setting, changed=changed),
+                  patch.object(codex_mesh, "_running_servers", return_value=[]),
+                  patch.object(codex_mesh, "_client_counts", return_value={}),
+                  patch.object(codex_mesh, "_running_daemons", return_value=[self.target]),
+                  patch.object(codex_mesh, "_daemon_process_tree", return_value=discovered),
+                  patch.object(codex_mesh, "_daemon_verdict", return_value=codex_mesh.ServerInUse("shared home has a login")),
+                  patch.object(account, "process_codex_home", side_effect=selected),
+                  contextlib.redirect_stdout(io.StringIO()) as output,
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=True)), 0)
+            diagnostic = output.getvalue() + errors.getvalue()
+            self.assertIn("201", diagnostic)
+            self.assertIn("kept", diagnostic.lower())
+            self.assertEqual(self.signals, [])
+            self.assertEqual(self.stopped, {201})
+
+    def test_sweep_preserves_job_control_stops_and_recovers_only_detached_members(self) -> None:
+        member = codex_mesh.UnclassifiedCodexProcess(
+            self.child.pid, self.child.started, self.child.arguments, self.child.executable)
+        self.identities[201] = member
+        for platform, held, detached in (("linux", "pts/3", "?"), ("darwin", "ttys003", "??")):
+            for terminal in (held, detached, ""):
+                self.stopped = {201}
+                self.signals = []
+                with (self.subTest(platform=platform, terminal=terminal),
+                      patch.object(sys, "platform", platform),
+                      patch.object(codex_mesh, "_running_servers", return_value=[]),
+                      patch.object(codex_mesh, "_client_counts", return_value={}),
+                      patch.object(codex_mesh, "_running_daemons", return_value=[member]),
+                      patch.object(codex_mesh, "_process_terminal", side_effect=self.native_terminal),
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                          [], 0, terminal + "\n" if terminal else "", "")) as command,
+                      contextlib.redirect_stdout(io.StringIO()) as output,
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(self.home), stop=True)), 0)
+                self.assertEqual(cast(tuple[str, ...], command.call_args.args[0]), ("ps", "-p", "201", "-o", "tty="))
+                diagnostic = output.getvalue() + errors.getvalue()
+                self.assertIn("201", diagnostic)
+                if terminal == detached:
+                    self.assertEqual(self.signals, [(201, signal.SIGCONT)])
+                    self.assertEqual(self.stopped, set())
+                else:
+                    self.assertEqual(self.signals, [])
+                    self.assertEqual(self.stopped, {201})
+                    self.assertIn("kept", diagnostic)
+                    self.assertIn(held if terminal else "could not be read", diagnostic)
+
+    def test_session_candidate_exit_is_skipped_but_unreadable_session_refuses_and_resumes_the_family(self) -> None:
+        for denied in (False, True):
+            self.identities = {101: self.target, 201: self.child,
+                               203: dataclasses.replace(self.child, pid=203, started="short-lived")}
+            self.parents = {101: 1, 201: 101, 203: 1}
+            self.stopped = set()
+            self.signals = []
+            listings = 0
+            candidate_reads = 0
+            def listing() -> str:
+                nonlocal listings
+                listings += 1
+                return self.listing()
+            def get_session(pid: int) -> int:
+                nonlocal candidate_reads
+                if pid == 203:
+                    candidate_reads += 1
+                    if denied:
+                        raise PermissionError("synthetic denied")
+                    raise ProcessLookupError("synthetic exited")
+                return self.process_sessions[pid]
+            with (self.subTest(denied=denied),
+                  patch.object(codex_mesh, "_list_family_processes", side_effect=listing),
+                  patch.object(codex_mesh, "_process_session", side_effect=self.native_session),
+                  patch.object(codex_mesh, "_daemon_process_tree", side_effect=self.snapshot),
+                  patch.object(os, "getsid", side_effect=get_session),
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(codex_mesh._stop_daemon(self.target), not denied)  # pyright: ignore[reportPrivateUsage]
+            self.assertGreater(listings, 0)
+            self.assertEqual(candidate_reads, listings, "read a candidate's session once per process table")
+            self.assertFalse(any(pid == 203 for pid, _sig in self.signals))
+            if denied:
+                self.assertIn("203", errors.getvalue())
+                self.assertIn("could not be read", errors.getvalue())
+                self.assertEqual(self.signals, [(101, signal.SIGSTOP), (201, signal.SIGSTOP),
+                                                (201, signal.SIGCONT), (101, signal.SIGCONT)])
+                self.assertEqual(set(self.parents), {101, 201, 203})
+            else:
+                self.assertEqual(self.signals, [(101, signal.SIGSTOP), (201, signal.SIGSTOP),
+                                                (201, signal.SIGKILL), (101, signal.SIGKILL)])
+                self.assertNotIn("not stopped", errors.getvalue())
+                self.assertEqual(self.parents, {203: 1})
+            self.assertEqual(self.stopped, set())
+
+    def test_kept_family_recovery_names_the_cleanup_holding_its_lock(self) -> None:
+        self.stopped = {201}
+        with (codex_mesh._daemon_stop_lock(),  # pyright: ignore[reportPrivateUsage]
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(codex_mesh._recover_kept_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("another daemon cleanup holds the stop lock", errors.getvalue())
+        self.assertNotIn("recovery failed", errors.getvalue())
+        self.assertEqual(self.signals, [])
+        self.assertEqual(self.stopped, {201})
+
+    def test_session_orphan_uses_its_table_session_without_a_second_racy_read(self) -> None:
+        table_number = 0
+        orphan_reads: dict[int, int] = {}
+        def listing() -> str:
+            nonlocal table_number
+            table_number += 1
+            return self.listing()
+        def get_session(pid: int) -> int:
+            if pid == 203 and pid not in self.stopped:
+                orphan_reads[table_number] = orphan_reads.get(table_number, 0) + 1
+                if orphan_reads[table_number] > 1:
+                    raise ProcessLookupError("candidate exited after its table session was read")
+            return self.process_sessions[pid]
+        def signal_process(pid: int, sig: int) -> None:
+            self.signal_process(pid, sig)
+            if (pid, sig) == (201, signal.SIGSTOP):
+                self.parents[203] = 1
+                self.identities[203] = dataclasses.replace(self.child, pid=203, started="orphan-start")
+                self.starts[203] = "orphan-start"
+                self.process_sessions[203] = 101
+        with (patch.object(codex_mesh, "_list_family_processes", side_effect=listing),
+              patch.object(codex_mesh, "_process_session", side_effect=self.native_session),
+              patch.object(codex_mesh, "_daemon_process_tree", side_effect=self.snapshot),
+              patch.object(os, "getsid", side_effect=get_session),
+              patch.object(os, "kill", side_effect=signal_process)):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(orphan_reads), 2, "both tables bind the orphan to its session before freezing it")
+        self.assertTrue(all(count == 1 for count in orphan_reads.values()))
+        self.assertIn((203, signal.SIGSTOP), self.signals)
+        self.assertIn((203, signal.SIGKILL), self.signals)
+        self.assertEqual(self.parents, {})
 
     def test_reparented_member_remains_tracked_until_frozen_and_killed(self) -> None:
         def signal_process(pid: int, sig: int) -> None:
@@ -6217,6 +7248,140 @@ class DaemonFamilySafetyTests(unittest.TestCase):
                                         (202, signal.SIGKILL), (201, signal.SIGKILL), (101, signal.SIGKILL)])
         self.assertEqual(self.parents, {})
 
+    def test_unseen_intermediates_orphan_is_found_in_a_frozen_leaders_session_before_any_kill(self) -> None:
+        self.process_sessions[201] = 201
+        def signal_process(pid: int, sig: int) -> None:
+            if (pid, sig) == (201, signal.SIGSTOP):
+                # An intermediate forked and exited between listings. Only its
+                # orphan and the frozen session leader remain observable.
+                self.parents[203] = 1
+                self.identities[203] = dataclasses.replace(self.child, pid=203, started="orphan-start")
+                self.process_sessions[203] = 201
+                self.starts[203] = "orphan-start"
+            if sig == signal.SIGKILL and not any(event[1] == signal.SIGKILL for event in self.signals):
+                self.assertEqual(self.stopped, {101, 201, 203})
+            self.signal_process(pid, sig)
+        with patch.object(os, "kill", side_effect=signal_process):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn((203, signal.SIGSTOP), self.signals)
+        self.assertIn((203, signal.SIGKILL), self.signals)
+        self.assertEqual(self.parents, {})
+
+    def test_survivor_in_a_swept_session_refuses_success_and_names_its_pid(self) -> None:
+        def signal_process(pid: int, sig: int) -> None:
+            self.signal_process(pid, sig)
+            if (pid, sig) == (101, signal.SIGKILL):
+                self.parents[203] = 1
+                self.identities[203] = dataclasses.replace(self.child, pid=203, started="survivor-start")
+                self.process_sessions[203] = 101
+        with (patch.object(os, "kill", side_effect=signal_process),
+              patch.object(time, "sleep", return_value=None),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("not stopped", errors.getvalue())
+        self.assertIn("203", errors.getvalue())
+        self.assertIn(203, self.parents)
+        self.assertFalse(any(event[0] == 203 for event in self.signals))
+
+    def test_excluded_session_orphan_is_never_stopped_and_the_frozen_family_is_resumed(self) -> None:
+        self.parents[203] = 1
+        self.process_sessions[203] = 101
+        orphan = dataclasses.replace(self.child, pid=203, started="orphan-start")
+        cases = (
+            (orphan, account.ProcessCodexHome(self.home / ".codex1")),
+            (orphan, account.ProcessEnvironmentUnread("synthetic denied")),
+            (dataclasses.replace(orphan, executable=Path("/Applications/ChatGPT.app/Contents/MacOS/codex")),
+             account.ProcessWithoutCodexHome()),
+            (codex_mesh.UnreadCodexProcess(203, "synthetic unread identity"), account.ProcessWithoutCodexHome()),
+        )
+        for identity, setting in cases:
+            self.identities[203] = identity
+            self.signals = []
+            def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread:
+                return setting if pid == 203 else account.ProcessWithoutCodexHome()
+            with (self.subTest(identity=identity, setting=setting),
+                  patch.object(account, "process_codex_home", side_effect=selected),
+                  contextlib.redirect_stderr(io.StringIO()) as errors):
+                self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+            self.assertIn("203", errors.getvalue())
+            self.assertFalse(any(pid == 203 or sig == signal.SIGKILL for pid, sig in self.signals))
+            self.assertEqual({pid for pid, sig in self.signals if sig == signal.SIGSTOP},
+                             {pid for pid, sig in self.signals if sig == signal.SIGCONT})
+            self.assertEqual(self.stopped, set())
+
+    def test_a_session_with_an_untracked_leader_is_never_swept(self) -> None:
+        self.process_sessions = {101: 900, 201: 900, 203: 900}
+        self.parents[203] = 1
+        self.identities[203] = dataclasses.replace(self.child, pid=203, started="unrelated-session-member")
+        self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(any(event[0] == 203 for event in self.signals))
+        self.assertEqual(self.parents, {203: 1})
+
+    def test_overlapping_daemon_stops_hold_one_lock_until_the_first_family_is_released(self) -> None:
+        other = dataclasses.replace(self.target, pid=301, started="other-daemon-start")
+        self.identities[301] = other
+        self.parents[301] = 1
+        self.process_sessions[301] = 301
+        self.starts[301] = other.started
+        overlaps: list[bool] = []
+        def signal_process(pid: int, sig: int) -> None:
+            self.signal_process(pid, sig)
+            if (pid, sig) == (101, signal.SIGSTOP):
+                overlaps.append(codex_mesh._stop_daemon(other))  # pyright: ignore[reportPrivateUsage]
+                self.assertFalse(any(event[0] == 301 for event in self.signals))
+        with (patch.object(os, "kill", side_effect=signal_process),
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(overlaps, [False])
+            self.assertIn("lock", errors.getvalue().lower())
+            self.assertTrue(codex_mesh._stop_daemon(other))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.parents, {})
+        self.assertEqual(self.signals[-2:], [(301, signal.SIGSTOP), (301, signal.SIGKILL)])
+
+    def test_session_sweep_never_reads_or_signals_another_users_process(self) -> None:
+        commands: list[tuple[str, ...]] = []
+        foreign = "302 101 codex --remote-control\n"
+        def command(arguments: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(arguments)
+            text = self.listing()
+            if arguments != ("ps", "-u", "1000", "-o", "pid=,ppid=,args="):
+                text += foreign
+            return subprocess.CompletedProcess(arguments, 0, text, "")
+        with (patch.object(os, "getuid", return_value=1000),
+              patch.object(subprocess, "run", side_effect=command),
+              patch.object(codex_mesh, "_list_family_processes", side_effect=self.native_listing),
+              patch.object(codex_mesh, "_daemon_process_tree", side_effect=self.snapshot)):
+            self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(commands)
+        self.assertTrue(all(arguments == ("ps", "-u", "1000", "-o", "pid=,ppid=,args=")
+                            for arguments in commands))
+        self.assertFalse(any(event[0] == 302 for event in self.signals))
+
+    def test_snapshot_reads_full_identities_only_for_family_and_swept_session_candidates(self) -> None:
+        self.parents.update({203: 1, 900: 1})
+        self.identities[203] = dataclasses.replace(self.child, pid=203, started="session-orphan")
+        self.identities[900] = dataclasses.replace(self.child, pid=900, started="unrelated")
+        self.process_sessions.update({203: 101, 900: 900})
+        with patch.object(codex_mesh, "_process_identity", side_effect=self.identity) as identity:
+            snapshot = self.snapshot(101, {101: self.target, 201: self.child}, frozenset({101}))
+        self.assertEqual(set(snapshot), {101, 201, 203})
+        self.assertEqual({call.args[0] for call in identity.call_args_list}, {101, 201, 203})
+        self.assertEqual(self.signals, [])
+
+    def test_kept_family_resumes_and_reports_a_shared_home_member_found_already_stopped(self) -> None:
+        self.stopped = {201}
+        def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome:
+            return account.ProcessCodexHome(self.home / ".codex1") if pid == 101 else account.ProcessWithoutCodexHome()
+        with (patch.object(account, "process_codex_home", side_effect=selected),
+              contextlib.redirect_stdout(io.StringIO()) as output,
+              contextlib.redirect_stderr(io.StringIO()) as errors):
+            self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.signals, [(201, signal.SIGCONT)])
+        self.assertEqual(self.stopped, set())
+        diagnostic = output.getvalue() + errors.getvalue()
+        self.assertIn("201", diagnostic)
+        self.assertIn("stopped", diagnostic)
+
     def test_excluded_member_found_after_freeze_resumes_every_stopped_member_without_killing(self) -> None:
         for setting in (account.ProcessCodexHome(self.home / ".codex1"), account.ProcessEnvironmentUnread("denied")):
             def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome | account.ProcessEnvironmentUnread:
@@ -6270,24 +7435,25 @@ class DaemonFamilySafetyTests(unittest.TestCase):
             self.assertEqual(self.stopped, {201})
             self.assertEqual(set(self.parents), {101, 201})
 
-    def test_exclusion_after_freezing_resumes_only_members_stopped_by_cleanup(self) -> None:
+    def test_exclusion_after_freezing_keeps_a_pre_stopped_member_on_another_home_stopped(self) -> None:
         self.stopped = {201}
         excluded: list[int] = []
         snapshots = 0
-        def tree() -> dict[int, codex_mesh.FamilyProcess]:
+        def tree(*_arguments: object) -> dict[int, codex_mesh.FamilyProcess]:
             nonlocal snapshots
             snapshots += 1
             return self.tree()
         def selected(pid: int) -> account.ProcessCodexHome | account.ProcessWithoutCodexHome:
             if pid == 201 and snapshots >= 2:
-                self.assertEqual(self.stopped, {101, 201})
+                if not excluded:
+                    self.assertEqual(self.stopped, {101, 201})
                 excluded.append(pid)
                 return account.ProcessCodexHome(self.home / ".codex1")
             return account.ProcessWithoutCodexHome()
         with (patch.object(account, "process_codex_home", side_effect=selected),
               patch.object(codex_mesh, "_daemon_process_tree", side_effect=tree)):
             self.assertFalse(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(excluded, [201])
+        self.assertEqual(set(excluded), {201})
         self.assertEqual(self.signals, [(101, signal.SIGSTOP), (101, signal.SIGCONT)])
         self.assertEqual(self.stopped, {201})
         self.assertEqual(set(self.parents), {101, 201})
@@ -6316,11 +7482,11 @@ class DaemonFamilySafetyTests(unittest.TestCase):
 
     def test_unrelated_snapshot_processes_do_not_prevent_verified_family_shutdown(self) -> None:
         snapshot_pid = 900
-        def tree() -> dict[int, codex_mesh.FamilyProcess]:
+        def tree(*_arguments: object) -> dict[int, codex_mesh.FamilyProcess]:
             nonlocal snapshot_pid
             snapshot_pid += 1
             unrelated = codex_mesh.ProcessIdentity(snapshot_pid, f"ps-{snapshot_pid}", ("ps", "-eo", "pid,ppid"), Path("/bin/ps"))
-            return {**self.tree(), snapshot_pid: codex_mesh.FamilyProcess(1, unrelated)}
+            return {**self.tree(), snapshot_pid: codex_mesh.FamilyProcess(1, unrelated, codex_mesh.ProcessSession(snapshot_pid))}
         with patch.object(codex_mesh, "_daemon_process_tree", side_effect=tree):
             self.assertTrue(codex_mesh._stop_daemon(self.target))  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(all(event[0] in (101, 201) for event in self.signals))
@@ -6348,8 +7514,10 @@ class DaemonFamilySafetyTests(unittest.TestCase):
         }
         after = {**before, 201: process_table.Process(201, 1, "codex", "codex exec unrelated")}
         self.identities[201] = dataclasses.replace(self.child, started="replacement-start", arguments=("codex", "exec", "unrelated"))
-        with patch.object(process_table, "snapshot", side_effect=[before, after]):
-            snapshot = self.snapshot()
+        listings = ["".join(f"{item.pid} {item.parent} {item.arguments}\n"
+                            for item in table.values()) for table in (before, after)]
+        with patch.object(codex_mesh, "_list_family_processes", side_effect=listings):
+            snapshot = self.snapshot(101, {201: self.child}, frozenset())
         self.assertIsInstance(snapshot[201].identity, codex_mesh.UnreadCodexProcess)
         self.assertEqual(self.signals, [])
 
@@ -6657,6 +7825,48 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(reaped, [8])
         self.assertIn("8\t4008\tstopped\tno current or retired server record", printed.getvalue())
+
+    def test_sweep_preserves_paused_threads_but_plain_stop_ends_them(self) -> None:
+        old = codex_mesh.SERVER_IDLE_SECS + 60
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = root / "paused-run"
+            run.mkdir()
+            server_path = run / codex_mesh.SERVER_FILE
+            _ = server_path.write_text(json.dumps({"pid": 9, "port": 4009}))
+            roster_path = run / codex_mesh.ROSTER_FILE
+            roster = {
+                "impl": {"thread_id": "paused-thread", "status": "paused", "role": "impl",
+                         "paused_from": "running", "paused_turn": True},
+                "review": {"thread_id": "done-thread", "status": "done", "role": "review"},
+            }
+            _ = roster_path.write_text(json.dumps(roster))
+            stale = time.time() - old
+            for activity in (server_path, roster_path):
+                os.utime(activity, (stale, stale))
+            with (
+                patch.object(codex_mesh, "_running_servers", return_value=[(9, 4009, old)]),
+                patch.object(codex_mesh, "_client_counts", return_value={}),
+                patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(run)),
+                patch.object(codex_mesh, "_busy_threads", return_value=()),
+                patch.object(codex_mesh, "_reap", return_value=True) as reap,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                code = codex_mesh.main(["sweep", "--root", directory, "--stop"])
+            self.assertEqual(code, 0)
+            self.assertIn("1 stopped", output.getvalue())
+            reap.assert_called_once_with(9)
+            self.assertFalse(server_path.exists())
+            remaining = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+            self.assertEqual(remaining, roster)
+            self.assertFalse(codex_mesh._end_marker_path(str(run), "impl").exists())  # pyright: ignore[reportPrivateUsage]
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = codex_mesh.main(["stop", "--session-dir", str(run)])
+            self.assertEqual(code, 0)
+            ended = cast(dict[str, dict[str, object]], json.loads(roster_path.read_text()))
+            self.assertEqual({seat: entry["status"] for seat, entry in ended.items()},
+                             {"impl": "ended", "review": "ended"})
+            self.assertEqual(ended["impl"]["thread_id"], "paused-thread")
 
     def test_recorded_server_stops_when_ended_and_stays_for_each_live_signal(self) -> None:
         old = codex_mesh.SERVER_IDLE_SECS + 60
@@ -7498,6 +8708,28 @@ class WorkersHomeTests(unittest.TestCase):
         record = cast(dict[str, object], json.loads((self.session_dir / codex_mesh.SERVER_FILE).read_text()))
         self.assertEqual(record["codex_home"], str(home))
         self.assertEqual(record["auto_compact_tokens"], codex_mesh.AUTO_COMPACT_TOKENS)
+
+    def started_environment(self, caller: dict[str, str]) -> dict[str, str]:
+        _ = self.select()
+        process = MagicMock(spec=subprocess.Popen)
+        process.pid = 99999999
+        cast(MagicMock, process.poll).return_value = None
+        with patch.dict(os.environ, caller), patch.object(subprocess, "Popen", return_value=process) as launch, patch.object(codex_mesh, "_free_port", return_value=4001), patch.object(codex_mesh, "WebSocket"), patch.object(codex_mesh, "_start_watcher"):
+            _ = codex_mesh._start_server(str(self.session_dir), agent_accounts.workers_home())  # pyright: ignore[reportPrivateUsage]
+        return cast(dict[str, str], launch.call_args.kwargs["env"])
+
+    def test_a_run_folders_server_names_its_run_whatever_the_caller_carries(self) -> None:
+        # implement.sh's claim step can start the server before the launcher exports the run.
+        with patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)):
+            for caller in ({}, {"PLAN_DELEGATE_BOARD_DIR": str(self.home / "other-run")}):
+                with self.subTest(caller=caller):
+                    environment = self.started_environment(caller)
+                    self.assertEqual(environment["PLAN_DELEGATE_BOARD_DIR"], str(self.session_dir))
+
+    def test_a_server_outside_the_run_roots_keeps_the_callers_environment(self) -> None:
+        # A review pool's mesh directory serves many units' turns, so it names no run.
+        with patch.object(codex_mesh, "RUN_ROOTS", (self.home,)):
+            self.assertNotIn("PLAN_DELEGATE_BOARD_DIR", self.started_environment({}))
 
     def test_home_change_retires_server_even_when_sign_in_timestamps_are_unchanged(self) -> None:
         home = self.select()
