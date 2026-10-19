@@ -100,7 +100,7 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Gotchas:** a Codex thread resumed in a new rollout file must keep the retention its compactions decided (`3-fixed/codex/work/scan_rollouts.py`, checked by `check_parser.py`); restoring all start parts on resume overstated cost by 1,272,628 weighted tokens a week.
 
-### Phase 4 — What the turns do  · status: todo
+### Phase 4 — What the turns do  · status: done
 **Depends on:** Phase 2, Phase 3
 
 #### Work Order
