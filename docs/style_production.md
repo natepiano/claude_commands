@@ -359,7 +359,10 @@ Each finding must preserve behavior using only its own edits; another finding's
 call-site changes cannot complete its rename. Changed documented usage, including
 block documentation, requires review. Glob imports prevent proving a rename's
 identity, and public glob re-exports prevent establishing module privacy.
-The gate shortens constant paths through added imports only when both paths match.
+The gate shortens constant paths only when the added import and each site share one module scope and both paths match.
+A glob is allowed in a module, but not in a block around a changed site.
+An added import may carry one `#[cfg]` if each site's item carries the same condition.
+An external crate name counts as a root only when the file uses it only as a path root.
 It proves `Mode::Old` and `Self::Old` variant renames only when no other item has the enum's name.
 Attributes or unsupported derives that observe variant names prevent proof.
 It proves a local `let` rename only when its name is used after the statement, in its own block.
