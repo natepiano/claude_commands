@@ -34,6 +34,7 @@ import re
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,13 @@ TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
 # times TYPES_PEAK_MARGIN for growth between samples, or this when none is recorded.
 TYPES_MEMORY_MIB = 3072
 TYPES_PEAK_MARGIN = 1.2
+# A module this many times slower than the median of its last MODULE_HISTORY_RUNS times, and at least
+# the floor slower, is named in the report. On 2026-10-19 agents/test_codex_mesh.py went from 49 s to
+# 1264 s (four tests each waited a 300 s call timeout) and no line said so. Load alone moved modules
+# about 2x. The median names a regression on about three runs in a row, then takes it as the normal.
+SLOW_MODULE_FACTOR = 3.0
+SLOW_MODULE_FLOOR_S = 60.0
+MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
 SETTINGS_BLOB = "b3466859"
 # Python restores these dispositions before exec, including an inherited SIG_IGN.
@@ -279,6 +287,10 @@ def process_memory_mib(roots: set[int]) -> dict[int, float]:
     return totals
 
 
+def slower_than_recorded(seconds: float, recorded: float) -> bool:
+    return seconds >= recorded * SLOW_MODULE_FACTOR and seconds - recorded >= SLOW_MODULE_FLOOR_S
+
+
 def gate_state_dir() -> Path:
     return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser()
 
@@ -326,7 +338,20 @@ def read_measures(path: Path) -> dict[str, float]:
             if isinstance(key, str) and isinstance(seconds, (int, float)) and seconds >= 0}
 
 
-def save_measures(path: Path, measures: dict[str, float]) -> None:
+def read_history(path: Path) -> dict[str, list[float]]:
+    try:
+        value = cast(object, json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {key: [float(seconds) for seconds in cast(list[object], runs)
+                  if isinstance(seconds, (int, float)) and seconds >= 0]
+            for key, runs in cast(dict[object, object], value).items()
+            if isinstance(key, str) and isinstance(runs, list)}
+
+
+def save_measures(path: Path, measures: dict[str, float] | dict[str, list[float]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as output:
         temporary = Path(output.name)
@@ -378,6 +403,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     types_peaks = read_measures(types_peaks_path)
     types_key = " ".join(type_dirs)
     types_peak_mib = 0.0
+    slow_modules: list[str] = []
+    history_path = gate_state_dir() / "module_history.json"
+    history = read_history(history_path)
     modules.sort(key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
                                   -timings.get(f"{item[0]}/{item[1].name}", 0)))
     pending = deque(modules)
@@ -471,7 +499,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                             types_peaks[types_key] = types_peak_mib
                         status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
                     else:
-                        timings[f"{job.suite}/{job.path.name}"] = finished - job.started
+                        key, seconds = f"{job.suite}/{job.path.name}", finished - job.started
+                        past = history.get(key) or ([timings[key]] if key in timings else [])
+                        if past and slower_than_recorded(seconds, statistics.median(past)):
+                            slow_modules.append(f"{key} {seconds:.0f} s, median of the last {len(past)} runs "
+                                                + f"{statistics.median(past):.0f} s")
+                        history[key] = [*past, seconds][-MODULE_HISTORY_RUNS:]
+                        timings[key] = seconds
                     results.append(GateJobResult(job.suite, job.path.name, status, finished - job.started, captured))
                     suite_finished[job.suite] = finished
                     running.remove(job)
@@ -485,6 +519,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                 job.output.close()
             save_measures(timings_path, timings)
             save_measures(types_peaks_path, types_peaks)
+            save_measures(history_path, history)
     elapsed = time.monotonic() - began
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
@@ -496,6 +531,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     for result in results:
         if result.suite == "types":
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
+    for slow in slow_modules:
+        print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
     print(f"Gate tests: {elapsed:.2f}s; peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)

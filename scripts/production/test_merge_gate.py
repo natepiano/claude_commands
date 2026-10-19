@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import io
 import os
 from pathlib import Path
@@ -883,6 +884,30 @@ class MergeGateTests(unittest.TestCase):
         self.assertTrue(admission.admits(True))
         admission.release(1)
         self.assertEqual(admission.fixed_mib, {})
+
+    def test_a_module_three_times_slower_than_its_record_and_a_minute_over_is_slow(self) -> None:
+        self.assertTrue(merge_gate.slower_than_recorded(1264.0, 49.0))
+        self.assertTrue(merge_gate.slower_than_recorded(90.0, 30.0))
+        self.assertFalse(merge_gate.slower_than_recorded(89.0, 30.0))
+        self.assertFalse(merge_gate.slower_than_recorded(12.0, 1.0))
+
+    def test_the_report_names_a_module_slower_than_its_record(self) -> None:
+        runner = self.state / "runner"
+        runner.mkdir()
+        self.write(runner / "module_history.json", json.dumps({
+            "lib/test_second.py": [0.0, 0.0, 1000.0], "hooks/test_first.py": [1000.0] * 5}))
+        with mock.patch.object(merge_gate, "SLOW_MODULE_FLOOR_S", 0.0), \
+                mock.patch.dict(os.environ, self.environment), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            run = merge_gate.run_suites(self.checkout)
+        self.assertTrue(run.passed, output.getvalue())
+        self.assertRegex(output.getvalue(), r"(?m)^Slow module: lib/test_second\.py \d+ s, median of the last 3 runs 0 s \(3x or more\)$")
+        history = cast(dict[str, list[float]], json.loads((runner / "module_history.json").read_text()))
+        self.assertEqual(history["lib/test_second.py"][:3], [0.0, 0.0, 1000.0])
+        self.assertEqual(len(history["lib/test_second.py"]), 4)
+        self.assertEqual(history["hooks/test_first.py"][:4], [1000.0] * 4)
+        self.assertEqual(len(history["hooks/test_first.py"]), 5)
+        self.assertNotIn("Slow module: hooks/", output.getvalue())
 
     def test_memory_scan_schedule_uses_controlled_quarter_second_clock(self) -> None:
         admission = merge_gate.SampledRSSAdmission(3072)
