@@ -10,11 +10,12 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import cast
+from urllib.parse import quote
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
@@ -22,9 +23,10 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 import coverage_report
 import rules
 import style_ledger
+import style_rules
 from add_style import StandingStyleProduction, standing_style_production
-from issues import Issue, frontmatter, open_issues
-from proposal_issue import STAR
+from issues import Issue, frontmatter, open_issues, plain
+from proposal_issue import GOAL, STAR
 from unit_files import unit_file_holders
 
 
@@ -127,15 +129,101 @@ def batch_name(label: str, findings: tuple[style_ledger.HeldFinding, ...]) -> st
     return f"style {label[:32]} {digest}.md"
 
 
-def proposed_ranking(kind: style_ledger.FindingKind, finding_count: int) -> str:
+DEFAULT_GOAL = "1 - Ship Hana"
+
+
+def project_goal(proposals: Path, project: str) -> str:
+    counts: Counter[str] = Counter()
+    for path in sorted(proposals.glob("*.md")):
+        issue = Issue(path, frontmatter(path))
+        goal = plain(issue.value("backlog_goal"))
+        if (issue.value("status") == "open" and "style" not in issue.fields.get("tags", [])
+                and plain(issue.value("project")) == plain(project) and GOAL.fullmatch(goal)):
+            counts[goal] += 1
+    if counts:
+        return min(counts, key=lambda goal: (-counts[goal], int(goal.split(" - ", 1)[0]), goal))
+    print(f"goal: no ranked {project} issue; default {DEFAULT_GOAL}")
+    return DEFAULT_GOAL
+
+
+def proposed_ranking(kind: style_ledger.FindingKind, finding_count: int, goal: str) -> str:
     effort = 1 if finding_count <= 3 else 2 if finding_count <= 15 else 3
     impact = 1 if kind == "rename" else 2
-    return (f"goal 1 - Ship Hana · alignment {STAR * 2} · impact {STAR * impact} "
+    return (f"goal {goal} · alignment {STAR * 2} · impact {STAR * impact} "
             + f"· urgency {STAR} · effort {STAR * effort}")
 
 
 def proposal_kind(finding: style_ledger.HeldFinding, definition: rules.Rule) -> style_ledger.FindingKind:
     return "restructure" if definition.tier == "D" or definition.mode_propose else finding.kind
+
+
+@dataclass(frozen=True)
+class GitHubRuleRoot:
+    repository: str
+    branch: str
+
+    def url(self, path: str) -> str:
+        return f"https://github.com/{self.repository}/blob/{quote(self.branch, safe='')}/{quote(path, safe='/')}"
+
+
+def github_rule_root(root: Path) -> GitHubRuleRoot:
+    remote = subprocess.run(["git", "-C", str(root), "remote", "get-url", "origin"],
+                            capture_output=True, text=True, check=False)
+    if remote.returncode:
+        raise style_ledger.LedgerError(f"{root}: cannot read origin: {remote.stderr.strip()}")
+    origin = remote.stdout.strip()
+    match = re.fullmatch(r"(?:git@github\.com:|https://github\.com/)([^/\s]+/[^/\s]+)", origin)
+    if match is None:
+        raise style_ledger.LedgerError(f"{root}: non-GitHub origin {origin}")
+    branch = subprocess.run(["git", "-C", str(root), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                            capture_output=True, text=True, check=False)
+    name = branch.stdout.strip().removeprefix("origin/")
+    if branch.returncode or not name:
+        name = "main"
+        print(f"rules: {root}: no origin/HEAD; default main")
+    return GitHubRuleRoot(match[1].removesuffix(".git"), name)
+
+
+@dataclass
+class RuleLinker:
+    repo: Path
+    roots: dict[Path, GitHubRuleRoot] = field(default_factory=dict)
+
+    def rule_url(self, rule: str) -> str:
+        origin, separator, path = rule.removesuffix("#uncovered").partition(":")
+        if not separator or origin not in {"global", "local"} or not path:
+            raise style_ledger.LedgerError(f"invalid rule {rule}")
+        if PurePosixPath(path).is_absolute() or ".." in PurePosixPath(path).parts:
+            raise style_ledger.LedgerError(f"invalid rule path {rule}")
+        root = (style_rules.NATE_STYLE_DIR if origin == "global" else self.repo).resolve()
+        if root not in self.roots:
+            self.roots[root] = github_rule_root(root)
+        return self.roots[root].url(path)
+
+    def urls(self, findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[str, ...]:
+        return tuple(sorted({self.rule_url(finding.rule) for finding in findings}))
+
+
+def link_rules(ledger: style_ledger.Ledger, proposals: Path) -> None:
+    by_id = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+    linker = RuleLinker(ledger.repo)
+    linked = already = skipped = 0
+    for path in sorted(proposals.glob("*.md")):
+        fields = frontmatter(path)
+        if "style" not in fields.get("tags", []) or not fields.get("style_findings"):
+            continue
+        if "style_rules" in fields:
+            already += 1
+            continue
+        missing = [identity for identity in fields["style_findings"] if identity not in by_id]
+        if missing:
+            skipped += 1
+            print(f"skipped {path}: unknown findings {', '.join(missing)}")
+            continue
+        findings = tuple(by_id[identity] for identity in fields["style_findings"])
+        proposal_command("rules", str(path), "--rules", ",".join(linker.urls(findings)))
+        linked += 1
+    print(f"linked {linked}, already linked {already}, skipped {skipped}")
 
 
 def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> tuple[Path, ...]:
@@ -179,6 +267,8 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
     holders: dict[str, frozenset[str]] = (
         unit_file_holders(ledger.repo, standing.doc, ledger) if isinstance(standing, StandingStyleProduction) else {}
     )
+    linker = RuleLinker(ledger.repo)
+    goals: dict[str, str] = {}
     written: list[Path] = []
     for (kind, rule, crate), items in sorted(batches.items()):
         findings = tuple(items)
@@ -195,11 +285,13 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
             body_file = Path(scratch) / "body.md"
             _ = body_file.write_text("\n".join(body))
             project = issue_project(ledger.repo, crate, proposals.parent)
+            if project.project not in goals:
+                goals[project.project] = project_goal(proposals, project.project)
             proposal_command("create", str(issue), "--project", project.project, "--short", project.short,
                              "--proposed-by", style_slug(ledger.repo),
-                             "--proposed-ranking", proposed_ranking(kind, len(findings)),
+                             "--proposed-ranking", proposed_ranking(kind, len(findings), goals[project.project]),
                              "--extra-tags", "style", "--findings", ",".join(finding.finding_id for finding in findings),
-                             "--body-file", str(body_file))
+                             "--body-file", str(body_file), "--rules", ",".join(linker.urls(findings)))
         for finding in findings:
             ledger.file_held(finding.finding_id, issue)
         written.append(issue)
@@ -211,6 +303,7 @@ def rank_proposals(ledger: style_ledger.Ledger, proposals: Path) -> None:
     definitions = {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)}
     directories = _workspace_directories(ledger)
     by_id = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+    goals: dict[str, str] = {}
     ranked = 0
     for issue in open_issues(proposals, "style"):
         try:
@@ -227,8 +320,11 @@ def rank_proposals(ledger: style_ledger.Ledger, proposals: Path) -> None:
                 raise style_ledger.LedgerError("findings do not form one proposal batch")
             kind: style_ledger.FindingKind = next(iter(kinds))
             text = issue.path.read_bytes().decode("utf-8")
+            project = plain(issue.value("project"))
+            if project not in goals:
+                goals[project] = project_goal(proposals, project)
             updated = re.sub(r"^Proposed ranking:[ \t]*(?=\r?$)",
-                             lambda match: match[0].rstrip(" \t") + " " + proposed_ranking(kind, len(findings)),
+                             lambda match: match[0].rstrip(" \t") + " " + proposed_ranking(kind, len(findings), goals[project]),
                              text, count=1, flags=re.MULTILINE)
             if kind == "restructure" and crates == {"."}:
                 updated = re.sub(r"^# Style restructure: (?=\r?$)",
@@ -276,6 +372,8 @@ def main(argv: list[str]) -> int:
     _ = filing.add_argument("--parent", required=True)
     ranking = sub.add_parser("rank")
     _ = ranking.add_argument("--proposals", type=Path, required=True)
+    linking = sub.add_parser("link-rules")
+    _ = linking.add_argument("--proposals", type=Path, required=True)
     _ = sub.add_parser("complete")
     declining = sub.add_parser("decline")
     _ = declining.add_argument("--issue", type=Path, required=True)
@@ -289,6 +387,8 @@ def main(argv: list[str]) -> int:
                 _ = file_proposals(ledger, args.proposals.expanduser().resolve(), args.parent)
             elif args.command == "rank":
                 rank_proposals(ledger, args.proposals.expanduser().resolve())
+            elif args.command == "link-rules":
+                link_rules(ledger, args.proposals.expanduser().resolve())
             elif args.command == "decline":
                 decline(ledger, args.issue.expanduser().resolve(), args.words)
             else:
