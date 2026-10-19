@@ -731,8 +731,10 @@ class LaunchBuildWarningTests(unittest.TestCase):
         self.source = self.root / "crates" / "hana" / "main.rs"
         self.source.parent.mkdir(parents=True)
         _ = self.source.write_text("committed source\n")
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/hana"]\n')
+        _ = (self.root / "Cargo.lock").write_text("version = 4\n")
         self.git("init", "--quiet")
-        self.git("add", "crates/")
+        self.git("add", "crates/", "Cargo.toml", "Cargo.lock")
         self.git("-c", "user.name=Hana Shot Test", "-c", "user.email=hana-shot@example.invalid", "commit", "--quiet", "-m", "fixture")
         self.executable = self.root / "target" / "debug" / "hana"
         self.executable.parent.mkdir(parents=True)
@@ -767,6 +769,30 @@ class LaunchBuildWarningTests(unittest.TestCase):
         _ = path.write_text("new source\n")
         os.utime(path, ns=(1_000_000_000, 1_000_000_000))
         self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [path.relative_to(self.root).as_posix()])
+
+    def test_modified_root_lockfile_older_than_binary_is_named(self) -> None:
+        path = self.root / "Cargo.lock"
+        _ = path.write_text("version = 4\n# dependency changed\n")
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), ["Cargo.lock"])
+
+    def test_modified_root_manifest_newer_than_binary_is_excluded(self) -> None:
+        path = self.root / "Cargo.toml"
+        _ = path.write_text('[workspace]\nmembers = []\n')
+        os.utime(path, ns=(3_000_000_000, 3_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
+
+    def test_manifest_outside_crates_and_repository_root_is_excluded(self) -> None:
+        path = self.root / "other" / "Cargo.toml"
+        path.parent.mkdir()
+        _ = path.write_text('[package]\nname = "unrelated"\n')
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
+
+    def test_deleted_root_cargo_files_are_named_without_file_mtimes(self) -> None:
+        (self.root / "Cargo.toml").unlink()
+        (self.root / "Cargo.lock").unlink()
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), ["Cargo.lock", "Cargo.toml"])
 
     def test_deleted_source_is_included_without_a_file_mtime(self) -> None:
         self.source.unlink()
@@ -812,7 +838,7 @@ class LaunchBuildWarningTests(unittest.TestCase):
         with mock.patch.object(hana_shot, "port_answers", return_value=False), self.assertRaises(hana_shot.Refused) as refused:
             _ = hana_shot.launch(15797, str(self.root), str(self.executable))
         self.assertIn(f"no Hana binary at {self.executable}; build it first (cargo build -p hana)", str(refused.exception))
-        self.assertIn("crates/ has uncommitted edits a build will include: crates/hana/main.rs", str(refused.exception))
+        self.assertIn("uncommitted edits in crates/ or the root Cargo files will be included by a build: crates/hana/main.rs", str(refused.exception))
 
     def test_launch_warns_before_start_and_saves_all_uncommitted_paths_with_capped_text(self) -> None:
         paths: list[str] = []
@@ -847,7 +873,7 @@ class LaunchBuildWarningTests(unittest.TestCase):
         ):
             state, _ = hana_shot.launch(15797, str(self.root), str(self.executable))
         warning = next(line for line in diagnostics.getvalue().splitlines() if line.startswith("hana_shot: warning:"))
-        self.assertIn(f"{self.executable} was built after uncommitted edits in crates/", warning)
+        self.assertIn(f"{self.executable} was built after uncommitted edits in crates/ or the root Cargo files,", warning)
         for path in paths[:10]:
             self.assertIn(path, warning)
         for path in paths[10:]:

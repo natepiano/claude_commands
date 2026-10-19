@@ -1936,10 +1936,10 @@ def panic_lines(log: Path) -> list[str]:
 
 
 def uncommitted_build_paths(root: Path, executable: Path) -> list[str]:
-    """Dirty crate paths that predate the binary, or every dirty path before a build."""
+    """Dirty build inputs that predate the binary, or every dirty input before a build."""
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "crates/"],
+            ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "crates/", "Cargo.toml", "Cargo.lock"],
             stdin=subprocess.DEVNULL, capture_output=True, timeout=3, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -1953,12 +1953,12 @@ def uncommitted_build_paths(root: Path, executable: Path) -> list[str]:
             continue
         status = record[:2]
         path = os.fsdecode(record[3:])
-        if path.startswith("crates/"):
+        if path.startswith("crates/") or path in ("Cargo.toml", "Cargo.lock"):
             dirty[path] = b"D" in status
         if b"R" in status or b"C" in status:
             # In -z format the destination comes first, followed by the original path.
             original = os.fsdecode(next(records, b""))
-            if b"R" in status and original.startswith("crates/"):
+            if b"R" in status and (original.startswith("crates/") or original in ("Cargo.toml", "Cargo.lock")):
                 dirty[original] = True
     try:
         if not executable.is_file():
@@ -1995,11 +1995,11 @@ def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchS
     executable = Path(binary).expanduser().resolve() if binary else root / "target" / "debug" / "hana"
     uncommitted_paths = uncommitted_build_paths(root, executable)
     if not executable.is_file():
-        hint = f"; crates/ has uncommitted edits a build will include: {build_paths_label(uncommitted_paths)}" if uncommitted_paths else ""
+        hint = f"; uncommitted edits in crates/ or the root Cargo files will be included by a build: {build_paths_label(uncommitted_paths)}" if uncommitted_paths else ""
         raise Refused(f"no Hana binary at {executable}; build it first (cargo build -p hana){hint}")
     if uncommitted_paths:
         print(
-            f"hana_shot: warning: {executable} was built after uncommitted edits in crates/, "
+            f"hana_shot: warning: {executable} was built after uncommitted edits in crates/ or the root Cargo files, "
             + f"so this Hana runs that code: {build_paths_label(uncommitted_paths)}",
             file=sys.stderr,
         )
