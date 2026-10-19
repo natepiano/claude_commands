@@ -92,7 +92,6 @@ import launch_permission as restore_permission  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 import remote_control  # noqa: E402
-import showrunner_footer  # noqa: E402
 import stop as stop_work  # noqa: E402
 from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -1437,11 +1436,6 @@ def _restore_timers(
                             reason=_error_reason(error),
                         )
                     )
-        footer = timer["footer"]
-        if footer["kind"] == "footer" and not dry_run:
-            showrunner_footer.set_footer_state(
-                footer["slug"], showrunner_footer.FooterState.ON
-            )
     return tuple(failures)
 
 

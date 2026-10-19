@@ -634,7 +634,7 @@ class StopTests(ShutdownTestCase):
 
     def test_cancel_during_a_stop_claim_keeps_its_record_and_timers(self) -> None:
         saved = entry(top_level('owner', 101))
-        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True, footer=record.NoFooter(kind='no footer'))]
+        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True)]
         self.create([saved])
         entered = threading.Event()
         release = threading.Event()

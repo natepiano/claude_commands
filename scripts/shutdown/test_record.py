@@ -103,7 +103,6 @@ def entry(
     progress: object = None,
     *,
     number: int = 1,
-    timer_footer: record.ShowrunnerFooter | record.NoFooter | None = None,
     settle_message: record.SettleMessage | None = None,
     where: record.Where | None = None,
 ) -> LegacyEntryFixture:
@@ -113,7 +112,6 @@ def entry(
             record.TimerRestore(
                 instance=f"timer-{number}",
                 was_enabled=True,
-                footer=timer_footer or record.NoFooter(kind="no footer"),
             )
         ],
         settle_message=settle_message or record.SettleMessageNotSent(kind="not sent"),
@@ -1575,8 +1573,7 @@ class RecoverySnapshotTests(ShutdownTestCase):
         entries: list[record.SnapshotSession] = []
         for number in numbers:
             entries.append(record.SnapshotClaudeSession(agent="claude", session=session(number), workers=[],
-                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True,
-                    footer=record.ShowrunnerFooter(kind="footer", slug="show"))], last_seen=NOW, state="running", boot_id="boot-one"))
+                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True)], last_seen=NOW, state="running", boot_id="boot-one"))
         return record.RecoverySnapshot(machine="natedev", login="owner@example.com", label="owner",
                                        taken_at=NOW, sessions=entries, boot_id="boot-one")
 

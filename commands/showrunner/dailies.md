@@ -320,12 +320,12 @@ unless it names another plan's document. User, 2026-10-02.
   not be read. A row from `expand` carries no style line. A showrunner with
   nothing below it gets none of this.
 - **Agents:** after the chart and any build-hold and Mac-block lines, one line per active account shows its week used, when it runs out at its current pace (each rise weighted by half per 12 hours of age, across refills, `scripts/whoami/run_out.py`), whether it reaches its refill first, and its available resets. With no pace, it says the account does not run out at this pace; when exhausted, it says the account ran out: `- claude1: 40%; runs out about Tue 07:10 EDT, before its Sun 23:00 refill; 1 reset available until Oct 22` (user, 2026-10-05; wording updated 2026-10-06).
-- **Footer:** the reply footer (`/showrunner:produce` → Footer), from
-  `next_run`, the build-holder files, the Mac block file, `OUTSTANDING` and whether
-  any subject has `needed:`. A due item below this production also keeps it
-  from saying `nothing needed`, and the two tree bullets (`reports to <root>`,
-  `<slug>: needs-user list unreadable`) appear as in a reply. The report ends with that footer. The Waiting on
-  block follows it, as in every reply.
+- **Footer:** the report ends with its own closing bullets, from `next_run`,
+  the build-holder files, the Mac block file, `OUTSTANDING` and whether any
+  subject has `needed:`. A due item below this production also keeps it from
+  saying `nothing needed`, and the two tree bullets (`reports to <root>`,
+  `<slug>: needs-user list unreadable`) appear there. No reply carries this
+  footer and no `Waiting on:` block follows it (user, 2026-10-18).
 
 ## Length
 

@@ -51,9 +51,9 @@ State:
   (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`), and
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
-  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The footer hook asks for it only until one reply has carried it.
+  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The Stop hook asks for it only until one reply has carried it.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
-  by `update_registration.py footer --state` when `SHOWRUNNER_STATE` includes
+  by `update_registration.py questions --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
   `report_to_user` is kept the same way in
   `~/.local/state/showrunner/reports/<slug>.json`.
@@ -115,8 +115,7 @@ State:
   (`/showrunner:attach`). `showrunners.py parent|children|root <slug>` and
   `showrunners.py tree` say where a production sits; look it up each time, as
   an attachment can change. The top of a tree is its root, the user's one
-  place to see everything below it: its count, its list and its footer cover
-  every item that needs the user. The user may still work with any showrunner
+  place to see everything below it: its count and its list cover every item that needs the user. The user may still work with any showrunner
   directly, and one below a root answers them in its own pane as a root does.
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
@@ -147,7 +146,7 @@ State:
     needed, wherever the answer came from, the user typing in your own pane
     included. The root's count drops by itself: send the root nothing to drop
     it. A phone alert for it (<Notify/>) is still yours to send, as before. If
-    the root is not running, keep it there and say so at your next footer.
+    the root is not running, keep it there and say so in your next reply.
   - **A question between productions** (a Mac window, the order of two
     promotions) goes to your parent, not to the root.
   - **Who decides a shared resource:**
@@ -167,12 +166,12 @@ State:
     child's words, and relay the answer back to that child.
   - **As a root**, never copy a lower showrunner's item into your own
     `open_for_user`. It stays in its owner's list; your count and your
-    footer's `nothing needed` already cover every list below you. When its
+    dailies' `nothing needed` already cover every list below you. When its
     owner clears it, your count drops with no message to you and nothing for
     you to remove (live check, 2026-10-12: an item answered in the lower
     showrunner's own pane had to be dropped at the root by hand).
-  - **Two footer bullets come from the tree.** Under a root, your footer
-    carries `reports to <root>`. As a root, `<slug>: needs-user list
+  - **Two dailies bullets come from the tree.** Under a root, your dailies'
+    closing bullets carry `reports to <root>`. As a root, `<slug>: needs-user list
     unreadable` means that production's list could not be counted: tell its
     showrunner to store it again.
   - **Your dailies show each production directly below you as one row**, from
@@ -230,10 +229,8 @@ State:
     silent, <DesignAuthority/>). Never bring them a choice you can settle.
 - **Open questions.** Ask the user each question once, in full, in the reply
   where it first comes up: what is asked, why, and the answer choices. Set it
-  in `open_for_user` in that turn (**Footer** below). After that turn no reply
-  restates the question or its choices. The Waiting on block says only
-  `There are {n} open questions for you.` (`There is 1 open question for you.`
-  for one), where n counts every `OUTSTANDING` item now due: everything that
+  in `open_for_user` in that turn (**Open-questions list** below). After that turn no reply
+  restates the question or its choices. The user sees only their count n, where n counts every `OUTSTANDING` item now due: everything that
   waits on the user, a step only they can run included. A root's n also counts
   every due item of every production below it (**Nested showrunners** above).
   A change waiting for the user's check is never an open question: it goes on
@@ -251,7 +248,7 @@ State:
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
   by the production that owns it. A dailies report still lists what needs the user in full, because
   it is a report the user asked for. User, 2026-10-12, replacing the
-  2026-10-06 rule that restated the user's items in every Waiting on block.
+  2026-10-06 rule that restated the user's items in every reply.
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
 - **Helpers.** Stop each named helper agent once its report is read.
@@ -266,61 +263,32 @@ State:
   director answered without a time, message it yourself, because
   the command will not repeat the request. Report `none measured - requested`
   until it answers.
-- **Waiting on block.** When footers are on, after the footer leave two empty lines, write `Waiting on:`, leave one empty line, then write one `* ` bullet per item. What waits on the user shows only as its count (**Open questions** above): while any item is due, the first bullet is `There are {n} open questions for you.`, and no bullet restates one. Every other item leads with its ETA from measured runs, without the zone, soonest first: `19:45 (18:20–23:55) - startup Phase 16`; items with none follow, led by `no ETA measured - `. Name each item by what it is and what it is doing, never by a task, agent or session id. The footer hook checks the block's form, the count and the item order. User, 2026-10-06; count rule 2026-10-12.
-- **Footer.** Run `python3 ~/.claude/scripts/production/update_registration.py
-  footer --production PRODUCTION_DOC` for the footer, adding
-  `--state SHOWRUNNER_STATE` once that file exists. Paste the rendered footer
-  word for word before the Waiting on block.
-  Pass `--nothing-needed` when no subject needs a follow-up nobody has started.
-  When the user-facing open list changes, set `open_for_user` in
-  `SHOWRUNNER_STATE` to the complete new list, starting from `OUTSTANDING`'s
-  current items; `[]` clears it.
-  The line after the footer's `HH:MM <zone> update:` header counts what waits
-  on the user, read when the footer is rendered and never stored, zero counts
-  left out and no line when all are zero: `For you: 2 changes to review, 1
-  proposal, 3 projects`. Changes are the rows still to review on the list the
-  doc's Change review line names; proposals are the open `proposal` issues in
-  its Proposals folder; projects, only for a doc with an `- **Improvement
-  queue:** <ledger>` line, are its ledger lines still `proposed`, or
-  `accepted` without `assigned`, `applied`, `built` or `declined` (write
-  `assigned <unit>` on a line when you hand the project out). The Waiting on
-  block carries the question count, so this line leaves it out.
-  When the footer switch is off, the command says `footers off`; omit both the
-  footer and the Waiting on block. It still stores `open_for_user`, so the
-  dailies count it. It prints no counts line. A reply never carries a
-  `For you: …` line, because the user reads those counts in the status line.
-  The footer hook blocks a reply that has one (user, 2026-10-18). The command reads the switch, the notifier's
-  next due time, and open-for-the-user items from `OUTSTANDING`. Keep each
-  item complete enough to stand alone when the user asks for the list: what
-  is asked, where, why and the choices. Remove
-  an item only when the user addresses it and tells you; defer an item with
-  `after` when the user asks. Build holds come from holder files in
-  `~/.local/state/build-hold/`, and a dailies input marks each held unit. A
-  pending or active Mac block comes from `~/.local/state/mac-test/`.
+- **No footer.** A reply carries no footer, no `Waiting on:` block and no
+  `For you: …` line. The user reads the counts in the status line (user,
+  2026-10-18: "i want footers gone for good").
+- **Open-questions list.** When the user-facing open list changes, set
+  `open_for_user` in `SHOWRUNNER_STATE` to the complete new list, starting
+  from `OUTSTANDING`'s current items (`[]` clears it), and run `python3
+  ~/.claude/scripts/production/update_registration.py questions --production
+  PRODUCTION_DOC --state SHOWRUNNER_STATE`. It stores the list in
+  `OUTSTANDING` and reviews each new question; paste each `reviewed question:`
+  line it prints into the reply that asks it. Keep each item complete enough
+  to stand alone when the user asks for the list: what is asked, where, why
+  and the choices. Remove an item only when the user addresses it and tells
+  you; defer an item with `after` when the user asks. Build holds come from
+  holder files in `~/.local/state/build-hold/`, and a dailies input marks each
+  held unit. A pending or active Mac block comes from
+  `~/.local/state/mac-test/`.
 
   `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
-  targeted by `UPDATES`. When footers are on, a missing or outdated footer or
-  Waiting on block blocks the reply with the exact footer lines and the Waiting on
-  block's form. A block that restates a user item, or whose count differs from the
-  `OUTSTANDING` items now due, blocks it with the count line to write. End the reply with those lines and the Waiting on block. The footer
-  check passes a reply after any Stop-hook block, and the hook passes on errors.
+  targeted by `UPDATES`. It blocks a reply that asks the user something not
+  stored through `questions`, and a reply that leaves out a reviewed question
+  still waiting to be asked. It passes on errors.
 
-  A turn the user did not start (only cross-session messages, the update tick
-  among them, or task notifications) can get exactly `-` as its reply when
-  nothing in it is of use to the user; `-` carries no footer. A reply with a
-  result or status the user can use goes out as usual, with the footer when
-  footers are on.
+  An `/adhoc_review` in this session pauses current dailies, then asks whether
+  to turn them back on at the end (`commands/adhoc_review.md` Steps 2 and 5).
 
-  `/showrunner:footer off` and `/showrunner:footer on` pause and resume the
-  footer for this showrunner. A new production starts with it off. Run them when the user says "footers off" or
-  "footers on" as well as when they type the command. While `/showrunner:footer`
-  reports off, omit both the footer and the Waiting on block. Run
-  `/showrunner:footer` after every compaction and session resume: its switch
-  survives both. An `/adhoc_review` in this session pauses current dailies and
-  footers, then asks whether to turn back on what it paused at the end
-  (`commands/adhoc_review.md` Steps 2 and 5). The dailies keep their own switch.
-
-  When the user types a message here, the dailies and footer pause on their own.
+  When the user types a message here, the dailies pause on their own.
   Later, a `conversation-pause:` message asks you to put this question to the
   user word for word: `Return to automatic updates? (yes / no) They return on
   their own in 5 minutes.` Never answer it for them. Their typed yes or no is
@@ -333,27 +301,6 @@ State:
   open here, the question waits for the review to end.
   `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/conversation_pause.py" status`
   says what is paused.
-
-  Example with a hold and an active agent (user, 2026-10-04):
-
-  ```text
-
-  ---
-  11:37 EDT update:
-
-  * build hold: <holder> holds builds since 11:34 EDT for the frame-time lane's breakdown of what each added tool costs; expected to release 11:40 EDT (in 3 minutes)
-  * Mac block: <holder> since 11:35 EDT, for the Mac-only test run - lifts Wed 12:35 EDT
-  * claude1: …
-  * next dailies: 11:53 EDT - nothing needed
-
-
-  Waiting on:
-
-  * <item>
-  ```
-  With two questions open, the last footer bullet drops ` - nothing needed`
-  and the block's first bullet is `* There are 2 open questions for you.`.
-  A dailies report ends with the same footer.
 </Throughout>
 
 ---
@@ -454,11 +401,9 @@ When the doc's Updates line reads `on demand`, or there is none, it makes
 `UPDATES` at the default 15 minutes and stops it, prints `on demand: no
 scheduled dailies`, and no scheduled update comes: a dailies runs only when
 the user asks for one. The stopped instance stays, because it is the
-showrunner's only record. On a new production, one with no `UPDATES` yet, it
-also turns the footer off and prints `footer: ok — off — new production`; a
-restart keeps the footer as it was. New productions are quiet until the user
-asks (user, 2026-10-13): `/showrunner:report_interval <minutes>` schedules
-updates and `/showrunner:footer on` turns the footer on.
+showrunner's only record. New productions are quiet until the user asks
+(user, 2026-10-13): `/showrunner:report_interval <minutes>` schedules
+updates.
 
 The prompt:
 
