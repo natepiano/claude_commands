@@ -158,9 +158,16 @@ class NextMovesTests(unittest.TestCase):
         next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
         self.assertEqual(next_moves.read_next_moves(), (unit, claude))
 
+    def test_numbered_claude_workers_target_survives_storage_and_listing(self) -> None:
+        entry = next_moves.add_next_move("workers", 1, "claude4")
+        self.assertEqual(next_moves.read_next_moves(), (entry,))
+        assert isinstance(entry, next_moves.WorkersMove)
+        self.assertEqual(entry.to, next_moves.DelegateToClaude(next_moves.ClaudeWorkersTarget("claude4")))
+        self.assertIn("workers 1: at 1% → claude4", next_moves.list_next_moves())
+
     def test_workers_hold_and_wrong_tool_targets_are_refused_without_changing_the_log(self) -> None:
         entry = next_moves.add_next_move("units", 1, "claude4")
-        for target, hold in (("codex2", 5), ("claude", 1), ("claude2", 0), ("codex0", 0)):
+        for target, hold in (("codex2", 5), ("claude", 1), ("claude0", 0), ("codex0", 0)):
             with self.subTest(target=target, hold=hold):
                 with self.assertRaises(next_moves.NextMoveError):
                     _ = next_moves.add_next_move("workers", 1, target, hold)
@@ -171,7 +178,7 @@ class NextMovesTests(unittest.TestCase):
             _ = next_moves.decode_next_moves(json.dumps(document))
 
     def test_remote_workers_add_and_read_preserve_target_variants_without_local_log(self) -> None:
-        for target in ("codex2", "claude"):
+        for target in ("codex2", "claude", "claude4"):
             with self.subTest(target=target):
                 def remote(arguments: tuple[str, ...]) -> str:
                     self.assertEqual(arguments[0], "next-write")

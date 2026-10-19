@@ -1,4 +1,4 @@
-"""Claude next-move reminders and Codex quota delivery use isolated state."""
+"""Claude account-move reminders and Codex quota delivery use isolated state."""
 
 from __future__ import annotations
 
@@ -350,7 +350,7 @@ class QuotaAlertTests(unittest.TestCase):
             "claude2 has 2% of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.")
         self.assertEqual(self.noted[0].title, "Claude work on claude2 may stop")
         self.assertEqual(self.noted[0].action,
-                         ActionRequired("In the natedev session, type /next_moves and the move you want, for example: when units reach 1% switch to claude2."))
+                         ActionRequired("In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2."))
         for minute, left in ((4, "1"), (32, "1"), (120, "null"), (122, "1")):
             _ = self.alert([self.note("claude2.md", "active", left)], self.now + timedelta(minutes=minute))
         self.assertEqual(len(self.noted), 1)
@@ -633,7 +633,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(push.body,
             "codex1 has 2% of its weekly usage left, and no move is set up for its workers. When it runs out, they spend its paid credits, then move to Claude. Nothing is needed.")
         self.assertEqual(push.action, ActionRequired(
-            "Optional: to move them at 1% instead, type in the natedev session: /next_moves when workers reach 1% switch to Claude"))
+            "Optional: to move them at 1% instead, type in the natedev session: /account_moves when workers reach 1% switch to Claude"))
         self.assertEqual(self.sent, [])
         _ = self.alert([self.note("codex1.md", "active", "80")], self.now + timedelta(minutes=34))
         self.sent.clear()  # Restoration notices remain in Phase54.
@@ -1346,6 +1346,154 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         stale = next(home for home in checked if home.home == self.root / ".codex3")
         usage_store.save([stale.report], stale.observed_at)
         return quota_alert.CodexAlertPassReadings(fresh.workers, fresh.selected_account, checked)
+
+    def test_queued_claude_account_routes_workers_and_overrides_only_worker_launches(self) -> None:
+        _ = (self.root / ".claude.json").write_text("{}")
+        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude4"), [])
+        directory = accounts.account_dir("claude4")
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "workers@example.invalid"}}))
+        _ = next_moves.add_next_move("workers", 1, "claude4")
+        _ = self.alert(left=1)
+        self.swap.assert_not_called()
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "claude")
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(fallback.claude_account, next_moves.ClaudeWorkersTarget("claude4"))
+        routed = [row for row in moves.read_journal() if row["kind"] == "routed to claude"]
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0].get("claude_account"), "claude4")
+        self.assertEqual(role_map.read_role_map().workers_claude, role_map.NamedWorkersClaudeAccount("claude4", self.now + timedelta(days=2)))
+        # A caller with an invalid account must not replace the workers route.
+        selected = accounts.account_for_unscoped_launch({"CLAUDE_CONFIG_DIR": str(self.root / ".claude99")}, workers=True)
+        self.assertEqual(selected, accounts.NamedAccount("claude4", directory))
+        with self.assertRaises(accounts.AccountsError):
+            _ = accounts.account_for_unscoped_launch({"CLAUDE_CONFIG_DIR": str(self.root / ".claude99")})
+        (directory / ".claude.json").unlink()
+        with self.assertRaisesRegex(accounts.AccountsError, "claude and /login"):
+            _ = accounts.account_for_unscoped_launch({}, workers=True)
+
+        # Recovery closes the shared route as well as the local fallback.
+        with quota_alert.state_file() as state:
+            back = quota_alert.switch_back(state, self.now + timedelta(days=8),
+                self.readings(self.now + timedelta(days=8), left=100))
+        self.assertIsInstance(back, quota_alert.SwitchBack)
+        self.assertIsInstance(role_map.read_role_map().workers_claude, role_map.DefaultWorkersClaudeAccount)
+
+    def test_failed_named_claude_switch_keeps_the_previous_workers_route(self) -> None:
+        _ = (self.root / ".claude.json").write_text("{}")
+        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude4"), [])
+        _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "workers@example.invalid"}}))
+        _ = next_moves.add_next_move("workers", 1, "claude4")
+        with mock.patch.object(quota_alert, "edit_registry", return_value="fixture switch failed"):
+            _ = self.alert(left=1)
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        self.assertIsInstance(role_map.read_role_map().workers_claude, role_map.DefaultWorkersClaudeAccount)
+        self.assertEqual(len(next_moves.read_next_moves()), 1)
+        with quota_alert.state_file() as state:
+            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+
+    def test_failed_route_rollback_keeps_both_errors_and_the_unseen_switch_notice(self) -> None:
+        owner = self.readings(self.now).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        until = self.now + timedelta(days=2)
+        note = self.note(1)
+        original_write = role_map.write_role_map
+        for failure in (role_map.RoleMapWriteRefused("fixture rollback refused"),
+                        role_map.RoleMapUnavailable("fixture map unavailable"),
+                        OSError("fixture disk full")):
+            with self.subTest(failure=type(failure).__name__):
+                original_write(role_map.WorkersClaudeRouteChange(
+                    role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "reset the test route", self.now.isoformat()))
+
+                def write_route(change: role_map.RoleMapChange | role_map.WorkersClaudeRouteChange) -> None:
+                    if isinstance(change, role_map.WorkersClaudeRouteChange) and isinstance(
+                            change.account, role_map.DefaultWorkersClaudeAccount):
+                        raise failure
+                    original_write(change)
+
+                with quota_alert.state_file() as state:
+                    state["episodes"][note.label] = {"since": self.now.isoformat(), "last": {}}
+                    state["unseen"] = []
+                    with (mock.patch.object(quota_alert, "edit_registry", return_value="fixture edit failed"),
+                          mock.patch.object(role_map, "write_role_map", side_effect=write_route)):
+                        result = quota_alert.switch_to_claude(state, note, self.now.isoformat(), owner,
+                            hold=quota_alert.ScheduledMoveHold(until),
+                            claude_account=next_moves.ClaudeWorkersTarget("claude4"))
+                    assert isinstance(result, quota_alert.CodexWorkSwitchFailed)
+                    self.assertIn("fixture edit failed", result.cause)
+                    self.assertIn(f"route rollback failed: {failure}", result.cause)
+                    self.assertEqual(state["episodes"][note.label].get("switch_failed"), result.cause)
+                with quota_alert.state_file() as saved:
+                    unseen = saved.get("unseen", [])
+                    self.assertEqual(len(unseen), 1)
+                    self.assertIn(result.cause, unseen[0])
+                self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+
+    def test_uncertain_registry_switch_keeps_the_named_route_until_the_weekly_reset(self) -> None:
+        for failed_step in ("edit", "confirmation"):
+            with self.subTest(failed_step=failed_step):
+                _ = quota_alert.REGISTRY.write_text(REGISTRY)
+                owner = self.readings(self.now).selected_account
+                assert isinstance(owner, agent_accounts.KnownCodexAccount)
+                until = self.now + timedelta(days=2)
+                note = self.note(1)
+                original_edit = quota_alert.edit_registry
+
+                def edit_then_lose_confirmation(editor: str, *arguments: str) -> str | None:
+                    result = original_edit(editor, *arguments)
+                    if failed_step == "edit":
+                        raise OSError("fixture edit reply lost")
+                    return result
+
+                original_read = quota_alert.registry_assignments
+                with quota_alert.state_file() as state:
+                    with (mock.patch.object(quota_alert, "edit_registry", side_effect=edit_then_lose_confirmation),
+                          mock.patch.object(quota_alert, "registry_assignments", side_effect=[
+                              original_read(), OSError("fixture confirmation failed")])):
+                        result = quota_alert.switch_to_claude(state, note, self.now.isoformat(), owner,
+                            hold=quota_alert.ScheduledMoveHold(until),
+                            claude_account=next_moves.ClaudeWorkersTarget("claude4"))
+                    self.assertIsInstance(result, quota_alert.CodexWorkSwitchFailed)
+                    self.assertTrue(any("failed" in line for line in state.get("unseen", [])))
+                self.assertEqual(original_read()["delegate"], "claude")
+                self.assertEqual(role_map.read_role_map().workers_claude,
+                                 role_map.NamedWorkersClaudeAccount("claude4", until))
+
+    def test_lost_quota_state_does_not_keep_the_named_workers_account_past_its_reset(self) -> None:
+        _ = (self.root / ".claude.json").write_text("{}")
+        for label in ("claude2", "claude4"):
+            _ = (self.root / f"{label}.md").write_text(f"---\nlogin: {label}@example.invalid\n---\n")
+            self.assertEqual(accounts.setup(label), [])
+            _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+        _ = next_moves.add_next_move("workers", 1, "claude4")
+        _ = self.alert(left=1)
+        caller = {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}
+        self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
+                         accounts.NamedAccount("claude4", accounts.account_dir("claude4")))
+        _ = quota_alert.STATE.write_text("invalid quota state")
+        until = self.now + timedelta(days=2)
+        with quota_alert.state_file() as state:
+            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+            self.assertIsInstance(quota_alert.switch_back(state, until, self.readings(until, left=100)),
+                                  quota_alert.NoCodexFallbackRestoration)
+        with mock.patch.object(accounts, "datetime", wraps=datetime, now=mock.Mock(return_value=until)):
+            self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
+                             accounts.NamedAccount("claude2", accounts.account_dir("claude2")))
+
+    def test_queued_claude_account_with_no_folder_waits_with_setup_step(self) -> None:
+        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        head = next_moves.add_next_move("workers", 1, "claude4")
+        _ = self.alert(left=1)
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.swap.assert_not_called()
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        self.assertTrue(any("accounts.py setup claude4" in text for text in self.relayed_texts()))
 
     def test_stale_workers_head_blocks_a_fresh_later_entry_and_notifies_once(self) -> None:
         head = next_moves.add_next_move("workers", 1, "codex3")

@@ -44,14 +44,14 @@
   },
   "quota.claude_next_move": {
     "uncovered_empty": {
-      "reviewer": "opus",
-      "sha256": "2a7621904fa25e78aad26f1d722ab1771c161194723dc0c1db90ac57a9a5763a",
-      "time": "2026-10-16T21:23:39.016211-04:00"
+      "reviewer": "opus; user-spec: Phase 81 renames the slash command to /account_moves; command name only",
+      "sha256": "bbf6f78138530821038d9877e23a7dfa123e8dc73970e1ec472598952f505b74",
+      "time": "2026-10-19T16:50:03.103471-04:00"
     },
     "uncovered_low": {
-      "reviewer": "opus",
-      "sha256": "2a7621904fa25e78aad26f1d722ab1771c161194723dc0c1db90ac57a9a5763a",
-      "time": "2026-10-16T21:23:28.135801-04:00"
+      "reviewer": "opus; user-spec: Phase 81 renames the slash command to /account_moves; command name only",
+      "sha256": "bbf6f78138530821038d9877e23a7dfa123e8dc73970e1ec472598952f505b74",
+      "time": "2026-10-19T16:50:03.103547-04:00"
     }
   },
   "quota.codex_credits_forecast": {
@@ -173,7 +173,7 @@
     "credits_off_claude": {
       "objections": [
         {
-          "quote": "Optional: to move them at 1% instead, type in the natedev session: /next_moves when workers reach 1% switch to Claude",
+          "quote": "Optional: to move them at 1% instead, type in the natedev session: /account_moves when workers reach 1% switch to Claude",
           "rule": "every-choice-says-what-it-does"
         },
         {
@@ -189,9 +189,9 @@
           "rule": "before-and-after"
         }
       ],
-      "reviewer": "user-spec: showrunner 2026-10-16 exact text; user 2026-10-14: credits-on default is stay on credits; user redesign: no entry -> alert at 2% to set up what happens next, similar for Codex; reviewer: opus",
-      "sha256": "22d35ab39eff4de362aac0fdc089acf4c4fb7bd910d1f97f5a617b06ab522818",
-      "time": "2026-10-16T23:19:39.350409-04:00"
+      "reviewer": "user-spec: showrunner 2026-10-16 exact text; user 2026-10-14: credits-on default is stay on credits; user redesign: no entry -> alert at 2% to set up what happens next, similar for Codex; reviewer: opus; user-spec: Phase 81 renames the slash command to /account_moves; command name only",
+      "sha256": "edf944aa086ddcb143153c46d4b449a583cd487b3dd9f02fa1fc727bc8429bcf",
+      "time": "2026-10-19T16:50:03.103608-04:00"
     },
     "credits_off_codex": {
       "objections": [
@@ -208,9 +208,9 @@
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: showrunner 2026-10-16 exact text; user 2026-10-14: credits-on default is stay on credits; user redesign: no entry -> alert at 2% to set up what happens next, similar for Codex; reviewer: opus",
-      "sha256": "22d35ab39eff4de362aac0fdc089acf4c4fb7bd910d1f97f5a617b06ab522818",
-      "time": "2026-10-16T23:19:22.855906-04:00"
+      "reviewer": "user-spec: showrunner 2026-10-16 exact text; user 2026-10-14: credits-on default is stay on credits; user redesign: no entry -> alert at 2% to set up what happens next, similar for Codex; reviewer: opus; user-spec: Phase 81 renames the slash command to /account_moves; command name only",
+      "sha256": "edf944aa086ddcb143153c46d4b449a583cd487b3dd9f02fa1fc727bc8429bcf",
+      "time": "2026-10-19T16:50:03.103656-04:00"
     },
     "credits_on": {
       "objections": [
@@ -227,9 +227,9 @@
           "rule": "reader-starts-cold"
         }
       ],
-      "reviewer": "user-spec: showrunner 2026-10-16 exact text; user 2026-10-14: credits-on default is stay on credits; user redesign: no entry -> alert at 2% to set up what happens next, similar for Codex; reviewer: opus",
-      "sha256": "22d35ab39eff4de362aac0fdc089acf4c4fb7bd910d1f97f5a617b06ab522818",
-      "time": "2026-10-16T23:19:06.923533-04:00"
+      "reviewer": "user-spec: showrunner 2026-10-16 exact text; user 2026-10-14: credits-on default is stay on credits; user redesign: no entry -> alert at 2% to set up what happens next, similar for Codex; reviewer: opus; user-spec: Phase 81 renames the slash command to /account_moves; command name only",
+      "sha256": "edf944aa086ddcb143153c46d4b449a583cd487b3dd9f02fa1fc727bc8429bcf",
+      "time": "2026-10-19T16:50:03.103702-04:00"
     }
   },
   "quota.codex_on_credits": {
