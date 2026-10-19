@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
-The default sampled RSS cap is 4096 MiB. A 163-module run with an empty timing
+The default sampled memory cap is 4096 MiB. A 163-module run with an empty timing
 cache took 102.80 s, peaked at 2.027 GiB, and had a largest module peak of
-0.494 GiB (one-minute load 7.79-16.32). Each running job keeps a reservation:
-admission counts max(job RSS, largest job peak seen so far, initially 96 MiB)
-plus the runner itself. Startup RSS samples never discard reservations.
+0.494 GiB (one-minute load 7.79-16.32). A sample is resident plus swapped memory.
+Each running job keeps a reservation: admission counts max(job memory, largest job peak seen so far, initially 96 MiB)
+plus the runner itself. Startup samples never discard reservations.
 Samples are at least 0.25 seconds apart. One job is always allowed to progress;
 an observed overshoot makes the run red. This is admission on samples, not an
-OS allocation limit; unexpected job growth can still exceed the cap.
+OS allocation limit; growth between samples can still exceed the cap. A job whose
+own sampled memory goes over the cap is killed at that sample and fails the run.
 --tests-only runs the same suite runner without performing any git operations.
 A unit checkpoint commit without its Change-Review line is refused before the merge. After the
 push, each visible change becomes a row in the change-review list that --change-review names, or
@@ -113,6 +114,8 @@ class RunningGateJob:
     started: float
     output: TextIO
     log: Path
+    # Set when the runner kills the job for its sampled memory; the job's result names it.
+    killed_for: str = ""
 
 
 @dataclass
@@ -213,8 +216,22 @@ def release_running() -> bool:
     return False
 
 
+def swapped_kib(pid: int) -> int:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmSwap:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def process_memory_mib(roots: set[int]) -> dict[int, float]:
-    """Sum resident memory of our child roots and descendants, never other jobs."""
+    """Sum resident and swapped memory of our child roots and descendants, never other jobs.
+
+    Swap counts: a job that leaks under memory pressure keeps its old pages swapped out, so its
+    RSS alone stays low while it grows (2026-10-18: 10 GiB resident of 28 GiB held).
+    """
     parents: dict[int, int] = {}
     resident: dict[int, int] = {}
     for entry in Path("/proc").iterdir():
@@ -234,7 +251,8 @@ def process_memory_mib(roots: set[int]) -> dict[int, float]:
         while frontier:
             frontier = {pid for pid, parent in parents.items() if parent in frontier and pid not in owned}
             owned.update(frontier)
-        totals[root] = sum(resident.get(pid, 0) for pid in owned) * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+        pages = sum(resident.get(pid, 0) for pid in owned)
+        totals[root] = (pages * os.sysconf("SC_PAGE_SIZE") / 1024 + sum(swapped_kib(pid) for pid in owned)) / 1024
     return totals
 
 
@@ -295,7 +313,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     tmpfs = Path("/dev/shm")
     if not tmpfs.is_dir() or not os.access(tmpfs, os.W_OK):
         raise GateRefused("the test runner requires writable tmpfs at /dev/shm")
-    print(f"Runner: {len(modules)} modules, sampled RSS cap {memory_cap_mib} MiB", flush=True)
+    print(f"Runner: {len(modules)} modules, sampled memory cap {memory_cap_mib} MiB", flush=True)
     timings_path = module_timings_path()
     timings = previous_module_seconds(timings_path)
     modules.sort(key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
@@ -329,6 +347,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         if job.suite != "types" and measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
                             largest_module = f"{job.suite}/{job.path.name}"
+                        if measured > memory_cap_mib and not job.killed_for:
+                            # Admission cannot stop a job that grows after it starts; on 2026-10-18 one
+                            # module grew to 28 GiB in 56 minutes and filled natedev's swap.
+                            job.killed_for = (f"killed: sampled memory {measured / 1024:.3f} GiB is over the "
+                                              + f"{memory_cap_mib / 1024:.3f} GiB cap")
+                            print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                            kill_job_group(job)
                 while pending and admission.admits(bool(running)):
                     suite, path = pending.popleft()
                     log = Path(temporary) / f"{suite}-{path.stem}.log"
@@ -359,6 +384,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     job.output.close()
                     captured = job.log.read_text(errors="replace")
                     job.log.unlink()
+                    if job.killed_for:
+                        captured = f"{job.killed_for}\n{captured}"
                     # Python 3.13's unittest CLI exits 5 for an empty module. Helper
                     # modules were also empty within whole-suite discovery; no tests
                     # are discarded, and import errors still return 1.
@@ -391,11 +418,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     for result in results:
         if result.suite == "types":
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
-    print(f"Gate tests: {elapsed:.2f}s; peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled RSS); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
-    print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled RSS); module: {largest_module or '(not sampled)'}", flush=True)
+    print(f"Gate tests: {elapsed:.2f}s; peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
+    print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
-        print("RED: sampled RSS exceeded the cap", flush=True)
+        print("RED: sampled memory exceeded the cap", flush=True)
     return GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib)
 
 
@@ -605,7 +632,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--mac-repo", default="~/.claude")
     _ = parser.add_argument("--settings-blob", default=SETTINGS_BLOB)
     _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
-                            help="sampled RSS admission cap in MiB (default: 4096); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
+                            help="sampled memory admission cap in MiB (default: 4096); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
     _ = parser.add_argument("--tests-only", action="store_true")
     args = cast(GateArguments, parser.parse_args(argv))
     if not args.tests_only:

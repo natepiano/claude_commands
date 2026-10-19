@@ -127,6 +127,13 @@ class FixtureTest(unittest.TestCase):
             os.replace(state / "module-held.tmp", state / "module-held")
             while True:
                 time.sleep(0.01)
+        if (state / "grow-memory").exists() and suite == "hooks":
+            # Grows until the runner kills it; past 2 GiB the cap failed to stop it.
+            blocks = []
+            while len(blocks) < 256:
+                blocks.append(b"x" * (8 << 20))
+                time.sleep(0.02)
+            self.fail("fixture grew to 2 GiB and was never killed")
         if (state / "barrier").exists() and suite == "lib":
             deadline = time.monotonic() + 300
             while True:
@@ -499,7 +506,7 @@ class MergeGateTests(unittest.TestCase):
         self.assertIsNotNone(peak, result.stdout)
         assert peak is not None
         self.assertGreater(float(peak.group(1)), 0)
-        self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled RSS\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
+        self.assertRegex(result.stdout, r"(?m)^Largest module peak: [\d.]+ GiB \(sampled memory\); module: (?:\w+/test_\w+\.py|\(not sampled\))$")
         launches = [call for call in self.calls() if call["tool"] == "suite-python"]
         self.assertEqual(len(launches), MODULES)
         for call in launches:
@@ -562,7 +569,7 @@ class MergeGateTests(unittest.TestCase):
         self.assertGreaterEqual(peak, 2)
         self.assertEqual(active, set())
         self.assertEqual(len(events), 2 * MODULES)
-        self.assertIn("sampled RSS cap 268 MiB", result.stdout)
+        self.assertIn("sampled memory cap 268 MiB", result.stdout)
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
         self.assertFalse(any(call["tool"] in ("basedpyright", "ssh") for call in self.calls()))
@@ -575,7 +582,7 @@ class MergeGateTests(unittest.TestCase):
         for start, finish in zip(events[::2], events[1::2], strict=True):
             self.assertEqual((start["event"], finish["event"]), ("start", "finish"))
             self.assertEqual(start["pid"], finish["pid"])
-        self.assertIn("sampled RSS cap 48 MiB", result.stdout)
+        self.assertIn("sampled memory cap 48 MiB", result.stdout)
 
     def test_nonpositive_memory_cap_refuses_without_running_modules(self) -> None:
         result = self.run_gate("--tests-only", "--memory-cap-mib", "0")
@@ -609,6 +616,21 @@ class MergeGateTests(unittest.TestCase):
             self.assertIn(f"fixture failure in {suite}/{module}", result.stdout + result.stderr)
         starts = [row for row in self.module_events() if row["event"] == "start"]
         self.assertEqual(len(starts), MODULES)
+
+    def test_a_module_that_grows_past_the_cap_is_killed_and_the_gate_is_red(self) -> None:
+        self.write(self.state / "grow-memory", "grow")
+        result = self.run_gate("--tests-only", "--memory-cap-mib", "256")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"(?m)^hooks/test_first\.py killed: sampled memory [\d.]+ GiB is over the 0\.250 GiB cap$")
+        self.assertRegex(result.stdout, r"(?m)^hooks: RED ")
+        self.assertNotIn("never killed", result.stdout)
+        starts = [row for row in self.module_events() if row["event"] == "start"]
+        self.assertEqual(len(starts), MODULES)
+
+    def test_a_sample_counts_swapped_memory(self) -> None:
+        with mock.patch.object(merge_gate, "swapped_kib", return_value=1024 * 1024):
+            sample = merge_gate.process_memory_mib({os.getpid()})
+        self.assertGreater(sample[os.getpid()], 1024.0)
 
     def test_type_failure_resets_merge_and_does_not_push(self) -> None:
         self.write(self.state / "types-red", "red")
@@ -807,7 +829,7 @@ class MergeGateTests(unittest.TestCase):
             result = merge_gate.run_suites(self.checkout, 48)
         self.assertFalse(result.passed)
         self.assertEqual(len(result.jobs), MODULES)
-        self.assertIn("sampled RSS exceeded the cap", output.getvalue())
+        self.assertIn("sampled memory exceeded the cap", output.getvalue())
 
     def test_runner_reports_load_at_its_own_start_and_end(self) -> None:
         output = io.StringIO()
