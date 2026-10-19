@@ -427,18 +427,18 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Source:** a live run rebuilt `hana` from a worktree with another phase's uncommitted `crates/` edits, and nothing said so (showrunner, 2026-10-19).
 
-- `uncommitted_build_paths(root, executable) -> list[str]` runs one `git -C <root> status --porcelain=v1 -z --untracked-files=all -- crates/` (3 s timeout, stdin closed) and returns sorted repository-relative paths. With the binary present: each modified, added, untracked or renamed-to file whose mtime is at or before the binary's, plus each deleted or renamed-away path (its removal cannot be dated). With the binary missing: every dirty path under `crates/`. A git failure, a timeout or a non-git root returns `[]`, so the check never blocks a launch.
-- `launch` calls it once after it resolves the executable; every launch path (`launch`, and `--launch` on `shot` and `views check`) goes through `launch`. Binary present and paths found: stderr gets `hana_shot: warning: <binary> was built after uncommitted edits in crates/, so this Hana runs that code: <paths>` before the start, and the launch continues. Binary missing: the existing refusal adds `; crates/ has uncommitted edits a build will include: <paths>`. `build_paths_label` names at most 10 paths, then `, and N more`.
+- `uncommitted_build_paths(root, executable) -> list[str]` runs one `git -C <root> status --porcelain=v1 -z --untracked-files=all -- crates/ Cargo.toml Cargo.lock` (3 s timeout, stdin closed) and returns sorted repository-relative paths. With the binary present: each modified, added, untracked or renamed-to file whose mtime is at or before the binary's, plus each deleted or renamed-away path (its removal cannot be dated). With the binary missing: every dirty path under `crates/` and each dirty root `Cargo.toml` or `Cargo.lock`. A git failure, a timeout or a non-git root returns `[]`, so the check never blocks a launch.
+- `launch` calls it once after it resolves the executable; every launch path (`launch`, and `--launch` on `shot` and `views check`) goes through `launch`. Binary present and paths found: stderr gets `hana_shot: warning: <binary> was built after uncommitted edits in crates/ or the root Cargo files, so this Hana runs that code: <paths>` before the start, and the launch continues. Binary missing: the existing refusal adds `; uncommitted edits in crates/ or the root Cargo files will be included by a build: <paths>`. `build_paths_label` names at most 10 paths, then `, and N more`.
 - `LaunchState` has an optional `uncommitted_paths: list[str]`, saved only when non-empty and holding every path. No other command changes and no refusal is added.
 
 **Files:**
 - `scripts/hana_shot/hana_shot.py` — `uncommitted_build_paths`, `build_paths_label`, the launch warning and refusal hint, `LaunchState.uncommitted_paths`
-- `scripts/hana_shot/test_hana_shot.py` — `LaunchBuildWarningTests`: temporary git repositories with a fake binary and `os.utime` mtimes (clean, older/equal/newer, untracked with unusual names, staged, deleted, renamed, path scope, missing binary, non-git, git timeout), the missing-binary refusal, and the capped warning before a stubbed `Popen`
+- `scripts/hana_shot/test_hana_shot.py` — `LaunchBuildWarningTests`: temporary git repositories with a fake binary and `os.utime` mtimes (clean, older/equal/newer, untracked with unusual names, staged, deleted, renamed, path scope, missing binary, non-git, git timeout, root `Cargo.lock` and `Cargo.toml`, a `Cargo.toml` outside the root), the missing-binary refusal, and the capped warning before a stubbed `Popen`
 - `commands/hana_shot.md` — one sentence under launch
 
 **Binds later work:** the screenshot proposals re-rank treats the launch warning as no shot behavior change; it has no `changes.json` entry and is not a candidate.
 
 **Gotchas:**
 - In `-z` output a rename or copy record is followed by a separate original-path record; the parser consumes it so it is not read as a status entry.
-- The mtime test is a heuristic, not proof of what the binary holds, and only `crates/` is checked.
+- The mtime test is a heuristic, not proof of what the binary holds. Only `crates/` and the root `Cargo.toml` and `Cargo.lock` are checked (the root files added at e031f5e9).
 - Tests never start Hana: the natedev Hana ban holds, so live launch is untested.
