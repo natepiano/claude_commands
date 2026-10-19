@@ -134,27 +134,17 @@ Showrunner, 2026-10-19 (relayed task order): 1. main priority: the token-efficie
 
 **Ruled out:** dropping the director's `direct.md` re-Read after compaction (the copy in context holds only 260/707 and 236/710 of the required lines); raising Codex review compaction limits on cost-model evidence alone.
 
-### Phase 6 — Ranked proposals  · status: todo
+### Phase 6 — Ranked proposals  · status: done
 **Depends on:** Phase 5
 
-#### Work Order
+#### As-built
 
-**Goal:** the ranked list of ways to do the same work for fewer tokens, in the ledger and sent to the showrunner.
-
-**Spec:**
-- One proposal per change: what changes, where (file or setting, owner unit when one owns it), weekly gain as share and weighted tokens with range, evidence (phase report and query), risk to the work (what could get worse), and how to re-measure after adoption.
-- Rank by gain; break ties by Simple, then Fast, then Beautiful (decision criteria).
-- Each proposal's gain says which kind it is: measured saving (Phase 5), modeled estimate, or not measurable (with the reason); missing evidence is never zero.
-- Fold in the open ledger token findings: each is re-measured, merged into a new proposal, marked gone, or marked inconclusive or untested with the reason (for example no Codex tool-schema evidence, a zero-match scan, a judgment not re-checked); inconclusive and untested lines stay open. A merged or gone line gets its status text updated (`superseded by <date> <title>` or `gone on re-measure <date>`); no line is deleted.
-- Append each new proposal to `~/.local/state/nightly-review/ledger.md` as `- 2026-10-<dd> <scope>: <title> [gain/week: <x>% of tokens] — proposed`.
-- Write `token-study/report.md`: the token map summary, the ranked table, the experiment results, and what the study did not cover.
-- Send the showrunner the ranked table (top 10) and the report path.
+- `~/.local/state/nightly-review/token-study/report.md` (outside git) holds the token map summary, the ranked proposals, the experiment results and what the study did not cover. Each proposal row gives the change, where and owner, gain with share and range, gain kind, evidence, risk to the work and how to re-measure.
+- Twelve proposals. Rank 1, Codex workers wait with one blocking call in place of a run of empty polls, is the only one with a modeled gain: 37,638,356.80/week (0.51983%; 0–37,638,356.80). Ranks 2–10 are not measurable and ordered by exposure, which is an upper bound and not a gain. The largest is fewer wait turns per fix/impl job, at 749,850,925.14 (10.35632%). Ranks 11 and 12 (connectors, Workflows) have no sized exposure.
+- `~/.local/state/nightly-review/ledger.md`: 13 older token lines now read `superseded by 2026-10-19 <title>`; untested or inconclusive lines (21, 42, 60, 63, 64, 114) stay open and unchanged; 12 new lines are appended as `[gain/week: not measurable, up to X% of tokens] — proposed` (rank 1: `0.51983% of tokens, modeled`). The For you row reads 127 efficiency proposals.
+- The showrunner has the top-10 table and the report path.
 
 **Files:**
-- `docs/plans/build-followups-efficiency.md` — this phase's results, at shrink. Outside git: `~/.local/state/nightly-review/ledger.md` and `~/.local/state/nightly-review/token-study/report.md`.
+- `docs/plans/build-followups-efficiency.md` — this record; the ledger and report live outside git
 
-**Workers:** nothing splits: the unit director writes the ranking and the ledger lines from the phase reports; no worker opens.
-
-**Constraints from prior phases:** all phase reports. Phase 5 (`token-study/5-experiments/report.md`) measured no observed saving: every gain is a replay projection with range starting at 0, so label it "modeled", never "measured". Its projections (weighted/week): Codex wait-run collapse 37,638,356.80 (0.51983%, 4.32% of the 872M wait-only exposure); Claude one pause notice per context 1,488,675.10; Codex identical-read reference 13,378.65 (0–246,797.33); Codex review compaction limits none (no limit beats observed cost; instruction check fails). Do not propose dropping the director's `direct.md` re-Read after compaction (the copy in context lacks needed lines). The largest untested lever is wait turns per fix/impl job (about 750M exposure); propose it as not measurable with that reason. Phase 3–4 exposures are upper bounds, not gains. Phase 2's weighted per checkpoint is a descriptive comparison only; a claim that a change does the same work needs matched tasks or unchanged acceptance outcomes.
-
-**Acceptance gate:** every proposal has a gain with range and evidence; the open token findings listed in Key files each have a disposition; the For you row's efficiency count equals the net count after every ledger change (new lines up, superseded or gone lines down), checked against the rendered row; the showrunner has the table.
+**Ruled out:** dropping the director's `direct.md` re-Read after compaction; a tail-only re-Read without a hash check that the reattached copy matches the file (an older copy loses changed lines); `weighted_per_checkpoint` as a same-work check; marking the update-tick line gone on a weighted-versus-raw comparison.
