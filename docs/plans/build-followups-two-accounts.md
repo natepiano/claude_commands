@@ -2170,36 +2170,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 80 — The accounts table has no Login column and no roles line  · status: done
 
-**Depends on:** Phase 79
+#### As-built
 
-#### Work Order
-
-**Goal:** The user (via the showrunner, 2026-10-19 10:53 EDT): the no-argument accounts table (`/showrunner:accounts`) shows a Login column where every login is masked, so it tells nothing; and its top line `units: claude1, showrunners: claude3` repeats the Role column. Remove both. The unit-board mod (its phase 16, 2b697b39) no longer passes `--with-login`, so that flag has no users: remove it too.
-
-**Constraints from prior phases:**
-- `TABLE_HEADINGS` (~198), `_status_row_cells` (~3817, `row.login_cell`) and `render_status_table` (~3859, `reading.group_line`) build the table. `StatusRow.login` stays: the stored-usage lookup and other code use it. `StatusReading.group_line` goes if nothing else reads it.
-- `--with-login` is parsed at ~4164, checked at ~4215 and passed to `render_status_json` (~3825). The JSON without it (the `login` field absent) does not change.
-- `/showrunner:accounts` prints the table as `accounts.py` gives it; check `commands/showrunner/accounts.md` for any text about the Login column or the top line.
-
-**Spec:**
-1. The table has the columns Folder, Label, Role, Weekly left, Weekly resets, On credits, Credits left, Read. No Login column.
-2. The table has no `units: …, showrunners: …` line. It starts with the table header.
-3. `status --with-login` is not an option any more (argparse rejects it). `render_status_json` has no `with_login` parameter, and the JSON never has a `login` field.
-4. `docs/accounts.md:37` loses the `--with-login` sentences. Fix any other doc or command text in this repo that names the Login column, the top line or `--with-login`, except plan as-built history.
+- The no-argument `accounts.py status` table has the columns Folder, Label, Role, Weekly left, Weekly resets, On credits, Credits left, Read. It has no Login column and no `units: …, showrunners: …` line; it starts with its header row. The user asked for both (2026-10-19): the logins were masked, and the top line repeated the Role column.
+- `status --with-login` is removed (the unit-board mod stopped passing it in its phase 16). `render_status_json` has no `with_login` parameter, and the JSON has no `login` field.
+- A row with no folder, no login or an unreadable folder gets one note: `* <label>: not set up: no folder holds this account`, `* <label>: not logged in` or `* <label>: its folder could not be read`, unless a folder or sign-in note already explains it (`_account_state_notes`). It has no login address.
+- Each unconfigured Claude group gets `accounts: <group> has no account; run accounts.py move <group> <claudeN>` beside the Codex workers note. A configured group gets no note. The JSON problems list carries the same lines.
 
 **Files:**
-- `scripts/accounts/accounts.py` — the columns, the top line and the flag.
-- `scripts/accounts/test_accounts.py` — the table and JSON tests.
-- `docs/accounts.md` — line 37 and any other mention.
-- `commands/showrunner/accounts.md` — only if it names the removed parts.
-- `scripts/accounts/test_refusal_watch.py` — the status test for a missing group file (added in review).
-- `docs/as-built/unit-board.md` — the two lines that named `--with-login` (added in review).
+- `scripts/accounts/accounts.py` — the columns, the removed line and flag, the state and group notes.
+- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py` — tests.
+- `docs/accounts.md`, `commands/showrunner/accounts.md`, `docs/as-built/unit-board.md` — text.
 
-**Workers:** 1 writer. impl owns all files.
-
-**Verification:** `scripts.accounts.test_accounts scripts.accounts.test_role_map` with a scratch HOME; basedpyright 0/0 on changed Python files.
-
-**Acceptance gate:**
-- **Table:** the header row is exactly the Spec 1 columns, there is no line before it, and every data row has one cell per column.
-- **Flag:** `status --json --with-login` exits with a usage error; `status --json` is unchanged.
-- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
+**Gotchas:**
+- `group_status_line` stays: placement still prints it.
+- `accounts.py status` notes can still name a login (the "no account note, not selectable … with login:" line), so never run it to find a label.
+- The one pool review found one minor (a row lost its reason with the Login column). The merge gate found that status no longer said a group was not configured. Both are fixed with tests.
