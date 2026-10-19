@@ -1075,7 +1075,8 @@ diff, reviews, or finding ids.
 **Close every delegation result and launch with the short progress report**
 from <ProgressReport/>: phase and stage, ETA line, workers, summary, board link,
 and wall clock. Copy the recorder's phase, stage, ETA and clock exactly. Include
-both recorder tables only for `/unit:report tables`.
+the summary table in every report; include the round table only for
+`/unit:report tables`.
 
 Between windows, keep the recorder's `as of` and no-open-window lines. An
 activity still open after its phase closes remains the stage. If the recorder

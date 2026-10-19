@@ -1516,6 +1516,27 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         self.assertEqual(restart["LAST_RESTART"], str(report_at))
 
+    def test_a_phase_between_windows_prints_recorded_summary_without_tables_flag(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("between-summary", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_progress(session_dir, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+
+        report = self.run_command(
+            "progress", "--session-dir", str(session_dir),
+            "--activity", "waiting on the repair writers", at=started_at + 400,
+        )
+
+        self.assertIn("as of 05:35:00, the last progress report", report)
+        self.assertIn("No pass or activity is open.", report)
+        self.assertEqual(
+            [row[:3] for row in self.table_rows(report, SUMMARY_HEADER)],
+            [["Project", "40", "00:01:40"], ["Phase 3", "30", "00:01:40"]],
+        )
+        self.assertFalse(any(line.startswith("| Stage ") for line in report.splitlines()), report)
+        self.assertFalse(any(line.startswith("Earlier:") for line in report.splitlines()), report)
+
     def test_a_phase_never_reported_still_prints_both_tables(self) -> None:
         """Before the first report the clocks read as of the phase start."""
         started_at = 20_000
@@ -4573,6 +4594,12 @@ print('two homes isolated; recorder lock retained; caller restored')
         return next(line for line in report.splitlines()
                     if line.startswith(("ETA ", "gated ")))
 
+    def assert_summary_without_round_table(self, report: str) -> None:
+        rows = self.table_rows(report, [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]])
+        self.assertEqual([row[0] for row in rows], ["Project", "Phase 3"])
+        self.assertFalse(any(line.startswith("| Stage ") for line in report.splitlines()), report)
+        self.assertFalse(any(line.startswith("Earlier:") for line in report.splitlines()), report)
+
     def test_short_progress_keeps_promises_stage_and_worker_narration_without_tables(self) -> None:
         session_dir = self.short_report_fixture("short-workers")
 
@@ -4591,7 +4618,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.assertIn(model, worker)
             self.assertIn("fix", worker)
             self.assertIn(state, worker)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_short_progress_names_the_first_eta_and_completed_fix_round(self) -> None:
         session_dir = self.short_report_fixture("short-first", promises=("16:10",), running_fix=False)
@@ -4599,7 +4626,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         report = self.short_progress(session_dir, self.report_time(16))
 
         self.assertEqual(self.eta_report_line(report), "ETA 16:10 (on its first ETA, 1 fix round)")
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_short_progress_retains_each_worker_while_the_director_runs_an_activity(self) -> None:
         session_dir = self.short_report_fixture("short-concurrent-activity")
@@ -4616,7 +4643,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.assertRegex(worker, rf"\({slot}\) fix \S+ {state} ·")
             self.assertIn(model, worker)
         self.assertIn("▸ **Fix 2 - implementing**", report)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_short_eta_names_a_running_fix_round_without_zero_completed_rounds(self) -> None:
         session_dir = self.short_report_fixture("short-running-fix", completed_fix=False)
@@ -4672,16 +4699,19 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("repairing retry recovery", report)
         self.assertIn("waiting for retry fixture", report)
         self.assertIn("No pass or activity is open.", report)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
         self.assertEqual((state.read_bytes(), history.read_bytes()), before)
 
-    def test_tables_flag_adds_both_tables_and_keeps_the_same_eta_line(self) -> None:
+    def test_tables_flag_adds_the_round_table_and_keeps_the_summary_and_eta_line(self) -> None:
         session_dir = self.short_report_fixture("short-tables")
 
         short = self.short_progress(session_dir, self.report_time(16))
         detailed = self.short_progress(session_dir, self.report_time(16), tables=True)
 
         self.assertEqual(self.eta_report_line(detailed), self.eta_report_line(short))
+        self.assert_summary_without_round_table(short)
+        header = [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]]
+        self.assertEqual(self.table_rows(detailed, header)[:2], self.table_rows(short, header))
         self.assertEqual(
             [row[0] for row in self.table_rows(
                 detailed, [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]],
@@ -4708,14 +4738,14 @@ print('two homes isolated; recorder lock retained; caller restored')
 
                 self.assertEqual(self.eta_report_line(report),
                                  "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
-                self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+                self.assert_summary_without_round_table(report)
                 for offset, slot in enumerate(("impl", "test")):
                     self.finish_slot_pass(session_dir, slot, "completed", self.report_time(16, 1) + offset)
                 self.team_slot = ""
                 between = self.short_progress(session_dir, self.report_time(16, 10))
                 self.assertEqual(self.eta_report_line(between),
                                  "ETA 18:30 (first 17:15, +1:15, moved 2×, 3 fix rounds)")
-                self.assertFalse(any(line.startswith("|") for line in between.splitlines()), between)
+                self.assert_summary_without_round_table(between)
 
     def test_eta_line_names_only_the_requested_phases_own_gate(self) -> None:
         eta_line = cast(Callable[[Path, str], str], vars(progress_history)["_phase_eta_line"])
@@ -4745,7 +4775,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("shrink", stage)
         self.assertIn("recording the as-built phase", stage)
         self.assertNotIn("No pass or activity is open.", report)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_project_eta_uses_the_last_chain_finish_and_shifts_the_open_eta_band(self) -> None:
         session_dir, report = self.report_eta_chain("project-chain")
