@@ -56,6 +56,15 @@ if name == "basedpyright":
         raise SystemExit(1)
     print("0 errors, 0 warnings, 0 notes")
     raise SystemExit(3)
+if name == "uv":
+    if (state / "uv-fails").exists():
+        print("fixture: no network", file=sys.stderr)
+        raise SystemExit(2)
+    if sys.argv[1] == "venv":
+        python = Path(sys.argv[-1]) / "bin" / "python"
+        python.parent.mkdir(parents=True, exist_ok=True)
+        python.write_text("")
+    raise SystemExit(0)
 if name == "ssh":
     answer = (state / "mac-answer").read_text() if (state / "mac-answer").exists() else "ff_rc=0\\nfixture-head\\n"
     print(answer, end="")
@@ -203,6 +212,7 @@ class MergeGateTests(unittest.TestCase):
             "MERGE_GATE_TEST_STATE": str(self.state),
             "MERGE_GATE_PYTHON": str(self.bin / "suite-python"),
             "MERGE_GATE_BASEDPYRIGHT": str(self.bin / "basedpyright"),
+            "MERGE_GATE_UV": str(self.bin / "uv"),
             "MERGE_GATE_STATE_DIR": str(self.state / "runner"),
             "MERGE_GATE_STYLE_SYNC": str(self.bin / "style_sync.py"),
             # The calling showrunner is found from these update timers, never the live ones.
@@ -234,7 +244,7 @@ class MergeGateTests(unittest.TestCase):
         self.write(self.unit / "unit.txt", "checkpoint\n")
         self.checkpoint = self.commit(self.unit, "unit checkpoint")
         _ = self.git(self.unit, "push", "-u", "origin", "unit-phase")
-        for name in ("basedpyright", "ssh", "ps", "suite-python", "style_sync.py"):
+        for name in ("basedpyright", "uv", "ssh", "ps", "suite-python", "style_sync.py"):
             self.write(self.bin / name, TOOL_STUB.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1))
             (self.bin / name).chmod(0o755)
 
@@ -498,7 +508,8 @@ class MergeGateTests(unittest.TestCase):
         self.assertFalse(Path(starts[0]["tmpdir"]).exists())
         type_calls = [call for call in self.calls() if call["tool"] == "basedpyright"]
         self.assertEqual(len(type_calls), 1)
-        self.assertEqual(type_calls[0]["args"], ["scripts/production"])
+        venv = self.state / "runner" / "typecheck-venv"
+        self.assertEqual(type_calls[0]["args"], ["--pythonpath", str(venv / "bin" / "python"), "scripts/production"])
         self.assertEqual(type_calls[0]["cwd"], str(self.checkout))
         for suite in EXPECTED_SUITES:
             self.assertRegex(result.stdout, rf"(?m)^{suite}: OK \d+\.\d+s$")
@@ -649,6 +660,26 @@ class MergeGateTests(unittest.TestCase):
         with mock.patch.object(merge_gate, "swapped_kib", return_value=1024 * 1024):
             sample = merge_gate.process_memory_mib({os.getpid()})
         self.assertGreater(sample[os.getpid()], 1024.0)
+
+    def test_the_type_check_venv_is_built_once_with_the_pinned_stubs(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            first, second = merge_gate.typecheck_python(), merge_gate.typecheck_python()
+        venv = self.state / "runner" / "typecheck-venv"
+        self.assertEqual((first, second), (venv / "bin" / "python", venv / "bin" / "python"))
+        self.assertEqual([call["args"] for call in self.calls() if call["tool"] == "uv"],
+                         [["venv", "--clear", str(venv)],
+                          ["pip", "install", "--python", str(venv / "bin" / "python"),
+                           *merge_gate.TYPECHECK_REQUIREMENTS]])
+
+    def test_a_type_check_venv_that_cannot_be_built_is_red_and_names_the_command(self) -> None:
+        self.write(self.state / "uv-fails", "fail")
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("basedpyright: RED\ntype-check venv missing: fixture: no network; build it with: ", result.stdout)
+        self.assertIn(" pip install --python ", result.stdout)
+        self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
+        self.assertRegex(result.stdout, r"(?m)^lib: OK \d+\.\d+s$")
+        self.assert_not_pushed()
 
     def test_type_failure_resets_merge_and_does_not_push(self) -> None:
         self.write(self.state / "types-red", "red")

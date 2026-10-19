@@ -26,6 +26,7 @@ from collections import deque
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -54,6 +55,10 @@ MODULE_MEMORY_MIB = 48
 # behind it. The slowest measured module took 387 s at load 152 (delegate/test_verify_mac_offload.py,
 # 2026-10-18); the limit is about 4.6 times that.
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
+# basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this
+# type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
+# later dates report new diagnostics in bake_textures.py.
+TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
 MEMORY_SAMPLE_SECONDS = 0.25
 SETTINGS_BLOB = "b3466859"
 # Python restores these dispositions before exec, including an inherited SIG_IGN.
@@ -266,6 +271,38 @@ def module_timings_path() -> Path:
     return Path(os.environ.get("MERGE_GATE_STATE_DIR", "~/.local/state/merge-gate")).expanduser() / "module_seconds.json"
 
 
+def typecheck_venv_path() -> Path:
+    return module_timings_path().parent / "typecheck-venv"
+
+
+def typecheck_python() -> Path | str:
+    """The pinned type-check venv's interpreter, built with uv when absent; a failure is its reason."""
+    venv = typecheck_venv_path()
+    python = venv / "bin" / "python"
+    stamp = venv / "gate-requirements.txt"
+    wanted = "\n".join(TYPECHECK_REQUIREMENTS) + "\n"
+    uv = os.environ.get("MERGE_GATE_UV", "uv")
+    command = f"{uv} venv --clear {venv} && {uv} pip install --python {python} {' '.join(TYPECHECK_REQUIREMENTS)}"
+    venv.parent.mkdir(parents=True, exist_ok=True)
+    with (venv.parent / "typecheck-venv.lock").open("w") as lock:
+        # Gates run at the same time; one builds and the others wait for its stamp.
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if python.exists() and stamp.exists() and stamp.read_text() == wanted:
+            return python
+        stamp.unlink(missing_ok=True)
+        for argv in ([uv, "venv", "--clear", str(venv)],
+                     [uv, "pip", "install", "--python", str(python), *TYPECHECK_REQUIREMENTS]):
+            try:
+                built = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=600)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                return f"type-check venv missing: {error}; build it with: {command}"
+            if built.returncode:
+                return f"type-check venv missing: {built.stderr.strip() or built.stdout.strip()}; build it with: {command}"
+        _ = stamp.write_text(wanted)
+        print(f"Type-check venv built: {venv}", flush=True)
+        return python
+
+
 def previous_module_seconds(path: Path) -> dict[str, float]:
     try:
         value = cast(object, json.loads(path.read_text()))
@@ -328,10 +365,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     modules.sort(key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
                                   -timings.get(f"{item[0]}/{item[1].name}", 0)))
     pending = deque(modules)
-    if type_dirs:
-        pending.appendleft(("types", repo / "basedpyright"))
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
+    types_python = typecheck_python() if type_dirs else ""
+    if isinstance(types_python, Path):
+        pending.appendleft(("types", repo / "basedpyright"))
+    elif types_python:
+        results.append(GateJobResult("types", "basedpyright", 1, 0.0, types_python))
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
     admission = SampledRSSAdmission(memory_cap_mib)
@@ -370,7 +410,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     started = time.monotonic()
                     _ = suite_started.setdefault(suite, started)
                     try:
-                        argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), *type_dirs]
+                        argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
+                                 *type_dirs]
                                 if suite == "types" else
                                 [python, "-c", SUITE_BOOTSTRAP, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
                         process = subprocess.Popen(
