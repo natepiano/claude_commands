@@ -24,9 +24,11 @@ export interface BoardEta {
 }
 export type BoardStep = [state: string, what: string, started: BoardTime, took_seconds: number];
 export interface BoardWorker { slot: string; role: string; state: string; model: string; doing: string }
+export interface PlanPhase { kind: 'plan'; id: string; of: number; title: string }
+export interface TicketPhase { kind: 'ticket'; id: string; title: string; merged: number }
 export interface BoardUnit {
   key: string; plan: string; state: 'running' | 'run-finished' | 'standing-by';
-  phase: { id: string; of: number; title: string } | null;
+  phase: PlanPhase | TicketPhase | null;
   phases: BoardPhase[]; finish: BoardFinish; stage: string; eta: BoardEta | null;
   summary: string; steps: BoardStep[]; workers: BoardWorker[];
 }

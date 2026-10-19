@@ -6,8 +6,11 @@ import argparse
 import json
 import os
 import re
+import sqlite3
+import subprocess
 import sys
 import tempfile
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -249,6 +252,36 @@ def stage(events: list[dict[str, object]], state: str, rows: list[phase_table.Do
     return "Standing by"
 
 
+def is_standing_plan(plan: Path) -> bool:
+    try:
+        return any(line.startswith("> **Standing:**") for line in plan.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError):
+        return False
+
+
+def merged_tickets(worktree: Path, unit_name: str, sources: set[Path]) -> int:
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        if common.returncode or not common.stdout.strip():
+            return 0
+        main_repo = Path(common.stdout.rstrip("\n")).parent
+        state = Path(os.environ.get("STYLE_LEDGER_STATE_DIR", str(Path.home() / ".local/state/style"))).expanduser()
+        database = state / main_repo.name / "ledger.sqlite"
+        if not database.exists():
+            return 0
+        sources.add(database)
+        with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=0)) as connection:
+            row = cast(tuple[int], connection.execute(
+                "SELECT count(*) FROM tickets WHERE unit = ? AND state = 'merged'", (unit_name,),
+            ).fetchone())
+            return row[0]
+    except (OSError, UnicodeError, subprocess.TimeoutExpired, sqlite3.Error):
+        return 0
+
+
 def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[str, object]:
     value = production_units.cell_value
     worktree = Path(value(cells.get("Worktree", ""))).expanduser().resolve()
@@ -283,9 +316,17 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
     if isinstance(found, unit_run.RunFound):
         state = "run-finished" if events and events[-1].get("event_type") == "run_finished" else "running"
     current = record.current
+    unit_name = value(cells.get("Unit", ""))
+    standing = is_standing_plan(record.plan)
+    merged = merged_tickets(worktree, unit_name, sources) if standing else 0
+    current_phase: dict[str, object] | None = None
+    if isinstance(current, phase_table.OpenPhase):
+        current_phase = {"kind": "ticket", "id": current.phase, "title": current.title, "merged": merged} if standing else {
+            "kind": "plan", "id": current.phase, "of": len(record.phases), "title": current.title,
+        }
     summary = next((text(event.get("activity")) for event in reversed(events) if event.get("event_type") == "progress_reported"), "")
-    return {"key": value(cells.get("Unit", "")).removesuffix("-unit"), "plan": plan_cell if plan.is_file() else "", "state": state,
-            "phase": {"id": current.phase, "of": len(record.phases), "title": current.title} if isinstance(current, phase_table.OpenPhase) else None,
+    return {"key": unit_name.removesuffix("-unit"), "plan": plan_cell if plan.is_file() else "", "state": state,
+            "phase": current_phase,
             "phases": [clock.phase(row) for row in record.phases], "finish": clock.finish(record.plan_finish),
             "stage": stage(events, state, record.phases, current), "eta": clock.eta(current) if isinstance(current, phase_table.OpenPhase) else None,
             "summary": summary, "steps": phase_steps(events, clock, current), "workers": worker_rows}

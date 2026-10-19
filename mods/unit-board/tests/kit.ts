@@ -29,7 +29,7 @@ export function fixture(): BoardData {
   open.start = time(-60, "17:00");
   return { production: "show", as_of: time(0, "18:00"), zone: "America/New_York",
     utc_offset_minutes: -240, sources: [RUN, DISCOVERY], units: [{
-      key: "alpha", plan: "plan.md", state: "running", phase: { id: "2", of: 3, title: "Delivery 2" },
+      key: "alpha", plan: "plan.md", state: "running", phase: { kind: "plan", id: "2", of: 3, title: "Delivery 2" },
       phases: [done, open, phase("3", "todo")], finish: { kind: "predicted", at: time(42, "18:42") },
       stage: "Repair round 2", summary: "Finishing the retry path",
       eta: { at: time(30, "18:30"), first: time(-45, "17:15"),

@@ -157,7 +157,9 @@ export function BoardView(elements: PaneElements, columns: number, bodyRows: num
         <Text color="subtle" wrap="truncate-end">{data.units.length} units · as of {data.as_of.text}</Text>
       </Box>}
       {blocks.map(({ unit, strip, eta, gate, finish, workers, detailRows, compact }) => {
-        const heading = unit.phase ? `  Phase ${unit.phase.id}/${unit.phase.of}  ${unit.phase.title}` : `  ${unit.stage}`;
+        const heading = !unit.phase ? `  ${unit.stage}` : unit.phase.kind === 'ticket'
+          ? `  Ticket ${unit.phase.id} · ${unit.phase.merged} merged  ${unit.phase.title}`
+          : `  Phase ${unit.phase.id}/${unit.phase.of}  ${unit.phase.title}`;
         return <Box flexDirection="column" flexShrink={0} marginTop={gap}>
           <Box justifyContent="space-between">
             <Text wrap="truncate-end"><Text color={unit.state === 'running' ? 'suggestion' : 'inactive'}>● </Text>
