@@ -1253,6 +1253,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
         retry = ["down", account.login]
         if here:
             retry.append("--here")
+        elif not ids:
+            retry.extend(("--also", other_machine()))
         if ids:
             retry.extend(("--only", ",".join(ids)))
         if then == "restart":
