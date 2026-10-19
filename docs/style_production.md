@@ -446,6 +446,24 @@ refill skips it until a person marks it built:
 not applied at that ticket's checkpoint.
 A rename also has no check when its file declares neither name under one
 parent, or when more than one item in the file has the parent's name.
+
+A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
+where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
+Neither file name may be a Rust keyword, and the rest of `after` may not name a
+second `<x>.rs to <y>.rs` pair or a move, split or merge.
+It is applied when only the new file is in the code, and not applied when only the
+old file is. It has no check when a folder of child modules (`lock/` or
+`mutation_lock/`) is there; the gate refuses changes in that folder, and a person
+moves it. The gate allows the old file to go and the new file to come, with any
+content. In other Rust files it allows only the `mod <old>;` line and the path
+segments that name the module: `super::lock`, `self::lock`, `crate::ledger::lock`,
+`ledger::lock` from the module that holds `ledger`, `alpha::ledger::lock` in a file
+outside the crate (where `alpha` is the library's name), a `pub use lock::...`
+re-export, and `lock::` where a `mod` line, import or glob binds the module. When
+the ticket also renames an item, its qualified references there change too. The
+`use` and `mod` lines may take the order rustfmt gives them, and a call's trailing
+comma may change. The gate refuses every other change in those files. Comments stay
+in their order; only comments inside a block of `use` and `mod` lines move with them.
 The decision stays open and approved until every finding is built or waived.
 
 To repair a decision or an old issue that closed too early, run

@@ -19,6 +19,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import approved_renames
+import style_footprint
 import style_plan
 import style_proposals
 import proposal_issue
@@ -2505,6 +2506,147 @@ class StylePlanTests(unittest.TestCase):
         with redirect_stdout(output):
             result = style_plan.gate(self.repo, ticket)
         return result, output.getvalue()
+
+    LEDGER_MOD = ("mod handle;\nmod lock;\nmod map;\n\npub use lock::{LockError, MutationLock};\n\n"
+                  + "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n"
+                  + "    fn reads() {\n        let _ = lock::MutationLock;\n    }\n}\n")
+    LEDGER_HANDLE = ("// Takes the lock.\nuse super::lock::MutationLock;\nuse crate::ledger::lock;\n\n"
+                     + "pub struct Handle {\n    lock: MutationLock,\n}\n\n"
+                     + "pub fn take(handle: &Handle) -> lock::LockError {\n    let _ = &handle.lock;\n"
+                     + "    self::lock();\n    lock::LockError\n}\n\nfn lock() {}\n")
+
+    def file_rename_ticket(self, files: tuple[tuple[str, str], ...] = (),
+                           pairs: tuple[tuple[str, str], ...] = ()) -> str:
+        """An approved ticket that renames crates/alpha/src/ledger/lock.rs to mutation_lock.rs, at a HEAD that holds it.
+
+        Files replace or add HEAD files, and each pair adds a finding that renames an item of the file.
+        """
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")})))
+        old = "crates/alpha/src/ledger/lock.rs"
+        self.write(self.sources[0], "pub mod ledger;\n")
+        self.write("crates/alpha/src/ledger/mod.rs", self.LEDGER_MOD)
+        self.write("crates/alpha/src/ledger/handle.rs", self.LEDGER_HANDLE)
+        self.write("crates/alpha/src/ledger/map.rs", "pub fn lock() {}\n")
+        self.write(old, "pub struct MutationLock;\npub struct LockError;\n")
+        for path, text in files:
+            self.write(path, text)
+        _ = self.commit()
+        rule = self.rule("file-rename")
+        issue = self.root / "file-rename-approval.md"
+        with style_ledger.open_ledger(self.repo) as ledger:
+            blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+            findings = [ledger.hold(rule, old, 1, "pub struct MutationLock;", "rename", "The file contains MutationLock.",
+                                    "Rename ledger/lock.rs to ledger/mutation_lock.rs; update ledger/mod.rs and all "
+                                    + "super::lock paths", blob, "outside")]
+            findings.extend(ledger.hold(rule, old, 2, "pub struct LockError;", "rename", before, after, blob, "outside")
+                            for before, after in pairs)
+            for finding in findings:
+                ledger.file_held(finding.finding_id, issue)
+            _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+                                 + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [old], [rule],
+                              proposal=str(issue), finding_ids=tuple(finding.finding_id for finding in findings))
+        _ = self.git("mv", old, "crates/alpha/src/ledger/mutation_lock.rs")
+        return "names-unit-1"
+
+    def renamed_ledger(self, handle: str = LEDGER_HANDLE, error: str = "LockError") -> None:
+        """The edits a file rename makes outside the file, ordered as rustfmt orders them, with LockError named error."""
+        self.write("crates/alpha/src/ledger/mod.rs", self.LEDGER_MOD.replace(
+            "mod lock;\nmod map;\n\npub use lock::{LockError, MutationLock};",
+            f"mod map;\nmod mutation_lock;\n\npub use mutation_lock::{{{error}, MutationLock}};").replace(
+            "lock::MutationLock;\n    }", "mutation_lock::MutationLock;\n    }"))
+        self.write("crates/alpha/src/ledger/handle.rs", handle.replace(
+            "use super::lock::MutationLock;\nuse crate::ledger::lock;",
+            "use crate::ledger::mutation_lock;\nuse super::mutation_lock::MutationLock;").replace(
+            "lock::LockError", f"mutation_lock::{error}"))
+
+    def test_approved_file_rename_allows_its_mod_line_and_module_paths_in_other_files(self) -> None:
+        ticket = self.file_rename_ticket()
+        self.renamed_ledger()
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_file_rename_refuses_another_edit_in_a_file_it_changes(self) -> None:
+        ticket = self.file_rename_ticket()
+        self.renamed_ledger()
+        handle = self.repo / "crates/alpha/src/ledger/handle.rs"
+        for other in (("pub fn take(", "pub fn take_lock("), ("// Takes the lock.", "// Takes the mutation_lock."),
+                      ("    self::lock();", "    self::mutation_lock();"), ("handle.lock;", "handle.mutation_lock;")):
+            with self.subTest(other=other):
+                renamed = handle.read_text()
+                _ = handle.write_text(renamed.replace(*other))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+                _ = handle.write_text(renamed)
+
+    def test_canonical_order_drops_a_trailing_comma_only_where_it_does_not_change_the_code(self) -> None:
+        def words(text: str) -> tuple[str, ...]:
+            return style_plan.canonical_order(tuple(token.value for token in style_footprint.tokens(text)))
+        # A one-entry tuple is not the grouped expression, even when its entry holds commas.
+        self.assertNotEqual(words("let f = (|a: u8, b: u8| a + b,);"), words("let f = (|a: u8, b: u8| a + b);"))
+        self.assertNotEqual(words("let m = (HashMap::<u8, u8>::new(),);"), words("let m = (HashMap::<u8, u8>::new());"))
+        self.assertEqual(words("acquire(\n    mutation_lock::x,\n);"), words("acquire(mutation_lock::x);"))
+
+    def test_approved_file_rename_refuses_a_comment_moved_between_items(self) -> None:
+        handle = (self.LEDGER_HANDLE + "\n// a\nfn first() {}\n\n// b\nfn second() {}\n\n"
+                  + "/// c\nfn third() {}\n\n// SAFETY: d\nfn fourth() {}\n")
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),))
+        self.renamed_ledger(handle)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        path = self.repo / "crates/alpha/src/ledger/handle.rs"
+        renamed = path.read_text()
+        for first, second in (("// a", "// b"), ("/// c", "// SAFETY: d")):
+            with self.subTest(first=first, second=second):
+                _ = path.write_text(renamed.replace(first, "\0").replace(second, first).replace("\0", second))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+                _ = path.write_text(renamed)
+
+    def test_approved_file_rename_reads_a_plain_path_from_its_module_or_the_library_name(self) -> None:
+        store, beta = "crates/alpha/src/store/mod.rs", self.sources[3]
+        ticket = self.file_rename_ticket(files=(
+            (self.sources[0], "pub mod ledger;\nuse ledger::lock::MutationLock;\n"),
+            (self.sources[2], "use alpha::ledger::lock::MutationLock;\n"),
+            (store, "use archive::ledger::lock::Entry;\n"),
+            (beta, "use beta::ledger::lock::MutationLock;\n")))
+        self.renamed_ledger()
+        for path in (self.sources[0], self.sources[2]):
+            self.write(path, (self.repo / path).read_text().replace("::lock::", "::mutation_lock::"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for path in (store, beta):
+            with self.subTest(path=path):
+                text = (self.repo / path).read_text()
+                self.write(path, text.replace("::lock::", "::mutation_lock::"))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{path} (change is not an approved rename reference)", output)
+                self.write(path, text)
+
+    def test_approved_file_rename_and_item_rename_edit_one_file(self) -> None:
+        handle = self.LEDGER_HANDLE.replace("-> lock::LockError", "-> super::lock::LockError")
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),),
+                                         pairs=(("lock::LockError", "lock::LockFailure"),))
+        self.renamed_ledger(handle, "LockFailure")
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        path = self.repo / "crates/alpha/src/ledger/handle.rs"
+        _ = path.write_text(path.read_text().replace("super::mutation_lock::LockFailure", "super::mutation_lock::LockFault"))
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+
+    def test_approved_file_rename_leaves_a_folder_of_child_modules_to_a_person(self) -> None:
+        folder = "crates/alpha/src/ledger/lock"
+        ticket = self.file_rename_ticket(files=(
+            (f"{folder}.rs", "mod guard;\npub struct MutationLock;\npub struct LockError;\n"),
+            (f"{folder}/guard.rs", "pub struct Guard;\n")))
+        _ = self.git("mv", folder, "crates/alpha/src/ledger/mutation_lock")
+        self.renamed_ledger()
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        for name in ("lock", "mutation_lock"):
+            self.assertIn(f"crates/alpha/src/ledger/{name}/guard.rs (in crates/alpha/src/ledger/{name}/, the folder of "
+                          + "a renamed module: a person moves it)", output)
 
     def test_approved_rename_allows_only_reference_edits_in_an_outside_file(self) -> None:
         before = ('// Outcome::OldName stays in this comment.\r\n'

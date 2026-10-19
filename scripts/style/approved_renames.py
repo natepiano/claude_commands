@@ -5,10 +5,16 @@ The check is AppliedInCode only when no identifier is the old name and the scan 
 parent, and RenameNotApplied only when no identifier is the new name and the scan finds the old name declared under the
 parent. Every other case, both names present included, is NoAppliedCheck, so the scan never decides between two names.
 A file whose macros or attributes can make names that are not its identifiers is NoAppliedCheck too.
+
+A file rename finding moves one module file to a sibling file. Its check reads which of the two files is there: it is
+AppliedInCode when only the new file is, RenameNotApplied when only the old file is, and NoAppliedCheck otherwise. It is
+NoAppliedCheck too when a folder of child modules is at either name, because a person moves that folder.
 """
 
 from __future__ import annotations
 
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -22,6 +28,22 @@ ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "co
 ITEM_LEADS = frozenset({"{", "}", ";", "pub", "unsafe", "async", "const", "extern", "default"})
 # The macros that make an item name from other tokens or bring in items from another file.
 NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
+# A relative Rust file path: folders of name characters, then a file whose stem can be a module name.
+RUST_FILE = r"(?:[A-Za-z0-9_-]+/)*[A-Za-z_][A-Za-z0-9_]*\.rs"
+# A file rename finding's after: each path ends at a space, a mark, the end of a sentence or the end of the text.
+FILE_RENAME = re.compile(rf"Rename ({RUST_FILE}) to ({RUST_FILE})(?=$|[\s;,:)]|\.(?:\s|$))")
+# Words after a file rename that name another change: a second file pair, or a move, split or merge of code.
+OTHER_CHANGE = re.compile(
+    rf"{RUST_FILE}\s+to\s+{RUST_FILE}|\b(?:mov(?:e|es|ed|ing)|split(?:s|ting)?|merg(?:e|es|ed|ing))\b", re.IGNORECASE)
+# The file stems that are their folder's module or a crate root, not a module of their own name.
+ROOT_STEMS = frozenset({"mod", "lib", "main"})
+# The Rust keywords, strict and reserved in any edition: a module with one of these names needs `r#`.
+RUST_KEYWORDS = frozenset({
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
+    "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
+    "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract", "become",
+    "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
+})
 
 
 @dataclass(frozen=True)
@@ -40,13 +62,63 @@ class NoQualifiedRename:
 
 
 @dataclass(frozen=True)
+class FileRename:
+    """A rename of one module file to a sibling file, as paths from the repository root."""
+
+    old: str
+    new: str
+
+    @property
+    def old_stem(self) -> str:
+        return PurePosixPath(self.old).stem
+
+    @property
+    def new_stem(self) -> str:
+        return PurePosixPath(self.new).stem
+
+    @property
+    def module_folders(self) -> tuple[str, str]:
+        """The folders that hold the child modules of the old file and of the new file."""
+        return self.old.removesuffix(".rs"), self.new.removesuffix(".rs")
+
+
+@dataclass(frozen=True)
+class NoFileRename:
+    """The finding does not rename one module file.
+
+    Its after does not start with `Rename <a> to <b>`, its path does not end with <a>, the two files are not sibling
+    module files with different names that are not Rust keywords, or the rest of its after names another change.
+    """
+
+
+@dataclass(frozen=True)
+class MissingFile:
+    """Nothing is at the path in the code that is read."""
+
+
+@dataclass(frozen=True)
+class Folder:
+    """A folder is at the path in the code that is read."""
+
+
+# Reads one path of the code a check looks at, relative to the repository root: a file's bytes, a folder or nothing.
+FileReader = Callable[[str], bytes | Folder | MissingFile]
+
+
+@dataclass(frozen=True)
 class AppliedInCode:
-    """No identifier of the file is the old name, and the file declares the new name under its parent."""
+    """No identifier of the file is the old name, and the file declares the new name under its parent.
+
+    For a file rename, the old file is gone and the new file is there.
+    """
 
 
 @dataclass(frozen=True)
 class RenameNotApplied:
-    """No identifier of the file is the new name, and the file still declares the old name under its parent."""
+    """No identifier of the file is the new name, and the file still declares the old name under its parent.
+
+    For a file rename, the old file at path is there and the new file is not.
+    """
 
     path: str
 
@@ -56,7 +128,8 @@ class NoAppliedCheck:
     """The code cannot show whether the change is in, so a person checks it.
 
     The finding is not a qualified rename, its file holds both names or neither, a macro of the file can make names,
-    or the scan does not find with certainty the one name it holds declared under the parent.
+    or the scan does not find with certainty the one name it holds declared under the parent. For a file rename, both
+    files or neither are there, or a folder of child modules is at the old or the new name.
     """
 
     kind: str
@@ -108,6 +181,19 @@ def approved_rename(kind: str, before: str, after: str) -> ApprovedRename | NoQu
             or not style_footprint.IDENTIFIER.fullmatch(new[-1])):
         return NoQualifiedRename()
     return ApprovedRename(tuple(old[:-2]), old[-2], old[-1], new[-1])
+
+
+def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
+    """The file rename a finding approves, when its after starts with `Rename <a> to <b>` and its path ends with <a>."""
+    match = FILE_RENAME.match(after)
+    if kind != "rename" or not match or OTHER_CHANGE.search(after, match.end()):
+        return NoFileRename()
+    named_old, named_new = PurePosixPath(match[1]), PurePosixPath(match[2])
+    stems = {named_old.stem, named_new.stem}
+    if ((path != match[1] and not path.endswith("/" + match[1])) or named_old.parent != named_new.parent
+            or len(stems) == 1 or stems & ROOT_STEMS or stems & RUST_KEYWORDS):
+        return NoFileRename()
+    return FileRename(path, path.removesuffix(match[1]) + match[2])
 
 
 def file_module(path: str) -> str:
@@ -278,10 +364,19 @@ def declaration_sites(words: tuple[str, ...], path: str, rename: ApprovedRename,
     return Declarations(frozenset(sites))
 
 
-def applied_check(kind: str, before: str, after: str, path: str, source: bytes) -> AppliedCheck:
-    """Whether a finding's change is in source, the bytes of its file at path."""
+def applied_check(kind: str, before: str, after: str, path: str, read: FileReader) -> AppliedCheck:
+    """Whether a finding's change is in the code that read reads."""
+    moved = file_rename(kind, path, after)
+    if isinstance(moved, FileRename):
+        old, new = read(moved.old), read(moved.new)
+        if (isinstance(old, bytes) == isinstance(new, bytes)
+                or not all(isinstance(read(folder), MissingFile) for folder in moved.module_folders)):
+            return NoAppliedCheck(kind)
+        return AppliedInCode() if isinstance(new, bytes) else RenameNotApplied(moved.old)
     rename = approved_rename(kind, before, after)
-    if isinstance(rename, NoQualifiedRename):
+    source = read(path)
+    # A file that is not there declares neither name.
+    if isinstance(rename, NoQualifiedRename) or not isinstance(source, bytes):
         return NoAppliedCheck(kind)
     source_tokens = style_footprint.tokens(source.decode(errors="replace"))
     names = {token.value.removeprefix("r#") for token in source_tokens if token.kind == "identifier"}
