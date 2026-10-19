@@ -19,6 +19,8 @@ STATE_HISTORY = (
     "message/queue/", "message/postmaster/replies/", "notify/", "accounts/moves.jsonl", "showrunner/outstanding/",
     "plan-delegate/runs/", "plan-delegate/review_turns/", "model-study/", "claude-model-study/",
     "screenshot-analysis/", "plan-backlog/", "usage-model/",
+    # Build logs, hook trial records, the feature log, review prompts, verify events and shell history.
+    "buildlog/", "mul-add-hook/", "fn-length-hook/", "claude/feature-log/", "review-pool/", "verify/", "zsh/",
     # Rebuilt from its sources on the next board refresh.
     "unit-board/",
 )
@@ -29,7 +31,7 @@ PRODUCTION_HISTORY = ("log-backups/", "dailies_last.json", "rename_unit.json", "
 CONFIG_HISTORY = (
     "projects/", "file-history/", "history.jsonl", "todos/", "shell-snapshots/", "debug/", "plans/",
     "paste-cache/", "sessions/", "statsig/", "backups/", ".claude.json", ".git/", ".claude/worktrees/",
-    "data/review_regime.jsonl", "teams/",
+    "data/review_regime.jsonl", "data/review_regime_marks_", "teams/", "jobs/", "feedback/", "state/berth-fix/",
 )
 
 
