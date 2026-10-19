@@ -10,6 +10,7 @@ export const RUN = "/history/runs/current.jsonl";
 export const DISCOVERY = "/history/runs";
 export const REGISTRY = "/test-home/.local/state/notifier";
 export const CWD = "/test-worktree";
+export const SESSION = "showrunner-session-id";
 export const time = (minutes: number, text: string): BoardTime => ({ at: NOW / 1000 + minutes * 60, text });
 
 export function phase(id: string, status: BoardPhase["status"]): BoardPhase {
@@ -43,11 +44,12 @@ export function fixture(): BoardData {
     }] };
 }
 
-export function hostEngine(on: On) {
+export function hostEngine(on: On, sessionId = () => SESSION) {
   const panes = new Map<string, UiPane>();
   const opened: string[] = [];
   const closed: string[] = [];
   const forbidden: string[] = [];
+  on("session.id", () => ({ value: sessionId() }));
   on("session.start", (_$, event) => ({ cwd: event.cwd }));
   on("turn.complete", (_$, event) => ({ text: event.answer }));
   on("command.register", (_$, event) => ({ value: { command: event.name } }));
@@ -69,7 +71,8 @@ export function hostEngine(on: On) {
 }
 
 export function engineFiles(on: On) {
-  const host = hostEngine(on);
+  let sessionId = SESSION;
+  const host = hostEngine(on, () => sessionId);
   const clock = mock.clock(on, { now: NOW });
   mock.env(on, { HOME: "/test-home", XDG_STATE_HOME: "/test-state" });
   let boards = [fixture()];
@@ -115,6 +118,7 @@ export function engineFiles(on: On) {
     replace: (value: BoardData) => { boards = [value]; },
     replaceBoards: (values: BoardData[]) => { boards = values; },
     failNext: (reason: string) => { failure = reason; },
+    setSession: (value: string) => { sessionId = value; },
     clear: () => { reads.length = 0; stats.length = 0; processes.length = 0; },
   };
 }
@@ -158,7 +162,7 @@ export function lifecycleHarness() {
       set: async (_key: unknown, value: Record<string, PaneState<BoardData>>) => { calls.push("state"); panes = value; },
     },
     ui: { open: async () => ({ isPlaced: true }) },
-    session: { cwd: async () => CWD },
+    session: { cwd: async () => CWD, id: async () => SESSION },
     env: { get: async (name: string) => name === "HOME" ? "/test-home" : undefined },
     clock: {
       now: async () => NOW,

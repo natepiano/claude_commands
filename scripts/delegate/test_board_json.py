@@ -364,6 +364,69 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual([doc["production"] for doc in documents], [child.slug, grandchild.slug])
         self.assertNotIn("focus", response)
 
+    def test_showrunner_session_timer_selects_its_production_from_an_unrelated_cwd(self) -> None:
+        fixture = self.production(running=False)
+        unrelated = self.root / "etc/nixos"
+        unrelated.mkdir(parents=True)
+
+        response, documents = self.generate("--cwd", str(unrelated), "--session", "show-id")
+
+        self.assertEqual(response["files"], [str(self.output / "show.json")])
+        self.assertEqual([document["production"] for document in documents], [fixture.slug])
+        unit = object_fields(array_items(documents[0]["units"])[0])
+        self.assertEqual(unit["plan"], str(fixture.plan))
+
+    def test_showrunner_session_takes_precedence_over_another_productions_cwd(self) -> None:
+        fixture = self.production("session-production", running=False)
+        other = self.production("cwd-production", running=False)
+
+        _, documents = self.generate("--cwd", str(other.checkout),
+                                     "--session", "session-production-id")
+
+        self.assertEqual([document["production"] for document in documents], [fixture.slug])
+        self.assertFalse((self.output / f"{other.slug}.json").exists())
+
+    def test_showrunner_session_selects_its_subtree_without_parents_or_siblings(self) -> None:
+        parent = self.production("parent", running=False)
+        root = self.production("z-root", running=False)
+        child = self.production("m-child", running=False)
+        grandchild = self.production("a-grandchild", running=False)
+        sibling = self.production("sibling", running=False)
+        self.attach(root.slug, parent.slug)
+        self.attach(sibling.slug, parent.slug)
+        self.attach(child.slug, root.slug)
+        self.attach(grandchild.slug, child.slug)
+
+        response, documents = self.generate("--cwd", str(self.root), "--session", "z-root-id")
+
+        self.assertEqual([document["production"] for document in documents],
+                         [root.slug, child.slug, grandchild.slug])
+        self.assertEqual(response["files"], [str(self.output / f"{slug}.json")
+                                             for slug in (root.slug, child.slug, grandchild.slug)])
+        self.assertFalse((self.output / f"{parent.slug}.json").exists())
+        self.assertFalse((self.output / f"{sibling.slug}.json").exists())
+
+    def test_unknown_session_falls_back_to_cwd_and_leaves_an_unrelated_cwd_empty(self) -> None:
+        fixture = self.production(running=False)
+        nested = fixture.checkout / "nested"
+        nested.mkdir()
+        for cwd, expected in ((nested, [fixture.slug]), (self.root, [])):
+            with self.subTest(cwd=cwd):
+                _, documents = self.generate("--cwd", str(cwd), "--session", "unknown-session")
+
+                self.assertEqual([document["production"] for document in documents], expected)
+
+    def test_explicit_production_wins_over_session(self) -> None:
+        fixture = self.production("explicit", running=False)
+        other = self.production("session-production", running=False)
+        for production, expected in ((fixture.slug, [fixture.slug]), ("unknown-production", [])):
+            with self.subTest(production=production):
+                _, documents = self.generate("--production", production,
+                                             "--session", "session-production-id")
+
+                self.assertEqual([document["production"] for document in documents], expected)
+                self.assertFalse((self.output / f"{other.slug}.json").exists())
+
     def test_attach_and_detach_change_a_watched_directory_and_refresh_the_subtree(self) -> None:
         root = self.production("root")
         child = self.production("child")
