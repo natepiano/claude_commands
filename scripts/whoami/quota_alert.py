@@ -127,25 +127,26 @@ def reset_display(reset: refusals.KnownReset | refusals.NoResetKnown | accounts.
 
 
 def _save_codex_readings(readings: CodexAlertPassReadings, now: datetime) -> None:
-    held = usage_store.load()
-    changed = False
-    for checked in readings.checked_homes:
-        if (not checked.report.problem and not checked.report.quota_problem
-                and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE):
-            if checked.report.email:
-                previous = held.get(usage_store.key("Codex", checked.report.email), {})
-                if "weekly" in previous:
-                    try:
-                        if datetime.fromisoformat(previous["weekly"]["at"]) > checked.observed_at:
-                            continue
-                    except ValueError:
-                        pass
-            changed = usage_store.merge(held, [checked.report], checked.observed_at) or changed
-    if changed:
-        try:
-            usage_store.write(held)
-        except (OSError, ValueError) as error:
-            print(f"usage store: {error}", file=sys.stderr)
+    try:
+        with usage_store.read_lock():
+            held = usage_store.load()
+            changed = False
+            for checked in readings.checked_homes:
+                if (not checked.report.problem and not checked.report.quota_problem
+                        and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE):
+                    if checked.report.email:
+                        previous = held.get(usage_store.key("Codex", checked.report.email), {})
+                        if "weekly" in previous:
+                            try:
+                                if datetime.fromisoformat(previous["weekly"]["at"]) > checked.observed_at:
+                                    continue
+                            except ValueError:
+                                pass
+                    changed = usage_store.merge(held, [checked.report], checked.observed_at) or changed
+            if changed:
+                usage_store.write(held)
+    except (OSError, ValueError) as error:
+        print(f"usage store: {error}", file=sys.stderr)
 
 
 def _reading_for_account(readings: CodexAlertPassReadings, identity: agent_accounts.KnownCodexAccount,

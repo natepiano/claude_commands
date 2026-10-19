@@ -3867,11 +3867,11 @@ class AccountsTests(unittest.TestCase):
             (agent_accounts.UsageReadOutcome.STALE_TOKEN,
              "login token expired; start a session on it to refresh"),
             (agent_accounts.UsageReadOutcome.REFUSED_401,
-             "usage read refused (401); start a session on it to check its login"),
+             "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
-             "usage read refused (rate limit); the next read is in 2 minutes"),
+             "the usage service is busy, so this shows the reading from 05:29; next try in 2 min"),
             (agent_accounts.UsageReadOutcome.ERROR,
-             "usage read failed; the next read is in 2 minutes"),
+             "the usage read failed, so this shows the reading from 05:29; next try in 2 min"),
         )
         for outcome, reason in cases:
             with self.subTest(outcome=outcome):
@@ -3897,6 +3897,63 @@ class AccountsTests(unittest.TestCase):
         self.live_reads.assert_not_called()
         self.codex_reads.assert_not_awaited()
 
+    def test_usage_failure_notes_name_the_service_and_retry_time_in_table_and_json(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        at = datetime(2026, 10, 19, 15, 11, tzinfo=timezone.utc)
+        cases = (
+            (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
+             "the usage service is busy, so this shows the reading from 08:09; next try after 08:21",
+             "the usage service is busy and no reading is stored yet; next try after 08:21"),
+            (agent_accounts.UsageReadOutcome.ERROR,
+             "the usage read failed, so this shows the reading from 08:09; next try in 2 min",
+             "the usage read failed and no reading is stored yet; next try in 2 min"),
+            (agent_accounts.UsageReadOutcome.REFUSED_401,
+             "the usage service did not accept this login; start a session on it to check it",
+             "the usage service did not accept this login; start a session on it to check it"),
+            (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+             "login token expired; start a session on it to refresh",
+             "login token expired; start a session on it to refresh"),
+        )
+        for outcome, with_reading, without_reading in cases:
+            for has_reading, reason in ((True, with_reading), (False, without_reading)):
+                with self.subTest(outcome=outcome, reading=has_reading):
+                    usage = usage_store.StoredUsage(read_outcome=outcome, attempted_at=at.isoformat(),
+                        attempt_outcome=outcome)
+                    if has_reading:
+                        usage["weekly"] = usage_store.StoredWindow(left=75,
+                            at=(at - timedelta(minutes=2)).isoformat(),
+                            resets=(at + timedelta(days=1)).isoformat())
+                        usage["five_hour"] = usage["weekly"]
+                    with usage_store.read_lock():
+                        usage_store.write({"idle@example.invalid": usage})
+                    code, output, error = self.run_cli("status", "--stored")
+                    self.assertEqual((code, error), (0, ""))
+                    note = f"* claude2: {reason}"
+                    self.assertEqual([line for line in output.splitlines() if line.startswith("* ")], [note])
+                    code, document, error = self.run_cli("status", "--json", "--stored")
+                    self.assertEqual((code, error), (0, ""))
+                    problems = cast(dict[str, object], json.loads(document))["problems"]
+                    self.assertEqual([problem for problem in cast(list[str], problems)
+                                      if problem.startswith("* ")], [note])
+                    self.assertNotIn("refused", note)
+        self.live_reads.assert_not_called()
+
+    def test_a_held_refresh_keeps_the_stored_reading_and_failure_note(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        at = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 25, at + timedelta(days=1)))], at)
+        usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429)], at)
+        before = usage_store.store_file().read_bytes()
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude",
+            email="idle@example.invalid", usage_read_outcome=agent_accounts.UsageReadOutcome.HELD)
+        code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("01-02 05:29 PST*", output)
+        self.assertIn("the usage service is busy, so this shows the reading from 05:29; next try in 2 min", output)
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+
     def test_first_identity_failure_after_upgrade_marks_the_old_reading(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
@@ -3911,7 +3968,7 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage read failed; the next read is in 2 minutes"])
+                         ["* claude2: the usage read failed, so this shows the reading from 05:29; next try in 2 min"])
         self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
         self.live_reads.assert_called_once_with(directory)
 
@@ -3933,7 +3990,7 @@ class AccountsTests(unittest.TestCase):
         row = next(line for line in output.splitlines() if "| claude2 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
         self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
-                         ["* claude2: usage read failed; the next read is in 2 minutes"])
+                         ["* claude2: the usage read failed, so this shows the reading from 05:29; next try in 2 min"])
         self.live_reads.assert_not_called()
 
     def test_failed_read_today_keeps_the_short_time_and_marks_a_never_read_account(self) -> None:
@@ -3965,7 +4022,7 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         row = next(line for line in output.splitlines() if "| codex1 " in line)
         self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
-        self.assertIn("* codex1: usage read failed; the next read is in 2 minutes", output)
+        self.assertIn("* codex1: the usage read failed, so this shows the reading from 05:29; next try in 2 min", output)
         self.assertIn("/showrunner:accounts setup codex1", row)
 
     def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:

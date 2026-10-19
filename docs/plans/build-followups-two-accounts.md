@@ -2142,3 +2142,28 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - After a refused turn the app-server reports the thread as `systemError`, not `idle`. A status check that accepts only `idle` waits on a refused thread without limit.
 - The one pool review found one blocker (the stored-refusal path still returned `WorkerWaitingOnLiveTurn`). It is fixed with regression tests. The first new tests fail on the old code.
+
+### Phase 79 — One usage read at a time, in clear words  · status: done
+
+#### As-built
+
+- `agent_accounts.claude_live` claims each read with `usage_store.claim_read` under an `fcntl.flock` on `~/.local/state/agent-notes/usage.lock`. A login attempted less than 90 s ago, or less than 10 minutes after a 429, is not read: the report has outcome `HELD`, no quotas and no `quota_problem`. `merge`, `agent_notes.apply` and the accounts table change nothing for it. The lock is never held during the HTTP call.
+- `usage_store.finish_read` keeps the attempt outcome (`attempted_at`, `attempt_outcome`) and the reading for every claimed read, also for callers that do not save (whoami). A claimed report carries its `UsageReadClaim`; a claim older than the stored `attempted_at` changes nothing in `merge`.
+- `save`, `claim_read`, `finish_read` and `quota_alert._save_codex_readings` do their load, merge and write under the lock. `write` is a plain replace and takes no lock.
+- A store error in the claim reads without a hold; one in the finish keeps the live report. Each prints one stderr line.
+- `accounts._read_failure_note` says "the usage service is busy, so this shows the reading from HH:MM; next try after HH:MM" (429 attempt time plus 10 minutes), "the usage read failed, so this shows the reading from HH:MM; next try in 2 min", and "the usage service did not accept this login; start a session on it to check it". With no stored reading the first two say "... and no reading is stored yet". The JSON problems list carries the same lines.
+- Cause (2026-10-19 08:11 EDT): during the units move, about 28 `shutdown.py status` and `ready --where` runs each started the full snapshot, which read every Claude login. Six overlapping passes made 18 reads in 24 s, and every login got 429.
+
+**Files:**
+- `scripts/whoami/agent_accounts.py` — `HELD`, the claim types and the claim and finish around the HTTP call.
+- `scripts/whoami/usage_store.py` — the lock, the attempt fields, `claim_read`, `finish_read`, `merge` for held and stale claims, `save` under the lock.
+- `scripts/whoami/quota_alert.py` — the Codex save under the lock.
+- `scripts/whoami/agent_notes.py` — a held report writes nothing.
+- `scripts/accounts/accounts.py` — the footnote words and the attempt time on each row.
+- Tests: `scripts/whoami/test_agent_accounts.py`, `test_usage_store.py`, `test_quota_alert.py`, `test_agent_notes.py`, `scripts/accounts/test_accounts.py`.
+
+**Gotchas:**
+- The 90 s hold must stay shorter than the 2-minute agent-sessions timer, or the timer holds its own reads.
+- `write` needs the caller to hold `read_lock`. A second flock on the lock file in one thread blocks, so never take the lock inside a path that already holds it.
+- The extra passes still run the snapshot's notes refresh (in `/etc/nixos/modules/linux/agent-sessions-snapshot.py`, outside this repo); they now read nothing. The showrunner routes the change that skips it.
+- The one pool review found one blocker (a late save of an older good read cleared a newer 429) and one minor (a store error cost the read). Both are fixed with tests.

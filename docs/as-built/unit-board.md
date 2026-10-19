@@ -93,7 +93,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `overdueText` gives ` · overdue Nm|Nh Mm|Nd Mh`. |
 | `hooks/board.tsx` | `BoardView`, `RulerView` and the shared text helpers `etaText`, `gateText`, `finishText`, `workersText`. |
 | `hooks/unit.tsx` | `UnitView`: one unit's detail. |
-| `hooks/accounts.tsx` | `AccountsView`, `accountDisplay` and the display types. |
+| `hooks/accounts.tsx` | `AccountsView`, `accountsTable`, `accountDisplay` and the display types. |
 | `types/board.d.ts`, `types/accounts.d.ts` | Wire contracts of the generator and of `accounts.py`. |
 | `types/index.d.ts` | `BoardSnapshot`, `PaneState`, `AccountsPaneState`, the `PluginState` keys. |
 | `tests/` | `kit.ts` fixtures; `geometry`, `register` and `accounts` tests. |
@@ -158,7 +158,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
   - Older done rows fold into `+N earlier: <ids>`, and todo rows past the next three into `+N later`.
   - Older steps fold into `+N earlier steps`.
   - An empty record reads `no phases recorded`. A block with nothing in it is not drawn.
-- Accounts: `units: <labels>, showrunners: <labels>` from `roles` (units match `units` and `unit directors`; none reads `unassigned`), then Label, Login, Roles, Weekly left, Weekly resets, On credits, Credits left, Read, then Problems. `accountDisplay` maps the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`), so a null reading shows `unavailable`, never 0. Dates format with `Intl.DateTimeFormat` in the resolved zone.
+- Accounts: `units: <labels>, showrunners: <labels>` from `roles` (units match `units` and `unit directors`; none reads `unassigned`), then the table Label, Login, Roles, Left, Resets, Credits, Read, then Problems. `accountDisplay` maps the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`). `accountsTable(rows, zone): AccountsTable` makes the cell strings: Left is the rounded percent; Resets and Read are `Oct 18 14:00` (`Intl.DateTimeFormat` in the resolved zone, no weekday, comma removed); Credits is the balance (`42`, `unlimited`) with ` in use` when the account uses credits; a missing reading or invalid date is `—`, never 0. Its `width` is the column widths in terminal columns (`cellWidth`) plus two spaces between columns, and the last column has no padding: a pane at least `width` columns wide draws each account on one line, and only a narrower pane wraps. Row text is the default colour.
 - `resolveUserZone(calls, isActive): Promise<ZoneLookup>` follows [`scripts/lib/user_zone.py`](../../scripts/lib/user_zone.py): `USER_ZONE`, then the `zone=` line of `USER_ZONE_CONF` or `~/.claude/config/user_zone.conf`, then `America/New_York`, validated through `Intl.DateTimeFormat`; it returns `{kind: 'cancelled'}` once the lifecycle moves on.
 
 ### The short report
@@ -194,7 +194,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Ruler horizon: 10 % beyond the later of the promise and now; board ruler width is `bodyColumns - 4`, unit `bodyColumns - 2`, minimum 8.
 - `doing` is cut to 80 characters, after the `launcher: ` prefix and the summary or findings path are removed.
 - `local_run` stops at the `run_started` line: parsing every line of every run file once per unit took 35 s for three productions, past the mod's 30 s process limit. Reading to that line brings it to about 4.5 s.
-- Weekly left under 10 % is `error`, under 25 % `warning`.
+- Left under 10 % is `error`, under 25 % `warning`, else the default colour (`leftTone`); no account row is `subtle`, which made the table hard to read.
 - `HH:MM` for `--time`, `--earliest`, `--latest` means today only; a later-day ETA needs the full date.
 - A phase record's `first_eta` comes from `_instance_eta_events`, so a checkpoint-notice ETA recorded before the phase starts counts as its first.
 - `build_plan` can select an older resumed phase as open, so the newest `phase_started` is the wrong instance for `steps` and `stage`; both follow `OpenPhase.instance_id`.

@@ -1279,6 +1279,21 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(converted["worker_id"], identity["seat_id"])
         self.assertNotIn("seat_id", converted)
 
+    def test_follow_up_of_a_worker_with_no_identity_record_resumes_its_roster_thread(self) -> None:
+        session_dir = self.start_phase("lost-identity")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        path = session_dir / "impl_worker_impl.json"
+        identity = cast("dict[str, object]", json.loads(path.read_text()))
+        path.unlink()
+        resumed = self.mesh_launch(session_dir, to=str(identity["name"]))
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(json.loads(path.read_text()), identity)
+        _ = path.write_text(json.dumps({**identity, "worker_id": "another-thread"}))
+        refused = self.mesh_launch(session_dir, to=str(identity["name"]))
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn("has no matching durable worker identity for slot impl", refused.stderr)
+
     def test_peer_turn_after_claim_closes_follow_up_as_error(self) -> None:
         session_dir = self.start_phase("peer-after-claim")
         first = self.mesh_launch(session_dir)

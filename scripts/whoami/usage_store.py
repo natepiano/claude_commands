@@ -6,15 +6,25 @@ accounts table has each account's newest numbers and the time they were read.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import sys
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-from agent_accounts import ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome
-from note_file import canonical_label
+# Package callers and sibling scripts share the same store and claim types.
+if __name__ == "usage_store":
+    _ = sys.modules.setdefault("scripts.whoami.usage_store", sys.modules[__name__])
+elif __name__ == "scripts.whoami.usage_store":
+    _ = sys.modules.setdefault("usage_store", sys.modules[__name__])
+
+from scripts.whoami.agent_accounts import ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
+from scripts.whoami.note_file import canonical_label
 
 
 class StoredWindow(TypedDict):
@@ -44,6 +54,8 @@ class StoredUsage(TypedDict, total=False):
     # Identifies a later failed attempt even when authentication returns no login.
     weekly_read_skip_directory: str
     read_outcome: UsageReadOutcome
+    attempted_at: str
+    attempt_outcome: UsageReadOutcome
 
 
 
@@ -96,6 +108,52 @@ class LabelUsage(TypedDict, total=False):
 
 def store_file() -> Path:
     return Path.home() / ".local" / "state" / "agent-notes" / "usage.json"
+
+
+@contextmanager
+def read_lock() -> Generator[None]:
+    """Guard claims and store writes across readers, including separate threads."""
+    path = store_file().with_name("usage.lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(descriptor, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def claim_read(login: str, now: datetime) -> UsageReadClaim | UsageReadHeld:
+    with read_lock():
+        stored = load()
+        usage = stored.setdefault(key("Claude", login), StoredUsage())
+        attempted = usage.get("attempted_at", "")
+        try:
+            at = datetime.fromisoformat(attempted)
+        except ValueError:
+            at = None
+        if at is not None and at.tzinfo is not None:
+            age = (now - at).total_seconds()
+            if age < 90 or (age < 600 and usage.get("attempt_outcome") == UsageReadOutcome.RATE_LIMITED_429):
+                return UsageReadHeld()
+        usage["attempted_at"] = now.isoformat()
+        # The claim replaces the previous attempt. A prior 429 cannot extend it.
+        _ = usage.pop("attempt_outcome", None)
+        write(stored)
+    return UsageReadClaim(now)
+
+
+def finish_read(login: str, claim: UsageReadClaim, report: Report) -> None:
+    """Keep the result even when the caller does not save reports."""
+    with read_lock():
+        stored = load()
+        usage = stored.get(key("Claude", login))
+        if usage is None or usage.get("attempted_at") != claim.at.isoformat():
+            return  # A newer reader owns the login now.
+        usage["attempt_outcome"] = report.usage_read_outcome
+        _ = merge(stored, [report], claim.at)
+        write(stored)
 
 
 def label_file() -> Path:
@@ -161,6 +219,14 @@ def load() -> UsageReadings:
                 usage["read_outcome"] = UsageReadOutcome(held["read_outcome"])
             except (ValueError, TypeError):
                 usage["read_outcome"] = UsageReadOutcome.ERROR
+        attempted = held.get("attempted_at")
+        if isinstance(attempted, str):
+            usage["attempted_at"] = attempted
+        if "attempt_outcome" in held:
+            try:
+                usage["attempt_outcome"] = UsageReadOutcome(held["attempt_outcome"])
+            except (ValueError, TypeError):
+                usage["attempt_outcome"] = UsageReadOutcome.ERROR
         # Accept links from the first Phase 75 format, but write only the directory map.
         directory = held.get("read_source_directory") or held.get("weekly_read_skip_directory")
         if isinstance(directory, str):
@@ -188,8 +254,18 @@ def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) ->
     """
     changed = False
     for report in reports:
-        if report.tool not in ("Claude", "Codex"):
+        if report.usage_read_outcome == UsageReadOutcome.HELD or report.tool not in ("Claude", "Codex"):
             continue
+        if report.tool == "Claude" and isinstance(report.usage_read_claim, UsageReadClaim):
+            current = stored.get(key("Claude", report.email or ""), StoredUsage())
+            try:
+                attempted = datetime.fromisoformat(current.get("attempted_at", ""))
+            except ValueError:
+                attempted = report.usage_read_claim.at
+            if attempted.tzinfo is not None and report.usage_read_claim.at < attempted:
+                continue
+        read_at = (report.usage_read_claim.at if isinstance(report.usage_read_claim, UsageReadClaim)
+                   else checked_at)
         directory = (str(report.source.directory) if isinstance(report.source, ClaudeDirectorySource)
                      else str(report.source.home) if isinstance(report.source, CodexHomeSource) else "")
         source_key = directory_key(report.tool, directory)
@@ -220,7 +296,7 @@ def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) ->
             _ = stored[login].pop("weekly_read_skip_directory", None)
             changed = True
         weekly_quota = next((quota for quota in report.quotas if quota.label == "Weekly"), None)
-        weekly = _read(weekly_quota, checked_at) if weekly_quota is not None else None
+        weekly = _read(weekly_quota, read_at) if weekly_quota is not None else None
         outcome = (UsageReadOutcome.OK if weekly is not None else UsageReadOutcome.STALE_TOKEN
                    if isinstance(report.weekly_read_skip, StaleTokenSkip) else report.usage_read_outcome)
         if usage.get("read_outcome") != outcome:
@@ -231,14 +307,14 @@ def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) ->
         usage["weekly"] = weekly
         if report.credit_balance is not None:
             usage["credits"] = StoredCredits(
-                balance=report.credit_balance, at=checked_at.isoformat(timespec="seconds"),
+                balance=report.credit_balance, at=read_at.isoformat(timespec="seconds"),
             )
-        five_hour = _read(report.five_hour, checked_at) if report.five_hour is not None else None
+        five_hour = _read(report.five_hour, read_at) if report.five_hour is not None else None
         if five_hour is not None:
             usage["five_hour"] = five_hour
         elif report.tool == "Claude":
             # A Claude read that holds no 5-hour window found none open: all of it is left.
-            usage["five_hour"] = StoredWindow(left=100.0, resets="", at=checked_at.isoformat(timespec="seconds"))
+            usage["five_hour"] = StoredWindow(left=100.0, resets="", at=read_at.isoformat(timespec="seconds"))
         else:
             # Codex lists every window an account has, so this account has no 5-hour window.
             _ = usage.pop("five_hour", None)
@@ -247,7 +323,7 @@ def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) ->
 
 
 def write(stored: dict[str, StoredUsage]) -> None:
-    """Replace the store in one step, readable by this user only."""
+    """Replace the store. The caller must hold read_lock across load, merge and write."""
     encoded: dict[str, object] = dict(stored)
     if isinstance(stored, UsageReadings) and stored.directory_logins:
         encoded["_directory_logins"] = stored.directory_logins
@@ -302,8 +378,9 @@ def save(reports: list[Report], checked_at: datetime, logins: dict[str, str] | N
     from the whole store, so a label keeps its last good reading when this read
     was refused; the status line judges its age.
     """
-    stored = load()
-    if merge(stored, reports, checked_at):
-        write(stored)
-    if logins is not None:
-        _replace(label_file(), json.dumps(by_label(stored, logins), indent=1, sort_keys=True) + "\n")
+    with read_lock():
+        stored = load()
+        if merge(stored, reports, checked_at):
+            write(stored)
+        if logins is not None:
+            _replace(label_file(), json.dumps(by_label(stored, logins), indent=1, sort_keys=True) + "\n")

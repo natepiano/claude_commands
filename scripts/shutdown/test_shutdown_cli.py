@@ -481,15 +481,25 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         original = self.recovery("shared-id")
         other: record.RecoverySnapshot = {**original, "login": "third@example.invalid", "label": "claude3"}
         record.write_snapshot(other)
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error:
-            self.assertEqual(shutdown.main(["forget", "shared-id"]), 2)
-        self.assertIn("more than one local session", error.getvalue())
         with redirect_stdout(io.StringIO()):
             self.assertEqual(shutdown.main(["forget", "shared-id", "--account", "claude3"]), 0)
         self.assertEqual(record.read_snapshot(LOGIN), original)
         retired = record.read_snapshot("third@example.invalid")
         assert not isinstance(retired, record.NoRecoverySnapshot)
         self.assertEqual(retired["sessions"], [])
+
+    def test_forget_one_session_id_moved_between_accounts_forgets_it_on_both(self) -> None:
+        _ = (self.root / "notes/claude3.md").write_text("---\nlogin: third@example.invalid\n---\n")
+        original = self.recovery("shared-id")
+        record.write_snapshot({**original, "login": "third@example.invalid", "label": "claude3"})
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(shutdown.main(["forget", "shared-id"]), 0)
+        self.assertEqual(sorted(output.getvalue().splitlines()),
+                         ["shared-id-name: forgotten on claude2", "shared-id-name: forgotten on claude3"])
+        for login in (LOGIN, "third@example.invalid"):
+            snapshot = record.read_snapshot(login)
+            assert not isinstance(snapshot, record.NoRecoverySnapshot)
+            self.assertEqual(snapshot["sessions"], [])
 
     def test_forget_spaced_account_label_resolves_to_the_recorded_login(self) -> None:
         _ = self.recovery("failed-id")
