@@ -14,7 +14,7 @@ A set of agent-session tools in `~/.claude`, all Python (standard library) or zs
 
 The 96-hour measure ran from 2026-10-07 01:44:05 EDT to 2026-10-11 01:44:05 EDT. It found 27 `too_many_lines` failed steps among 763 hana clippy steps. The rate was 3.539 per 100 against a ≤3.3 limit: **FAIL** (baseline 13.3). Sole-cause cost was 0.116 worker-hours per day against ≤0.27: **PASS** (baseline 1.07). All four Claude/Codex controls on natedev/Mac passed.
 
-The [multiply-add lint rewrite](build-followups-mul-add.md) and the [one-command unit start and checkpoint merge](showrunner-automation.md) have their own docs.
+The [multiply-add lint fix](build-followups-mul-add.md) and the [one-command unit start and checkpoint merge](showrunner-automation.md) have their own docs.
 
 ### Function-length hook
 
