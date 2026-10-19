@@ -393,14 +393,16 @@ class RoleTests(unittest.TestCase):
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 role = self.command_lines({"session_id": "own-id"}, shell=shell, SHOWRUNNER_UNIT="show")[0]
-                self.assertEqual(ANSI.sub("", role).split(" | ")[0], "herdr-trust - unit director for natedev")
+                # The name takes the role's color: one color span holds both.
+                self.assertEqual(role.split(" | ")[0], "\x1b[94mherdr-trust - unit director for natedev\x1b[0m")
                 # A record whose session id is another session's names nobody.
                 other = self.command_lines({"session_id": "other-id"}, shell=shell, SHOWRUNNER_UNIT="show")[0]
                 self.assertEqual(ANSI.sub("", other).split(" | ")[0], "unit director for natedev")
         self.timer("showrunner-own", "session:own-id")
         for shell in SHELLS:
             with self.subTest(shell=shell, role="showrunner"):
-                self.assertEqual(self.first_line("own-id").split(" | ")[0], "herdr-trust showrunner")
+                own = self.command_lines({"session_id": "own-id"}, shell=shell)[0]
+                self.assertEqual(own.split(" | ")[0], "\x1b[95mherdr-trust showrunner\x1b[0m")
 
     def test_unit_director_with_a_truncated_live_showrunner_record_still_renders_both_lines(self) -> None:
         self.timer("showrunner-show", "session:parent-id")

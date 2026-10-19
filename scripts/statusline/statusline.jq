@@ -26,7 +26,8 @@
 #             Line 3, when present: this session's "For you: …" counts row, from
 #             the "<session id> <row>" lines in $counts that statusline.sh reads
 #             from each showrunner's counts cache, with each count in bold.
-#             ANSI colors wrap the role, account, tokens and percentages only.
+#             ANSI colors wrap the role (with the session name before it), account, tokens
+#             and percentages only.
 
 def trim: gsub("^\\s+|\\s+$"; "");
 
@@ -159,11 +160,12 @@ def usage($config; $label; $window; $fmt):
       | (if $role == "unit director" and ($showrunner_name | type) == "string"
             and $showrunner_name != ""
          then $role + " for " + $showrunner_name else $role end)
-      | color($colors; "role." + ($role | gsub(" "; "-")))
       | if $session_name == null then .
         elif $role == "showrunner" then $session_name + " " + .
         elif $role == "unit director" then $session_name + " - " + .
-        else . end),
+        else . end
+      # The session name takes the role's color.
+      | color($colors; "role." + ($role | gsub(" "; "-")))),
      $base,
      (.context_window as $context
       | (($context.total_input_tokens // 0) | commas)
