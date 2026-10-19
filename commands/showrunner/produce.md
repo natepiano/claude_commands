@@ -54,7 +54,7 @@ State:
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
   remove an item once it is reported; it needs no review), and `next` (a list
-  of one-line text: each action you owe and what sets it off; see Compaction). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The Stop hook asks for it only until one reply has carried it.
+  of one-line text: each action you owe and what sets it off; see Compaction). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that asks it carries the printed `reviewed question` text.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py questions --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
@@ -296,11 +296,6 @@ State:
   holder files in `~/.local/state/build-hold/`, and a dailies input marks each
   held unit. A pending or active Mac block comes from
   `~/.local/state/mac-test/`.
-
-  `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
-  targeted by `UPDATES`. It blocks a reply that asks the user something not
-  stored through `questions`, and a reply that leaves out a reviewed question
-  still waiting to be asked. It passes on errors.
 
   An `/adhoc_review` in this session pauses current dailies, then asks whether
   to turn them back on at the end (`commands/adhoc_review.md` Steps 2 and 5).

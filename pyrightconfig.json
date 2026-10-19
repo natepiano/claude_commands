@@ -60,6 +60,7 @@
         "scripts/notify",
         "scripts/production",
         "scripts/lib",
+        "scripts/shutdown",
         "scripts/herdr"
       ]
     },

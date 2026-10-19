@@ -1,4 +1,4 @@
-"""Read a running production, its open questions and the question review a reply must keep.
+"""Read a running production and its open questions.
 
 The reply footer and its Waiting on block are gone (user, 2026-10-18: "i want footers gone for
 good"). The user reads the counts in the status line.
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -35,119 +35,6 @@ class NoDailiesSchedule(Enum):
 
 class FooterError(Exception):
     """A production's open-questions list cannot be read."""
-
-
-@dataclass(frozen=True)
-class PendingReviewedQuestion:
-    text: str
-    reviewed: str
-
-
-@dataclass(frozen=True)
-class PendingReviewUnavailableQuestion:
-    text: str
-    question: str
-    reason: str
-
-
-PendingQuestion = PendingReviewedQuestion | PendingReviewUnavailableQuestion
-
-
-@dataclass(frozen=True)
-class QuestionReplyReady:
-    pass
-
-
-@dataclass(frozen=True)
-class QuestionReplyBlocked:
-    reason: str
-
-
-class PendingReviewedQuestionRecord(TypedDict):
-    kind: Literal["reviewed"]
-    text: str
-    reviewed: str
-
-
-class PendingReviewUnavailableQuestionRecord(TypedDict):
-    kind: Literal["review unavailable"]
-    text: str
-    question: str
-    reason: str
-
-
-class PendingReviewedRecord(TypedDict):
-    items: list[PendingReviewedQuestionRecord | PendingReviewUnavailableQuestionRecord]
-
-
-def pending_reviewed_path(instance_dir: Path) -> Path:
-    return instance_dir / "pending_reviewed.json"
-
-
-def read_pending_reviewed(instance_dir: Path) -> list[PendingQuestion]:
-    path = pending_reviewed_path(instance_dir)
-    try:
-        raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-    except FileNotFoundError:
-        return []
-    if not isinstance(raw, dict):
-        raise FooterError(f"{path}: expected an object")
-    entries = cast(dict[str, object], raw).get("items")
-    if not isinstance(entries, list):
-        raise FooterError(f"{path}: expected items")
-    items: list[PendingQuestion] = []
-    for raw_item in cast(list[object], entries):
-        if not isinstance(raw_item, dict):
-            raise FooterError(f"{path}: expected a question object")
-        item = cast(dict[str, object], raw_item)
-        text = item.get("text")
-        if not isinstance(text, str) or not text.strip():
-            raise FooterError(f"{path}: expected item text")
-        if item.get("kind") == "reviewed":
-            reviewed = item.get("reviewed")
-            if not isinstance(reviewed, str) or not reviewed.strip():
-                raise FooterError(f"{path}: expected reviewed question")
-            items.append(PendingReviewedQuestion(text, reviewed))
-        elif item.get("kind") == "review unavailable":
-            question, reason = item.get("question"), item.get("reason")
-            if not isinstance(question, str) or not question.strip() or not isinstance(reason, str):
-                raise FooterError(f"{path}: expected unavailable question and reason")
-            items.append(PendingReviewUnavailableQuestion(text, question, reason))
-        else:
-            raise FooterError(f"{path}: unknown question kind")
-    return items
-
-
-def add_pending_reviewed(instance_dir: Path, items: list[PendingQuestion]) -> None:
-    combined = read_pending_reviewed(instance_dir)
-    for item in items:
-        if item not in combined:
-            combined.append(item)
-    if combined:
-        write_pending_reviewed(instance_dir, combined)
-
-
-def write_pending_reviewed(instance_dir: Path, items: list[PendingQuestion]) -> None:
-    """Store exactly these questions as waiting to be asked; none deletes the file."""
-    if not items:
-        delete_pending_reviewed(instance_dir)
-        return
-    record: PendingReviewedRecord = {"items": []}
-    for item in items:
-        if isinstance(item, PendingReviewedQuestion):
-            record["items"].append({"kind": "reviewed", "text": item.text, "reviewed": item.reviewed})
-        else:
-            record["items"].append({"kind": "review unavailable", "text": item.text,
-                                    "question": item.question, "reason": item.reason})
-    path = pending_reviewed_path(instance_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    scratch = path.with_suffix(".tmp")
-    _ = scratch.write_text(json.dumps(record, ensure_ascii=False) + "\n", encoding="utf-8")
-    _ = scratch.replace(path)
-
-
-def delete_pending_reviewed(instance_dir: Path) -> None:
-    pending_reviewed_path(instance_dir).unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -300,88 +187,6 @@ def deferred_until(slugs: list[str], zone: str) -> datetime | None:
         return datetime.fromisoformat(min(afters)).replace(tzinfo=ZoneInfo(zone))
     except ValueError:
         return None
-
-
-def normalised(text: str) -> str:
-    return " ".join(text.split())
-
-
-def choice_comparison_text(text: str) -> str:
-    return normalised(re.sub(r"^\s*(?:[-*+]|\d+[.)])\s+", "", text))
-
-
-def pending_question_text(item: PendingQuestion) -> str:
-    return item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
-
-
-def instance_slugs(instance_dirs: list[str]) -> set[str]:
-    return {Path(instance).name.removeprefix("showrunner-") for instance in instance_dirs}
-
-
-def with_below(slugs: set[str]) -> set[str]:
-    """These productions and every one below them, as a root's count covers them."""
-    return slugs.union(*(place_of(slug).below for slug in slugs))
-
-
-def outstanding_texts(slugs: set[str]) -> list[str]:
-    """Every text, question and reviewed question in these productions' open_for_user lists."""
-    texts: list[str] = []
-    for slug in sorted(slugs):
-        try:
-            raw = cast(object, json.loads(outstanding_path(slug).read_text(encoding="utf-8")))
-        except FileNotFoundError:
-            continue
-        if not isinstance(raw, list):
-            raise FooterError(f"{slug}: expected outstanding list")
-        for entry in cast(list[object], raw):
-            if isinstance(entry, dict):
-                fields = cast(dict[str, object], entry)
-                texts.extend(value for key in ("text", "question", "reviewed")
-                             if isinstance(value := fields.get(key), str))
-    return texts
-
-
-def check_reviewed_text(instance_dirs: list[str], reply: str) -> QuestionReplyReady | QuestionReplyBlocked:
-    accepted: list[str] = []
-    slugs: set[str] = set()
-    for instance in instance_dirs:
-        pending = read_pending_reviewed(Path(instance))
-        missing = [item for item in pending if normalised(pending_question_text(item)) not in normalised(reply)]
-        # A question is shown in full once, when it opens: the reply that carries it ends its wait,
-        # whatever else this hook says of that reply, so no later reply is made to repeat it.
-        if len(missing) < len(pending):
-            write_pending_reviewed(Path(instance), missing)
-        if missing:
-            return QuestionReplyBlocked(f"Question {missing[0].text!r}: paste its reviewed question into this reply:\n"
-                                        + pending_question_text(missing[0]))
-        accepted.extend(pending_question_text(item) for item in pending)
-        slugs.add(Path(instance).name.removeprefix("showrunner-"))
-    notify_scripts = str(Path(__file__).resolve().parent.parent / "notify")
-    if notify_scripts not in sys.path:
-        sys.path.insert(0, notify_scripts)
-    if TYPE_CHECKING:
-        from ..notify import reply_asks
-    else:
-        import reply_asks
-    asks = reply_asks.user_reply_questions(reply)
-    if not asks.sentences and not asks.has_choices:
-        return QuestionReplyReady()
-    accepted.extend(outstanding_texts(with_below(slugs)))
-    registered = [reply_asks.question_prose(choice_comparison_text(question)) for question in accepted]
-    for sentence in (*asks.sentences, *asks.choice_lines):
-        compared = reply_asks.question_prose(choice_comparison_text(sentence))
-        if compared and not any(item and (compared in item or item in compared) for item in registered):
-            return QuestionReplyBlocked(f"Unregistered ask {sentence!r}: record the item with "
-                                        + "update_registration.py questions --state and paste its reviewed question "
-                                        + "into this reply.")
-    return QuestionReplyReady()
-
-
-def block_reason(instance_dirs: list[str], reply: str) -> str | None:
-    if not instance_dirs:
-        return None
-    checked = check_reviewed_text(instance_dirs, reply)
-    return checked.reason if isinstance(checked, QuestionReplyBlocked) else None
 
 
 def counts_line(productions: list[Production], questions: int) -> str | None:

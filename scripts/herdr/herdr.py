@@ -1837,6 +1837,11 @@ def _is_agent_process(arguments: list[str], kind: str) -> bool:
     )
 
 
+def is_claude_process(arguments: list[str]) -> bool:
+    """The argv is a Claude Code process, native or through node."""
+    return _is_agent_process(arguments, "claude")
+
+
 def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIdentity]) -> AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable:
     """Keep identified processes across exec and parent changes; inspect every thread."""
     root = _proc_root()

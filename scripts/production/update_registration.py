@@ -17,12 +17,10 @@ from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
 
 if TYPE_CHECKING:
-    from ..hooks.showrunner_footer import (PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
-        read_pending_reviewed, ReportItem, reports_path)
+    from ..hooks.showrunner_footer import ReportItem, reports_path
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
-    from showrunner_footer import (PendingQuestion, PendingReviewedQuestion, PendingReviewUnavailableQuestion, write_pending_reviewed,
-        read_pending_reviewed, ReportItem, reports_path)
+    from showrunner_footer import ReportItem, reports_path
 import showrunners
 from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
@@ -499,7 +497,21 @@ class HeldRegistrationQuestion(NamedTuple):
     details: str
 
 
-def review_open_question(slug: str, item: QuestionForReview) -> PendingQuestion | HeldRegistrationQuestion:
+class ReviewedQuestion(NamedTuple):
+    text: str
+    reviewed: str
+
+
+class ReviewUnavailableQuestion(NamedTuple):
+    text: str
+    question: str
+    reason: str
+
+
+AcceptedQuestion = ReviewedQuestion | ReviewUnavailableQuestion
+
+
+def review_open_question(slug: str, item: QuestionForReview) -> AcceptedQuestion | HeldRegistrationQuestion:
     # Copied registration trees can run reminder-only commands without notify installed.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
     if TYPE_CHECKING:
@@ -508,9 +520,9 @@ def review_open_question(slug: str, item: QuestionForReview) -> PendingQuestion 
         import review
     outcome = review.review_question(review.QuestionKey(slug, item.text), item.question)
     if isinstance(outcome, review.QuestionAccepted):
-        return PendingReviewedQuestion(item.text, outcome.question)
+        return ReviewedQuestion(item.text, outcome.question)
     if isinstance(outcome, review.QuestionReviewUnavailable):
-        return PendingReviewUnavailableQuestion(item.text, outcome.question, outcome.reason)
+        return ReviewUnavailableQuestion(item.text, outcome.question, outcome.reason)
     details = outcome.questions if isinstance(outcome, review.QuestionAwaitingFacts) else outcome.details
     return HeldRegistrationQuestion("; ".join(details + tuple(f"{failure.rule}: {failure.quote}" for failure in outcome.failures)))
 
@@ -524,7 +536,7 @@ def questions(production: Production, path: Path | None) -> None:
         now = datetime.now(production.zone)
         since = now.strftime("%Y-%m-%dT%H:%M")
         entries: list[OutstandingItem] = []
-        pending: list[PendingQuestion] = []
+        pending: list[AcceptedQuestion] = []
         held: list[str] = []
         items_by_text: dict[str, OpenForUserItem] = {}
         for item in state.outstanding.items:
@@ -553,10 +565,10 @@ def questions(production: Production, path: Path | None) -> None:
                 keep_question_fields(entry, previous[item.text])
             elif isinstance(item, QuestionForReview):
                 accepted = review_open_question(production.slug, item)
-                if isinstance(accepted, PendingReviewedQuestion):
+                if isinstance(accepted, ReviewedQuestion):
                     entry["question"], entry["reviewed"] = item.question, accepted.reviewed
                     pending.append(accepted)
-                elif isinstance(accepted, PendingReviewUnavailableQuestion):
+                elif isinstance(accepted, ReviewUnavailableQuestion):
                     entry["question"], entry["review_unavailable"] = item.question, accepted.reason
                     pending.append(accepted)
                 else:
@@ -565,16 +577,10 @@ def questions(production: Production, path: Path | None) -> None:
         if held:
             raise RegistrationFailure("questions", "question held for review: " + "; ".join(held))
         outstanding.parent.mkdir(parents=True, exist_ok=True)
-        instance_dir = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{production.slug}"
-        if (instance_dir / "conf").exists():
-            existing_pending = read_pending_reviewed(instance_dir)
-            retained_pending = [item for item in existing_pending if item.text in items_by_text]
-            if retained_pending != existing_pending or pending:
-                write_pending_reviewed(instance_dir, retained_pending + pending)
         record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
         _ = outstanding.write_text(json.dumps(entries) + "\n", encoding="utf-8")
         for item in pending:
-            accepted_text = item.reviewed if isinstance(item, PendingReviewedQuestion) else item.question
+            accepted_text = item.reviewed if isinstance(item, ReviewedQuestion) else item.question
             print("reviewed question: " + accepted_text)
     if isinstance(state.reports, ReplaceReports):
         reports = reports_path(production.slug)

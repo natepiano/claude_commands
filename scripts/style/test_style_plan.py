@@ -806,6 +806,128 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotIn(outside.finding_id, text)
         self.assertIn("Judge these 2 files of `crates/alpha`", text)
 
+    def test_first_files_get_a_separate_read_ticket_before_paths_that_sort_earlier(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        first = self.sources[1]
+        _ = self.plan.write_text(self.plan_header().replace(
+            "## Phases", f"- **First files:**  {first}  \n\n## Phases"))
+
+        result = self.run_next()
+
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [first])
+
+    def test_first_files_rank_a_crate_ahead_of_more_stale_cells(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        for path in self.sources[:2]:
+            self.record(rule, path, self.tip)
+            self.write(path, "pub fn revised() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.assertEqual(self.candidates()[0].crate, "crates/alpha")
+        first = self.sources[-1]
+        _ = self.plan.write_text(self.plan_header().replace(
+            "## Phases", f"- **First files:** {first}\n\n## Phases"))
+
+        result = self.run_next()
+
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [first])
+
+    def test_first_files_without_a_line_keep_the_existing_ticket_order(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        ledger = self.ledger()
+        busy = style_plan.BusyFiles(self.board(), frozenset())
+        expected = style_plan.candidate_tickets(self.repo, ledger, busy, "names")
+
+        result = self.run_next()
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(ledger.ticket_open("names-unit")[0]["files"], list(expected[0].files))
+
+    def test_first_files_with_no_pending_cell_leave_the_queue_unchanged(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        first = self.sources[-1]
+        self.record(rule, first, self.tip)
+        expected = self.candidates()
+        _ = self.plan.write_text(self.plan_header().replace(
+            "## Phases", f"- **First files:** {first}, missing.rs\n\n## Phases"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo), "--unit", "names-unit"]), 0)
+        self.assertEqual([line.split(" files: ")[1] for line in output.getvalue().splitlines()],
+                         [", ".join(ticket.files) for ticket in expected])
+
+    def test_first_files_invalid_lines_refuse_before_assigning_or_editing_a_plan(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        for line, message in (
+            ("- **First files:** a.rs\n- **First files:** b.rs", "first files has more than one line"),
+            ("- **First files:** /tmp/a.rs", "first files has absolute path /tmp/a.rs"),
+            ("- **First files:** a.rs, a.rs", "first files has duplicate path a.rs"),
+            ("- **First files:** a.rs, ", "first files has empty entry"),
+        ):
+            with self.subTest(line=line):
+                _ = self.plan.write_text(self.plan_header().replace("## Phases", line + "\n\n## Phases"))
+                before = self.plan.read_bytes()
+                code, output, errors = self.run_next()
+                self.assertEqual(code, 2, output)
+                self.assertEqual(errors, f"style_plan: {message}\n")
+                self.assertEqual(self.count_tickets(), 0)
+                self.assertEqual(self.plan.read_bytes(), before)
+
+    def test_first_files_queue_uses_the_unit_copy_and_matches_next_phase(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        first = self.sources[-1]
+        _ = self.plan.write_text(self.plan_header().replace(
+            "## Phases", f"- **First files:** {first}\n\n## Phases"))
+        template = self.style / "docs/style-production/units/names-unit.md"
+        _ = template.write_text(self.plan_header().replace(
+            "## Phases", f"- **First files:** {self.sources[0]}\n\n## Phases"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo), "--unit", "names-unit"]), 0)
+        self.assertEqual(output.getvalue().splitlines()[0].split(" files: ")[1], first)
+        self.assertEqual(set(path for line in output.getvalue().splitlines()
+                             for path in line.split(" files: ")[1].split(", ")), set(self.sources))
+        result = self.run_next()
+        self.assertEqual(result[0], 0, result)
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [first])
+
+    def test_first_files_in_another_unit_are_checked_only_when_that_unit_is_selected(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        types = self.root / "types"
+        types_plan = types / "docs/style-production/units/types-unit.md"
+        types_plan.parent.mkdir(parents=True)
+        _ = types_plan.write_text(self.plan_header().replace(
+            "## Phases", "- **First files:** a.rs, a.rs\n\n## Phases"))
+        _ = self.doc.write_text(self.doc.read_text() +
+                                f"| types-unit | docs/style-production/units/types-unit.md | {types} | types |\n")
+
+        with self.subTest(selection="names queue"):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                code = style_plan.main(["queue", "--repo", str(self.repo), "--unit", "names-unit"])
+            self.assertEqual(code, 0)
+            self.assertIn("names-unit: read crates/alpha", output.getvalue())
+
+        with self.subTest(selection="all queues"):
+            errors = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(errors):
+                code = style_plan.main(["queue", "--repo", str(self.repo)])
+            self.assertEqual(code, 2)
+            self.assertEqual(errors.getvalue(), "style_plan: first files has duplicate path a.rs\n")
+
+        with self.subTest(selection="names next phase"):
+            result = self.run_next()
+            self.assertEqual(result[0], 0, result)
+            self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], list(self.sources[:2]))
+
     def test_unit_plan_scope_resolves_package_names_and_exhausts_only_that_crate(self) -> None:
         rule = self.rule("read")
         self.write("crates/beta/Cargo.toml", '[package]\nname = "cargo-handler"\nversion = "0.1.0"\n')
