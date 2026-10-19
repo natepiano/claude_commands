@@ -149,12 +149,50 @@ class StyleProposalsTests(unittest.TestCase):
             _ = ledger.hold(self.structure, "src/lib.rs", line, f"root site {line}", "rename",
                             "before", "after", blob, "outside")
 
+    def ranked_issue(self, name: str, goal: str, *, project: str = "sample",
+                     status: str = "open", tags: str = "issue") -> None:
+        self.proposals.mkdir(parents=True, exist_ok=True)
+        _ = (self.proposals / (name + ".md")).write_text(
+            f'---\nproject: "[[{project}]]"\nbacklog_goal: "{goal}"\nstatus: {status}\ntags: [{tags}]\n---\n')
+
+    def test_goal_counts_only_open_non_style_project_issues_and_breaks_ties(self) -> None:
+        self.ranked_issue("one", "2 - Find Collaborators")
+        for name, options in (("style", {"tags": "issue, style"}), ("closed", {"status": "closed"}),
+                              ("other", {"project": "other"})):
+            self.ranked_issue(name, "1 - Ship Hana", **options)
+        self.ranked_issue("invalid", "not a goal")
+        self.assertEqual(style_proposals.project_goal(self.proposals, "sample"), "2 - Find Collaborators")
+        self.ranked_issue("tie", "1 - Ship Hana")
+        self.assertEqual(style_proposals.project_goal(self.proposals, "sample"), "1 - Ship Hana")
+
+    def test_goal_default_names_project_once_for_multiple_batches(self) -> None:
+        output = io.StringIO()
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            _ = self.hold(ledger, kind="type", line=2)
+            with redirect_stdout(output):
+                paths = style_proposals.file_proposals(ledger, self.proposals, "parent")
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(output.getvalue().count("goal: no ranked sample issue; default 1 - Ship Hana\n"), 1)
+
+    def test_file_and_rank_use_project_goal_two(self) -> None:
+        self.ranked_issue("ranked", "2 - Find Collaborators")
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            expected = issue.read_bytes()
+            self.assertIn(b"Proposed ranking: goal 2 - Find Collaborators", expected)
+            _ = issue.write_bytes(re.sub(rb"Proposed ranking: [^\n]*", b"Proposed ranking: ", expected))
+            with redirect_stdout(io.StringIO()):
+                style_proposals.rank_proposals(ledger, self.proposals)
+            self.assertEqual(issue.read_bytes(), expected)
+
     def test_proposed_ranking_sets_all_values_for_each_kind_and_effort_boundary(self) -> None:
         for kind, impact in (("rename", "⭐"), ("type", "⭐⭐"), ("restructure", "⭐⭐")):
             for count, effort in ((1, "⭐"), (3, "⭐"), (4, "⭐⭐"), (15, "⭐⭐"), (16, "⭐⭐⭐")):
                 with self.subTest(kind=kind, findings=count):
-                    self.assertEqual(style_proposals.proposed_ranking(cast(style_ledger.FindingKind, kind), count),
-                                     f"goal 1 - Ship Hana · alignment ⭐⭐ · impact {impact} · urgency ⭐ · effort {effort}")
+                    self.assertEqual(style_proposals.proposed_ranking(cast(style_ledger.FindingKind, kind), count, "2 - Find Collaborators"),
+                                     f"goal 2 - Find Collaborators · alignment ⭐⭐ · impact {impact} · urgency ⭐ · effort {effort}")
 
     def test_root_crate_restructure_uses_repository_name_in_title_and_filename_with_ranking(self) -> None:
         with self.ledger() as ledger:
