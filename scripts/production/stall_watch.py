@@ -22,7 +22,6 @@ from socket import gethostname
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo
 
-import add_unit
 import production_units
 import showrunners
 import unit_lookup
@@ -434,10 +433,6 @@ def tick(now: float) -> None:
             print(f"stall-watch: {configured['slug']}: its units are not watched: {error}", file=sys.stderr)
             continue
         for name, unit in marked.items():
-            # The review unit waits for a review merge by design, so idle is its normal state.
-            if add_unit.is_review_unit(name, lines):
-                forget(slug, name)
-                continue
             # A unit is watched while the newest /unit:direct run in its worktree is unfinished.
             try:
                 running = name in live and unit_lookup.run_state(Path(live[name])) is unit_lookup.UnitState.RUNNING

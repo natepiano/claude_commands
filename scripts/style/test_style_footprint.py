@@ -163,9 +163,16 @@ class StyleFootprintTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--worktree"])
-        self.assertEqual((code, output.getvalue()), (1, "review: snapshot failed\n"))
+        self.assertEqual((code, output.getvalue()), (2, "error: snapshot failed\n"))
         self.assertTrue(indexes)
         self.assertTrue(all(not path.exists() for path in indexes))
+
+    def test_missing_base_revision_is_an_error_not_a_review(self) -> None:
+        self.write("src/lib.rs", "fn value() {}\n")
+        _ = self.commit()
+        result = self.check("0" * 40)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertTrue(result.stdout.startswith("error: "), result.stdout)
 
     def test_head_and_worktree_are_required_mutually_exclusive_options(self) -> None:
         self.write("src/lib.rs", "fn value() {}\n")
@@ -373,7 +380,32 @@ class StyleFootprintTests(unittest.TestCase):
                 if count == 99:
                     self.assert_mechanical(base)
                 else:
-                    self.assertIn("check 5", self.assert_review(base))
+                    self.assertEqual(
+                        self.assert_review(base),
+                        "review: check 5: src/lib.rs: 200 or more changed lines (size only)\n",
+                    )
+
+    def comment_fixture(self, modules: tuple[str, ...], lines: int) -> str:
+        self.write("src/lib.rs", "".join(f"mod {module};\n" for module in modules))
+        for module in modules:
+            self.write(f"src/{module}.rs", "// Read the value.\n" * lines + "fn value() {}\n")
+        base = self.commit()
+        for module in modules:
+            path = self.repo / f"src/{module}.rs"
+            _ = path.write_text(path.read_text().replace("Read the value", "Load the value"))
+        _ = self.commit()
+        return base
+
+    def test_changed_line_limit_counts_each_file_not_the_whole_diff(self) -> None:
+        base = self.comment_fixture(tuple(f"part{index}" for index in range(19)), 8)
+        self.assert_mechanical(base)
+
+    def test_each_file_over_the_changed_line_limit_gives_its_own_reason(self) -> None:
+        base = self.comment_fixture(("first", "second"), 100)
+        self.assertEqual(self.assert_review(base), (
+            "review: check 5: src/first.rs: 200 or more changed lines (size only); "
+            "check 5: src/second.rs: 200 or more changed lines (size only)\n"
+        ))
 
     def test_condition_literal_control_flow_and_serialized_name_changes_require_review(self) -> None:
         changes = (
@@ -1392,7 +1424,7 @@ class StyleFootprintTests(unittest.TestCase):
             with redirect_stdout(output):
                 code = style_footprint.main(["check", "--repo", str(self.repo), "--base", base, "--head", head])
         self.assertEqual((code, output.getvalue()),
-                         (1, "review: git merge-tree: fatal: merge-tree unavailable (exit 128)\n"))
+                         (2, "error: git merge-tree: fatal: merge-tree unavailable (exit 128)\n"))
 
     def test_incomplete_rename_with_old_uses_remaining_requires_review(self) -> None:
         base = self.rename_fixture()

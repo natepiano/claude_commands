@@ -81,5 +81,9 @@ each merge. It closes only approved decisions, when all findings are built or
 waived. It also closes an approved decision with no merged ticket when no
 finding is left to build. A decision closed with nothing left to build opens
 again with its approval for a later finding, as a decision closed as built does.
+A finding is built only when its change is in the code. Repair a decision
+or an old issue that closed too early with `style_proposals.py reopen --repo
+<style checkout> --issue <issue> --parent <slug>`; add `--dry-run` to see the
+lines first.
 For other proposals, `/unit:direct` marks plan issues active, and its final
 as-built pass closes them with the as-built doc.

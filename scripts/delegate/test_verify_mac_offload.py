@@ -1391,6 +1391,9 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assertEqual(self.local_runs(), [])
         runners = self.runner_events()
         self.assertEqual(len(runners), 2)
+        # The step gave the token back for its memory wait and left for the Mac
+        # without taking it again.
+        self.assertFalse(runners[1]["token_held"])
         arguments = runners[1]["args"]
         self.assertEqual(arguments[arguments.index("--last-decline") + 1], "busy")
         self.assertEqual(set(self.free_now_settings()), {self.environment["MAC_TEST_CONFIG"]})
@@ -1399,6 +1402,35 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         record = self.last_call()
         self.assertEqual((record["status"], record["mac"], record["mac_reason"], record["mac_s"]),
                          (42, "failed", "", 3.25))
+
+    def test_a_step_that_left_for_the_mac_ends_without_the_token_a_peer_now_holds(self) -> None:
+        _ = self.hold_memory()
+        mac_free = self.runner_state / "mac-free"
+        process = self.start_verify("test", "sample", "--no-cache", extra={
+            "TEST_RUNNER_BUSY_UNTIL": str(mac_free),
+            "TEST_RUNNER_MAC": "passed", "TEST_RUNNER_STATUS": "0"})
+        self.addCleanup(self.stop_verify, process)
+        self.wait_for_path(self.runner_state / "free-now-events", (process,))
+        # The step gave the token back for its memory wait, and a peer takes it.
+        lock = self.board / "locks" / "cargo.d"
+        self.assertFalse(lock.exists())
+        peer = subprocess.Popen(["sleep", "600"])
+
+        def stop_peer() -> None:
+            peer.kill()
+            _ = peer.wait(timeout=5)
+
+        self.addCleanup(stop_peer)
+        acquired = subprocess.run(["bash", str(VERIFY.with_name("board.sh")), "acquire", str(self.board),
+                                   "peer", "cargo", "--pid", str(peer.pid)],
+                                  capture_output=True, text=True, check=False, timeout=60)
+        self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        _ = mac_free.write_text("free\n")
+        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertEqual(self.local_runs(), [])
+        self.assertEqual(self.last_call()["mac"], "passed_full")
+        self.assertEqual((lock / "holder_pid").read_text(), str(peer.pid))
 
     def test_hold_that_lands_during_the_memory_wait_still_leaves_for_a_freed_mac(self) -> None:
         meminfo = self.hold_memory()
