@@ -2125,3 +2125,20 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - The Phase 76 regression made four tests wait 300 s each and the merge gate take about 1260 s. After this phase the gate took 121 s.
 - The one pool review found two blockers: the wait dropped the connection and thread a refused move had already adopted, and a capacity retry left `resume_owed` set. Both are fixed with regression tests.
+
+### Phase 78 — A launcher sees a refused thread as ended  · status: done
+
+#### As-built
+
+- `codex_mesh._thread_has_no_active_turn(status)` names the app-server thread states with no active turn: `idle`, `notLoaded` and `systemError`. `_ended_unseen`, `_read_live_turn` and reset use it.
+- A refused thread (status `systemError`) with an account-move marker resumes the move on the next quiet poll. A result held after a detached run ends goes through `_finish_if_ended_unseen`: the worker moves, waits for room or finishes. Reset accepts a refused or unloaded thread.
+- `_move_idle_worker` returns `WorkerWaitingForRoom("the refused account has not recovered", ...)` for an owed continuation on an unchanged account with a stored refusal. `WorkerWaitingOnLiveTurn` now means only a live turn. A follow or one-turn launch logs the wait once, keeps the continuation and the held messages, and finishes. A later account move resumes the continuation through its detached resume.
+- The showrunner reported it (2026-10-19): style's seat `claude-build-followups-style-impl2` stayed attached about 3 hours after codex1 reached zero.
+
+**Files:**
+- `scripts/agents/codex_mesh.py` — the predicate, its three callers and the stored-refusal room wait.
+- `scripts/agents/test_codex_mesh.py` — regressions for the marked move, the held result (follow and one-turn launch, with and without a stored refusal) and reset; six refusal tests now expect the room wait, not the timeout handoff.
+
+**Gotchas:**
+- After a refused turn the app-server reports the thread as `systemError`, not `idle`. A status check that accepts only `idle` waits on a refused thread without limit.
+- The one pool review found one blocker (the stored-refusal path still returned `WorkerWaitingOnLiveTurn`). It is fixed with regression tests. The first new tests fail on the old code.

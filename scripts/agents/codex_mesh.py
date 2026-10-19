@@ -1933,8 +1933,13 @@ def _describe_item(item: dict[str, object]) -> str:
     return kind or "working"
 
 
+def _thread_has_no_active_turn(status: str) -> bool:
+    """These app-server thread states have no turn left to finish."""
+    return status in ("idle", "notLoaded", "systemError")
+
+
 def _ended_unseen(client: Client, thread_id: str) -> bool:
-    """True when the thread is idle with nothing queued, so no turn is left to end.
+    """True when no turn is active and nothing is queued, so no turn is left to end.
 
     A launcher that reads this while it waits for a completion notice has missed
     the notice. The read asks for no turns, so it stays small on a long thread.
@@ -1950,7 +1955,7 @@ def _ended_unseen(client: Client, thread_id: str) -> bool:
     except SystemExit:
         return False
     thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
-    return _as_str(_as_dict(thread.get("status")).get("type")) == "idle"
+    return _thread_has_no_active_turn(_as_str(_as_dict(thread.get("status")).get("type")))
 
 
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
@@ -3962,7 +3967,7 @@ def _move_idle_worker(
                     return WorkerThreadStateUnknown("quota handoff did not establish a recoverable account; continuation is held")
                 if refusals.key("codex", identity.login) not in refusals.load():
                     return WorkerWaitingForRoom("no fresh reading shows room on the account", client, old_port, thread_id)
-                return WorkerWaitingOnLiveTurn("the refused account has not recovered")
+                return WorkerWaitingForRoom("the refused account has not recovered", client, old_port, thread_id)
             if isinstance(client.serving, NotBoundCodexServer):
                 _ = _bind_serving_server(client, session_dir, started_here=_fresh)
             if _fresh and port == old_port:
@@ -4385,7 +4390,7 @@ def _read_live_turn(client: Client, thread_id: str) -> ThreadState:
         return ThreadStateUnknown("thread/read returned no thread")
     status = _as_str(_as_dict(thread.get("status")).get("type"))
     # app-server/src/thread_status.rs: systemError means the last turn failed; none is active.
-    if status in ("idle", "notLoaded", "systemError"):
+    if _thread_has_no_active_turn(status):
         return ThreadIdle()
     if status != "active":
         return ThreadStateUnknown(f"unrecognized status {status or '(missing)'}")
@@ -6615,7 +6620,7 @@ def command_reset(args: argparse.Namespace) -> int:
         })
         thread = _as_dict(read.get("thread"))
         status = _as_str(_as_dict(thread.get("status")).get("type"))
-        if status != "idle":
+        if not _thread_has_no_active_turn(status):
             print(f"codex_mesh: {name}: thread state is {status or 'unknown'}; reset refused", file=sys.stderr)
             return 2
         result = _serving_request(client, "thread/turns/list", {

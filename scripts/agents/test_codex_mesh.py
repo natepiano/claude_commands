@@ -1738,8 +1738,27 @@ class MeshCommandTests(unittest.TestCase):
                 self.assertEqual(self.methods("thread/revert"), [])
                 self.assertEqual(self.methods("thread/turns/list"), [])
 
-    def test_reset_refuses_threads_that_do_not_read_idle(self) -> None:
-        for status in ("active", "systemError", "notLoaded"):
+    def test_reset_clears_a_thread_with_no_active_turn_after_a_refusal_or_unload(self) -> None:
+        self.history_turns = [{"id": "refused-turn", "status": "failed", "items": []}]
+        for status in ("systemError", "notLoaded"):
+            with self.subTest(status=status):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": "failed", "context_tokens": 9876,
+                }})
+                self.thread_statuses[THREAD_ID] = status
+                self.server.requests.clear()
+
+                code, _output, errors = self.run_mesh(["reset", "--to", "worker"])
+
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(self.methods("thread/revert")[0]["params"], {
+                    "threadId": THREAD_ID, "beforeTurnId": "refused-turn",
+                })
+                self.assertEqual(self.worker_record()["context_tokens"], 0)
+                self.assertEqual(self.methods("turn/start"), [])
+
+    def test_reset_refuses_active_or_unknown_thread_states(self) -> None:
+        for status in ("active", "unrecognized"):
             with self.subTest(status=status):
                 entries: dict[str, object] = {"worker": {
                     "thread_id": THREAD_ID, "status": "done", "context_tokens": 9876,
@@ -3081,7 +3100,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.worker_record()["status"], "failed")
         self.assertIs(self.worker_record().get("continuation_owed"), False)
 
-    def test_stream_refusal_timeout_hands_one_rerun_to_its_director_and_clears_continuation(self) -> None:
+    def test_stream_refusal_waits_for_room_without_handing_off_or_clearing_continuation(self) -> None:
         source = self.prepare_stream_refusal_wait()
         commands: list[list[str]] = []
 
@@ -3096,15 +3115,15 @@ class MeshCommandTests(unittest.TestCase):
               patch.object(subprocess, "run", side_effect=report)):
             code, errors = self.run_start()
         self.assertEqual(code, 1)
-        self.assertIn("no turn/completed within", errors)
-        handoffs = [command for command in commands if "--stopped" in command]
-        self.assertEqual(len(handoffs), 1)
-        self.assertEqual(handoffs[0][handoffs[0].index("--stopped") + 1:][:2], ["own-director", "worker"])
-        self.assertIs(self.worker_record().get("continuation_owed"), False)
+        self.assertIn("worker waits for room on codex2: the refused account has not recovered", errors)
+        self.assertNotIn("no turn/completed within", errors)
+        self.assertEqual(len(commands), 1)
+        self.assertFalse(any("--stopped" in command for command in commands))
+        self.assertIs(self.worker_record().get("continuation_owed"), True)
         self.assertEqual(self.worker_record()["status"], "failed")
         self.assertEqual(len(self.methods("turn/start")), 1)
 
-    def test_replacement_thread_refusal_timeout_hands_one_rerun_to_its_director_and_clears_continuation(self) -> None:
+    def test_replacement_thread_refusal_waits_for_room_and_keeps_its_continuation(self) -> None:
         target, replacement = self.prepare_workers_move()
         self.start_args_timeout = 2.0
         original = self.respond
@@ -3139,20 +3158,19 @@ class MeshCommandTests(unittest.TestCase):
               patch.object(subprocess, "run", side_effect=report)):
             code, errors = self.run_start()
         self.assertEqual(code, 1)
-        self.assertIn("replacement-thread: still live at the timeout", errors)
-        handoffs = [command for command in commands if "--stopped" in command]
-        self.assertEqual(len(handoffs), 1)
-        self.assertEqual(handoffs[0][handoffs[0].index("--stopped") + 1:],
-                         ["own-director", "worker", shlex.join(sys.argv)])
+        self.assertIn("worker waits for room on codex1: the refused account has not recovered", errors)
+        self.assertNotIn("still live at the timeout", errors)
+        self.assertEqual(len(commands), 1)
+        self.assertFalse(any("--stopped" in command for command in commands))
         self.assertEqual(self.worker_record()["thread_id"], "replacement-thread")
-        self.assertIs(self.worker_record().get("continuation_owed"), False)
+        self.assertIs(self.worker_record().get("continuation_owed"), True)
         self.assertEqual(self.worker_record()["status"], "failed")
         self.assertNotIn("launcher_pid", self.worker_record())
         self.assertEqual([request["method"] for request in replacement.requests
                           if request["method"] in ("thread/resume", "thread/start", "turn/start")],
                          ["thread/resume", "thread/start", "turn/start"])
 
-    def test_markerless_stream_exit_keeps_its_launcher_director_after_the_failed_roster_write(self) -> None:
+    def test_markerless_room_wait_keeps_its_continuation_without_a_director_handoff(self) -> None:
         source = self.prepare_stream_refusal_wait()
         launcher_pid, director_pid = os.getpid(), 700
         table = {
@@ -3188,8 +3206,9 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(code, 1, errors)
         snapshot.assert_called()
         self.assertEqual(len(routing_reports), 1, errors)
-        self.assertEqual([handoff[:2] for handoff in handoffs], [["launcher-director", "worker"]])
-        self.assertIs(self.worker_record().get("continuation_owed"), False)
+        self.assertEqual(handoffs, [])
+        self.assertIn("worker waits for room on codex2: the refused account has not recovered", errors)
+        self.assertIs(self.worker_record().get("continuation_owed"), True)
 
     def test_old_command_exit_leaves_a_replacement_workers_thread_and_continuation_untouched(self) -> None:
         source = self.prepare_refusing_account()
@@ -3241,7 +3260,6 @@ class MeshCommandTests(unittest.TestCase):
     def test_started_refusal_keeps_the_account_after_its_server_record_disappears(self) -> None:
         account = self.prepare_refusing_account()
         self.save_unresolved_refusal(account)
-        self.skip_quota_wait_time()
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
@@ -3252,8 +3270,9 @@ class MeshCommandTests(unittest.TestCase):
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             code, _errors = self.run_start()
         self.assertEqual(code, 1)
-        self.assert_routing_then_exited_handoff(report)
-        self.assertEqual(cast(codex_mesh.CommandStoppedBeforeThread | codex_mesh.CommandStoppedOnThread, reported_stopped_context(report)).session_dir, str(self.session_dir))
+        report.assert_called_once()
+        self.assertIsInstance(reported_stopped_context(report), codex_mesh.RefusalWithoutCommandExit)
+        self.assertIs(self.worker_record().get("continuation_owed"), True)
         serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
         self.assertEqual(serving.account, account)
         self.assertEqual((serving.port, serving.pid, serving.home), (self.server.port, os.getpid(), account.home))
@@ -3350,10 +3369,9 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(cast(codex_mesh.CommandStoppedBeforeThread | codex_mesh.CommandStoppedOnThread, reported_stopped_context(report)).session_dir, str(self.session_dir))
         self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
 
-    def test_submission_refusal_routes_then_reports_the_exited_command(self) -> None:
+    def test_submission_refusal_reports_its_account_and_keeps_the_continuation_for_room(self) -> None:
         account = self.prepare_refusing_account()
         self.save_unresolved_refusal(account)
-        self.skip_quota_wait_time()
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
@@ -3362,7 +3380,9 @@ class MeshCommandTests(unittest.TestCase):
         self.server.respond = respond
         with patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_start()[0], 1)
-        self.assert_routing_then_exited_handoff(report)
+        report.assert_called_once()
+        self.assertIsInstance(reported_stopped_context(report), codex_mesh.RefusalWithoutCommandExit)
+        self.assertIs(self.worker_record().get("continuation_owed"), True)
         self.assertEqual(cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1])).account, account)
 
     def test_failed_fork_preserves_the_account_without_reporting_a_turn_refusal(self) -> None:
@@ -3414,7 +3434,6 @@ class MeshCommandTests(unittest.TestCase):
         account = agent_accounts.codex_account(target)
         assert isinstance(account, agent_accounts.KnownCodexAccount)
         self.save_unresolved_refusal(account)
-        self.skip_quota_wait_time()
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "thread/resume":
@@ -3431,7 +3450,9 @@ class MeshCommandTests(unittest.TestCase):
         with patch.object(codex_mesh, "_capacity_sleep", side_effect=wait), \
                 patch.object(codex_mesh, "_report_quota_refusal") as report:
             self.assertEqual(self.run_start()[0], 1)
-        self.assert_routing_then_exited_handoff(report)
+        report.assert_called_once()
+        self.assertIsInstance(reported_stopped_context(report), codex_mesh.RefusalWithoutCommandExit)
+        self.assertIs(self.worker_record().get("continuation_owed"), True)
         serving = cast(codex_mesh.ServingCodexServer, cast(object, report.call_args.args[1]))
         self.assertEqual(serving.home, target)
         self.assertIsInstance(serving.account, agent_accounts.KnownCodexAccount)
@@ -3707,6 +3728,41 @@ class MeshCommandTests(unittest.TestCase):
 
     def test_sign_in_change_resumes_live_holder_but_leaves_dead_holders_worker_alone(self) -> None:
         self.assert_waiting_launcher_account_move(sign_in_change=True, ended_run=True)
+
+    def test_quiet_poll_resumes_a_marked_account_move_after_a_system_error(self) -> None:
+        _target, destination = self.prepare_workers_move()
+        self.outcomes = ["disconnect", "completed"]
+        self.start_args_timeout = 20
+        now = time.time()
+        elapsed = 0.0
+        quiet_polls = 0
+        read = codex_mesh.Client.next_frame
+
+        def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            nonlocal elapsed, quiet_polls
+            if client.port == self.server.port:
+                elapsed += 1
+                quiet_polls += 1
+                if quiet_polls == 1:
+                    self.error_threads.add(THREAD_ID)
+                    self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
+                    moved = codex_mesh._interrupt_worker_for_account_move(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), "worker", self.worker_record(), self.server.port, "codex1")
+                    self.assertIsInstance(moved, codex_mesh.InterruptedWorkerMove)
+                return None
+            return read(client, deadline)
+
+        with (patch.object(codex_mesh.Client, "next_frame", frame),
+              patch.object(codex_mesh, "time", SimpleNamespace(time=lambda: now + elapsed,
+                  monotonic=time.monotonic, sleep=MagicMock(side_effect=AssertionError("no real sleep"))))):
+            code, errors = self.run_start()
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(quiet_polls, 1)
+        self.assertLess(elapsed, self.start_args_timeout / 2)
+        self.assert_account_move_continuation(destination)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
 
     def assert_ended_busy_server_is_left_running(self, *, sign_in_change: bool) -> None:
         target, new = self.prepare_running_account_swap()
@@ -4871,6 +4927,85 @@ class MeshCommandTests(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertIn("went idle with no completion notice and no answer", errors)
         self.assertEqual(self.worker_record()["status"], "failed")
+
+    def assert_system_error_delivers_a_finished_run_result(self, *, follow: bool, room_wait: bool = False) -> None:
+        account = self.prepare_refusing_account()
+        if follow:
+            self.assertEqual(self.run_start()[0], 0)
+        stalled_turn = self.turn_starts + 1
+        self.outcomes = ["disconnect", "completed"]
+        self.start_args_timeout = 20
+        runs = self.session_dir / codex_mesh.DETACHED_RUNS_DIR
+        runs.mkdir()
+        run = runs / "scratch-run.json"
+        _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
+        result = "Run finished: scratch verification passed"
+        now = time.time()
+        elapsed = 0.0
+        quiet_polls = 0
+        read = codex_mesh.Client.next_frame
+
+        def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            nonlocal elapsed, quiet_polls
+            if self.turn_starts == stalled_turn:
+                elapsed += 1
+                quiet_polls += 1
+                self.error_threads.add(THREAD_ID)
+                if quiet_polls == 2:
+                    # The first quiet poll must keep the launcher for the live run.
+                    self.assertEqual(self.methods("thread/read")[-1]["params"], {
+                        "threadId": THREAD_ID, "includeTurns": True,
+                    })
+                    _ = run.write_text(json.dumps({"worker": "worker", "status": "done", "pid": os.getpid()}))
+                    if room_wait:
+                        self.save_unresolved_refusal(account)
+                        worker = self.worker_record()
+                        worker["continuation_owed"] = True
+                        self.write_pool_roster({"worker": worker})
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(codex_mesh.command_send(argparse.Namespace(
+                            session_dir=str(self.session_dir), to="worker", message=result, message_file="")), 0)
+                return None
+            return read(client, deadline)
+
+        with (patch.object(codex_mesh.Client, "next_frame", frame),
+              patch.object(codex_mesh, "time", SimpleNamespace(time=lambda: now + elapsed,
+                  monotonic=time.monotonic, sleep=MagicMock(side_effect=AssertionError("no real sleep"))))):
+            code, errors = self.run_follow() if follow else self.run_start()
+
+        self.assertEqual(quiet_polls, 2)
+        self.assertLess(elapsed, self.start_args_timeout / 2)
+        pending = cast(dict[str, object], json.loads((self.session_dir / "worker.pending.json").read_text()))
+        if room_wait:
+            line = ("worker waits for room on codex2: the refused account has not recovered; "
+                    "the continuation stays owed")
+            self.assertEqual(code, 1, errors)
+            self.assertIn(line, errors)
+            log = (self.session_dir / "worker.log").read_text()
+            self.assertEqual(log.count(line), 1)
+            self.assertNotIn("no turn/completed within", log + errors)
+            self.assertIs(self.worker_record().get("continuation_owed"), True)
+            self.assertEqual(self.turn_starts, stalled_turn)
+            self.assertEqual(pending["messages"], [result])
+            self.assertIs(pending["accepting_messages"], False)
+            return
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(self.turn_starts, stalled_turn + 1)
+        self.assertEqual(self.turn_inputs[-1], result)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertEqual(pending["messages"], [])
+
+    def test_one_turn_launcher_delivers_a_finished_run_result_after_a_system_error(self) -> None:
+        self.assert_system_error_delivers_a_finished_run_result(follow=False)
+
+    def test_follow_delivers_a_finished_run_result_after_a_system_error(self) -> None:
+        self.assert_system_error_delivers_a_finished_run_result(follow=True)
+
+    def test_one_turn_launcher_keeps_a_finished_run_result_while_the_refused_account_has_no_room(self) -> None:
+        self.assert_system_error_delivers_a_finished_run_result(follow=False, room_wait=True)
+
+    def test_follow_keeps_a_finished_run_result_while_the_refused_account_has_no_room(self) -> None:
+        self.assert_system_error_delivers_a_finished_run_result(follow=True, room_wait=True)
 
     def test_a_thread_with_a_queued_message_or_a_live_turn_has_not_ended(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
