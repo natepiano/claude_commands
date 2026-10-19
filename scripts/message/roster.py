@@ -682,6 +682,8 @@ def _production_places(
     places: dict[str, _ProductionPlace] = {}
     # One read of every production's marks serves every showrunner below.
     every = _every_marked_unit() if registered else unit_lookup.MarkedProductions({}, {})
+    # One process scan places every record; a scan per record took most of the roster's time.
+    record_places: dict[int, herdr.HerdrPlace] | None = None
     for runner in registered:
         doc = Path(runner["doc"])
         runner_address = addresses.get(runner["slug"], "")
@@ -710,8 +712,10 @@ def _production_places(
                     _ = places.setdefault(marked.claude.session_id, place)
                     continue
                 # A socketless director is still identified by its marked pane.
+                if record_places is None:
+                    record_places = herdr.herdr_places()
                 for record in records:
-                    same_place = herdr.herdr_place_of(record["pid"]) == marked.place
+                    same_place = record_places.get(record["pid"]) == marked.place
                     if record["sessionId"] not in ledger_workers and same_place:
                         _ = places.setdefault(record["sessionId"], place)
                         break

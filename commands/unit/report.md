@@ -7,8 +7,8 @@ argument-hint: "[tables|on|off]"
 
 **Usage:** `/unit:report [tables|on|off]`
 
-Type this to see the phase, stage, ETA, workers and summary; add `tables` for
-the recorder's clocks and round tables. It runs inside
+Type this to see the phase, stage, ETA, workers and summary table; add `tables`
+for the round table, `Earlier:` and verification gate lines. It runs inside
 the current session and already knows the session directory, the phase, and
 which dispatches are live. If no `/unit:direct` run is active, say so in one line and
 stop.
@@ -25,8 +25,9 @@ using the requested word. Relay its output and stop without composing a report.
 A Codex unit has no notifier; say this switch is unavailable there. If the
 command fails, relay its message as printed: exit 1 covers both a session with
 no active run and a run whose notifier instance is missing, and the message
-says which. `tables` composes the report below with `progress --tables`;
-ordinary reports and notifier ticks omit that flag. Reject other arguments.
+says which. Every report includes the summary table. `tables` adds the round
+table with `progress --tables`; ordinary reports and notifier ticks omit that
+flag. Reject other arguments.
 
 Everything below is the contract.
 
@@ -91,16 +92,17 @@ Everything below is the contract.
    the stage; `No active phase to report` means no phase or activity is open.
 
    Include the override reason only when rejecting applicable calibration.
-   Copy the recorder's phase heading, stage line, ETA line and wall clock
+   Copy the recorder's summary table byte for byte in every report.
+   Copy its phase heading, stage line, ETA line and wall clock
    exactly, keeping its `as of` and no-open-window lines when present. The ETA
    is the latest promise, including `passed` when overdue; never substitute a
-   schedule prediction. For `tables`, also copy both tables, `Earlier:` and
-   verification gate lines byte-for-byte. Worker narration supplies step 7;
+   schedule prediction. For `tables`, also copy the round table, `Earlier:` and
+   verification gate lines byte for byte. Worker narration supplies step 7;
    never paste the `- **Agent N**` lines themselves.
-6. Present sections in this order: phase and stage, ETA line, worker table,
-   summary sentences, then `See /showrunner:unit_board for the board.` For `tables`, put
-   the two recorder tables after the ETA line. If early review is armed, say
-   the writer and reviewer are working at once.
+6. Present sections in this order: phase and stage, ETA line, summary table,
+   worker table, summary sentences, then `See /showrunner:unit_board for the board.`
+   For `tables`, put the round table after the summary table. If early review
+   is armed, say the writer and reviewer are working at once.
 
    Use the recorder's worker lines for slot, role, state, model and effort.
    `running` means working; `waiting` means held up; `idle` means its window

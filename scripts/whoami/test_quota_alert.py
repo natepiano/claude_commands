@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.whoami.note_file import note_name
 
 import io
+import fcntl
 import base64
 import json
 import os
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -242,6 +245,44 @@ class QuotaAlertTests(unittest.TestCase):
             five_hour=Quota("5-hour", 0, reset), credit_balance=selected.get("credit_balance"))
         return quota_alert.CodexAlertPassReadings(workers, account,
             (quota_alert.CodexHomeReading(home, live, now),))
+
+    def test_a_claim_during_a_codex_save_keeps_both_results(self) -> None:
+        home = self.root / ".codex"
+        login = "reader@example.invalid"
+        worker = agent_accounts.KnownCodexAccount(home, "worker@example.invalid", "codex1")
+        report = Report("Codex", email=worker.login, quotas=[Quota("Weekly", 40, None)])
+        readings = quota_alert.CodexAlertPassReadings(
+            accounts.CodexWorkersAccount(worker.label, home), worker,
+            (quota_alert.CodexHomeReading(home, report, self.now),))
+        merging, claiming = Event(), Event()
+        merge = usage_store.merge
+
+        def merge_while_claim_starts(stored: usage_store.UsageReadings,
+                                    reports: list[Report], at: datetime) -> bool:
+            merging.set()
+            with usage_store.store_file().with_name("usage.lock").open("a") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(claiming.wait(timeout=2))
+            return merge(stored, reports, at)
+
+        def claim() -> agent_accounts.UsageReadClaim | agent_accounts.UsageReadHeld:
+            self.assertTrue(merging.wait(timeout=2))
+            claiming.set()
+            return usage_store.claim_read(login, self.now)
+
+        with (mock.patch.object(usage_store, "merge", side_effect=merge_while_claim_starts),
+              ThreadPoolExecutor(max_workers=2) as pool):
+            saved = pool.submit(quota_alert._save_codex_readings, readings, self.now)  # pyright: ignore[reportPrivateUsage]
+            claimed = pool.submit(claim)
+            saved.result(timeout=3)
+            result = claimed.result(timeout=3)
+        self.assertIsInstance(result, agent_accounts.UsageReadClaim)
+        stored = usage_store.load()
+        self.assertEqual(stored[login].get("attempted_at"), self.now.isoformat())
+        self.assertEqual(stored[usage_store.key("Codex", worker.login)].get("weekly", {}).get("left"), 60)
+        self.assertIsInstance(usage_store.claim_read(login, self.now + timedelta(seconds=1)),
+                              agent_accounts.UsageReadHeld)
 
     def alert(self, notes: Notes, now: datetime | None = None, *,
               selection: ClaudeAccountsInUse | quota_alert.ReadCurrentClaudeSelection =

@@ -1592,7 +1592,8 @@ def tell_showrunners_outcome(records: list[SessionShutdown], *,
             text = f"{summary}. The user is told; in a terminal on {saved['machine']}: {command} retries it."
         else:
             continue
-        if saved.get("showrunner_told") == told:
+        # A batch reports when its last session ends; by then a later stop or forget can own this one.
+        if saved.get("showrunner_told") == told or store.taken_over(saved):
             continue
         showrunner = _unit_showrunner(saved)
         # A record archived on success is no longer live, so it cannot be marked; it is reported once anyway.

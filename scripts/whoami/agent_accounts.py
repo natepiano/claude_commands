@@ -37,8 +37,10 @@ import urllib.request
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
+from enum import Enum
+from importlib import import_module
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -302,6 +304,53 @@ class NoWeeklyReadSkip:
     """The read was not skipped for an expired login token."""
 
 
+class UsageReadOutcome(str, Enum):
+    """The result of the latest attempt to read a login's usage."""
+
+    HELD = "held"
+    OK = "ok"
+    STALE_TOKEN = "stale_token"
+    REFUSED_401 = "refused_401"
+    RATE_LIMITED_429 = "rate_limited_429"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class UsageReadClaim:
+    """This reader owns the login's attempt at this time."""
+
+    at: datetime
+
+
+@dataclass(frozen=True)
+class UsageReadUnclaimed:
+    """This report has no stored read claim."""
+
+
+@dataclass(frozen=True)
+class UsageReadHeld:
+    """Another recent attempt supplies this login's reading."""
+
+
+class UsageReadStore(Protocol):
+    """The store claims and keeps each live usage attempt."""
+
+    def claim_read(self, login: str, now: datetime) -> UsageReadClaim | UsageReadHeld: ...
+    def finish_read(self, login: str, claim: UsageReadClaim, report: Report) -> None: ...
+
+
+@dataclass(frozen=True)
+class KnownUsageLogin:
+    """The caller already knows which login this directory holds."""
+
+    login: str
+
+
+@dataclass(frozen=True)
+class UnknownUsageLogin:
+    """The caller has no login to use if the identity read fails."""
+
+
 @dataclass
 class Report:
     """One tool's account. `problem` replaces the account lines; `quota_problem` follows them."""
@@ -322,6 +371,9 @@ class Report:
     source: ClaudeDirectorySource | CodexHomeSource | AccountSourceUnspecified = field(default_factory=AccountSourceUnspecified)
     codex_startup: CodexStartupStatus = field(default_factory=NoCodexStartupFailure)
     weekly_read_skip: StaleTokenSkip | NoWeeklyReadSkip = field(default_factory=NoWeeklyReadSkip)
+    usage_read_outcome: UsageReadOutcome = UsageReadOutcome.ERROR
+    usage_read_claim: UsageReadClaim | UsageReadUnclaimed = field(default_factory=UsageReadUnclaimed)
+    last_known_login: KnownUsageLogin | UnknownUsageLogin = field(default_factory=UnknownUsageLogin)
 
     @property
     def weekly_reset(self) -> datetime | None:
@@ -677,6 +729,8 @@ def claude_five_hour(usage: dict[str, object]) -> Quota | None:
 
 
 def claude_live(config_dir: Path | None = None) -> Report:
+    store = cast(UsageReadStore, cast(object, import_module("scripts.whoami.usage_store")))
+
     report = Report("Claude", source=ClaudeDirectorySource(
         claude_config_dir() if config_dir is None else config_dir,
     ))
@@ -700,6 +754,7 @@ def claude_live(config_dir: Path | None = None) -> Report:
     if account.get("authMethod") != "claude.ai":
         report.quota_problem = "Weekly quota: unavailable for this authentication method"
         return report
+    claim: UsageReadClaim | UsageReadHeld = UsageReadHeld()
     try:
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None
         if not token:
@@ -710,6 +765,7 @@ def claude_live(config_dir: Path | None = None) -> Report:
             # The service answers a stale one with 429 or 401; asking with it only adds refused calls.
             if token and isinstance(expires, int) and expires / 1000 <= time.time():
                 report.weekly_read_skip = StaleTokenSkip()
+                report.usage_read_outcome = UsageReadOutcome.STALE_TOKEN
                 report.quota_problem = "Weekly quota: not read (stale token; a Claude session on this account refreshes it)"
                 return report
         if not token:
@@ -718,17 +774,38 @@ def claude_live(config_dir: Path | None = None) -> Report:
             "https://api.anthropic.com/api/oauth/usage",
             headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
         )
+        if not report.email:
+            raise RuntimeError("usage login unavailable")
+        try:
+            claim = store.claim_read(report.email, datetime.now(timezone.utc))
+        except (OSError, ValueError):
+            print("usage store: could not claim the read; read without a hold", file=sys.stderr)
+        else:
+            if isinstance(claim, UsageReadHeld):
+                report.usage_read_outcome = UsageReadOutcome.HELD
+                return report
+            report.usage_read_claim = claim
         opened = cast(http.client.HTTPResponse, urllib.request.urlopen(request, timeout=15))
         with opened as response:
             usage = cast(dict[str, object], json.loads(response.read()))
         report.quotas = claude_usage_quotas(usage)
         report.five_hour = claude_five_hour(usage)
+        if any(quota.label == "Weekly" and quota.remaining_percent is not None for quota in report.quotas):
+            report.usage_read_outcome = UsageReadOutcome.OK
         if not any(quota.label == "Weekly" for quota in report.quotas):
             report.quota_problem = "Weekly quota: unavailable"
     except urllib.error.HTTPError as error:
+        report.usage_read_outcome = (UsageReadOutcome.REFUSED_401 if error.code == 401 else
+                                     UsageReadOutcome.RATE_LIMITED_429 if error.code == 429 else UsageReadOutcome.ERROR)
         report.quota_problem = f"Weekly quota: unavailable (HTTP {error.code}; try Claude /usage)"
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         report.quota_problem = "Weekly quota: unavailable (could not read live usage; try Claude /usage)"
+    finally:
+        if report.email and isinstance(claim, UsageReadClaim):
+            try:
+                store.finish_read(report.email, claim, report)
+            except (OSError, ValueError):
+                print("usage store: could not save the read; keep the live report", file=sys.stderr)
     return report
 
 
@@ -997,6 +1074,8 @@ async def codex_live(home: Path) -> Report:
             report.five_hour = codex_five_hour(usage)
             report.credit_balance = codex_credits(usage)
             reset_credits(report, usage.get("rateLimitResetCredits"))
+            if any(quota.label == "Weekly" and quota.remaining_percent is not None for quota in report.quotas):
+                report.usage_read_outcome = UsageReadOutcome.OK
             if not report.quotas:
                 report.quota_problem = "Weekly quota: unavailable (no weekly window returned)"
         except (OSError, ValueError, KeyError, RuntimeError, asyncio.TimeoutError):
@@ -1050,9 +1129,17 @@ async def live_reports(selection: ClaudeAccountsInUse, workers_home: Path | NoWo
         *(named.directory for named in selection.named_accounts),
         *selection.live_directories,
     ]))
-    if claude_on_disk(Path.home() / ".claude").email and Path.home() / ".claude" not in directories:
+    home_login = claude_on_disk(Path.home() / ".claude").email
+    if home_login and Path.home() / ".claude" not in directories:
         directories.append(Path.home() / ".claude")
-    return list(await asyncio.gather(
+    reports = list(await asyncio.gather(
         *(asyncio.to_thread(claude_live, directory) for directory in directories),
         *(codex_live(home) for home in homes),
     ))
+    known = {named.directory: named.identity.login for named in selection.named_accounts}
+    if home_login:
+        known[Path.home() / ".claude"] = home_login
+    for report in reports:
+        if isinstance(report.source, ClaudeDirectorySource) and report.source.directory in known:
+            report.last_known_login = KnownUsageLogin(known[report.source.directory])
+    return reports

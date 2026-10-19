@@ -639,6 +639,25 @@ class CountsRowTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines()[-1],
                          "For you: \x1b[1m1\x1b[22m project, \x1b[1m12\x1b[22m questions")
 
+    def test_the_row_counts_efficiency_proposals_and_refreshes_when_the_ledger_changes(self) -> None:
+        ledger = self.home / "efficiency.md"
+        doc = self.home / "docs/plans/show-production.md"
+        _ = doc.write_text(doc.read_text(encoding="utf-8") + f"- **Efficiency ledger:** {ledger}\n",
+                           encoding="utf-8")
+        _ = self.ledger.write_text("- 2026-10-19 Project (project.md) — proposed\n", encoding="utf-8")
+        self.questions({"since": "2026-10-19T04:00", "text": "Review the study"})
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                _ = ledger.write_text("- 2026-10-19 config: First — proposed\n"
+                                      + "- 2026-10-19 messages: Second — deferred\n"
+                                      + "- 2026-10-19 rust: Done — accepted, applied\n", encoding="utf-8")
+                self.assertEqual(self.lines(shell=shell)[-1],
+                                 "For you: 2 efficiency proposals, 1 project, 1 question")
+                _ = ledger.write_text("- 2026-10-19 config: First — accepted, applied\n"
+                                      + "- 2026-10-19 messages: Second — deferred\n", encoding="utf-8")
+                self.assertEqual(self.lines(shell=shell)[-1],
+                                 "For you: 1 efficiency proposal, 1 project, 1 question")
+
     def test_nothing_counted_shows_no_row(self) -> None:
         self.assertEqual(len(self.lines()), 1)
         self.assertEqual(self.cache.read_text(encoding="utf-8").splitlines()[:2], ["", ""])

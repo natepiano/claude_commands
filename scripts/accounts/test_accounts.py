@@ -64,6 +64,17 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
 
 
+def failed_read_cell(read: datetime) -> str:
+    """The Read cell after a failed attempt: a read from an earlier day in the status zone also shows its date.
+
+    A read some minutes old falls on the day before just after midnight, so a fixed form fails then.
+    """
+    zone = ZoneInfo("America/Los_Angeles")
+    local = read.astimezone(zone)
+    form = "%H:%M %Z" if local.date() == datetime.now(zone).date() else "%m-%d %H:%M %Z"
+    return local.strftime(form) + "*"
+
+
 def named_prefix(config_dir: Path) -> str:
     return "".join(
         f"{name}={shlex.quote(value)} "
@@ -3844,10 +3855,175 @@ class AccountsTests(unittest.TestCase):
         rows = self.status_rows()
 
         self.assertEqual(rows[0][4], "75%")
-        self.assertEqual(rows[0][8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
-        # claude3 is logged in and has never been read.
-        self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 2, "—", "—", "—"))
+        self.assertEqual(rows[0][8], failed_read_cell(read))
+        # claude3 has no good reading. Its failed attempt still gets a star.
+        self.assertEqual(rows[1][2:], ("unit@example.invalid", "", *("unavailable",) * 2, "—", "—", "—*"))
         self.assertEqual(self.live_reads.call_count, 2)
+
+    def test_failed_read_causes_show_old_date_star_and_one_footnote_until_a_good_read(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        cases = (
+            (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+             "login token expired; start a session on it to refresh"),
+            (agent_accounts.UsageReadOutcome.REFUSED_401,
+             "the usage service did not accept this login; start a session on it to check it"),
+            (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
+             "the usage service is busy, so this shows the reading from 05:29; next try in 2 min"),
+            (agent_accounts.UsageReadOutcome.ERROR,
+             "the usage read failed, so this shows the reading from 05:29; next try in 2 min"),
+        )
+        for outcome, reason in cases:
+            with self.subTest(outcome=outcome):
+                usage_store.save([self.reading("idle@example.invalid", None,
+                    agent_accounts.Quota("Weekly", 25, old + timedelta(days=1)))], old)
+                usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+                    usage_read_outcome=outcome)], old + timedelta(minutes=2))
+                code, output, error = self.run_cli("status", "--stored")
+                self.assertEqual((code, error), (0, ""))
+                row = next(line for line in output.splitlines() if "| claude2 " in line)
+                self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+                self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
+                                 [f"* claude2: {reason}"])
+                now = datetime.now(timezone.utc)
+                usage_store.save([self.reading("idle@example.invalid", None,
+                    agent_accounts.Quota("Weekly", 10, now + timedelta(days=1)))], now)
+                code, output, error = self.run_cli("status", "--stored")
+                self.assertEqual((code, error), (0, ""))
+                row = next(line for line in output.splitlines() if "| claude2 " in line)
+                self.assertEqual(row.split("|")[-2].strip(),
+                                 now.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
+                self.assertFalse(any(line.startswith("* ") for line in output.splitlines()))
+        self.live_reads.assert_not_called()
+        self.codex_reads.assert_not_awaited()
+
+    def test_usage_failure_notes_name_the_service_and_retry_time_in_table_and_json(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        at = datetime(2026, 10, 19, 15, 11, tzinfo=timezone.utc)
+        cases = (
+            (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
+             "the usage service is busy, so this shows the reading from 08:09; next try after 08:21",
+             "the usage service is busy and no reading is stored yet; next try after 08:21"),
+            (agent_accounts.UsageReadOutcome.ERROR,
+             "the usage read failed, so this shows the reading from 08:09; next try in 2 min",
+             "the usage read failed and no reading is stored yet; next try in 2 min"),
+            (agent_accounts.UsageReadOutcome.REFUSED_401,
+             "the usage service did not accept this login; start a session on it to check it",
+             "the usage service did not accept this login; start a session on it to check it"),
+            (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+             "login token expired; start a session on it to refresh",
+             "login token expired; start a session on it to refresh"),
+        )
+        for outcome, with_reading, without_reading in cases:
+            for has_reading, reason in ((True, with_reading), (False, without_reading)):
+                with self.subTest(outcome=outcome, reading=has_reading):
+                    usage = usage_store.StoredUsage(read_outcome=outcome, attempted_at=at.isoformat(),
+                        attempt_outcome=outcome)
+                    if has_reading:
+                        usage["weekly"] = usage_store.StoredWindow(left=75,
+                            at=(at - timedelta(minutes=2)).isoformat(),
+                            resets=(at + timedelta(days=1)).isoformat())
+                        usage["five_hour"] = usage["weekly"]
+                    with usage_store.read_lock():
+                        usage_store.write({"idle@example.invalid": usage})
+                    code, output, error = self.run_cli("status", "--stored")
+                    self.assertEqual((code, error), (0, ""))
+                    note = f"* claude2: {reason}"
+                    self.assertEqual([line for line in output.splitlines() if line.startswith("* ")], [note])
+                    code, document, error = self.run_cli("status", "--json", "--stored")
+                    self.assertEqual((code, error), (0, ""))
+                    problems = cast(dict[str, object], json.loads(document))["problems"]
+                    self.assertEqual([problem for problem in cast(list[str], problems)
+                                      if problem.startswith("* ")], [note])
+                    self.assertNotIn("refused", note)
+        self.live_reads.assert_not_called()
+
+    def test_a_held_refresh_keeps_the_stored_reading_and_failure_note(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        at = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 25, at + timedelta(days=1)))], at)
+        usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429)], at)
+        before = usage_store.store_file().read_bytes()
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude",
+            email="idle@example.invalid", usage_read_outcome=agent_accounts.UsageReadOutcome.HELD)
+        code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("01-02 05:29 PST*", output)
+        self.assertIn("the usage service is busy, so this shows the reading from 05:29; next try in 2 min", output)
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+
+    def test_first_identity_failure_after_upgrade_marks_the_old_reading(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        path = usage_store.store_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        window = {"left": 75, "resets": (old + timedelta(days=1)).isoformat(), "at": old.isoformat()}
+        _ = path.write_text(json.dumps({"idle@example.invalid": {"weekly": window}}))
+        directory = accounts.account_dir("claude2")
+        self.live[directory] = agent_accounts.Report("Claude", problem="identity unavailable")
+        code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if "| claude2 " in line)
+        self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+        self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
+                         ["* claude2: the usage read failed, so this shows the reading from 05:29; next try in 2 min"])
+        self.assertEqual(usage_store.load()["idle@example.invalid"].get("weekly"), window)
+        self.live_reads.assert_called_once_with(directory)
+
+    def test_failure_from_the_first_of_two_directories_marks_their_shared_login(self) -> None:
+        login = "shared@example.invalid"
+        self.login_directory("claude2", login)
+        old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        first, second = self.home / ".claude2", self.home / ".claude3"
+        for directory in (first, second):
+            usage_store.save([agent_accounts.Report("Claude", email=login,
+                source=agent_accounts.ClaudeDirectorySource(directory),
+                quotas=[agent_accounts.Quota("Weekly", 25, old + timedelta(days=1))])], old)
+        # The failure has no identity hint. Only the persisted directory link can name its login.
+        usage_store.save([agent_accounts.Report("Claude",
+            source=agent_accounts.ClaudeDirectorySource(first), problem="identity unavailable")],
+            old + timedelta(minutes=2))
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if "| claude2 " in line)
+        self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+        self.assertEqual([line for line in output.splitlines() if line.startswith("* ")],
+                         ["* claude2: the usage read failed, so this shows the reading from 05:29; next try in 2 min"])
+        self.live_reads.assert_not_called()
+
+    def test_failed_read_today_keeps_the_short_time_and_marks_a_never_read_account(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        self.login_directory("claude3", "never@example.invalid")
+        now = datetime.now(timezone.utc)
+        usage_store.save([self.reading("idle@example.invalid", None,
+            agent_accounts.Quota("Weekly", 25, now + timedelta(days=1)))], now)
+        usage_store.save([agent_accounts.Report("Claude", email=login,
+            usage_read_outcome=agent_accounts.UsageReadOutcome.RATE_LIMITED_429)
+            for login in ("idle@example.invalid", "never@example.invalid")], now)
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        rows = [line for line in output.splitlines() if "| claude2 " in line or "| claude3 " in line]
+        self.assertEqual([line.split("|")[-2].strip() for line in rows],
+            [now.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z") + "*", "—*"])
+        self.assertEqual(len([line for line in output.splitlines() if line.startswith("* ")]), 2)
+
+    def test_failed_codex_start_keeps_its_last_good_read_time_and_shows_a_footnote(self) -> None:
+        _, target = self.workers_fixture()
+        old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
+        usage_store.save([agent_accounts.Report("Codex", email="target@example.invalid",
+            source=agent_accounts.CodexHomeSource(target),
+            quotas=[agent_accounts.Quota("Weekly", 25, old + timedelta(days=1))])], old)
+        self.codex_reads.return_value = agent_accounts.Report("Codex", problem="Startup request timed out",
+            source=agent_accounts.CodexHomeSource(target),
+            codex_startup=agent_accounts.CodexStartupFailure(target, "/showrunner:accounts setup codex1"))
+        code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if "| codex1 " in line)
+        self.assertEqual(row.split("|")[-2].strip(), "01-02 05:29 PST*")
+        self.assertIn("* codex1: the usage read failed, so this shows the reading from 05:29; next try in 2 min", output)
+        self.assertIn("/showrunner:accounts setup codex1", row)
 
     def test_status_after_weekly_reset_explains_a_stale_login_without_reading_it_again(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
@@ -3880,7 +4056,7 @@ class AccountsTests(unittest.TestCase):
         row = self.status_rows()[0]
         self.assertEqual(row[4], "not read since 05:29")
         self.assertEqual(row[5], "unavailable")
-        self.assertEqual(row[8], "05:29 PST")
+        self.assertEqual(row[8], "01-02 05:29 PST*")
         self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
 
     def test_status_auth_failure_after_stale_login_skip_clears_its_reason_and_keeps_last_good_reading(self) -> None:
@@ -3909,8 +4085,11 @@ class AccountsTests(unittest.TestCase):
                                   agent_accounts.StaleTokenSkip)
             failed = self.status_rows()[0]
         self.assertEqual(failed[4], "not read since 05:29")
-        self.assertEqual((failed[5], failed[8]), ("unavailable", "05:29 PST"))
-        self.assertEqual(usage_store.load()[login], before)
+        self.assertEqual((failed[5], failed[8]), ("unavailable", "01-02 05:29 PST*"))
+        held = usage_store.load()[login]
+        self.assertEqual(held.get("weekly"), before.get("weekly"))
+        self.assertEqual(held.get("five_hour"), before.get("five_hour"))
+        self.assertEqual(usage_store.latest_read_outcome(held), agent_accounts.UsageReadOutcome.ERROR)
         self.assertEqual(credentials.read_bytes(), credential_bytes)
         self.assertEqual(auth.call_count, 2)
         self.assertEqual(reads.call_args_list, [call(directory), call(directory)])
@@ -3927,7 +4106,7 @@ class AccountsTests(unittest.TestCase):
         row = self.status_rows()[0]
         self.assertEqual(row[4], "75%")
         self.assertEqual(row[5], reset.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%a %m-%d %H:%M %Z"))
-        self.assertEqual(row[8], read.astimezone(ZoneInfo("America/Los_Angeles")).strftime("%H:%M %Z"))
+        self.assertEqual(row[8], failed_read_cell(read))
         self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
 
     def test_status_stale_token_skip_without_any_stored_reading_stays_unavailable(self) -> None:
@@ -3935,7 +4114,7 @@ class AccountsTests(unittest.TestCase):
         self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude", email="idle@example.invalid",
             weekly_read_skip=agent_accounts.StaleTokenSkip())
         row = self.status_rows()[0]
-        self.assertEqual((row[4], row[5], row[8]), ("unavailable", "unavailable", "—"))
+        self.assertEqual((row[4], row[5], row[8]), ("unavailable", "unavailable", "—*"))
         self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
 
     def test_status_times_use_the_users_zone_setting_when_no_production_runs_or_none_can_be_read(self) -> None:

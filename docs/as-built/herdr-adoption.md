@@ -234,6 +234,7 @@ Run the nine suites on the Mac with a scratch home. Run the command from the roo
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
+- The prompt goes in only when the composer is empty. Every composer check reads `pane read --source visible --format ansi` and drops faint text (SGR 2, until 22 or 0; colour arguments of 38/48/58 are skipped), because a new session shows a faint hint such as `Try "fix lint errors"` in its empty composer. Read as plain text, that hint looked like input, and add_unit's efficiency launch waited out its limit twice (2026-10-19).
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
 - `start_new_server` is exclusive and raises `SessionTaken` on a taken name. Launchers that create a session use it. Adopting starts are only for restoring into a recorded server.
 - Restored workspaces are cleared on every server spawn. Restart closes only workspaces that pass the untouched startup-shell test, never one it did not create.
@@ -280,6 +281,8 @@ Run the nine suites on the Mac with a scratch home. Run the command from the roo
 - Linux discovery skips a process whose cwd no longer resolves, so callers that hold a registry pid place it with `herdr_place_of`.
 - natedev's `claude` alias adds `--remote-control` and `--settings`. herdr types a bare `claude` at the pane prompt, so without the `HERDR_AGENT_PANE` guard every session would get those flags twice.
 - An account move cannot run `accounts.py exec` inside herdr, since it removes credentials and checks readiness, which pane variables cannot do. Moves pass `prepared_account(target, resume=True)` variables and removals instead.
+- A detached run is not a unit's second pane. A worker build that `mesh_runs.py supervise` runs stays in the herdr service's cgroup, so herdr places it in the session. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Before this, three tool-based-ui units read as marked twice and `roster.py` exited 1.
+- `herdr_place_of` reads every process for each call. `herdr_places()` places every pid at once; `roster.py` took 10.7 s for 40 calls and now takes about 1 s in total.
 
 **Mac.**
 

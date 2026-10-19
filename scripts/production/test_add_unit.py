@@ -395,7 +395,7 @@ class AddUnitTests(ShutdownTestCase):
             screen = "/remote-control is active" if (self.state / "ready").exists() else "Waiting for remote control"
             responses[f"--session {name} pane read w1:p1 --source recent --lines 60"] = CommandResponse(
                 code=0, stdout=screen)
-            responses[f"--session {name} pane read w1:p1 --source visible"] = CommandResponse(
+            responses[f"--session {name} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
                 code=0, stdout="────────\n❯ \n────────")
             process = self.root / "proc/102"
             server = self.root / "proc/101"
@@ -1211,21 +1211,39 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
         self.assertEqual(self.repository_state(), before)
 
-    def test_new_work_and_a_promote_still_refuse_a_row_off_the_naming_pattern(self) -> None:
+    def test_new_work_still_refuses_a_row_off_the_naming_pattern(self) -> None:
         recorded = self.commit_row_off_the_naming_pattern()
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        promote = ("--resume", "session-123", "--cwd", str(recorded),
-                   "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
-        for launch, flags in (("new work", ()), ("promote", promote)):
-            with self.subTest(launch=launch):
-                result = self.cli("trunk", "--plan", "docs/plans/given.md", *flags)
-                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                self.assertEqual(
-                    result.stderr,
-                    f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
-                )
-                self.assert_no_launch_change(document, head)
+        result = self.cli("trunk", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(
+            result.stderr,
+            f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
+        )
+        self.assert_no_launch_change(document, head)
+
+    def test_a_resume_in_its_row_worktree_off_the_naming_pattern_launches_there(self) -> None:
+        """hana's startup-polish row predates the naming rule (2026-10-19); its resume was refused."""
+        recorded = self.commit_row_off_the_naming_pattern()
+        result = self.cli("trunk", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(recorded), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+        # The fixture marks only alpha-unit, so the launch ends at the mark wait, after the row check.
+        self.assertNotIn("Worktree is", result.stderr)
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
+
+    def test_a_resume_outside_its_row_worktree_is_refused_with_exit_two(self) -> None:
+        recorded = self.commit_row_off_the_naming_pattern()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("trunk", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(elsewhere), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr,
+                         f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its Units row names {recorded}\n")
+        self.assert_no_launch_change(document, head)
 
     def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there(self) -> None:
         self.commit_prepared_row(self.unit_row())
