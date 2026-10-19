@@ -93,7 +93,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
 | `RESIDENT_POLL_SECS`, `REAP_WAIT_SECS`, `REAP_POLL_SECS` | `scripts/agents/codex_mesh.py` | `1.0`, `5.0`, `0.2` | patched as module attributes |
-| `PLAN_DELEGATE_ACTIVE_DIR` | `end_session.sh`, `unit_notifier.sh`, `unit_status.sh`, `hooks/delegate_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory and pins it for `unit_notifier.sh` | `/tmp/claude/delegate/active` | a temp dir |
+| `PLAN_DELEGATE_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/delegate_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
 | `PLAN_DELEGATE_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 

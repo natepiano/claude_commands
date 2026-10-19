@@ -9,7 +9,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import statistics
 import subprocess
 import sys
@@ -185,13 +184,9 @@ class FindingTally(TypedDict):
     reopened: int
 
 
-# The report interval lives in delegate.conf, the same file progress_timer.sh
-# reads, so the next tick this header names and the timer that actually fires
-# can never disagree. `PLAN_DELEGATE_CONFIG` overrides the path so the tests
-# read a fixture rather than the machine's live settings.
+# delegate.conf, whose digest a pass records. `PLAN_DELEGATE_CONFIG` overrides the
+# path so the tests read a fixture rather than the machine's live settings.
 DEFAULT_CONFIG_PATH = Path("~/.claude/config/delegate.conf").expanduser()
-PROGRESS_INTERVAL_KEY = "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS"
-TIMER_MARKER_FILENAME = "progress_timer"
 
 # A pass already records the agent identity it resolved to, so the digest covers
 # what that identity cannot: the assignment tables that produced it and the
@@ -232,29 +227,6 @@ def _config_digest() -> str:
         except OSError:
             return ""
     return hashlib.sha256(b"".join(contents)).hexdigest()[:CONFIG_DIGEST_LENGTH]
-
-
-def _progress_interval_seconds() -> int | None:
-    """Configured seconds between reports, or None when the key is unusable.
-
-    A report is not a timer, so an unusable interval drops the next-tick clause
-    instead of stopping the header. progress_timer.sh reads the same key and is
-    the caller that fails loudly on it.
-    """
-    try:
-        config_text = _config_path().read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for line in config_text.splitlines():
-        key, separator, value = line.split("#", 1)[0].strip().partition("=")
-        if not separator or key.strip() != PROGRESS_INTERVAL_KEY:
-            continue
-        try:
-            parsed = int(value.strip())
-        except ValueError:
-            return None
-        return parsed if parsed > 0 else None
-    return None
 
 
 PASS_OWNER_ENV = "PLAN_DELEGATE_PASS_OWNER"
@@ -2149,74 +2121,14 @@ def _work_seconds(
     return int(work)
 
 
-def _restart_unit_notifier(session_dir: Path) -> int | None:
-    """Restart an existing unit instance and return its next due epoch."""
-    zsh = shutil.which("zsh")
-    if zsh is None:
-        return None
-    notifier = Path(__file__).resolve().parents[1] / "message" / "notifier.sh"
-    environment = os.environ.copy()
-    if configured_now := environment.get("PLAN_DELEGATE_NOW_EPOCH"):
-        environment["NOTIFIER_NOW_EPOCH"] = configured_now
-    try:
-        result = subprocess.run(
-            [zsh, str(notifier), "restart", unit_runs.instance(session_dir)],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-            env=environment,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    match = re.search(r"^next_due=(\d+)", result.stdout, re.MULTILINE)
-    return int(match.group(1)) if match is not None else None
-
-
-def _next_report_at(session_dir: Path, now: float, notifier_due: int | None) -> float | None:
-    """When the next progress report is due, in epoch seconds.
-
-    A restarted notifier instance supplies the actual next deadline. For runs
-    without one, progress_timer.sh clears its marker as it ticks, so at the
-    usual reporting moment -- after the tick, before the next timer is armed --
-    no marker exists and the configured interval supplies the answer. A marker still present and
-    still ahead of the clock is a timer genuinely armed right now, and that
-    deadline beats an interval added to the current time.
-    """
-    if notifier_due is not None:
-        return notifier_due
-    try:
-        marker_text = (session_dir / TIMER_MARKER_FILENAME).read_text(encoding="utf-8")
-    except OSError:
-        marker_text = ""
-    for line in marker_text.splitlines():
-        key, separator, value = line.partition("=")
-        if not separator or key.strip() != "deadline_epoch":
-            continue
-        try:
-            deadline = float(value.strip())
-        except ValueError:
-            break
-        if deadline > now:
-            return deadline
-        break
-    interval = _progress_interval_seconds()
-    return now + interval if interval is not None else None
-
-
-def _clock_line(now: float, next_report_at: float | None) -> str:
-    """Anchor the durations above to wall-clock time and name the next report.
+def _clock_line(now: float) -> str:
+    """Anchor the durations above to wall-clock time.
 
     Every other number in the header is a duration, which says how long but
     never when. This line is the one place a reader can tell whether the report
-    they are looking at is current and how long until the next one lands.
+    they are looking at is current.
     """
-    line = f"**now {datetime.fromtimestamp(now, user_zone()):%Y-%m-%d %H:%M:%S}"
-    if next_report_at is not None:
-        line += f" - next report {_moment_stamp(next_report_at, now)}"
-    return line + "**"
+    return f"**now {datetime.fromtimestamp(now, user_zone()):%Y-%m-%d %H:%M:%S}**"
 
 
 def _moment_stamp(epoch: float, now: float) -> str:
@@ -3934,7 +3846,7 @@ def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], co
     phase_id = _string(phase.get("id")) if phase is not None else ""
     order = counts.get("order")
     if (phase is None or phase_id in ("", "ad hoc") or not isinstance(order, list)
-            or phase_id in order or _run_plan_path(state) != counted):
+            or _run_plan_path(state) != counted or _plan_lists_phase(counted, phase_id)):
         return counts
     finished = _string(phase.get("status")) == "completed"
     done, todo = _integer(counts.get("done")), _integer(counts.get("todo"))
@@ -3947,13 +3859,23 @@ def _with_unlisted_phase(counts: dict[str, object], state: dict[str, object], co
     }
 
 
+def _plan_lists_phase(plan: Path, phase_id: str) -> bool:
+    """Whether a heading names `phase_id` by its number or, as a standing plan writes
+    `### Phase 201 — types-unit-201`, by the first word of its title."""
+    try:
+        phases, _ = plan_history.plan_phase_details(plan)
+    except OSError:
+        return False
+    return any(phase_id in (phase["id"], *phase["title"].split()[:1]) for phase in phases)
+
+
 def _phase_missing_from_plan(state: dict[str, object], phase_id: str) -> Path | None:
     """The run's plan when it lists phases and none of them is `phase_id`."""
     plan = _run_plan_path(state)
     if plan is None or phase_id == "ad hoc":
         return None
-    order = _count_plan_phases(plan).get("order")
-    return plan if isinstance(order, list) and phase_id not in order else None
+    listed = _count_plan_phases(plan).get("available") is not True or _plan_lists_phase(plan, phase_id)
+    return None if listed else plan
 
 
 def _reported_window(
@@ -4271,7 +4193,6 @@ def _print_last_recorded(
     state: dict[str, object],
     phase: dict[str, object],
     now: float,
-    notifier_due: int | None,
     reported_window: ReportedActivityWindow | NoReportedWindow,
     tables: bool = False,
 ) -> None:
@@ -4315,7 +4236,7 @@ def _print_last_recorded(
         ),
         *section,
         window_line,
-        _clock_line(now, _next_report_at(session_dir, now, notifier_due)),
+        _clock_line(now),
     ]
     print("\n".join(lines))
 
@@ -4324,7 +4245,6 @@ def _report_progress(args: argparse.Namespace) -> None:
     session_dir = _session_dir(args)
     tables = getattr(args, "tables", False) is True
     now = plan_history.now_epoch()
-    notifier_due = _restart_unit_notifier(session_dir)
     state = _ensure_project_timing(session_dir, _read_state(session_dir), now)
     phase = _object_dict(state.get("phase"))
     reported_window = _reported_window(state)
@@ -4333,14 +4253,14 @@ def _report_progress(args: argparse.Namespace) -> None:
     if _string(phase.get("status")) != "active":
         if isinstance(reported_window, ReportedActivityWindow):
             _print_last_recorded(
-                session_dir, state, phase, now, notifier_due, reported_window, tables=tables
+                session_dir, state, phase, now, reported_window, tables=tables
             )
             return
         phase_status = _string(phase.get("status")) or "missing"
         raise SystemExit(f"No active phase to report: phase {phase_status}. {WORKERS_UNSEEN}")
     if isinstance(reported_window, NoReportedWindow):
         _print_last_recorded(
-            session_dir, state, phase, now, notifier_due, reported_window, tables=tables
+            session_dir, state, phase, now, reported_window, tables=tables
         )
         return
     current_pass = reported_window.record
@@ -4458,11 +4378,9 @@ def _report_progress(args: argparse.Namespace) -> None:
     )
     pass_elapsed = max(0, int(now - _number(current_pass.get("started_at"), now)))
     total_elapsed = max(0, int(now - _number(state.get("project_started_at"), now)))
-    next_report_at = _next_report_at(session_dir, now, notifier_due)
     event = _event(state, "progress_reported", now)
     event.update(
         {
-            "next_report_at": next_report_at,
             "raw_percent": phase_raw_percent,
             "percent": phase_percent,
             "same_percent_started_at": phase_percent_started_at,
@@ -4559,7 +4477,7 @@ def _report_progress(args: argparse.Namespace) -> None:
             *summary,
             *(section if tables else []),
         ]
-    lines.append(_clock_line(now, next_report_at))
+    lines.append(_clock_line(now))
     print("\n".join(lines))
 
 

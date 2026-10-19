@@ -479,13 +479,17 @@ class UnitRenameTests(unittest.TestCase):
         with (Path(common) / f"showrunner-merge-{SLUG}.lock").open("a") as gate:
             fcntl.flock(gate, fcntl.LOCK_EX)
             process = self.start_apply()
-            time.sleep(2)
+            # Hold the gate until apply says it waits: a fixed sleep let a slow start under
+            # load reach the lock after it was released, so it never waited.
+            assert process.stdout is not None
+            waited = str(process.stdout.readline())  # pyright: ignore[reportAny]
             # The gate holds the merge branch: the rename has not even checked the checkout yet.
             self.assertIsNone(process.poll())
             self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
             fcntl.flock(gate, fcntl.LOCK_UN)
         stdout, stderr = process.communicate(timeout=120)
-        self.assertIn("merge lock: waiting — a merge gate or a unit rename is writing demo's merge branch", stdout)
+        self.assertIn("merge lock: waiting — a merge gate or a unit rename is writing demo's merge branch",
+                      waited + stdout)
         # The fake restart starts nothing; every step before verify ran once the gate was done.
         self.assertIn("gamma-unit is not running", stderr)
         self.assertEqual(self.journal()["step"], 10)

@@ -36,13 +36,6 @@ class UnitRunsTest(unittest.TestCase):
                 _ = (new / "active/s1").write_text("run\n")
                 self.assertEqual(unit_runs.marker("s1"), new / "active/s1")
 
-    def test_a_run_under_the_former_name_keeps_its_instance(self) -> None:
-        self.assertEqual(unit_runs.instance(Path("/tmp/claude/unit/abc")), "unit-abc")
-        self.assertEqual(unit_runs.instance(Path("/tmp/claude/delegate/abc")), "delegate-abc")
-        self.assertEqual(unit_runs.instance(Path("/scratch/runs/abc")), "unit-abc")
-        self.assertTrue(all("unit-abc".startswith(prefix) or "delegate-abc".startswith(prefix)
-                            for prefix in unit_runs.INSTANCE_PREFIXES))
-
     def test_the_recorded_director_wins_over_the_session_that_started_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             run, history = Path(folder) / "run", Path(folder) / "history.jsonl"
