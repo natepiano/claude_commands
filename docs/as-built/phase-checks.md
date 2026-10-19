@@ -15,7 +15,7 @@
 | rustdoc `-D warnings` | the same `lint` | the members that differ from HEAD |
 | style review | the unit director's main review in `<DualReview/>`, pass 1 only | the phase's diff from `${PHASE_DIR}/phase_baseline`, untracked files included |
 
-`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy, doc. Mend rewrites the code first. Fmt formats what mend wrote. A clippy failure with `#suboptimal_flops` starts up to five JSON replay and apply rounds. After at least one applied round, lint formats once, updates the cache key and judges again. Every clippy run in this path uses `--keep-going`. Rustdoc runs after clippy passes. See [Lint-step rewrite](build-followups-mul-add.md#lint-step-rewrite) for the round rules.
+`verify.sh lint` runs its stages in this order: mend, fmt, taplo, clippy, doc. Mend rewrites the code first. Fmt formats what mend wrote. The clippy stage runs `cargo clippy --fix` and fmt, repeated while a pass changes the tree, at most three times. Then it updates the cache key and judges. Every clippy run in this path uses `--keep-going`. Rustdoc runs after clippy passes. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
 
 **Files and their roles**
 
