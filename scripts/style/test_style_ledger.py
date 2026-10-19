@@ -475,6 +475,28 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertIn("unknown ticket", refused.stderr)
         self.assertEqual(ledger.rule_candidates(), (candidate,))
 
+    def test_withdrawal_migration_thirteen_keeps_version_twelve_findings_filed(self) -> None:
+        rule = self.rule("read")
+        database = self.root / "version-twelve.sqlite"
+        issue = self.root / "decision.md"
+        with closing(sqlite3.connect(database)) as connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number <= 12:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (12)")
+            _ = connection.execute("INSERT INTO held_findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                   ("legacy", rule, self.sources[0], 2, "change", "rename", "old", "new", self.blob(rule),
+                                    "read-1", "filed", str(issue), "created", "updated", "", ""))
+            connection.commit()
+        with style_ledger.Ledger(self.repo, database) as ledger:
+            finding, = ledger.proposal_findings(issue)
+            self.assertEqual(finding.state, style_ledger.Filed(issue))
+            self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn")), ())
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (13,))
+            self.assertEqual(connection.execute("SELECT withdrawn_by FROM held_findings").fetchone(), (0,))
+
     def test_decision_migration_eleven_preserves_version_ten_findings_and_tickets(self) -> None:
         rule = self.rule("read")
         database = self.root / "version-ten.sqlite"
@@ -734,7 +756,7 @@ class StyleLedgerTests(unittest.TestCase):
                 rows = cast(list[tuple[str, str, str]], connection.execute(
                     "SELECT path,declared_scope,verdict_detail FROM judgments ORDER BY id").fetchall())
                 version = cast(tuple[int], connection.execute("SELECT version FROM schema_version").fetchone())
-            self.assertEqual(version, (12,))
+            self.assertEqual(version, (13,))
             self.assertEqual(rows, [(path, "rule", "original detail") for path in self.sources[:2]])
             self.write(self.sources[1], "pub fn sibling_changed() {}\n")
             ledger.set_tip(self.commit("Change sibling after migration"))
@@ -971,6 +993,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE judgments DROP COLUMN declared_scope")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN build_ticket")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN moved_from")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN withdrawn_by")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
             _ = connection.execute("UPDATE schema_version SET version=8")
@@ -1518,7 +1541,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(12,)])
+        self.assertEqual(versions, [(13,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -2952,7 +2975,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(12,)])
+        self.assertEqual(versions, [(13,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -3210,7 +3233,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(12,)])
+        self.assertEqual(versions, [(13,)])
 
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
@@ -3274,6 +3297,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE judgments DROP COLUMN declared_scope")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN build_ticket")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN moved_from")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN withdrawn_by")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
             _ = connection.execute("UPDATE schema_version SET version=6")
