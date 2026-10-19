@@ -19,14 +19,25 @@ with three actions: `plan`, `apply` and `verify`.
 
 apply works under the production lock in `unit_move`, which `rename.py` also takes. It saves the
 journal `rename_unit.json` before changing anything, and checks the showrunner checkout before
-each step. Every step except the first and the last also checks that the unit is stopped. The
+each step. The preflight, each step's checks, and every step except stop, relaunch and verify
+(`Step.locked`) run under the merge lock, `merge_checkpoint.merge_lock(checkout, slug)`: an flock
+on `<git common dir>/showrunner-merge-<slug>.lock`, which `merge_checkpoint.py` holds for a
+whole gate run, unit checkpoints and `--from-child` hand-offs alike. A rename that finds a gate
+running prints `merge lock: waiting — …` and waits, and a gate waits for the step. The steps that
+wait do not hold the lock, so no gate waits behind a stop. Every step except the first and the last also checks that the unit is stopped. The
 steps:
 
 1. **Stop.** A running unit is not a refusal: plan lists this step, and apply stops the unit
    through `shutdown.py down --only <session>`. The unit's id is `SHOWRUNNER_UNIT_ID` in the
    environment of its Claude process in its herdr pane, set at launch, and a live process cannot
-   change it, so every rename is a relaunch. While the stop settles, apply exits 2 and a rerun
-   resumes. Refused up front: the new id already running, a Claude that cannot be read, and
+   change it, so every rename is a relaunch. apply then waits for the stop (`_await_stopped`):
+   it reads the unit's shutdown record every `POLL_SECONDS` (1 s) and prints `stop: waiting —
+   <unit> is <progress>` on each change. It goes on when the record reads stopped, and refuses when
+   the record asks for a restart, reads something else, or was never written (`RECORD_WAIT_SECONDS`,
+   120 s). It exits 2 only past `STOP_WAIT_SECONDS` (`RENAME_UNIT_STOP_WAIT`, default 3600), and a
+   rerun resumes there. Before 2026-10-18 apply always exited 2 here and nothing reran it, so a
+   rename stopped its unit and stayed at step 0 until someone ran it again (user: "it is
+   unacceptable that it require my intervention"). Refused up front: the new id already running, a Claude that cannot be read, and
    processes inside the worktree of a unit with no Claude to stop.
 2. **Merge.** `origin/<merge branch>` is merged into the unit in the old worktree. While the unit's
    work is in progress (`_in_progress`: an open phase in its run record, or `git status --porcelain`
@@ -64,7 +75,9 @@ steps:
      there and not in the path its thread started in.
 
    `restart._unit_argv` still reads the plan from the Units row.
-10. **Relaunch.** `shutdown.py restart --only <session> --here` brings the unit back. The rename
+10. **Relaunch.** `shutdown.py restart --only <session> --here` brings the unit back. apply then
+    waits for the new id to carry a live Claude mark (`_await_live`, `LIVE_WAIT_SECONDS`,
+    `RENAME_UNIT_LIVE_WAIT`, default 180), so verify does not run before the unit is up. The rename
     claim (`rename_state.rename_claim`) refuses add_unit for both ids until step 9 is done.
 11. **Verify** (below).
 

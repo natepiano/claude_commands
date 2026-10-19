@@ -9,8 +9,10 @@ the unit through the shutdown path, merges the merge branch into the unit, moves
 worktree (unit_move), commits `chore(<slug>): rename unit <old> to <new>` on the merge branch, which
 merge_branch_history follows, merges that commit into the unit, moves the unit's state, retires the
 old branch, points the unit's shutdown record at the new names, relaunches the unit from it and
-verifies. A stop takes a while: apply exits 2 while the unit is stopping, and a rerun resumes. plan
-writes nothing: it runs every refusal check and prints the steps with their old and new values.
+verifies. One apply does all of it: it waits for the stop (STOP_WAIT_SECONDS) and for the relaunched
+unit to come up live (LIVE_WAIT_SECONDS), and exits 2 only when the stop outlasts its wait; a rerun
+then resumes. The steps that write git run under the merge lock (merge_checkpoint.merge_lock), so they
+wait for a merge gate that is running, and a gate waits for them. plan writes nothing: it runs every refusal check and prints the steps with their old and new values.
 verify reruns the last step on a finished rename.
 """
 from __future__ import annotations
@@ -21,7 +23,9 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
 import add_unit  # noqa: E402
 import issues  # noqa: E402
+import merge_checkpoint  # noqa: E402
 import phase_table  # noqa: E402
 import production_units  # noqa: E402
 import proposal_issue  # noqa: E402
@@ -66,10 +71,16 @@ PROGRESS = ("merged", "doc_commit", "unit_tip", "account", "session_id", "kept")
 SHUTDOWN = Path(os.environ.get("RENAME_UNIT_SHUTDOWN") or Path(__file__).resolve().parent.parent / "shutdown/shutdown.py")
 STOPPED = frozenset({"stopped", "already gone", "process identity lost"})
 STOPPING = frozenset({"waiting", "reaping", "ready", "stopping", "held by usage limit", "passive worker ready"})
+# How long apply waits for the unit to stop, and for the relaunched unit to come up live.
+STOP_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_STOP_WAIT") or 3600)
+LIVE_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_LIVE_WAIT") or 180)
+# A stop request that has written no shutdown record by then has failed.
+RECORD_WAIT_SECONDS = 120.0
+POLL_SECONDS = 1.0
 
 
 class RenameWaiting(RenameRefused):
-    """The unit is still stopping: a rerun of apply resumes once it has stopped."""
+    """The unit is still stopping after STOP_WAIT_SECONDS: a rerun of apply resumes once it has stopped."""
 
 
 @dataclass
@@ -427,35 +438,55 @@ def _unit_records(rename: UnitRename) -> list[SessionShutdown]:
 
 
 def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
-    """Stop the unit through the shutdown path, so its record carries the relaunch.
+    """Stop the unit through the shutdown path, so its record carries the relaunch, and wait for it.
 
     A live process cannot change its env mark and the director's context holds the old paths, so a
     rename of a running unit is always a relaunch.
     """
-    records = _unit_records(rename)
-    if len(records) > 1:
-        raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
-    if records:
-        saved = records[0]
-        progress = saved["progress"]["kind"]
-        if saved["then"] == "restart":
+    if not _unit_records(rename):
+        try:
+            found = unit_lookup.marked_unit(rename.slug, rename.old)
+        except OSError as error:
+            raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
+        if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
+            return
+        if isinstance(found.claude, unit_lookup.ClaudeUnknown):
+            raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
+        _shutdown("down", "--only", found.claude.session_id)
+    saved = _await_stopped(rename)
+    rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
+
+
+def _await_stopped(rename: UnitRename) -> SessionShutdown:
+    """The unit's shutdown record once it reads stopped. The stop is waited for here, so one apply
+    does the whole rename (user, 2026-10-18)."""
+    started = time.monotonic()
+    shown = ""
+    while True:
+        records = _unit_records(rename)
+        if len(records) > 1:
+            raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
+        waited = time.monotonic() - started
+        if not records and waited >= RECORD_WAIT_SECONDS:
+            raise RenameRefused(f"the shutdown path wrote no record for {rename.old}; settle the stop first")
+        progress = records[0]["progress"]["kind"] if records else "stopping"
+        if records and records[0]["then"] == "restart":
             raise RenameRefused(f"a shutdown will restart {rename.old}; rename once it is back")
-        if progress in STOPPING:
-            raise RenameWaiting(f"{rename.old} is stopping ({progress}); rerun apply once it has stopped")
-        if progress not in STOPPED:
+        if progress in STOPPED:
+            return records[0]
+        if progress not in STOPPING:
             raise RenameRefused(f"{rename.old}'s shutdown record reads {progress}; settle it first")
-        rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
-        return
-    try:
-        found = unit_lookup.marked_unit(rename.slug, rename.old)
-    except OSError as error:
-        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
-    if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
-        return
-    if isinstance(found.claude, unit_lookup.ClaudeUnknown):
-        raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
-    _shutdown("down", "--only", found.claude.session_id)
-    raise RenameWaiting(f"{rename.old} is stopping; rerun apply once it has stopped")
+        if waited >= STOP_WAIT_SECONDS:
+            raise RenameWaiting(f"{rename.old} is still {progress} after {_minutes(STOP_WAIT_SECONDS)}; "
+                                + "rerun apply once it has stopped")
+        if progress != shown:
+            print(f"stop: waiting — {rename.old} is {progress}", flush=True)
+            shown = progress
+        time.sleep(POLL_SECONDS)
+
+
+def _minutes(seconds: float) -> str:
+    return f"{round(seconds / 60)} min" if seconds >= 60 else f"{round(seconds)} s"
 
 
 def _moved(path: str, old: str, new: str) -> str:
@@ -514,6 +545,18 @@ def _restart_record(rename: UnitRename, _save: Callable[[], None]) -> None:
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
     if rename.session_id:
         _shutdown("restart", "--only", rename.session_id)
+        _await_live(rename)
+
+
+def _await_live(rename: UnitRename) -> None:
+    """Wait for the relaunched unit to carry a live Claude mark, so verify does not run before it is up.
+    Past LIVE_WAIT_SECONDS verify reports it as not running."""
+    deadline = time.monotonic() + LIVE_WAIT_SECONDS
+    while True:
+        found = unit_lookup.marked_units(rename.slug).get(rename.new)
+        if (found is not None and isinstance(found.claude, unit_lookup.LiveClaude)) or time.monotonic() >= deadline:
+            return
+        time.sleep(POLL_SECONDS)
 
 
 def _unit_proposals(rename: UnitRename, unit: str) -> list[issues.Issue]:
@@ -637,6 +680,9 @@ class Step(NamedTuple):
     # Whether the unit must be stopped before the step runs: the stop step stops it, and verify
     # runs after the relaunch.
     stopped: bool = True
+    # Whether the step runs under the merge lock. The steps that wait (stop, relaunch) and verify
+    # do not, so a merge gate is never held behind them.
+    locked: bool = True
 
 
 def _describe_stop(r: UnitRename) -> str:
@@ -686,7 +732,7 @@ def _describe_verify(r: UnitRename) -> str:
 
 
 STEPS = (
-    Step(_stop, _describe_stop, stopped=False),
+    Step(_stop, _describe_stop, stopped=False, locked=False),
     Step(_merge, _describe_merge),
     Step(_move_git, _describe_git),
     Step(_move_claude, _describe_claude),
@@ -695,8 +741,8 @@ STEPS = (
     Step(_move_state, _describe_state),
     Step(_retire, _describe_retire),
     Step(_restart_record, _describe_record),
-    Step(_relaunch, _describe_relaunch),
-    Step(_verify, _describe_verify, stopped=False),
+    Step(_relaunch, _describe_relaunch, locked=False),
+    Step(_verify, _describe_verify, stopped=False, locked=False),
 )
 
 
@@ -762,18 +808,29 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
         rename = _resumed(path, old, new)
         if rename is None:
             rename = _build(slug, old, new, scratch)
-            _preflight(rename)
+            with _merge_lock(rename):
+                _preflight(rename)
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, rename)
         for number in range(rename.step + 1, len(STEPS) + 1):
-            # Revalidated before every step: a resumed run may come back to a changed machine.
-            _check_checkout(rename)
-            if STEPS[number - 1].stopped:
-                _check_stopped(rename)
-            STEPS[number - 1].run(rename, lambda: _save(path, rename))
+            step = STEPS[number - 1]
+            # Revalidated before every step: a resumed run may come back to a changed machine. A merge
+            # gate leaves the checkout mid-merge while it runs, so the check waits for it too.
+            with _merge_lock(rename):
+                _check_checkout(rename)
+                if step.stopped:
+                    _check_stopped(rename)
+                if step.locked:
+                    step.run(rename, lambda: _save(path, rename))
+            if not step.locked:
+                step.run(rename, lambda: _save(path, rename))
             rename.step = number
             _save(path, rename)
     return rename
+
+
+def _merge_lock(rename: UnitRename) -> AbstractContextManager[None]:
+    return merge_checkpoint.merge_lock(Path(rename.checkout), rename.slug)
 
 
 def verify(slug: str, old: str, new: str) -> UnitRename:
