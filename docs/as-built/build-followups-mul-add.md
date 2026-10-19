@@ -1,10 +1,10 @@
-# Fused multiply-add: lint rewrites and Rust edit hooks
+# Fused multiply-add: lint rewrite
 
 ## What it is
 
-`verify.sh lint` applies Clippy's automatic multiply-add fixes before its final judgment. It runs up to five rewrite rounds to reach inner sums and more workspace crates. A Rust PostToolUse hook also tells Claude and Codex about likely multiply-adds on lines they write. The hook gives a conditional correction because it cannot prove every type. The latest hana measurement passes both limits. The edit hook stays installed while the showrunner decides on its proposed retirement.
+`verify.sh lint` applies Clippy's automatic multiply-add fixes before its final judgment. It runs up to five rewrite rounds to reach inner sums and more workspace crates. This lint rewrite is the only multiply-add correction mechanism. No Claude or Codex edit runs a multiply-add hook.
 
-The hook shares its edit parser, Rust scanner and Cargo lint reader with the function-length hook. The nightly Rust release check enables FMA for its Linux clippy build. Buildlog records a Codex worker's own thread as its session.
+The nightly Rust release check enables FMA for its Linux clippy build. Buildlog records a Codex worker's own thread as its session. The latest hana measurement passes both limits.
 
 ## How it works
 
@@ -15,78 +15,15 @@ The hook shares its edit parser, Rust scanner and Cargo lint reader with the fun
 | `scripts/delegate/verify.sh` | Runs the lint judgments, rewrite rounds, formatting and cache rekey. |
 | `scripts/lint/invoke.sh` | Runs and logs Cargo steps. Keeps JSON stdout separate from stderr. |
 | `scripts/lint/apply_mul_add.py` | Applies only Clippy's automatic `suboptimal_flops` suggestions. |
-| `scripts/hooks/mul_add_lib.py` | Finds likely multiply-adds. Applies evidence rules, lint scope and exemptions. Builds correction text. |
-| `scripts/hooks/fn_length_lib.py` | Shares the edit parser, scanner, lint reader and target-root check. Also checks function length. |
-| `scripts/hooks/post-tool-use-mul-add.py` | Scans written lines, collects findings and returns one block. |
-| `scripts/hooks/post-tool-use-fn-length.py` | Uses the same parser. Checks whole files against their function-length limits. |
-| `scripts/hooks/codex_hooks.py` | Installs and trusts the Codex `apply_patch` handlers. |
-| `settings.json` | Runs basedpyright, fn-length and mul_add in Claude's `Edit\|MultiEdit\|Write` group. |
 | `scripts/buildlog/rust_release.py` | Sets the release trial's Linux clippy FMA flags. |
 | `scripts/buildlog/record.py` | Supplies worker, delegate session and agent session for step and call records. |
 | `scripts/delegate/test_verify_lint_scope.py` | Uses fake Cargo to check lint scope, rounds, counts, cache keys and output streams. |
 | `scripts/lint/test_apply_mul_add.py` | Checks lint selection, byte edits, duplicates, overlaps and file bounds. |
-| `scripts/hooks/test_mul_add.py`, `test_fn_length.py`, `test_codex_hooks.py` | Check payloads, scope, exemptions, errors, scaling and Codex registration with synthetic inputs. |
 | `scripts/buildlog/test_rust_release.py`, `test_record.py` | Check release flags and agent-session precedence with isolated inputs. |
 
-The public hook entry points are:
+### Edit checks
 
-```python
-applied_rust_edits(raw: str) -> AppliedRustEdits | IgnoredEdit
-applied_patch_rust_files(patch: str) -> tuple[str, ...]
-written_lines(source: str, replacements: tuple[Replacement, ...]) -> frozenset[int]
-read_clippy_lint(rs_file: os.PathLike[str] | str, lint: str,
-                group: str) -> ConfiguredClippyLint | UnavailableClippyLint
-suboptimal_flops_scope(rs_file: os.PathLike[str] | str) -> SuboptimalFlopsLintScope
-mul_add_findings(rs_file: os.PathLike[str] | str,
-                 written: frozenset[int] | None = None
-                 ) -> tuple[SuboptimalFlopsLintScope, list[MulAddFinding]]
-long_functions(rs_file: os.PathLike[str] | str
-               ) -> tuple[TooManyLinesLintScope, list[FunctionLength]]
-```
-
-`AppliedRustEdits(agent, tool, cwd, files, replacements)` holds the Rust files from one supported edit in payload order. `Replacement` is an `(old, new)` text pair. Each file has its own tuple of pairs. `IgnoredEdit` means no supported Rust edit needs a scan. `written_lines` returns 1-based line numbers. At the detector boundary, `written=None` selects all lines. The scan uses `SourceLineSelection.ALL` for that state.
-
-`ConfiguredClippyLint(level, package_dir)` holds the package's lint level. `ClippyLintLevel` has `ALLOW`, `EXPECT`, `WARN`, `DENY`, `FORBID` and `UNSET`. `UnavailableClippyLint` has `NO_PACKAGE` and `UNREADABLE`. `SuboptimalFlopsLintScope.state` uses `ScopeState`: `ENABLED`, `DISABLED`, `EXEMPT` or `NO_PACKAGE`. Only `ENABLED` scans expressions. `EXEMPT` covers a possible no_std target or an uncertain crate root.
-
-`MulAddFinding(line, a, b, c, expr, rewrite)` holds the source line, product operands, addend, expression text and correction. Its properties are read-only. `TooManyLinesLintScope(enabled, threshold)` holds the function-length limit. `FunctionLength(name, line, lines, exempt)` holds one measured function. `RustToken(text, start, end)` keeps source offsets. These scanner and finding classes use `__slots__` to limit import cost on each edit.
-
-### Edit → scan → correction
-
-1. **Read the edit.** Both hook entries return before importing the parser when the raw text has neither `.rs` nor a Unicode escape. Claude `Edit`, `MultiEdit` and `Write` supply `tool_input.file_path` and `cwd`. Codex `apply_patch` supplies patch text in `tool_input.command`.
-2. **Keep replacements.** An `Edit` supplies one `(old, new)` pair. `MultiEdit` supplies one per entry. `Write` supplies `("", content)`. A patch supplies one pair per added file or update chunk. `*** Move to:` carries the pairs to the new path. Delete headers add no file. Rust paths are deduplicated in payload order.
-3. **Select written lines.** The hook resolves paths against `realpath(cwd)` and reads each existing file. It skips files with no `*`. It also skips files with neither `+` nor `-`. `written_lines` removes the common leading and trailing lines from each pair. It maps the remaining nonempty new lines to every occurrence of the new text in the file. If the new text is absent, it selects lines whose stripped text occurs in the new text but not the old text.
-4. **Scan.** `mul_add_findings` scans function bodies with comments and strings blanked. It keeps a finding if any line in its source span was written. The function-length hook checks the whole file. Its rules are in [the function-length hook](build-followups-fn-length-hook.md).
-5. **Return one block per hook.** Each hook scans all files before it appends any block record. Its JSON has `decision: "block"`, `continue: true`, `reason`, `systemMessage` and `hookSpecificOutput.additionalContext`. The edit stays on disk.
-
-The multiply-add description is `<file>:<line>: if <expr> is f32 or f64 arithmetic, write <rewrite> (clippy::suboptimal_flops)`. The reason joins descriptions with `; ` and ends with `. Leave integer and vector arithmetic as it is. The edit was applied.` Additional context joins the descriptions with newlines. The system message reports the number of possible expressions and the affected files. The function-length reason names the function, count and limit, then says `split it now`.
-
-The multiply-add log is `blocks.jsonl` under `MUL_ADD_HOOK_STATE`, else `~/.local/state/mul-add-hook`. It writes one record per expression: `at`, `agent`, `tool`, `cwd`, absolute resolved `file`, `line`, `expression`. Each record has its own UTC time. Records from one response share no ID. The function-length log uses `FN_LENGTH_HOOK_STATE`, else `~/.local/state/fn-length-hook`. It writes one record per affected file with `threshold` and `functions: [{name, line, lines}]`. Append errors do not change the block.
-
-### Detector evidence and exemptions
-
-`ArithmeticTokens` finds product chains next to binary `+` or `-`, or on the whole right side of `+=` or `-=`. The last operator in a chain of `*`, `/` and `%` must be `*`. Parentheses around a product do not hide it. One sum gives one finding. When both sides are products, the left product supplies the receiver. Calls, paths, indexes, casts and macro invocation arguments can occur in a candidate. The scanner skips `macro_rules!` definitions.
-
-The detector checks evidence from the whole sum:
-
-- Float literals and `_FLOAT_EVIDENCE` allow sums that also have integer evidence.
-- Integer evidence skips a sum with no float evidence. It includes integer terms or factors, integer casts, `.len()`, `.count()` and a sum used as a whole index. Integer literals inside indexes, call arguments and tuple fields do not count as terms.
-- `VECTOR` matches and bare names with non-float or vector evidence skip a sum. A dotted vector match followed by `()` and a scalar member does not count as vector evidence. `_SCALAR_RESULT` names `.x`, `.y`, `.z`, `.w`, `.width`, `.height`, `.depth`, `.length`, `.0` and `.1`.
-
-`BareNameEvidence` uses the last `let` before the sum in the same function. This includes an unannotated `let`. With no local binding, it uses the parameter annotation or a file `const` or `static` typed other than `f32` or `f64`. A nested function's bindings do not affect its parent. `NameArithmeticEvidence.UNKNOWN` and `FLOAT` disprove nothing. `NONFLOAT` and `VECTOR` skip the sum. The hook needs no same-file field proof. Pattern, destructuring and let-else exclusions do not apply.
-
-Const items, `const fn`, const blocks and static initializers are exempt. So are sums used as `.sqrt()` receivers and items with `allow` or `expect` for the lint or `nursery`. These attributes also apply through enclosing items, file attributes and `cfg_attr`. A `'static` lifetime gives no exemption. An unsuffixed literal receiver swaps with its other product operand. Two unsuffixed product literals give no finding.
-
-The correction uses Clippy's form. For example, `c - a * b` gives `a.mul_add(-b, c)`. `a * b - c` gives `a.mul_add(b, -c)`. `x += a * b` gives `x = a.mul_add(b, x)`. A product chain gives `(a * b).mul_add(c, d)`. `_receiver` and `_negated` add parentheses where needed. A generic call keeps its whole callee. `_compact` removes comments and reduces whitespace outside literals to one space in `expr` and `rewrite`.
-
-### Scope and Codex registration
-
-`read_clippy_lint` finds the nearest package manifest. It follows `lints.workspace = true`, including an explicit `package.workspace` path. An explicit `suboptimal_flops` entry wins over `nursery`. `too_many_lines` wins over `pedantic`. String levels and `{level = …}` entries are accepted. Warn, deny and forbid enable checking. Missing or unreadable configuration passes the edit. The function-length threshold comes from an ancestor `clippy.toml` or `.clippy.toml`. Its default is 100. An invalid or negative threshold disables that check.
-
-For multiply-add, `target_may_be_no_std` checks the edited target's root. A std `src/main.rs` is checked beside a no_std library. Binary, test, example and bench targets use their own roots. Other library modules inspect available `lib.rs` and `main.rs` roots. They pass if either can be no_std. A missing root, `build.rs` or a path outside supported target folders passes as exempt. This exemption applies only to multiply-add.
-
-`codex_hooks.py install|check` manages three `CodexHook` handlers for `apply_patch`. The fn-length and mul_add handlers use `PostToolUse` with a 10-second timeout. The berth handler uses `PreToolUse` with a 30-second timeout. Command strings match the Claude registrations where present. `LocatedHook` holds the handler key, hash, trust state and enabled state. `MissingHook` means the handler is absent.
-
-`install` adds missing groups to `CODEX_HOME/hooks.json`, else `~/.codex/hooks.json`, by atomic replacement. It keeps existing indexes and trust. Through `codex app-server`, it calls `initialize`, `hooks/list` and `config/batchWrite` to trust each untrusted or modified handler. It then lists again. A trusted enabled duplicate wins. `check` lists without writing. Both return 0 only when all three handlers are trusted and enabled. Other results name the state or file/RPC error. The app-server has a 30-second deadline. Its child stops on exit. Binary and home overrides resolve before a directory change.
+Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-length only. Codex `apply_patch` runs fn-length after the edit and berth before it. See [the function-length hook](build-followups-fn-length-hook.md#function-length-hook) for the edit parser, Rust scanner, Cargo lint reader and Codex installation rules.
 
 ### Runtime flags and attribution
 
@@ -128,16 +65,12 @@ The JSON route selects one lint without changing lint levels. A `cargo clippy --
 
 ## Invariants
 
-- Keep `clippy::suboptimal_flops` enabled in Cargo. The edit hook honors local exemptions and gives a conditional correction.
-- Only written expression lines trigger the multiply-add hook. The function-length hook still checks whole files.
-- Unknown payloads, missing or unreadable configuration and internal errors pass the edit. An unbalanced multiply-add scan returns at most one `mul_add hook error: <type>: <message>` system message and exit 0. The function-length checker skips unclosed bodies but keeps complete earlier functions.
-- One parser and scanner serve both agents. Scan every affected file before logging any block. A later scan error must leave no records for a block that was not returned.
-- A block record proves a finding, not delivery. The append occurs before the response. A missing record does not prove the hook stayed silent because logging can fail.
+- Keep `clippy::suboptimal_flops` enabled in Cargo.
 - Apply only the target lint's `MachineApplicable` spans inside the workspace root. Do not apply `MaybeIncorrect` macro-body suggestions.
 - Stop after at most five replays. Keep earlier edits after a later failure. After any successful round, format and rekey before the one final judgment.
 - Keep JSON stdout separate. Complete both logs before returning. Keep the command's status even if `tee` fails. Preserve Bash 3.2 support.
 - Save count lines once per applied round, in order. Measurement uses the last judging step per call as its verdict.
-- Tests use temporary hook state, Codex home and buildlog state. They use stubs for Cargo and Codex. They never inspect a live hana tree. Python interfaces have no `Any` or file-level type ignores.
+- Tests use temporary buildlog state and Cargo stubs. They never inspect a live hana tree. Python interfaces have no `Any` or file-level type ignores.
 
 ## Calibration / gotchas
 
@@ -149,21 +82,16 @@ The fused slice improved 74.6× for f32 and 38.9× for f64 with v3. A dependent 
 
 Count FMA references per function outside `compiler_builtins`. Its runtime implementation makes a whole-binary instruction count nonzero even in a default build. GOT loads followed by register-indirect calls can evade a name-only count. Debug builds can call `<f32>::mul_add` out of line. Inspect the callee too. Hana debug binaries changed from seven `fmaf`/`fma` references in four functions and no other FMA instructions to no such references and 80 FMA instructions in ten functions.
 
-### Detector and rewrite limits
+### Rewrite limits
 
-- **Line selection.** Lines end at `"\n"`. Patch input first converts CRLF to LF. `splitlines()` would also split Unicode separators inside Rust strings. Common lines between two changed parts of one replacement still count as written. The finding's source span supplies its last line because `expr` has no newlines.
-- **Evidence limits.** The detector cannot infer types across files or expand macros. It can report vectors, points, colors, references and integers that have no evidence to exclude them. A name's last `let` wins anywhere in its function. Block scopes are not modelled. `.min(`, `.max(`, `.left`, `.size()` and generic type tokens can exclude scalar sums.
-- **Exempt roots.** A copied file without `src/lib.rs` or `main.rs` can be exempt. `#![cfg_attr(c, no_std, allow(x))]` is not recognized as no_std when it is not the last argument.
-- **Hook coverage.** Shell edits bypass the edit hooks. Formatting can grow a line after its edit. Clippy's rewrite loop provides a second chance when it runs.
 - **Rounds.** Overlapping spans need later diagnostics on the changed tree. The five-round cap can leave work for the final judgment. A failed replay adds no count line. An applier failure can leave edits in files it wrote before the failure.
 - **Replay status.** A complete replay can exit 101 under `-D warnings`. The applier still requires `build-finished`. A missing count log cannot distinguish no fixes from a failed save.
 - **Log order.** Two `tee -a` writers can insert a JSON chunk inside a stderr line. Spooling stdout prevents this. Logs keep complete lines but do not keep the time order between streams. Named descriptor redirections and waiting on process-substitution PIDs do not work on Bash 3.2.
 - **Measurement.** Read a call's full sequence before selecting its final judgment. The index can lag the log after a process exits. Do not measure a selected call until its completion record exists. Rank remaining causes by failed verdicts because warnings can repeat the same expression.
-- **Cost and scaling.** Non-Rust edits avoid scanner imports. `test_many_findings_scan_scales_with_file_length` takes the minimum of five wall-time samples for 200 and 800 finding lines. Each sample checks the count and last line. The larger scan must take less than 10× the smaller. Minima reduce scheduling noise.
 
 ## Why
 
-FMA avoids fallback calls and permits vectorization. `x86-64-v3` enables AVX2 and FMA without selecting one CPU model. Explicit `mul_add` makes fused rounding visible. The edit hook gives an early conditional correction. The lint loop uses Clippy's own automatic suggestions and checks the final tree. Shared parsing keeps Claude and Codex aligned. Lazy imports and small scanner classes limit per-edit cost. Separate count logs keep rewrite evidence when buildlog drops a successful step's output.
+FMA avoids fallback calls and permits vectorization. `x86-64-v3` enables AVX2 and FMA without selecting one CPU model. Explicit `mul_add` makes fused rounding visible. The lint loop uses Clippy's own automatic suggestions and checks the final tree. Separate count logs keep rewrite evidence when buildlog drops a successful step's output.
 
 ## Measured outcome
 
@@ -179,7 +107,7 @@ FMA avoids fallback calls and permits vectorization. `x86-64-v3` enables AVX2 an
 | JSON replay cost and result | **26 replays in 12 calls; 37 recorded fixes; 2,285.385 s added clippy time** | **3 calls** ended with a passing clippy verdict; those calls contain **6 replays** | `rewrite_steps`, `rewrite_calls`, `rewrite_fixes`, `rewrite_clippy_seconds`, `rewrite_passing_calls`, `rewrite_passing_verdicts` |
 | Applied rounds and cap stops | **14 rounds: 10 calls with one round; 2 calls with two rounds; 0 cap stops; 0 unknown round counts** | All 12 count logs are available | `rewrite_rounds`, `rounds_per_call`, `cap_stops`, `rewrite_missing_count_logs` |
 
-Both limits **PASS**. No final failed verdict contains the target lint. Thus, no remaining target cause has a failed verdict to rank (`commits.json`: empty `causes` and `diagnostic_groups`; `remaining_warnings` is empty). The other 42 failed verdicts do not contain this lint. There are no sole-cause call times or follow-up intervals to sample. The call-wall median, interval median and interval p75 are unavailable. Their sums are zero. These results support a proposal to retire the edit hook. The edit hook stays installed. The showrunner must decide on the proposal.
+Both limits **PASS**. No final failed verdict contains the target lint. Thus, no remaining target cause has a failed verdict to rank (`commits.json`: empty `causes` and `diagnostic_groups`; `remaining_warnings` is empty). The other 42 failed verdicts do not contain this lint. There are no sole-cause call times or follow-up intervals to sample. The call-wall median, interval median and interval p75 are unavailable. Their sums are zero. The re-measure passes both limits, so the edit hook is retired.
 
 The count logs give these applied rounds and fixes. The total sums each saved count line once. A fix can be one stage of a chained expression's rewrite.
 
@@ -201,7 +129,7 @@ The count logs give these applied rounds and fixes. The total sums each saved co
 
 The last call's first judgment started at **2026-10-18 16:42:39.178 EDT (2026-10-18T20:42:39.178Z)**. Its final judgment started at **2026-10-18 17:10:09.085 EDT (2026-10-18T21:10:09.085Z)**. The final judgment failed on other errors. It had no target warning. The cohort includes that final judgment even though it started after the window end.
 
-The final pipeline completed after every selected call had a completion record. **`audit.json` reports PASS**. It agrees on the selected verdict IDs, both limit verdicts, cost sums, rounds, fixes, replay times and cap stops. The synthetic checks report **PASS**. All four copied or new Python files report **0 errors, 0 warnings, 0 notes** under basedpyright.
+The final pipeline completed after every selected call had a completion record. **`audit.json` reports PASS**. It agrees on the selected verdict IDs, both limit verdicts, cost sums, rounds, fixes, replay times and cap stops. The synthetic checks report **PASS**. The measurement scripts report **0 errors, 0 warnings, 0 notes** under basedpyright.
 
 The source scripts and JSON are in `~/.local/state/mul-add-hook/lint-rounds/`. They use the per-call verdict rule below. A call enters the cohort when its first judging clippy step starts inside the window. The scripts read all steps in that call, including steps after the window ends. They use its last judging step as the verdict. JSON replay steps are not verdicts. A step with no call ID stands alone. Both the measurement and the audit reject a selected call with no completion record.
 

@@ -12,7 +12,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import cast
+from enum import Enum
+from typing import NamedTuple, cast
+
+
+RETIRED_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-mul-add.py"'
 
 
 class CodexHook:
@@ -36,7 +40,6 @@ class CodexHook:
 
 HOOKS: tuple[CodexHook, ...] = (
     CodexHook("fn-length", "post-tool-use-fn-length.py"),
-    CodexHook("mul_add", "post-tool-use-mul-add.py"),
     # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
     CodexHook("berth", "pre-tool-use-berth.py", "PreToolUse", 30),
 )
@@ -66,6 +69,28 @@ class MissingHook:
 
     def __init__(self, hook: CodexHook) -> None:
         self.hook: CodexHook = hook
+
+
+class AllToolsMatcher(Enum):
+    ALL_TOOLS = "all_tools"
+
+
+class DefaultHookTimeout(Enum):
+    DEFAULT = "default"
+
+
+class AbsentHandlerCommand(Enum):
+    NO_COMMAND = "no_command"
+
+
+class HandlerTrustIdentity(NamedTuple):
+    """The handler contents and hash to which the user's trust applies."""
+
+    event: str
+    matcher: str | AllToolsMatcher
+    command: str | AbsentHandlerCommand
+    timeout: int | float | DefaultHookTimeout
+    current_hash: str
 
 
 def _object(value: object, description: str) -> dict[str, object]:
@@ -106,7 +131,44 @@ def _matching_group(group: object, hook: CodexHook) -> bool:
     )
 
 
-def _install_file(path: str) -> None:
+def _is_retired_handler(handler: object) -> bool:
+    if not isinstance(handler, dict):
+        return False
+    entry = cast(dict[str, object], handler)
+    return entry.get("type") == "command" and entry.get("command") == RETIRED_COMMAND
+
+
+def _remove_retired_handlers(hooks: dict[str, object], path: str) -> bool:
+    changed = False
+    needs_manual_removal = False
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            continue
+        for group in cast(list[object], groups):
+            if not isinstance(group, dict):
+                continue
+            fields = cast(dict[str, object], group)
+            handlers = fields.get("hooks")
+            if not isinstance(handlers, list):
+                continue
+            entries = cast(list[object], handlers)
+            kept = [handler for handler in entries if not _is_retired_handler(handler)]
+            changed |= len(kept) != len(entries)
+            for handler in kept:
+                if not isinstance(handler, dict):
+                    continue
+                entry = cast(dict[str, object], handler)
+                command = entry.get("command")
+                if entry.get("type") == "command" and isinstance(command, str) and "post-tool-use-mul-add.py" in command:
+                    needs_manual_removal = True
+            # Keep groups in place so other groups keep their trust keys.
+            fields["hooks"] = kept
+    if needs_manual_removal:
+        print(f"{path}: remove the remaining retired script handler by hand", file=sys.stderr)
+    return changed
+
+
+def _install_file(path: str, binary: str, codex_home: str) -> list[HandlerTrustIdentity]:
     document: dict[str, object]
     if os.path.exists(path):
         try:
@@ -117,7 +179,8 @@ def _install_file(path: str) -> None:
     else:
         document = {"hooks": {}}
     hooks = _object(document.get("hooks"), f"{path} hooks")
-    missing = 0
+    removed = _remove_retired_handlers(hooks, path)
+    changed = removed
     for hook in HOOKS:
         groups_value = hooks.setdefault(hook.event, [])
         if not isinstance(groups_value, list):
@@ -125,9 +188,20 @@ def _install_file(path: str) -> None:
         groups = cast(list[object], groups_value)
         if not any(_matching_group(group, hook) for group in groups):
             groups.append({"matcher": "apply_patch", "hooks": [hook.handler()]})
-            missing += 1
-    if not missing:
-        return
+            changed = True
+    if not changed:
+        return []
+    previously_trusted: list[HandlerTrustIdentity] = []
+    if removed:
+        server = AppServer(binary, codex_home)
+        try:
+            _initialize(server)
+            previously_trusted = [
+                _handler_identity(entry) for entry in _listed_hook_entries(server, path)
+                if entry.get("trustStatus") == "trusted" and entry.get("enabled") is True
+            ]
+        finally:
+            server.close()
     destination = os.path.realpath(path) if os.path.islink(path) else path
     directory = os.path.dirname(destination)
     os.makedirs(directory, exist_ok=True)
@@ -140,6 +214,7 @@ def _install_file(path: str) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+    return previously_trusted
 
 
 class AppServer:
@@ -222,41 +297,103 @@ class AppServer:
             return _object(response.get("result"), f"{method} result")
 
 
-def _listed_hooks(server: AppServer, path: str) -> dict[CodexHook, LocatedHook | MissingHook]:
+def _initialize(server: AppServer) -> None:
+    _ = server.call(
+        "initialize",
+        {"clientInfo": {"name": "codex_hooks", "version": "1.0"},
+         "capabilities": {"experimentalApi": True}},
+    )
+
+
+def _listed_hook_entries(server: AppServer, path: str) -> list[dict[str, object]]:
     result = server.call("hooks/list", {"cwds": [_home()]})
     data = result.get("data")
     if not isinstance(data, list):
         raise HookError("invalid hooks/list data")
-    selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in HOOKS}
+    entries: list[dict[str, object]] = []
     for workspace in cast(list[object], data):
         hooks = _object(workspace, "hooks/list workspace").get("hooks")
         if not isinstance(hooks, list):
             raise HookError("invalid hooks/list hooks")
         for candidate in cast(list[object], hooks):
             entry = _object(candidate, "hooks/list entry")
-            hook = next((hook for hook in HOOKS if entry.get("command") == hook.command), None)
-            if (
-                hook is None
-                or entry.get("eventName") != hook.listed_event()
-                or entry.get("matcher") != "apply_patch"
-                or entry.get("handlerType") != "command"
-                or entry.get("timeoutSec") != hook.timeout
-                or entry.get("sourcePath") != path
-            ):
-                continue
+            if entry.get("sourcePath") == path:
+                entries.append(entry)
+    return entries
+
+
+def _handler_identity(entry: dict[str, object]) -> HandlerTrustIdentity:
+    event = entry.get("eventName")
+    matcher = entry.get("matcher")
+    command = entry.get("command")
+    timeout = entry.get("timeoutSec")
+    current_hash = entry.get("currentHash")
+    if (
+        not isinstance(event, str) or not isinstance(current_hash, str)
+        or (command is not None and not isinstance(command, str))
+        or (matcher is not None and not isinstance(matcher, str))
+        or (timeout is not None and (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)))
+    ):
+        raise HookError("incomplete hooks/list entry")
+    return HandlerTrustIdentity(
+        event, AllToolsMatcher.ALL_TOOLS if matcher is None else matcher,
+        AbsentHandlerCommand.NO_COMMAND if command is None else command,
+        DefaultHookTimeout.DEFAULT if timeout is None else timeout, current_hash,
+    )
+
+
+def _trust_handlers(server: AppServer, values: dict[str, dict[str, str]]) -> None:
+    _ = server.call(
+        "config/batchWrite",
+        {"edits": [{"keyPath": "hooks.state", "value": values, "mergeStrategy": "upsert"}],
+         "reloadUserConfig": True},
+    )
+
+
+def _restore_moved_trust(
+    server: AppServer, entries: list[dict[str, object]], previously_trusted: list[HandlerTrustIdentity],
+) -> bool:
+    values: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        if entry.get("trustStatus") != "untrusted":
+            continue
+        identity = _handler_identity(entry)
+        if identity in previously_trusted:
             key = entry.get("key")
-            current_hash = entry.get("currentHash")
-            trust_status = entry.get("trustStatus")
-            enabled = entry.get("enabled")
-            if not isinstance(key, str) or not isinstance(current_hash, str) or not isinstance(trust_status, str) or not isinstance(enabled, bool):
+            if not isinstance(key, str):
                 raise HookError("incomplete hooks/list entry")
-            found = LocatedHook(hook, key, current_hash, trust_status, enabled)
-            previous = selected[hook]
-            if found.trust_status == "trusted" and found.enabled:
+            values[key] = {"trusted_hash": identity.current_hash}
+    if not values:
+        return False
+    _trust_handlers(server, values)
+    return True
+
+
+def _select_hooks(entries: list[dict[str, object]]) -> dict[CodexHook, LocatedHook | MissingHook]:
+    selected: dict[CodexHook, LocatedHook | MissingHook] = {hook: MissingHook(hook) for hook in HOOKS}
+    for entry in entries:
+        hook = next((hook for hook in HOOKS if entry.get("command") == hook.command), None)
+        if (
+            hook is None
+            or entry.get("eventName") != hook.listed_event()
+            or entry.get("matcher") != "apply_patch"
+            or entry.get("handlerType") != "command"
+            or entry.get("timeoutSec") != hook.timeout
+        ):
+            continue
+        key = entry.get("key")
+        current_hash = entry.get("currentHash")
+        trust_status = entry.get("trustStatus")
+        enabled = entry.get("enabled")
+        if not isinstance(key, str) or not isinstance(current_hash, str) or not isinstance(trust_status, str) or not isinstance(enabled, bool):
+            raise HookError("incomplete hooks/list entry")
+        found = LocatedHook(hook, key, current_hash, trust_status, enabled)
+        previous = selected[hook]
+        if found.trust_status == "trusted" and found.enabled:
+            selected[hook] = found
+        elif not (isinstance(previous, LocatedHook) and previous.trust_status == "trusted" and previous.enabled):
+            if isinstance(previous, MissingHook) or (found.trust_status == "trusted" and previous.trust_status != "trusted"):
                 selected[hook] = found
-            elif not (isinstance(previous, LocatedHook) and previous.trust_status == "trusted" and previous.enabled):
-                if isinstance(previous, MissingHook) or (found.trust_status == "trusted" and previous.trust_status != "trusted"):
-                    selected[hook] = found
     return selected
 
 
@@ -270,28 +407,20 @@ def _run(action: str) -> int:
     codex_home = _codex_home()
     binary = _command_binary()
     path = os.path.join(codex_home, "hooks.json")
-    if action == "install":
-        _install_file(path)
+    previously_trusted = _install_file(path, binary, codex_home) if action == "install" else []
     server = AppServer(binary, codex_home)
     try:
-        _ = server.call(
-            "initialize",
-            {"clientInfo": {"name": "codex_hooks", "version": "1.0"},
-             "capabilities": {"experimentalApi": True}},
-        )
-        entries = _listed_hooks(server, path)
+        _initialize(server)
+        listed = _listed_hook_entries(server, path)
+        if previously_trusted and _restore_moved_trust(server, listed, previously_trusted):
+            listed = _listed_hook_entries(server, path)
+        entries = _select_hooks(listed)
         if action == "install":
             for hook in HOOKS:
                 entry = entries[hook]
                 if isinstance(entry, LocatedHook) and entry.trust_status in {"untrusted", "modified"}:
-                    _ = server.call(
-                        "config/batchWrite",
-                        {"edits": [{"keyPath": "hooks.state",
-                                    "value": {entry.key: {"trusted_hash": entry.current_hash}},
-                                    "mergeStrategy": "upsert"}],
-                         "reloadUserConfig": True},
-                    )
-                    entries = _listed_hooks(server, path)
+                    _trust_handlers(server, {entry.key: {"trusted_hash": entry.current_hash}})
+                    entries = _select_hooks(_listed_hook_entries(server, path))
     finally:
         server.close()
     success = all(isinstance(entry, LocatedHook) and entry.trust_status == "trusted" and entry.enabled
