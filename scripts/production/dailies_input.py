@@ -24,7 +24,8 @@ from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, 
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
                             parse_style_summary, read_outstanding)
 from merge_checkpoint import ChildHandoffEntry, NoMerge, git, merge_branch_history
-from update_registration import RegistrationFailure, UpdatesOnDemand, outstanding_file, update_schedule
+from update_registration import (RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
+                                 update_schedule)
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
@@ -847,6 +848,9 @@ def run(args: argparse.Namespace) -> int:
     render_state = cast(Path, args.render_state)
     expand = cast(list[str], args.expand)
     production = read_production(production_path)
+    # Before any state is read: a showrunner started before the state move gets its state copied here.
+    for line in adopt_moved_state(production):
+        print(f"state-dir: ok — {line}", file=sys.stderr)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = units_from_doc(lines, production.slug)

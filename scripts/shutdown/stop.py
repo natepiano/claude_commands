@@ -171,6 +171,11 @@ def _fresh_inventory(login: str, only: frozenset[str]) -> Inventory:
     return inventory(login, only=only, refresh_desktops=False)
 
 
+def _same_process(stored: Session) -> bool:
+    """Whether the recorded process still runs with its recorded start."""
+    return bool(stored["proc_start"]) and sessions.process_start(stored["pid"]) == stored["proc_start"]
+
+
 def fresh_session(stored: Session, report: Inventory) -> FreshSession:
     session_id = stored["session_id"]
     current = next(
@@ -571,7 +576,7 @@ def _stop_owner(
             _owner_identity_lost_issues(stored, clock),
         )
         return
-    if match["kind"] == "session account unreadable":
+    if match["kind"] == "session account unreadable" and not (force_now and _same_process(stored)):
         _ = _set_stop_outcome(
             claim, "stop failed", clock,
             [{"kind": "account unreadable", "at": _timestamp(clock)}],
@@ -599,12 +604,13 @@ def _stop_owner(
         )
         return
 
-    current = match["session"]
+    # A forced stop of a session whose account cannot be read goes by its process identity alone.
+    current, workers = (match["session"], match["workers"]) if match["kind"] == "matching session" else (stored, [])
     if not force_now and prior["kind"] != "reaping" and (
         (prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
          and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
         or not settle.stoppable_status(current["status"])
-        or any(worker["status"] != "idle" for worker in match["workers"])
+        or any(worker["status"] != "idle" for worker in workers)
         or settle.blocker(current, moving=bool(entry.get("target")))["kind"] != "clear"
     ):
         issue = NotReadyToStop(
@@ -685,7 +691,7 @@ def _stop_owner(
                 _owner_identity_lost_issues(stored, clock),
             )
             return
-        if second["kind"] == "session account unreadable":
+        if second["kind"] == "session account unreadable" and not (force_now and _same_process(stored)):
             _ = _set_stop_outcome(
                 claim, "stop failed", clock,
                 [{"kind": "account unreadable", "at": _timestamp(clock)}],
@@ -761,6 +767,7 @@ def stop_session(
     record: SessionShutdown,
     *,
     idle_reason: IdleStopReason = "not an idle stop",
+    forced: bool = False,
     kill: KillProcess = os.kill,
     is_alive: LivenessCheck = process_is_alive,
     session_record_exists: SessionRecordPresence = session_record_exists,
@@ -813,7 +820,7 @@ def stop_session(
             return update_session(current["login"], current["session"]["session_id"], restore_progress)
         _stop_owner(
             owned, current, prior=prior, idle_reason=idle_reason,
-            force_now=current["force"] == "now",
+            force_now=forced or current["force"] == "now",
             kill=kill, is_alive=is_alive,
             session_record_exists=session_record_exists,
             fresh_inventory=fresh_inventory, clock=clock,

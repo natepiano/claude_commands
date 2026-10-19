@@ -94,6 +94,19 @@ class StyleProposalsTests(unittest.TestCase):
             _ = (self.catalog / (name + ".md")).write_text("---\n" + metadata + "---\n# Rule\n")
         with self.ledger() as ledger:
             ledger.set_tip(self.tip, "style/main")
+        for root, origin in ((self.repo, "git@github.com:example/sample.git"),
+                             (self.catalog.parent, "https://github.com/example/nate_style.git")):
+            if root != self.repo:
+                _ = self.git_at(root, "init", "-q", "--initial-branch=main")
+            _ = self.git_at(root, "remote", "add", "origin", origin)
+            if root != self.repo:
+                _ = self.git_at(root, "config", "user.name", "Rule tests")
+                _ = self.git_at(root, "config", "user.email", "rules@example.invalid")
+                _ = self.git_at(root, "add", "--all")
+                _ = self.git_at(root, "commit", "-qm", "Rules")
+            _ = self.git_at(root, "update-ref", "refs/remotes/origin/main", self.git_at(root, "rev-parse", "HEAD"))
+            # All refs are local; no test contacts the fake origin.
+            _ = self.git_at(root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
         self.calls = []
         _ = self.enterContext(mock.patch.object(style_proposals, "proposal_command", side_effect=self.issue_command))
         _ = self.enterContext(mock.patch.object(style_proposals, "renumber"))
@@ -103,6 +116,9 @@ class StyleProposalsTests(unittest.TestCase):
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def git_at(self, root: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=True).stdout.strip()
 
     def write(self, path: str, text: str) -> None:
         destination = self.repo / path
@@ -149,12 +165,131 @@ class StyleProposalsTests(unittest.TestCase):
             _ = ledger.hold(self.structure, "src/lib.rs", line, f"root site {line}", "rename",
                             "before", "after", blob, "outside")
 
+    def ranked_issue(self, name: str, goal: str, *, project: str = "sample",
+                     status: str = "open", tags: str = "issue") -> None:
+        self.proposals.mkdir(parents=True, exist_ok=True)
+        _ = (self.proposals / (name + ".md")).write_text(
+            f'---\nproject: "[[{project}]]"\nbacklog_goal: "{goal}"\nstatus: {status}\ntags: [{tags}]\n---\n')
+
+    def test_goal_counts_only_open_non_style_project_issues_and_breaks_ties(self) -> None:
+        self.ranked_issue("one", "2 - Find Collaborators")
+        for name, options in (("style", {"tags": "issue, style"}), ("closed", {"status": "closed"}),
+                              ("other", {"project": "other"})):
+            self.ranked_issue(name, "1 - Ship Hana", **options)
+        self.ranked_issue("invalid", "not a goal")
+        self.assertEqual(style_proposals.project_goal(self.proposals, "sample"), "2 - Find Collaborators")
+        self.ranked_issue("tie", "1 - Ship Hana")
+        self.assertEqual(style_proposals.project_goal(self.proposals, "sample"), "1 - Ship Hana")
+
+    def test_goal_default_names_project_once_for_multiple_batches(self) -> None:
+        output = io.StringIO()
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            _ = self.hold(ledger, kind="type", line=2)
+            with redirect_stdout(output):
+                paths = style_proposals.file_proposals(ledger, self.proposals, "parent")
+        self.assertEqual(len(paths), 2)
+        self.assertEqual(output.getvalue().count("goal: no ranked sample issue; default 1 - Ship Hana\n"), 1)
+
+    def test_file_and_rank_use_project_goal_two(self) -> None:
+        self.ranked_issue("ranked", "2 - Find Collaborators")
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            expected = issue.read_bytes()
+            self.assertIn(b"Proposed ranking: goal 2 - Find Collaborators", expected)
+            _ = issue.write_bytes(re.sub(rb"Proposed ranking: [^\n]*", b"Proposed ranking: ", expected))
+            with redirect_stdout(io.StringIO()):
+                style_proposals.rank_proposals(ledger, self.proposals)
+            self.assertEqual(issue.read_bytes(), expected)
+
+    def test_rule_urls_use_both_github_remotes_and_cache_each_root(self) -> None:
+        _ = self.git("update-ref", "refs/remotes/origin/release", self.tip)
+        _ = self.git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/release")
+        linker = style_proposals.RuleLinker(self.repo)
+        with mock.patch.object(style_proposals, "github_rule_root", wraps=style_proposals.github_rule_root) as roots:
+            self.assertEqual(linker.rule_url("local:docs/style/names.md#uncovered"),
+                             "https://github.com/example/sample/blob/release/docs/style/names.md")
+            self.assertEqual(linker.rule_url("global:rust/names.md#uncovered"),
+                             "https://github.com/example/nate_style/blob/main/rust/names.md")
+            self.assertEqual(linker.rule_url("global:rust/modules.md"),
+                             "https://github.com/example/nate_style/blob/main/rust/modules.md")
+            self.assertEqual(roots.call_count, 2)
+
+    def test_rule_urls_report_main_fallback_and_refuse_non_github_remote(self) -> None:
+        _ = self.git("symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+        output = io.StringIO()
+        linker = style_proposals.RuleLinker(self.repo)
+        with redirect_stdout(output):
+            url = linker.rule_url("local:docs/style/names.md")
+            _ = linker.rule_url("local:docs/style/other.md")
+        self.assertEqual(url, "https://github.com/example/sample/blob/main/docs/style/names.md")
+        self.assertEqual(output.getvalue(), f"rules: {self.repo}: no origin/HEAD; default main\n")
+        _ = self.git("remote", "set-url", "origin", "https://gitlab.com/example/sample.git")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "non-GitHub origin https://gitlab.com/example/sample.git"):
+            _ = style_proposals.RuleLinker(self.repo).rule_url("local:docs/style/names.md")
+
+    def test_file_writes_sorted_distinct_rule_links_and_keeps_body_rule_lines(self) -> None:
+        local_rule = "local:docs/style/modules.md"
+        self.write("docs/style/modules.md", "---\ntier: D\nfamily: modules\ninput_scope: crate\n---\n# Modules\n")
+        _ = (self.catalog / "propose.md").write_text(
+            "---\ntier: B\nfamily: names\ninput_scope: file\nmode: propose\ncandidates:\n"
+            + "  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: other names\n---\n# Rule\n")
+        with self.ledger() as ledger:
+            first = self.hold(ledger, rule=self.propose)
+            _ = self.hold(ledger, rule=local_rule, line=2)
+            _ = ledger.hold(self.propose + "#uncovered", first.path, 3, "uncovered site", "rename",
+                            "before", "after", first.rule_blob, "outside")
+            issue = self.file(ledger)[0]
+        self.assertEqual(frontmatter(issue)["style_rules"], [
+            "https://github.com/example/nate_style/blob/main/rust/propose.md",
+            "https://github.com/example/sample/blob/main/docs/style/modules.md",
+        ])
+        self.assertIn(f"Rule: {local_rule}\n", issue.read_text())
+        self.assertIn(f"Rule: {self.propose}#uncovered\n", issue.read_text())
+
+    def test_link_rules_backfills_open_and_closed_issues_and_is_idempotent(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            opened = self.file(ledger)[0]
+            _ = self.hold(ledger, kind="type", line=2)
+            closed = self.file(ledger)[0]
+            _ = self.hold(ledger, crate="beta")
+            linked = self.file(ledger)[0]
+        for issue in (opened, closed):
+            text = re.sub(r"^style_rules:.*\n", "", issue.read_text(), flags=re.MULTILINE)
+            if issue == closed:
+                text = text.replace("status: open", "status: closed")
+            _ = issue.write_text(text)
+        unknown = self.proposals / "unknown.md"
+        _ = unknown.write_text("---\nstatus: open\ntags: [style]\nstyle_findings: [missing]\n---\n# Keep\n")
+        untagged = self.proposals / "untagged.md"
+        _ = untagged.write_text(unknown.read_text().replace("tags: [style]", "tags: [issue]"))
+        untouched = {path: path.read_bytes() for path in (linked, unknown, untagged)}
+        args = ["link-rules", "--repo", str(self.repo), "--proposals", str(self.proposals)]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_proposals.main(args), 0)
+        self.assertIn(str(unknown), output.getvalue())
+        self.assertTrue(output.getvalue().endswith("linked 2, already linked 1, skipped 1\n"))
+        for issue in (opened, closed):
+            self.assertEqual(frontmatter(issue)["style_rules"],
+                             ["https://github.com/example/nate_style/blob/main/rust/names.md"])
+        self.assertEqual(frontmatter(closed)["status"], ["closed"])
+        self.assertEqual({path: path.read_bytes() for path in untouched}, untouched)
+        stamps = {path: path.stat().st_mtime_ns for path in self.proposals.glob("*.md")}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_proposals.main(args), 0)
+        self.assertTrue(output.getvalue().endswith("linked 0, already linked 3, skipped 1\n"))
+        self.assertEqual({path: path.stat().st_mtime_ns for path in stamps}, stamps)
+
     def test_proposed_ranking_sets_all_values_for_each_kind_and_effort_boundary(self) -> None:
         for kind, impact in (("rename", "⭐"), ("type", "⭐⭐"), ("restructure", "⭐⭐")):
             for count, effort in ((1, "⭐"), (3, "⭐"), (4, "⭐⭐"), (15, "⭐⭐"), (16, "⭐⭐⭐")):
                 with self.subTest(kind=kind, findings=count):
-                    self.assertEqual(style_proposals.proposed_ranking(cast(style_ledger.FindingKind, kind), count),
-                                     f"goal 1 - Ship Hana · alignment ⭐⭐ · impact {impact} · urgency ⭐ · effort {effort}")
+                    self.assertEqual(style_proposals.proposed_ranking(cast(style_ledger.FindingKind, kind), count, "2 - Find Collaborators"),
+                                     f"goal 2 - Find Collaborators · alignment ⭐⭐ · impact {impact} · urgency ⭐ · effort {effort}")
 
     def test_root_crate_restructure_uses_repository_name_in_title_and_filename_with_ranking(self) -> None:
         with self.ledger() as ledger:

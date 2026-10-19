@@ -9,6 +9,7 @@ work tree. A refused commit warns and never fails the merge.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import re
 import shlex
@@ -16,6 +17,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
@@ -205,6 +208,22 @@ class Stop(Exception):
 
 def report(step: str, state: str, detail: str) -> None:
     print(f"{step}: {state} — {detail}", flush=True)
+
+
+@contextmanager
+def merge_lock(checkout: Path, slug: str) -> Generator[None]:
+    """Held for a whole merge gate. A unit rename takes it before it writes the merge branch, so
+    neither lands a commit inside the other's run."""
+    common = git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.returncode:
+        raise OSError(f"{checkout}: no git directory for the merge lock: {common.stderr.strip()}")
+    with (Path(common.stdout.strip()) / f"showrunner-merge-{slug}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"merge lock: waiting — a merge gate or a unit rename is writing {slug}'s merge branch", flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -1233,7 +1252,9 @@ def main() -> int:
                     cast(str, args.regime) != "after", cast(int, args.holds), cast(int, args.merge_defects),
                     cast(str | None, args.excluded), cast(str | None, args.scratch))):
                 raise Refusal("--from-child is separate from unit checkpoint arguments")
-            return run_handoff(child_request(args))
+            handoff = child_request(args)
+            with merge_lock(handoff.production.checkout, handoff.production.slug):
+                return run_handoff(handoff)
         except (Refusal, Stop, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
@@ -1242,7 +1263,9 @@ def main() -> int:
     if not all((cast(str | None, args.unit), cast(str | None, args.phase), cast(str | None, args.hash))):
         parser.error("unit, phase and hash are required for a unit checkpoint")
     try:
-        return run(request_from(args))
+        request = request_from(args)
+        with merge_lock(request.production.checkout, request.production.slug):
+            return run(request)
     except (Refusal, OSError, ValueError) as error:
         report("input", "failed", str(error))
         print(f"send {cast(str, args.unit)}: correct the checkpoint input and resend it")

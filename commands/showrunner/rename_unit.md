@@ -5,12 +5,12 @@ argument-hint: "<old> <new>"
 
 # Rename unit
 
-Run from the showrunner session, at any time, also in the middle of a phase. `<old>` is the unit's id or its stem.
+Run from the showrunner session, at any time, also in the middle of a phase. `<old>` is the unit's id, its stem, or its Claude session's name. When the id already is `<new>`, only the session takes the new name: the plan shows the other steps as already matching.
 `<new>` can be an id or a stem, and it becomes `<stem>-unit`. The script lives at
-`~/.claude/scripts/production/rename_unit.py`; `<scratch>` is your scratchpad:
+`~/.claude/scripts/production/rename_unit.py`. It finds the showrunner state in `STATE_DIR`:
 
 ```sh
-"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/rename_unit.py" <plan|apply|verify> <slug> <old> <new> --scratch <scratch>
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/rename_unit.py" <plan|apply|verify> <slug> <old> <new>
 ```
 
 1. Run `plan`. It writes nothing, and it either refuses or prints every step with its old and new values.
@@ -21,7 +21,9 @@ Run from the showrunner session, at any time, also in the middle of a phase. `<o
 
    A running unit is not a refusal: apply stops it itself, at step 1. The stop pauses its Codex
    seats, and the unit's commits that are not merged move with the branch.
-2. Run `apply`. It journals each step, so a rerun resumes from the step that stopped. The steps are:
+2. Run `apply` once, in the background: one run does the whole rename, with no rerun. It waits for the
+   unit to stop (up to an hour), for a merge gate that is running, and for the relaunched unit to come
+   up. It journals each step, so a rerun after a refusal resumes from the step that stopped. The steps are:
    1. stop the unit through the shutdown path;
    2. merge the merge branch into the unit, except while its work is in progress (an open phase or
       uncommitted work): then the branch keeps its tip, steps 2 and 6 merge nothing, and the unit
@@ -35,7 +37,7 @@ Run from the showrunner session, at any time, also in the middle of a phase. `<o
    9. point the unit's shutdown record at the new names;
    10. relaunch the unit;
    11. verify.
-   - **Exit 2** means the unit is still stopping. Wait for its stop, then rerun `apply`.
+   - **Exit 2** means the unit was still stopping after an hour. Find out why its stop holds, then rerun `apply`.
    - **Exit 1** names the step that refused. Fix the cause and rerun `apply`.
 3. Verify fails when a live place still holds an old name, or when a file nothing classifies holds one.
    A failure leaves the journal open. A stale live place is a bug in the rename. A file nothing

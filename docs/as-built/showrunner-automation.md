@@ -20,7 +20,8 @@ The problem it solves is the number of manual steps a showrunner has to carry. E
 
 - **Named states**: every optional or alternative value crossing a reader boundary is a `NamedTuple` union (`FieldPresent | FieldAbsent`, `PushedTip | NotYetPushed`, `EtaFresh | EtaStale | EtaPassed | EtaNone`, and so on), never a string or `None`.
 
-- **State directory**: `DAILIES_STATE_DIR` (`<SCRATCH>/dailies_input_state`, in `produce.md`'s State list) is the one `--state-dir` for the dailies builder, every stateful `ci_points.py` call and every stateful `waiting.py` call. It holds `eta_seen.json`, `ci_points.json`, `ci_run.json`, `review_watch.json`, `agenda_seen.json` and the scratch-test logs.
+- **Session state**: `showrunners.session_state_dir(<slug>)` is `~/.local/state/showrunner/<slug>/session` (`STATE_DIR` in `produce.md`). It holds `showrunner_state.json`, `dailies_judgment.json`, `dailies_state.json`, `unit_status/` and `dailies_input_state/`, which a scratchpad held before. A new session id, a restart and a reboot keep it; a rename moves it with the slug folder, and a wrap deletes that folder. `showrunners.copy_session_state` copies each of the five that a scratchpad holds and the folder does not; a copy never replaces a file. It runs with no step by anyone: `update_registration.adopt_moved_state`, which every `update_registration.py` call and every `dailies_input.py` run calls first, looks for the files the folder lacks in the scratchpad of the session the update timer's TARGET names (`/tmp/claude-*/*/<session id>/scratchpad`), and rewrites `prompt.txt` when it differs from what `produce.md` gives now. `load --scratch <SCRATCH>` runs the same copy from a named scratchpad.
+- **State directory**: `DAILIES_STATE_DIR` (`<STATE_DIR>/dailies_input_state`, in `produce.md`'s State list) is the one `--state-dir` for the dailies builder, every stateful `ci_points.py` call and every stateful `waiting.py` call. It holds `eta_seen.json`, `ci_points.json`, `ci_run.json`, `review_watch.json`, `agenda_seen.json` and the scratch-test logs.
 
 ### Unit start: `add_unit.py` and `/showrunner:add_unit`
 
@@ -87,6 +88,8 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 
 `production_lifecycle.py load|open|promote-main|wrap --production <doc> [--no-ci] …`. `--no-ci` makes the CI, smoke-launch and Mac-run steps print `<step>: ok — skipped: no CI` and is refused together with a verdict flag.
 
+- `load [--resume] [--scratch <dir>]`: checks the checkout; with `--scratch`, prints `state-dir: ok — <dir>` after the copy above; on resume or for a running doc, prints the last `### STATE` block, each unit's last code merge and its session.
+
 - `open --session <name>` (status `planned` only): creates the merge branch, sets the doc to `running` and writes the session line once, commits `production(<name>): plans for <N> units` with the unit plans, pushes with upstream, adds `LOG` to `.git/info/exclude` and creates it with `# Production log — <name>`. A re-run resumes at the first step not done.
 
 - `promote-main --ci-green <sha> --smoke-passed <sha>`: each verdict must resolve to the merge tip, else held; `origin/main` must be an ancestor of the tip; each Promote destination prints `already at <tip>`, `pushed <tip>` or `advanced to <tip>`; with no destinations it pushes `<tip>:refs/heads/main`; the declared Mac is pulled even under `--no-ci`.
@@ -99,7 +102,8 @@ The showrunner still judges, before the call: the other units' overlap notice, n
 
 - `time <ISO or HH:MM>` prints `time: ok — HH:MM <zone>` in the user's zone, never UTC.
 
-- `log "<event>" [--state <file>] [--before-compaction]` appends `- HH:MM <zone>: <event>`. On every tenth event line and with `--before-compaction` it also writes `### STATE <time>`: one `<unit>: <phase>; last merged phase <N> (<short>)|none; waits on <wait>` line per Units row (phase and wait from `--state`, keyed by session, `not stated` when absent), `Merges accepted but held: …` and `Open for the user: …` from `OUTSTANDING`.
+- `log "<event>" [--state <file>] [--before-compaction]` appends `- HH:MM <zone>: <event>`. On every tenth event line and with `--before-compaction` it also writes `### STATE <time>`: one `<unit>: <phase>; last merged phase <N> (<short>)|none; waits on <wait>` line per Units row (phase and wait from `--state`, keyed by session, `not stated` when absent), `Merges accepted but held: …` and `Open for the user: …` from `OUTSTANDING`. The state file's `next` list (one-line text each) becomes a `Next: a; b` line, or `Next: none`.
+- **Compaction hooks**: `scripts/hooks/showrunner-compaction.py` acts only for a session that a production's update timer is addressed to (`showrunners.production_of`). On PreCompact it runs `log "before compaction (<trigger>)" --before-compaction` with the showrunner state file, and again without it when the log refuses that file. On SessionStart `compact` or `resume` it adds context that names `/showrunner:produce <doc> resume`, unless the resuming prompt already runs it, and the `Next:` line. Past the handoff point, `post-tool-use-context-usage.py` tells a showrunner to fill `next` in place of a handoff doc; it looks up the timer only past that point.
 
 - `questions [--state <file>]` stores `open_for_user` in `OUTSTANDING` (`~/.local/state/showrunner/outstanding/<slug>.json`), reviews each new question and prints `questions: ok — recorded`. `OUTSTANDING` is rewritten only when `--state` has an `open_for_user` key, keeping each item's earlier `since`; an invalid `--state` file fails the step. Until 2026-10-18 this verb was `footer` and also rendered the reply footer; the footer and its switch are gone (user: "i want footers gone for good").
 

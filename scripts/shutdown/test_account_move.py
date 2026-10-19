@@ -513,8 +513,10 @@ class AccountMoveTests(ShutdownTestCase):
                 self.assertIn("shutdown.py ready --where", text)
             return {"kind": "sent"}
 
-        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop") -> record.SessionShutdown:
+        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop",
+                    forced: bool = False) -> record.SessionShutdown:
             self.assertEqual(idle_reason, "not an idle stop")
+            self.assertFalse(forced)
             events.append("stop")
             self.assertEqual(saved["progress"]["kind"], "ready")
             checkpoint = saved["where"]
@@ -543,6 +545,7 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(settle, "merge_in_progress", return_value=False),
               patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "requester-outside-group"}),
               patch.object(subprocess, "run", side_effect=request),
+              patch.object(settle, "_carry_trust"),
               patch.object(settle, "send_message", side_effect=delivered),
               patch.object(runner_registry, "current_name", return_value="parent-runner"),
               patch.object(stop_work, "stop_session", side_effect=stopped) as stop):
@@ -568,7 +571,7 @@ class AccountMoveTests(ShutdownTestCase):
             saved = record.session_records(report["login"])[0]
             self.assertIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                   settle.StopSession)
-            _ = settle._stop_after_telling(saved)  # pyright: ignore[reportPrivateUsage]
+            _ = settle._stop_after_telling(saved, settle.StopSession())  # pyright: ignore[reportPrivateUsage]
             stop.assert_called_once()
         self.assertTrue(events[1].startswith(f"{director['name']} is stopping:"), events)
         self.assertEqual(events[-1], "stop")

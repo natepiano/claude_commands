@@ -5,7 +5,8 @@ Usage: retire_unit.py <slug> <unit> [--dry-run] [--wait-minutes N]
 
 A showrunner runs it through /showrunner:retire_unit. It refuses, and changes nothing, while the
 unit's worktree has uncommitted work or its branch has a commit the merge branch does not have.
-Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
+The `Project started` line the /unit:direct recorder adds to a plan, alone in its file's diff, is not
+uncommitted work: no person wrote it. Then it stops what the unit owns. It finds each thing by its own record, never by a name pattern:
 
 - each Claude session that works in the worktree (the unit director and its Claude seats) stops
   through `shutdown.py down`, which asks it to pause and stops it at its ready mark, and its
@@ -42,9 +43,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
 import add_unit  # noqa: E402
 import berth_board  # noqa: E402
 import production_units  # noqa: E402
+import progress_history  # noqa: E402
 import showrunners  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402
@@ -167,6 +170,15 @@ def branch_refs(unit: Unit) -> list[str]:
     return refs
 
 
+def recorder_line_only(worktree: Path, path: str) -> bool:
+    """Whether the file's whole change against HEAD is one added `Project started` line."""
+    diff = run(["git", "-C", str(worktree), "diff", "--no-color", "--unified=0", "HEAD", "--", path])
+    changed = [line for line in diff.stdout.splitlines()
+               if line[:1] in ("+", "-") and not line.startswith(("+++ ", "--- "))]
+    return (diff.returncode == 0 and len(changed) == 1 and changed[0].startswith("+")
+            and progress_history.PROJECT_STARTED_PATTERN.fullmatch(changed[0][1:]) is not None)
+
+
 def refusals(unit: Unit) -> list[str]:
     """What keeps the unit from retiring: uncommitted work, and commits the merge branch lacks.
 
@@ -177,10 +189,14 @@ def refusals(unit: Unit) -> list[str]:
         status = run(["git", "-C", str(unit.worktree), "status", "--short"])
         if status.returncode:
             found.append(f"cannot read {unit.worktree}: {failure(status)}")
-        elif status.stdout.strip():
-            paths = [line[3:] for line in status.stdout.splitlines()]
-            found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths[:5])}"
-                         + (f" and {len(paths) - 5} more" if len(paths) > 5 else ""))
+        else:
+            # The /unit:direct recorder writes its `Project started` line into the plan and never
+            # commits it; a unit that never checkpoints keeps it as its only change. No person wrote it.
+            paths = [line[3:] for line in status.stdout.splitlines()
+                     if not (line[:2] == " M" and recorder_line_only(unit.worktree, line[3:]))]
+            if paths:
+                found.append(f"uncommitted work in {unit.worktree}: {', '.join(paths[:5])}"
+                             + (f" and {len(paths) - 5} more" if len(paths) > 5 else ""))
     for ref in branch_refs(unit):
         listed = _git(unit, "log", "--no-merges", "--format=%s", f"{unit.production.merge_branch}..{ref}")
         if listed.returncode:

@@ -304,6 +304,23 @@ class LifecycleTests(unittest.TestCase):
         self.assertIn("resumed state", resumed.stdout)
         self.assertIn("alpha-unit: no code checkpoint", resumed.stdout)
 
+    def test_load_copies_the_scratchpad_state_once_and_never_replaces_it(self) -> None:
+        scratch = self.root / "scratch"
+        self.write(scratch / "showrunner_state.json", '{"merges_held": ["old"]}\n')
+        self.write(scratch / "unit_status" / "decisions_seen", "alpha-unit|1\n")
+        target = self.state / "showrunner" / "example" / "session"
+
+        first = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
+        self.assert_step(first, "ok")
+        self.assertIn("copied unit_status, showrunner_state.json", first.stdout)
+        self.assertEqual((target / "unit_status" / "decisions_seen").read_text(), "alpha-unit|1\n")
+
+        self.write(target / "showrunner_state.json", '{"merges_held": ["new"]}\n')
+        again = self.run_lifecycle("load", "--no-ci", "--scratch", str(scratch))
+        self.assert_step(again, "ok")
+        self.assertNotIn("copied", again.stdout)
+        self.assertIn('"new"', (target / "showrunner_state.json").read_text())
+
     def test_load_reports_each_last_code_merge_even_after_shrink(self) -> None:
         self.running()
         _, alpha_merge = self.side_commit(self.alpha, "alpha-branch", "alpha-unit", "2")

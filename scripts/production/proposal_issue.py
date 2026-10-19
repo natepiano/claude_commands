@@ -8,6 +8,7 @@ Usage:
   proposal_issue.py approve <issue> --showrunner S --unit U --plan P
   proposal_issue.py start <issue>
   proposal_issue.py close <issue> --as-built PATH
+  proposal_issue.py rules <issue> --rules URLS
   proposal_issue.py stars <issue> --goal G --alignment A --impact I --urgency U --effort E
 """
 from __future__ import annotations
@@ -90,6 +91,31 @@ def set_fields(text: str, fields: dict[str, str], path: Path) -> tuple[str, list
     return "".join(lines), changed
 
 
+def set_list_fields(text: str, fields: dict[str, list[str]], path: Path) -> tuple[str, list[str]]:
+    """Set JSON lists without changing other frontmatter or body bytes."""
+    lines = text.splitlines(keepends=True)
+    changed: list[str] = []
+    for key, values in fields.items():
+        end = _closing_fence(lines, path)
+        span = _key_span(lines, end, key)
+        start, stop = span if span is not None else (end, end)
+        newline = lines[start][len(lines[start].rstrip("\r\n")):] or "\n"
+        replacement = f"{key}: {json.dumps(values, ensure_ascii=False)}{newline}"
+        if lines[start:stop] != [replacement]:
+            lines[start:stop] = [replacement]
+            changed.append(key)
+    return "".join(lines), changed
+
+
+def edit_rules(path: Path, urls: list[str], today: date) -> list[str]:
+    text, changed = set_list_fields(_read(path), {"style_rules": sorted(set(urls))}, path)
+    text, dates = set_fields(text, {"date_modified": _vault_date(today)}, path)
+    changed.extend(dates)
+    if changed:
+        _write(path, text)
+    return changed
+
+
 def _read(path: Path) -> str:
     if not path.is_file():
         raise Refusal(f"{path} is not a file")
@@ -157,7 +183,8 @@ def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
 
 
 def create(path: Path, project: str, short: str, proposed_by: str, tags: list[str],
-           findings: list[str], body: str, template: Path, today: date, proposed_ranking: str = "") -> bool:
+           findings: list[str], body: str, template: Path, today: date, proposed_ranking: str = "",
+           rule_urls: tuple[str, ...] = ()) -> bool:
     """Create once; the finding identities protect crash recovery from overwriting an issue."""
     identities = sorted(set(findings))
     if not identities:
@@ -172,13 +199,11 @@ def create(path: Path, project: str, short: str, proposed_by: str, tags: list[st
         "DATE": today.isoformat(), "CATEGORY": "refactor", "DEPENDS_ON": "[]",
     }
     text = re.sub(r"\{\{([A-Z_]+)\}\}", lambda match: values.get(match[1], ""), text)
-    lines = text.splitlines(keepends=True)
-    for key, value in (("tags", list(dict.fromkeys(["issue", "proposal", *tags]))), ("style_findings", identities)):
-        end = _closing_fence(lines, path)
-        span = _key_span(lines, end, key)
-        start, stop = span if span is not None else (end, end)
-        lines[start:stop] = [f"{key}: {json.dumps(value, ensure_ascii=False)}\n"]
-    text = "".join(lines).rstrip() + f"\n\nProposed ranking: {proposed_ranking}\n\n" + body.rstrip() + "\n"
+    lists = {"tags": list(dict.fromkeys(["issue", "proposal", *tags])), "style_findings": identities}
+    if rule_urls:
+        lists["style_rules"] = sorted(set(rule_urls))
+    text, _ = set_list_fields(text, lists, path)
+    text = text.rstrip() + f"\n\nProposed ranking: {proposed_ranking}\n\n" + body.rstrip() + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive create keeps a concurrent filer from replacing an issue after approval.
     with path.open("x", encoding="utf-8") as stream:
@@ -204,13 +229,16 @@ def main(argv: list[str]) -> int:
         _ = creation.add_argument(f"--{name}", required=True)
     _ = creation.add_argument("--extra-tags", nargs="+", default=[])
     _ = creation.add_argument("--proposed-ranking", default="")
+    _ = creation.add_argument("--rules", default="")
     _ = creation.add_argument("--body-file", type=Path, required=True)
     _ = creation.add_argument("--template", type=Path, default=Path.home() / "rust/hanadocs/.claude/templates/issue.yaml")
+    linking = verbs.add_parser("rules", help="set the rule links")
+    _ = linking.add_argument("--rules", required=True)
     stars = verbs.add_parser("stars", help="set the five ranking values")
     _ = stars.add_argument("--goal", required=True, help="e.g. '1 - Ship Hana'")
     for name in ("alignment", "impact", "urgency", "effort"):
         _ = stars.add_argument(f"--{name}", required=True, help="1 to 5")
-    for verb in (approve, verbs.choices["start"], close, stars):
+    for verb in (approve, verbs.choices["start"], close, stars, linking):
         _ = verb.add_argument("issue", type=Path)
     args = parser.parse_args(argv)
     # A plan's Issues line writes `~/rust/hanadocs/issues/<name>.md`, quoted since names hold spaces.
@@ -221,10 +249,14 @@ def main(argv: list[str]) -> int:
             created = create(path, cast(str, args.project), cast(str, args.short), cast(str, args.proposed_by),
                              cast(list[str], args.extra_tags), cast(str, args.findings).split(","),
                              cast(Path, args.body_file).read_text(), cast(Path, args.template), today,
-                             cast(str, args.proposed_ranking))
+                             cast(str, args.proposed_ranking),
+                             tuple(url for url in cast(str, args.rules).split(",") if url))
             print(f"create {path.name}: {'created' if created else 'unchanged'}")
             return 0
-        changed = edit(path, fields_for(args, today), today)
+        if cast(str, args.verb) == "rules":
+            changed = edit_rules(path, [url for url in cast(str, args.rules).split(",") if url], today)
+        else:
+            changed = edit(path, fields_for(args, today), today)
     except (Refusal, OSError, UnicodeError) as error:
         print(f"proposal_issue: {error}", file=sys.stderr)
         return 2

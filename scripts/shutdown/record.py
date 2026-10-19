@@ -506,6 +506,8 @@ class SessionShutdown(TypedDict):
     why: NotRequired[str]
     # Set by rename_unit while the unit is stopped: the restart note tells the session its new names.
     renamed: NotRequired[str]
+    # A move stopped the session mid-turn; its last tool call, or "" when the transcript showed none.
+    cut_off: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -1148,7 +1150,7 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")
         values["target"] = canonical_label(target)
-    for field in ("source_label", "why", "renamed"):
+    for field in ("source_label", "why", "renamed", "cut_off"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (

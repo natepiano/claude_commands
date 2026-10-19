@@ -639,6 +639,10 @@ def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
         if where["kind"] == "said":
             punctuation = "" if where["text"].endswith((".", "!", "?")) else "."
             note += f" Before it you wrote: {where['text']}{punctuation}"
+        if "cut_off" in record:
+            step = f"; your last step was {record['cut_off']}" if record["cut_off"] else ""
+            note += (f" The move stopped you in the middle of a turn{step}. "
+                     "Check whether that step finished, and do it again if it did not.")
         return note
     origin = record["requested_by"]
     if origin["kind"] == "snapshot":
