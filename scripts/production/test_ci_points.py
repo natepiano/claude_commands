@@ -252,7 +252,7 @@ class CiPointsTests(unittest.TestCase):
         produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
         dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
         state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
-        self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<SCRATCH>/dailies_input_state`")
+        self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<STATE_DIR>/dailies_input_state`")
         calls = cast(list[tuple[str, str]], re.findall(
             r"ci_points\.py\s+(due|watch|ci start|ci collect|notice clear|notice lift)\b([^`]*)`",
             produce, flags=re.DOTALL))
@@ -264,7 +264,7 @@ class CiPointsTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertRegex(body, r"--state-dir\s+DAILIES_STATE_DIR\b")
                 self.assertNotRegex(body, r"--state-dir\s+SCRATCH\b")
-        self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<scratchpad>/dailies_input_state\b")
+        self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<STATE_DIR>/dailies_input_state\b")
 
     def test_ci_start_passes_cancel_prior_only_when_requested(self) -> None:
         flagged = self.run_ci("ci", "start", "--state-dir", str(self.state), "--cancel-prior")

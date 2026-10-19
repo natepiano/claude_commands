@@ -33,8 +33,10 @@ State:
   `python3 ~/.claude/scripts/lib/user_zone.py` prints. It is one setting for
   every production; a doc's own **User zone** line is not read.
 - `CHECKOUT` — this session's checkout, which must be on `MERGE_BRANCH`.
-- `SCRATCH` — this session's scratchpad directory.
-- `DAILIES_STATE_DIR` — `<SCRATCH>/dailies_input_state`, the dailies builder's
+- `SCRATCH` — this session's scratchpad directory, for files that only this session needs.
+- `STATE_DIR` — `~/.local/state/showrunner/<slug>/session`, the showrunner's own state.
+  It lasts across a new session id, a restart and a reboot, which a scratchpad does not.
+- `DAILIES_STATE_DIR` — `<STATE_DIR>/dailies_input_state`, the dailies builder's
   `--state-dir` (`commands/showrunner/dailies.md` passes this path) and the
   `--state-dir` for every `ci_points.py` and stateful `waiting.py` call.
 - `LAST_MERGED[unit]` — the unit's last merged checkpoint. Read it from the
@@ -45,13 +47,14 @@ State:
 - `UPDATES` — `showrunner-<slug>`, where `<slug>` is the production doc's file
   name less `-production.md`.
 - `PROMPT_FILE` — `~/.local/state/showrunner/<slug>/prompt.txt`.
-- `SHOWRUNNER_STATE` — `<SCRATCH>/showrunner_state.json`, one JSON object with
+- `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
   (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`), and
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
-  remove an item once it is reported; it needs no review). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The Stop hook asks for it only until one reply has carried it.
+  remove an item once it is reported; it needs no review), and `next` (a list
+  of one-line text: each action you owe and what sets it off; see Compaction). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The Stop hook asks for it only until one reply has carried it.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py questions --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
@@ -75,11 +78,17 @@ State:
   (user, 2026-10-02).
 - **Log.** Run `python3 ~/.claude/scripts/production/update_registration.py
   log "<event>" --production PRODUCTION_DOC` for each event. Add
-  `--state SHOWRUNNER_STATE` once that file exists, and `--before-compaction`
-  before a compaction. The command writes
+  `--state SHOWRUNNER_STATE` once that file exists. The command writes
   the event line and each tenth `### STATE` block, including unit phase, last
-  merged checkpoint, waits, accepted but held merges and items open for the user.
-  After a compaction, the production doc plus `LOG` is the whole state.
+  merged checkpoint, waits, accepted but held merges, items open for the user
+  and the `next` list.
+- **Compaction.** Keep `next` in `SHOWRUNNER_STATE` current: each action you owe,
+  with what sets it off ("merge alpha phase 2 when its gate is green"). Write no
+  handoff doc. Before a compaction, a PreCompact hook writes the `### STATE`
+  block from that file. After it, a SessionStart hook tells you to run
+  `/showrunner:produce PRODUCTION_DOC resume` and act first on what was in
+  flight and the `Next:` line. The production doc, `LOG` and `STATE_DIR` are
+  the whole state.
 - **Unit worktrees.** Never `cd` into one; use `git -C`. Never commit, reset or
   edit files there.
 - **A unit's pane** is looked up each time it is needed, never remembered:
@@ -321,8 +330,8 @@ State:
 
 <LoadProduction>
 Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
---production PRODUCTION_DOC`, adding `--resume` on resume. The command checks
-the checkout, reads the last `### STATE` block of `LOG`, rebuilds each unit's
+--production PRODUCTION_DOC --scratch <SCRATCH>`, adding `--resume` on resume. The command checks
+the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
 last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
 again and retargets the instance. A reboot needs nothing.
@@ -409,11 +418,11 @@ The prompt:
 
 > Scheduled update (every <N> minutes, every unit checked; the user is in
 > <zone>). `<SCRATCH>` below stands for your own scratchpad directory: put its
-> path in place of it before you run a command. Run `zsh ~/.claude/scripts/production/unit_status.sh <SCRATCH>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
+> path in place of it before you run a command. Run `zsh ~/.claude/scripts/production/unit_status.sh <STATE_DIR>/unit_status <zone> --production <production doc> > <SCRATCH>/unit_status.txt`.
 > It checks every unit director: its session and Claude are running, anything waiting
 > on the user, and its latest step and ETA. Run `/showrunner:dailies gantt`
 > for every unit and open topic; its input builder reads the saved status file.
-> Pass `--render-state <SCRATCH>/dailies_state.json` to the builder; the renderer
+> Pass `--render-state <STATE_DIR>/dailies_state.json` to the builder; the renderer
 > uses that same file as `--state`.
 > Follow each `flags first:` line: a SESSION GONE, CLAUDE NOT RUNNING, FORM
 > WAITING, usage-limit or DECISION subject goes first, with `needed:` saying what

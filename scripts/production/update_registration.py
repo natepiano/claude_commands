@@ -105,6 +105,8 @@ class ShowrunnerState(NamedTuple):
     merges_held: tuple[str, ...]
     outstanding: KeepOutstanding | ReplaceOutstanding
     reports: KeepReports | ReplaceReports = KeepReports()
+    # What the showrunner owes and what sets each off; a resume acts on it first.
+    owed: tuple[str, ...] = ()
 
 
 class RegistrationFailure(Exception):
@@ -159,7 +161,7 @@ def update_schedule(lines: list[str]) -> ScheduledUpdates | UpdatesOnDemand:
     return ScheduledUpdates(minutes, "on the hour" in line)
 
 
-def scheduled_prompt(minutes: int, zone: str, doc: Path) -> str:
+def scheduled_prompt(minutes: int, zone: str, doc: Path, slug: str) -> str:
     source = Path(__file__).resolve().parents[2] / "commands/showrunner/produce.md"
     document = source.read_text(encoding="utf-8")
     if "The prompt:\n" not in document:
@@ -170,6 +172,7 @@ def scheduled_prompt(minutes: int, zone: str, doc: Path) -> str:
     template = tail.split("\n**A tick**", 1)[0]
     prompt = "\n".join(line.removeprefix("> ").removeprefix(">") for line in template.strip().splitlines())
     prompt = prompt.replace("<N>", str(minutes)).replace("<zone>", zone).replace("<production doc>", str(doc))
+    prompt = prompt.replace("<STATE_DIR>", str(showrunners.session_state_dir(slug)))
     return prompt
 
 
@@ -187,7 +190,7 @@ def register(production: Production) -> None:
     # An on-demand timer is made at the default interval and stopped, so it stays the showrunner's record.
     minutes, aligned = ((schedule.minutes, schedule.aligned) if isinstance(schedule, ScheduledUpdates)
                         else (DEFAULT_MINUTES, False))
-    prompt = scheduled_prompt(minutes, str(production.zone), production.doc)
+    prompt = scheduled_prompt(minutes, str(production.zone), production.doc, production.slug)
     relative = production.doc.relative_to(production.checkout)
     dirty = command("register", ["git", "status", "--porcelain", "--", str(relative)], cwd=production.checkout)
     if dirty:
@@ -244,7 +247,7 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
         raise state_error(step, path, "root", "an object")
     fields = cast(dict[str, object], value)
     for key in fields:
-        if key not in {"units", "merges_held", "open_for_user", "report_to_user"}:
+        if key not in {"units", "merges_held", "open_for_user", "report_to_user", "next"}:
             raise state_error(step, path, key, "a known key")
     raw_units = fields.get("units", [])
     if not isinstance(raw_units, list):
@@ -267,6 +270,10 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
     raw_held = fields.get("merges_held", [])
     if not isinstance(raw_held, list) or not all(isinstance(item, str) for item in cast(list[object], raw_held)):
         raise state_error(step, path, "merges_held", "a list of text")
+    raw_next = fields.get("next", [])
+    if not isinstance(raw_next, list) or not all(isinstance(item, str) and item.strip() and "\n" not in item
+                                                 for item in cast(list[object], raw_next)):
+        raise state_error(step, path, "next", "a list of one-line text")
     outstanding: KeepOutstanding | ReplaceOutstanding = KeepOutstanding()
     if "open_for_user" in fields:
         raw_open = fields["open_for_user"]
@@ -305,7 +312,7 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
                 items.append(OpenQuestionWithoutText(cast(str, item["text"]), after))
         outstanding = ReplaceOutstanding(tuple(items))
     return ShowrunnerState(tuple(units), tuple(cast(list[str], raw_held)), outstanding,
-                           report_items(fields, path, step))
+                           report_items(fields, path, step), tuple(cast(list[str], raw_next)))
 
 
 def report_items(fields: dict[str, object], path: Path, step: str) -> KeepReports | ReplaceReports:
@@ -397,7 +404,7 @@ def state_block(production: Production, state: ShowrunnerState, timestamp: str) 
     held_lines = ", ".join(state.merges_held)
     open_lines = ", ".join(item.text for item in read_outstanding(outstanding_path(production)))
     return "\n".join([f"### STATE {timestamp}", *unit_lines, f"Merges accepted but held: {held_lines or 'none'}",
-                      f"Open for the user: {open_lines or 'none'}", ""])
+                      f"Open for the user: {open_lines or 'none'}", f"Next: {'; '.join(state.owed) or 'none'}", ""])
 
 
 def append_log(production: Production, event: str, path: Path | None, before_compaction: bool) -> None:

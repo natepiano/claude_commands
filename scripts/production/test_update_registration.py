@@ -334,7 +334,10 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         prompt = prompts[0].read_text(encoding="utf-8")
         self.assertIn("unit_status.txt", prompt)
         self.assertIn("/showrunner:dailies gantt", prompt)
-        self.assertEqual(prompt.count("Pass `--render-state <SCRATCH>/dailies_state.json` to the builder"), 1)
+        state_dir = self.state / "showrunner" / self.doc.name.removesuffix("-production.md") / "session"
+        self.assertEqual(prompt.count(f"Pass `--render-state {state_dir}/dailies_state.json` to the builder"), 1)
+        self.assertIn(f"unit_status.sh {state_dir}/unit_status ", prompt)
+        self.assertNotIn("<STATE_DIR>", prompt)
         self.assertEqual(prompt.count("--render-state"), 1)
         self.assertIn("America/Los_Angeles", prompt)
         self.assertIn(f"--production {self.doc}", prompt)
@@ -376,7 +379,9 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         _ = state.write_text(json.dumps({"units": [{"unit": "alpha-unit", "phase": "Phase 2 of 3: panels",
                                                     "wait": "review"}],
                                            "merges_held": ["alpha phase 2"],
-                                           "open_for_user": ["stale state item"]}), encoding="utf-8")
+                                           "open_for_user": ["stale state item"],
+                                           "next": ["merge alpha phase 2 when its gate is green",
+                                                    "send the restarts plan at 03:30"]}), encoding="utf-8")
         before = self.run_command("log", "compacting", "--state", str(state), "--before-compaction")
         self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
         log = (self.checkout / "production.log").read_text(encoding="utf-8")
@@ -384,11 +389,12 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertIn("Merges accepted but held: alpha phase 2", log)
         self.assertIn("Open for the user: review colors", log)
         self.assertNotIn("stale state item", log)
+        self.assertIn("Next: merge alpha phase 2 when its gate is green; send the restarts plan at 03:30", log)
 
     def test_invalid_state_fails_log_without_writing(self) -> None:
         log = self.checkout / "production.log"
         _ = log.write_text("existing line\n", encoding="utf-8")
-        for key, value in (("unknown", 1), ("units", "wrong"), ("merges_held", "wrong")):
+        for key, value in (("unknown", 1), ("units", "wrong"), ("merges_held", "wrong"), ("next", ["two\nlines"])):
             with self.subTest(key=key):
                 state = self.root / f"{key}.json"
                 _ = state.write_text(json.dumps({key: value}), encoding="utf-8")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -146,9 +147,33 @@ def checkout_ready(production: Production) -> PlanLanded | PlanPending:
     return state
 
 
-def load(production: Production, lines: list[str], resume: bool) -> None:
+# The showrunner state a scratchpad held before showrunners.session_state_dir; load copies each one that is absent.
+SESSION_STATE = ("dailies_input_state", "unit_status", "showrunner_state.json", "dailies_judgment.json",
+                 "dailies_state.json")
+
+
+def move_session_state(slug: str, scratch: Path) -> None:
+    """Copy each state file the scratchpad holds and the state directory does not; a copy never replaces one."""
+    target = showrunners.session_state_dir(slug)
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for name in SESSION_STATE:
+        source, destination = scratch / name, target / name
+        if destination.exists() or not source.exists():
+            continue
+        if source.is_dir():
+            _ = shutil.copytree(source, destination)
+        else:
+            _ = shutil.copy2(source, destination)
+        copied.append(name)
+    report("state-dir", "ok", f"{target}" + (f"; copied {', '.join(copied)} from {scratch}" if copied else ""))
+
+
+def load(production: Production, lines: list[str], resume: bool, scratch: Path | None) -> None:
     state = checkout_ready(production)
     report("load", "ok", "production doc read")
+    if scratch is not None:
+        move_session_state(production.slug, scratch)
     if not resume and not isinstance(doc_status(lines), ProductionRunning):
         return
     if production.log.exists():
@@ -537,6 +562,7 @@ def main() -> int:
     _ = parser.add_argument("--production", required=True, type=Path)
     _ = parser.add_argument("--no-ci", action="store_true")
     _ = parser.add_argument("--resume", action="store_true")
+    _ = parser.add_argument("--scratch", type=Path, help="load: the scratchpad whose state moves to the state directory")
     # Accepted and unused: a showrunner started before its name was looked up still passes it.
     _ = parser.add_argument("--session")
     _ = parser.add_argument("--ci-green")
@@ -555,7 +581,7 @@ def main() -> int:
         production = read_production(cast(Path, args.production))
         lines = doc_lines(production)
         if action == "load":
-            load(production, lines, cast(bool, args.resume))
+            load(production, lines, cast(bool, args.resume), cast(Path | None, args.scratch))
         elif action == "open":
             open_production(production, lines)
         elif action == "promote-main":

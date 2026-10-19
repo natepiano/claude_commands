@@ -228,6 +228,11 @@ def production_slug(doc: str) -> str:
     return slug
 
 
+def session_state_dir(slug: str) -> Path:
+    """The showrunner's own state, which a new session id, a restart and a reboot keep; a wrap deletes it."""
+    return SHOWRUNNER_STATE_DIR / slug / "session"
+
+
 def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
     """Map a former production name to its current slug; leave other slugs unchanged."""
     timers: list[Timer] = []
