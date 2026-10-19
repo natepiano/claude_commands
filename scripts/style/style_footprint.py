@@ -25,6 +25,8 @@ NUMBER = re.compile(r"\d[\w.]*(?:[+-]\d+)?")
 IDENTIFIER = re.compile(r"(?:r#)?[A-Za-z_][A-Za-z_0-9]*")
 PUNCTUATION = re.compile(r"::|->|=>|==|!=|<=|>=|&&|\|\||[{}()\[\];:,.<>!&|+*/%=\-?#@'$^~]")
 FILE_CHANGED_LINE_LIMIT = 200
+# The std traits whose derives add no names to the item they decorate.
+STD_DERIVES = frozenset({"Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Debug"})
 
 
 class FootprintError(Exception):
@@ -1271,7 +1273,6 @@ def function_bodies(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
 def enum_bodies(words: tuple[str, ...]) -> tuple[EnumBody, ...]:
     result: list[EnumBody] = []
     attributes = decorated_items(words)
-    allowed = {"Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Debug"}
     for index, word in enumerate(words[:-1]):
         if word != "enum":
             continue
@@ -1301,7 +1302,7 @@ def enum_bodies(words: tuple[str, ...]) -> tuple[EnumBody, ...]:
         for start, finish in attribute_spans(attached):
             attribute = attached[start:finish]
             if len(attribute) < 6 or attribute[2:4] != ("derive", "(") or any(
-                name not in allowed and name != "," for name in attribute[4:-2]
+                name not in STD_DERIVES and name != "," for name in attribute[4:-2]
             ):
                 safe = False
         result.append(EnumBody(words[index + 1], begin, end, tuple(variants), frozenset(attributed_variants), safe))

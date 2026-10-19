@@ -80,7 +80,8 @@ checking once more for work; delivery clears only that wait, preserving a later 
 A ticket with no code changes makes no commit: record its cells at HEAD, verify
 `git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then run
 `style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD>`
-and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`. Follow
+and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`. Act on
+its `not built` lines as after a showrunner's `ticket merge` (**Merging back**). Follow
 the checkpoint procedure's atomic committed-awaiting-release record using that
 ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
 report `From <unit>: ticket <id> closed with no code change; <n> held.` and
@@ -151,7 +152,8 @@ judged. Both `queue` and `next-phase` read the unit's own copy.
 One style production and one synced branch point per repository. The ledger is
 `~/.local/state/style/<repo>/ledger.sqlite`; only `style_ledger.py` writes it.
 Startup runs `style_ledger.py reconcile --repo <checkout> --branch-point <branch>
---style-branch <style branch>` and logs its change lines. Reconcile recovers work
+--style-branch <style branch>` and logs its change lines. Act on its `not built`
+lines as after `ticket merge` (**Merging back**). Reconcile recovers work
 state from Git without advancing a tip already associated with that style branch.
 When initializing or changing the style branch, reconcile syncs the ledger at
 that branch's commit, falling back to the branch-point tip only if the style
@@ -262,6 +264,12 @@ with one `--also <path>` for each entry of the unit's open ticket's `files`
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
 to wake every unit waiting for sync, and send the owning unit director
 `From the showrunner of <style slug>: ticket <id> merged; refill.`
+For each `has no applied check` line that merge prints, check the change in the
+code, and run the printed `held built` command when the change is there. A rerun
+of `ticket merge` on a merged ticket prints these lines again. A finding whose
+change is not there waits for a person, who makes the change and
+runs that command, or waives the finding with
+`style_ledger.py held waive --repo <checkout> --id <finding id>`.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.
@@ -292,7 +300,8 @@ as unit checkpoints.
 
 At startup, first run
 `style_sync.py resume --repo <checkout> --slug <style slug> --branch-point <branch point> --style-branch <style merge branch>`
-and append its reconcile change lines to **Log**. Reconcile stores the branch
+and append its reconcile change lines to **Log**. Act on its `not built` lines as
+after `ticket merge`. Reconcile stores the branch
 point before any acknowledgment and marks merged hand-offs by ancestry.
 Replay proceeds oldest first: pending notices are sent then recorded; sent
 notices are sent again; a notice sent to another parent is sent to the current
@@ -417,6 +426,42 @@ file and the commit. When no finding of the decision is left to build, refill
 closes it. Refill does not assign a queued proposal ticket that was
 made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
 then run migrate.
+
+A finding is built only when its change is in the code. A rename finding
+whose `before` and `after` are one `<parent>::<name>` pair has an applied check
+in the finding's file. It is not applied while the old name has a declaration
+under its parent, and applied when only the new name has one. A parent is an
+enum, struct, union, trait, impl or inline module, or the file itself as its
+module (`crate` for `lib.rs` and `main.rs`). The gate refuses an approved ticket
+while any such rename is not applied in the worktree, with one line per rename:
+`review: <finding id>: <before> -> <after> not applied in <path>`.
+`ticket merge` marks a finding built only when its check passes at the
+ticket's checkpoint, and prints one line for each other finding. A rename that
+is not applied stays filed with no build ticket, so the next refill takes it
+into a new ticket: `not built <finding id>: rename not applied in <path>`.
+A finding with no applied check stays filed and keeps its merged ticket, so
+refill skips it until a person marks it built:
+`not built <finding id>: <kind> has no applied check; mark it built with style_ledger.py held built --repo <checkout> --id <finding id> after checking`.
+`held built` refuses a finding with no merged build ticket, and a rename that is
+not applied at that ticket's checkpoint.
+A rename also has no check when its file declares neither name under one
+parent, or when more than one item in the file has the parent's name.
+The decision stays open and approved until every finding is built or waived.
+
+To repair a decision or an old issue that closed too early, run
+`style_proposals.py reopen --repo <style checkout> --issue <issue> --parent <slug> [--dry-run]`.
+It checks each built rename at the synced tip and sets each one that is not
+applied back to filed, with no build ticket. Findings with no check stay built.
+A decision opens again with its approval. The findings of an old issue move to
+the decision for their rule, crate and rule blob, as migrate moves them; a new
+decision takes the old issue's approval. Reopen prints
+`filed again <finding id> in <decision>: <before> -> <after> not applied in <path>`
+for each finding, or `nothing to reopen: every built finding is applied`.
+The dry run prints the same lines and writes nothing. Reopen refuses an issue
+that is not approved, an issue that an open ticket builds, an issue with a
+merged ticket whose checkpoint the synced tip does not hold yet (sync first), and
+an old issue that migrate would refuse or whose decision is declined or has no
+answer. A refusal writes nothing.
 
 After each merge and at startup, run `style_proposals.py complete --repo
 <style checkout>`. It closes only approved decisions, and only when all their
