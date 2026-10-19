@@ -81,35 +81,42 @@ Steps on natedev, in order, after promotion:
 1. herdr `~/.config/herdr/config.toml`: add `[session]` with `resume_agents_on_restore = false`,
    then `herdr --session agents server reload-config`.
 2. `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_record.py seed` once.
-3. The nixos units (`modules/linux/agent-sessions.nix` or a new `herdr.nix`) below, then rebuild.
-   The shared server running now is the transient unit `herdr-agents.service` that
-   `systemd-run` made, the same name. Not tested: how the rebuild treats a unit file under the name
-   of an active transient unit. After the rebuild, check `systemctl --user status
-   herdr-agents.service` and that only one `herdr --session agents server` runs. The boot unit
-   takes over at the next reboot.
+3. The nixos units below, added to `modules/linux/herdr.nix`, then
+   rebuild. The shared server running now is the transient unit `herdr-agents.service` that
+   `systemd-run` made, the same name, and the transient file wins while it runs. Not tested: how
+   the rebuild treats a unit file under the name of an active transient unit. After the rebuild,
+   check `systemctl --user status herdr-agents.service` and that only one
+   `herdr --session agents server` runs. The boot unit takes over at the next reboot. Linger is
+   off, so both units start at login. Both take the user manager's PATH, as the transient unit
+   does now.
 
 ```nix
-systemd.user.services.herdr-agents = {
-  description = "The shared herdr session, from login";
-  wantedBy = [ "default.target" ];
-  serviceConfig = {
-    Environment = "PATH=/etc/profiles/per-user/${username}/bin:/run/current-system/sw/bin";
-    ExecStart = "/etc/profiles/per-user/${username}/bin/herdr --session agents server";
-    # The restore takes minutes; its own unit keeps it out of this unit's start time.
-    ExecStartPost = "/run/current-system/sw/bin/systemctl --user start --no-block herdr-agents-restore.service";
-    Restart = "on-failure";
-    RestartSec = 5;
+{ inputs, pkgs, ... }:
+{
+  # environment.systemPackages as now.
+
+  systemd.user.services.herdr-agents = {
+    description = "The shared herdr session, from login";
+    wantedBy = [ "default.target" ];
+    serviceConfig = {
+      ExecStart = "/run/current-system/sw/bin/herdr --session agents server";
+      # The restore takes minutes; its own unit keeps it out of this unit's start time.
+      ExecStartPost = "/run/current-system/sw/bin/systemctl --user start --no-block herdr-agents-restore.service";
+      Restart = "on-failure";
+      RestartSec = 5;
+    };
   };
-};
-systemd.user.services.herdr-agents-restore = {
-  description = "Resume each herdr pane's Claude on its own account";
-  after = [ "herdr-agents.service" ];
-  serviceConfig = {
-    Type = "oneshot";
-    Environment = "PATH=/etc/profiles/per-user/${username}/bin:/run/current-system/sw/bin";
-    ExecStart = "%h/.claude/scripts/lib/py %h/.claude/scripts/shutdown/pane_restore.py";
+  systemd.user.services.herdr-agents-restore = {
+    description = "Resume each herdr pane's Claude on its own account";
+    after = [ "herdr-agents.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "%h/.claude/scripts/lib/py %h/.claude/scripts/shutdown/pane_restore.py";
+      # Up to 90 s per pane; the 90 s default start timeout would kill it.
+      TimeoutStartSec = "1h";
+    };
   };
-};
+}
 ```
 
 ## Still to come
