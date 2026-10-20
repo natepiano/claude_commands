@@ -54,7 +54,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
   - `scripts/production/merge_checkpoint.py` — 940 lines; `request_from` :278, refusal `unit {name} not in production doc` :285; CLI positionals `unit phase hash`, `--production`, `--started` (required), `--review-trial`/`--delivers`/`--parallel` (required for a code checkpoint) (`main` :910-929); `merge_branch_history` :333, regex :336 `^Merge (.+?) phase (\S+?)( shrink| as-built)? \(([0-9a-f]+)\)`; `merge_history` :349; `merge_subject` :539 `Merge <unit> phase <phase>[ shrink| as-built] (<hash7>) into <merge branch>`; `push_git` :677 (`git push` :687); `push_validate` :711 (`--quick` :714); `run` :856, push step :886-890, then `record_changes`, `into`, `promote`, `record`. Productions without a `**Push:**` line (cargo-liner, hana) push through validate_and_push `--quick`.
   - `scripts/production/merge_gate.py` — `TEST_SUITES` :40-45 (fixed list; the gate refuses a listed suite with no test modules); `run_suites` :279 globs `scripts/<suite>/test_*.py`; `merge_checkpoint` :459, subject :483 `Merge {unit} {phase} ({checkpoint}) into {merge_branch}`, `git push` :502; `--tests-only` :564.
   - `scripts/validate_and_push/validate_ci.sh:201` — `VALIDATE_QUICK=1` skips clippy, rustdoc and nextest; quick runs mend, rustfmt and taplo (:259).
-  - `scripts/delegate/verify.sh` — the lint/check/test front end (`lint <pkg>`).
+  - `scripts/direct/verify.sh` — the lint/check/test front end (`lint <pkg>`).
   - `scripts/production/dailies_render.py` — 1941 lines; `ChildReport` :395; `check_keys` :645 rejects unknown keys; `parse_child_row` :720; `parse_child_report` :731 with `check_keys` :734 over `{written, zone, interval, units, held, rows}`; `parse_child` :745; `child_row` :1690; `last_report` :1806 (pure).
   - `scripts/production/dailies_input.py` — `save_last_report` :784, called :1069.
   - `scripts/production/proposal_issue.py`, `proposals_table.py` — the proposal issue writer and the `/showrunner:proposals` table.
@@ -374,7 +374,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `scripts/style/add_style.py`, `scripts/style/test_add_style.py` — `standing_style_production`
 - `scripts/style/style_plan.py`, `scripts/style/style_footprint.py` and their tests — shared lookup, `--worktree` gate
 - `scripts/style/test_standing_checkpoint.py` — temp-repo standing-checkpoint acceptance case
-- `scripts/delegate/verify.sh` — `lint --workspace --check`
+- `scripts/direct/verify.sh` — `lint --workspace --check`
 - `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate.py` and their tests — `notify_style`
 
 **Binds later work:** `ticket <id> merged; refill.` is the only wake for the merge wait; the child hand-off path's push calls the same `notify_style`; new hand-off subcommands join the `style_sync.py` CLI (which already inserts `scripts/production` on `sys.path`); the style showrunner's unit-checkpoint merge must keep the unit's tip an ancestor so the unit's next `--ff-only` merge succeeds; the proposal-ticket approved-file gate replaces the gate in both `<StandingPlanRefill>` and checkpoint step 6.
@@ -583,7 +583,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `docs/as-built/fix-pipeline.md`, `docs/plans/fix-pipeline-deferred.md` — deleted
 - `commands/nightly_review.md` — rust mode without style sweeps or a weight line
 - `commands/make_a_worktree.md`, `commands/worktree_delete.md`, `scripts/worktree_delete/perform_deletion.sh`, `scripts/new_rust_project/rust_generate.sh` — no fix-pipeline hooks
-- `commands/lint_config.md`, `scripts/lint/*`, `scripts/delegate/verify.sh` — consumers without the fix pipeline
+- `commands/lint_config.md`, `scripts/lint/*`, `scripts/direct/verify.sh` — consumers without the fix pipeline
 - `scripts/cli_agent/cli_agent.sh`, `scripts/whoami/test_quota_alert.py`, `scripts/agents/test_agent_exec.py`, `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh`, `docs/as-built/agent-registry.md` — fix references removed
 - `pyrightconfig.json` — no `scripts/fix` environment
 
@@ -819,7 +819,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** a new stage value (the vault already ranks `active` as in progress); writing stages on read in the footer or table; changing `dailies_counts.py` `issues` counts or the style ledger's `proposals <n>` line.
 
-### Phase 30 — a finding on a renamed item follows the rename  · status: todo
+### Phase 30 — a finding on a renamed item follows the rename  · status: done
 
 **Depends on:** Phase 28
 
