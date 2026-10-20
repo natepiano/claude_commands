@@ -50,7 +50,9 @@ State:
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
-  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`), and
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`; an
+  object may add `urgency`: `blocks`, `soon` with `due`, or `later`, and
+  `follows`: the text of the item it comes after), and
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
   remove an item once it is reported; it needs no review), and `next` (a list
@@ -264,11 +266,11 @@ State:
   The user sees the count at all times in the Claude Code status line's
   `For you: …` row, under the quota row, with the changes, proposals and
   projects.
-  When the user asks for the next question, show only the oldest due item
+  When the user asks for the next question, show only the current item
   (`/next question`).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
-  --production PRODUCTION_DOC` and show its list, oldest first, each item led
+  --production PRODUCTION_DOC` and show its list in the order of `/next`, each item led
   by the production that owns it. A dailies report still lists what needs the user in full, because
   it is a report the user asked for. User, 2026-10-12, replacing the
   2026-10-06 rule that restated the user's items in every reply.
@@ -499,7 +501,7 @@ whatever arrived:
 | a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
 | the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
-| the user asks what the open questions are | run `update_registration.py open --production PRODUCTION_DOC` and show its list: every item now due in full, oldest first, each led by its production; a deferred item with its time; a list it could not read (<Throughout/> → Open questions) |
+| the user asks what the open questions are | run `update_registration.py open --production PRODUCTION_DOC` and show its list: every item now due in full, in the order of `/next`, each led by its production; a deferred item with its time; a list it could not read (<Throughout/> → Open questions) |
 | a child showrunner's item for the user | show it in the child's words; relay the answer to that child (<Throughout/> → Nested showrunners) |
 | the user's words for a production below this one | relay them to the child that holds it (<Throughout/> → Nested showrunners) |
 

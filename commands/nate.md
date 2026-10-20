@@ -48,8 +48,9 @@ pushes always go through. The delay says when silence starts. Act on the instruc
 - None: `on` (lasts until `off`).
 - An end (`until 7am`): `on --until "YYYY-MM-DD HH:MM"`; a length (`for an hour`): `on --for 1h`.
 - `off` or `status`: that subcommand.
-- `auto <length>` (`auto 45min`), `auto off`, or `auto` alone (shows it): run
-  `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/auto_silence.py" [<span>|off]`, never delayed.
+- `auto on` (2 h idle), `auto <length>` (`auto 45min`), `auto off` (turns it off), or `auto` alone (shows
+  it): run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/auto_silence.py" [on|<span>|off]`,
+  never delayed.
   After that long with no prompt in a showrunner or unit director, silence starts and the user gets one
   push; their next prompt there ends it, with one push. A silence set by hand never ends this way.
 

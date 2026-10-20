@@ -53,8 +53,12 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add <production> --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>]
+… add <production> --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>] [--urgency <level>] [--due <ISO>] [--after C<n>]
 ```
+
+`--urgency` is `blocks` (work stops until the user checks it), `soon` (with
+`--due`), `later` or `user`; leave it out for a normal row. `--after` names a
+row that must be checked first.
 
 One row per change, written for a person with no context. Each part is one
 line. `--check` names the machine (natedev or the Mac), the session (a
@@ -79,7 +83,7 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 ## show
 
 Only when the user asks for "change review" or "the next change"
-(`/next change`). Run `show <production>`. It prints the first row to review:
+(`/next change`). Run `show <production>`. It prints the current row:
 its id and change, how to check it, when it merged, and how many rows wait
 after it; or `nothing to review`. Say what changed, how to try it and what the
 user sees, even if already shown, then wait for the user's verdict in their
@@ -87,6 +91,10 @@ reply. Never use a form; ask in one plain-text line.
 
 Show one row per request. After its verdict, stop: never show the next row
 until the user asks for it (user, 2026-10-20).
+
+The list keeps the order of `/next` (`commands/next.md`): the row `show`
+printed stays first until its verdict. When the user calls a row important,
+run `mark-important <production> --row C<n>`.
 
 ## verdict
 
