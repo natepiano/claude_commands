@@ -273,7 +273,7 @@ class StyleProposalsTests(unittest.TestCase):
         issue = self.proposals / (name + ".md")
         identities = ", ".join(finding.finding_id for finding in findings)
         _ = issue.write_text(f'---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'style_findings: [{identities}]\nunit: names-unit\nplan: unit.md\n---\n# Old\n')
+                             + f'style_findings: [{identities}]\nunit: names-unit\nplan: unit.md\n---\n# Old\n\nParent: parent\n')
         for finding in findings:
             ledger.file_held(finding.finding_id, issue)
         return issue
@@ -942,7 +942,7 @@ class StyleProposalsTests(unittest.TestCase):
         self.assertEqual(self.reopen_all(), (1, [self.filed_again_line(reopened, missing),
                                                  f"skipped {refused}: open ticket names-unit-1 builds it",
                                                  "totals: reopen 1, filed again 1, skipped 1"],
-                                             "style_proposals: skipped 1 decisions\n"))
+                                             "style_proposals: skipped 1 issues\n"))
         with self.ledger() as ledger:
             states = {finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
         self.assertEqual((states[missing.finding_id], states[kept.finding_id]),
@@ -957,6 +957,72 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             self.assertEqual(self.written(ledger), before)
         self.assertEqual(self.reopen_all(), preview)
+
+    def test_reopen_all_moves_a_closed_old_issue_under_the_parent_that_its_parent_line_names(self) -> None:
+        with self.ledger() as ledger:
+            old, _, missing = self.closed_old_issue(ledger)
+            _ = old.write_text(old.read_text().replace("Parent: parent\n", "Parent: remove-running-section\n"))
+            before = self.written(ledger)
+        decision = self.proposals / style_proposals.batch_name(
+            style_proposals.DecisionKey(self.rename, "alpha", missing.rule_blob))
+        moved = (0, [self.filed_again_line(decision, missing), "totals: reopen 1, filed again 1, skipped 0"])
+        # The issue's own Parent line comes before --parent.
+        self.assertEqual(self.reopen_all("--dry-run", "--parent", "given")[:2], moved)
+        with self.ledger() as ledger:
+            self.assertEqual(self.written(ledger), before)
+        self.assertEqual(self.reopen_all("--parent", "given")[:2], moved)
+        self.assertIn("Parent: remove-running-section\n", decision.read_text())
+        with self.ledger() as ledger:
+            self.assertEqual(ledger.proposal_findings(decision)[0].state, style_ledger.Filed(decision))
+
+    def test_reopen_all_prints_a_skip_line_for_each_issue_with_built_findings_that_it_leaves_out(self) -> None:
+        with self.ledger() as ledger:
+            reopened, _, filed = self.built_decision(ledger, "alpha")
+            declined = self.approved_decision(ledger, refused := self.hold(ledger, rule=self.propose, crate="beta", line=5))
+            self.built_before_the_check(ledger, refused)
+            style_proposals.decline(ledger, declined, "not now")
+            old, _, missing = self.closed_old_issue(ledger, "beta")
+            _ = old.write_text(old.read_text().replace("Parent: parent\n", ""))
+            gone = self.legacy_issue(ledger, "gone", lost := self.hold(ledger, crate="beta", line=6))
+            unanswered = self.legacy_issue(ledger, "unanswered", unasked := self.hold(ledger, crate="beta", line=7))
+            _ = unanswered.write_text(unanswered.read_text().replace("unit: names-unit\nplan: unit.md\n", ""))
+            self.issue_command("close", str(unanswered), "--reason", "closed by hand")
+            self.built_before_the_check(ledger, lost, unasked)
+            gone.unlink()
+        self.assertEqual(self.reopen_all("--dry-run"), (1, [
+            f"skipped {gone}: missing file", f"skipped {old}: no Parent line; pass --parent",
+            self.filed_again_line(reopened, filed), f"skipped {declined}: not approved",
+            f"skipped {unanswered}: closed without answer", "totals: reopen 1, filed again 1, skipped 4"],
+            "style_proposals: skipped 4 issues\n"))
+        moved_to = self.proposals / style_proposals.batch_name(
+            style_proposals.DecisionKey(self.rename, "beta", missing.rule_blob))
+        code, lines, _ = self.reopen_all("--parent", "given")
+        self.assertEqual((code, lines[1], lines[-1]), (1, self.filed_again_line(moved_to, missing),
+                                                        "totals: reopen 2, filed again 2, skipped 3"))
+        self.assertIn("Parent: given\n", moved_to.read_text())
+
+    def test_reopen_all_skips_an_old_issue_whose_decision_has_no_generated_body_and_writes_nothing(self) -> None:
+        with self.ledger() as ledger:
+            decision = self.approved_decision(ledger, self.hold(ledger, line=4))
+            old, _, _ = self.closed_old_issue(ledger)
+            _ = decision.write_text(decision.read_text().replace(proposal_issue.GENERATED_START, ""))
+            before = self.written(ledger)
+        skipped = (1, [f"skipped {old}: {decision}: missing generated decision body",
+                       "totals: reopen 0, filed again 0, skipped 1"], "style_proposals: skipped 1 issues\n")
+        self.assertEqual(self.reopen_all("--dry-run"), skipped)
+        self.assertEqual(self.reopen_all(), skipped)
+        with self.ledger() as ledger:
+            self.assertEqual(self.written(ledger), before)
+
+    def test_reopen_all_keeps_the_parent_of_an_existing_decision_that_an_old_issue_moves_into(self) -> None:
+        with self.ledger() as ledger:
+            decision = self.approved_decision(ledger, self.hold(ledger, line=4))
+            _, _, missing = self.closed_old_issue(ledger)
+            _ = decision.write_text(decision.read_text().replace("Parent: parent\n", "Parent: other\n"))
+        self.assertEqual(self.reopen_all()[:2], (0, [self.filed_again_line(decision, missing),
+                                                     "totals: reopen 1, filed again 1, skipped 0"]))
+        self.assertIn("Parent: other\n", decision.read_text())
+        self.assertNotIn("Parent: parent\n", decision.read_text())
 
     def test_sites_and_candidates_list_the_ledger_records_without_filing_candidates(self) -> None:
         with self.ledger() as ledger:

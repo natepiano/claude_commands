@@ -651,4 +651,25 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
 
 **Gotchas:**
-- A built finding whose decision file is missing is skipped without a line.
+- A built finding whose decision file is missing was skipped without a line; phase 22 prints `skipped <issue>: missing file`.
+
+### Phase 22 — reopen --all covers old-form issues  · status: done
+**Depends on:** Phase 21
+
+#### Work Order
+
+**Goal:** `reopen --all` also checks approved old-form style issues (not decisions) that hold built findings, and prints a skip line for every issue it leaves out, so it never skips without a word.
+
+**Spec:**
+- Old-form approved issues with built findings join the sweep. Find each issue parent by itself (from the issue or the ledger); take an optional `--parent` only if it cannot. Ruled by natedev, 2026-10-20.
+- Every issue with built findings that the sweep leaves out (missing file, not approved, closed without answer, no parent found) prints one skip line and counts in `skipped`.
+- Test: a dry run over an old-form issue with a false built row reports it (not totals 0).
+
+**Files:** `scripts/style/style_proposals.py`, `scripts/style/test_style_proposals.py`, `docs/style_production.md`
+
+**Workers:** 1 writer — nothing splits.
+- `impl` — all of the above
+
+**Constraints from prior phases:** Phase 21: `reopen_all`, `file_unapplied_again`, `Built(proposal)`.
+
+**Acceptance gate:** the tests above; `scripts/style` green; basedpyright clean; merge gate `--tests-only` green.

@@ -380,7 +380,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE held_findings SET state='built'")
         before = self.held_rows(ledger.database)
-        hint = f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all (decision {issue})\n"
+        hint = f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all (issue {issue})\n"
         for index, (finding_id, notice) in enumerate(((ids[0], ""), (ids[1], hint))):
             result = self.cli(
                 "held", "add", "--rule", rule, "--path", self.sources[index], "--line", str(index + 1),
