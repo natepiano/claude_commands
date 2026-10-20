@@ -5,21 +5,25 @@ import { BoardView } from "../hooks/board";
 import { UnitView } from "../hooks/unit";
 import { cellWidth, fitText } from "../hooks/geometry";
 import type { BoardData, BoardUnit } from "../types/board";
-import { fixture, NOW, phase, time } from "./kit";
+import { engineFiles, fixture, NOW, phase, time } from "./kit";
 
 const props = { title: "Units", isFocused: true, bodyColumns: 170,
   scroll: { offset: 0, bodyRows: 50 }, view: {}, placement: "dock" as const };
 
-async function render($: Engine, on: On, surface: RenderSurface, data: BoardData, detail = false, columns = 170, bodyRows = 50) {
-  on("ui.render", { component: "Pane", requestId: "phase8-layout" }, ($, event) => {
+function prepareRender($: Engine, on: On, surface: RenderSurface, data: BoardData, detail = false, columns = 170, bodyRows = 50, requestId = "phase17-layout") {
+  on("ui.render", { component: "Pane", requestId }, ($, event) => {
     const elements = $.ui.resolve(event);
     return detail
       ? UnitView(elements, columns, bodyRows, data, data.units[0]!, NOW / 1000, () => {})
       : BoardView(elements, columns, bodyRows, { files: [], watch: [], loadedAt: NOW / 1000,
-        boards: [data], focus: null }, NOW / 1000, () => {});
+        boards: [data] }, NOW / 1000, () => {});
   });
-  return $.ui.mount({ plugin: "unit-board", component: "Pane", requestId: "phase8-layout", surface,
+  return () => $.ui.mount({ plugin: "unit-board", component: "Pane", requestId, surface,
     props: { ...props, bodyColumns: columns, scroll: { offset: 0, bodyRows } } });
+}
+
+async function render($: Engine, on: On, surface: RenderSurface, data: BoardData, detail = false, columns = 170, bodyRows = 50) {
+  return prepareRender($, on, surface, data, detail, columns, bodyRows)();
 }
 
 function node(value: unknown): Record<string, unknown> {
@@ -77,32 +81,26 @@ function occupiedRows(value: unknown): number {
     + Number(attributes.paddingBottom ?? attributes.paddingY ?? attributes.padding ?? 0);
 }
 
-function trunk(): BoardData {
-  const data = fixture();
-  const running = Array.from({ length: 4 }, (_, index) => {
-    const result = unit(`run-${index + 1}`, "running");
-    result.phase = { id: "2", of: 3, title: `Active delivery ${index + 1}` };
-    result.stage = ["Build", "Tests", "Review", "Repair round 2"][index]!;
-    result.workers = [{ slot: `worker-${index + 1}`, role: "", state: "running", model: "", doing: "" }];
-    return result;
-  });
-  const folded = Array.from({ length: 18 }, (_, index) => {
-    const result = unit(`d${String(index + 1).padStart(2, "0")}`, index % 2 ? "standing-by" : "run-finished");
-    result.phase = null;
-    result.phases = [phase("1", "done")];
-    result.stage = index % 2 ? "Standing by" : "Run done";
-    result.finish = { kind: "finished", at: time(-10, "17:50") };
-    result.workers = [{ slot: "folded-worker", role: "review", state: "paused", model: "", doing: "" }];
-    return result;
-  });
-  data.units = [folded[0]!, running[0]!, folded[1]!, ...running.slice(1), ...folded.slice(2)];
-  return data;
+/** Preserve vertical spacing when checking the rows a person sees. */
+function layoutRows(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(layoutRows);
+  if (node(value).type !== "Box") return lines(value);
+  const attributes = node(node(value).props);
+  const content = attributes.flexDirection === "column"
+    ? children(value).map(layoutRows).filter(rows => rows.length).flatMap((rows, index) =>
+      [...Array<string>(index ? Number(attributes.rowGap ?? attributes.gap ?? 0) : 0).fill(""), ...rows])
+    : lines(value);
+  const top = Number(attributes.marginTop ?? 0)
+    + Number(attributes.paddingTop ?? attributes.paddingY ?? attributes.padding ?? 0);
+  const bottom = Number(attributes.marginBottom ?? 0)
+    + Number(attributes.paddingBottom ?? attributes.paddingY ?? attributes.padding ?? 0);
+  return [...Array<string>(top).fill(""), ...content, ...Array<string>(bottom).fill("")];
 }
 
 function longUnit(): BoardData {
   const data = fixture();
   const active = data.units[0]!;
-  active.phase = { id: "10", of: 17, title: "Current delivery" };
+  active.phase = { kind: "plan", id: "10", of: 17, title: "Current delivery" };
   active.phases = Array.from({ length: 17 }, (_, index) => {
     const id = index + 1;
     const row = phase(String(id), id < 10 ? "done" : id === 10 ? "open" : "todo");
@@ -120,32 +118,515 @@ function longUnit(): BoardData {
   return data;
 }
 
-// Run the same layout assertions against both engine element surfaces.
-describe("board layout", () => {
+/** Inspect inherited colors, including facts nested inside a colored Text. */
+function coloredText(value: unknown, inherited = "default"): { text: string; color: string }[] {
+  if (typeof value === "string" || typeof value === "number") return [{ text: String(value), color: inherited }];
+  if (value === null || value === undefined || typeof value === "boolean") return [];
+  if (Array.isArray(value)) return value.flatMap(child => coloredText(child, inherited));
+  const attributes = node(node(value).props);
+  const color = typeof attributes.color === "string" ? attributes.color : inherited;
+  return children(value).flatMap(child => coloredText(child, color));
+}
+function elements(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.flatMap(elements);
+  if (typeof value !== "object" || value === null) return [];
+  return [node(value), ...children(value).flatMap(elements)];
+}
+function textInColor(value: unknown, color: string): string {
+  return coloredText(value).filter(span => span.color === color).map(span => span.text).join("");
+}
+function normalized(rows: string[]): string[] {
+  return rows.filter(row => row.trim()).map(row => row.trim().replace(/\s+/g, " "));
+}
+function quietUnit(key: string, state: BoardUnit["state"]): BoardUnit {
+  return { ...noPhase().units[0]!, key, state,
+    stage: state === "run-finished" ? "Run done" : "Standing by" };
+}
+function activeUnits(): BoardData {
+  const data = fixture();
+  data.units = ["a", "b", "c"].map(key => {
+    const active = unit(key, "running");
+    active.stage = "Build";
+    active.eta!.fix_done = 0;
+    active.eta!.fix_running = 0;
+    active.finish = { kind: "unknown" };
+    return active;
+  });
+  return data;
+}
+function gated(data: BoardData, timed = false): void {
+  const row = data.units[0]!.phases[2]!;
+  row.status = "gated";
+  row.gate = timed
+    ? { kind: "timed", gate: "G1", until: time(60, "wrong gate time"), waits_on: "design approval" }
+    : { kind: "untimed", gate: "G1", waits_on: "design approval" };
+}
+
+// Both element surfaces must carry the same facts, colors and height budget.
+describe("phase 17 board", () => {
   for (const surface of ["terminal", "desktop"] as const) {
-    for (const bodyRows of [4, 50]) {
-      for (const hasStrip of [false, true]) {
-      test(`${surface}: a 76-column no-phase unit shows its stage once with ${hasStrip ? "a strip" : "no strip"} in ${bodyRows} rows`, async ($, on) => {
-        const data = noPhase();
-        const waiting = data.units[0]!;
-        waiting.state = "running";
-        waiting.stage = "Waiting on G3";
-        waiting.phases = hasStrip ? [phase("1", "done"), phase("2", "gated")] : [];
-        // Details force the compact branch in the four-row pane.
-        waiting.eta = fixture().units[0]!.eta;
-        waiting.workers = fixture().units[0]!.workers;
-        const ui = await render($, on, surface, data, false, 76, bodyRows);
+    test(`${surface}: all states share a case-insensitive alphabetical list with clickable bold names`, async ($, on) => {
+      const data = fixture();
+      data.units = [quietUnit("zulu", "run-finished"), unit("delta", "running"),
+        quietUnit("Bravo", "standing-by"), quietUnit("alpha", "run-finished")];
+      const ui = await render($, on, surface, data);
+      const tree = await ui.drawn();
+      const rows = lines(tree);
+      expect(rows.filter(row => row.includes("●")).map(row => row.match(/●\s+(\S+)/)?.[1]))
+        .toEqual(["alpha", "Bravo", "delta", "zulu"]);
+      expect(rows.join("\n")).not.toMatch(/(?:^|\n)(?:Done:|Standing by:)/);
+      expect(await ui.findAll({ type: "Button", text: /^open$/i })).toEqual([]);
+      for (const key of ["alpha", "Bravo", "delta", "zulu"]) {
+        const buttons = await ui.findAll({ type: "Button", text: new RegExp(`^${key}$`) });
+        expect(buttons).toHaveLength(1);
+        expect(buttons[0]!.props.plain).toBe(true);
+        const bold = elements(tree).some(element => node(element.props).bold === true
+          && lines(element).join("").includes(key));
+        expect(bold).toBe(true);
+      }
+    });
+
+    test(`${surface}: pressing the unit name opens that unit's detail`, async ($, on) => {
+      const fake = engineFiles(on);
+      const data = fixture();
+      data.units[0]!.summary = "Named unit detail reached";
+      fake.replace(data);
+      await $.command.run({ command: "showrunner:unit_board", args: "",
+        origin: { kind: "composer" }, presentation: { isFullscreen: false, columns: 170 } });
+      const ui = await $.ui.mount({ plugin: "unit-board", component: "Pane", requestId: "unit-board",
+        surface, props });
+      const button = (await ui.findAll({ type: "Button", text: /^alpha$/ }))[0];
+      if (!button?.key) throw new Error("Missing named unit button");
+      await ui.press({ key: button.key });
+      expect(lines(await ui.drawn()).join("\n")).toContain("Named unit detail reached");
+      expect(await ui.findAll({ type: "Button", text: /^board$/ })).toHaveLength(1);
+      expect(fake.processes).toHaveLength(1);
+    });
+
+    test(`${surface}: an active unit uses three rows without a ruler or ETA history`, async ($, on) => {
+      const data = fixture();
+      data.units[0]!.stage = "Phase 2 running";
+      const ui = await render($, on, surface, data);
+      const tree = await ui.drawn();
+      const rows = normalized(lines(tree));
+      const start = rows.findIndex(row => row.includes("●"));
+      expect(rows.slice(start)).toHaveLength(3);
+      expect(rows[start]).toBe("● alpha Phase 2 Delivery 2");
+      expect(rows[start + 1]).toMatch(/█▓░ 1\/3.*fix rounds 1 \+ 1 running.*ETA 14:30 · in 30m/);
+      expect(rows[start + 2]).toMatch(/workers 1 running.*run ends 14:42/);
+      expect(rows.join("\n")).not.toMatch(/Phase 2 running|first ETA|moved|│|━|─/);
+      expect(occupiedRows(tree)).toBeLessThanOrEqual(5);
+    });
+
+    for (const merged of [0, 62]) {
+      test(`${surface}: ticket ${merged} merged keeps the title and drops the redundant running stage`, async ($, on) => {
+        const data = fixture();
+        const active = data.units[0]!;
+        active.phase = { kind: "ticket", id: "alpha-63", merged, title: "Fix names" };
+        active.stage = "Ticket alpha-63 running";
+        const ui = await render($, on, surface, data);
+        const rows = normalized(lines(await ui.drawn()));
+        expect(rows.find(row => row.includes("●"))).toBe(`● alpha Ticket alpha-63 · ${merged} merged Fix names`);
+        expect(rows.join("\n")).not.toContain(active.stage);
+      });
+    }
+
+    test(`${surface}: a grown 132-phase plan draws twenty bar cells and the actual done total`, async ($, on) => {
+      const data = fixture();
+      const active = data.units[0]!;
+      active.phase = { kind: "plan", id: "75", of: 74, title: "New delivery" };
+      active.phases = Array.from({ length: 132 }, (_, index) =>
+        phase(String(index + 1), index < 74 ? "done" : index === 74 ? "open" : "todo"));
+      const ui = await render($, on, surface, data);
+      const rows = lines(await ui.drawn());
+      const strip = rows.find(row => row.includes("74/132"))!;
+      expect((strip.match(/[█▓░▒]/g) ?? [])).toHaveLength(20);
+      expect(rows.find(row => row.includes("alpha"))).toContain("Phase 75");
+      expect(rows.find(row => row.includes("alpha"))).not.toContain("75/74");
+      expect(rows.join("\n")).not.toContain("74/132 done");
+    });
+
+    test(`${surface}: late ETA and missing ETA use their semantic tones`, async ($, on) => {
+      const data = fixture();
+      const active = data.units[0]!;
+      active.eta!.at = time(-149, "wrong ETA");
+      const missing = unit("beta", "running");
+      missing.eta = null;
+      const noPromise = unit("gamma", "running");
+      noPromise.eta!.at = null;
+      data.units.push(missing, noPromise);
+      const ui = await render($, on, surface, data);
+      const tree = await ui.drawn();
+      expect(textInColor(tree, "error")).toContain("ETA 11:31 · late 2h 29m");
+      expect(textInColor(tree, "warning").match(/no ETA/g)).toHaveLength(2);
+      expect(lines(tree).join("\n")).not.toMatch(/wrong ETA|overdue|moved|first ETA/);
+    });
+
+    test(`${surface}: workers aggregate by state, in running idle paused order, with meaning in color`, async ($, on) => {
+      const data = fixture();
+      data.units[0]!.workers = ["paused", "idle", "running", "idle", "paused", "running", "running", "queued"]
+        .map((state, index) => ({ slot: `secret-slot-${index}`, role: `secret-role-${index}`, state, model: "", doing: "" }));
+      const ui = await render($, on, surface, data);
+      const tree = await ui.drawn();
+      const workerRow = normalized(lines(tree)).find(row => row.startsWith("workers"))!;
+      expect(workerRow).toContain("workers 3 running · 2 idle · 2 paused · 1 queued");
+      expect(textInColor(tree, "suggestion")).toContain("3 running");
+      expect(textInColor(tree, "warning")).toContain("2 paused");
+      expect(textInColor(tree, "default")).toContain("2 idle");
+      expect(textInColor(tree, "default")).toContain("1 queued");
+      expect(textInColor(tree, "inactive")).toContain("workers");
+      expect(lines(tree).join("\n")).not.toMatch(/secret-slot|secret-role/);
+    });
+
+    test(`${surface}: fix rounds show only when positive and warn at three`, async ($, on) => {
+      const data = activeUnits();
+      data.units[1]!.eta!.fix_done = 2;
+      data.units[2]!.eta!.fix_done = 3;
+      data.units[2]!.eta!.fix_running = 1;
+      const ui = await render($, on, surface, data);
+      const tree = await ui.drawn();
+      const rows = lines(tree);
+      expect(rows.join("\n")).not.toContain("fix rounds 0");
+      expect(textInColor(tree, "default")).toContain("fix rounds 2");
+      expect(textInColor(tree, "warning")).toContain("fix rounds 3 + 1 running");
+    });
+
+    test(`${surface}: a running first repair has no fix count until a repair completes`, async ($, on) => {
+      const data = activeUnits();
+      data.units = data.units.slice(0, 2);
+      data.units[0]!.stage = "Repair round 1";
+      data.units[1]!.stage = "Repair round 3";
+      data.units[0]!.eta!.fix_running = 1;
+      data.units[1]!.eta!.fix_done = 2;
+      data.units[1]!.eta!.fix_running = 1;
+      const ui = await render($, on, surface, data);
+      const rows = normalized(lines(await ui.drawn()));
+      const second = rows.findIndex(row => row.startsWith("● b "));
+      const firstBlock = rows.slice(1, second).join("\n");
+      expect(firstBlock).toContain("Repair round 1");
+      expect(firstBlock).not.toContain("fix rounds");
+      expect(rows.slice(second).join("\n")).toContain("fix rounds 2 + 1 running");
+    });
+
+    test(`${surface}: paired facts reach column 85 and move to their own row at width 40`, async ($, on) => {
+      const data = fixture();
+      data.units[0]!.workers = ["running", "running", "running", "idle", "idle", "idle", "idle",
+        "paused", "paused", "paused", "paused", "paused"]
+        .map((state, index) => ({ slot: String(index), role: "test", state, model: "", doing: "" }));
+      const drawWide = prepareRender($, on, surface, data, false, 85);
+      const drawNarrow = prepareRender($, on, surface, data, false, 40, 50, "phase17-repair-narrow");
+      const wide = await drawWide();
+      const wideRows = lines(await wide.drawn());
+      const eta = wideRows.find(row => row.includes("ETA 14:30"))!;
+      const finish = wideRows.find(row => row.includes("run ends 14:42"))!;
+      expect(eta).toContain("1/3");
+      expect(eta).toMatch(/ {2,}ETA 14:30 · in 30m$/);
+      expect(cellWidth(eta)).toBe(85);
+      expect(finish).toContain("workers 3 running · 4 idle · 5 paused");
+      expect(finish).toMatch(/ {2,}run ends 14:42$/);
+      expect(cellWidth(finish)).toBe(85);
+      await wide.unmount();
+      const narrow = await drawNarrow();
+      const narrowRows = lines(await narrow.drawn());
+      expect(narrowRows.find(row => row.includes("ETA 14:30"))).toBe("  ETA 14:30 · in 30m");
+      expect(narrowRows.find(row => row.includes("run ends 14:42"))).toBe("  run ends 14:42");
+      for (const row of narrowRows) expect(cellWidth(row)).toBeLessThanOrEqual(40);
+    });
+
+    for (const [kind, expected] of [["predicted", "run ends 14:42"], ["finished", "run ended 14:42"],
+      ["after_gate", "run ends after G1"], ["unknown", ""]] as const) {
+      test(`${surface}: ${kind} run finish appears on the worker row`, async ($, on) => {
+        const data = fixture();
+        data.units[0]!.finish = kind === "predicted" || kind === "finished"
+          ? { kind, at: time(42, "wrong finish") }
+          : kind === "after_gate" ? { kind, gate: "G1", waits_on: "approval" } : { kind };
+        const ui = await render($, on, surface, data);
+        const tree = await ui.drawn();
+        const rows = normalized(lines(tree));
+        expect(rows.slice(1)).toHaveLength(3);
+        if (expected) expect(rows.find(row => row.startsWith("workers"))).toContain(expected);
+        else expect(rows.join("\n")).not.toMatch(/run ends|run ended/);
+        expect(rows.join("\n")).not.toContain("wrong finish");
+      });
+    }
+
+    test(`${surface}: a past predicted run end is red and includes compact lateness`, async ($, on) => {
+      const data = fixture();
+      data.units[0]!.finish = { kind: "predicted", at: time(-2050, "wrong finish") };
+      const ui = await render($, on, surface, data);
+      expect(textInColor(await ui.drawn(), "error")).toContain("run ends Thu 03:50 · late 1d 10h");
+    });
+
+    test(`${surface}: no-phase units have one row with counts and known finishes`, async ($, on) => {
+      const data = fixture();
+      const finished = quietUnit("a", "run-finished");
+      finished.phases = [phase("1", "done"), phase("2", "done")];
+      finished.finish = { kind: "finished", at: time(-10, "wrong finish") };
+      const future = quietUnit("b", "standing-by");
+      future.phases = [phase("1", "done"), phase("2", "todo")];
+      future.finish = { kind: "predicted", at: time(60, "wrong finish") };
+      data.units = [finished, future, quietUnit("c", "standing-by")];
+      const ui = await render($, on, surface, data);
+      const rows = normalized(lines(await ui.drawn()));
+      expect(rows.slice(1)).toEqual(["● a Run done · 2/2 · run ended 13:50",
+        "● b Standing by · 1/2 · run ends 15:00", "● c Standing by"]);
+    });
+
+    for (const timed of [false, true]) {
+      test(`${surface}: ${timed ? "timed" : "untimed"} gate is a warning row naming the waiting phase`, async ($, on) => {
+        const data = fixture();
+        gated(data, timed);
+        const ui = await render($, on, surface, data);
+        const expected = timed ? "Phase 3 waits on G1 until 15:00: design approval"
+          : "Phase 3 waits on G1: design approval";
+        expect(textInColor(await ui.drawn(), "warning")).toContain(expected);
+      });
+    }
+
+    for (const [minutes, expected] of [[30, "14:30"], [1440, "Sat 14:00"], [-1440, "Thu 14:00"],
+      [6 * 1440, "Thu 14:00"], [-6 * 1440, "Sat 14:00"], [7 * 1440, "23 Oct"], [-7 * 1440, "9 Oct"]] as const) {
+      test(`${surface}: short time ${minutes} minutes from now is ${expected}`, async ($, on) => {
+        const data = fixture();
+        data.units[0]!.eta!.at = time(minutes, "poisoned time text");
+        const ui = await render($, on, surface, data);
+        const text = lines(await ui.drawn()).join("\n");
+        expect(text).toContain(`ETA ${expected} · ${minutes < 0 ? "late" : "in"}`);
+        expect(text).not.toContain("poisoned time text");
+      });
+    }
+
+    test(`${surface}: local midnight, rather than the UTC date, determines the short-time form`, async ($, on) => {
+      const data = fixture();
+      data.utc_offset_minutes = 600;
+      data.as_of.text = "poisoned as-of text";
+      data.units[0]!.eta!.at = time(-300, "poisoned ETA text");
+      const ui = await render($, on, surface, data);
+      const text = lines(await ui.drawn()).join("\n");
+      expect(text).toContain("ETA Fri 23:00 · late 5h 0m");
+      expect(text).toContain("as of 04:00");
+      expect(text).not.toContain("poisoned");
+    });
+
+    test(`${surface}: health dots honor late, gate, no ETA, running, finished and inactive priority`, async ($, on) => {
+      const data = fixture();
+      const lateEta = unit("a-late-eta", "running");
+      lateEta.eta!.at = time(-1, "wrong");
+      const lateFinish = unit("b-late-finish", "running");
+      lateFinish.finish = { kind: "predicted", at: time(-1, "wrong") };
+      const gate = fixture();
+      gated(gate);
+      gate.units[0]!.key = "c-gate";
+      const missing = unit("d-no-eta", "running");
+      missing.eta = null;
+      data.units = [lateEta, lateFinish, gate.units[0]!, missing, unit("e-running", "running"),
+        quietUnit("f-finished", "run-finished"), quietUnit("g-idle", "standing-by")];
+      const ui = await render($, on, surface, data);
+      const dots = coloredText(await ui.drawn()).filter(span => span.text.includes("●"));
+      expect(dots.map(span => span.color)).toEqual(["error", "error", "warning", "warning", "suggestion", "success", "inactive"]);
+    });
+
+    test(`${surface}: header counts each late unit once and styles only the late count red`, async ($, on) => {
+      const data = fixture();
+      data.as_of.text = "wrong header clock";
+      const late = unit("a", "running");
+      late.eta!.at = time(-1, "wrong");
+      late.finish = { kind: "predicted", at: time(-1, "wrong") };
+      const lateFinish = unit("b", "running");
+      lateFinish.finish = { kind: "predicted", at: time(-1, "wrong") };
+      data.units = [late, lateFinish, quietUnit("c", "run-finished")];
+      const ui = await render($, on, surface, data);
+      const tree = await ui.drawn();
+      expect(normalized(lines(tree))[0]).toMatch(/show.*3 units · 2 late · as of 14:00/);
+      expect(textInColor(tree, "error")).toContain("2 late");
+      expect(textInColor(tree, "inactive")).toContain("3 units");
+      expect(textInColor(tree, "inactive")).toContain("as of 14:00");
+      expect(elements(tree).some(element => node(element.props).bold === true
+        && lines(element).join("") === "show")).toBe(true);
+    });
+
+    test(`${surface}: a healthy header omits the zero late count`, async ($, on) => {
+      const data = fixture();
+      const ui = await render($, on, surface, data);
+      expect(normalized(lines(await ui.drawn()))[0]).toMatch(/1 units · as of 14:00/);
+      expect(normalized(lines(await ui.drawn()))[0]).not.toContain("late");
+    });
+
+    for (const detail of [false, true]) {
+      test(`${surface}: ${detail ? "detail" : "board"} uses no subtle or dim text and draws facts in the default color`, async ($, on) => {
+        const data = fixture();
+        const ui = await render($, on, surface, data, detail);
+        const tree = await ui.drawn();
+        expect(elements(tree).filter(element => node(element.props).color === "subtle"
+          || node(element.props).dimColor === true)).toEqual([]);
+        const facts = textInColor(tree, "default");
+        if (detail) {
+          for (const fact of ["plan.md", "Finishing the retry path", "Build retry path", "17:10", "said 17:00"])
+            expect(facts).toContain(fact);
+        } else {
+          for (const fact of ["Delivery 2", "Repair round 2", "1/3", "ETA 14:30", "run ends 14:42"])
+            expect(facts).toContain(fact);
+        }
+      });
+    }
+
+    for (const late of [false, true]) {
+      test(`${surface}: detail ruler labels the ${late ? "late" : "future"} promise with its dot's color`, async ($, on) => {
+        const data = fixture();
+        data.units[0]!.eta!.at = time(late ? -30 : 30, late ? "17:30" : "18:30");
+        const ui = await render($, on, surface, data, true);
+        const tree = await ui.drawn();
+        expect(textInColor(tree, late ? "error" : "success")).toContain(late ? "17:30" : "18:30");
+        expect(textInColor(tree, "default")).toContain("│");
+      });
+    }
+
+    for (const width of [40, 60, 85]) {
+      test(`${surface}: long facts wrap without loss or overflow at ${width} cells`, async ($, on) => {
+        const data = fixture();
+        const active = data.units[0]!;
+        const title = "界😀 a very long delivery title with enough words to wrap across the entire pane and retain its final marker TITLE_END";
+        const reason = "Wait for the layout design approval and the downstream implementation team to finish their coordinated review GATE_END";
+        active.phase!.title = title;
+        gated(data, true);
+        active.phases[2]!.gate = { kind: "timed", gate: "G1", until: time(60, "wrong"), waits_on: reason };
+        active.workers = Array.from({ length: 37 }, (_, index) => ({ slot: `slot-${index}`, role: "review", state: index % 2 ? "idle" : "running", model: "", doing: "" }));
+        const ui = await render($, on, surface, data, false, width, 80);
         const tree = await ui.drawn();
         const rows = lines(tree);
-        const header = rows.findIndex(row => row.includes("alpha"));
-        expect(rows[header]).toMatch(/alpha\s+Waiting on G3/);
-        expect(rows.filter(row => row.includes("Waiting on G3"))).toHaveLength(1);
-        expect(rows.filter(row => /[█▓░▒]/.test(row))).toEqual(hasStrip ? ["  █▒"] : []);
-        expect(emptyBoxes(tree)).toBe(0);
-        expect(occupiedRows(tree)).toBeLessThanOrEqual(bodyRows);
+        for (const row of rows) {
+          expect(row).not.toContain("…");
+          expect(cellWidth(row)).toBeLessThanOrEqual(width);
+        }
+        expect(elements(tree).filter(element => node(element.props).wrap === "truncate-end")).toEqual([]);
+        const text = rows.join(" ").replace(/\s+/g, " ");
+        expect(text).toContain(title);
+        expect(text).toContain(reason);
+        expect(text).toContain("ETA 14:30 · in 30m");
+        expect(text).toContain("19 running · 18 idle");
+        expect(text).toContain("run ends 14:42");
+        expect(rows.find(row => row.includes("TITLE_END"))).toMatch(/^ {2}/);
+        if (width === 40) {
+          const eta = rows.find(row => row.includes("ETA 14:30"))!;
+          expect(eta).toMatch(/^ {2}/);
+          expect(eta).not.toContain("█");
+          const finish = rows.find(row => row.includes("run ends"))!;
+          expect(finish).toMatch(/^ {2}/);
+          expect(finish).not.toContain("workers");
+        }
+        expect(occupiedRows(tree)).toBeLessThanOrEqual(80);
       });
-      }
     }
+
+    test(`${surface}: the header has a blank row before the first unit until the budget folds gaps`, async ($, on) => {
+      const data = activeUnits();
+      const drawTall = prepareRender($, on, surface, data, false, 170, 13);
+      const drawShort = prepareRender($, on, surface, data, false, 170, 7, "phase17-repair-short");
+      const tall = await drawTall();
+      const tallRows = layoutRows(await tall.drawn());
+      expect(tallRows).toHaveLength(13);
+      expect(tallRows[0]).toContain("show");
+      expect(tallRows[1]).toBe("");
+      expect(tallRows[2]).toMatch(/^● a /);
+      expect(tallRows.filter(row => !row.trim())).toHaveLength(3);
+      await tall.unmount();
+      const short = await drawShort();
+      const shortRows = layoutRows(await short.drawn());
+      expect(shortRows).toHaveLength(7);
+      expect(shortRows[1]).toMatch(/^● a /);
+      expect(shortRows.filter(row => !row.trim())).toEqual([]);
+      expect(shortRows.filter(row => row.includes("●"))).toHaveLength(3);
+    });
+
+    test(`${surface}: height pressure drops worker rows from the bottom before removing gaps or units`, async ($, on) => {
+      const data = activeUnits();
+      // Three three-row blocks, a gap before each unit, one header = thirteen rows.
+      const ui = await render($, on, surface, data, false, 170, 12);
+      const tree = await ui.drawn();
+      const rows = lines(tree);
+      const headings = rows.map((row, index) => row.includes("●") ? index : -1).filter(index => index >= 0);
+      expect(headings).toHaveLength(3);
+      expect(rows.slice(headings[0], headings[1]).join(" ")).toContain("workers");
+      expect(rows.slice(headings[1], headings[2]).join(" ")).toContain("workers");
+      expect(rows.slice(headings[2]).join(" ")).not.toContain("workers");
+      expect(occupiedRows(tree)).toBe(12);
+    });
+
+    test(`${surface}: height pressure removes gaps after every worker row, before whole units`, async ($, on) => {
+      const data = activeUnits();
+      const ui = await render($, on, surface, data, false, 170, 7);
+      const tree = await ui.drawn();
+      const rows = lines(tree);
+      expect(rows.filter(row => row.includes("●"))).toHaveLength(3);
+      expect(rows.join("\n")).not.toContain("workers");
+      expect(rows.join("\n")).not.toContain("more:");
+      expect(occupiedRows(tree)).toBe(7);
+    });
+
+    test(`${surface}: whole bottom units become one alphabetical more line only after gaps are gone`, async ($, on) => {
+      const data = activeUnits();
+      data.units.push({ ...unit("d", "running"), finish: { kind: "unknown" } });
+      data.units.reverse();
+      const ui = await render($, on, surface, data, false, 170, 6);
+      const tree = await ui.drawn();
+      const rows = normalized(lines(tree));
+      expect(rows.filter(row => row.includes("●")).map(row => row.match(/●\s+(\S+)/)?.[1])).toEqual(["a", "b"]);
+      expect(rows.at(-1)).toBe("+2 more: c, d");
+      expect(rows.join("\n")).not.toContain("workers");
+      expect(occupiedRows(tree)).toBe(6);
+    });
+
+    test(`${surface}: wrapped title rows count before dropping whole units`, async ($, on) => {
+      const data = activeUnits();
+      data.units.forEach(active => { active.phase!.title = "word ".repeat(24) + "TITLE_END"; });
+      const ui = await render($, on, surface, data, false, 40, 10);
+      const tree = await ui.drawn();
+      const rows = lines(tree);
+      expect(occupiedRows(tree)).toBeLessThanOrEqual(10);
+      expect(rows.filter(row => row.includes("●"))).toHaveLength(1);
+      expect(rows.filter(row => row.includes("TITLE_END"))).toHaveLength(1);
+      expect(normalized(rows).at(-1)).toBe("+2 more: b, c");
+      for (const row of rows) expect(cellWidth(row)).toBeLessThanOrEqual(40);
+    });
+  }
+});
+
+describe("unit detail layout", () => {
+  for (const surface of ["terminal", "desktop"] as const) {
+    test(`${surface}: an empty board gives only the showrunner command instruction`, async ($, on) => {
+      on("ui.render", { component: "Pane", requestId: "empty-board" }, ($, event) =>
+        BoardView($.ui.resolve(event), 170, 50,
+          { files: [], watch: [], loadedAt: NOW / 1000, boards: [] }, NOW / 1000, () => {}));
+      const ui = await $.ui.mount({ plugin: "unit-board", component: "Pane", requestId: "empty-board",
+        surface, props });
+
+      expect(lines(await ui.drawn()).filter(line => line.trim()))
+        .toEqual(["Run /showrunner:unit_board in a showrunner session."]);
+      expect(await ui.findAll({ type: "Button" })).toEqual([]);
+    });
+
+    // Retain the detail heading contracts; only the board drops phase totals.
+    for (const merged of [0, 62]) {
+      test(`${surface}: detail ticket heading shows ${merged} merged at 76 columns`, async ($, on) => {
+        const data = fixture();
+        data.units[0]!.phase = { kind: "ticket", id: "alpha-unit-63", title: "Fix names", merged };
+        data.units[0]!.stage = "Build";
+        const ui = await render($, on, surface, data, true, 76);
+        const heading = lines(await ui.drawn()).find(row => row.includes("alpha"))!;
+        expect(heading).toContain(`Ticket alpha-unit-63 · ${merged} merged · Build`);
+        expect(heading).not.toContain("Phase ");
+        expect(cellWidth(heading)).toBeLessThanOrEqual(76);
+      });
+    }
+
+    test(`${surface}: detail plan heading keeps its phase total at 76 columns`, async ($, on) => {
+      const data = fixture();
+      data.units[0]!.stage = "Build";
+      const ui = await render($, on, surface, data, true, 76);
+      const heading = lines(await ui.drawn()).find(row => row.includes("alpha"))!;
+      expect(heading).toContain("Phase 2 of 3 · Build");
+      expect(heading).not.toContain("Ticket ");
+      expect(cellWidth(heading)).toBeLessThanOrEqual(76);
+    });
 
     test(`${surface}: step labels leave two cells before aligned times in a 76-column pane`, async ($, on) => {
       const data = fixture();
@@ -221,153 +702,6 @@ describe("board layout", () => {
       });
     }
 
-    test(`${surface}: excess running units share one whole-key more line inside the body budget`, async ($, on) => {
-      const data = trunk();
-      const running = Array.from({ length: 25 }, (_, index) => unit(`r${String(index + 1).padStart(2, "0")}`, "running"));
-      data.units = [...running, ...data.units.filter(item => !item.phase)];
-      const ui = await render($, on, surface, data);
-      const tree = await ui.drawn();
-      const rows = lines(tree);
-      expect(occupiedRows(tree)).toBeLessThanOrEqual(50);
-      expect(rows.filter(row => row.startsWith("Done:"))).toHaveLength(1);
-      expect(rows.filter(row => row.startsWith("Standing by:"))).toHaveLength(1);
-      const more = rows.find(row => /^\+\d+ more running:/.test(row))!;
-      expect(more).toBe("+2 more running: r24, r25");
-      expect(cellWidth(more)).toBeLessThanOrEqual(170);
-      expect(rows.indexOf(more)).toBeLessThan(rows.findIndex(row => row.startsWith("Done:")));
-      for (const item of running) expect(rows.filter(row => row.includes(item.key))).toHaveLength(1);
-      expect((await ui.findAll({ type: "Button", text: /^open$/i })).length).toBe(23);
-    });
-
-    test(`${surface}: a narrow compact row keeps stage and overdue ETA ahead of the strip`, async ($, on) => {
-      const data = fixture();
-      const active = data.units[0]!;
-      active.stage = "Build";
-      active.eta!.at = time(-12, "17:48");
-      active.phases = Array.from({ length: 30 }, (_, index) => phase(String(index + 1), "done"));
-      const ui = await render($, on, surface, data, false, 40, 3);
-      const tree = await ui.drawn();
-      expect(occupiedRows(tree)).toBeLessThanOrEqual(3);
-      const compact = lines(tree).find(row => row.includes("ETA 17:48"))!;
-      const visible = fitText(compact, 40);
-      expect(visible).toContain("Build  ETA 17:48 · overdue 12m");
-      expect(visible.indexOf("Build")).toBeLessThan(visible.indexOf("ETA"));
-      expect(compact.indexOf("overdue 12m")).toBeLessThan(compact.indexOf("█"));
-      expect(cellWidth(visible)).toBeLessThanOrEqual(40);
-    });
-
-    for (const bodyRows of [0, 1, 2, 3]) {
-      test(`${surface}: a ${bodyRows}-row body reserves folds before headings and overflow notices`, async ($, on) => {
-        const ui = await render($, on, surface, trunk(), false, 40, bodyRows);
-        const tree = await ui.drawn();
-        const rows = lines(tree);
-        expect(occupiedRows(tree)).toBeLessThanOrEqual(bodyRows);
-        if (bodyRows >= 1) expect(rows.some(row => row.startsWith("Done:"))).toBe(true);
-        if (bodyRows >= 2) expect(rows.some(row => row.startsWith("Standing by:"))).toBe(true);
-      });
-    }
-
-    test(`${surface}: all 22 trunk units fit with separate ordered finished and standing-by lines`, async ($, on) => {
-      const data = trunk();
-      const ui = await render($, on, surface, data);
-      const tree = await ui.drawn();
-      const rows = lines(tree);
-      const folded = data.units.filter(item => item.phase === null && item.state === "run-finished");
-      const doneRows = rows.filter(row => row.trimStart().startsWith("Done:"));
-      expect(doneRows.map(row => row.trim())).toEqual([`Done: ${folded.map(item => item.key).join(", ")}`]);
-      expect(rows.filter(row => row.startsWith("Standing by:"))).toEqual([
-        `Standing by: ${data.units.filter(item => item.state === "standing-by").map(item => item.key).join(", ")}`,
-      ]);
-      expect(rows.findIndex(row => row.startsWith("Standing by:"))).toBeGreaterThan(rows.indexOf(doneRows[0]!));
-      for (const item of data.units) expect(rows.join("\n")).toContain(item.key);
-      expect(rows.filter(row => /●.*run-\d/.test(row)).map(row => row.match(/run-\d/)?.[0]))
-        .toEqual(["run-1", "run-2", "run-3", "run-4"]);
-      for (const item of data.units.filter(item => item.phase !== null)) {
-        const header = rows.findIndex(row => row.includes(item.key));
-        expect(rows[header]).toContain(item.phase!.title);
-        const block = rows.slice(header, header + 7).join("\n");
-        expect(block).toContain(item.stage);
-        expect(block).toContain("ETA 18:30");
-        expect(block).toContain("done by 18:42");
-        expect(block).toContain(item.workers[0]!.slot);
-        expect(block).toContain("│");
-      }
-      expect(rows.indexOf(doneRows[0]!)).toBeGreaterThan(rows.findIndex(row => row.includes("worker-4")));
-      expect(rows.join("\n")).not.toContain("folded-worker");
-      expect(occupiedRows(tree)).toBeLessThanOrEqual(50);
-    });
-
-    test(`${surface}: narrow fold lines each end with an accurate overflow count`, async ($, on) => {
-      const data = trunk();
-      const ui = await render($, on, surface, data, false, 40);
-      const rows = lines(await ui.drawn());
-      const doneRows = rows.filter(row => row.trimStart().startsWith("Done:"));
-      expect(doneRows).toHaveLength(1);
-      const row = doneRows[0]!.trim();
-      expect(row.length).toBeLessThanOrEqual(40);
-      expect(row).toMatch(/\+\d+ more$/);
-      const shown = row.match(/d\d{2}/g) ?? [];
-      const omitted = Number(row.match(/\+(\d+) more$/)?.[1]);
-      const foldedKeys = data.units.filter(item => item.phase === null && item.state === "run-finished").map(item => item.key);
-      expect(shown.length).toBeGreaterThan(0);
-      expect(shown).toEqual(foldedKeys.slice(0, shown.length));
-      expect(shown.length + omitted).toBe(foldedKeys.length);
-      const standing = rows.find(row => row.startsWith("Standing by:"))!;
-      expect(standing.length).toBeLessThanOrEqual(40);
-      expect(standing).toMatch(/\+\d+ more$/);
-      const idleKeys = data.units.filter(item => item.state === "standing-by").map(item => item.key);
-      const idleShown = standing.match(/d\d{2}/g) ?? [];
-      expect(idleShown).toEqual(idleKeys.slice(0, idleShown.length));
-      expect(idleShown.length + Number(standing.match(/\+(\d+) more$/)?.[1])).toBe(idleKeys.length);
-      for (let index = 1; index <= 4; index++) expect(rows.join("\n")).toContain(`worker-${index}`);
-    });
-
-    test(`${surface}: a gate wait keeps a single header below running units and above folds`, async ($, on) => {
-      const data = trunk();
-      const waiting = { ...noPhase().units[0]!, key: "waiting-unit", state: "standing-by" as const, stage: "Waiting on G2",
-        phases: [phase("3", "gated")] };
-      waiting.workers = [{ slot: "hidden-waiter", role: "", state: "paused", model: "", doing: "" }];
-      data.units.unshift(waiting);
-      const ui = await render($, on, surface, data);
-      const rows = lines(await ui.drawn());
-      const header = rows.find(row => row.includes("waiting-unit"))!;
-      expect(header).toContain("Waiting on G2");
-      expect(rows.filter(row => row.includes("Waiting on G2"))).toHaveLength(1);
-      expect(rows.find(row => row.startsWith("Done:"))).not.toContain("waiting-unit");
-      expect(rows.find(row => row.startsWith("Standing by:"))).not.toContain("waiting-unit");
-      expect(rows.join("\n")).not.toContain("hidden-waiter");
-      expect(rows.indexOf(header)).toBeGreaterThan(rows.findIndex(row => row.includes("worker-4")));
-      expect(rows.indexOf(header)).toBeLessThan(rows.findIndex(row => row.startsWith("Done:")));
-    });
-
-    for (const bodyRows of [50, 20]) {
-      test(`${surface}: seven running units and both fold lines stay inside ${bodyRows} body rows`, async ($, on) => {
-        const data = trunk();
-        const folded = data.units.filter(item => !item.phase).slice(0, 15);
-        const running = Array.from({ length: 7 }, (_, index) => {
-          const result = unit(`active-${index + 1}`, "running");
-          result.workers = [{ slot: `details-${index + 1}`, role: "", state: "running", model: "", doing: "" }];
-          result.eta!.at = time(-12, "17:48");
-          return result;
-        });
-        data.units = [...running, ...folded];
-        const ui = await render($, on, surface, data, false, 170, bodyRows);
-        const tree = await ui.drawn();
-        const rows = lines(tree);
-        expect(occupiedRows(tree)).toBeLessThanOrEqual(bodyRows);
-        for (const item of running) expect(rows.filter(row => row.includes(item.key))).toHaveLength(1);
-        expect(rows.filter(row => row.startsWith("Done:"))).toHaveLength(1);
-        expect(rows.filter(row => row.startsWith("Standing by:"))).toHaveLength(1);
-        expect((await ui.findAll({ type: "Button", text: /^open$/i })).length).toBe(7);
-        const lastHeader = rows.findIndex(row => row.includes("active-7"));
-        expect(rows[lastHeader + 1]).toMatch(/Repair round 2.*ETA 17:48.*overdue 12m/);
-        expect(rows[lastHeader + 2]).toMatch(/^Done:/);
-        expect(rows.join("\n")).not.toContain("details-7");
-        if (bodyRows === 50) expect(rows.join("\n")).toContain("details-1");
-        else expect(rows.join("\n")).not.toContain("details-1");
-      });
-    }
-
     test(`${surface}: record ids share a column across numeric and as-built phases`, async ($, on) => {
       const data = noPhase();
       data.units[0]!.phases = [phase("9", "done"), phase("as-built", "done")];
@@ -377,70 +711,6 @@ describe("board layout", () => {
       for (const marker of ["0:10", "none stated", "Delivery"]) {
         expect(new Set(rows.map(row => row.indexOf(marker))).size).toBe(1);
       }
-    });
-
-    test(`${surface}: no-phase stage appears once in the header while phased stage stays with the strip`, async ($, on) => {
-      const data = noPhase();
-      data.units[0]!.state = "running";
-      data.units[0]!.stage = "Waiting on G2";
-      data.units.push(unit("phased", "running"));
-      const ui = await render($, on, surface, data);
-      const rows = lines(await ui.drawn());
-      expect(rows.filter(row => row.includes("Waiting on G2"))).toHaveLength(1);
-      expect(rows.find(row => row.includes("alpha"))).toMatch(/●\s+alpha\s+Waiting on G2/);
-      expect(rows.join("\n").toLowerCase()).not.toContain("no phase running");
-      expect(rows.find(row => row.includes("phased"))).toMatch(/Phase 2\/3.*Delivery 2/);
-      expect(rows.find(row => row.includes("Repair round 2"))).not.toContain("phased");
-    });
-
-    test(`${surface}: strip stage separator appears only after actual cells`, async ($, on) => {
-      const data = noPhase();
-      const empty = unit("empty-strip", "running");
-      empty.phases = [];
-      empty.stage = "Empty strip stage";
-      const filled = unit("filled-strip", "running");
-      filled.stage = "Filled strip stage";
-      data.units = [empty, filled];
-      const ui = await render($, on, surface, data);
-      const rows = lines(await ui.drawn());
-      const emptyRow = rows.find(row => row.includes("Empty strip stage"))!;
-      const filledRow = rows.find(row => row.includes("Filled strip stage"))!;
-      expect(emptyRow).toBe("  Empty strip stage");
-      expect(filledRow).toMatch(/[█▓░▒]  Filled strip stage/);
-      expect(rows.filter(row => /^ {4}/.test(row))).toEqual([]);
-    });
-
-    test(`${surface}: missing worker roles use slot names and ended workers are hidden`, async ($, on) => {
-      const data = noPhase();
-      data.units[0]!.state = "running";
-      data.units[0]!.workers = ["impl", "test"].map(slot => ({ slot, role: "", state: "paused", model: "", doing: "" }));
-      const ended = unit("closed", "running");
-      ended.workers = [{ slot: "1", role: "review", state: "ended", model: "", doing: "" }];
-      data.units.push(ended);
-      const ui = await render($, on, surface, data);
-      const rows = lines(await ui.drawn());
-      const workers = rows.find(row => row.includes("paused"))!;
-      expect(workers).toContain("impl paused · test paused");
-      expect(workers).not.toMatch(/\b2 paused\b/);
-      expect(rows.join("\n")).not.toContain("ended");
-    });
-
-    test(`${surface}: a no-phase predicted finish requires a later todo or gated phase`, async ($, on) => {
-      const data = noPhase();
-      const base = data.units[0]!;
-      base.state = "running";
-      base.finish = { kind: "predicted", at: time(42, "18:42") };
-      base.phases = [phase("1", "done")];
-      const todo = { ...base, key: "future", phases: [phase("2", "todo")],
-        finish: { kind: "predicted" as const, at: time(60, "19:00") } };
-      const gated = { ...base, key: "gated", phases: [phase("3", "gated")],
-        finish: { kind: "predicted" as const, at: time(90, "19:30") } };
-      data.units.push(todo, gated);
-      const ui = await render($, on, surface, data);
-      const text = lines(await ui.drawn()).join("\n");
-      expect(text).not.toContain("18:42");
-      expect(text).toContain("done by 19:00");
-      expect(text).toContain("done by 19:30");
     });
 
     test(`${surface}: finished detail omits empty timing and strip blocks`, async ($, on) => {
@@ -465,13 +735,14 @@ describe("board layout", () => {
       expect(rows).toEqual(["1         fix    idle    short activity", "adversary review running long activity"]);
     });
 
-    test(`${surface}: an empty phase history has an explicit subtle record line`, async ($, on) => {
+    test(`${surface}: an empty phase history has an explicit readable record line`, async ($, on) => {
       const data = noPhase();
       data.units[0]!.state = "run-finished";
       const ui = await render($, on, surface, data, true);
       expect(lines(await ui.drawn()).join("\n")).toContain("Phase record");
       const recorded = await ui.findAll({ type: "Text", text: /^no phases recorded$/ });
-      expect(recorded.map(item => item.props.color)).toEqual(["subtle"]);
+      expect(recorded).toHaveLength(1);
+      expect(recorded.map(item => item.props.color)).toEqual(["inactive"]);
     });
 
     for (const stage of ["Run done", "Standing by", "Waiting on G2"]) {
@@ -511,17 +782,7 @@ describe("board layout", () => {
       expect(rows.find(row => row.includes("Record 3"))).toContain("●●●●●");
     });
 
-    test(`${surface}: a long phase title leaves an ellipsis and two spaces before open`, async ($, on) => {
-      const data = fixture();
-      data.units[0]!.phase!.title = "A phase title that deliberately exceeds the entire narrow pane width";
-      const ui = await render($, on, surface, data, false, 60);
-      const header = lines(await ui.drawn()).find(row => row.includes("alpha"))!;
-      expect(header.length).toBeLessThanOrEqual(60);
-      expect(header).toMatch(/… {2,}open$/);
-      expect((await ui.findAll({ type: "Button", text: /^open$/i })).length).toBe(1);
-    });
-
-    for (const detail of [false, true]) {
+    for (const detail of [true]) {
       test(`${surface}: ${detail ? "unit" : "board"} labels past promises and predicted finishes overdue`, async ($, on) => {
         const data = fixture();
         data.units[0]!.eta!.at = time(-12, "17:48");

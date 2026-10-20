@@ -317,6 +317,15 @@ class InventoryTests(ShutdownTestCase):
         updater.assert_not_called()
         self.assertEqual(desktops[DESKTOP_ID], "Writing")
 
+    def test_desktop_snapshot_update_skips_the_agent_notes_refresh(self) -> None:
+        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            _ = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
+        updater.assert_called_once()
+        environment = cast("dict[str, str]", updater.call_args.kwargs["env"])
+        self.assertEqual(environment[inventory.SKIP_AGENT_NOTES], "1")
+        self.assertEqual(environment["PATH"], os.environ["PATH"])
+
     def test_nested_shutdown_inventory_reads_existing_snapshot_without_updating_notes(self) -> None:
         with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),
               patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
@@ -1719,8 +1728,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         timer.mkdir()
         _ = (timer / "conf").write_text("TARGET=session:owner-id\n")
         _ = (timer / "state").write_text("ENABLED=0\n")
-        pause = conversation_pause.PauseRecord("owner-id", ("reminder",), (),
-                                                        conversation_pause.Quiet(1, 2))
+        pause = conversation_pause.PauseRecord("owner-id", ("reminder",), conversation_pause.Quiet(1, 2))
         conversation_pause.write_record(pause)
         before = conversation_pause.record_path("owner-id").read_bytes()
         with (patch.object(inventory, "_snapshot_timers", wraps=inventory._snapshot_timers) as timers,  # pyright: ignore[reportPrivateUsage]
@@ -1733,7 +1741,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         assert isinstance(found, inventory.CompleteInventory)
         self.assertEqual(set(found.sessions), {TARGET_LOGIN, OTHER_LOGIN})
         self.assertEqual(found.sessions[TARGET_LOGIN][0]["timers"], [
-            record.TimerRestore(instance="reminder", was_enabled=True, footer=record.NoFooter(kind="no footer"))])
+            record.TimerRestore(instance="reminder", was_enabled=True)])
         self.assertEqual(conversation_pause.record_path("owner-id").read_bytes(), before)
         self.assertEqual((timer / "state").read_text(), "ENABLED=0\n")
         self.assertEqual((timers.call_count, units.call_count), (1, 1))
@@ -1787,7 +1795,7 @@ class RecoveryInventoryTests(unittest.TestCase):
 
     def test_faulted_production_marks_cannot_turn_a_unit_into_a_standalone(self) -> None:
         self.claude()
-        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {"show": "duplicate unit marks"})) as marks:
+        with patch.object(unit_lookup, "every_marked_unit", return_value=unit_lookup.MarkedProductions({}, {"show": {"one-unit": "duplicate unit marks"}})) as marks:
             found = inventory.snapshot_inventory()
         self.assertIsInstance(found, inventory.PartialInventory)
         assert isinstance(found, inventory.PartialInventory)
@@ -1976,7 +1984,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         assert isinstance(found, inventory.PartialInventory)
         self.assertIn("Codex observation", "; ".join(found.failures))
 
-    def test_pause_intent_restores_footers_but_kept_off_remains_off_without_changing_pause(self) -> None:
+    def test_pause_intent_restores_timers_but_kept_off_remains_off_without_changing_pause(self) -> None:
         self.claude()
         timer = self.notifier / "showrunner-show"
         timer.mkdir()
@@ -1986,17 +1994,15 @@ class RecoveryInventoryTests(unittest.TestCase):
         _ = (timer / "state").write_text("ENABLED=0\n")
         for phase in (conversation_pause.Quiet(1, 2), conversation_pause.KeptOff()):
             with self.subTest(phase=phase):
-                pause = conversation_pause.PauseRecord("owner-id", ("showrunner-show",), ("show",), phase)
+                pause = conversation_pause.PauseRecord("owner-id", ("showrunner-show",), phase)
                 conversation_pause.write_record(pause)
                 path = conversation_pause.record_path("owner-id")
                 before = path.read_bytes()
                 found = inventory.snapshot_inventory()
                 assert isinstance(found, inventory.CompleteInventory), found
                 restore = not isinstance(phase, conversation_pause.KeptOff)
-                footer: record.ShowrunnerFooter | record.NoFooter = (record.ShowrunnerFooter(kind="footer", slug="show")
-                    if restore else record.NoFooter(kind="no footer"))
                 self.assertEqual(found.sessions[TARGET_LOGIN][0]["timers"], [record.TimerRestore(
-                    instance="showrunner-show", was_enabled=restore, footer=footer)])
+                    instance="showrunner-show", was_enabled=restore)])
                 self.assertEqual(path.read_bytes(), before)
                 self.assertEqual((timer / "state").read_text(), "ENABLED=0\n")
 

@@ -52,7 +52,8 @@
 #                                        the reviewer's streamed log. Fresh
 #                                        reviewers are read-only; assigned reviewers
 #                                        are checked for an unchanged tree after
-#                                        their turn.
+#                                        their turn, less any path another open
+#                                        phase's files list holds (review_tree.py).
 
 set -euo pipefail
 
@@ -203,7 +204,6 @@ PY="${SCRIPT_DIR}/../lib/py"
 POOL_HELPER="${SCRIPT_DIR}/review_pool.py"
 MESH_SESSION_DIR="${SESSION_DIR}"
 POOL_ALLOCATED=0
-POOL_PROMPT_FILE=""
 MESH_CLAIMED=0
 TURN_THREAD_ID=""
 LEASE_ORDINAL=0
@@ -213,6 +213,9 @@ TURN_RAISED=0
 TURN_COUNT_READY=0
 TURN_RECORD_STATUS="error"
 mkdir -p "${ARTIFACT_DIR}"
+# Every dispatch names the run's director in the run folder (unit_runs.py), which the
+# production tree reads: a marker names one run per director, and a director runs phases side by side.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
@@ -227,6 +230,7 @@ else
 fi
 LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log"
 REPLY_FILE="${ARTIFACT_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
+TREE_BASELINE_FILE="${ARTIFACT_DIR}/review_tree_${PASS_INDEX}${SUFFIX}.$$.json"
 if [[ -n "${POOL_TYPE}" ]]; then
   rm -f "${SLOT_FILE}"
 fi
@@ -349,68 +353,18 @@ cleanup_mesh_review() {
       --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
       --claim-pid "${FOLLOW_LAUNCHER_PID}" >/dev/null 2>&1 || true
   fi
-  rm -f "${REPLY_FILE}"
+  rm -f "${REPLY_FILE}" "${TREE_BASELINE_FILE}"
 }
 
-tree_status() {
-  git -C "${WORKING_DIR}" status --porcelain
-}
-
-tree_diff_hash() {
-  git -C "${WORKING_DIR}" diff HEAD |
-    "$PY" -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
-}
-
-tree_head() {
-  git -C "${WORKING_DIR}" rev-parse HEAD
-}
-
-tree_untracked_hash() {
-  "$PY" -c '
-import hashlib
-import os
-import subprocess
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-names = subprocess.check_output(
-    ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"]
-).split(b"\0")
-digest = hashlib.sha256()
-for raw_name in names:
-    if not raw_name:
-        continue
-    path = root / os.fsdecode(raw_name)
-    digest.update(len(raw_name).to_bytes(8, "big"))
-    digest.update(raw_name)
-    if path.is_symlink():
-        content = os.fsencode(os.readlink(path))
-        digest.update(b"symlink\0")
-        digest.update(content)
-    else:
-        digest.update(b"file\0")
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-print(digest.hexdigest())
-' "${WORKING_DIR}"
-}
-
-tree_paths() {
-  {
-    git -C "${WORKING_DIR}" diff HEAD --name-only
-    git -C "${WORKING_DIR}" ls-files --others --exclude-standard
-  } | LC_ALL=C sort -u
-}
-
+# The tree guard keeps per-path entries, so a phase writing beside this one changes only its
+# own paths and review_tree.py can leave them out (its docstring has the rule).
 capture_tree_baseline() {
-  TREE_HEAD_BEFORE="$(tree_head)"
-  TREE_STATUS_BEFORE="$(tree_status)"
-  TREE_DIFF_HASH_BEFORE="$(tree_diff_hash)"
-  TREE_UNTRACKED_HASH_BEFORE="$(tree_untracked_hash)"
-  TREE_PATHS_BEFORE="$(tree_paths)"
-  TREE_BASELINE_READY=1
+  if "$PY" "${SCRIPT_DIR}/review_tree.py" baseline \
+    --root "${WORKING_DIR}" --out "${TREE_BASELINE_FILE}" 2>>"${LOG_FILE}"; then
+    TREE_BASELINE_READY=1
+  else
+    TREE_BASELINE_READY=-1
+  fi
 }
 
 record_new_worker_identity() {
@@ -551,9 +505,6 @@ finish_review_exit() {
     "$PY" "${POOL_HELPER}" release --production "${POOL_PRODUCTION}" \
       --reviewer "${REVIEW_WORKER}" --pid "$$" --thread-id "${TURN_THREAD_ID}" >>"${LOG_FILE}" 2>&1
   fi
-  if [[ -n "${POOL_PROMPT_FILE}" ]]; then
-    rm -f "${POOL_PROMPT_FILE}"
-  fi
   exit "${code}"
 }
 
@@ -631,11 +582,6 @@ if [[ -n "${NEW_SLOT}" ]]; then
 fi
 
 TREE_BASELINE_READY=0
-TREE_HEAD_BEFORE=""
-TREE_STATUS_BEFORE=""
-TREE_DIFF_HASH_BEFORE=""
-TREE_UNTRACKED_HASH_BEFORE=""
-TREE_PATHS_BEFORE=""
 TURN_IMAGE_ARGS=()
 
 if [[ -n "${POOL_TYPE}" ]]; then
@@ -664,7 +610,7 @@ if [[ -n "${POOL_TYPE}" ]]; then
     --production "${POOL_PRODUCTION}" --type "${POOL_TYPE}" \
     --unit "${POOL_UNIT}" --phase "${POOL_PHASE}" --pass "${PASS_INDEX}" \
     "${LENS_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
-    # The pool's last line is its reason (`no primed code template`); the director acts on it.
+    # The pool's last line is its reason (`no primed code template: <cause>`); the director acts on it.
     echo "ERROR: pool allocation failed: $(tail -n 1 "${LOG_FILE}"); see ${LOG_FILE}." >&2
     exit 1
   fi
@@ -682,20 +628,6 @@ if [[ -n "${POOL_TYPE}" ]]; then
   TEAM_SLOT="pool_${REVIEW_WORKER}"
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
-  # A reviewer's thread already holds the unit memory after its first turn.
-  if [[ "${LEASE_ORDINAL}" -eq 1 ]]; then
-    POOL_PROMPT_FILE="$(mktemp "${ARTIFACT_DIR}/review_message_${PASS_INDEX}${SUFFIX}.XXXXXX")"
-    "$PY" "${POOL_HELPER}" unit-memory --production "${POOL_PRODUCTION}" \
-      --unit "${POOL_UNIT}" > "${POOL_PROMPT_FILE}" 2>>"${LOG_FILE}"
-    if [[ -s "${POOL_PROMPT_FILE}" ]]; then
-      printf '\n\n' >> "${POOL_PROMPT_FILE}"
-      cat "${PROMPT_FILE}" >> "${POOL_PROMPT_FILE}"
-      PROMPT_FILE="${POOL_PROMPT_FILE}"
-    else
-      rm -f "${POOL_PROMPT_FILE}"
-      POOL_PROMPT_FILE=""
-    fi
-  fi
 fi
 
 if [[ -n "${REVIEW_WORKER}" ]]; then
@@ -860,28 +792,19 @@ wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
 TREE_CHANGED=0
 CHANGED_PATHS=""
-if [[ -n "${REVIEW_WORKER}" && "${TREE_BASELINE_READY}" -eq 1 ]]; then
-  TREE_HEAD_AFTER="$(tree_head)"
-  TREE_STATUS_AFTER="$(tree_status)"
-  TREE_DIFF_HASH_AFTER="$(tree_diff_hash)"
-  TREE_UNTRACKED_HASH_AFTER="$(tree_untracked_hash)"
-  TREE_PATHS_AFTER="$(tree_paths)"
-  if [[ "${TREE_HEAD_BEFORE}" != "${TREE_HEAD_AFTER}" || \
-        "${TREE_STATUS_BEFORE}" != "${TREE_STATUS_AFTER}" || \
-        "${TREE_DIFF_HASH_BEFORE}" != "${TREE_DIFF_HASH_AFTER}" || \
-        "${TREE_UNTRACKED_HASH_BEFORE}" != "${TREE_UNTRACKED_HASH_AFTER}" ]]; then
+if [[ -n "${REVIEW_WORKER}" && "${TREE_BASELINE_READY}" -ne 0 ]]; then
+  if [[ "${TREE_BASELINE_READY}" -eq 1 ]] && CHANGED_PATHS="$("$PY" "${SCRIPT_DIR}/review_tree.py" changes \
+    --root "${WORKING_DIR}" --baseline "${TREE_BASELINE_FILE}" \
+    --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" 2>>"${LOG_FILE}")"; then
+    CHANGED_PATHS="$(tr '\n' ' ' <<<"${CHANGED_PATHS}" | sed 's/[[:space:]]*$//')"
+  else
+    CHANGED_PATHS="the tree check failed (see ${LOG_FILE})"
+  fi
+  if [[ -n "${CHANGED_PATHS}" ]]; then
     TREE_CHANGED=1
-    HEAD_CHANGED_PATHS=""
-    if [[ "${TREE_HEAD_BEFORE}" != "${TREE_HEAD_AFTER}" ]]; then
-      HEAD_CHANGED_PATHS="$(git -C "${WORKING_DIR}" diff --name-only \
-        "${TREE_HEAD_BEFORE}" "${TREE_HEAD_AFTER}" 2>/dev/null || true)"
-    fi
-    CHANGED_PATHS="$(printf '%s\n%s\n%s\n' \
-      "${TREE_PATHS_BEFORE}" "${TREE_PATHS_AFTER}" "${HEAD_CHANGED_PATHS}" |
-      sed '/^$/d' | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
-    [[ -n "${CHANGED_PATHS}" ]] || CHANGED_PATHS="working tree state changed"
     echo "ERROR: review worker ${REVIEW_WORKER} changed the working tree: ${CHANGED_PATHS}" >&2
   fi
+  rm -f "${TREE_BASELINE_FILE}"
 fi
 
 # The durable record stores this count before finish-pass closes the pass.

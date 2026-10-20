@@ -195,7 +195,7 @@ def launch():
 def launch():
     selected = accounts.role_account("unit")
     herdr.open_pane("unit", "unit", cwd, named_account_environment(selected.dir))
-    herdr.start_agent("unit", pane, kind="claude", agent_arguments=[])
+    herdr.start_agent("unit", pane, kind="claude", agent="unit", agent_arguments=[])
 '''
         problems = launch_account_violations(source, "fixture.py")
         self.assertTrue(any("selects with" in problem for problem in problems), problems)

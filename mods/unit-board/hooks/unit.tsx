@@ -1,7 +1,8 @@
 import type { RenderElement } from 'claude-code';
 import type { PaneElements } from './board';
+import type { Tone } from './geometry';
 import type { BoardData, BoardPhase, BoardUnit } from '../types/board';
-import { cellWidth, duration, fitText, runsOf, signedMinutes, stripCells } from './geometry';
+import { cellWidth, duration, fitText, runsOf, signedMinutes, stripCells, wrappedLines } from './geometry';
 import { etaText, finishText, gateText, RulerView } from './board';
 
 function recordText(phase: BoardPhase): string {
@@ -10,35 +11,6 @@ function recordText(phase: BoardPhase): string {
     return `${signedMinutes(eta.delta_minutes)} ${eta.delta_minutes > 0 ? 'late' : 'early'}, said ${eta.trail.at(-1)?.[0].text ?? '—'}`;
   }
   return eta.trail.length ? `ETA ${eta.trail.at(-1)?.[0].text}` : 'none stated';
-}
-
-/** Explicit wrapping makes each rendered row's height known before folding. */
-function wrappedLines(text: string, columns: number): string[] {
-  const width = Math.max(1, columns);
-  return text.split('\n').flatMap(paragraph => {
-    const lines: string[] = [];
-    let rest = paragraph;
-    while (cellWidth(rest) > width) {
-      let prefix = '';
-      let used = 0;
-      for (const ch of rest) {
-        if (used + cellWidth(ch) > width) break;
-        prefix += ch;
-        used += cellWidth(ch);
-      }
-      const space = prefix.lastIndexOf(' ');
-      const end = space > 0 ? space : prefix.length;
-      if (!end) {
-        lines.push('…');
-        rest = rest.slice(Array.from(rest)[0]!.length);
-      } else {
-        lines.push(rest.slice(0, end).trimEnd());
-        rest = rest.slice(end).trimStart();
-      }
-    }
-    if (rest.length) lines.push(rest);
-    return lines;
-  });
 }
 
 /** Rows are removed in this order only after history and steps have folded. */
@@ -64,9 +36,14 @@ function padCells(text: string, width: number): string {
 export function UnitView(elements: PaneElements, columns: number, bodyRows: number, data: BoardData, unit: BoardUnit, now: number, back: () => void) {
   const { Box, Text, Button } = elements;
   const limit = Math.max(0, Math.floor(bodyRows));
+  const fact = (text: string, tone: Tone = 'default') => tone === 'default'
+    ? <Text>{text}</Text> : <Text color={tone}>{text}</Text>;
   const eta = etaText(unit, now);
   const gate = gateText(unit);
   const finish = finishText(unit, now);
+  const heading = !unit.phase ? unit.stage : unit.phase.kind === 'ticket'
+    ? `Ticket ${unit.phase.id} · ${unit.phase.merged} merged · ${unit.stage}`
+    : `Phase ${unit.phase.id} of ${unit.phase.of} · ${unit.stage}`;
   const trail = unit.eta?.trail.map(([eta, stated]) => `${eta.text} said ${stated.text}`).join(' → ') ?? '';
   const strip = stripCells(unit.phases);
   const slotWidth = Math.max(0, ...unit.workers.map(worker => cellWidth(worker.slot))) + 1;
@@ -89,44 +66,46 @@ export function UnitView(elements: PaneElements, columns: number, bodyRows: numb
 
   function sections(): UnitSection[] {
     const overview = [row(<Box justifyContent="space-between">
-      <Text wrap="truncate-end"><Text bold>{unit.key}</Text>  {unit.phase ? `Phase ${unit.phase.id} of ${unit.phase.of} · ` : ''}{unit.stage}</Text>
+      <Text wrap="truncate-end"><Text bold>{unit.key}</Text>  {heading}</Text>
       <Button key="back" label="board" plain onPress={back} />
     </Box>, 'navigation')];
-    if (unit.phase?.title || unit.plan) overview.push(row(<Text bold wrap="truncate-end">{unit.phase?.title || unit.plan}</Text>));
-    if (unit.phase && unit.plan) overview.push(row(<Text color="subtle" wrap="truncate-end">{unit.plan}</Text>));
-    overview.push(...wrappedLines(unit.summary, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
-    overview.push(row(<Text color="subtle" wrap="truncate-end">as of {data.as_of.text}</Text>));
+    if (unit.phase?.title) overview.push(row(<Text bold wrap="truncate-end">{unit.phase.title}</Text>));
+    if (unit.plan) overview.push(row(unit.phase
+      ? <Text wrap="truncate-end">{unit.plan}</Text>
+      : <Text bold wrap="truncate-end">{unit.plan}</Text>));
+    overview.push(...wrappedLines(unit.summary, columns).map(line => row(<Text wrap="truncate-end">{line}</Text>)));
+    overview.push(row(<Text wrap="truncate-end"><Text color="inactive">as of </Text>{data.as_of.text}</Text>));
     const timing: UnitRow[] = [];
     timing.push(...wrappedLines(eta, columns).map(line => row(<Text wrap="truncate-end">{line}</Text>)));
     timing.push(...wrappedLines(gate, columns).map(line => row(<Text color="warning" wrap="truncate-end">{line}</Text>)));
-    timing.push(...wrappedLines(finish, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
+    timing.push(...wrappedLines(finish, columns).map(line => row(<Text wrap="truncate-end">{line}</Text>)));
     if (unit.phase) timing.push(row(RulerView(elements, unit, data, now, Math.max(1, columns - 2)), 'context', 2));
-    timing.push(...wrappedLines(trail, columns).map(line => row(<Text color="subtle" wrap="truncate-end">{line}</Text>)));
+    timing.push(...wrappedLines(trail, columns).map(line => row(<Text wrap="truncate-end">{line}</Text>)));
     const steps: UnitRow[] = [];
     if (unit.steps.length) {
       steps.push(row(<Text bold>This phase</Text>, 'heading'));
-      if (hiddenSteps) steps.push(row(<Text color="subtle" wrap="truncate-end">+{hiddenSteps} earlier steps</Text>, 'fold'));
+      if (hiddenSteps) steps.push(row(<Text color="inactive" wrap="truncate-end">+{hiddenSteps} earlier steps</Text>, 'fold'));
       unit.steps.slice(hiddenSteps).forEach(([state, what], offset) => {
         const label = fitText(what, labelWidth);
-        steps.push(row(<Text wrap="truncate-end"><Text color={state === 'running' ? 'suggestion' : 'success'}>{padCells(state === 'running' ? '▶ ' : '✓ ', markWidth)}</Text>{padCells(label, labelWidth)}  <Text color="subtle">{fitText(stepTimes[hiddenSteps + offset]!, timeWidth)}</Text></Text>, 'step'));
+        steps.push(row(<Text wrap="truncate-end"><Text color={state === 'running' ? 'suggestion' : 'success'}>{padCells(state === 'running' ? '▶ ' : '✓ ', markWidth)}</Text>{padCells(label, labelWidth)}  <Text>{fitText(stepTimes[hiddenSteps + offset]!, timeWidth)}</Text></Text>, 'step'));
       });
     }
     const workers: UnitRow[] = unit.workers.length ? [row(<Text bold>Workers</Text>, 'heading'), ...unit.workers.map(worker => row(
-      <Text wrap="truncate-end"><Text color="subtle">{padCells(worker.slot, slotWidth)}</Text><Text bold>{padCells(worker.role || worker.slot, roleWidth)}</Text><Text color={worker.state === 'running' ? 'suggestion' : 'inactive'}>{padCells(worker.state, stateWidth)}</Text>{worker.doing}</Text>, 'worker'))] : [];
+      <Text wrap="truncate-end"><Text>{padCells(worker.slot, slotWidth)}</Text><Text bold>{padCells(worker.role || worker.slot, roleWidth)}</Text>{fact(padCells(worker.state, stateWidth), worker.state === 'running' ? 'suggestion' : worker.state === 'paused' ? 'warning' : 'default')}{worker.doing}</Text>, 'worker'))] : [];
     const record = [row(<Text bold>Phase record</Text>, 'heading')];
-    if (!unit.phases.length) record.push(row(<Text color="subtle">no phases recorded</Text>, 'phase'));
-    if (hiddenFuture.size) record.push(row(<Text color="subtle" wrap="truncate-end">+{hiddenFuture.size} later</Text>, 'fold'));
+    if (!unit.phases.length) record.push(row(<Text color="inactive">no phases recorded</Text>, 'phase'));
+    if (hiddenFuture.size) record.push(row(<Text color="inactive" wrap="truncate-end">+{hiddenFuture.size} later</Text>, 'fold'));
     [...unit.phases].reverse().filter(phase => !hiddenDone.has(phase) && !hiddenFuture.has(phase)).forEach(phase => {
       const id = ' '.repeat(Math.max(0, idWidth - cellWidth(phase.id))) + phase.id;
       record.push(row(<Text wrap="truncate-end">
-        <Text color="subtle">{id}  </Text>{(phase.took === null ? phase.status : duration(phase.took)).padEnd(timingWidth)}
+        <Text>{id}  </Text>{(phase.took === null ? phase.status : duration(phase.took)).padEnd(timingWidth)}
         <Text color="warning">{('●'.repeat(phase.fix_done) + (phase.fix_running ? '○' : '')).padEnd(fixWidth)}</Text>
-        <Text color={phase.eta.delta_minutes !== null && phase.eta.delta_minutes > 0 ? 'error' : 'subtle'}>{padCells(recordText(phase), recordWidth)}</Text>  {phase.title}
+        {fact(padCells(recordText(phase), recordWidth), phase.eta.delta_minutes !== null && phase.eta.delta_minutes > 0 ? 'error' : 'default')}  {phase.title}
       </Text>, phase.status === 'open' ? 'open-phase' : 'phase'));
     });
-    if (hiddenDone.size) record.push(row(<Text color="subtle" wrap="truncate-end">{fitText(`+${hiddenDone.size} earlier: ${earlierIds(done.filter(phase => hiddenDone.has(phase)))}`, columns)}</Text>, 'fold'));
+    if (hiddenDone.size) record.push(row(<Text color="inactive" wrap="truncate-end">{fitText(`+${hiddenDone.size} earlier: ${earlierIds(done.filter(phase => hiddenDone.has(phase)))}`, columns)}</Text>, 'fold'));
     return [{ rows: overview, gap: 0 }, { rows: timing, gap: 1 },
-      { rows: strip.length ? [row(<Text wrap="truncate-end">{runsOf(strip).map(run => <Text color={run.tone}>{run.text}</Text>)}</Text>)] : [], gap: 1 },
+      { rows: strip.length ? [row(<Text wrap="truncate-end">{runsOf(strip).map(run => run.tone === 'default' ? <Text>{run.text}</Text> : <Text color={run.tone}>{run.text}</Text>)}</Text>)] : [], gap: 1 },
       { rows: steps, gap: 1 }, { rows: workers, gap: 1 }, { rows: record, gap: 1 }];
   }
 

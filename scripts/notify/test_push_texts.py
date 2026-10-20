@@ -105,6 +105,18 @@ class PushTextTests(unittest.TestCase):
                     self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
 
+    def test_failed_restart_catalog_examples_show_named_sessions(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")
+        self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
+        stop = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.stop_failed")
+        self.assertEqual({example.name for example in stop.examples}, {"typical", "many_long_names"})
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = push_texts.render_entry(entry, example.values)
+                stopped = push.values["stopped"]
+                self.assertRegex(stopped, r"\([^()]+\)")
+                self.assertIn(stopped, push.message)
+
     def test_every_catalog_example_keeps_email_addresses_out_of_pushes(self) -> None:
         for entry in push_texts.catalog():
             for example in entry.examples:
@@ -154,8 +166,10 @@ class PushTextTests(unittest.TestCase):
             for example in entry.examples:
                 with self.subTest(id=entry.id, example=example.name):
                     push = push_texts.render_entry(entry, example.values)
-                    expected = ([f"Or stop it instead, and the {example.values['operation']} goes on without it. "
-                                 + f"In a terminal on {example.values['machine']}: {example.values['command']}"]
+                    expected = ([f"Answer the form (recommended): the session pauses, and the {example.values['operation']} goes on.",
+                                 "Stop the session: it ends, its uncommitted work stays, and the "
+                                 + f"{example.values['operation']} goes on without it. In a terminal on {example.values['machine']}, run:",
+                                 example.values["command"]]
                                 if entry.id == "shutdown.holdout"
                                 else ["Stopping it ends only that session and keeps its uncommitted work. "
                                       + f"Then the {example.values['operation']} goes on.", example.values["command"]])

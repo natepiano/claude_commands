@@ -22,6 +22,9 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - Free text amends or narrows the selected work.
 - `single` and `verbose` are mutually exclusive.
 
+At startup or restart, a header `**Standing:** style_plan.py` runs
+<StandingPlanRefill/> before choosing a phase; repeat after compaction.
+
 State:
 
 - `SESSION_DIR`: last path printed by `prepare_session.sh`.
@@ -102,9 +105,9 @@ mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
 
 When the production doc names a review pool, send code reviews with
 `review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
-review resumes the unit's own reviewer, which is never reset. A refusal ending
-`no primed code template` means `review-unit` has not primed the pool yet: send
-that review to an idle worker with `--to`, and tell the showrunner once.
+review resumes the unit's own reviewer, which is never reset. A refusal
+`no primed code template: <cause>` means the pool could not prime itself: send
+that review to an idle worker with `--to`, and tell the showrunner the cause once.
 
 Compaction can erase earlier prompt text. Every opening, later-phase, repair,
 review, and follow-up prompt repeats the Three Gods sentence and carries the
@@ -260,8 +263,7 @@ Applies to every implementation, test, fix, and review launcher.
    output as a substitute for that review.
 4. Claude: after assigned synchronous work, end the turn under <TurnEndGate/>,
    naming what is running in the `— holding: waiting on <what is running>`
-   line, never its handle. Task and notifier messages resume the workflow
-   independently; process the first without waiting for the other.
+   line, never its handle. A task message resumes the workflow.
 5. Codex: apply <CodexDispatchWait/>. Never end the turn while the launcher is
    active; its terminal result drives the next workflow step.
 6. A new-worker or follow-up launcher killed at its time limit leaves its Codex
@@ -335,12 +337,11 @@ Codex only; no timer process:
 
 1. Empty-poll `${DISPATCH_HANDLE}` with `write_stdin`. Set `yield_time_ms` to the
    configured interval from <ProgressContract/>, capped by
-   `background_terminal_max_timeout`; when the user has stopped updates, use
-   the maximum. Do not use shell `wait`, `sleep`, a status-file loop, or a second
+   `background_terminal_max_timeout`. Do not use shell `wait`, `sleep`, a status-file loop, or a second
    terminal.
 2. A result with the same `session_id` and no `exit_code` means the interval
-   elapsed and the launcher remains active. Unless the user stopped updates,
-   apply <ProgressContract/>, then poll the same session again.
+   elapsed and the launcher remains active. Apply <EarlyReviewArm/>, then poll
+   the same session again. A poll timeout composes no report.
 3. An initial launch or poll result with `exit_code` means the launcher finished.
    Clear `${DISPATCH_HANDLE}`, read the call site's status/result files, and
    route to review, synthesis, repair, smoke, or the next stage immediately in
@@ -363,8 +364,8 @@ with no env prefix, redirect or trailing command: the settings allow rule
 matches only that shape, and the task notification already carries its exit
 code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
 opens its own progress window, and tell the user what is running. Claude ends
-the turn and resumes from a task or notifier message; Codex applies
-<CodexDispatchWait/> with progress disabled.
+the turn and resumes from a task message; Codex applies
+<CodexDispatchWait/>.
 </BackgroundVerificationContract>
 
 <PauseForMove>
@@ -455,7 +456,7 @@ Rust delegates run only exact prompt lines using
 | package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it cannot pass on macOS>"` |
+| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it cannot pass on macOS>"`; never to keep tests off the Mac: a reason that names a reservation is refused, and a Mac hold (`/build:hold hold <why> target mac`) does that |
 | phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
 | changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
 | final workspace gate | `bash ~/.claude/scripts/delegate/verify.sh final` |
@@ -598,20 +599,9 @@ printed.
 
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
 `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
-The key sets the Codex poll timeout and a Claude unit's notifier interval.
-For Codex, a missing or non-positive integer is an error; tell the user to set
-it. <PrepareSession/> creates Claude's `unit-<run id>` instance, where
-the run id is the basename of `${SESSION_DIR}`; `end_session.sh` removes it.
-With `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, the default, it creates none:
-reports run only when asked, until `/unit:report on` starts the schedule. A
-resumed run that already has an instance keeps it, on or off. The key does not
-change the Codex poll interval. The agent arms nothing. When `prepare_session.sh` prints `notifier instance not
-created`, say so in one line: this run gets no ticks until
-`zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID"`
-succeeds. While work runs, the notifier sends
-`/unit:report` from `unit-<run id>` every interval. That message
-is the Claude tick. Each `progress_history.py progress` call restarts its
-clock; `--hold` keeps at most one tick waiting.
+It sets the Codex poll timeout. A missing or non-positive integer is an error;
+tell the user to set it. No timer sends reports: a report comes only when
+someone asks (2026-10-19).
 
 Launcher work is a **pass**; unit-director work -- verification, smoke, style -- is
 an **activity**. `verify.sh` opens and closes its own whenever it runs with
@@ -626,25 +616,16 @@ the row can only say `done`, which reports that the window closed rather than
 what it found. Activities sit beside passes and are invisible to `findings.py`,
 which is why <PassOwnership/> forbids faking a pass for the same purpose.
 
-On a Claude notifier tick or Codex poll timeout, compose the update per
-<ProgressReport/>, which
-`~/.claude/commands/unit/report.md` defines in full. Read that file and
-follow it; a report written from memory of an earlier read drops the
-byte-for-byte copy rule first. It also owns this tick's <EarlyReviewArm/>
-trigger point and the query that answers questions about work already finished.
-The user can invoke the same file as `/unit:report`.
+A requested status check — `/unit:report`, or a user or showrunner asking —
+emits <ProgressReport/> immediately, which `~/.claude/commands/unit/report.md`
+defines in full. Read that file and follow it; a report written from memory of an
+earlier read drops the byte-for-byte copy rule first. It also owns that report's
+<EarlyReviewArm/> trigger point and the query that answers questions about work
+already finished. A report never replaces the completion report: when work
+finishes, report its result and current progress header.
 
-After a Codex report, return to <CodexDispatchWait/> on the same session and
-read the interval again before polling. A tick never replaces the completion
-report: when work finishes, report its result and current progress header even
-if a tick arrived recently.
-
-A user-requested status check emits <ProgressReport/> immediately. If the user
-stops updates, use `/unit:report off` for Claude; Codex keeps polling without
-reports. A message the user types pauses these status reports on its own; later
-a `conversation-pause:` message asks you to put its question to the user word
-for word. Never answer it for them. Resume Claude updates with
-`/unit:report on`. Change one unit's interval with `/unit:report_interval <min>`.
+A `conversation-pause:` message asks you to put its question to the user word for
+word. Never answer it for them.
 </ProgressContract>
 
 <AuthorizationContract>
@@ -742,7 +723,7 @@ phase's gates pass. Follow its order through the next turn boundary.
 <PrepareSession>
 Run `bash ~/.claude/scripts/delegate/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
-creates the run-active marker and Claude's notifier instance; every exit must
+creates the run-active marker; every exit must
 eventually run `end_session.sh`
 through <RunSummary/> or single-mode completion.
 
@@ -935,14 +916,14 @@ file named by the delegate is visible; stop if not. Capture the diff and status.
 
 <EarlyReviewArm>
 Launch the blind reviewer while the writer is still running, so both finish
-together instead of back to back. Evaluate only on a <ProgressContract/> tick,
-and arm only when all of these hold: an implementation or fix dispatch is
+together instead of back to back. Evaluate only at a Codex poll timeout or a
+requested <ProgressReport/>, and arm only when all of these hold: an implementation or fix dispatch is
 active; `EARLY_REVIEW=none`; the completed dispatch would receive a delegate
 review — <DualReview/> pass 1 or a closure review; **pass-internal** completion
 of that dispatch is at least 75%; and at least ten minutes of writer time still
 remain.
 
-Read completion from the tick's evidence — the heartbeat shows the delegate
+Read completion from that report's or poll's evidence — the heartbeat shows the delegate
 running its listed verification commands, or the diff already covers essentially
 all Work Order (or fix batch) files — and the remainder from how long the pass
 has already run against that estimate. Ten minutes left at 75% means a pass of
@@ -955,7 +936,7 @@ contained diff; that judgment is the unit director's own reading of the batch, a
 no task name carries it. When the two estimates disagree, or either rests on no
 evidence, do nothing; the synchronous path still exists.
 
-At an eligible tick, in that same tick:
+At an eligible point, in that same turn:
 
 1. Increment `${REVIEW_PASS}` now; <DualReview/> will not increment it again.
 2. **Delete every stale delivery artifact and prove they are gone.**
@@ -1072,7 +1053,8 @@ diff, reviews, or finding ids.
 **Close every delegation result and launch with the short progress report**
 from <ProgressReport/>: phase and stage, ETA line, workers, summary, board link,
 and wall clock. Copy the recorder's phase, stage, ETA and clock exactly. Include
-both recorder tables only for `/unit:report tables`.
+the summary table in every report; include the round table only for
+`/unit:report tables`.
 
 Between windows, keep the recorder's `as of` and no-open-window lines. An
 activity still open after its phase closes remains the stage. If the recorder
@@ -1292,9 +1274,8 @@ instructions name; with none, skip and say so in one line.
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
      `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
      `review.sh --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
-     in the background. The launcher resumes the unit's UI reviewer, sends
-     every listed image, and sends the unit's memory on that reviewer's
-     first turn only; its thread carries the memory after that.
+     in the background. The launcher resumes the unit's UI reviewer and sends
+     every listed image; its thread carries what it learned from earlier reviews.
    - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
      also start the fresh Claude helper with the prompt from its helper file
      and those shots;
@@ -1391,6 +1372,9 @@ fails the checkpoint.
 </CheckpointCommit>
 
 <ShrinkCommit>
+Standing plans skip this tag entirely: their excluded plan and pinned files
+are never staged, and no shrink commit or notice is sent.
+
 Read `~/.claude/commands/unit/checkpoint.md` in full and apply it at
 <PhaseEnd/>'s point in loop and verbose. It commits the plan doc and an approved
 `${NEXT_ITEMS_PATH}` change, then runs <PushCheckpoint/>. It owns no
@@ -1464,7 +1448,9 @@ answer from the completed report and preserve the gate.
 </VerbosePostPhaseGate>
 
 <NextPhase>
-At <PhaseEnd/>'s next boundary, choose the next phase or close the plan. If no
+At <PhaseEnd/>'s next boundary, a plan whose header carries
+`**Standing:** style_plan.py` runs <StandingPlanRefill/> first. Otherwise choose
+the next phase or close the plan. If no
 todo phase remains, run <FinalGate/>, <RunAsBuilt/>, the final <PeriodicCI/>
 point and <CICleanup/>, then <RunSummary/>.
 
@@ -1481,6 +1467,55 @@ dispatching. Announce the next phase, run
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
+
+<StandingPlanRefill>
+Run at standing-plan startup, after compaction or restart, and at every
+<NextPhase/> boundary, before deciding that the plan is exhausted.
+Before `next-phase`, read every
+`${SESSION_DIR}/phases/*/delegated_phase_reservation_state.json`. For any record
+in `checkpoint_committed_awaiting_release_confirmation`, resume
+<CheckpointCommit/> at step 7 through release confirmation, then push and merge
+request as that procedure requires, before refilling; a new ticket must not
+overtake an unconfirmed release. An unsuccessful recovery stops refill.
+
+Then run:
+
+```sh
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <unit-worktree>
+```
+
+Use the unit worktree's own plan: `add_unit.py` copies the showrunner template
+only at first launch. Exit 0 continues with the todo phase; a todo repair
+always runs first. The ledger resumes assigned work, rebuilds a missing phase,
+recovers interrupted assignment, and discards merged or dropped ticket phases;
+never take a second ticket while one is open.
+
+| Exit | Unit status and next action |
+| --- | --- |
+| 3 | `waiting for sync` or `waiting for structure: <crates>`; report the printed line once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message or any `ticket <id> merged; refill.`. |
+| 4 | `waiting for board`; report `board unavailable: <reason>` once and end the turn with `— blocked: waiting on the showrunner: board`. Refill on the next sync or showrunner message. |
+| 5 | `waiting for merge: <id>`; report once and end the turn with `— blocked: waiting on the showrunner: ticket <id> merge`. Refill on `ticket <id> merged; refill.` |
+| 6 | `merge the style branch first: <n> cells judged at <unit tip> wait for <style branch>`; each cell was judged at a commit in the unit tip with the inputs the tip has, and the pushed style merge branch changes those inputs. In the unit worktree, run the standing style unit merge (`~/.claude/docs/production_format.md` <ProductionUnit/> item 5): `git -C <unit-worktree> fetch origin <style merge branch> && git -C <unit-worktree> merge --ff-only origin/<style merge branch>`, then refill at once. If the fast-forward is refused or leaves HEAD unchanged, do not refill: report it once to the showrunner and end the turn with `— blocked: waiting on the showrunner: style merge`. |
+| Other nonzero | Report the error and retain the ticket; repair it before refill. |
+
+A standing plan never closes its run: skip FinalGate, RunAsBuilt, the final
+PeriodicCI, CICleanup and RunSummary. Never stage or shrink the excluded plan,
+`docs/style-production/` or its pinned rule files. Workers judge only the pinned
+`docs/style-production/rules/<blob>.md` files named in the ticket Work Order;
+`record --ticket` keeps that pinned blob even after a live rule edit, which
+leaves the new rule's cell stale until a later ticket.
+
+The ticket gate is `style_plan.py gate --repo . --ticket <id>`, from the unit
+worktree. Run it again at <CheckpointCommit/> step 6 before staging. The gate and
+`ticket checkpoint` refuse unjudged owned cells, naming each one. Coverage
+selection runs the mechanical filter at the ticket's recorded base; an approved
+proposal permits only files of its approved findings. Exit 1 prints `review:`,
+retains the reservation and returns to repair. Exit 2 prints `error:` when the
+gate could not run, such as a locked ledger: retain the reservation and rerun
+it; if the same error comes back, stop and report it. Exit 0 permits committing exactly that tree,
+then `style_ledger.py ticket checkpoint --id <ticket> --commit <code commit>`
+before marking the phase done. Both gates run this one command, so they cannot drift.
+</StandingPlanRefill>
 
 <FinalGate>
 Loop/verbose only after plan exhaustion:

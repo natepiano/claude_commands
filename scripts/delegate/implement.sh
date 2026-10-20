@@ -166,6 +166,9 @@ fi
 PY="${SCRIPT_DIR}/../lib/py"
 "$PY" "${SCRIPT_DIR}/worker_state.py" "${SESSION_DIR}"
 mkdir -p "${ARTIFACT_DIR}"
+# Every dispatch names the run's director in the run folder (unit_runs.py), which the
+# production tree reads: a marker names one run per director, and a director runs phases side by side.
+"$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" record-director "${SESSION_DIR}" || true
 SUMMARY_FILE="${ARTIFACT_DIR}/impl_summary${SLOT}.txt"
 # Truncate at launch: the "done" post below names this path unconditionally, so a
 # worker that reports on the board without writing a summary would otherwise leave
@@ -229,7 +232,7 @@ root = Path(root_text)
 compact_above = int(compact_above_text)
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
-from worker_state import worker_claim_lock, worker_ledger, worker_record_path
+from worker_state import worker_claim_lock, worker_ledger, worker_record_path, worker_slot
 
 identity_file = worker_record_path(root, name, slot)
 
@@ -277,7 +280,14 @@ with worker_claim_lock(root):
         identity_file.write_text(json.dumps(identity))
     elif action == "claim":
         identity = read(identity_file)
-        if not identity or identity != {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}:
+        expected = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
+        # A run from before the repair worker had its own record lost the fix worker's identity
+        # to the impl worker's, and a reopened seat keeps only its roster thread: record it from there.
+        # A worker recorded under another slot is followed in the wrong role and stays refused.
+        if not identity and worker_id and worker_slot(root, name) is None:
+            identity_file.write_text(json.dumps(expected))
+            identity = expected
+        if identity != expected:
             fail(f"{name} has no matching durable worker identity for slot {slot}")
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
@@ -374,6 +384,17 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
   worker_record claim
   trap 'worker_record release' EXIT
+fi
+
+# A phase claims its files before any seat edits them, wherever the seat runs
+# (phase_reservation.py claim): an unclaimed edit drifts to another reservation.
+if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim \
+  --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" --repo "${WORKING_DIR}" >>"${LOG_FILE}" 2>&1; then
+  echo "ERROR: phase ${PHASE_ID} could not claim its files before its seat opens; see ${LOG_FILE}." >&2
+  echo "error" > "${STATUS_FILE}"
+  bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
+    "launcher: phase ${PHASE_ID} could not claim its files; its seat did not open" || true
+  exit 1
 fi
 
 : > "${SUMMARY_FILE}"
@@ -476,7 +497,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
   elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
       --session-dir "${SESSION_DIR}" --to "${MESH_NAME}" --claim-pid "${FOLLOW_LAUNCHER_PID}" \
-      --role "${PASS_KIND}" \
+      --role "${PASS_KIND}" --cwd "${WORKING_DIR}" \
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
       --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
@@ -486,7 +507,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     exit 2
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
-  AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
+  AGENT_BG_WORKERS=1 AGENT_BG_EFFORT="${AGENT_EFFORT:-}" AGENT_BG_LEDGER="${SESSION_DIR}/workers" bash "${SCRIPT_DIR}/../agents/agent_bg.sh" \
     "${MESH_NAME}" "${WORKING_DIR}" "${PROMPT_FILE}" "${SUMMARY_FILE}" \
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then

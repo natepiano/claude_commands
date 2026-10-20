@@ -8,7 +8,13 @@ A `/unit:direct` run opens its Codex workers once and keeps them for the rest of
 
 ### Worker lifecycle in `scripts/agents/codex_mesh.py`
 
-Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it. The verbs:
+Each run has one detached `codex app-server --listen ws://127.0.0.1:<port>`. Each worker is a named, non-ephemeral thread on it.
+
+**Server environment.** `_start_server` gives the server the caller's environment with `CODEX_HOME` set to the workers home. When `--session-dir` is a child of a unit run root (`RUN_ROOTS`, `/tmp/claude/unit` and `/tmp/claude/delegate`), it also sets `PLAN_DELEGATE_BOARD_DIR` to that folder, replacing any value the caller carries. Seat processes inherit it: `verify.sh` takes the cargo token on that board, and the berth hook (`scripts/hooks/pre-tool-use-berth.py`) checks that run's open phases. The caller's copy cannot be used: implement.sh exports it only after its claim step, and the claim's `compact` call starts the server when none is running. On 2026-10-17, 11 of 13 live app-servers lacked it, all three started by that `compact` call among them. A review pool's mesh directory (`mesh/<generation>/`), and any other mesh directory outside the run roots, keeps the caller's environment unchanged: one pool server serves the turns of many units, so no single run is right for it, and a reviewer edits nothing. A server already running keeps its environment until it is next started.
+
+The berth hook takes the session directory from `PLAN_DELEGATE_BOARD_DIR` when it names a folder that exists. When the variable is unset or its folder is gone, it reads the director's run marker (`unit_runs.marker`), so a stale variable never lets an edit through unchecked. The marker names one run, so a seat in a director's side run would otherwise check the main run's reservations.
+
+The verbs:
 
 | Verb | Signature | Behavior |
 | --- | --- | --- |
@@ -53,7 +59,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`.
+  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`. A missing file with a roster thread for the name is not a mismatch: the claim writes the identity from the roster and continues. That resumes a reopened seat, and a fix worker of a run from before 2026-10-17, whose record the impl worker's replaced. A worker recorded under another slot is still refused.
   2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On any other failure it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
@@ -81,15 +87,9 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
   - The worker stays open until `end_session.sh`.
 - **Neither flag**: runs the fresh blind reviewer through `agent_exec.sh … readonly`, with no address (`mesh=none`). The skills use this form only for a review outside a run.
 
-**Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` records five things:
+**Tree guard (assigned and pooled reviews).** Before the turn, `review.sh` runs `review_tree.py baseline`, which records HEAD and, for each path `git status` names (untracked, non-ignored files included), its HEAD, index and worktree entries: mode and blob id, a symlink's target standing for its content.
 
-- `git rev-parse HEAD`
-- `git status --porcelain`
-- a SHA-256 of `git diff HEAD`
-- a SHA-256 over every untracked, non-ignored file's name and content (a symlink's target, for symlinks)
-- the changed paths
-
-After the turn it compares the first four. Any difference makes the review status `error`, prints `ERROR: review worker <worker> changed the working tree: <paths>`, posts `blocked` on the board, and keeps the findings file. An early review, which starts while the writer is still running, takes this snapshot when its early-ready sentinel appears.
+After the turn `review_tree.py changes` checks every path that was dirty before or after, or that HEAD moved under, and lists each one whose entries differ. When two or more phases are open in the session and the review names its phase with `--phase`, a changed path that another open phase's `phases/<phase>/files` list holds is that phase's writer at work: the launcher log notes it and the check leaves it out. A path the reviewed phase holds, or no phase holds, stays the review's. Any path left makes the review status `error`, prints `ERROR: review worker <worker> changed the working tree: <paths>`, posts `blocked` on the board, and keeps the findings file. An early review, which starts while the writer is still running, takes this snapshot when its early-ready sentinel appears.
 
 ### Choosing a worker for a review
 
@@ -108,15 +108,15 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 ### Cleanup
 
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. That removes Claude workers only and leaves Codex threads open. After a successful Claude session listing, and only under the real delegate root, it runs `codex_mesh.py sweep --stop` (best-effort). A sweep failure prints one line and worker cleanup continues.
-- **Run end.** `scripts/delegate/end_session.sh` takes these steps in order:
-  1. `remove_workers.py`
-  2. `codex_mesh.py stop`, whenever `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json` exists
-  3. `sweep --root <delegate root> --stop`
-  4. removal of `verify_cache/`
-  5. removal of the run's notifier
+- **Run end.** `scripts/delegate/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. It is a plain scan: reading the director of all 224 live folders took about 25 ms (2026-10-17). The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
+  1. one `remove_workers.py` call with a `--session-dir` per held run
+  2. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
+  3. one `sweep --root <root of the first held run> --stop`
+  4. removal of each held run's `verify_cache/`
+  5. removal of the marker run's notifier
   6. removal of the run-active marker
 
-  Each step continues after a failure.
+  Steps 1 to 4 run even with no marker, for runs the session still holds. Each step continues after a failure. Tests point the scan at a temp folder with `PLAN_DELEGATE_RUN_ROOT` and the marker with `PLAN_DELEGATE_ACTIVE_DIR`.
 - **Sweep.** It first decides who owns each `ws://` app-server: the current server of a run, a retired server of a run, an unowned server whose log names its run, or an unowned server with no log. It then judges whether anything still needs the server:
   - Any connected client means in use.
   - For a current server, a run-active marker or a running worker means in use.
@@ -162,8 +162,9 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
 | `scripts/delegate/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
 | `scripts/delegate/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
-| `scripts/delegate/end_session.sh` | Ends the run's workers (`stop`) and sweeps |
-| `scripts/delegate/remove_workers.py` | Removes Claude workers at phase end; sweeps after a successful listing |
+| `scripts/delegate/end_session.sh` | Ends the workers of every run the director holds (`stop`) and sweeps |
+| `scripts/delegate/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
+| `scripts/lib/unit_runs.py` | `held`: every run folder a director holds |
 | `scripts/delegate/progress_history.py` | Agent columns for extra workers |
 | `scripts/whoami/worker_usage.py` | Before/after usage report over the usage store |
 | `scripts/usage/weights.py` | Dated per-model weights the report applies |

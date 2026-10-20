@@ -344,6 +344,43 @@ def _record_active_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _claim_command(args: argparse.Namespace) -> int:
+    """Acquire a phase's reservation over its whole files list before any of its seats edits.
+
+    A seat's first edit is claimed only when the seat runs the berth check itself: a Codex seat
+    whose hook never fires, on either machine, edits with no reservation, and drift charges those
+    paths to whichever reservation is held. Claiming at launch leaves no window. A directory entry
+    (trailing `/`) is claimed at its first touch.
+    """
+    session_dir = Path(cast(str, args.session_dir))
+    phases = open_phases(session_dir)
+    directory = phase_directory(session_dir, cast(str, args.phase))
+    phase = next((open_phase for open_phase in phases if open_phase.directory == directory), None)
+    state = _read_state(phase.directory) if phase is not None else {}
+    if phase is None or _string(state.get("kind")) != AWAITING_FIRST_TOUCH:
+        print(f"phase reservation: {_string(state.get('kind')) or 'no state'}; nothing to claim")
+        return 0
+    root = repository_root(Path(cast(str, args.repo)))
+    scopes = [entry for entry in _phase_files(phase) if not entry.endswith("/")]
+    if root is None or not scopes:
+        print("phase reservation: no repository or no files to claim; still awaiting first touch")
+        return 0
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    answer = check(root, scopes, phase_session_id(session_id, phase.phase))
+    if answer.status == UNCONFIGURED:
+        return 0
+    if answer.status != CLEAR:
+        print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
+        return 1
+    acquisition = own_acquisition(answer, root, phases, session_id)
+    if acquisition is None:
+        print("phase reservation: a sibling phase's reservation holds every file; still awaiting first touch")
+        return 0
+    _ = record_active(phase.directory, acquisition)
+    print(f"phase reservation: Active, reservation {acquisition.reservation_id}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -351,8 +388,13 @@ def main(argv: list[str]) -> int:
     _ = record.add_argument("--session-dir", required=True)
     _ = record.add_argument("--phase", required=True)
     _ = record.add_argument("--repo", default=".")
+    claim = commands.add_parser("claim", help="acquire a phase's reservation over its files before its seats open")
+    _ = claim.add_argument("--session-dir", required=True)
+    _ = claim.add_argument("--phase", required=True)
+    _ = claim.add_argument("--repo", default=".")
     args = parser.parse_args(argv)
-    return _record_active_command(args)
+    command = cast(str, args.command)
+    return _claim_command(args) if command == "claim" else _record_active_command(args)
 
 
 if __name__ == "__main__":

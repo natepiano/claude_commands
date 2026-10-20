@@ -594,7 +594,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
                    + b"\0".join(os.fsencode(word) for word in arguments) + b"\0HOME=/scratch\0")
         with (patch.object(sys, "platform", "darwin"),
               patch.object(subprocess, "run", return_value=listing),
-              patch.object(account, "_kern_procargs2", return_value=payload),
+              patch.object(account, "kern_procargs2", return_value=payload),
               patch.object(accounts, "list_codex_home_processes", side_effect=self.process_lister)):
             self.assertNotEqual(self.run_cutover(), 0)
         self.assertIn(f"321 ({shlex.join(arguments)}) uses {self.source}", self.errors.getvalue())
@@ -717,7 +717,7 @@ class CodexCutoverProcessListingTests(unittest.TestCase):
         listing = subprocess.CompletedProcess([], 0, "  321 codex           \n  654 codex           \n  987 codex           \n  777 python          \n  888 Codex (Service) \n", "")
         with (patch.object(sys, "platform", "darwin"),
               patch.object(subprocess, "run", return_value=listing) as listed,
-              patch.object(account, "_kern_procargs2", side_effect=kernel_record),
+              patch.object(account, "kern_procargs2", side_effect=kernel_record),
               patch.object(account, "process_codex_home", wraps=account.process_codex_home) as read_home):
             found = accounts.list_codex_home_processes()
         listed.assert_called_once_with(("ps", "-u", str(os.getuid()), "-o", "pid=,ucomm="),

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The nightly review's open candidates, as one Markdown table in the order /nightly_next ranks them.
+"""The nightly review's open candidates, as one Markdown table in the order /efficiency_next ranks them.
 
 Usage: candidates.py                   print the table
        candidates.py record <report>   add a night's report to the ledger: its proposal and each
@@ -12,7 +12,7 @@ The ledger is the one record, and every candidate is a line of its own:
 
 A line is open while it ends `— proposed` or `— deferred`. The gain is measured user-visible time
 (`38 min waiting`, `2.5 h red CI`) or a share of tokens (`3.1% of tokens`); a line with no tag is
-unmeasured. Time ranks before tokens and unmeasured comes last, as /nightly_next ranks them.
+unmeasured. Time ranks before tokens and unmeasured comes last, as /efficiency_next ranks them.
 
 The note at ~/rust/hanadocs/nightly improvement list.md copies the ledger's table.
 NIGHTLY_REVIEW_NOTE replaces that path; both commands rewrite the note.

@@ -11,7 +11,7 @@ The unit does the modes in order; for each it writes NIGHT/<mode>.md and message
 distills the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped when no
 running production holds the unit.
 
-Nothing offers the proposals: the ledger's queue grows until the user asks for /nightly_next
+Nothing offers the proposals: the ledger's queue grows until the user asks for /efficiency_next
 (user, 2026-10-10).
 """
 
@@ -270,7 +270,7 @@ def live_unit(slug: str) -> LiveClaude | None:
     else:
         import unit_lookup
 
-    unit = unit_lookup.marked_units(slug).get(NIGHTLY_UNIT)
+    unit = unit_lookup.marked_unit(slug, NIGHTLY_UNIT)
     return unit.claude if unit is not None and isinstance(unit.claude, unit_lookup.LiveClaude) else None
 
 

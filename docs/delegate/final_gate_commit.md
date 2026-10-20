@@ -24,7 +24,7 @@ phase review, so the run leaves no uncommitted work behind.
 
    <what the closing repairs changed>
 
-   Change-Review: none — <why nothing visible changes>, or one `<change> | <how to check>` line each
+   Change-Review: none — <why nothing visible changes>, or one `<what changed for you> | <how to try it: where and what to type> | <what you see>` line each
    Claude-Session: <session url>
    ```
 

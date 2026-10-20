@@ -5,8 +5,10 @@ Claude Code edits reach `cargo-berth hook pre-tool-use` through `berth_pre_edit.
 seat's `apply_patch` had no berth check at all, so its first touch never turned the phase's
 `enrolled_awaiting_first_touch` state `Active`. This hook runs for Codex `PreToolUse` on
 `apply_patch`. It acts only for a seat of a running unit: the app-server a unit director starts
-carries the director's `CLAUDE_CODE_SESSION_ID`, and that session's run marker names the session
-directory. Any other Codex session is left alone.
+carries the director's `CLAUDE_CODE_SESSION_ID` and, when codex_mesh started it for a run, that run
+as `PLAN_DELEGATE_BOARD_DIR`. The run named there is the session directory; when it is unset or
+names a folder that is gone, the director's run marker names it. Any other Codex session is left
+alone.
 
 Seats persist across phases and the mesh knows no phase, so each edited path goes to the open
 phase that owns it (`phase_reservation.attribute`): the only open phase, else the one whose
@@ -37,10 +39,19 @@ import unit_runs  # noqa: E402
 
 
 def _seat_session_dir() -> Path | None:
-    """The unit's session directory when this Codex process is one of its seats."""
+    """The unit's session directory when this Codex process is one of its seats.
+
+    The seat's own run comes first: codex_mesh names it as PLAN_DELEGATE_BOARD_DIR in the
+    environment of every app-server it starts for a run, and a director running phases side by
+    side marks just one of their runs. The marker is read when that variable is unset or names a
+    folder that is gone, so a stale variable never lets an edit through unchecked.
+    """
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     if not session_id:
         return None
+    board = os.environ.get("PLAN_DELEGATE_BOARD_DIR", "")
+    if board and Path(board).is_dir():
+        return Path(board)
     try:
         marker = unit_runs.marker(session_id, os.environ.get("PLAN_DELEGATE_ACTIVE_DIR"))
         lines = marker.read_text(encoding="utf-8").splitlines()

@@ -20,6 +20,10 @@ class HostedUnit:
     pane: str
     marks: dict[str, str]
     screen: str = ""
+    # herdr's state for the Claude agent in the pane, as `agent list` reports it.
+    agent_status: str = "idle"
+    # The pane's label, as `pane list` reports it.
+    label: str = ""
 
 
 def environment(root: Path) -> dict[str, str]:
@@ -62,6 +66,10 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
         process(env, server + 1, server, ["zsh"], {**unit.marks, "HERDR_PANE_ID": unit.pane})
         sessions.append({"name": unit.session, "running": True, "default": False,
                          "session_dir": "/fixture", "socket_path": "/fixture/socket"})
+        responses[f"--session {unit.session} agent list"] = {"code": 0, "stdout": json.dumps({"result": {"agents": [
+            {"pane_id": unit.pane, "agent": "claude", "agent_status": unit.agent_status}]}})}
+        responses[f"--session {unit.session} pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
+            {"pane_id": unit.pane, "label": unit.label or None}]}})}
         for source in ("recent", "recent-unwrapped"):
             for lines in (3, 60, 400):
                 for ansi in ("", " --format ansi"):

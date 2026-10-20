@@ -1,32 +1,25 @@
 ---
 description: Show what this unit's /unit:direct run and its agents are doing right now.
-argument-hint: "[tables|on|off]"
+argument-hint: "[tables]"
 ---
 
 # Direct — status report
 
-**Usage:** `/unit:report [tables|on|off]`
+**Usage:** `/unit:report [tables]`
 
-Type this to see the phase, stage, ETA, workers and summary; add `tables` for
-the recorder's clocks and round tables. It runs inside
+Type this to see the phase, stage, ETA, workers and summary table; add `tables`
+for the round table, `Earlier:` and verification gate lines. It runs inside
 the current session and already knows the session directory, the phase, and
 which dispatches are live. If no `/unit:direct` run is active, say so in one line and
 stop.
 
-`/unit:direct` reads this file at every notifier tick and Codex poll timeout.
-It defines `<ProgressReport/>` — the content of an update. `<ProgressContract/>` in
-`~/.claude/commands/unit/direct.md` keeps the timing rules that say when one is
-owed. Never compose a report from memory of an earlier read: the byte-for-byte
+Reports come only when someone asks: no timer sends them. `/unit:direct` reads
+this file for each one. It defines `<ProgressReport/>` — the content of an update. Never compose a report from memory of an earlier read: the byte-for-byte
 copy rule and the ordinary-English closing sentences are the parts that decay.
 
-With `on` or `off`, run
-`zsh ~/.claude/scripts/delegate/unit_notifier.sh "$CLAUDE_CODE_SESSION_ID" on|off`
-using the requested word. Relay its output and stop without composing a report.
-A Codex unit has no notifier; say this switch is unavailable there. If the
-command fails, relay its message as printed: exit 1 covers both a session with
-no active run and a run whose notifier instance is missing, and the message
-says which. `tables` composes the report below with `progress --tables`;
-ordinary reports and notifier ticks omit that flag. Reject other arguments.
+Every report includes the summary table. `tables` adds the round
+table with `progress --tables`; ordinary reports omit that flag. Reject other
+arguments.
 
 Everything below is the contract.
 
@@ -37,12 +30,11 @@ Everything below is the contract.
    completion; a returned `session_id` without it remains active. When no
    dispatch, background verification or open activity remains active, process
    completion; its result closes with the report from step 5. A closed pass
-   alone is not completion (step 5). Ticks arriving during a report, or several
-   together, get one report.
+   alone is not completion (step 5).
 2. Read the current Work Order and verification list, the latest relevant
    heartbeat lines, `board.sh read "${SESSION_DIR}" --since <cursor>`,
    `git status --short`, and `git diff --stat` in `${WORKING_DIR}`. Keep the
-   board cursor across ticks, compare status with the phase baseline, include
+   board cursor across reports, compare status with the phase baseline, include
    untracked paths without changing the index, and read the board's `handoff`
    posts for which slot holds which role right now.
 3. Derive the **current-phase** percentage from completed and remaining work,
@@ -64,9 +56,9 @@ Everything below is the contract.
    count directly, without an active phase and pass:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
-4. Apply <EarlyReviewArm/>: steps 2-3 are its evidence and this tick is its only
-   trigger point. It runs **before** the recorder, so a reviewer it launches is
-   already listed among this tick's workers.
+4. Apply <EarlyReviewArm/>: steps 2-3 are its evidence and this report is one of
+   its trigger points. It runs **before** the recorder, so a reviewer it launches is
+   already listed among this report's workers.
 5. Run:
 
    `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
@@ -91,23 +83,25 @@ Everything below is the contract.
    the stage; `No active phase to report` means no phase or activity is open.
 
    Include the override reason only when rejecting applicable calibration.
-   Copy the recorder's phase heading, stage line, ETA line and wall clock
+   Copy the recorder's summary table byte for byte in every report.
+   Copy its phase heading, stage line, ETA line and wall clock
    exactly, keeping its `as of` and no-open-window lines when present. The ETA
    is the latest promise, including `passed` when overdue; never substitute a
-   schedule prediction. For `tables`, also copy both tables, `Earlier:` and
-   verification gate lines byte-for-byte. Worker narration supplies step 7;
+   schedule prediction. For `tables`, also copy the round table, `Earlier:` and
+   verification gate lines byte for byte. Worker narration supplies step 7;
    never paste the `- **Agent N**` lines themselves.
-6. Present sections in this order: phase and stage, ETA line, worker table,
-   summary sentences, then `See /unit-board for the board.` For `tables`, put
-   the two recorder tables after the ETA line. If early review is armed, say
-   the writer and reviewer are working at once.
+6. Present sections in this order: phase and stage, ETA line, summary table,
+   worker table, summary sentences, then `See /showrunner:unit_board for the board.`
+   For `tables`, put the round table after the summary table. If early review
+   is armed, say the writer and reviewer are working at once.
 
    Use the recorder's worker lines for slot, role, state, model and effort.
    `running` means working; `waiting` means held up; `idle` means its window
    closed while the round continues; `done` means its stretch ended. With
    `tables`, the round table adds timing and history for the last three stages;
    use `timeline` for stages named by `Earlier:`.
-7. Write the worker table yourself: one row per worker the recorder listed, columns
+7. Write the worker table yourself: one row per worker the recorder listed (it leaves
+   out a worker that finished over 10 minutes ago), columns
    `#`, `Role`, `Model`, `Effort`, `Details`. Take the number and the slot from
    the worker's label, the model and effort from the recorder when it names them
    and `-` when it does not. `Details` is a sentence of yours, not the worker's,
@@ -133,8 +127,8 @@ Everything below is the contract.
      reviewer's phrasing.
    - Give an age only when it is news — a worker silent long enough to look
      stalled, or finished and how long ago. "1s ago" tells the reader nothing.
-   - One table per report, from this tick's recorder output only. Never carry a
-     previous tick's rows forward or print two tables.
+   - One table per report, from this report's recorder output only. Never carry a
+     previous report's rows forward or print two tables.
 
    Not this:
 
@@ -153,35 +147,43 @@ Everything below is the contract.
    | 1 | impl | gpt-5.6-sol | xhigh | starting its verification build |
    | 2 | test | gpt-5.6-sol | xhigh | fixing six compile errors its new identity tests turned up |
    ```
-8. Add two or three ordinary-English sentences under <UserFacingText/>: open
-   with what this phase gives the person using the tool, then its movement and
-   what remains. One topic per sentence, no more than two clauses; when a topic
-   holds more than two items, give the count and what they have in common.
-   When the opening is not the default, or a worker is doing something other than
-   its name, say so in those words: "the test worker is writing the catalyst
-   side".
+8. Add three or four short sentences in Simplified Technical English, under
+   <UserFacingText/>. A reader who has seen nothing else must follow them. Use
+   this order:
+   1. What this phase gives the person who uses the tool.
+   2. Where the phase is, and what is left.
+   3. When it lands.
+
+   One topic per sentence, no more than two clauses. When a topic holds more
+   than two items, give the count and what they have in common. When a worker
+   is doing something other than its name, say so: "the test worker is writing
+   the catalyst side".
+
+   Never write:
+   - test-case or scene names (`scale-6`, `S6-S12`), finding ids, lane or gate names;
+   - the team's own terms: fail-first runs, a lint try, red test lines, closure,
+     passes, tokens;
+   - an account of a missed time ("my 15:30 time has passed"). Give the new
+     time only;
+   - logs, filenames, or work measured in lines, insertions or file counts.
 
    Not this:
 
    ```text
-   The repair pass has landed its production changes: an edge whose successor
-   has already ended now reports as ended rather than still waiting on its
-   predecessor, ancestry questions are narrowed to the reservations that
-   actually have something ordered after them, and an unrelated missing commit
-   no longer poisons a whole batch of ancestry answers.
+   The tests passed on the Mac at 15:22: 416 of 416, with the long-end case,
+   the normal scale-6 case, and the scale-4.2 case, which now counts within two
+   frames. The table's three red test lines are the planned fail-first runs and
+   a lint try that did not start. My 15:30 time has passed, and I commit and
+   push as soon as lint passes.
    ```
 
    This:
 
    ```text
-   This phase lets one worktree's work be ordered behind another's — start here
-   only once that branch is done. The repair pass fixed four cases where the
-   tool gave the wrong answer about whether the waiting side was still blocked.
-   Tests for that ordering come next, then verification.
+   This phase makes a cable count as plugged in as soon as its plug reaches the
+   jack, at every cable length and size. All tests pass. The last check is lint,
+   which waits for the build machine. It lands about 16:45.
    ```
-
-   Do not paste logs or filenames, or quantify work in lines, insertions, or
-   file counts.
 
 **Questions about work already finished** — how many fix passes there have been,
 how long a review took, what an earlier phase ran — are answered by

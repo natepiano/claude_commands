@@ -1,10 +1,11 @@
-"""Claude next-move reminders and Codex quota delivery use isolated state."""
+"""Claude account-move reminders and Codex quota delivery use isolated state."""
 
 from __future__ import annotations
 
 from scripts.whoami.note_file import note_name
 
 import io
+import fcntl
 import base64
 import json
 import os
@@ -13,6 +14,8 @@ import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from collections.abc import Callable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -31,6 +34,7 @@ import agent_notes
 import session_table
 import note_file
 import account
+import usage_store
 from agent_notes import local_reset
 from note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
@@ -47,7 +51,7 @@ REGISTRY = """\
 [assignments]
 delegate=codex
 cli=claude
-fix=codex   # a trailing comment
+module_review=codex   # a trailing comment
 ask_a_friend=caller
 
 [delegate.codex]
@@ -58,10 +62,10 @@ impl=opus:high
 commit_prep=gpt-6-sol:high
 [cli.claude]
 commit_prep=sonnet:high
-[fix.codex]
-style_fix=gpt-6-sol:xhigh
-[fix.claude]
-style_fix=opus:max
+[module_review.codex]
+review=gpt-6-sol:xhigh
+[module_review.claude]
+review=opus:max
 [ask_a_friend.codex]
 consultation=gpt-6-sol:max
 [ask_a_friend.claude]
@@ -242,6 +246,44 @@ class QuotaAlertTests(unittest.TestCase):
         return quota_alert.CodexAlertPassReadings(workers, account,
             (quota_alert.CodexHomeReading(home, live, now),))
 
+    def test_a_claim_during_a_codex_save_keeps_both_results(self) -> None:
+        home = self.root / ".codex"
+        login = "reader@example.invalid"
+        worker = agent_accounts.KnownCodexAccount(home, "worker@example.invalid", "codex1")
+        report = Report("Codex", email=worker.login, quotas=[Quota("Weekly", 40, None)])
+        readings = quota_alert.CodexAlertPassReadings(
+            accounts.CodexWorkersAccount(worker.label, home), worker,
+            (quota_alert.CodexHomeReading(home, report, self.now),))
+        merging, claiming = Event(), Event()
+        merge = usage_store.merge
+
+        def merge_while_claim_starts(stored: usage_store.UsageReadings,
+                                    reports: list[Report], at: datetime) -> bool:
+            merging.set()
+            with usage_store.store_file().with_name("usage.lock").open("a") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertTrue(claiming.wait(timeout=2))
+            return merge(stored, reports, at)
+
+        def claim() -> agent_accounts.UsageReadClaim | agent_accounts.UsageReadHeld:
+            self.assertTrue(merging.wait(timeout=2))
+            claiming.set()
+            return usage_store.claim_read(login, self.now)
+
+        with (mock.patch.object(usage_store, "merge", side_effect=merge_while_claim_starts),
+              ThreadPoolExecutor(max_workers=2) as pool):
+            saved = pool.submit(quota_alert._save_codex_readings, readings, self.now)  # pyright: ignore[reportPrivateUsage]
+            claimed = pool.submit(claim)
+            saved.result(timeout=3)
+            result = claimed.result(timeout=3)
+        self.assertIsInstance(result, agent_accounts.UsageReadClaim)
+        stored = usage_store.load()
+        self.assertEqual(stored[login].get("attempted_at"), self.now.isoformat())
+        self.assertEqual(stored[usage_store.key("Codex", worker.login)].get("weekly", {}).get("left"), 60)
+        self.assertIsInstance(usage_store.claim_read(login, self.now + timedelta(seconds=1)),
+                              agent_accounts.UsageReadHeld)
+
     def alert(self, notes: Notes, now: datetime | None = None, *,
               selection: ClaudeAccountsInUse | quota_alert.ReadCurrentClaudeSelection =
               quota_alert.READ_CURRENT_CLAUDE_SELECTION) -> list[str]:
@@ -308,7 +350,7 @@ class QuotaAlertTests(unittest.TestCase):
             "claude2 has 2% of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.")
         self.assertEqual(self.noted[0].title, "Claude work on claude2 may stop")
         self.assertEqual(self.noted[0].action,
-                         ActionRequired("In the natedev session, type /next_moves and the move you want, for example: when units reach 1% switch to claude2."))
+                         ActionRequired("In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2."))
         for minute, left in ((4, "1"), (32, "1"), (120, "null"), (122, "1")):
             _ = self.alert([self.note("claude2.md", "active", left)], self.now + timedelta(minutes=minute))
         self.assertEqual(len(self.noted), 1)
@@ -344,17 +386,28 @@ class QuotaAlertTests(unittest.TestCase):
             _ = self.alert([note], self.now + timedelta(minutes=minute))
         self.assertEqual((self.noted, self.pushed, self.sent), ([], [], []))
 
+    def test_self_targeting_claude_head_with_a_later_move_still_sends_the_reminder(self) -> None:
+        head = next_moves.add_next_move("units", 1, "claude2")
+        later = next_moves.add_next_move("units", 1, "claude3")
+        note = self.note("claude2.md", "active", "1")
+        for minute in (0, 2, 32):
+            _ = self.alert([note], self.now + timedelta(minutes=minute))
+        self.assertEqual([push.id for push in self.noted], ["quota.claude_next_move"])
+        self.assertEqual(self.noted[0].values["account"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (head, later))
+        self.assertEqual((self.sent, self.pushed), ([], []))
+
     def test_claude_reminder_is_suppressed_only_when_every_group_on_the_account_has_an_entry(self) -> None:
         note = self.note("claude2.md", "active", "1")
         _ = note.path.write_text(note.path.read_text().replace("role: unit", "role: [units, showrunners]"))
         note = note_file.read_note(note.path)
         assert isinstance(note, note_file.Note)
         unit = next_moves.add_next_move("units", 1, "claude3")
-        runner = next_moves.add_next_move("showrunners", 1, "claude1")
+        _ = next_moves.add_next_move("showrunners", 1, "claude1")
         _ = self.alert([note], self.now)
         _ = self.alert([note], self.now + timedelta(minutes=30))
         self.assertEqual((self.noted, self.sent, self.pushed), ([], [], []))
-        next_moves.remove_next_move(runner.id)
+        next_moves.remove_next_move("showrunners", next_moves.GroupPosition(1))
         _ = self.alert([note], self.now + timedelta(minutes=32))
         self.assertEqual(len(self.noted), 1)
         _ = self.alert([note], self.now + timedelta(minutes=64))
@@ -523,7 +576,7 @@ class QuotaAlertTests(unittest.TestCase):
         roles = accounts.claude_account_selection()
         with mock.patch.object(accounts, "claude_account_selection", side_effect=AssertionError("roles resolved twice")):
             lines = self.block([note], self.now, selection=roles)
-        self.assertIn("switched to claude for codex1: delegate, fix", lines)
+        self.assertIn("switched to claude for codex1: delegate, module_review", lines)
         self.assertEqual((len(self.sent), len(self.pushed)), (0, 0))
 
     def test_recovery_does_not_announce_a_different_healthy_claude_account(self) -> None:
@@ -580,7 +633,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(push.body,
             "codex1 has 2% of its weekly usage left, and no move is set up for its workers. When it runs out, they spend its paid credits, then move to Claude. Nothing is needed.")
         self.assertEqual(push.action, ActionRequired(
-            "Optional: to move them at 1% instead, type in the natedev session: /next_moves when workers reach 1% switch to Claude"))
+            "Optional: to move them at 1% instead, type in the natedev session: /account_moves when workers reach 1% switch to Claude"))
         self.assertEqual(self.sent, [])
         _ = self.alert([self.note("codex1.md", "active", "80")], self.now + timedelta(minutes=34))
         self.sent.clear()  # Restoration notices remain in Phase54.
@@ -588,28 +641,33 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(len(self.noted), 2)
         self.assertEqual(self.sent, [])
 
-    def test_workers_self_target_does_not_cover_the_low_account_or_repeat_the_reminder(self) -> None:
+    def test_workers_self_target_keeps_the_low_reminder_due_without_pushing_a_fallback(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
         _ = quota_alert.CONFIG.write_text(json.dumps(config))
         entry = next_moves.add_next_move("workers", 1, "codex1")
+        note = self.note("codex1.md", "active", "2")
         for minute in (0, 2, 32):
-            _ = self.alert([self.note("codex1.md", "active", "2")], self.now + timedelta(minutes=minute))
-        self.assertEqual([push.id for push in self.noted], ["quota.codex_next_move"])
+            _ = self.alert([note], self.now + timedelta(minutes=minute))
+        self.assertEqual(quota_alert.codex_next_move_push(note, now=self.now),
+                         quota_alert.QuotaStatusNote("codex1", "the queued next entry targets the current account"))
+        self.assertEqual(self.noted, [])
         self.assertEqual(self.sent, [])
         self.assertEqual(next_moves.read_next_moves(), (entry,))
+        with quota_alert.state_file() as state:
+            self.assertEqual(state["episodes"]["codex1"].get("push"), "due")
 
     def test_runnable_workers_entry_keeps_the_reminder_due_until_removed(self) -> None:
         config = quota_alert.load_config()
         config["threshold_percent"] = 2
         _ = quota_alert.CONFIG.write_text(json.dumps(config))
-        entry = next_moves.add_next_move("workers", 1, "codex2")
+        _ = next_moves.add_next_move("workers", 1, "codex2")
         note = self.note("codex1.md", "active", "2")
         _ = self.alert([note], self.now)
         self.assertEqual((self.noted, self.sent), ([], []))
         with quota_alert.state_file() as state:
             self.assertEqual(state["episodes"]["codex1"].get("push"), "due")
-        next_moves.remove_next_move(entry.id)
+        next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
         _ = self.alert([note], self.now + timedelta(minutes=2))
         self.assertEqual([push.id for push in self.noted], ["quota.codex_next_move"])
         self.assertEqual(self.sent, [])
@@ -854,7 +912,7 @@ class QuotaAlertTests(unittest.TestCase):
         log = self.alert([self.note("codex1.md", "active", "1")], self.now)
         self.assertEqual([line for line in log if "switch" in line], [])
         self.assertEqual(self.assignments(),
-                         {"delegate": "codex", "cli": "claude", "fix": "codex", "ask_a_friend": "caller"})
+                         {"delegate": "codex", "cli": "claude", "module_review": "codex", "ask_a_friend": "caller"})
         self.assertEqual(self.sent, [])
         self.assertEqual([push.id for push in self.noted], ["quota.codex_next_move"])
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))
@@ -862,9 +920,9 @@ class QuotaAlertTests(unittest.TestCase):
     def test_a_quota_refusal_moves_every_codex_function_to_claude_once(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
-        self.assertEqual(self.refuse(), "switched to claude for codex1: delegate, fix")
+        self.assertEqual(self.refuse(), "switched to claude for codex1: delegate, module_review")
         self.assertEqual(self.assignments(),
-                         {"delegate": "claude", "cli": "claude", "fix": "claude", "ask_a_friend": "caller"})
+                         {"delegate": "claude", "cli": "claude", "module_review": "claude", "ask_a_friend": "caller"})
         self.sent.clear()
         _ = self.alert(notes, self.now + timedelta(minutes=30))
         self.assertEqual(self.sent, [])
@@ -877,10 +935,10 @@ class QuotaAlertTests(unittest.TestCase):
         assert "switch" in saved
         self.assertNotIn("credits_off_until", saved["switch"])
         self.assertEqual(self.routing_entries()[-1]["kind"], "routed to claude")
-        # The user puts fix back on codex mid-episode; the next run does not move it again.
-        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "fix", "codex"))
+        # The user puts module_review back on codex mid-episode; the next run does not move it again.
+        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "module_review", "codex"))
         _ = self.alert(notes, self.now + timedelta(minutes=60))
-        self.assertEqual(self.assignments()["fix"], "codex")
+        self.assertEqual(self.assignments()["module_review"], "codex")
 
     def test_legacy_low_quota_episode_does_not_send_a_second_opening_alert(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "1")]
@@ -924,7 +982,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.pushed.clear()
         later = self.now + timedelta(minutes=5)
         log = self.block(notes, later)
-        self.assertIn("switched to claude for codex1: delegate, fix", log)
+        self.assertIn("switched to claude for codex1: delegate, module_review", log)
         self.assertTrue(any(line.startswith("quota status codex1:") for line in log))
         self.assertEqual(self.sent, [])
         self.assertEqual(self.pushed, [])
@@ -956,7 +1014,7 @@ class QuotaAlertTests(unittest.TestCase):
         assert isinstance(owner, agent_accounts.KnownCodexAccount)
         with quota_alert.state_file() as state:
             self.assertEqual(quota_alert.switch_to_claude(state, note, stamp, owner),
-                             quota_alert.CodexWorkMovedToClaude("codex1", ("delegate", "fix")))
+                             quota_alert.CodexWorkMovedToClaude("codex1", ("delegate", "module_review")))
 
         log = self.block([note], self.now + timedelta(minutes=1))
         self.assertTrue(any("New work had already moved to Claude" in line for line in log))
@@ -965,7 +1023,7 @@ class QuotaAlertTests(unittest.TestCase):
     def test_refusal_push_says_when_nothing_was_on_codex(self) -> None:
         registry = quota_alert.REGISTRY
         _ = registry.write_text(REGISTRY.replace("delegate=codex", "delegate=claude").replace(
-            "fix=codex", "fix=claude"))
+            "module_review=codex", "module_review=claude"))
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
         self.pushed.clear()
@@ -984,14 +1042,14 @@ class QuotaAlertTests(unittest.TestCase):
 
     def test_a_refusal_before_the_first_alert_or_after_an_earlier_episode_still_switches(self) -> None:
         notes: Notes = [self.note("codex1.md", "active", "0")]
-        self.assertIn("switched to claude for codex1: delegate, fix", self.block(notes, self.now))
+        self.assertIn("switched to claude for codex1: delegate, module_review", self.block(notes, self.now))
         self.assertEqual(self.sent, [])
         _ = self.alert([self.note("codex1.md", "active", "100")], self.now + timedelta(minutes=2))
         self.assertEqual(self.assignments()["delegate"], "codex")
         _ = self.alert(notes, self.now + timedelta(minutes=4))
         self.sent.clear()
         log = self.block(notes, self.now + timedelta(minutes=6))
-        self.assertIn("switched to claude for codex1: delegate, fix", log)
+        self.assertIn("switched to claude for codex1: delegate, module_review", log)
         self.assertEqual(self.sent, [])
 
     def test_claude_running_out_switches_nothing(self) -> None:
@@ -1004,13 +1062,13 @@ class QuotaAlertTests(unittest.TestCase):
     def test_recovery_moves_back_only_what_is_still_on_claude(self) -> None:
         _ = self.alert([self.note("codex1.md", "active", "0")], self.now)
         _ = self.refuse()
-        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "fix", "codex"))
+        self.assertIsNone(quota_alert.edit_registry("agents_set_assignment", "module_review", "codex"))
         self.sent.clear()
         log = self.alert([self.note("codex1.md", "active", "100")], self.now + timedelta(hours=1))
         self.assertIn("switch to claude undone: moved back from Claude to Codex: delegate; left alone, "
-                      + "re-assigned since the switch: fix", log)
+                      + "re-assigned since the switch: module_review", log)
         self.assertEqual(self.assignments(),
-                         {"delegate": "codex", "cli": "claude", "fix": "codex", "ask_a_friend": "caller"})
+                         {"delegate": "codex", "cli": "claude", "module_review": "codex", "ask_a_friend": "caller"})
         self.assertEqual(self.sent, [])
         self.assertEqual(self.routing_entries()[-1]["kind"], "routed back")
 
@@ -1030,14 +1088,14 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         self.assertEqual((opened[0]["kind"], opened[0]["owner"], opened[0]["cause"]),
                          ("routed to claude", "codex1", "refusal"))
-        self.assertEqual(set(cast(list[str], opened[0]["moved"])), {"delegate", "fix"})
+        self.assertEqual(set(cast(list[str], opened[0]["moved"])), {"delegate", "module_review"})
         # Reload through the persisted updater state, then recover in another pass.
         with quota_alert.state_file() as state:
             fallback = state["fallback"]
             self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
             assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
             self.assertEqual(fallback.at, opened[0]["fallback_at"])
-        _ = quota_alert.edit_registry("agents_set_assignment", "fix", "codex")
+        _ = quota_alert.edit_registry("agents_set_assignment", "module_review", "codex")
         later = self.now + timedelta(hours=1)
         _ = self.alert([self.note("codex1.md", "active", "100")], later)
         _ = self.alert([self.note("codex1.md", "active", "100")], later)
@@ -1045,14 +1103,14 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual([entry["kind"] for entry in entries], ["routed to claude", "routed back"])
         self.assertEqual(entries[0]["fallback_at"], entries[1]["fallback_at"])
         self.assertEqual(entries[1]["restored"], ["delegate"])
-        self.assertEqual(entries[1]["kept"], ["fix"])
+        self.assertEqual(entries[1]["kept"], ["module_review"])
         self.assertNotIn("move_id", entries[1])
 
     def test_partial_routing_restoration_records_failed_keys_and_never_claims_full_recovery(self) -> None:
         _ = self.block([self.note("codex1.md", "active", "0")], self.now)
         edit = quota_alert.edit_registry
         def fail_one(function: str, *arguments: str) -> str | None:
-            if function == "agents_set_assignment" and arguments[0] == "fix":
+            if function == "agents_set_assignment" and arguments[0] == "module_review":
                 return "registry locked"
             return edit(function, *arguments)
         with mock.patch.object(quota_alert, "edit_registry", side_effect=fail_one):
@@ -1061,9 +1119,9 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual([entry["kind"] for entry in entries], ["routed to claude", "routing not restored"])
         self.assertEqual(entries[1]["outcome"], "partial")
         self.assertEqual(entries[1]["restored"], ["delegate"])
-        self.assertEqual(entries[1]["failed"], ["fix (registry locked)"])
+        self.assertEqual(entries[1]["failed"], ["module_review (registry locked)"])
         self.assertEqual(entries[1]["fallback_at"], entries[0]["fallback_at"])
-        self.assertEqual(self.assignments()["fix"], "claude")
+        self.assertEqual(self.assignments()["module_review"], "claude")
 
     def test_unreadable_registry_records_failed_recovery_for_every_owed_key(self) -> None:
         _ = self.block([self.note("codex1.md", "active", "0")], self.now)
@@ -1074,7 +1132,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.assertEqual(entries[1]["outcome"], "failed")
         self.assertEqual(entries[1]["restored"], [])
         self.assertEqual(set(cast(list[str], entries[1]["failed"])),
-                         {"delegate (registry unreadable)", "fix (registry unreadable)"})
+                         {"delegate (registry unreadable)", "module_review (registry unreadable)"})
 
     def test_unknown_fallback_owner_stays_unknown_after_reload_and_recovery_on_a_noted_home(self) -> None:
         _ = self.block([self.note("codex1.md", "active", "0")], self.now)
@@ -1151,7 +1209,7 @@ class QuotaAlertTests(unittest.TestCase):
         self.sent.clear()
         log = self.alert([self.note("codex1.md", "inactive", "0"), self.note("codex2.md", "active", "1")],
                                 self.now + timedelta(minutes=2))
-        self.assertIn("switch to claude undone: moved back from Claude to Codex: delegate, fix", log)
+        self.assertIn("switch to claude undone: moved back from Claude to Codex: delegate, module_review", log)
         self.assertEqual(self.assignments()["delegate"], "codex")
         self.assertFalse(any(text.startswith("Quota alert:") for _, text in self.sent))
         self.assertEqual(self.sent, [])
@@ -1166,8 +1224,8 @@ class QuotaAlertTests(unittest.TestCase):
         self.sent.clear()
         lines = self.refresh([self.note("codex1.md", "active", "100")], "natedev",
                              self.now + timedelta(minutes=3))
-        self.assertIn("switch to claude undone: moved back from Claude to Codex: delegate, fix", lines)
-        self.assertEqual(self.assignments()["fix"], "codex")
+        self.assertIn("switch to claude undone: moved back from Claude to Codex: delegate, module_review", lines)
+        self.assertEqual(self.assignments()["module_review"], "codex")
         self.assertEqual(self.sent, [])
         self.assertEqual([row["kind"] for row in self.routing_entries()], ["routed to claude", "routed back"])
 
@@ -1179,13 +1237,13 @@ class QuotaAlertTests(unittest.TestCase):
         text = quota_alert.notice(lambda: "natedev")
         assert text is not None
         self.assertTrue(text.startswith(f"Codex refused work for quota (codex1 at 0%, resets {self.resets}): delegate, "
-                                        + "fix moved to Claude at "))
+                                        + "module_review moved to Claude at "))
         self.assertIsNone(quota_alert.notice(lambda: "natedev"))
         _ = self.alert([self.note("codex1.md", "active", "100")], self.now + timedelta(hours=1))
         text = quota_alert.notice(lambda: "natedev")
         assert text is not None
         self.assertTrue(text.startswith("Codex recovered at "))
-        self.assertTrue(text.endswith(": moved back from Claude to Codex: delegate, fix."))
+        self.assertTrue(text.endswith(": moved back from Claude to Codex: delegate, module_review."))
 
 
 class CodexZeroEpisodeTests(unittest.TestCase):
@@ -1279,6 +1337,273 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         for text in self.relayed_texts():
             self.assertNotIn("default", text.lower())
         return lines
+
+    def stale_workers_target_readings(self, now: datetime) -> quota_alert.CodexAlertPassReadings:
+        fresh = self.readings(now, left=0)
+        checked = tuple(quota_alert.CodexHomeReading(home.home, home.report,
+            self.now - timedelta(minutes=11) if home.home == self.root / ".codex3" else now)
+            for home in fresh.checked_homes)
+        stale = next(home for home in checked if home.home == self.root / ".codex3")
+        usage_store.save([stale.report], stale.observed_at)
+        return quota_alert.CodexAlertPassReadings(fresh.workers, fresh.selected_account, checked)
+
+    def test_queued_claude_account_routes_workers_and_overrides_only_worker_launches(self) -> None:
+        _ = (self.root / ".claude.json").write_text("{}")
+        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude4"), [])
+        directory = accounts.account_dir("claude4")
+        _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "workers@example.invalid"}}))
+        _ = next_moves.add_next_move("workers", 1, "claude4")
+        _ = self.alert(left=1)
+        self.swap.assert_not_called()
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "claude")
+        with quota_alert.state_file() as state:
+            fallback = state["fallback"]
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(fallback.claude_account, next_moves.ClaudeWorkersTarget("claude4"))
+        routed = [row for row in moves.read_journal() if row["kind"] == "routed to claude"]
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0].get("claude_account"), "claude4")
+        self.assertEqual(role_map.read_role_map().workers_claude, role_map.NamedWorkersClaudeAccount("claude4", self.now + timedelta(days=2)))
+        # A caller with an invalid account must not replace the workers route.
+        selected = accounts.account_for_unscoped_launch({"CLAUDE_CONFIG_DIR": str(self.root / ".claude99")}, workers=True)
+        self.assertEqual(selected, accounts.NamedAccount("claude4", directory))
+        with self.assertRaises(accounts.AccountsError):
+            _ = accounts.account_for_unscoped_launch({"CLAUDE_CONFIG_DIR": str(self.root / ".claude99")})
+        (directory / ".claude.json").unlink()
+        with self.assertRaisesRegex(accounts.AccountsError, "claude and /login"):
+            _ = accounts.account_for_unscoped_launch({}, workers=True)
+
+        # Recovery closes the shared route as well as the local fallback.
+        with quota_alert.state_file() as state:
+            back = quota_alert.switch_back(state, self.now + timedelta(days=8),
+                self.readings(self.now + timedelta(days=8), left=100))
+        self.assertIsInstance(back, quota_alert.SwitchBack)
+        self.assertIsInstance(role_map.read_role_map().workers_claude, role_map.DefaultWorkersClaudeAccount)
+
+    def test_failed_named_claude_switch_keeps_the_previous_workers_route(self) -> None:
+        _ = (self.root / ".claude.json").write_text("{}")
+        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        self.assertEqual(accounts.setup("claude4"), [])
+        _ = (accounts.account_dir("claude4") / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "workers@example.invalid"}}))
+        _ = next_moves.add_next_move("workers", 1, "claude4")
+        with mock.patch.object(quota_alert, "edit_registry", return_value="fixture switch failed"):
+            _ = self.alert(left=1)
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        self.assertIsInstance(role_map.read_role_map().workers_claude, role_map.DefaultWorkersClaudeAccount)
+        self.assertEqual(len(next_moves.read_next_moves()), 1)
+        with quota_alert.state_file() as state:
+            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+
+    def test_failed_route_rollback_keeps_both_errors_and_the_unseen_switch_notice(self) -> None:
+        owner = self.readings(self.now).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        until = self.now + timedelta(days=2)
+        note = self.note(1)
+        original_write = role_map.write_role_map
+        for failure in (role_map.RoleMapWriteRefused("fixture rollback refused"),
+                        role_map.RoleMapUnavailable("fixture map unavailable"),
+                        OSError("fixture disk full")):
+            with self.subTest(failure=type(failure).__name__):
+                original_write(role_map.WorkersClaudeRouteChange(
+                    role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "reset the test route", self.now.isoformat()))
+
+                def write_route(change: role_map.RoleMapChange | role_map.WorkersClaudeRouteChange) -> None:
+                    if isinstance(change, role_map.WorkersClaudeRouteChange) and isinstance(
+                            change.account, role_map.DefaultWorkersClaudeAccount):
+                        raise failure
+                    original_write(change)
+
+                with quota_alert.state_file() as state:
+                    state["episodes"][note.label] = {"since": self.now.isoformat(), "last": {}}
+                    state["unseen"] = []
+                    with (mock.patch.object(quota_alert, "edit_registry", return_value="fixture edit failed"),
+                          mock.patch.object(role_map, "write_role_map", side_effect=write_route)):
+                        result = quota_alert.switch_to_claude(state, note, self.now.isoformat(), owner,
+                            hold=quota_alert.ScheduledMoveHold(until),
+                            claude_account=next_moves.ClaudeWorkersTarget("claude4"))
+                    assert isinstance(result, quota_alert.CodexWorkSwitchFailed)
+                    self.assertIn("fixture edit failed", result.cause)
+                    self.assertIn(f"route rollback failed: {failure}", result.cause)
+                    self.assertEqual(state["episodes"][note.label].get("switch_failed"), result.cause)
+                with quota_alert.state_file() as saved:
+                    unseen = saved.get("unseen", [])
+                    self.assertEqual(len(unseen), 1)
+                    self.assertIn(result.cause, unseen[0])
+                self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+
+    def test_uncertain_registry_switch_keeps_the_named_route_until_the_weekly_reset(self) -> None:
+        for failed_step in ("edit", "confirmation"):
+            with self.subTest(failed_step=failed_step):
+                _ = quota_alert.REGISTRY.write_text(REGISTRY)
+                owner = self.readings(self.now).selected_account
+                assert isinstance(owner, agent_accounts.KnownCodexAccount)
+                until = self.now + timedelta(days=2)
+                note = self.note(1)
+                original_edit = quota_alert.edit_registry
+
+                def edit_then_lose_confirmation(editor: str, *arguments: str) -> str | None:
+                    result = original_edit(editor, *arguments)
+                    if failed_step == "edit":
+                        raise OSError("fixture edit reply lost")
+                    return result
+
+                original_read = quota_alert.registry_assignments
+                with quota_alert.state_file() as state:
+                    with (mock.patch.object(quota_alert, "edit_registry", side_effect=edit_then_lose_confirmation),
+                          mock.patch.object(quota_alert, "registry_assignments", side_effect=[
+                              original_read(), OSError("fixture confirmation failed")])):
+                        result = quota_alert.switch_to_claude(state, note, self.now.isoformat(), owner,
+                            hold=quota_alert.ScheduledMoveHold(until),
+                            claude_account=next_moves.ClaudeWorkersTarget("claude4"))
+                    self.assertIsInstance(result, quota_alert.CodexWorkSwitchFailed)
+                    self.assertTrue(any("failed" in line for line in state.get("unseen", [])))
+                self.assertEqual(original_read()["delegate"], "claude")
+                self.assertEqual(role_map.read_role_map().workers_claude,
+                                 role_map.NamedWorkersClaudeAccount("claude4", until))
+
+    def test_lost_quota_state_does_not_keep_the_named_workers_account_past_its_reset(self) -> None:
+        _ = (self.root / ".claude.json").write_text("{}")
+        for label in ("claude2", "claude4"):
+            _ = (self.root / f"{label}.md").write_text(f"---\nlogin: {label}@example.invalid\n---\n")
+            self.assertEqual(accounts.setup(label), [])
+            _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+        _ = next_moves.add_next_move("workers", 1, "claude4")
+        _ = self.alert(left=1)
+        caller = {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2"))}
+        self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
+                         accounts.NamedAccount("claude4", accounts.account_dir("claude4")))
+        _ = quota_alert.STATE.write_text("invalid quota state")
+        until = self.now + timedelta(days=2)
+        with quota_alert.state_file() as state:
+            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+            self.assertIsInstance(quota_alert.switch_back(state, until, self.readings(until, left=100)),
+                                  quota_alert.NoCodexFallbackRestoration)
+        with mock.patch.object(accounts, "datetime", wraps=datetime, now=mock.Mock(return_value=until)):
+            self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
+                             accounts.NamedAccount("claude2", accounts.account_dir("claude2")))
+
+    def test_queued_claude_account_with_no_folder_waits_with_setup_step(self) -> None:
+        _ = (self.root / "claude4.md").write_text("---\nlogin: workers@example.invalid\n---\n")
+        head = next_moves.add_next_move("workers", 1, "claude4")
+        _ = self.alert(left=1)
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.swap.assert_not_called()
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        self.assertTrue(any("accounts.py setup claude4" in text for text in self.relayed_texts()))
+
+    def test_stale_workers_head_blocks_a_fresh_later_entry_and_notifies_once(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        later = next_moves.add_next_move("workers", 1, "codex2")
+        with (mock.patch.object(quota_alert, "recipients", return_value=["director"]),
+              mock.patch.object(accounts, "check_codex_target", wraps=accounts.check_codex_target) as check,
+              redirect_stdout(io.StringIO()) as output):
+            for minute in (0, 2):
+                now = self.now + timedelta(minutes=minute)
+                returned = quota_alert.run_workers_next_moves(self.stale_workers_target_readings(now), now)
+                self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex1", self.root / ".codex1"))
+        self.swap.assert_not_called()
+        self.assertEqual([call.args[0] for call in check.call_args_list], ["codex3", "codex3"])
+        self.assertEqual(next_moves.read_next_moves(), (head, later))
+        self.assertEqual(moves.read_moves(), [])
+        self.relay.assert_called_once()
+        recipient, text, _ = cast(tuple[str, str, str | None], self.relay.call_args.args)
+        self.assertEqual(recipient, "director")
+        self.assertNotIn(head.id, text)
+        for detail in ("workers 1", "codex3", "due", "no fresh reading",
+                       (self.now - timedelta(minutes=11)).strftime("%H:%M")):
+            self.assertIn(detail, text)
+        self.assertIn(text, output.getvalue())
+        self.phone.assert_not_called()
+
+    def test_queued_workers_head_blocks_a_provider_refusal_fallback_swap(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        readings = self.readings(self.now, left=80)
+        identity = readings.selected_account
+        assert isinstance(identity, agent_accounts.KnownCodexAccount)
+        with mock.patch.object(accounts, "pick", wraps=accounts.pick) as pick:
+            _ = quota_alert.blocked([self.note(1, left=80)], identity, self.now,
+                codex_readings=readings, window=refusals.KnownWindow("weekly"))
+        pick.assert_not_called()
+        self.swap.assert_not_called()
+        self.assertEqual(accounts.role_account("workers").label, "codex1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        waits = moves.read_moves()
+        self.assertEqual([row["kind"] for row in waits], ["waited"])
+        waited = waits[0]
+        assert waited["kind"] == "waited"
+        self.assertEqual((waited["window"], waited["subject"]), ("weekly", "workers"))
+        self.assertIn(refusals.key("codex", identity.login), refusals.load())
+
+    def test_queued_workers_head_blocks_a_credits_off_fallback_swap(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        notes = [self.note(1, "off"), self.note(2), self.note(3)]
+        with (mock.patch.object(quota_alert, "recipients", return_value=["director"]),
+              redirect_stdout(io.StringIO())):
+            _ = quota_alert.alert(notes, self.now,
+                selection=ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(
+                    self.root / ".claude", "fixture identity unavailable"), False, (), frozenset()),
+                codex_readings=self.stale_workers_target_readings(self.now))
+        self.swap.assert_not_called()
+        self.assertEqual(accounts.role_account("workers").label, "codex1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.assertEqual(quota_alert.registry_assignments()["delegate"], "codex")
+        self.assertEqual(moves.read_moves(), [])
+
+    def test_removing_a_queued_head_releases_the_still_zero_credits_off_fallback_once(self) -> None:
+        _ = self.note(1, "off")
+        head = next_moves.add_next_move("workers", 1, "codex1")
+        _ = self.alert()
+        self.swap.assert_not_called()
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
+        _ = self.alert(self.now + timedelta(minutes=2))
+        _ = self.alert(self.now + timedelta(minutes=4))
+        self.swap.assert_called_once_with("workers", "codex2", why="codex1 weekly usage used; credits off", cause="credits off")
+        self.assertEqual(len([row for row in moves.read_moves() if row["kind"] == "requested"]), 1)
+
+    def test_workers_target_allowance_changes_below_the_same_threshold_send_one_notice(self) -> None:
+        head = next_moves.add_next_move("workers", 20, "codex3")
+        with mock.patch.object(quota_alert, "recipients", return_value=["director"]):
+            for minute, left in ((0, 10), (2, 9)):
+                now = self.now + timedelta(minutes=minute)
+                readings = self.readings(now, left=1, spare_accounts=((3, left, "0"),))
+                _ = quota_alert.run_workers_next_moves(readings, now)
+        self.relay.assert_called_once()
+        text = cast(str, self.relay.call_args.args[1])
+        self.assertIn("10% left, at or below 20%", text)
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.swap.assert_not_called()
+        self.phone.assert_not_called()
+
+    def test_workers_successor_becomes_eligible_only_after_its_head_is_consumed(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex3")
+        later = next_moves.add_next_move("workers", 80, "codex2")
+        readings = self.readings(self.now, left=1,
+            spare_accounts=((3, 50, "0"), (2, 90, "0")))
+        with mock.patch.object(accounts, "check_codex_target", wraps=accounts.check_codex_target) as check:
+            returned = quota_alert.run_workers_next_moves(readings, self.now)
+            self.swap.assert_called_once_with("workers", "codex3", why=f"auto: {head.id}", cause="auto")
+            self.assertEqual(next_moves.read_next_moves(), (later,))
+            self.assertEqual([call.args[0] for call in check.call_args_list], ["codex3"])
+            self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex3", self.root / ".codex3"))
+            self.swap.reset_mock()
+            check.reset_mock()
+            now = self.now + timedelta(minutes=2)
+            readings = self.readings(now, selected=3, left=50,
+                spare_accounts=((2, 90, "0"),))
+            returned = quota_alert.run_workers_next_moves(readings, now)
+        self.swap.assert_called_once_with("workers", "codex2", why=f"auto: {later.id}", cause="auto")
+        self.assertEqual([call.args[0] for call in check.call_args_list], ["codex2"])
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(returned.workers, accounts.CodexWorkersAccount("codex2", self.root / ".codex"))
+        self.assertEqual([row["why"] for row in moves.read_moves() if row["kind"] == "requested"],
+                         [f"auto: {head.id}", f"auto: {later.id}"])
+        self.relay.assert_not_called()
 
     def test_pending_phone_retry_normalizes_the_saved_note_filename_without_reopening_or_relaying(self) -> None:
         _ = self.alert()
@@ -1386,6 +1711,156 @@ class CodexZeroEpisodeTests(unittest.TestCase):
             self.assertNotEqual(episode["phone"], "due")
             self.assertNotIn("sessions", episode)
 
+    def assert_queued_credits_wait_without_a_fallback_promise(self, target: str) -> None:
+        head = next_moves.add_next_move("workers", 1, target)
+        with mock.patch.object(quota_alert, "switch_to_claude", side_effect=AssertionError("queued credits routed work")):
+            # An alternative target has no current reading, so the head cannot run.
+            for minute in (0, 2):
+                now = self.now + timedelta(minutes=minute)
+                _ = quota_alert.alert([self.note(1), self.note(2), self.note(3)], now,
+                    selection=ClaudeAccountsInUse(agent_accounts.UnreadableIdentity(
+                        self.root / ".claude", "fixture identity unavailable"), False, (), frozenset()),
+                    codex_readings=self.stale_workers_target_readings(now))
+            push, = self.zero_pushes()
+            self.assertEqual(push.id, "quota.codex_on_credits")
+            self.assertIn("codex1", push.body)
+            for forbidden in ("codex2", "codex3", "Claude", "Within minutes", "workers move"):
+                self.assertNotIn(forbidden, push.body)
+            self.assertEqual(push.values["turn_off"],
+                "Turn off: paid spending stops. Workers stay on codex1 and wait for the account move you queued.")
+            self.assertEqual(push.values["leave_on"],
+                "Leave on: workers spend codex1's credits until that move runs or the credits run out, then wait.")
+            _ = self.note(1, "off")
+            _ = self.alert(self.now + timedelta(minutes=4),
+                spare_accounts=((3, 0, "0"),))
+        self.swap.assert_not_called()
+        self.assertFalse(any(row["kind"] == "requested" for row in moves.read_moves()))
+        self.assertEqual(accounts.role_account("workers").label, "codex1")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+
+    def test_paid_credits_with_a_self_targeting_workers_head_promise_only_the_queue(self) -> None:
+        self.assert_queued_credits_wait_without_a_fallback_promise("codex1")
+
+    def test_paid_credits_with_a_blocked_other_workers_head_promise_only_the_queue(self) -> None:
+        self.assert_queued_credits_wait_without_a_fallback_promise("codex3")
+
+    def test_queued_workers_credit_forecast_promises_only_the_entry_and_moves_nothing(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex1")
+        with mock.patch.object(quota_alert, "switch_to_claude", side_effect=AssertionError("queued forecast routed work")):
+            _ = self.alert()
+            self.phone.reset_mock()
+            self.history([(0, 6370), (30, 6340), (60, 6310)])
+            _ = self.alert(self.now + timedelta(hours=1), balance="6310")
+        forecast, = self.zero_pushes()
+        self.assertEqual(forecast.id, "quota.codex_credits_forecast")
+        self.assertIn("60", forecast.body)
+        self.assertIn("6,310", forecast.body)
+        self.assertEqual(forecast.values["destination"],
+                         "When credits run out, workers wait for the account move you queued.")
+        for forbidden in ("codex2", "codex3", "Claude"):
+            self.assertNotIn(forbidden, forecast.body)
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        self.swap.assert_not_called()
+
+    def test_failed_workers_blocked_head_delivery_retries_until_it_is_delivered(self) -> None:
+        head = next_moves.add_next_move("workers", 1, "codex1")
+        self.relay.side_effect = ["fixture recipient unavailable", None]
+        with mock.patch.object(quota_alert, "recipients", return_value=["director"]):
+            for minute in (0, 2, 4):
+                now = self.now + timedelta(minutes=minute)
+                _ = quota_alert.run_workers_next_moves(self.readings(now), now)
+                with quota_alert.state_file() as state:
+                    self.assertEqual(head.id in state.get("workers_move_notices", {}), minute > 0)
+        self.assertEqual(self.relay.call_count, 2)
+        self.assertEqual(self.relayed_texts()[0], self.relayed_texts()[1])
+        self.swap.assert_not_called()
+        self.phone.assert_not_called()
+
+    def test_paid_credit_retry_after_queue_removal_restores_the_never_queued_notice(self) -> None:
+        _ = self.alert()
+        expected_push, = self.zero_pushes()
+        with quota_alert.state_file() as state:
+            expected_notice = state.get("codex_zero", {})["codex1"]["notice"]
+        for opened_while_queued in (False, True):
+            with self.subTest(opened_while_queued=opened_while_queued):
+                quota_alert.STATE.unlink()
+                next_moves.next_moves_file().unlink(missing_ok=True)
+                self.phone.reset_mock()
+                self.phone.side_effect = [quota_alert.PushFailed("fixture offline"),
+                    quota_alert.PushFailed("fixture offline"), quota_alert.PushSent()]
+                if opened_while_queued:
+                    _ = next_moves.add_next_move("workers", 1, "codex1")
+                _ = self.alert()
+                with quota_alert.state_file() as state:
+                    self.assertEqual(state.get("codex_zero", {})["codex1"]["notice"], expected_notice)
+                if not opened_while_queued:
+                    _ = next_moves.add_next_move("workers", 1, "codex1")
+                self.assertEqual(len(next_moves.read_next_moves()), 1)
+                _ = self.alert(self.now + timedelta(minutes=2))
+                queued_push = self.zero_pushes()[-1]
+                self.assertIn("wait for the account move you queued", queued_push.body)
+                with quota_alert.state_file() as state:
+                    episode = state.get("codex_zero", {})["codex1"]
+                    self.assertEqual(episode["phone"], "due")
+                    self.assertEqual(episode["notice"], expected_notice)
+                next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
+                _ = self.alert(self.now + timedelta(minutes=4))
+                self.assertEqual(self.zero_pushes()[-1], expected_push)
+                with quota_alert.state_file() as state:
+                    episode = state.get("codex_zero", {})["codex1"]
+                    self.assertNotEqual(episode["phone"], "due")
+                    self.assertEqual(episode["notice"], expected_notice)
+                self.phone.side_effect = None
+        self.swap.assert_not_called()
+
+    def test_credit_forecast_retry_after_queue_removal_restores_the_never_queued_notice(self) -> None:
+        self.history([(0, 6370), (30, 6340), (60, 6310)])
+        _ = self.alert()
+        _ = self.alert(self.now + timedelta(hours=1), balance="6310")
+        expected_push = self.zero_pushes()[-1]
+        self.assertEqual(expected_push.id, "quota.codex_credits_forecast")
+        with quota_alert.state_file() as state:
+            episode = state.get("codex_zero", {})["codex1"]
+            assert "forecast_notice" in episode
+            expected_notice = episode["forecast_notice"]
+        for opened_while_queued in (False, True):
+            with self.subTest(opened_while_queued=opened_while_queued):
+                quota_alert.STATE.unlink()
+                next_moves.next_moves_file().unlink(missing_ok=True)
+                self.phone.reset_mock()
+                self.phone.side_effect = None
+                _ = self.alert()
+                self.phone.reset_mock()
+                self.phone.side_effect = [quota_alert.PushFailed("fixture offline"),
+                    quota_alert.PushFailed("fixture offline"), quota_alert.PushSent()]
+                if opened_while_queued:
+                    _ = next_moves.add_next_move("workers", 1, "codex1")
+                _ = self.alert(self.now + timedelta(hours=1), balance="6310")
+                with quota_alert.state_file() as state:
+                    episode = state.get("codex_zero", {})["codex1"]
+                    assert "forecast_notice" in episode
+                    self.assertEqual(episode["forecast_notice"], expected_notice)
+                if not opened_while_queued:
+                    _ = next_moves.add_next_move("workers", 1, "codex1")
+                self.assertEqual(len(next_moves.read_next_moves()), 1)
+                _ = self.alert(self.now + timedelta(minutes=62), balance="6310")
+                self.assertIn("wait for the account move you queued", self.zero_pushes()[-1].body)
+                with quota_alert.state_file() as state:
+                    episode = state.get("codex_zero", {})["codex1"]
+                    assert "forecast_phone" in episode and "forecast_notice" in episode
+                    self.assertEqual(episode["forecast_phone"], "due")
+                    self.assertEqual(episode["forecast_notice"], expected_notice)
+                next_moves.remove_next_move("workers", next_moves.GroupPosition(1))
+                _ = self.alert(self.now + timedelta(minutes=64), balance="6310")
+                self.assertEqual(self.zero_pushes()[-1], expected_push)
+                with quota_alert.state_file() as state:
+                    episode = state.get("codex_zero", {})["codex1"]
+                    assert "forecast_phone" in episode and "forecast_notice" in episode
+                    self.assertNotEqual(episode["forecast_phone"], "due")
+                    self.assertEqual(episode["forecast_notice"], expected_notice)
+                self.phone.side_effect = None
+        self.swap.assert_not_called()
+
     def test_zero_phone_failure_retries_only_the_phone(self) -> None:
         attempts = 0
 
@@ -1424,7 +1899,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
             _ = self.alert(spare_left=0)
             fallback.assert_called_once()
             self.assertEqual(quota_alert.registry_assignments()["delegate"], "claude")
-            self.assertEqual(quota_alert.registry_assignments()["fix"], "claude")
+            self.assertEqual(quota_alert.registry_assignments()["module_review"], "claude")
             for minute in (2, 30):
                 _ = self.alert(self.now + timedelta(minutes=minute), spare_left=0)
             fallback.assert_called_once()
@@ -1433,7 +1908,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         routed = [entry for entry in moves.read_journal() if entry["kind"] == "routed to claude"]
         self.assertEqual(len(routed), 1)
         self.assertEqual(routed[0]["cause"], "credits off")
-        self.assertEqual(set(routed[0]["moved"]), {"delegate", "fix"})
+        self.assertEqual(set(routed[0]["moved"]), {"delegate", "module_review"})
         push = self.zero_pushes()[-1]
         self.assertIn("Claude", push.body)
         self.assertIn("codex1", push.body)
@@ -1580,6 +2055,9 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                     with self.subTest(id=entry.id, example=example.name):
                         quota_alert.STATE.unlink(missing_ok=True)
                         moves.store_file().unlink(missing_ok=True)
+                        next_moves.next_moves_file().unlink(missing_ok=True)
+                        usage_store.store_file().unlink(missing_ok=True)
+                        usage_store.label_file().unlink(missing_ok=True)
                         _ = quota_alert.REGISTRY.write_text(REGISTRY)
                         self.phone.reset_mock()
                         self.relay.reset_mock()
@@ -1593,6 +2071,9 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                         off = entry.id in ("quota.codex_workers_moved", "quota.codex_workers_stay")
                         _ = self.note(source, "off" if off else "on")
                         accounts.set_role("workers", f"codex{source}")
+                        queued_retry = example.name == "queued" and entry.id == "quota.codex_on_credits_last"
+                        if example.name == "queued" and not queued_retry:
+                            _ = next_moves.add_next_move("workers", 1, f"codex{source}")
                         balance = "6370" if source == 1 else "2114"
                         if example.name == "unlimited":
                             balance = "unlimited"
@@ -1629,9 +2110,14 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                             self.swap.side_effect = accounts.AccountsError(
                                 "accounts: cannot use codex1 (~/.codex1): usage reading is unavailable")
                         with mock.patch.object(self, "readings", side_effect=scenario_readings):
+                            if queued_retry:
+                                self.phone.side_effect = [quota_alert.PushFailed("fixture phone offline"), quota_alert.PushSent()]
+                                _ = self.alert(self.now)
+                                _ = next_moves.add_next_move("workers", 1, f"codex{source}")
                             if entry.id == "quota.codex_credits_forecast":
                                 _ = self.alert(self.now - timedelta(hours=1))
-                            _ = self.alert(self.now)
+                            _ = self.alert(self.now + timedelta(minutes=2) if queued_retry else self.now)
+                            self.phone.side_effect = None
                         with quota_alert.state_file() as state:
                             episode = state.get("codex_zero", {})[f"codex{source}"]
                             if entry.id == "quota.codex_credits_forecast":
@@ -1640,8 +2126,18 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                             else:
                                 notice = episode["notice"]
                         self.assertEqual(notice["id"], entry.id)
-                        self.assertEqual(notice["values"], example.values)
-                        self.assertEqual(self.zero_pushes()[-1], render_entry(entry, example.values))
+                        if example.name == "queued":
+                            self.assertNotIn("account move you queued", " ".join(notice["values"].values()))
+                        else:
+                            self.assertEqual(notice["values"], example.values)
+                        expected_values = dict(example.values)
+                        if example.name == "queued" and entry.id == "quota.codex_on_credits":
+                            # Queued advice overlays the ordinary opening saved for later retries.
+                            ordinary = next(item for item in entry.examples if item.name == "codex_one")
+                            expected_values["opening"] = ordinary.values["opening"]
+                            self.assertEqual(notice["values"]["opening"], ordinary.values["opening"])
+                        self.assertEqual(self.zero_pushes()[-1].values, expected_values)
+                        self.assertEqual(self.zero_pushes()[-1], render_entry(entry, expected_values))
 
     def test_credits_off_fallback_hold_uses_an_earlier_five_hour_refill(self) -> None:
         _ = self.note(1, "off")

@@ -102,7 +102,7 @@ exit 97
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
-    *"status --porcelain"*) : ;;
+    *"status --porcelain"*|*" ls-tree "*) : ;;
     *) exit 1 ;;
 esac
 ''')
@@ -614,71 +614,161 @@ exec "$TEST_REAL_SLEEP" "$@"
         self.assertIsNone(process.poll(), errors.read_text(errors="replace"))
         return process
 
-    def test_two_phases_sharing_a_role_name_each_keep_the_token_through_a_memory_wait(self) -> None:
+    def wait_for_output(self, path: Path, text: str, process: subprocess.Popen[bytes]) -> None:
+        # The directory watch sees new files, not writes to this one, so poll it.
+        deadline = time.monotonic() + 300
+        while (text not in path.read_text(errors="replace")
+               and process.poll() is None and time.monotonic() < deadline):
+            time.sleep(0.01)
+        self.assertIn(text, path.read_text(errors="replace"))
+
+    def test_a_memory_wait_gives_the_token_to_a_peer_and_takes_it_back_before_its_step(self) -> None:
         # Phases 15 and 16 of one unit share the session's board and its role
-        # names. Phase 15's launcher ending must not free phase 16's token.
+        # names. Phase 16 waits for memory without the token, so phase 15
+        # builds meanwhile. Phase 16's step then waits for the token, and phase
+        # 15's launcher ending cannot free it.
         board = self.root / "board"
         lock = board / "locks" / "cargo.d"
         meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        peer_meminfo = self.root / "peer-meminfo"
+        _ = peer_meminfo.write_text("MemAvailable: 50331648 kB\n")
         environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
                        "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
         phase_16_errors = self.root / "phase-16.err"
-        phase_15_errors = self.root / "phase-15.err"
         phase_16 = self.start_memory_waiter(environment, phase_16_errors)
         phase_15: subprocess.Popen[bytes] | None = None
         try:
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+            self.assertFalse(lock.exists(), "the memory wait kept the token")
+            phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                        cwd=self.root,
+                                        env={**environment, "BUILDLOG_MEMINFO": str(peer_meminfo),
+                                             "TEST_BLOCK": "1"},
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        start_new_session=True)
+            self.started_groups.add(phase_15.pid)
+            self.wait_for_running(self.root / "running", phase_15)
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_15.pid))
             launcher_release = subprocess.run(["bash", str(BOARD), "release", str(board), "impl",
                                                "cargo"], capture_output=True, text=True,
                                               check=False, timeout=300)
             self.assertEqual(launcher_release.returncode, 1, launcher_release.stdout)
-            self.assertIn(f"held by live pid {phase_16.pid}", launcher_release.stderr)
-            self.assertEqual((lock / "holder_pid").read_text(), str(phase_16.pid))
+            self.assertIn(f"held by live pid {phase_15.pid}", launcher_release.stderr)
 
-            with phase_15_errors.open("wb") as stream:
-                phase_15 = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
-                                            cwd=self.root, env=environment,
-                                            stdout=stream, stderr=subprocess.STDOUT,
-                                            start_new_session=True)
-            self.started_groups.add(phase_15.pid)
             _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.wait_for_output(phase_16_errors, "memory free after", phase_16)
+            self.assertIsNone(phase_16.poll(), phase_16_errors.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+            self.assertEqual((lock / "holder_pid").read_text(), str(phase_15.pid))
+
+            _ = (self.root / "release").touch()
+            self.assertEqual(phase_15.wait(timeout=300), 0)
             self.assertEqual(phase_16.wait(timeout=300), 0, phase_16_errors.read_text())
-            self.assertEqual(phase_15.wait(timeout=300), 0, phase_15_errors.read_text())
             self.assertNotIn("Traceback", phase_16_errors.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
             self.assertFalse(lock.exists())
         finally:
             _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            _ = (self.root / "release").touch()
             for process in (phase_16, phase_15):
                 if process is not None:
                     if process.poll() is None:
                         self.end_group(process.pid)
                     _ = process.wait(timeout=300)
 
-    def test_a_token_lost_during_the_memory_wait_stops_the_step_with_a_reason(self) -> None:
+    def test_a_long_token_wait_never_gives_up(self) -> None:
+        # Each refused acquire moves the clock past the old 1800 s limit.
+        home = self.root / "busy-home"
+        delegate = home / ".claude/scripts/delegate"
+        delegate.mkdir(parents=True)
+        for source in VERIFY.parent.parent.iterdir():
+            if source.name != "delegate":
+                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        for source in VERIFY.parent.iterdir():
+            if source.name != "board.sh":
+                (delegate / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = (delegate / "board.sh").write_text('''#!/bin/bash
+if [[ "$1" == acquire ]]; then
+    count=$(( $(cat "$TEST_ACQUIRES" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\\n' "$count" > "$TEST_ACQUIRES"
+    if (( count <= 3 )); then
+        printf '%s\\n' $(( $(cat "$PLAN_DELEGATE_TOKEN_CLOCK_FILE") + 1800 )) > "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+        echo "busy cargo held by peer" >&2
+        exit 1
+    fi
+fi
+exec bash "$TEST_REAL_BOARD" "$@"
+''')
+        clock = self.root / "busy-clock"
+        _ = clock.write_text("100\n")
+        acquires = self.root / "acquires"
+        environment = {**self.environment, "HOME": str(home),
+                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "busy-board"),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "TEST_REAL_BOARD": str(BOARD),
+                       "TEST_ACQUIRES": str(acquires), "PLAN_DELEGATE_TOKEN_CLOCK_FILE": str(clock)}
+        result = self.verify(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("did not get it", result.stderr)
+        self.assertGreaterEqual(int(acquires.read_text()), 4)
+        self.assertEqual(self.records()[0]["token_wait_s"], 5400)
+        self.assertFalse((self.root / "busy-board" / "locks" / "cargo.d").exists())
+
+    def test_sigterm_during_the_token_wait_exits_at_once_and_leaves_no_board_entry(self) -> None:
         board = self.root / "board"
-        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
-        _ = meminfo.write_text("MemAvailable: 0 kB\n")
-        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
-                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1"}
-        errors = self.root / "lost.err"
-        process = self.start_memory_waiter(environment, errors)
+        lock = board / "locks" / "cargo.d"
+        first = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                                 env={**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                                      "PLAN_DELEGATE_TEAM_ROLE": "first", "TEST_BLOCK": "1"},
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+        self.started_groups.add(first.pid)
+        second: subprocess.Popen[bytes] | None = None
         try:
-            # A peer's acquire made the directory and has not written its pid yet.
-            shutil.rmtree(board / "locks" / "cargo.d")
-            (board / "locks" / "cargo.d").mkdir()
-            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
-            self.assertNotEqual(process.wait(timeout=300), 0)
-            text = errors.read_text()
-            self.assertIn("lost the cargo token before its step started", text)
-            self.assertNotIn("Traceback", text)
-            self.assertFalse((self.root / "cargo-calls").exists())
+            self.wait_for_running(self.root / "running", first)
+            second = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                                      env={**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                                           "PLAN_DELEGATE_TEAM_ROLE": "second"},
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      start_new_session=True)
+            self.started_groups.add(second.pid)
+            waiting = second
+
+            def acquiring() -> bool:
+                for pid in self.live_group_processes(waiting.pid):
+                    try:
+                        words = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                    except OSError:
+                        continue
+                    if b"acquire" in words and b"second" in words:
+                        return True
+                return waiting.poll() is not None
+
+            deadline = time.monotonic() + 300
+            while not acquiring() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNone(second.poll(), "second verify exited before it waited for the token")
+
+            # The signal goes to verify alone, as a caller's kill would.
+            os.kill(second.pid, signal.SIGTERM)
+            self.assertEqual(second.wait(timeout=10), -signal.SIGTERM)
+            deadline = time.monotonic() + 10
+            while self.live_group_processes(second.pid) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(self.live_group_processes(second.pid), [],
+                             "the token wait outlived its verify")
+            self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
+
+            _ = (self.root / "release").touch()
+            self.assertEqual(first.wait(timeout=300), 0)
+            self.assertFalse(lock.exists())
+            self.assertNotIn("[second] claim", (board / "board.log").read_text())
         finally:
-            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
-            if process.poll() is None:
-                self.end_group(process.pid)
-            _ = process.wait(timeout=300)
+            _ = (self.root / "release").touch()
+            for process in (second, first):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=300)
 
     def assert_interrupted_holder_stops_step_before_release(self, interruption: signal.Signals) -> None:
         board = self.root / "board"

@@ -8,7 +8,7 @@ import fcntl
 import os
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import cast
@@ -26,7 +26,7 @@ def acquire_writer_lock(
     path: Path = LOCK_PATH,
     *,
     timeout_seconds: float = 30.0,
-) -> Iterator[None]:
+) -> Generator[None]:
     """Acquire an OS-released exclusive lock, waiting for a bounded interval."""
 
     path.parent.mkdir(parents=True, exist_ok=True)

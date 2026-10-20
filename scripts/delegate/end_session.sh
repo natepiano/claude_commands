@@ -7,14 +7,20 @@
 # stop-delegate-continue.py refuses to let the turn end near the auto-compaction
 # threshold, on the assumption that the run still has phases to go.
 #
-# Removes every claude worker this run launched, and any a dead run left alive
-# (remove_workers.py). Also stops this run's codex app-server, if one was
+# Acts on every run folder this session directs (`unit_runs.py held`): the
+# marker names one, and phases run side by side each keep their own folder,
+# which records its director. A run of another director is never touched.
+#
+# Removes every claude worker those runs launched, and any a dead run left
+# alive (remove_workers.py). Also stops each run's codex app-server, if one was
 # started. That server is detached on purpose -- it has to outlive each
 # delegate so a peer can still reach a thread between turns -- so the end of
 # the run is the only point that knows nobody needs it any more.
 #
-# Deletes the run's verify.sh pass records (verify_cache/); the time they saved
-# is already in ~/.local/state/verify/saved.jsonl.
+# Deletes each run's verify.sh pass records (verify_cache/); the time they
+# saved is already in ~/.local/state/verify/saved.jsonl.
+#
+# PLAN_DELEGATE_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
 # Safe to run when no run is active. The rest of the session directory is left
 # alone; heartbeat and delegate logs stay readable after the run.
@@ -43,32 +49,52 @@ else
   fi
 fi
 
+# The marker holds the session directory, which is where the mesh files live.
+SESSION_DIR=""
 if [[ -f "${MARKER}" ]]; then
-  # The marker holds the session directory, which is where the mesh files live.
   SESSION_DIR="$(head -n 1 "${MARKER}")"
-  if [[ -n "${SESSION_DIR}" ]]; then
-    "$PY" "${SCRIPT_DIR}/remove_workers.py" \
-      --session-dir "${SESSION_DIR}" || true
+fi
+
+# The marker's run first, kept even when the scan fails, then every other run
+# this session directs.
+RUNS=()
+if [[ -n "${SESSION_DIR}" ]]; then
+  RUNS+=("${SESSION_DIR}")
+fi
+HELD_ARGS=(held "${CLAUDE_CODE_SESSION_ID}")
+if [[ -n "${PLAN_DELEGATE_RUN_ROOT:-}" ]]; then
+  HELD_ARGS+=(--root "${PLAN_DELEGATE_RUN_ROOT}")
+fi
+if [[ -n "${PLAN_DELEGATE_ACTIVE_DIR:-}" ]]; then
+  HELD_ARGS+=(--active "${PLAN_DELEGATE_ACTIVE_DIR}")
+fi
+HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}" || true)"
+while IFS= read -r run; do
+  if [[ -n "${run}" && "${run}" != "${SESSION_DIR}" ]]; then
+    RUNS+=("${run}")
   fi
-  if [[ -n "${SESSION_DIR}" && ( -f "${SESSION_DIR}/mesh_roster.json" || -f "${SESSION_DIR}/mesh_server.json" || -f "${SESSION_DIR}/mesh_retired.json" ) ]]; then
-    "$PY" "${MESH}" \
-      stop --session-dir "${SESSION_DIR}" || true
-  fi
-  if [[ -n "${SESSION_DIR}" ]]; then
-    "$PY" "${MESH}" sweep --root "$(dirname "${SESSION_DIR}")" --stop || true
-  fi
-  if [[ -n "${SESSION_DIR}" && -d "${SESSION_DIR}/verify_cache" ]]; then
-    rm -rf -- "${SESSION_DIR}/verify_cache"
-  fi
-  if [[ -n "${SESSION_DIR}" ]]; then
-    # A run folder under delegate/ keeps the instance name it started with.
-    INSTANCE="unit-$(basename "${SESSION_DIR}")"
-    if [[ "$(basename "$(dirname "${SESSION_DIR}")")" == delegate ]]; then
-      INSTANCE="delegate-$(basename "${SESSION_DIR}")"
+done <<< "${HELD}"
+
+if (( ${#RUNS[@]} > 0 )); then
+  REMOVE_ARGS=()
+  for run in "${RUNS[@]}"; do
+    REMOVE_ARGS+=(--session-dir "${run}")
+  done
+  "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
+  for run in "${RUNS[@]}"; do
+    if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" || -f "${run}/mesh_retired.json" ]]; then
+      "$PY" "${MESH}" stop --session-dir "${run}" || true
     fi
-    zsh "${SCRIPT_DIR}/../message/notifier.sh" remove "${INSTANCE}" \
-      >/dev/null 2>&1 || true
-  fi
+  done
+  "$PY" "${MESH}" sweep --root "$(dirname "${RUNS[0]}")" --stop || true
+  for run in "${RUNS[@]}"; do
+    if [[ -d "${run}/verify_cache" ]]; then
+      rm -rf -- "${run}/verify_cache"
+    fi
+  done
+fi
+
+if [[ -f "${MARKER}" ]]; then
   rm -f "${MARKER}"
   echo "Unit run ended; marker cleared."
 else

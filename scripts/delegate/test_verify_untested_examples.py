@@ -13,6 +13,9 @@ from typing import override
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
+# A hang limit, not a speed check: a verify.sh call starts many processes, and at load 150 one took
+# over 30 s (a merge gate went red at 30 s, 2026-10-18). A real hang still fails, after this many seconds.
+HANG_SECONDS = 300
 REAL_CARGO = shutil.which("cargo")
 
 
@@ -40,7 +43,7 @@ if [ "$1" = metadata ]; then
 fi
 printf "%s\n" "$*" >> "$CARGO_CALLS"
 if [ "$1 $2" = "nextest run" ] && [ -n "$EDIT_DURING_TEST" ]; then
-    printf "// changed during the test run\n" >> "$PACKAGE_ROOT/src/lib.rs"
+    printf "// changed during the test run\n" >> "$PACKAGE_ROOT/${EDIT_DURING_TEST_PATH:-src/lib.rs}"
 fi
 case "$1 $2" in
     "nextest --version"|"nextest run"|"+nightly fmt"|"check --workspace") exit 0 ;;
@@ -53,7 +56,8 @@ esac
 case " $* " in
     *"rev-parse --show-toplevel"*) printf "%s\n" "$PACKAGE_ROOT" ;;
     *"rev-parse HEAD^{tree}"*) printf "fixed-tree\n" ;;
-    *"status --porcelain"*) [ -z "$TREE_DIRTY" ] || printf " M src/lib.rs\000" ;;
+    *"status --porcelain"*) [ -z "$TREE_DIRTY" ] || printf " M %s\000" ${TREE_DIRTY_PATHS:-src/lib.rs} ;;
+    *" ls-tree "*) : ;;
     *) exit 1 ;;
 esac
 ''')
@@ -143,7 +147,7 @@ esac
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
+            timeout=HANG_SECONDS,
         )
 
     def calls_made(self) -> list[str]:
@@ -305,6 +309,36 @@ esac
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("PASS (recorded)", result.stdout)
         self.assertEqual(len(list((self.root / "session" / "verify_cache").glob("*.pass"))), 1)
+
+    def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
+        """Test alpha, which depends on gamma, while another phase edits `edited`."""
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta", "gamma"]\nresolver = "2"\n')
+        _ = self.package("alpha", root=self.root / "alpha",
+                         manifest_extra='\n[dependencies]\ngamma = { path = "../gamma" }\n')
+        _ = self.package("beta", root=self.root / "beta")
+        _ = self.package("gamma", root=self.root / "gamma")
+        self.environment.update({
+            "TREE_DIRTY": "1", "TREE_DIRTY_PATHS": "beta/src/lib.rs gamma/src/lib.rs",
+            "EDIT_DURING_TEST": "1", "EDIT_DURING_TEST_PATH": edited,
+        })
+        return self.verify("test", "alpha")
+
+    def test_an_edit_to_a_member_the_package_is_not_built_from_keeps_its_pass(self) -> None:
+        result = self.side_by_side_phases("beta/src/lib.rs")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("the tree changed while test ran", result.stdout)
+        self.assertEqual(len(list((self.root / "session" / "verify_cache").glob("*.pass"))), 1)
+
+        result = self.verify("test", "alpha")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PASS (recorded)", result.stdout)
+        self.assertEqual(sum(call.startswith("nextest run ") for call in self.calls_made()), 1)
+
+    def test_an_edit_to_a_path_dependency_during_the_run_records_no_pass(self) -> None:
+        result = self.side_by_side_phases("gamma/src/lib.rs")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the tree changed while test ran, so this result was not recorded", result.stdout)
+        self.assertEqual(list((self.root / "session" / "verify_cache").glob("*.pass")), [])
 
     def test_final_checks_every_workspace_member_before_workspace_gate(self) -> None:
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta"]\nresolver = "2"\n')

@@ -51,6 +51,10 @@ from scripts.lib import unit_runs
 NOT_A_MESH_WORKER = 3
 # Lines of the log the result message carries.
 RESULT_TAIL_LINES = 20
+# Characters the result message keeps of one log line, and of the whole tail: the message
+# is a Codex turn input, which Codex refuses over 1,048,576 characters.
+RESULT_LINE_CHARS = 2_000
+RESULT_TAIL_CHARS = 20_000
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
@@ -193,12 +197,26 @@ def _exit_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
 
+def _cut_line(line: str) -> str:
+    if len(line) <= RESULT_LINE_CHARS:
+        return line
+    return f"{line[:RESULT_LINE_CHARS]} [cut: {len(line) - RESULT_LINE_CHARS} more characters]"
+
+
 def _tail(path: Path, count: int) -> list[str]:
+    """The log's last `count` lines, each cut to RESULT_LINE_CHARS, newest first kept within RESULT_TAIL_CHARS."""
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
-    return lines[-count:]
+    kept: list[str] = []
+    total = 0
+    for line in map(_cut_line, reversed(lines[-count:])):
+        total += len(line) + 1
+        if total > RESULT_TAIL_CHARS:
+            break
+        kept.append(line)
+    return kept[::-1]
 
 
 def result_text(record: RunRecord, exit_code: int) -> str:
@@ -206,7 +224,7 @@ def result_text(record: RunRecord, exit_code: int) -> str:
     lines = [f"Run finished: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES)
     if tail:
-        lines.extend(["", f"Last {len(tail)} log lines:", *tail])
+        lines.extend(["", f"Last {len(tail)} log lines (lines over {RESULT_LINE_CHARS} characters are cut):", *tail])
     return "\n".join(lines)
 
 

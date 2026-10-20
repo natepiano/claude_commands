@@ -1,4 +1,4 @@
-"""An adhoc review restores only the dailies and footers it paused."""
+"""An adhoc review restores the dailies only when it paused them."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ class ReviewPauseTests(unittest.TestCase):
     root: Path = Path()
     instance: Path = Path()
     record: Path = Path()
-    switch: Path = Path()
     enabled: Path = Path()
     environment: dict[str, str] = {}
 
@@ -50,7 +49,6 @@ class ReviewPauseTests(unittest.TestCase):
         self.enabled.touch()
         state = self.root / "showrunner-state"
         self.record = state / "review-paused/demo.json"
-        self.switch = state / "footers-off/demo"
         stub = self.root / "notifier.py"
         _ = stub.write_text(
             "#!/usr/bin/env python3\n"
@@ -99,19 +97,14 @@ class ReviewPauseTests(unittest.TestCase):
     def test_pause_and_resume_both(self) -> None:
         paused = self.run_script("pause")
         self.assertEqual(paused.returncode, 0, paused.stderr)
-        self.assertEqual(paused.stdout, "demo: paused dailies and footers\n")
+        self.assertEqual(paused.stdout, "demo: paused dailies\n")
         self.assertFalse(self.enabled.exists())
-        self.assertTrue(self.switch.exists())
-        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done", "footers": "done"})
-        self.assertEqual(self.run_script("status").stdout, "demo: review paused dailies, footers\n")
-        self.assertEqual(self.run_script("pause").stdout, "demo: review paused dailies, footers\n")
-        self.switch.unlink()
-        self.assertEqual(self.run_script("pause").stdout, "demo: review paused dailies, footers\n")
-        self.assertFalse(self.switch.exists())
-        self.switch.touch()
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done"})
+        self.assertEqual(self.run_script("status").stdout, "demo: review paused dailies\n")
+        self.assertEqual(self.run_script("pause").stdout, "demo: review paused dailies\n")
+        self.assertEqual(self.run_script("pause").stdout, "demo: review paused dailies\n")
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
         self.assertFalse(self.record.exists())
 
     def test_pause_persists_record_before_stopping_notifier(self) -> None:
@@ -127,25 +120,21 @@ class ReviewPauseTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 1)
         self.assertIn("notifier stop refused", failed.stderr)
         self.assertEqual(json.loads(self.record.read_text()),
-                         {"dailies": "attempted", "footers": "untouched"})
+                         {"dailies": "attempted"})
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
         _ = self.environment.pop("FAIL_STOP")
         retried = self.run_script("pause")
         self.assertEqual(retried.returncode, 0, retried.stderr)
-        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done", "footers": "done"})
+        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done"})
         self.assertFalse(self.enabled.exists())
-        self.assertTrue(self.switch.exists())
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
 
     def test_failed_stop_resume_does_not_restore_uncompleted_actions(self) -> None:
         self.environment["FAIL_STOP"] = "1"
         self.assertEqual(self.run_script("pause").returncode, 1)
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
         self.assertFalse(self.record.exists())
 
     def test_stop_that_takes_effect_then_fails_is_restored_on_resume(self) -> None:
@@ -154,11 +143,10 @@ class ReviewPauseTests(unittest.TestCase):
         self.assertEqual(failed.returncode, 1)
         self.assertIn("failed after stopping", failed.stderr)
         self.assertEqual(json.loads(self.record.read_text()),
-                         {"dailies": "attempted", "footers": "untouched"})
+                         {"dailies": "attempted"})
         self.assertFalse(self.enabled.exists())
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
         self.assertFalse(self.record.exists())
 
     def test_status_names_effective_pause_after_stop_reports_failure(self) -> None:
@@ -177,9 +165,8 @@ class ReviewPauseTests(unittest.TestCase):
         _ = self.environment.pop("FAIL_STOP_AFTER")
         retried = self.run_script("pause")
         self.assertEqual(retried.returncode, 0, retried.stderr)
-        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done", "footers": "done"})
-        self.assertTrue(self.switch.exists())
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done"})
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
 
     def test_later_production_failure_keeps_earlier_pause_and_retries_both(self) -> None:
@@ -189,27 +176,25 @@ class ReviewPauseTests(unittest.TestCase):
         _ = (other / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
         (other / "enabled").touch()
         other_record = self.record.with_name("zeta.json")
-        other_switch = self.switch.with_name("zeta")
         self.environment["FAIL_STOP_AFTER_FOR"] = other.name
         failed = self.run_script("pause")
         self.assertEqual(failed.returncode, 1)
-        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done", "footers": "done"})
+        self.assertEqual(json.loads(self.record.read_text()), {"dailies": "done"})
         self.assertEqual(json.loads(other_record.read_text()),
-                         {"dailies": "attempted", "footers": "untouched"})
+                         {"dailies": "attempted"})
         self.assertFalse(self.enabled.exists())
         self.assertFalse((other / "enabled").exists())
         _ = self.environment.pop("FAIL_STOP_AFTER_FOR")
         retried = self.run_script("pause")
         self.assertEqual(retried.returncode, 0, retried.stderr)
-        self.assertEqual(json.loads(other_record.read_text()), {"dailies": "done", "footers": "done"})
-        self.assertTrue(other_switch.exists())
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(json.loads(other_record.read_text()), {"dailies": "done"})
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
         self.assertTrue((other / "enabled").exists())
         self.assertFalse(self.record.exists())
         self.assertFalse(other_record.exists())
 
-    def test_review_pause_uses_shared_footer_switch(self) -> None:
+    def test_review_pause_uses_shared_showrunner_state(self) -> None:
         self.assertIs(review_pause.showrunner_footer, showrunner_footer)
 
     def test_record_path_uses_shared_review_pause_path(self) -> None:
@@ -220,40 +205,32 @@ class ReviewPauseTests(unittest.TestCase):
 
     def test_already_stopped_dailies_stay_stopped(self) -> None:
         self.stop_dailies()
-        self.assertEqual(self.run_script("pause").stdout,
-                         "demo: paused footers; dailies were already off\n")
+        self.assertEqual(self.run_script("pause").stdout, "demo: nothing to pause\n")
         self.assertEqual(json.loads(self.record.read_text()),
-                         {"dailies": "skipped", "footers": "done"})
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+                         {"dailies": "skipped"})
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertFalse(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
 
-    def test_resume_footers_and_none_follow_record(self) -> None:
-        self.assertEqual(self.run_script("pause").returncode, 0)
-        self.assertEqual(self.run_script("resume", "footers").returncode, 0)
-        self.assertFalse(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
-        self.assertFalse(self.record.exists())
-        self.assertEqual(self.run_script("pause").stdout, "demo: paused footers; dailies were already off\n")
-        self.assertEqual(self.run_script("resume", "none").returncode, 0)
-        self.assertFalse(self.enabled.exists())
-        self.assertTrue(self.switch.exists())
+    def test_a_record_written_while_footers_existed_resumes_its_dailies(self) -> None:
+        self.stop_dailies()
+        self.record.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.record.write_text('{"dailies": "done", "footers": "done"}\n')
+        self.assertEqual(self.run_script("status").stdout, "demo: review paused dailies\n")
+        self.assertEqual(self.run_script("resume", "footers").returncode, 2)
+        self.assertEqual(self.run_script("resume", "dailies").stdout, "demo: turned on dailies\n")
         self.assertFalse(self.record.exists())
 
     def test_resume_none_keeps_both_off_and_deletes_record(self) -> None:
         self.assertEqual(self.run_script("pause").returncode, 0)
         self.assertEqual(self.run_script("resume", "none").returncode, 0)
         self.assertFalse(self.enabled.exists())
-        self.assertTrue(self.switch.exists())
         self.assertFalse(self.record.exists())
 
     def test_nothing_to_pause_and_unrelated_session(self) -> None:
         self.stop_dailies()
-        self.switch.parent.mkdir(parents=True)
-        self.switch.touch()
         self.assertEqual(self.run_script("pause").stdout, "demo: nothing to pause\n")
         self.assertEqual(json.loads(self.record.read_text()),
-                         {"dailies": "skipped", "footers": "skipped"})
+                         {"dailies": "skipped"})
         self.assertEqual(self.run_script("pause", session="other").stdout, "")
         self.assertEqual(self.run_script("status", session="other").stdout, "")
         self.assertEqual(self.run_script("resume", "none").returncode, 0)
@@ -261,20 +238,15 @@ class ReviewPauseTests(unittest.TestCase):
 
     def test_retry_does_not_capture_actions_that_were_already_off(self) -> None:
         self.stop_dailies()
-        self.switch.parent.mkdir(parents=True)
-        self.switch.touch()
         self.assertEqual(self.run_script("pause").returncode, 0)
         self.assertEqual(json.loads(self.record.read_text()),
-                         {"dailies": "skipped", "footers": "skipped"})
+                         {"dailies": "skipped"})
         self.enabled.touch()
         _ = (self.instance / "state").write_text("ENABLED=1\nNEXT_DUE=1\n")
-        self.switch.unlink()
         self.assertEqual(self.run_script("pause").returncode, 0)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
 
     def test_legacy_skipped_actions_stay_on_after_repeated_pause(self) -> None:
         self.record.parent.mkdir(parents=True)
@@ -282,11 +254,9 @@ class ReviewPauseTests(unittest.TestCase):
         paused = self.run_script("pause")
         self.assertEqual(paused.returncode, 0, paused.stderr)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
         self.assertEqual(self.run_script("status").stdout, "demo: review paused nothing\n")
-        self.assertEqual(self.run_script("resume", "both").returncode, 0)
+        self.assertEqual(self.run_script("resume", "dailies").returncode, 0)
         self.assertTrue(self.enabled.exists())
-        self.assertFalse(self.switch.exists())
 
 
 if __name__ == "__main__":

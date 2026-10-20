@@ -207,19 +207,9 @@ class TopLevelSession(SessionFields):
 Session = ShowrunnerSession | UnitSession | WorkerSession | TopLevelSession
 
 
-class ShowrunnerFooter(TypedDict):
-    kind: Literal["footer"]
-    slug: str
-
-
-class NoFooter(TypedDict):
-    kind: Literal["no footer"]
-
-
 class TimerRestore(TypedDict):
     instance: str
     was_enabled: bool
-    footer: ShowrunnerFooter | NoFooter
 
 
 class CodexSessionId(TypedDict):
