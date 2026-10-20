@@ -2776,6 +2776,18 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
         self.assertEqual(frontmatter(issue)["status"], ["open"])
 
+    def test_decision_refill_waits_when_a_findings_trait_identity_is_uncertain(self) -> None:
+        site = self.sources[0]
+        source = "impl Trait for Type {\n    fn method(&self) { 7 }\n}\n"
+        self.commit_files({site: source})
+        issue, (finding,) = self.judged_findings(self.rule("read"), ((site, 2, "7"),))
+        self.write_generated_body(issue)
+        self.commit_files({site: source.replace("impl Trait", "impl external::Trait")})
+        output = self.refill_decisions()
+        self.assertIn(f"waiting {issue}: {finding.finding_id} trait identity uncertain\n", output)
+        self.assertEqual(self.ledger().proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+        self.assertFalse(any(finding.finding_id in ticket["finding_ids"] for ticket in self.ledger().ticket_open("names-unit")))
+
     def test_decision_refill_closes_a_decision_whose_only_finding_the_declaration_step_built(self) -> None:
         site = self.sources[0]
         parent = "pub struct Parent {\n    old: u32,\n}\n"

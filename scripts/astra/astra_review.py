@@ -12,10 +12,16 @@ exits 2.
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.astra import astra_roles  # noqa: E402
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
@@ -27,6 +33,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 # Tests point these at a stub and a temporary folder.
 ACCOUNTS_COMMAND = os.environ.get("ASTRA_REVIEW_ACCOUNTS") or ""
 RUNS_ROOT = Path(os.environ.get("ASTRA_REVIEW_DIR") or "/tmp/claude/astra")
+THREAD_HEADER_TIMEOUT = 30.0
 
 
 def accounts_command() -> list[str]:
@@ -91,6 +98,76 @@ def tail(text: str) -> str:
     return "\n".join(text.strip().splitlines()[-ERROR_TAIL_LINES:])
 
 
+def workers_home() -> str:
+    """Read the workers account's CODEX_HOME without evaluating shell text."""
+    found = subprocess.run([*accounts_command(), "env", "workers"], capture_output=True, text=True, check=False)
+    if found.returncode == 0:
+        for assignment in shlex.split(found.stdout):
+            if assignment.startswith("CODEX_HOME="):
+                return assignment.removeprefix("CODEX_HOME=")
+    raise ValueError("could not read CODEX_HOME from accounts env workers")
+
+
+def review_thread(process: subprocess.Popen[str], log: Path) -> str:
+    """Read Codex's header for up to 30 seconds, or until the process ends."""
+    deadline = time.monotonic() + THREAD_HEADER_TIMEOUT
+    header = ""
+    with log.open(encoding="utf-8", errors="replace") as output:
+        while True:
+            header += output.read()
+            match = re.search(r"^session id:[ \t]*(\S+)[ \t]*\r?\n", header, re.MULTILINE)
+            if match:
+                return match[1]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            try:
+                _ = process.wait(timeout=min(0.05, remaining))
+            except subprocess.TimeoutExpired:
+                continue
+            header += output.read()
+            match = re.search(r"^session id:[ \t]*(\S+)[ \t]*$", header, re.MULTILINE)
+            return match[1] if match else ""
+
+
+def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
+    """Keep the reviewer role only during this Codex process."""
+    manager = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    codex_home = ""
+    if manager:
+        try:
+            codex_home = workers_home()
+        except (OSError, ValueError) as error:
+            print(f"astra_review: reviewer role unavailable: {error}", file=sys.stderr)
+    held_thread = ""
+    with log.open("w", encoding="utf-8") as output, subprocess.Popen(
+        codex_arguments(label, review, Path.cwd()), stdin=subprocess.PIPE, stdout=output,
+        stderr=subprocess.STDOUT, text=True,
+    ) as process:
+        try:
+            if process.stdin is not None:
+                try:
+                    _ = process.stdin.write(prompt)
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+            if manager and codex_home:
+                thread = review_thread(process, log)
+                if thread:
+                    try:
+                        _ = astra_roles.hold("reviewer", thread, codex_home, pid=process.pid, manager=manager)
+                        held_thread = thread
+                    except (OSError, ValueError) as error:
+                        print(f"astra_review: reviewer role unavailable: {error}", file=sys.stderr)
+            return process.wait()
+        finally:
+            if held_thread:
+                try:
+                    astra_roles.release(held_thread)
+                except OSError as error:
+                    print(f"astra_review: could not release reviewer role: {error}", file=sys.stderr)
+
+
 def main(arguments: list[str]) -> int:
     if not arguments or arguments[0] in ("-h", "--help"):
         print("usage: astra_review.py <document> [focus...]", file=sys.stderr)
@@ -110,12 +187,10 @@ def main(arguments: list[str]) -> int:
     prompt = review_prompt(document, focus)
     _ = (folder / "prompt.md").write_text(prompt, encoding="utf-8")
     log = folder / "codex.log"
-    with log.open("w", encoding="utf-8") as output:
-        finished = subprocess.run(codex_arguments(label, review, Path.cwd()), input=prompt, stdout=output,
-                                  stderr=subprocess.STDOUT, text=True, check=False)
+    returncode = run_review(label, review, prompt, log)
     written = review.read_text(encoding="utf-8").strip() if review.is_file() else ""
-    if finished.returncode != 0 or not written:
-        why = f"exit {finished.returncode}" if finished.returncode != 0 else "no review was written"
+    if returncode != 0 or not written:
+        why = f"exit {returncode}" if returncode != 0 else "no review was written"
         said = tail(log.read_text(encoding="utf-8"))
         print(f"astra_review: the {MODEL} review of {document} failed on workers account {label} ({why}).",
               f"Codex said:\n{said}", f"Log: {log}", sep="\n", file=sys.stderr)

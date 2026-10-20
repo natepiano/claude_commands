@@ -30,7 +30,9 @@ import style_footprint
 import style_rules
 from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
-from declarations import Declaration, DeclaredFile, DeclaredItem, ImplOrTraitItem, moved_site_line, read_declarations
+from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
+                          ImplPosition, UnprovedImplPosition,
+                          NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
 CellState = Literal["current", "stale", "open", "awaiting merge"]
@@ -570,6 +572,57 @@ class DeclaredInSeveralFiles:
 
 
 @dataclass(frozen=True)
+class TraitIdentityUncertain:
+    """The trait paths cannot be proved equal or different, so the finding stays as it is."""
+
+    finding: HeldFinding
+    declaration: Declaration
+
+
+class TraitIdentity(StrEnum):
+    SAME = "same"
+    DIFFERENT = "different"
+    UNCERTAIN = "uncertain"
+
+
+@dataclass(frozen=True)
+class ResolvedTraitPath:
+    """A path with supported imports expanded and no skipped binding of its names."""
+
+    path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnresolvedTraitPath:
+    """An unsupported import or relative path prevents a trait identity proof."""
+
+
+@dataclass(frozen=True)
+class ResolvedTraitModule:
+    """One declared trait's full rooted module path, proved by the crate's file layout."""
+
+    module: str
+    declarations: int
+
+
+@dataclass(frozen=True)
+class UnresolvedTraitModule:
+    """The path does not prove which declared trait it names."""
+
+
+@dataclass(frozen=True)
+class RootedFileModule:
+    """The complete module chain proved by a file's src layout."""
+
+    path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnreadableFileModule:
+    """The file has no proved module chain in its crate's src layout."""
+
+
+@dataclass(frozen=True)
 class DeclaredInAnotherCrate:
     """The subject of a filed finding moved to a file in another crate. Its decision is per crate, so it stays."""
 
@@ -661,11 +714,41 @@ class NoItemRename:
 
 @dataclass(frozen=True)
 class BuiltRename:
-    """The item rename of one built finding, with the finding's path and decision."""
+    """A built rename with its read site, its build site, and its decision.
+
+    The before name resolves at before_commit; the after name resolves at commit.
+    """
 
     rename: ItemRename
     path: str
+    commit: str
+    before_path: str
+    before_commit: str
     proposal: Path
+    before_position: ImplPosition
+    position: ImplPosition
+
+
+@dataclass(frozen=True)
+class UnrestrictedTraitMembership:
+    """The declaration is not an impl or trait member, so trait membership does not restrict it."""
+
+
+@dataclass(frozen=True)
+class RequiredTraitMembership:
+    """A destination must retain the source member's trait relationship, with any proved trait rename."""
+
+    implemented_trait: TraitMembership
+    commit: str
+    path: str
+
+
+TraitRequirement = UnrestrictedTraitMembership | RequiredTraitMembership
+
+
+def _trait_requirement(item: DeclaredItem, commit: str, path: str) -> TraitRequirement:
+    return (RequiredTraitMembership(item.implemented_trait, commit, path) if isinstance(item.declaration.owner, ImplOrTraitItem)
+            else UnrestrictedTraitMembership())
 
 
 @dataclass(frozen=True)
@@ -674,6 +757,7 @@ class RenamedByBuilds:
     or trait that holds it, or both."""
 
     declaration: Declaration
+    trait_requirement: TraitRequirement
 
 
 @dataclass(frozen=True)
@@ -681,7 +765,7 @@ class NoBuiltRename:
     """No built rename of an approved decision gives the finding's item or its impl or trait a new name."""
 
 
-BuiltRenaming = RenamedByBuilds | NoBuiltRename
+BuiltRenaming = RenamedByBuilds | NoBuiltRename | TraitIdentityUncertain
 
 
 def _module_name(path: str) -> str:
@@ -741,9 +825,9 @@ class KeptForOpenBuild:
 
 DeclarationOutcome = (DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved
                       | DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationRenamed | RenameAwaitingApproval
-                      | DeclarationGoneFromFile | KeptForOpenBuild)
+                      | DeclarationGoneFromFile | KeptForOpenBuild | TraitIdentityUncertain)
 # The outcomes that leave a finding as it is for a person to waive or fix in the code.
-DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile
+DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain
 
 
 @dataclass(frozen=True)
@@ -1245,6 +1329,7 @@ class Ledger:
         self._named_files: dict[tuple[str, str], tuple[str, ...]] = {}
         self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
+        self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
         try:
@@ -2284,6 +2369,275 @@ class Ledger:
             self._declared_files[key] = read_declarations(content.decode(errors="replace") if isinstance(content, bytes) else "")
         return self._declared_files[key]
 
+    def _crate_file_modules(self, commit: str, crate: str) -> dict[str, RootedFileModule]:
+        """Prove file modules through plain declarations, with one scan per crate and commit."""
+        key = (commit, crate)
+        if key in self._file_modules:
+            return self._file_modules[key]
+        modules: dict[str, RootedFileModule] = {}
+        self._file_modules[key] = modules
+        tip = self._tip(commit)
+        manifest = self._commit_file(commit, str(PurePosixPath(crate) / "Cargo.toml"))
+        if not isinstance(manifest, bytes):
+            return modules
+        data = _table(tomllib.loads(manifest.decode(errors="replace")))
+        bins = data.get("bin", [])
+        targets = [_table(data.get("lib"))]
+        if isinstance(bins, list):
+            targets.extend(_table(item) for item in cast(list[object], bins))
+        if any("path" in target for target in targets):
+            return modules
+        files = {path for path in tip.blobs if path.endswith(".rs") and tip.crate(path) == crate}
+        links: dict[str, tuple[str, ...]] = {}
+        for path in sorted(files):
+            content = self._commit_file(commit, path)
+            if not isinstance(content, bytes):
+                return modules
+            words = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace")))
+            attributes = style_footprint.decorated_items(words)
+            if any(words[index] == "mod" and "path" in attribute for index, attribute in attributes.items()):
+                return modules
+            depth = 0
+            names: list[str] = []
+            for index, word in enumerate(words):
+                if word == "mod" and depth == 0 and index not in attributes and index + 2 < len(words):
+                    if style_footprint.IDENTIFIER.fullmatch(words[index + 1]) and words[index + 2] == ";":
+                        names.append(words[index + 1])
+                depth += (word in ("{", "(", "[")) - (word in ("}", ")", "]"))
+            links[path] = tuple(names)
+        src = PurePosixPath(crate) / "src"
+        pending: list[tuple[str, tuple[str, ...]]] = [(str(src / name), ("crate",)) for name in ("lib.rs", "main.rs") if str(src / name) in files]
+        while pending:
+            path, chain = pending.pop()
+            if path in modules:
+                if modules[path].path != chain:
+                    modules.clear()
+                    return modules
+                continue
+            modules[path] = RootedFileModule(chain)
+            file = PurePosixPath(path)
+            is_root = file.parent == src and file.name in ("lib.rs", "main.rs")
+            directory = file.parent if is_root or file.name == "mod.rs" else file.with_suffix("")
+            for name in links[path]:
+                candidates = [str(directory / (name + ".rs")), str(directory / name / "mod.rs")]
+                children = [child for child in candidates if child in files and not PurePosixPath(child).is_relative_to(src / "bin")]
+                if len(children) == 1:
+                    pending.append((children[0], (*chain, name)))
+        return modules
+
+    def _file_module(self, commit: str, path: str) -> RootedFileModule | UnreadableFileModule:
+        """Read the same proved module chain for imports and trait declarations."""
+        crate = self._tip(commit).crate(path)
+        return self._crate_file_modules(commit, crate).get(path, UnreadableFileModule())
+
+    def _relative_trait_path(self, commit: str, path: str, trait: tuple[str, ...],
+                             position: ImplPosition) -> ResolvedTraitPath | UnresolvedTraitPath:
+        """Resolve self and super only from a file-level header's proved module chain."""
+        if trait[0] not in ("self", "super"):
+            return ResolvedTraitPath(trait)
+        if isinstance(position, BlockScopedImpl):
+            return UnresolvedTraitPath()
+        module = self._file_module(commit, path)
+        if isinstance(module, UnreadableFileModule):
+            return UnresolvedTraitPath()
+        parts = module.path
+        if trait[0] == "self":
+            return ResolvedTraitPath((*parts, *trait[1:]))
+        index = 0
+        while index < len(trait) and trait[index] == "super":
+            if len(parts) == 1:
+                return UnresolvedTraitPath()
+            parts = parts[:-1]
+            index += 1
+        return ResolvedTraitPath((*parts, *trait[index:]))
+
+    def _trait_site_position(self, commit: str, path: str, line: int, spelling: str) -> ImplPosition:
+        """Read the qualifier's scope, or the declared item's header scope when the qualifier is absent."""
+        content = self._commit_file(commit, path)
+        if not isinstance(content, bytes):
+            return UnprovedImplPosition()
+        tokenized = style_footprint.tokenized_text(content.decode(errors="replace"))
+        words = tuple(token.value for token in tokenized.tokens)
+        wanted = tuple(token.value for token in style_footprint.tokens(spelling.split(";", 1)[0]))
+        if not wanted:
+            return UnprovedImplPosition()
+        blocks: list[int] = []
+        scopes: dict[tuple[int, ...], int] = {}
+        for index, (word, number) in enumerate(zip(words, tokenized.lines, strict=True)):
+            if number == line and words[index:index + len(wanted)] == wanted:
+                scopes[tuple(blocks)] = index
+            if word == "{":
+                blocks.append(index)
+            elif word == "}" and blocks:
+                _ = blocks.pop()
+        if not scopes:
+            declared = self._declared_file(commit, path)
+            item = declared.declaration_at(line)
+            if not isinstance(item, DeclaredItem):
+                return UnprovedImplPosition()
+            # Several item boundaries on one line do not prove which item owns the site.
+            boundaries = [other for other in declared.declared_items
+                          if line in (other.first_line, other.keyword_line, other.last_line)]
+            if len(boundaries) > 1 or any(other.import_position != item.import_position for other in boundaries):
+                return UnprovedImplPosition()
+            return item.import_position
+        if len(scopes) != 1:
+            return UnprovedImplPosition()
+        scope, index = next(iter(scopes.items()))
+        return BlockScopedImpl(index) if scope else FileLevelImpl()
+
+    def _trait_import_path(self, commit: str, path: str, trait: tuple[str, ...],
+                           position: ImplPosition) -> ResolvedTraitPath | UnresolvedTraitPath:
+        """Read only imports visible at the header; enclosing block imports still block their names."""
+        if isinstance(position, UnprovedImplPosition):
+            return UnresolvedTraitPath()
+        content = self._commit_file(commit, path)
+        words = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace"))) if isinstance(content, bytes) else ()
+        blocks: list[int] = []
+        enclosing: dict[int, tuple[int, ...]] = {}
+        for index, word in enumerate(words):
+            if word == "use" or isinstance(position, BlockScopedImpl) and index == position.header_word:
+                enclosing[index] = tuple(blocks)
+            if word == "{":
+                blocks.append(index)
+            elif word == "}" and blocks:
+                _ = blocks.pop()
+        header_blocks = enclosing.get(position.header_word, ()) if isinstance(position, BlockScopedImpl) else ()
+        imports: dict[str, list[tuple[str, ...]]] = {}
+        blocked: set[str] = set()
+        glob = False
+        for item in style_footprint.use_items(words):
+            use = words.index("use", item.start, item.end)
+            use_blocks = enclosing.get(use, ())
+            if use_blocks and (len(use_blocks) > len(header_blocks) or header_blocks[:len(use_blocks)] != use_blocks):
+                continue
+            body = words[use + 1:item.end - 1]
+            bindings: list[tuple[str, tuple[str, ...]]] = []
+            if "as" in body:
+                alias = body.index("as")
+                paths = style_footprint.use_paths(body[:alias])
+                if len(paths) == 1 and len(body) == alias + 2 and style_footprint.IDENTIFIER.fullmatch(body[alias + 1]):
+                    bindings.append((body[alias + 1], paths[0]))
+            else:
+                bindings.extend((imported[-1], imported) for imported in item.paths)
+            supported = bool(bindings) and not item.attributed and not use_blocks and words[item.start] == "use"
+            if "*" in body:
+                glob = True
+            if not supported:
+                # An unread visible import can bind either end of the trait path.
+                blocked.update(name for name, _ in bindings)
+                if not bindings:
+                    blocked.update(word for word in body if style_footprint.IDENTIFIER.fullmatch(word))
+                continue
+            for name, imported in bindings:
+                imports.setdefault(name, []).append(imported)
+        seen: set[tuple[str, str]] = set()
+        # A binding must not expand twice, even when each expansion grows the path.
+        while len(seen) < 32:
+            relative = self._relative_trait_path(commit, path, trait, position)
+            if isinstance(relative, UnresolvedTraitPath):
+                return relative
+            trait = relative.path
+            if glob or trait[0] in blocked or trait[-1] in blocked:
+                return UnresolvedTraitPath()
+            candidates = imports.get(trait[0], [])
+            if not candidates:
+                return ResolvedTraitPath(trait)
+            binding = (path, trait[0])
+            if len(candidates) != 1 or binding in seen:
+                return UnresolvedTraitPath()
+            seen.add(binding)
+            trait = (*candidates[0], *trait[1:])
+        return UnresolvedTraitPath()
+
+    def _trait_module(self, commit: str, path: str, trait: tuple[str, ...]) -> ResolvedTraitModule | UnresolvedTraitModule:
+        """Resolve only declared module traits; a missing or ambiguous declaration proves nothing."""
+        tip = self._tip(commit)
+        crate = tip.crate(path)
+        homes = [candidate for candidate in self._files_naming(commit, trait[-1])
+                 if candidate in tip.rust_files and tip.crate(candidate) == crate
+                 for item in self._declared_file(commit, candidate).declared_items
+                 if item.declaration.keyword == "trait" and item.declaration.name == trait[-1]
+                 and not isinstance(item.declaration.owner, ImplOrTraitItem)]
+        modules: dict[str, str] = {}
+        for candidate in (*homes, path):
+            module = self._file_module(commit, candidate)
+            if isinstance(module, RootedFileModule):
+                modules[candidate] = "::".join(module.path)
+        if len(trait) == 1:
+            local = [home for home in homes if home in modules and modules[home] == modules.get(path)]
+            choices = local if local else homes
+        else:
+            if trait[0] in ("self", "super"):
+                return UnresolvedTraitModule()
+            module = "::".join(trait[:-1] if trait[0] == "crate" else ("crate", *trait[:-1]))
+            choices = [home for home in homes if modules.get(home) == module]
+        return (ResolvedTraitModule(modules[choices[0]], len(homes))
+                if len(choices) == 1 and choices[0] in modules else UnresolvedTraitModule())
+
+    def _trait_identity(self, left: TraitMembership, left_commit: str, left_path: str,
+                        right: TraitMembership, right_commit: str, right_path: str) -> TraitIdentity:
+        """Prove trait equality or difference; missing name evidence keeps the finding."""
+        if isinstance(left, UnreadableImplementedTrait) or isinstance(right, UnreadableImplementedTrait):
+            return TraitIdentity.UNCERTAIN
+        if isinstance(left, NoImplementedTrait) or isinstance(right, NoImplementedTrait):
+            return TraitIdentity.SAME if left == right else TraitIdentity.DIFFERENT
+        left_import = self._trait_import_path(left_commit, left_path, left.path, left.position)
+        right_import = self._trait_import_path(right_commit, right_path, right.path, right.position)
+        if isinstance(left_import, UnresolvedTraitPath) or isinstance(right_import, UnresolvedTraitPath):
+            return TraitIdentity.UNCERTAIN
+        left_words, right_words = left_import.path, right_import.path
+        if left.arguments != right.arguments or left_words[-1] != right_words[-1]:
+            return TraitIdentity.DIFFERENT
+        if left_words == right_words:
+            return TraitIdentity.SAME
+        left_home = self._trait_module(left_commit, left_path, left_words)
+        right_home = self._trait_module(right_commit, right_path, right_words)
+        if isinstance(left_home, ResolvedTraitModule) and isinstance(right_home, ResolvedTraitModule):
+            if left_home.module != right_home.module:
+                return TraitIdentity.DIFFERENT
+            if left_home.declarations == right_home.declarations == 1:
+                return TraitIdentity.SAME
+        return TraitIdentity.UNCERTAIN
+
+    def _trait_rename_identity(self, membership: ImplementedTrait, commit: str, path: str,
+                               built: BuiltRename, qualifier: tuple[str, ...]) -> TraitIdentity:
+        """Prove what the qualifier names at the built finding's own site and commit."""
+        resolved = self._trait_import_path(built.before_commit, built.before_path, qualifier, built.before_position)
+        if isinstance(resolved, UnresolvedTraitPath):
+            return TraitIdentity.UNCERTAIN
+        candidate = resolved.path
+        if commit == built.before_commit and path == built.before_path:
+            return self._trait_identity(membership, commit, path,
+                                        ImplementedTrait(candidate, membership.arguments, built.before_position), commit, path)
+        if len(candidate) == 1:
+            home = self._trait_module(built.before_commit, built.before_path, candidate)
+            if isinstance(home, UnresolvedTraitModule):
+                return TraitIdentity.UNCERTAIN
+            candidate = (*home.module.split("::"), candidate[-1])
+        return self._trait_identity(membership, commit, path,
+                                    ImplementedTrait(candidate, membership.arguments, built.before_position), built.before_commit, built.before_path)
+
+    def _matches_declaration(self, item: DeclaredItem, declaration: Declaration, requirement: TraitRequirement,
+                             commit: str, path: str) -> TraitIdentity:
+        if item.declaration != declaration:
+            return TraitIdentity.DIFFERENT
+        if isinstance(requirement, UnrestrictedTraitMembership):
+            return TraitIdentity.SAME
+        return self._trait_identity(requirement.implemented_trait, requirement.commit, requirement.path,
+                                    item.implemented_trait, commit, path)
+
+    def _matching_items(self, finding: HeldFinding, declaration: Declaration, requirement: TraitRequirement,
+                        commit: str, path: str) -> tuple[DeclaredItem, ...] | TraitIdentityUncertain:
+        matches: list[DeclaredItem] = []
+        for item in self._declared_file(commit, path).declared_items:
+            identity = self._matches_declaration(item, declaration, requirement, commit, path)
+            if identity == TraitIdentity.UNCERTAIN:
+                return TraitIdentityUncertain(finding, declaration)
+            if identity == TraitIdentity.SAME:
+                matches.append(item)
+        return tuple(matches)
+
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
                              approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...]) -> DeclarationOutcome:
         if not isinstance(finding.state, (Unfiled, Filed)) or PurePosixPath(finding.path).suffix != ".rs":
@@ -2311,20 +2665,28 @@ class Ledger:
         if not isinstance(old, DeclaredItem):
             return DeclarationNotRead(finding)
         declaration = old.declaration
-        if any(item.declaration == declaration for item in self._declared_file(tip.commit, finding.path).declared_items):
+        requirement = _trait_requirement(old, read, finding.path)
+        if isinstance(old.implemented_trait, UnreadableImplementedTrait):
+            return TraitIdentityUncertain(finding, declaration)
+        in_place = self._matching_items(finding, declaration, requirement, tip.commit, finding.path)
+        if isinstance(in_place, TraitIdentityUncertain):
+            return in_place
+        if in_place:
             return DeclarationInPlace(finding)
-        # A file the declaration moved to gained it since the read commit; one that already declared it holds a
-        # different item of the same identity.
-        found: dict[str, DeclaredItem] = {}
+        # A destination must gain the same member, including its proved trait identity.
+        found: dict[str, tuple[DeclaredItem, ...]] = {}
         for path in self._files_naming(tip.commit, declaration.name):
             if path == finding.path or path not in rust_files or path not in changed:
                 continue
-            if any(item.declaration == declaration for item in self._declared_file(read, path).declared_items):
-                continue
-            item = next((item for item in self._declared_file(tip.commit, path).declared_items if item.declaration == declaration), None)
-            if item is not None:
-                found[path] = item
-        if len(found) > 1:
+            prior = self._matching_items(finding, declaration, requirement, read, path)
+            items = self._matching_items(finding, declaration, requirement, tip.commit, path)
+            if isinstance(prior, TraitIdentityUncertain):
+                return prior
+            if isinstance(items, TraitIdentityUncertain):
+                return items
+            if items and not prior:
+                found[path] = items
+        if len(found) > 1 or any(len(items) != 1 for items in found.values()):
             return DeclaredInSeveralFiles(finding, declaration, tuple(sorted(found)))
         for path in found:
             if isinstance(finding.state, Filed) and tip.crate(path) != tip.crate(finding.path):
@@ -2335,10 +2697,13 @@ class Ledger:
             if ticket["state"] not in FINAL_TICKET_STATES:
                 return KeptForOpenBuild(finding, ticket["id"])
         if found:
-            path, item = next(iter(found.items()))
+            path, items = next(iter(found.items()))
+            item, = items
             return DeclarationMoved(finding, declaration, path,
                                     moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
-        after_builds = self._built_renaming(finding, read, declaration, tip, approved, renames)
+        after_builds = self._built_renaming(finding, read, old, tip, approved, renames)
+        if isinstance(after_builds, TraitIdentityUncertain):
+            return after_builds
         renamed = self._renamed_site(finding, read, old_file, old, after_builds, tip, rust_files, changed, approved)
         if not isinstance(renamed, NoRenamedSite):
             return renamed
@@ -2353,7 +2718,7 @@ class Ledger:
     def _renamed_site(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
                       after_builds: BuiltRenaming, tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],
                       approved: Callable[[Path], bool],
-                      ) -> DeclarationRenamed | RenameAwaitingApproval | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite:
+                      ) -> DeclarationRenamed | RenameAwaitingApproval | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite | TraitIdentityUncertain:
         """Where a filed rename's after name is declared at the tip with the keyword and owner of its gone declaration,
         else with the owner that the built renames gave it.
 
@@ -2371,18 +2736,25 @@ class Ledger:
                 or new_name == old_name or not style_footprint.IDENTIFIER.fullmatch(new_name)):
             return NoRenamedSite()
         renamed = Declaration(declaration.keyword, new_name, declaration.owner)
-        found = self._gaining_files(finding, read, renamed, tip, rust_files, changed)
+        requirement = _trait_requirement(old, read, finding.path)
+        found = self._gaining_files(finding, read, renamed, requirement, tip, rust_files, changed)
+        if isinstance(found, TraitIdentityUncertain):
+            return found
         # The owner's own name comes first: a built rename of another type of that name, or one that a later commit put
         # back, gives the owner a new name that the code does not use.
         if (not found and isinstance(after_builds, RenamedByBuilds)
-                and after_builds.declaration.owner != declaration.owner):
+                and (after_builds.declaration.owner != declaration.owner
+                     or after_builds.trait_requirement != requirement)):
             renamed = Declaration(declaration.keyword, new_name, after_builds.declaration.owner)
-            found = self._gaining_files(finding, read, renamed, tip, rust_files, changed)
-        if len(found) > 1:
+            found = self._gaining_files(finding, read, renamed, after_builds.trait_requirement, tip, rust_files, changed)
+            if isinstance(found, TraitIdentityUncertain):
+                return found
+        if len(found) > 1 or any(len(items) != 1 for items in found.values()):
             return DeclaredInSeveralFiles(finding, renamed, tuple(sorted(found)))
         if not found:
             return NoRenamedSite()
-        path, item = next(iter(found.items()))
+        path, items = next(iter(found.items()))
+        item, = items
         if tip.crate(path) != tip.crate(finding.path):
             return DeclaredInAnotherCrate(finding, renamed, path)
         if isinstance(applied_check(finding.kind, finding.before, finding.after, path,
@@ -2393,7 +2765,7 @@ class Ledger:
         return DeclarationRenamed(finding, declaration, renamed, path,
                                   moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
 
-    def _built_renaming(self, finding: HeldFinding, read: str, declaration: Declaration, tip: RepositoryTip,
+    def _built_renaming(self, finding: HeldFinding, read: str, original: DeclaredItem, tip: RepositoryTip,
                         approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...]) -> BuiltRenaming:
         """The new names that the built renames of approved decisions in the finding's crate gave its item and the impl
         or trait that holds it.
@@ -2404,26 +2776,31 @@ class Ledger:
         item of that type's impl or trait under any name the renames gave the type. A built `Self` path has the type
         of its own impl or trait.
         """
+        declaration = original.declaration
+        requirement = _trait_requirement(original, read, finding.path)
         own = _item_rename(finding.kind, finding.before, finding.after)
         crate = tip.crate(finding.path)
         module = _module_name(finding.path)
         # The built finding can sit at a call site in any file of the crate; the gaining-file search still guards it.
         in_crate = tuple(built_rename for built_rename in renames if tip.crate(built_rename.path) == crate)
 
-        def renamed(name: str, holds_item: Callable[[RenameScope], bool]) -> tuple[str, ...]:
+        uncertain_traits: list[BuiltRename] = []
+
+        def renamed(name: str, holds_item: Callable[[BuiltRename], bool]) -> tuple[str, ...]:
             """name, then each new name the renames gave it in turn, up to a name with two new names or a name the chain
             already holds; name alone when the finding's own rename names it."""
             names = (name,)
             if isinstance(own, ItemRename) and own.old == name:
                 return names
             while new := {built_rename.rename.new for built_rename in in_crate if built_rename.rename.old == names[-1]
-                          and holds_item(built_rename.rename.scope) and approved(built_rename.proposal)}:
+                          and approved(built_rename.proposal) and holds_item(built_rename)}:
                 if len(new) > 1 or not new.isdisjoint(names):
                     return names
                 names = (*names, *new)
             return names
 
-        def module_item(scope: RenameScope) -> bool:
+        def module_item(built: BuiltRename) -> bool:
+            scope = built.rename.scope
             return isinstance(scope, UnqualifiedName) or (isinstance(scope, ModuleQualified) and scope.module == module)
 
         owner = declaration.owner
@@ -2431,11 +2808,11 @@ class Ledger:
             names = renamed(declaration.name, module_item)
             if len(names) == 1:
                 return NoBuiltRename()
-            return RenamedByBuilds(Declaration(declaration.keyword, names[-1], owner))
-        # The impl's type or the trait is a module item. A trait impl's owner is its type, so a trait path does not
-        # reach the items of a trait impl.
-        def owner_item(scope: RenameScope) -> bool:
-            if module_item(scope):
+            return RenamedByBuilds(Declaration(declaration.keyword, names[-1], owner), requirement)
+        # The impl's type and its implemented trait have separate name histories.
+        def owner_item(built: BuiltRename) -> bool:
+            scope = built.rename.scope
+            if module_item(built):
                 return True
             if not isinstance(scope, ModuleQualified):
                 return False
@@ -2447,54 +2824,119 @@ class Ledger:
                        for path in self._files_naming(read, owner.name))
 
         owners = renamed(owner.name, owner_item)
+        traits: tuple[str, ...] = ()
+        membership = original.implemented_trait
+        if isinstance(membership, ImplementedTrait):
+            trait_name = membership.path[-1]
 
-        def impl_or_trait_item(scope: RenameScope) -> bool:
-            return (isinstance(scope, UnqualifiedName)
-                    or (isinstance(scope, TypeQualified) and scope.type_name in owners))
+            references = {trait_name: RequiredTraitMembership(membership, read, finding.path)}
+
+            def trait_matches(built: BuiltRename, path: tuple[str, ...]) -> bool:
+                reference = references.get(path[-1], references[trait_name])
+                trait = reference.implemented_trait
+                if not isinstance(trait, ImplementedTrait):
+                    return False
+                identity = self._trait_rename_identity(trait, reference.commit, reference.path, built, path)
+                if identity == TraitIdentity.UNCERTAIN and path == (trait.path[-1],) and path[-1] != trait_name:
+                    resolved = self._trait_import_path(built.before_commit, built.before_path, path, built.before_position)
+                    # A proved rename grants its new name before a later build declares it. Imports still decide
+                    # that name first, and another declared trait prevents this chain from proving identity.
+                    declared = any(
+                        item.declaration.keyword == "trait" and item.declaration.name == path[-1]
+                        and not isinstance(item.declaration.owner, ImplOrTraitItem)
+                        for candidate in self._files_naming(built.before_commit, path[-1])
+                        if candidate in tip.rust_files and tip.crate(candidate) == crate
+                        for item in self._declared_file(built.before_commit, candidate).declared_items)
+                    if isinstance(resolved, ResolvedTraitPath) and resolved.path == path and not declared:
+                        identity = TraitIdentity.SAME
+                if identity == TraitIdentity.UNCERTAIN:
+                    uncertain_traits.append(built)
+                return identity == TraitIdentity.SAME
+
+            def trait_item(built: BuiltRename) -> bool:
+                scope = built.rename.scope
+                if isinstance(scope, UnqualifiedName):
+                    matches = trait_matches(built, (built.rename.old,))
+                else:
+                    matches = (isinstance(scope, ModuleQualified)
+                               and trait_matches(built, (scope.module, built.rename.old)))
+                if matches:
+                    reference = references[built.rename.old]
+                    trait = reference.implemented_trait
+                    if isinstance(trait, ImplementedTrait):
+                        # The before name belongs to the read commit; the new name belongs to the build commit.
+                        references[built.rename.new] = RequiredTraitMembership(
+                            ImplementedTrait((*trait.path[:-1], built.rename.new), trait.arguments, built.position), built.commit, built.path)
+                return matches
+
+            traits = renamed(trait_name, trait_item)
+            requirement = references[traits[-1]]
+
+        def impl_or_trait_item(built: BuiltRename) -> bool:
+            scope = built.rename.scope
+            if isinstance(scope, UnqualifiedName):
+                return True
+            if not isinstance(scope, TypeQualified):
+                return False
+            if scope.type_name in traits and isinstance(membership, ImplementedTrait):
+                return trait_matches(built, (scope.type_name,))
+            return scope.type_name in owners
 
         names = renamed(declaration.name, impl_or_trait_item)
-        if len(names) == 1 and len(owners) == 1:
+        if uncertain_traits:
+            # Uncertain authority matters only when a destination could have gained the renamed item.
+            for built in uncertain_traits:
+                scope = built.rename.scope
+                candidate = (Declaration(declaration.keyword, built.rename.new, ImplOrTraitItem(owners[-1]))
+                             if isinstance(scope, TypeQualified) else
+                             Declaration(declaration.keyword, names[-1], ImplOrTraitItem(owners[-1])))
+                if self._gaining_files(finding, read, candidate, UnrestrictedTraitMembership(), tip,
+                                       frozenset(tip.rust_files), self._changed_since(read, tip.commit)):
+                    return TraitIdentityUncertain(finding, declaration)
+        if len(names) == 1 and len(owners) == 1 and len(traits) <= 1:
             return NoBuiltRename()
-        return RenamedByBuilds(Declaration(declaration.keyword, names[-1], ImplOrTraitItem(owners[-1])))
+        return RenamedByBuilds(Declaration(declaration.keyword, names[-1], ImplOrTraitItem(owners[-1])), requirement)
 
     def _followed_rename(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
                          after_builds: RenamedByBuilds, tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],
-                         ) -> DeclarationMoved | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite:
+                         ) -> DeclarationMoved | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite | TraitIdentityUncertain:
         """Where the finding's item is declared at the tip under the new names that the built renames gave it.
 
         Several gaining files or a filed finding's file in another crate leave the finding, as a move does.
         """
         renamed = after_builds.declaration
-        found = self._gaining_files(finding, read, renamed, tip, rust_files, changed)
-        if len(found) > 1:
+        found = self._gaining_files(finding, read, renamed, after_builds.trait_requirement, tip, rust_files, changed)
+        if isinstance(found, TraitIdentityUncertain):
+            return found
+        if len(found) > 1 or any(len(items) != 1 for items in found.values()):
             return DeclaredInSeveralFiles(finding, renamed, tuple(sorted(found)))
         if not found:
             return NoRenamedSite()
-        path, item = next(iter(found.items()))
+        path, items = next(iter(found.items()))
+        item, = items
         if isinstance(finding.state, Filed) and tip.crate(path) != tip.crate(finding.path):
             return DeclaredInAnotherCrate(finding, renamed, path)
         return DeclarationMoved(finding, renamed, path,
                                 moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
 
-    def _gaining_files(self, finding: HeldFinding, read: str, renamed: Declaration, tip: RepositoryTip,
-                       rust_files: frozenset[str], changed: frozenset[str]) -> dict[str, DeclaredItem]:
-        """The files that gained renamed since the read commit, with its item there.
-
-        The finding's own file is checked first; when it gained renamed, it is the only file.
-        """
-
-        def gained(path: str) -> tuple[DeclaredItem, ...]:
-            """The items of path that declare renamed at the tip; none when path declared it at the read commit."""
-            if any(item.declaration == renamed for item in self._declared_file(read, path).declared_items):
-                return ()
-            return tuple(item for item in self._declared_file(tip.commit, path).declared_items if item.declaration == renamed)
-
-        if own := gained(finding.path):
-            return {finding.path: own[0]}
-        found: dict[str, DeclaredItem] = {}
-        for path in self._files_naming(tip.commit, renamed.name):
-            if path != finding.path and path in rust_files and path in changed and (items := gained(path)):
-                found[path] = items[0]
+    def _gaining_files(self, finding: HeldFinding, read: str, renamed: Declaration, requirement: TraitRequirement,
+                       tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],
+                       ) -> dict[str, tuple[DeclaredItem, ...]] | TraitIdentityUncertain:
+        """Find gained members; an uncertain source or destination keeps the finding."""
+        found: dict[str, tuple[DeclaredItem, ...]] = {}
+        for path in (finding.path, *self._files_naming(tip.commit, renamed.name)):
+            if path != finding.path and (path not in rust_files or path not in changed):
+                continue
+            prior = self._matching_items(finding, renamed, requirement, read, path)
+            current = self._matching_items(finding, renamed, requirement, tip.commit, path)
+            if isinstance(prior, TraitIdentityUncertain):
+                return prior
+            if isinstance(current, TraitIdentityUncertain):
+                return current
+            if current and not prior:
+                if path == finding.path:
+                    return {path: current}
+                found[path] = current
         return found
 
     def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
@@ -2504,15 +2946,21 @@ class Ledger:
         for finding in self.held_findings(HeldFindingsInState("built")):
             rename = _item_rename(finding.kind, finding.before, finding.after)
             if isinstance(finding.state, Built) and isinstance(rename, ItemRename):
+                judged = self.judged_commit(finding)
+                if isinstance(judged, NoJudgedCommit):
+                    continue
+                read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else judged
+                before_path = finding.follow.from_path if isinstance(finding.follow, FollowedDeclaration) else finding.path
                 if isinstance(rename.scope, SelfQualified):
-                    read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else self.judged_commit(finding)
-                    if isinstance(read, NoJudgedCommit):
-                        continue
                     item = self._declared_file(read.commit, finding.path).declaration_at(finding.line)
                     if not isinstance(item, DeclaredItem) or not isinstance(item.declaration.owner, ImplOrTraitItem):
                         continue
                     rename = ItemRename(rename.old, rename.new, TypeQualified(item.declaration.owner.name))
-                built_renames.append(BuiltRename(rename, finding.path, finding.state.proposal))
+                before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
+                built_renames.append(BuiltRename(
+                    rename, finding.path, read.commit, before_path, judged.commit, finding.state.proposal,
+                    self._trait_site_position(judged.commit, before_path, before_line, finding.before),
+                    self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
         renames = tuple(built_renames)
         return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames)
                                                     for finding_id in finding_ids))

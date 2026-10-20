@@ -14,7 +14,7 @@ SCRIPT = Path(__file__).with_name("astra_review.py")
 # The stand-in for accounts.py: answers `role workers`, and for `exec` records its call and writes
 # the review file Codex would write with -o.
 STUB = """#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 arguments = sys.argv[1:]
 if arguments[:2] == ["role", "workers"]:
     if os.environ.get("STUB_ROLE_FAILS"):
@@ -22,10 +22,20 @@ if arguments[:2] == ["role", "workers"]:
         sys.exit(1)
     print("codex7")
     sys.exit(0)
+if arguments[:2] == ["env", "workers"]:
+    print("CODEX_HOME=" + os.environ["STUB_CODEX_HOME"])
+    sys.exit(0)
 with open(os.environ["STUB_CALLS"], "w") as calls:
     json.dump({"argv": arguments, "stdin": sys.stdin.read(), "cwd": os.getcwd()}, calls)
 print("codex: working")
-if os.environ.get("STUB_EXIT"):
+if os.environ.get("STUB_ROLE_SNAPSHOT"):
+    print("session id: thread-review-fixture", file=sys.stderr, flush=True)
+    time.sleep(1)
+    from pathlib import Path
+    records = [json.loads(path.read_text()) for path in Path(os.environ["ASTRA_ROLES_STATE"]).glob("*.json")]
+    with open(os.environ["STUB_ROLE_SNAPSHOT"], "w") as snapshot:
+        json.dump({"records": records, "pid": os.getpid()}, snapshot)
+if int(os.environ.get("STUB_EXIT", "0")):
     print("error: model gpt-6-astra is not available on this plan")
     sys.exit(int(os.environ["STUB_EXIT"]))
 review = os.environ.get("STUB_REVIEW", "")
@@ -56,7 +66,9 @@ class AstraReviewTests(unittest.TestCase):
         _ = self.document.write_text("# Proposal\n", encoding="utf-8")
         self.environment = {**os.environ, "ASTRA_REVIEW_ACCOUNTS": str(stub),
                             "ASTRA_REVIEW_DIR": str(self.root / "runs"), "STUB_CALLS": str(self.root / "calls.json"),
+                            "ASTRA_ROLES_STATE": str(self.root / "roles"), "STUB_CODEX_HOME": str(self.root / "codex-home"),
                             "STUB_REVIEW": "Verdict: clear.\n\n1. Section Why: the cause is not shown."}
+        _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, cwd=self.root,
@@ -123,6 +135,34 @@ class AstraReviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("no workers account is set", result.stderr)
         self.assertFalse((self.root / "calls.json").exists())
+
+    def test_the_reviewer_role_exists_during_success_and_failure_and_is_released_afterward(self) -> None:
+        self.environment["CLAUDE_CODE_SESSION_ID"] = "sid-review-manager"
+        snapshot = self.root / "during-review.json"
+        self.environment["STUB_ROLE_SNAPSHOT"] = str(snapshot)
+        for exit_code in (0, 3):
+            with self.subTest(exit_code=exit_code):
+                self.environment["STUB_EXIT"] = str(exit_code)
+                result = self.run_script(str(self.document))
+                self.assertEqual(result.returncode, 0 if exit_code == 0 else 1, result.stderr)
+                during = cast(dict[str, object], json.loads(snapshot.read_text()))
+                records = cast(list[dict[str, object]], during["records"])
+                self.assertEqual(len(records), 1)
+                self.assertEqual({key: value for key, value in records[0].items() if key != "held_at"}, {
+                    "role": "reviewer", "thread_id": "thread-review-fixture",
+                    "codex_home": self.environment["STUB_CODEX_HOME"], "manager": "sid-review-manager",
+                    "pid": during["pid"], "session_dir": None, "worker": None,
+                })
+                self.assertFalse(list((self.root / "roles").glob("*.json")))
+
+    def test_a_codex_caller_creates_no_reviewer_role(self) -> None:
+        snapshot = self.root / "during-review.json"
+        self.environment["STUB_ROLE_SNAPSHOT"] = str(snapshot)
+        result = self.run_script(str(self.document))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        during = cast(dict[str, object], json.loads(snapshot.read_text()))
+        self.assertEqual(during["records"], [])
+        self.assertFalse(list((self.root / "roles").glob("*.json")))
 
 
 if __name__ == "__main__":

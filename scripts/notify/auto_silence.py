@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Silence pushes while the user is away: `auto_silence.py [SPAN | off] | active | check`.
+"""Silence pushes while the user is away: `auto_silence.py [on | SPAN | off] | active | check`.
 
-A SPAN (45min, 1h) is the idle length: after that long with no prompt typed in a showrunner or unit
+`on` sets the idle length to DEFAULT_IDLE (2 h); a SPAN (45min, 1h) sets that length: after that long with no prompt typed in a showrunner or unit
 director session, `check` tells the user, then turns silence on with the auto marker. `active`, the
 prompt hook's call, records the prompt; when the silence is an auto silence it ends it as
 `silence.py off` does and tells the user. A silence set by hand is never ended here. `off` stops
 auto silence; no argument shows it. Off until set.
 
 The idle length and the last prompt's time are in one file next to silence.json. `check` runs every
-minute as the notifier job `auto-silence`, which a SPAN makes and `off` removes. natedev holds the
+minute as the notifier job `auto-silence`, which `on` or a SPAN makes and `off` removes. natedev holds the
 state: on the Mac every subcommand runs there over ssh.
 """
 from __future__ import annotations
@@ -36,6 +36,8 @@ SCRIPT = Path.home() / ".claude/scripts/notify/auto_silence.py"
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/auto_silence.py"'
 ON_TEXT = "silence.auto_on"
 OFF_TEXT = "silence.auto_off"
+# `on` sets this idle length.
+DEFAULT_IDLE = 2 * 3600
 # The job's run may wait on a reviewed push; the notifier's own default cuts it at 120 s.
 JOB_TIMEOUT_SECONDS = 300
 
@@ -195,9 +197,9 @@ def main(argv: Sequence[str] | None = None, runner: Run = silence.run, system: s
         return check(clock, sender)
     if word == "off":
         return turn_off(runner, sender, kept_poster)
-    seconds = silence.span_seconds(word)
+    seconds = DEFAULT_IDLE if word == "on" else silence.span_seconds(word)
     if not seconds:
-        print(f"auto silence: {word!r} is not a span such as 45min or 1h, nor off", file=sys.stderr)
+        print(f"auto silence: {word!r} is not on, off, nor a span such as 45min or 1h", file=sys.stderr)
         return 2
     return set_length(seconds, runner, clock)
 
