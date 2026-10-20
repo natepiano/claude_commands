@@ -150,6 +150,20 @@ class FingerprintRecord(TypedDict):
     examples: list[FilledExampleRecord]
 
 
+def user_specified(text_id: str) -> bool:
+    """Whether the user specified this text: its values are written per send, so a failed review is
+    about one send's words, not the template, and no template fix is due."""
+    try:
+        approvals = cast(object, json.loads(REVIEWED_FILE.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
+    entry = cast(dict[str, object], approvals).get(text_id) if isinstance(approvals, dict) else None
+    if not isinstance(entry, dict) or not entry:
+        return False
+    return all(isinstance(approval, dict) and str(cast(dict[str, object], approval).get("reviewer", "")).startswith("user-spec:")
+               for approval in cast(dict[str, object], entry).values())
+
+
 def fingerprint(entry: PushText) -> str:
     examples: list[FilledExampleRecord] = []
     for example in entry.examples:

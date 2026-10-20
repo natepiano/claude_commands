@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     import roster
     from ..accounts import accounts
     from ..whoami.account import named_account_environment
+import push_texts  # noqa: E402
 import review  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
@@ -1036,7 +1037,7 @@ class TemplateFixErrorRecord(TypedDict):
 def template_fix_notice(record: dict[str, object]) -> None:
     """Launch one session notice per template per day without waiting for another claim."""
     text_id = as_str(record.get("text_id"))
-    if not text_id:
+    if not text_id or push_texts.user_specified(text_id):
         return
     directory = review.state_path() / "template-fixes"
     try:

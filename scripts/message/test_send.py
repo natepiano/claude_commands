@@ -1205,6 +1205,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             send.template_fix_notice(record)
             launch.assert_called_once()
 
+    def test_a_user_specified_template_gets_no_fix_notice(self) -> None:
+        record: dict[str, object] = {"text_id": "nate.adhoc", "title": "natedev it is ready", "body": "It is ready.\n\nadhoc",
+                                     "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
+        with mock.patch.object(subprocess, "Popen") as launch:
+            send.template_fix_notice(record)
+            launch.assert_not_called()
+
     def test_template_fix_launch_failure_does_not_change_a_successful_registry_delivery(self) -> None:
         record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "action": "Choose retry.", "body": "The work stopped.", "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
         message = send.Message("user", "script", "Choose an account", "The work stopped.", None)
