@@ -137,7 +137,24 @@ class StylePlanTests(unittest.TestCase):
         ledger = self.ledger()
         board = self.board(*blocked)
         busy = style_plan.busy_files(self.repo, self.doc, ledger, family + "-unit", board)
-        return style_plan.candidate_tickets(self.repo, ledger, busy, family)
+        return style_plan.candidate_tickets(self.repo, ledger, busy, family, base=self.base(family))
+
+    def base(self, family: rules.Family = "names") -> style_plan.UnitBase:
+        return style_plan.unit_base(self.repo, f"demo-style-{family}")
+
+    def modules_unit(self) -> Path:
+        """Add the modules unit's worktree and branch at the main tip, and return its plan."""
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        return plan
+
+    def unit_takes_tip(self) -> None:
+        """The style branch takes the synced tip, and the names unit merges the style branch."""
+        _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
 
     def run_next(self) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -416,11 +433,7 @@ class StylePlanTests(unittest.TestCase):
     def test_written_structure_phase_keeps_its_file_list_and_procedure_without_read_windows(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
-        worktree = self.root / "modules"
-        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
-        plan = worktree / "docs/style-production/units/modules-unit.md"
-        plan.parent.mkdir(parents=True)
-        _ = plan.write_text(self.plan_header())
+        plan = self.modules_unit()
         self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("modules-unit-1"))
         text = plan.read_text()
         self.assertEqual(text.split("**Files:**\n", 1)[1].split("\n**Workers:**", 1)[0],
@@ -740,7 +753,7 @@ class StylePlanTests(unittest.TestCase):
         ledger = self.ledger()
         with mock.patch.object(ledger, "listed_sites", wraps=ledger.listed_sites) as listed_sites:
             tickets = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()),
-                                                   "modules")
+                                                   "modules", base=self.base("modules"))
         self.assertEqual(tickets, (
             style_plan.TicketSelection("structure", "modules", "crates/alpha",
                 ("crates/alpha/src/lib.rs", "crates/alpha/src/other.rs"), (first, second), sites=(
@@ -871,6 +884,7 @@ class StylePlanTests(unittest.TestCase):
             self.write(path, "pub fn revised() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         self.assertEqual(self.candidates()[0].crate, "crates/alpha")
         first = self.sources[-1]
         _ = self.plan.write_text(self.plan_header().replace(
@@ -886,7 +900,7 @@ class StylePlanTests(unittest.TestCase):
         self.sync()
         ledger = self.ledger()
         busy = style_plan.BusyFiles(self.board(), frozenset())
-        expected = style_plan.candidate_tickets(self.repo, ledger, busy, "names")
+        expected = style_plan.candidate_tickets(self.repo, ledger, busy, "names", base=self.base())
 
         result = self.run_next()
         self.assertEqual(result[0], 0, result)
@@ -1030,7 +1044,8 @@ class StylePlanTests(unittest.TestCase):
         scope = style_plan.parse_pilot_scope(
             self.plan_header().replace("## Phases", "**Pilot scope:** beta, alpha\n\n## Phases"), self.repo)
         ledger = self.ledger()
-        tickets = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()), "names", scope)
+        tickets = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()), "names", scope,
+                                               base=self.base())
         self.assertEqual({ticket.crate for ticket in tickets}, {"crates/alpha", "crates/beta"})
 
     def test_unknown_or_repeated_scope_is_refused_before_ticket_assignment(self) -> None:
@@ -1169,6 +1184,7 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[0], "pub fn changed() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
 
@@ -1183,6 +1199,7 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
         self.assertEqual(self.candidates(), ())
@@ -1201,6 +1218,7 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
 
@@ -1215,6 +1233,7 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
         self.assertEqual(self.candidates(), ())
@@ -1239,12 +1258,260 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         for path in self.sources[1:]:
             self.record(read, path, self.tip)
 
         self.assertEqual(self.candidates(), (
             style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
         ))
+
+    def held_cell_with_final_findings(self) -> tuple[str, tuple[style_plan.TicketSelection, ...]]:
+        """Hold crate alpha's lib.rs under an open proposal, then change only another file of its crate."""
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = self.held_proposal(read, self.sources[0])
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.unit_takes_tip()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        return read, (style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),)
+
+    def hold_more(self, read: str, *states: str) -> None:
+        """Add one finding to crate alpha's lib.rs in each state."""
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == read)
+        for number, state in enumerate(states, len(ledger.held_findings(style_ledger.AllHeldFindings())) + 1):
+            finding = ledger.hold(read, self.sources[0], number, f"defect {number}", "rename", "before", "after", blob, "outside")
+            if state == "unfiled":
+                continue
+            ledger.file_held(finding.finding_id, self.root / "proposal.md")
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                _ = connection.execute("UPDATE held_findings SET state=?,withdrawn_by=? WHERE finding_id=?",
+                                       (state, int(state == "withdrawn"), finding.finding_id))
+                connection.commit()
+
+    def test_held_cell_skip_ignores_waived_findings_beside_filed_ones(self) -> None:
+        read, expected = self.held_cell_with_final_findings()
+        self.hold_more(read, "waived")
+        self.assertEqual(self.candidates(), ())
+        self.hold_more(read, "unfiled")
+        self.assertEqual(self.candidates(), expected)
+
+    def test_held_cell_with_only_final_findings_is_not_skipped(self) -> None:
+        read, expected = self.held_cell_with_final_findings()
+        self.hold_more(read, "waived", "built", "withdrawn")
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            _ = connection.execute("UPDATE held_findings SET state='built' WHERE state='filed'")
+            connection.commit()
+        self.assertEqual({type(finding.state) for finding in self.ledger().held_findings(style_ledger.AllHeldFindings())},
+                         {style_ledger.Waived, style_ledger.Built, style_ledger.Withdrawn})
+        self.assertEqual(self.candidates(), expected)
+
+    def judged_at_unit_tip_then_style_moves(self) -> tuple[str, str]:
+        """Judge crate alpha's lib.rs at the unit tip, merge that into the style branch, then change crate alpha there.
+
+        It returns the rule and the unit tip.
+        """
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        _ = (self.unit / self.sources[0]).write_text("pub fn judged() {}\n")
+        _ = self.git("commit", "-qam", "Ticket work", cwd=self.unit)
+        unit_tip = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.record(read, self.sources[0], unit_tip)
+        _ = self.git("merge", "-q", "--ff-only", "demo-style-names", cwd=self.style)
+        self.assertEqual(self.cell_state(read, self.sources[0]), "awaiting merge")
+        _ = (self.style / self.sources[1]).write_text("pub fn other_unit() {}\n")
+        _ = self.git("commit", "-qam", "Another unit's work in the same crate", cwd=self.style)
+        return read, unit_tip
+
+    def cell_state(self, rule: str, path: str) -> style_ledger.CellState:
+        return next(cell.state for cell in self.ledger().cells(rule) if cell.path == path)
+
+    def test_refill_says_merge_the_style_branch_first_when_each_cell_left_was_judged_at_the_unit_tip(self) -> None:
+        read, unit_tip = self.judged_at_unit_tip_then_style_moves()
+        self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
+        self.seed_sync_wait()
+
+        self.assertEqual(self.candidates(), ())
+        self.assertEqual(self.run_next(),
+                         (6, f"merge the style branch first: 1 cell judged at {unit_tip[:7]} wait for style/main\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual(self.sync_wait_rows(), [])
+        self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
+
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
+        merged = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["files"], ticket["base"]), ([self.sources[0]], merged))
+        self.record(read, self.sources[0], merged, ticket="names-unit-1")
+        self.assertEqual(self.cell_state(read, self.sources[0]), "awaiting merge")
+
+    def test_refill_issues_a_stale_cell_whose_inputs_at_the_unit_tip_changed_since_its_judgment(self) -> None:
+        read, _ = self.judged_at_unit_tip_then_style_moves()
+        _ = (self.unit / "crates/alpha/README.md").write_text("Unit notes.\n")
+        _ = self.git("add", "crates/alpha/README.md", cwd=self.unit)
+        _ = self.git("commit", "-qm", "Unit change in the same crate", cwd=self.unit)
+
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+        ))
+
+    def judged_on_all_sources_then_main_changes_crate_alpha(self) -> str:
+        """Judge every source at the unit tip with a crate-scope rule, then change crate alpha on main and sync."""
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        for path in self.sources:
+            self.record(read, path, self.tip)
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
+        return read
+
+    def test_refill_waits_for_sync_until_the_style_tip_changes_a_cell_judged_at_the_unit_tip(self) -> None:
+        read = self.judged_on_all_sources_then_main_changes_crate_alpha()
+        unit_tip = self.git("rev-parse", "HEAD", cwd=self.unit)
+        self.assertEqual(self.candidates(), ())
+
+        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=self.unit), unit_tip)
+        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+        _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
+        self.assertEqual(self.run_next(),
+                         (6, f"merge the style branch first: 2 cells judged at {unit_tip[:7]} wait for style/main\n", ""))
+        self.assertEqual(self.sync_wait_rows(), [])
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["files"], ticket["rules"], ticket["base"]), (list(self.sources[:2]), [read], self.tip))
+
+    def test_refill_names_a_style_branch_missing_on_origin(self) -> None:
+        _ = self.judged_at_unit_tip_then_style_moves()
+        origin = self.root / "origin.git"
+        _ = self.git("init", "-q", "--bare", str(origin))
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-q", "origin", "main")
+
+        code, output, errors = self.run_next()
+        self.assertEqual((code, output), (2, ""))
+        self.assertIn("cannot be resolved; fetch origin first", errors)
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_refill_without_a_stored_style_branch_waits_for_sync(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(self.tip)
+        for path in self.sources:
+            self.record(read, path, self.tip)
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(self.tip)
+        self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
+        self.assertEqual(self.candidates(), ())
+
+        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+
+    def test_refill_waits_for_sync_when_the_unit_tip_is_not_in_the_style_tip(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        for path in self.sources:
+            self.record(read, path, self.tip)
+        _ = (self.unit / self.sources[2]).write_text("pub fn unit_only() {}\n")
+        _ = self.git("commit", "-qam", "Unit change in crate beta only", cwd=self.unit)
+        _ = (self.style / self.sources[1]).write_text("pub fn changed() {}\n")
+        _ = self.git("commit", "-qam", "Change crate alpha", cwd=self.style)
+        self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
+        self.sync()
+        self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
+        self.assertEqual(self.candidates(), ())
+
+        self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
+
+    def test_refill_issues_a_cell_whose_newest_judgment_is_not_in_the_unit_tip(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = (self.style / self.sources[2]).write_text("pub fn beta_only() {}\n")
+        _ = self.git("commit", "-qam", "Change crate beta only", cwd=self.style)
+        self.record(read, self.sources[0], self.git("rev-parse", "HEAD", cwd=self.style))
+        _ = (self.style / self.sources[1]).write_text("pub fn changed() {}\n")
+        _ = self.git("commit", "-qam", "Change crate alpha", cwd=self.style)
+        self.tip = self.git("rev-parse", "HEAD", cwd=self.style)
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
+
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+        ))
+
+    def test_refill_issues_a_cell_whose_newest_judgment_is_not_in_the_style_branch(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = (self.unit / self.sources[2]).write_text("pub fn beta_only() {}\n")
+        _ = self.git("commit", "-qam", "Unit change in crate beta only", cwd=self.unit)
+        self.record(read, self.sources[0], self.git("rev-parse", "HEAD", cwd=self.unit))
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        self.assertEqual(self.cell_state(read, self.sources[0]), "stale")
+
+        self.assertEqual(self.candidates(), (
+            style_plan.TicketSelection("read", "names", "crates/alpha", (self.sources[0],), (read,)),
+        ))
+
+    def test_names_unit_waits_for_a_stale_structure_cell_judged_in_its_tip(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        read = self.rule("read")
+        self.sync()
+        for path in self.sources:
+            self.record(structure, path, self.tip)
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
+        self.assertEqual(self.cell_state(structure, self.sources[0]), "stale")
+        self.assertEqual(self.cell_state(read, self.sources[0]), "open")
+
+        self.assertEqual(self.candidates(), ())
+        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
+
+    def test_modules_unit_merges_the_style_branch_first_for_a_structure_cell_judged_at_its_tip(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        self.sync()
+        plan = self.modules_unit()
+        unit_tip = self.tip
+        for path in self.sources:
+            self.record(structure, path, self.tip)
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        _ = self.git("merge", "-q", "--ff-only", self.tip, cwd=self.style)
+        self.assertEqual(self.cell_state(structure, self.sources[0]), "stale")
+        self.assertEqual(self.candidates("modules"), ())
+
+        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo),
+                         style_plan.MergeStyleBranchFirst(2, unit_tip, "refs/heads/style/main"))
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.root / "modules")
+        self.assertEqual(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten("modules-unit-1"))
+        ticket = self.ledger().ticket_open("modules-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["files"], ticket["base"]), ("structure", list(self.sources[:2]), self.tip))
 
     def test_structure_precedes_family_reads_and_retains_partial_rule_sites(self) -> None:
         read = self.rule("read")
@@ -1399,7 +1666,8 @@ class StylePlanTests(unittest.TestCase):
         ])
         ledger = self.ledger()
         scoped = style_plan.candidate_tickets(self.repo, ledger, style_plan.BusyFiles(self.board(), frozenset()),
-                                             "modules", style_plan.PilotCrates(frozenset({"crates/alpha"})))
+                                             "modules", style_plan.PilotCrates(frozenset({"crates/alpha"})),
+                                             base=self.base("modules"))
         self.assertEqual([(ticket.crate, ticket.kind) for ticket in scoped], [("crates/alpha", "structure")])
 
     def test_structure_priority_counts_names_cells_only_inside_the_names_pilot_scope(self) -> None:
@@ -1411,12 +1679,13 @@ class StylePlanTests(unittest.TestCase):
         self.sync()
         ledger = self.ledger()
         busy = style_plan.BusyFiles(self.board(), frozenset())
-        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules")[0].crate, "crates/beta")
+        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules", base=self.base("modules"))[0].crate, "crates/beta")
 
         tickets = style_plan.candidate_tickets(
             self.repo, ledger, busy, "modules",
             family_scopes={"modules": style_plan.AllCrates(),
-                           "names": style_plan.PilotCrates(frozenset({"crates/alpha"}))})
+                           "names": style_plan.PilotCrates(frozenset({"crates/alpha"}))},
+            base=self.base("modules"))
 
         self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
         self.assertEqual({path for ticket in tickets for path in ticket.files},
@@ -1435,10 +1704,11 @@ class StylePlanTests(unittest.TestCase):
             self.record(names, path, self.tip)
         ledger = self.ledger()
         busy = style_plan.BusyFiles(self.board(), frozenset())
-        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules")[0].crate, "crates/beta")
+        self.assertEqual(style_plan.candidate_tickets(self.repo, ledger, busy, "modules", base=self.base("modules"))[0].crate, "crates/beta")
 
         tickets = style_plan.candidate_tickets(
-            self.repo, ledger, busy, "modules", family_scopes=style_plan.family_pilot_scopes(self.doc, self.repo))
+            self.repo, ledger, busy, "modules", family_scopes=style_plan.family_pilot_scopes(self.doc, self.repo),
+            base=self.base("modules"))
 
         self.assertEqual([ticket.crate for ticket in tickets], ["crates/alpha", "crates/beta"])
 
@@ -1992,6 +2262,7 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[2], "pub fn revised() {}\n")
         self.tip = self.commit()
         self.sync()
+        self.unit_takes_tip()
         tickets = self.candidates()
         self.assertEqual(tickets[0].crate, "crates/beta")
         states = {(cell.rule, cell.path): cell.state for cell in self.ledger().cells()}
@@ -3214,7 +3485,7 @@ class StylePlanTests(unittest.TestCase):
         _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
         with (mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])),
               mock.patch.object(style_proposals, "proposal_command") as start,
-              mock.patch.object(style_plan, "candidate_tickets", wraps=style_plan.candidate_tickets) as coverage):
+              mock.patch.object(style_ledger.Ledger, "cells", autospec=True, side_effect=style_ledger.Ledger.cells) as coverage):
             code, output, errors = self.run_next()
             self.assertEqual(code, 3, errors)
             self.assertIn(f"waiting {issue}: files busy", output)

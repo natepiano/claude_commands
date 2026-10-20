@@ -72,6 +72,11 @@ def _cell_scope(rule: Rule, path: str, tip: RepositoryTip) -> CellInputScope:
     return CellInputScope(rule.input_scope)
 
 
+def _judgment_rule(component: Rule, path: str) -> Rule:
+    """A listed rule's cell at a file that is not Rust takes the file's own inputs."""
+    return replace(component, input_scope="file") if component.tier == "B" and not path.endswith(".rs") else component
+
+
 class LedgerError(ValueError):
     """A ledger operation cannot represent the requested check."""
 
@@ -500,6 +505,37 @@ class CheckpointRestamps:
 @dataclass(frozen=True)
 class NoRestamps:
     """The move carries no verdict: it reaches no checkpoint, or the ticket's start is not under it."""
+
+
+@dataclass(frozen=True)
+class StyleMergeChanges:
+    """A fast-forward of the unit branch to the pushed style tip changes the inputs of these judged cells."""
+
+    style_branch: str
+    cells: tuple[Cell, ...]
+
+
+@dataclass(frozen=True)
+class NoStyleMergeChange:
+    """No style branch is stored, the unit tip is not in the pushed style tip, or that tip has each judged input."""
+
+
+StyleMerge = StyleMergeChanges | NoStyleMergeChange
+
+
+@dataclass(frozen=True)
+class StoredStyleBranch:
+    """The style merge branch the last sync stored."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class NoStoredStyleBranch:
+    """No sync stored a style merge branch."""
+
+
+StyleBranch = StoredStyleBranch | NoStoredStyleBranch
 
 
 def not_built_line(repo: Path, item: FindingNotBuilt) -> str:
@@ -2329,8 +2365,7 @@ class Ledger:
         rows = self._judgments(rule.rule_id, path)
         scope = _cell_scope(rule, path, tip)
         pending = ""
-        branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
-        style_branch = branches[0][0] if branches else ""
+        style_branch = self._style_branch()
         for row in rows:
             if row.declared_scope != rows[0].declared_scope or row.rule_blob != rule.blob:
                 continue
@@ -2340,11 +2375,9 @@ class Ledger:
                 continue
             if ancestor and self._judgment_inputs_match(row, tip, scope, path):
                 return "current", row.verdict
-            if not ancestor and style_branch:
+            if not ancestor and isinstance(style_branch, StoredStyleBranch):
                 try:
-                    if style_branch not in self._branch_tips:
-                        self._branch_tips[style_branch] = _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
-                    branch_commit = self._branch_tips[style_branch]
+                    branch_commit = self._branch_commit(style_branch.name)
                     checked_tip = self._tip(branch_commit)
                     if self._is_ancestor(row.commit, branch_commit) and self._judgment_inputs_match(row, checked_tip, scope, path):
                         if not pending:
@@ -2354,6 +2387,68 @@ class Ledger:
         if pending:
             return "awaiting merge", pending
         return ("stale" if rows else "open"), ""
+
+    def _style_branch(self) -> StyleBranch:
+        branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
+        return StoredStyleBranch(branches[0][0]) if branches and branches[0][0] else NoStoredStyleBranch()
+
+    def _branch_commit(self, branch: str) -> str:
+        if branch not in self._branch_tips:
+            self._branch_tips[branch] = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}")
+        return self._branch_tips[branch]
+
+    def _repeated_judgments(self, cells: Iterable[Cell], base: str) -> Iterator[tuple[Cell, Judgment, CellInputScope]]:
+        """Yield each stale cell that a ticket based at base cannot change, with its newest judgment and input scope.
+
+        The newest judgment (current rule blob, newest declared scope) is in base and in the style branch, and its
+        inputs at base are the inputs that judgment saw: a new judgment at base repeats it. The scope is taken at the
+        synced tip, as the stale verdict takes it.
+        """
+        tip = self._tip(base)
+        try:
+            synced = self._synced_tip()
+            match self._style_branch():
+                case StoredStyleBranch(name):
+                    merged = self._branch_commit(name)
+                case NoStoredStyleBranch():
+                    merged = synced.commit
+        except LedgerError:
+            return
+        for cell in cells:
+            if cell.state != "stale":
+                continue
+            rule = _judgment_rule(self._component_rule(cell.rule), cell.path)
+            scope = _cell_scope(rule, cell.path, synced)
+            rows = self._judgments(cell.rule, cell.path)
+            for row in rows:
+                if row.declared_scope != rows[0].declared_scope or row.rule_blob != rule.blob:
+                    continue
+                try:
+                    repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
+                               and self._judgment_inputs_match(row, tip, scope, cell.path))
+                except LedgerError:
+                    repeats = False
+                if repeats:
+                    yield cell, row, scope
+                break
+
+    def judged_at_base(self, cells: Iterable[Cell], base: str) -> tuple[Cell, ...]:
+        """Return the stale cells that a ticket based at base cannot change. Only a merge into base changes their inputs."""
+        return tuple(cell for cell, _, _ in self._repeated_judgments(cells, base))
+
+    def style_merge_changes(self, cells: Iterable[Cell], base: str) -> StyleMerge:
+        """Return the cells judged at base whose inputs a fast-forward of base to the pushed style tip changes."""
+        style_branch = self._style_branch()
+        if isinstance(style_branch, NoStoredStyleBranch):
+            return NoStyleMergeChange()
+        # A missing pushed style branch is an error with its own line, not a quiet wait for sync.
+        pushed = pushed_branch_point_tip(self.repo, style_branch.name)
+        if not self._is_ancestor(base, pushed):
+            return NoStyleMergeChange()
+        tip = self._tip(pushed)
+        changed = tuple(cell for cell, row, scope in self._repeated_judgments(cells, base)
+                        if not self._judgment_inputs_match(row, tip, scope, cell.path))
+        return StyleMergeChanges(style_branch.name, changed) if changed else NoStyleMergeChange()
 
     def _lint_coverage(self, tool: LintTool, tip: RepositoryTip) -> LintCoverage:
         rows = cast(list[tuple[str, str, int, str, str]], self._connection.execute(
@@ -2416,8 +2511,7 @@ class Ledger:
                                                   and lint_coverage.rule_blobs.get(component.rule_id) == component.blob) else "stale"
                         verdict = ""
                     else:
-                        judgment_rule = replace(component, input_scope="file") if component.tier == "B" and not path.endswith(".rs") else component
-                        state, verdict = self._judgment_state(judgment_rule, path, tip)
+                        state, verdict = self._judgment_state(_judgment_rule(component, path), path, tip)
                     yield Cell(component.rule_id, path, cell_crate, cast(Tier, component.tier), component.family, state), verdict
 
     def cells(self, rule: str | None = None, crate: str | None = None) -> Iterator[Cell]:
