@@ -845,7 +845,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** equality-based “no rename” checks and bool outcomes; named sum types distinguish the outcomes.
 
-### Phase 31 — a closed approved decision takes a new finding  · status: todo
+### Phase 31 — a closed approved decision takes a new finding  · status: done
 
 **Depends on:** Phase 29
 

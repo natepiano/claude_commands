@@ -510,8 +510,17 @@ followed finding, and `--json` adds `followed_from`, `followed_at` and
 One style decision covers one rule and crate under one rule blob. An answer
 also covers later findings under that rule text: a declined decision waives
 them with its stored words, and `file` prints
-`waived <n> findings in <decision>: declined: <words>`. A new rule blob needs a new
-answer. Each decision shows counts and up to three examples from different
+`waived <n> findings in <decision>: declined: <words>`. An approved decision
+that is closed opens again with its approval for a later finding when each of
+its findings is built, waived or withdrawn. The ledger decides this, not the
+close reason, so a decision closed by hand opens again too. A closed decision
+with a filed finding refuses it: `file` prints
+`skipped <decision>: closed decision has unbuilt findings` and exits 1. Open
+that decision with `proposal_issue.py reopen <decision>` and file again. A
+closed decision with no answer takes a later finding only when its close
+reason starts with `built in ` or `nothing left to build: `; else `file` prints
+`skipped <decision>: closed decision has no approval`. A new rule blob needs a
+new answer. Each decision shows counts and up to three examples from different
 files. The ledger holds its full site list. Show decisions only when the user
 asks through `/showrunner:proposals` or `/adhoc_review`.
 
@@ -690,8 +699,9 @@ through `/new_style`, or drops the idea with `style_proposals.py drop-candidate
 --parent <slug> --dry-run` before migrating old style issues. Migration moves
 only the findings filed to each old issue. A moved finding takes the answer of
 its decision: a declined decision waives it with the stored words, and a
-decision closed as built opens again with its approval. A decision closed with
-nothing left to build also opens again with its approval for a later finding. Migration leaves an
+closed decision opens again by the rule for a later finding that `file` files
+(above). A closed decision that refuses the finding stops the migration before
+any write, with `style_proposals: <decision>: <reason>`. Migration leaves an
 issue with an unfinished build ticket unchanged, and it can resume after a crash.
 Migration does not change an off-rule issue that a style unit filed through
 `/issue`; it lists the issue as `skipped: off-rule <path>` and counts it in its totals.

@@ -817,6 +817,121 @@ class StyleProposalsTests(unittest.TestCase):
             _ = style_proposals.reopen(ledger, issue, "parent")
         return output.getvalue()
 
+    def test_a_later_finding_reopens_an_approved_decision_closed_by_hand_with_every_finding_built(self) -> None:
+        with self.ledger() as ledger:
+            first = self.hold(ledger)
+            issue = self.approved_decision(ledger, first)
+            self.built_before_the_check(ledger, first)
+            self.issue_command("close", str(issue), "--reason", "built by names-unit phases 99 and 100")
+            later = self.hold(ledger, line=2)
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = style_proposals.main(["file", "--repo", str(self.repo), "--proposals", str(self.proposals), "--parent", "parent"])
+        self.assertEqual((code, errors.getvalue()), (0, ""))
+        self.assertIn(f"filed {issue}", output.getvalue().splitlines())
+        fields = frontmatter(issue)
+        self.assertEqual((fields["status"], fields["stage"], fields["unit"], fields["style_count"]),
+                         (["open"], ["active"], ["names-unit"], ["2"]))
+        self.assertNotIn("reason", fields)
+        with self.ledger() as ledger:
+            self.assertEqual(next(item.state for item in ledger.proposal_findings(issue)
+                                  if item.finding_id == later.finding_id), style_ledger.Filed(issue))
+
+    def test_a_later_finding_reopens_an_approved_decision_closed_by_hand_with_its_findings_built_or_waived(self) -> None:
+        with self.ledger() as ledger:
+            first, second = self.hold(ledger), self.hold(ledger, line=2)
+            issue = self.approved_decision(ledger, first, second)
+            self.built_before_the_check(ledger, first)
+            _ = ledger.decline_findings((second.finding_id,), "No")
+            self.issue_command("close", str(issue), "--reason", "done by hand")
+            later = self.hold(ledger, line=3)
+            self.assertEqual(self.file(ledger), (issue,))
+            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["unit"]), (["open"], ["names-unit"]))
+            self.assertEqual(next(item.state for item in ledger.proposal_findings(issue)
+                                  if item.finding_id == later.finding_id), style_ledger.Filed(issue))
+
+    def test_migration_moves_findings_into_an_approved_decision_closed_by_hand_and_reopens_it(self) -> None:
+        with self.ledger() as ledger:
+            first = self.hold(ledger)
+            issue = self.approved_decision(ledger, first)
+            self.built_before_the_check(ledger, first)
+            self.issue_command("close", str(issue), "--reason", "built by names-unit phases 99 and 100")
+            later = self.hold(ledger, line=2)
+            old = self.legacy_issue(ledger, "old", later)
+            self.assertIn(f"reopen {issue}", self.migration_lines(ledger, dry_run=False))
+            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["stage"]), (["open"], ["active"]))
+            self.assertEqual(next(item.state for item in ledger.proposal_findings(issue)
+                                  if item.finding_id == later.finding_id), style_ledger.Filed(issue))
+            self.assertEqual(frontmatter(old)["status"], ["closed"])
+
+    def test_a_closed_approved_decision_with_a_filed_finding_refuses_a_later_finding(self) -> None:
+        with self.ledger() as ledger:
+            first, second = self.hold(ledger), self.hold(ledger, line=2)
+            issue = self.approved_decision(ledger, first, second)
+            self.built_before_the_check(ledger, first)
+            self.issue_command("close", str(issue), "--reason", "built in names-unit-1")
+            later = self.hold(ledger, line=3)
+            before = issue.read_bytes()
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = style_proposals.main(["file", "--repo", str(self.repo), "--proposals", str(self.proposals), "--parent", "parent"])
+        self.assertEqual((code, errors.getvalue()), (1, "style_proposals: skipped 1 decisions\n"))
+        self.assertIn(f"skipped {issue}: closed decision has unbuilt findings", output.getvalue().splitlines())
+        self.assertEqual(issue.read_bytes(), before)
+        with self.ledger() as ledger:
+            self.assertEqual(next(item.state for item in ledger.held_findings(style_ledger.AllHeldFindings())
+                                  if item.finding_id == later.finding_id), style_ledger.Unfiled())
+
+    def test_a_closed_unanswered_decision_with_a_hand_reason_refuses_a_later_finding(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue, = self.file(ledger)
+            self.issue_command("close", str(issue), "--reason", "closed by hand")
+            _ = self.hold(ledger, line=2)
+            before = issue.read_bytes()
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = style_proposals.main(["file", "--repo", str(self.repo), "--proposals", str(self.proposals), "--parent", "parent"])
+        self.assertEqual((code, errors.getvalue()), (1, "style_proposals: skipped 1 decisions\n"))
+        self.assertIn(f"skipped {issue}: closed decision has no approval", output.getvalue().splitlines())
+        self.assertEqual(issue.read_bytes(), before)
+
+    def test_a_closed_unanswered_decision_whose_findings_were_withdrawn_reopens_with_no_answer_for_a_later_finding(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue, = self.file(ledger)
+            rule = self.catalog / "names.md"
+            kept = rule.read_text()
+            _ = self.newer_verdict(ledger, self.newer_rule_text(), "exception")
+            _ = self.withdraw(ledger)
+            self.assertEqual(frontmatter(issue)["status"], ["closed"])
+            self.assertTrue(frontmatter(issue)["reason"][0].startswith("nothing left to build: withdrawn: "))
+            _ = rule.write_text(kept)
+            later = self.hold(ledger, line=2)
+            self.assertEqual(self.file(ledger), (issue,))
+            fields = frontmatter(issue)
+            self.assertEqual((fields["status"], fields["stage"]), (["open"], ["backlog"]))
+            self.assertFalse(fields.get("unit"))
+            self.assertEqual(next(item.state for item in ledger.proposal_findings(issue)
+                                  if item.finding_id == later.finding_id), style_ledger.Filed(issue))
+
+    def test_migration_refuses_a_closed_approved_decision_with_a_filed_finding_before_any_write(self) -> None:
+        with self.ledger() as ledger:
+            first, second = self.hold(ledger), self.hold(ledger, line=2)
+            issue = self.approved_decision(ledger, first, second)
+            self.built_before_the_check(ledger, first)
+            self.issue_command("close", str(issue), "--reason", "built in names-unit-1")
+            later = self.hold(ledger, line=3)
+            _ = self.legacy_issue(ledger, "old", later)
+            before = self.written(ledger)
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = style_proposals.main(["migrate", "--repo", str(self.repo), "--proposals", str(self.proposals), "--parent", "parent"])
+        self.assertEqual(code, 1)
+        self.assertEqual(errors.getvalue(), f"style_proposals: {issue}: closed decision has unbuilt findings\n")
+        with self.ledger() as ledger:
+            self.assertEqual(self.written(ledger), before)
+
     def test_complete_keeps_a_decision_open_until_its_unapplied_rename_is_built(self) -> None:
         with self.ledger() as ledger:
             applied = self.hold(ledger)
