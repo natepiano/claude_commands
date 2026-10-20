@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
@@ -666,8 +667,11 @@ def test_steps(production: Production, paths: tuple[str, ...],
         for parent in (path.parent, *path.parents):
             if parent == checkout.parent:
                 break
-            if (parent / "Cargo.toml").exists():
-                packages.add(parent.name)
+            manifest = parent / "Cargo.toml"
+            if manifest.exists():
+                # A workspace root's manifest names no package: a path under it, such as docs, has no tests.
+                if "package" in tomllib.loads(manifest.read_text(encoding="utf-8")):
+                    packages.add(parent.name)
                 break
         match = re.search(r"(?:^|/)crates/([^/]+)/examples/([^/.]+)", raw)
         if match:
