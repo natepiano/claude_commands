@@ -821,131 +821,29 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 ### Phase 30 — a finding on a renamed item follows the rename  · status: done
 
-**Depends on:** Phase 28
+#### As-built
 
-#### Work Order
-
-**Goal:** When a built rename or type finding of an approved decision renamed a finding's item, or the impl or trait that holds the item, the declaration step follows the finding to the new name (same id, `followed_from` written). It no longer prints `left … declaration gone; waive it or declare it again` for code that is still there.
-
-**Spec:**
-
-The showrunner ruled this current on 2026-10-20, after phase 29: "it fixes a wrong result: 12 findings told a person to waive live code". On cargo-liner, 12 left findings sit on items that a built `dc6ab6df` finding renamed: `EscapeStripState` to `AnsiScanState` (3bc6b35a, 5a90eb26, and 8fbc062d on `EscapeStripState::consume`), `example_rx` to `owned_run_receiver` (0cb3bddc), `conclusion_style` to `ci_status_style` (af0beeab, a7b81340), `poll_example_msgs` to `poll_owned_run_events` (24797568, 7d97b73b) and `cargo_project_to_item` to `cargo_parse_result_to_item` (9c6dc0d9, 63e6ce48, 55cdb9cb, 9f326ced). The step reads none of the built findings, so it calls the item gone.
-
-Today (`scripts/style/style_ledger.py`): `_declaration_outcome` (:2145-2204) runs the move search (:2174-2186), the another-crate check (:2187-2189), the open-build check (:2190-2195), the one-file move (:2196-2198), then `_renamed_site` (:2199-2201), then `DeclarationGoneFromFile` (:2202-2203) or `DeclarationRemoved` (:2204). `_renamed_site` (:2206-2252) holds the gained-file search: the closure `gained` (:2226-2230) and the own-file-first loop (:2232-2238).
-
-1. **Item renames from built findings.** Add, beside `NoRenamedSite` (:598-602):
-   ```python
-   @dataclass(frozen=True)
-   class ItemRename:
-       """The old and new name of one item, as a built rename or type finding gives them."""
-
-       old: str
-       new: str
-
-
-   @dataclass(frozen=True)
-   class NoItemRename:
-       """The finding does not rename one item: its before and after are not one name pair, or a type finding changes more than one name."""
-
-
-   @dataclass(frozen=True)
-   class BuiltRename:
-       """The item rename of one built finding, with the finding's path and decision."""
-
-       rename: ItemRename
-       path: str
-       proposal: Path
-
-
-   def _item_rename(kind: str, before: str, after: str) -> ItemRename | NoItemRename:
-       """The item rename a finding names."""
-   ```
-   - `kind == "rename"`: `old` is the last `::` segment of `before.strip()`. `new` is the last `::` segment of the text of `after` before its first `;`, stripped. So `poll_owned_run_events; rename the connected …` gives `poll_owned_run_events`. Both must `style_footprint.IDENTIFIER.fullmatch` and differ.
-   - `kind == "type"`: `before.strip()` and `after.strip()` each fullmatch `_ITEM_HEAD = re.compile(rf"(fn|struct|enum|union|trait|type|const|static|mod)\s+({style_footprint.IDENTIFIER.pattern})(.*)", re.DOTALL)`. The keyword (group 1) and the rest (group 3) are equal, and the names (group 2) differ. So `enum EscapeStripState { Ground, … }` to `enum AnsiScanState { Ground, … }` gives that pair.
-   - Every other case gives `NoItemRename()`. A field form such as `Background.example_rx` gives `NoItemRename()`.
-   - This parser reads only built findings and the finding's own pair (item 3). `_renamed_site` keeps its own strict parse (:2218-2223), so a filed rename with a note after `;` is still never built by phase 28's rule.
-
-2. **Read once per reading.** `_declaration_reading` (:2254-2258) reads `self.held_findings(HeldFindingsInState("built"))` once. It keeps each finding whose `_item_rename(kind, before, after)` is an `ItemRename`, as `BuiltRename(rename, finding.path, finding.state.proposal)` (the state is `Built`, :201-204). It passes the tuple to `_declaration_outcome` as a new last parameter `renames: tuple[BuiltRename, ...]`. Rows are read fresh on each reading, so the recheck under the write lock in `follow_declarations` (:2296) reads them again. No approval is read here.
-
-3. **The follow.** Add `_followed_rename(self, finding, read, old_file, old, tip, rust_files, changed, approved, renames) -> DeclarationMoved | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite`. Call it in `_declaration_outcome` only when `_renamed_site` gives `NoRenamedSite`, before the `DeclarationGoneFromFile` line:
-   ```python
-   renamed = self._renamed_site(...)
-   if not isinstance(renamed, NoRenamedSite):
-       return renamed
-   followed = self._followed_rename(finding, read, old_file, old, tip, rust_files, changed, approved, renames)
-   if not isinstance(followed, NoRenamedSite):
-       return followed
-   ```
-   Order, author's call (the ruling said before `_renamed_site`): after it. `_renamed_site` gives a result only for a filed rename whose own pair names the item. Phase 28's build of that rename must win over a twin's built rename. For every other finding the two orders give the same result.
-
-   `_followed_rename` rules, in this order:
-   - `declaration = old.declaration`. `owner_name` is `declaration.owner.name` for an `ImplOrTraitItem`, else none.
-   - Own pair: when `_item_rename(finding.kind, finding.before, finding.after)` is an `ItemRename` whose `old` is `declaration.name` or `owner_name`, return `NoRenamedSite()`. The finding's own rename names its item, so the rename rules of phase 28 decide it. This keeps an unfiled rename whose twin was built withdrawn, as today.
-   - Matching renames: each `BuiltRename` with `tip.crate(built.path) == tip.crate(finding.path)`, `built.rename.old in {declaration.name, owner_name}` and `approved(built.proposal)`. Call `approved` only for a rename that passes the crate and name tests. The built finding can be in any file of the crate: the `conclusion_style` renames are at its call sites (`columns/project.rs`, `panes/package/render.rs`), not in `render.rs`. Author's call: the ruling said "the same file (or the one file that gained the new name)". Same crate is needed to cover af0beeab and a7b81340. The gained-since-read test below still guards it.
-   - New names: `names = {r.rename.new for r in matching if r.rename.old == declaration.name}`, `owners = {r.rename.new for r in matching if r.rename.old == owner_name}`. When either set has two or more names, return `NoRenamedSite()`.
-   - `renamed = Declaration(declaration.keyword, <the one name in names, else declaration.name>, ImplOrTraitItem(<the one name in owners>) if owners else declaration.owner)`. When no set has a name, return `NoRenamedSite()`.
-   - Search: `found = self._gaining_files(finding, read, renamed, tip, rust_files, changed)` (item 4).
-   - Two or more paths: `DeclaredInSeveralFiles(finding, renamed, tuple(sorted(found)))`. None: `NoRenamedSite()`.
-   - One path: for a `Filed` finding in another crate, `DeclaredInAnotherCrate(finding, renamed, path)`. Else `DeclarationMoved(finding, renamed, path, moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))`. This is the same rule as the one-file move (:2187-2198): an unfiled finding follows into another crate.
-   - Unfiled and filed findings both follow. The open-build check (:2190-2195) already returned for a held build.
-
-4. **Shared search.** Move the `gained` closure and the search loop out of `_renamed_site` (:2226-2238) into:
-   ```python
-   def _gaining_files(self, finding: HeldFinding, read: str, renamed: Declaration, tip: RepositoryTip,
-                      rust_files: frozenset[str], changed: frozenset[str]) -> dict[str, DeclaredItem]:
-       """The files that gained renamed since the read commit, with its item there.
-
-       The finding's own file is checked first; when it gained renamed, it is the only file.
-       """
-   ```
-   `_renamed_site` calls it in place of :2226-2238. Its results do not change.
-
-5. **Write and print: no change.** `follow_declarations` already writes `DeclarationMoved` as a move (:2299-2302: `path`, `line`, `followed_from`, `followed_from_line`, `followed_at`). The finding keeps its id and state. `style_proposals.follow_line` prints `follow <id> <rule> <path>:<line> -> <path>:<line>: <keyword> <new name>` (`declaration_line` of `renamed`, for example `fn AnsiScanState::consume`), and the totals count it in `follow`. Refill tickets it at its new site as a moved finding. A second run reads the followed finding at its follow commit, so it is `DeclarationInPlace`. A binding finding (for example `ws` to `workspace`, 9c6dc0d9) follows to the renamed fn and stays filed: its binding is still not renamed.
-
-6. **Docstrings.** `DeclarationMoved` (:533-541): "One other file declares the finding's subject at the synced tip, or a built rename of an approved decision renamed the subject or its impl or trait and one file gained the new declaration; the finding follows it to path and line." `NoRenamedSite`: add "or no built rename gives the item a new name". `follow_declarations` (:2268-2276): "Move each finding whose declaration moved to one other file, or whose item a built rename renamed, there, …".
-
-7. **Docs.** The `impl` writer makes these two edits. Phase 29 landed; keep its edits.
-   - `docs/style_production.md`, in the declaration step list under "No file:", add a bullet between the "A filed rename is built …" bullet and the "Another filed finding whose file is still there …" bullet:
-     "- A finding whose item, or the impl or trait that holds it, has a new name from built rename or type findings of approved decisions in the same crate follows the item to its newest name, in its own file or in the one file that gained it, and keeps its id. The renames apply one after another; a name with two new names, or a rename back to an earlier name, stops the chain. A rename qualified by a module names only the items of that module's files; one qualified by `Self` or a type names only impl or trait items, of that type under any of its names. Two or more gaining files, or a filed finding's file in another crate, leave the finding as a move does. A finding whose own rename names its item keeps the rule above; a filed rename whose impl type a built rename renamed is built at the renamed type."
-   - `commands/showrunner/proposal.md`, the "Filing first moves a finding …" sentence: change "moves a finding to the one file that now declares its item," to "moves a finding to the one file that now declares its item, or to its item's new name after a built rename,".
+- The declaration step follows unfiled and filed findings whose item, impl type or trait has a new name from built rename or type findings of approved decisions in the same crate. `DeclarationMoved` keeps the finding's id and state and records its new path, line and follow commit; a rerun reads the followed declaration in place.
+- `ItemRename` carries `RenameScope = UnqualifiedName | ModuleQualified | SelfQualified | TypeQualified`; `BuiltRename` carries the pair, path and decision. `_item_rename` accepts rename pairs with an optional note after `;`, or type findings that change only the item name. Field forms give `NoItemRename`.
+- `Ledger._built_renaming` returns `BuiltRenaming = RenamedByBuilds | NoBuiltRename`. Item and owner names follow successive approved renames, stopping before a fork or a return to an earlier name. A finding's own rename retains precedence; a filed method rename can become `DeclarationRenamed` and built at its renamed impl type, with the original owner checked first.
+- Module qualifiers restrict module items to that module's files and reach impl items through a type declared there. `_module_name` handles `mod.rs` and maps `src/lib.rs` and `src/main.rs` to `crate`. Type qualifiers match impl or trait owners under any name in their rename chain; a built `Self::` qualifier resolves at the built finding's recorded line.
+- `_gaining_files` requires the new declaration to be gained since the read commit and checks the finding's own file first. Built rows are collected once per declaration reading and read afresh with approvals under the write lock before changes persist.
 
 **Files:**
-- `scripts/style/style_ledger.py` — `ItemRename`, `NoItemRename`, `BuiltRename`, `_item_rename`, `_ITEM_HEAD`, `_followed_rename`, `_gaining_files`, the `renames` parameter, docstrings
-- `scripts/style/test_style_ledger.py` — the tests below
-- `docs/style_production.md` — the declaration step bullet (item 7)
-- `commands/showrunner/proposal.md` — the "Filing first moves a finding …" sentence (item 7)
+- `scripts/style/style_ledger.py` — rename scopes, parsing, chains, gaining-file search and declaration follow/build outcomes
+- `scripts/style/test_style_ledger.py` — follow persistence and reruns, chains, qualifiers, renamed owners, approval rechecks and move limits
+- `docs/style_production.md` — declaration-follow rules and qualifier limits
+- `commands/showrunner/proposal.md` — filing follows an item's new name after a built rename
 
-**Workers:** `1 writer + 1 tester`. The change is one chain in one module, so the code does not split. The Spec gives exact outcomes, paths and lines, so the tests go to the tester.
-- `impl` — `scripts/style/style_ledger.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`; hub: `scripts/style/style_ledger.py` (it holds the outcome types the tester imports).
-- `test` — `scripts/style/test_style_ledger.py`, from the Spec alone. Use the fixtures `PARENT_FILE`, `MOVED_FILE`, `TWIN_FILE`, `PARENT` (:33-38), `commit_tip` (:861), `hold_parent`/`judge_parent` (:872, :885; add a `kind: str = "rename"` keyword to both), `follow_approved` (:893), `held_rows` (:377) and `assert_rename_left` (:1070). Add a helper `built_finding(ledger, path, before, after, *, kind="rename", line=1) -> str` that holds a finding under its own read ticket over `path` (as `hold_parent` does), files it to `self.root / "built.md"`, drops the ticket, and sets `state='built'` with a direct sqlite `UPDATE` (as :851-853 does). Tests, each name states the behavior:
-  1. `test_a_finding_whose_item_a_built_rename_renamed_follows_the_new_name_in_its_file`: a filed `restructure` finding at `PARENT_FILE:2` (`old: u32,`, reads as `struct Parent`); a built rename `Parent` to `Renamed` in `PARENT_FILE` (decision `built.md`); the tip renames `Parent` to `Renamed`. The outcome is `DeclarationMoved(filed, Declaration("struct", "Renamed", ModuleItem()), PARENT_FILE, 2)`. The row keeps its id and `Filed(decision.md)`, with `follow == FollowedDeclaration(PARENT_FILE, 2, tip)`. A second run gives `DeclarationInPlace` and writes nothing.
-  2. `test_a_method_whose_impl_type_a_built_type_finding_renamed_follows_the_renamed_owner`: file `pub enum Parent {\n    A,\n}\n\nimpl Parent {\n    pub fn consume(&self) {}\n}\n`; a filed `type` finding at the `fn consume` line; a built `type` finding `enum Parent { A }` to `enum Renamed { A }`; the tip renames `Parent`. The outcome is `DeclarationMoved` with `Declaration("fn", "consume", ImplOrTraitItem("Renamed"))` at the same line.
-  3. `test_a_binding_rename_inside_a_renamed_fn_follows_the_fn_and_stays_filed`: `pub fn old() {\n    let ws = 1;\n}\n`; a filed rename `ws` to `workspace` at line 2; a built rename `old` to `new`; the tip renames only the fn. The outcome is `DeclarationMoved` with `Declaration("fn", "new", ModuleItem())`, and the state stays `Filed`.
-  4. `test_a_built_rename_at_a_call_site_in_the_same_crate_moves_the_finding`: the built rename is at `MOVED_FILE` with `before="a::old"`, `after="a::new"`. The finding in `PARENT_FILE` follows as in test 3.
-  5. `test_a_built_rename_whose_after_adds_a_note_moves_the_finding_to_the_head_name`: built `after="new; rename the connected satellites"`. The finding follows to `fn new`.
-  6. `test_an_unfiled_finding_whose_item_a_built_rename_renamed_follows_and_is_not_withdrawn`: the finding of test 1 left unfiled (`hold_parent`). The outcome is `DeclarationMoved`; the state stays `Unfiled()`.
-  7. `test_a_finding_whose_renamed_item_two_files_gained_is_left`: `PARENT_FILE` loses `Parent`, and `MOVED_FILE` and `TWIN_FILE` gain `Renamed`. `assert_rename_left` with `DeclaredInSeveralFiles(filed, Declaration("struct", "Renamed", ModuleItem()), (MOVED_FILE, TWIN_FILE))`.
-  8. `test_a_finding_whose_item_a_rename_of_an_unapproved_decision_renamed_is_left`: `follow_declarations(..., lambda path: path != self.root / "built.md")` gives `DeclarationGoneFromFile` and writes nothing.
-  9. `test_a_finding_whose_item_a_built_rename_in_another_crate_renamed_is_left`: the built rename is at `crates/beta/src/other.rs`. `DeclarationGoneFromFile`, nothing written.
-  10. `test_a_finding_whose_item_two_built_renames_name_differently_is_left`: built `Parent` to `Renamed` and `Parent` to `Other`; the tip declares `Renamed`. `DeclarationGoneFromFile`, nothing written.
-  11. `test_an_unfiled_rename_whose_own_rename_a_built_twin_did_is_still_withdrawn`: an unfiled rename `Parent` to `Renamed` at line 1 and a built twin with the same pair. `DeclarationRemoved`, withdrawn with `DeclarationGone(tip)`.
-  12. `test_a_filed_rename_whose_built_twin_renamed_its_item_is_built_not_followed`: a filed rename `Parent` to `Renamed` and a built twin. `DeclarationRenamed`, state `Built(decision.md)`.
-  13. `test_a_rename_follow_whose_built_rename_loses_its_approval_before_the_lock_stays_filed`: `approved` answers `True` once, then `False` (as :1134-1144). `DeclarationGoneFromFile`; `held_rows` unchanged.
+**Binds later work:** `follow` and `file` expose renamed-item outcomes through their existing output lines. `_built_renaming`, `_renamed_site(..., after_builds, ...)` and `_followed_rename(..., RenamedByBuilds, ...)` separate rename resolution from destination search; `NoRenamedSite` retains its filed-rename meaning.
 
-**Constraints from prior phases:**
-- Phase 29 landed (caa61935, merged at aad49a4a); keep its edits to proposal.md (state table, Approve section) and style_production.md:506-507.
-- `style_ledger.py` cannot import `style_proposals` (two module copies under `__main__`). The approval check comes in as the `approved: Callable[[Path], bool]` that `declaration_reading` and `follow_declarations` already take; `style_proposals.approved_decision` is the caller's callable (phase 28).
-- The approval is read at the plan and again under `BEGIN IMMEDIATE`. A decision that loses approval between them makes the recheck differ, and the retry gives the new outcome (phase 28).
-- Rows are read fresh on each reading; only commits, files and greps are cached per `Ledger` (`_declared_file`, `_commit_file`, `_files_naming`, `_changed_since`) (phase 27).
-- A file counts only when it gained the declaration since the read commit; this holds for the finding's own file too (phases 27, 28). Declaration identity collides across files often.
-- `test_the_declaration_step_reads_each_commit_and_file_once_and_its_recheck_sees_another_writer` (:937) counts `read_declarations` calls and git resolves. With no built finding, the new step must read no file and run no git.
-- `test_a_renamed_finding_whose_decision_loses_its_approval_before_the_lock_stays_filed` (:1134) gives `approved` one `True`. With no built finding, the new step must call `approved` zero times.
+**Gotchas:**
+- A trait-qualified path does not reach the items of the trait's impls — phase 33.
+- `self::` and `super::` module paths are not resolved; such a rename names no item.
+- Multiple gaining files, or a filed finding's destination in another crate, leave the finding for a person as a move does; an unfiled finding can follow across crates.
+- The built-pair parser accepts notes after `;`; a filed rename's own applied-name check keeps its strict parse.
 
-**Acceptance gate:** from the worktree root `<W>`:
-- Tests 1-7 above each fail without this phase (today they give `DeclarationGoneFromFile`). Tests 8-13 pin the limits and pass before and after. All 13 are present and pass.
-- `env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_proposals scripts.style.test_style_plan` is green.
-- `basedpyright scripts/style` reports `0 errors, 0 warnings`.
-- Observable behavior, after the merge to `~/.claude` main: `style_proposals.py follow --repo ~/rust/cargo-liner-style --proposals ~/rust/hanadocs/issues --dry-run` prints a `follow` line, not a `left … declaration gone` line, for the 12 findings named in the Spec, and the `left` total drops by 12.
+**Ruled out:** equality-based “no rename” checks and bool outcomes; named sum types distinguish the outcomes.
 
 ### Phase 31 — a closed approved decision takes a new finding  · status: todo
 
@@ -1168,3 +1066,122 @@ Today: `file_proposals` (`scripts/style/style_proposals.py:438-470`) runs the de
 - `env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_proposals scripts.style.test_style_plan` is green.
 - `basedpyright scripts/style` reports `0 errors, 0 warnings`.
 - Observable behavior, after the merge to `~/.claude` main: `style_proposals.py withdraw --repo ~/rust/cargo-liner-style --proposals ~/rust/hanadocs/issues --dry-run` prints `withdraw <id> global:rust/forbidden-words.md <path>:<line>: judgment <row> held under ab23f42d` for the 4 findings in the Spec table, with `totals: withdraw 4, kept 0, close 0`. After the next `file`, `held list --state unfiled` names none of them, and `file` prints no `rule changed since judged` line for them.
+
+### Phase 33 — a trait-qualified rename follows to the trait's impl methods  · status: todo
+
+**Depends on:** Phase 30, Phase 32. Run after Phase 32 to avoid concurrent ownership of `style_ledger.py` and its tests.
+
+#### Work Order
+
+**Goal:** A finding on a method renamed by a built, approved `Trait::old` → `Trait::new` finding follows the corresponding method of each implementing type. It keeps its id and existing filed or unfiled state, and records its follow location.
+
+**Spec:**
+
+All references below are at HEAD `e7a45401`; use the named functions after intervening phases move their lines.
+
+1. **Read the implemented trait without replacing the implementing type.**
+
+   `scripts/style/declarations.py` currently represents both inherent and trait-implementation members as `ImplOrTraitItem(type_name)` (:25-31). `_impl_name` (:106-126) identifies a top-level `for`, but discards the preceding trait path; `read_declarations` (:170-202) consequently records no implemented-trait relationship.
+
+   Add immutable declaration metadata with explicit states:
+
+   - `ImplementedTrait(path: tuple[str, ...])`: the readable, nonempty trait path of the enclosing trait implementation.
+   - `NoImplementedTrait`: the item is not directly owned by a trait implementation.
+   - `UnreadableImplementedTrait`: an enclosing trait implementation exists, but its trait path cannot be read safely.
+
+   Store this metadata on `DeclaredItem` (:51-57), separately from `Declaration.owner`. Preserve `Declaration("fn", "method", ImplOrTraitItem("Type"))`, `declaration_line`, and existing output formats.
+
+   Factor the header splitting used by `_impl_name` so the same parse identifies the implementing type and implemented trait. Skip leading impl generic parameters; distinguish the trait/type separator from `for<'a>`; use `approved_renames.type_path` (:235-242) for readable paths. `approved_renames.impl_blocks` (:269-312) demonstrates this distinction, but is an applied-rename scan with additional constraints, not a replacement declaration reader.
+
+   Attach metadata only to directly owned members. A nested function inside a method must not inherit the implementation’s membership. Preserve current behavior for unreadable implementing types.
+
+2. **Match trait-qualified built renames to implementation members.**
+
+   Keep `_item_rename` (`style_ledger.py:689-717`) and the existing `RenameScope` forms. `Trait::old` remains `TypeQualified("Trait")`; the declaration reader supplies the relationship needed to interpret it.
+
+   Change `_built_renaming` (:2370-2432) to receive the original `DeclaredItem`, rather than only its `Declaration`; update its caller at :2315. In addition to the current owner-name match, permit a type-qualified member rename when its qualifier matches the member’s readable implemented trait.
+
+   Keep the destination owner as the implementing type, including any name Phase 30’s owner-rename chain gave that type. A `Trait::old` rename must not turn `ImplOrTraitItem("Type")` into `ImplOrTraitItem("Trait")`.
+
+   Preserve the existing approved-decision and same-crate filters, own-rename exclusion, chain traversal, fork stopping and cycle stopping. If an approved built rename also renamed the trait, follow its readable name history using the existing scope restrictions; do not infer a trait relationship from unrelated occurrences of its name.
+
+3. **Carry the relationship through declaration searches.**
+
+   `_declaration_outcome` currently tests in-place and moved declarations by keyword/name/owner (:2290-2304). `_gaining_files` (:2451-2472) uses that same identity and selects the first matching item. Merely adding a branch to `_built_renaming` would therefore be insufficient.
+
+   For trait-implementation members, use the recorded implemented trait when checking the old declaration and identifying a renamed destination. An inherent method or another trait’s method on the same type is not the same declaration.
+
+   Carry any renamed-trait requirement through `RenamedByBuilds`, `_followed_rename` (:2434-2449), and the relevant `_renamed_site` searches (:2327-2368). Represent unrestricted versus required trait membership with named variants, not `None`, an empty string, or a boolean.
+
+   Preserve own-file preference only among matching implementation members. Keep the existing gained-since-read check, changed-file restriction, crate checks and ambiguity handling; never resolve an ambiguous implementation match by taking the first item. Unsupported or ambiguous trait identification grants no new automatic follow.
+
+4. **Preserve collection, transitions and output.**
+
+   Keep built-rename collection in `_declaration_reading` (:2474-2492), including resolution of `SelfQualified` at the built finding’s read or follow commit. `Self::` in an inherent implementation must not become a rename across every implementation of a trait.
+
+   A dependent finding uses `DeclarationMoved` and remains filed or unfiled. A filed finding describing its own completed rename still uses `_renamed_site` and `DeclarationRenamed`, subject to its existing approval and applied checks.
+
+   Retain open-ticket protection, planning before `BEGIN IMMEDIATE`, rechecking decisions and rows under the lock, synced-tip refusal, caching and idempotence. No schema migration is needed.
+
+   Existing consumers observe the result through `follow` and `file`, using `follow_line` (`style_proposals.py:1331-1351` at HEAD), and through `held list` follow metadata. Preserve their exit-code and line contracts.
+
+5. **Document the changed limit.**
+
+   Replace the statement at `docs/style_production.md:478` that a trait path does not reach implementation items with the supported trait-qualified behavior and its conservative parsing limits. Retain the separate `self::`/`super::` limitation.
+
+   Phase 30’s successful-follow outcome already has an external surface and tests; this phase extends that outcome rather than adding another command. Unresolved paths remain subject to the existing declaration outcomes and person-facing recovery instructions.
+
+**Files:**
+
+- `scripts/style/declarations.py` — implemented-trait metadata and header reading.
+- `scripts/style/style_ledger.py` — trait-aware rename matching and declaration searches.
+- `scripts/style/test_declarations.py` — parser and ownership tests.
+- `scripts/style/test_style_ledger.py` — follow, isolation and transition tests.
+- `scripts/style/test_style_proposals.py` — observable dry-run and real-run behavior.
+- `docs/style_production.md` — replace the trait-path limitation.
+
+**Workers:** `1 writer + 1 tester`.
+
+- `impl` — `declarations.py`, `style_ledger.py`, `docs/style_production.md`; hubs: `declarations.py` owns the metadata types, and `style_ledger.py` owns their matching semantics.
+- `test` — `test_declarations.py`, `test_style_ledger.py`, `test_style_proposals.py`, from the Spec. Keep all preceding phases’ tests.
+
+**Constraints from prior phases:**
+
+- Phase 30’s `RenameScope`, `ItemRename`, `BuiltRename`, `RenamedByBuilds` and `NoBuiltRename` remain semantic states. Extend them only where the new relationship needs to travel.
+- Do not replace an implementation’s owner with its trait, or broadly change `Declaration` equality to achieve the new match.
+- Preserve Phase 31’s in-progress proposal changes and Phase 32’s withdrawal changes. Neither phase is redundant or invalidated by Phase 30.
+- Phase 32 already cites ledger functions by name. Its numeric `test_style_ledger.py` references remain correct at `e7a45401`: `rule:120`, `cli:128`, `ledger:153`, `hold_finding:183`, and the migration test at :784; no correction is needed.
+- `file` runs declaration following before withdrawal and batching. Refill runs declaration following only; preserve that ordering.
+- `style_ledger.py` must not import `style_proposals`.
+- No compiler, dependency resolution or general Rust name-resolution service is introduced. Unsupported aliases and ambiguous paths must not establish trait membership.
+- The next-items entries remain separate, unsatisfied work; none requires amendment because of Phase 30 or this phase.
+
+**Acceptance gate:**
+
+Write behavior tests first, using temporary repositories and isolated ledgers. Reuse `commit_tip` (:861), `hold_parent` (:872), `judge_parent` (:887), `follow_approved` (:896) and `built_finding` (:1192) in `test_style_ledger.py`.
+
+Required cases:
+
+1. The declaration reader distinguishes inherent members, trait-body members and trait-implementation members while preserving existing owner declarations. Include qualified trait paths, generic impl headers, higher-ranked bounds and nested functions.
+2. A filed restructure finding inside `impl Trait for Type` follows `Trait::old` → `Trait::new`, keeps its id and decision, and records the exact follow commit and line.
+3. Two implementing types follow independently, including implementations in different files of the same crate.
+4. An unfiled dependent finding follows without being withdrawn; a second run changes nothing.
+5. A matching inherent method and another trait’s same-named method neither conceal the source’s removal nor receive the destination finding. Test both source and destination collisions.
+6. A renamed implementing type, and a readable renamed trait, compose with the method rename.
+7. A destination that already existed at the read commit is not treated as newly gained. Ambiguous destinations are not selected arbitrarily.
+8. Unapproved built findings, built findings from another crate, forks, cycles and open build tickets preserve their existing protections. Losing approval before the lock prevents the write.
+9. `follow --dry-run` prints the expected `follow … fn Type::new` line and writes nothing; the real run prints that action and persists it. A rerun is idempotent.
+10. Existing filed-own-rename behavior still builds only an approved, applied rename.
+
+The new successful trait-follow tests must fail on `e7a45401` because the finding does not follow. Collision tests must exercise competing declarations, rather than merely checking an absent match.
+
+From the worktree root `<W>`:
+
+```bash
+env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_declarations
+env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_proposals scripts.style.test_style_plan scripts.style.test_style_ledger
+basedpyright scripts/style
+```
+
+Both unittest commands pass; basedpyright reports `0 errors, 0 warnings`. All verification uses temporary fixtures and touches no live repository, proposal store or ledger.
+
