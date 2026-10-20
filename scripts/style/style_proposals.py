@@ -32,7 +32,7 @@ from add_style import StandingStyleProduction, standing_style_production
 from issues import Issue, frontmatter, open_issues, plain
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
                             UnansweredDecision, decision_answer, fill_ranking, refresh_decision, require_generated_body)
-from unit_files import git, unit_file_holders
+from unit_files import file_text, git, unit_file_holders
 from user_zone import user_zone
 
 
@@ -480,6 +480,58 @@ def files_at(repo: Path, tip: str, paths: tuple[str, ...]) -> frozenset[str]:
     if not paths:
         return frozenset()
     return frozenset(path for path in git(repo, "ls-tree", "-r", "-z", "--name-only", tip, "--", *paths).split("\0") if path)
+
+
+class MovedSites:
+    """Where filed findings' sites went between the commit each was judged at and the synced tip, read once per refill."""
+
+    def __init__(self, ledger: style_ledger.Ledger, tip: str) -> None:
+        self.ledger: style_ledger.Ledger = ledger
+        self.tip: str = tip
+        self.changed: dict[str, tuple[str, ...]] = {}
+        self.lines: dict[tuple[str, str], frozenset[str]] = {}
+
+    def destinations(self, findings: tuple[style_ledger.HeldFinding, ...]) -> dict[str, str]:
+        """The file at tip that each moved finding's site went to, by finding id.
+
+        A site moved when no line of its file at tip contains the finding's one-line text, stripped, and it moved into
+        exactly one file that gained the line since the finding was judged: changed since that commit, without the line
+        there and with it at tip. A finding with no judged commit, or whose text is still in its file, or went to no
+        file or to several, is left out.
+        """
+        moved: dict[str, str] = {}
+        for finding in findings:
+            text = finding.text.strip()
+            if len(text.splitlines()) != 1 or any(text in line for line in self.lines_at(self.tip, finding.path)):
+                continue
+            judged = self.ledger.judged_commit(finding)
+            if isinstance(judged, style_ledger.NoJudgedCommit):
+                continue
+            gained = [path for path in self.changed_since(judged.commit)
+                      if path != finding.path and text in self.lines_at(self.tip, path)
+                      and text not in self.lines_at(judged.commit, path)]
+            if len(gained) == 1:
+                moved[finding.finding_id] = gained[0]
+        return moved
+
+    def changed_since(self, commit: str) -> tuple[str, ...]:
+        """The files at tip that changed since commit, also the ones added."""
+        if commit not in self.changed:
+            # `-z --name-status` prints `<status>\0<path>\0` per file; without renames a moved file reads as added.
+            fields = git(self.ledger.repo, "diff", "--no-renames", "--ignore-submodules", "--name-status", "-z",
+                         "--diff-filter=AMT", commit, self.tip).split("\0")
+            statuses = dict(zip(fields[1::2], fields[::2]))
+            # An added file has no line at commit.
+            self.lines.update({(commit, path): frozenset() for path, status in statuses.items() if status == "A"})
+            self.changed[commit] = tuple(statuses)
+        return self.changed[commit]
+
+    def lines_at(self, commit: str, path: str) -> frozenset[str]:
+        """The stripped lines of path at commit, a file there."""
+        key = (commit, path)
+        if key not in self.lines:
+            self.lines[key] = frozenset(line.strip() for line in file_text(self.ledger.repo, commit, path).splitlines())
+        return self.lines[key]
 
 
 def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:

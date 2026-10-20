@@ -30,6 +30,14 @@ def git(repo: Path, *arguments: str) -> str:
     return result.stdout
 
 
+def file_text(repo: Path, commit: str, path: str) -> str:
+    """The text of the file at path in commit. Bytes that are not UTF-8 read as U+FFFD, so a latin-1 file never raises."""
+    shown = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{commit}:{path}"], capture_output=True, check=False)
+    if shown.returncode:
+        raise style_ledger.CheckCouldNotRun(shown.stderr.decode(errors="replace").strip() or f"git cat-file {commit}:{path} failed")
+    return shown.stdout.decode(errors="replace")
+
+
 def unit_worktrees(doc: Path) -> tuple[UnitWorktree, ...]:
     production = read_production(doc)
     rows = unit_table(doc.read_text().splitlines())

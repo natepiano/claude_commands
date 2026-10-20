@@ -625,3 +625,27 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Ruled out:**
 - An off-rule issue build ticket: approved proposals build as plain numbered code phases outside the style ledger.
 - A restructure split command: style decisions replace it.
+
+### Phase 20 — Values work starts per file  · status: done
+**Depends on:** Phase 19
+
+#### Work Order
+
+**Goal:** a non-structure cell at a file waits only for open or stale structure cells at that file, so values-unit follows modules-unit file by file instead of idling until a whole crate's structure is judged.
+
+**Spec:**
+- `blocked_by_structure` (`scripts/style/style_plan.py`): a cell at a file path waits only for open or stale tier-D cells at its own path; a crate-level cell (path == crate) still waits for every open or stale tier-D cell in the crate; busy files on the board still block. `waiting for structure` names only crates where every own cell is still blocked. Ruled by the showrunner (natedev, 2026-10-19).
+- Move-in case: a structure merge that moves code into file X from file Y (X keeps its path) turns X's other-family cells stale so they are judged again, and waives Y's filed findings whose site is gone from Y (as for a removed file), never one whose text stays in Y or one an open ticket builds. What already holds gets a proving test; what is missing is added.
+- One line in `docs/style_production.md` where it describes the structure wait.
+
+**Files:**
+- `scripts/style/style_plan.py`, `scripts/style/style_ledger.py` (only if the move-in case needs it), `scripts/style/test_style_plan*.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+
+**Workers:** 1 writer — one function, its callers and their tests; nothing splits.
+- `impl` — all of the above
+
+**Constraints from prior phases:** Phase 19: ledger writers follow the lock rule (`retry_on_change`); held state `withdrawn` exists; refill waives a finding whose file is gone.
+
+**Acceptance gate:**
+- Tests: a values cell at a judged file gets a ticket while the crate-level and another file's structure cells are open; a file with its own open structure cell still waits; a crate-level values cell still waits; the move-in case end to end.
+- `scripts/style` tests green, `basedpyright scripts/style scripts/production` 0 errors and 0 warnings, merge gate `--tests-only` green.

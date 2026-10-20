@@ -994,7 +994,8 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
 
 
 def blocked_by_structure(cell: style_ledger.Cell, structure: tuple[style_ledger.Cell, ...]) -> bool:
-    return any(blocker.crate == cell.crate and blocker.path in (cell.crate, cell.path)
+    """A file cell waits for the structure cells at its own file; a crate cell waits for every one in its crate."""
+    return any(blocker.crate == cell.crate and cell.path in (cell.crate, blocker.path)
                for blocker in structure)
 
 
@@ -1473,6 +1474,7 @@ def _select_phase(
     tip = synced_tip(ledger)
     decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
     closed = False
+    sites = style_proposals.MovedSites(ledger, tip)
     for issue in decisions:
         rule = issue.value("style_rule")
         definition = definitions.get(rule)
@@ -1485,16 +1487,19 @@ def _select_phase(
         if not findings:
             continue
         present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in findings})))
+        moved = sites.destinations(tuple(finding for finding in findings if finding.path in present))
         by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
         gone: dict[str, list[str]] = defaultdict(list)
         for finding in findings:
-            if finding.path in present:
-                by_file[finding.path].append(finding)
+            if finding.path not in present:
+                gone[f"{finding.path} is not in synced commit {tip}"].append(finding.finding_id)
+            elif finding.finding_id in moved:
+                gone[f"{finding.path} site moved to {moved[finding.finding_id]} in synced commit {tip}"].append(finding.finding_id)
             else:
-                gone[finding.path].append(finding.finding_id)
-        # A finding in a removed file can never build, so it is waived and the decision can close.
-        for path, finding_ids in sorted(gone.items()):
-            words = f"{path} is not in synced commit {tip}"
+                by_file[finding.path].append(finding)
+        # A finding in a removed file, or whose site a merge moved to another file, can never build at its
+        # site, so it is waived and the decision can close.
+        for words, finding_ids in sorted(gone.items()):
             _ = ledger.decline_findings(finding_ids, words)
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
         if gone and style_proposals.close_finished_decision(ledger, issue.path):
