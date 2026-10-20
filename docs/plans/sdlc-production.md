@@ -23,7 +23,7 @@
 
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
-| guilds-unit | `docs/plans/sdlc-guilds.md` (to be written) | `/home/natepiano/worktrees/claude-build-followups-sdlc-guilds` | `sdlc-guilds` | — | `docs/plans/sdlc-guilds.md`; more when the plan is written |
+| guilds-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guilds` | `sdlc-guilds` | — | `docs/plans/sdlc-guilds.md`; more when the plan is written |
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; more when the plan is written |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; more when the plan is written |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; more when the plan is written |
