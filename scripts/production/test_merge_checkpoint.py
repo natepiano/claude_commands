@@ -1639,5 +1639,28 @@ class TestPassedTests(unittest.TestCase):
         self.assertTrue(merge_checkpoint.test_passed(["python3"], subprocess.CompletedProcess(["python3"], 0, "", "")))
 
 
+@final
+class MacPromotionPathTests(unittest.TestCase):
+    def remote_command(self, promote_line: str) -> str:
+        promotion = merge_checkpoint.promotion_from_doc([f"- **Promote:** {promote_line}"])
+        assert isinstance(promotion, merge_checkpoint.PromoteTo)
+        assert isinstance(promotion.mac, merge_checkpoint.MacCheckout)
+        done = subprocess.CompletedProcess(["ssh"], 0, "rc=0\n", "")
+        with mock.patch("merge_checkpoint.subprocess.run", return_value=done) as run:
+            merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))
+        argv = cast(list[str], run.call_args.args[0])
+        self.assertEqual(argv[:2], ["ssh", "mac"])
+        return argv[2]
+
+    def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
+        remote = self.remote_command("mac `~/.claude`")
+        self.assertTrue(remote.startswith('cd "$HOME"/.claude && git pull'), remote)
+        self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
+
+    def test_absolute_mac_path_is_kept(self) -> None:
+        remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
+        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && git pull"), remote)
+
+
 if __name__ == "__main__":
     _ = unittest.main()
