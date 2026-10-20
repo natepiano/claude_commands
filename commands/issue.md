@@ -123,6 +123,8 @@ If the shorthand doesn't match any of these, tell the user and stop.
 
 8. Create the file at `~/rust/hanadocs/issues/<derived-filename>.md` with the filled-in frontmatter followed by the body content. If the title was shortened in step 3, prepend the original long title as a `## ` heading before the body content.
 
+   For a proposal, then give it its P number: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposal_issue.py" number "<issue path>"`.
+
 9. Show the user the created file path and a summary of what was created.
 
 10. Report the ranking. The vault's background watcher computes `backlog_score` and `backlog_rank` from the survey inputs — it does NOT finish within a tool-call round trip. Even a full re-rank measures about 3-4 seconds end to end (0.5s poll detection, debounce, snapshot, apply, validate, settle). Repeatedly re-reading the file in a tight loop just returns nothing several times and invites a false "the watcher isn't running" report.

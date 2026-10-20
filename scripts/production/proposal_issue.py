@@ -12,6 +12,10 @@ Usage:
   proposal_issue.py close <issue> --as-built PATH
   proposal_issue.py rules <issue> --rules URLS
   proposal_issue.py stars <issue> --goal G --alignment A --impact I --urgency U --effort E
+  proposal_issue.py number <issue>...
+
+`number` gives each proposal without one the next `proposal_id`, P1 up, as change rows are C1 up;
+`create` numbers a new decision the same way.
 """
 from __future__ import annotations
 
@@ -47,6 +51,10 @@ INHERITED_FIELDS = frozenset({"showrunner", "unit", "plan", "stage", "backlog_go
 CLOSE_FIELDS = ("as_built", "reason", "date_closed")
 PROPOSED_RANKING = re.compile(r"^Proposed ranking:[^\r\n]*", re.MULTILINE)
 EMPTY_RANKING = re.compile(r"^Proposed ranking:[ \t]*(?=\r?$)", re.MULTILINE)
+NUMBER_FIELD = "proposal_id"
+NUMBER = re.compile(r'^proposal_id:\s*"?P(\d+)"?\s*$', re.MULTILINE)
+# The vault keeps closed issues under archive/ beside the issues folder; their numbers stay taken.
+ARCHIVE = "archive"
 
 
 class Refusal(ValueError):
@@ -142,6 +150,46 @@ def _issue_lock(path: Path) -> Generator[None]:
     with (folder / f"proposal-issue-{digest}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
+
+
+@contextmanager
+def _folder_lock(folder: Path) -> Generator[None]:
+    """Hold an exclusive lock on the issues folder, so two filings never take one number."""
+    with _issue_lock(folder / ".proposal-numbers"):
+        yield
+
+
+def _highest_number(folder: Path) -> int:
+    """The highest P number in the folder or in the vault's archive beside it, or 0."""
+    highest = 0
+    for root in (folder, folder.parent / ARCHIVE):
+        for issue in root.rglob("*.md") if root.is_dir() else ():
+            try:
+                head = issue.read_text(encoding="utf-8").split(f"\n{FENCE}", 1)[0]
+            except (OSError, UnicodeError):
+                continue
+            highest = max([highest, *(int(found[1]) for found in NUMBER.finditer(head))])
+    return highest
+
+
+def number(paths: list[Path], today: date) -> list[str]:
+    """Give each proposal without a number the next one, oldest first. Returns one line per issue."""
+    issues = sorted((Issue(path, frontmatter(path)) for path in paths),
+                    key=lambda issue: (issue.value("date_created"), issue.path.name))
+    lines: list[str] = []
+    for issue in issues:
+        if "proposal" not in issue.fields.get("tags", []):
+            lines.append(f"number {issue.path.name}: not a proposal")
+            continue
+        with _folder_lock(issue.path.parent):
+            taken = NUMBER.search(_read(issue.path).split(f"\n{FENCE}", 1)[0])
+            if taken:
+                lines.append(f"number {issue.path.name}: P{taken[1]}")
+                continue
+            given = f"P{_highest_number(issue.path.parent) + 1}"
+            _ = edit(issue.path, {NUMBER_FIELD: given}, today)
+            lines.append(f"number {issue.path.name}: {given}")
+    return lines
 
 
 def edit_rules(path: Path, urls: list[str], today: date) -> list[str]:
@@ -326,6 +374,15 @@ def create(path: Path, project: str, short: str, proposed_by: str, tags: list[st
         if any(fields.get(key) != [value] for key, value in keys.items()):
             raise Refusal(f"{path}: different decision key")
         return False
+    with _folder_lock(path.parent):
+        return _create_numbered(path, template, project, short, proposed_by, tags, keys, count, body, today,
+                                proposed_ranking, rule_urls, inherited)
+
+
+def _create_numbered(path: Path, template: Path, project: str, short: str, proposed_by: str, tags: list[str],
+                     keys: dict[str, str], count: int, body: str, today: date, proposed_ranking: str,
+                     rule_urls: tuple[str, ...], inherited: dict[str, str]) -> bool:
+    """Write the new decision once, with the next free P number."""
     text = template.expanduser().read_text(encoding="utf-8")
     values = {
         "AREA": "unfiled", "PROJECT": project, "SHORT": short, "PROPOSED_BY": proposed_by,
@@ -336,7 +393,8 @@ def create(path: Path, project: str, short: str, proposed_by: str, tags: list[st
     if rule_urls:
         lists["style_rules"] = sorted(set(rule_urls))
     text, _ = set_list_fields(text, lists, path)
-    text, _ = set_fields(text, {"status": "open", "stage": "backlog", **inherited, **keys, "style_count": str(count)}, path)
+    text, _ = set_fields(text, {"status": "open", "stage": "backlog", **inherited, **keys, "style_count": str(count),
+                                NUMBER_FIELD: f"P{_highest_number(path.parent) + 1}"}, path)
     text = text.rstrip() + f"\n\nProposed ranking: {proposed_ranking}\n\n" + decision_body(body)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=".decision-", delete=False) as stream:
@@ -391,6 +449,8 @@ def main(argv: list[str]) -> int:
     linking = verbs.add_parser("rules", help="set the rule links")
     _ = linking.add_argument("--rules", required=True)
     stars = verbs.add_parser("stars", help="set the five ranking values")
+    numbering = verbs.add_parser("number", help="give each proposal without one its P number")
+    _ = numbering.add_argument("issues", type=Path, nargs="+")
     _ = stars.add_argument("--goal", required=True, help="e.g. '1 - Ship Hana'")
     for name in ("alignment", "impact", "urgency", "effort"):
         _ = stars.add_argument(f"--{name}", required=True, help="1 to 5")
@@ -398,9 +458,16 @@ def main(argv: list[str]) -> int:
         _ = verb.add_argument("issue", type=Path)
     args = parser.parse_args(argv)
     verb = cast(str, args.verb)
+    today = datetime.now(user_zone()).date()
+    if verb == "number":
+        try:
+            print("\n".join(number([path.expanduser() for path in cast(list[Path], args.issues)], today)))
+        except (ValueError, OSError, UnicodeError) as error:
+            print(f"proposal_issue: {error}", file=sys.stderr)
+            return 2
+        return 0
     # A plan's Issues line writes `~/rust/hanadocs/issues/<name>.md`, quoted since names hold spaces.
     path = cast(Path, args.issue).expanduser()
-    today = datetime.now(user_zone()).date()
     try:
         if verb == "create":
             created = create(path, cast(str, args.project), cast(str, args.short), cast(str, args.proposed_by),

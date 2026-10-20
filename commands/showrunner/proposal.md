@@ -12,7 +12,14 @@ is no index to add a row to. Every frontmatter change after filing goes through:
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposal_issue.py" <verb> <issue> …
 ```
 
-It edits that one file, sets `date_modified`, and prints what changed. On a
+It edits that one file, sets `date_modified`, and prints what changed.
+
+Each proposal carries a number, `proposal_id: "P12"`, as a change row carries
+`C12`. `number <issue>…` gives the next free number to each proposal without
+one, oldest first, and skips other issues; `create` numbers a new style
+decision. Numbers are never used again: the highest in the issues folder and
+in the vault's `archive/` beside it is taken. Name a proposal to the user by
+its number and title, such as `P12 selection widgets toggle`. On a
 missing file or one without frontmatter it exits 2: report the line.
 
 | State | `status` / `stage` | Set |
@@ -31,7 +38,8 @@ for all findings and `candidates` for off-rule ideas. A candidate is never a
 proposal; drop one with `style_proposals.py drop-candidate --idea "<text>"`. Other finished proposals become issues through `/issue`.
 
 For other proposals, tag `proposal` beside
-`issue`, and `proposed_by` the unit or session that wrote it. Drafts stay out.
+`issue`, and `proposed_by` the unit or session that wrote it; `/issue` then
+gives it its number. Drafts stay out.
 The writer proposes all five ranking values (`backlog_goal`,
 `backlog_alignment`, `backlog_impact`, `backlog_urgency`, `backlog_effort`) at
 once. The values reach the frontmatter only after the user confirms them, since
