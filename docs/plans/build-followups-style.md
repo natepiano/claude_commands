@@ -684,25 +684,18 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 ### Phase 24 — proposal gate takes the pairs it has; duplicates and plain-merge builds  · status: done
 
-**Depends on:** Phase 23
+#### As-built
 
-#### Work Order
+- `approved_rename_pairs` skips a rename finding with no `<parent>::<name>` pair (bare name, dot-form field, prose); a type or restructure finding still returns no pairs. Approval stays exact per token.
+- Bare duplicates: migrate and reopen print `drop <id> in <decision>: duplicate of <id>` and never move one beside its qualified finding. `style_proposals.py drop-duplicates --repo <repo> [--dry-run]` withdraws every bare duplicate that is filed or built, regenerates each decision body (also a stale one), and exits 1 on any skip. Migration 15: `held_findings.duplicate_of`; `WithdrawnBy = ExceptionVerdict(judgment) | DuplicateOf(finding)`.
+- A proposal ticket's phase text lists the exact cells to record (`Ledger.proposal_cells`, through the same `_check_cell_path` checks as record) and names the rename pairs; a rename with no pair is applied in its own file only. A git failure while listing cells stops the command.
+- `style_ledger.py held built --id <id>... --commit <merge> [--by <who>]` (`mark_built_at_merge`, `BuiltAtMerge`) marks filed findings built after a plain merge. The applied check runs at `<merge>`; a rename not applied is refused; a finding the check cannot prove needs `--by` and records `person_read_by`. All refusals come before the first write.
 
-**Goal:** a proposal ticket's gate accepts reference edits for every qualified rename even when other findings have no pair; bare old-form duplicates are never moved into a decision and the existing ones can be dropped; the phase text names the exact cells; a finding built by a plain merge can be marked built.
+**Files:**
+- `scripts/style/style_plan.py`, `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, their `test_*.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`
 
-**Spec (ruled by the showrunner, (v)):**
-1. `approved_rename_pairs` (`scripts/style/style_plan.py:225`) skips a rename finding with no `<parent>::<name>` pair (bare name, dot-form field, prose) instead of returning no pairs; a type or restructure finding still returns `()`. Approval stays exact per token.
-2. A bare duplicate is a rename finding whose `before` and `after` equal the last `::` segment of a qualified rename finding with the same rule and path. Migrate and reopen never move a bare duplicate into a decision that holds (or receives in the same run) its qualified finding. A new `style_proposals.py drop-duplicates [--dry-run]` command drops every bare duplicate in every open decision: state withdrawn, the row records which finding it duplicates, the decision body is regenerated; a finding held by an open ticket is refused before the first write. Prints `drop <id> in <decision>: duplicate of <id>` and totals.
-3. For a proposal ticket, `phase_text` (`style_plan.py:1198`) lists the exact cells to record: the parent rule only for files with a listed site at the synced tip, plus `#uncovered` for each ticket file.
-4. `style_ledger.py held built --id <id>... --commit <merge> [--by <who>]` marks filed findings built after a plain merge: `<merge>` must be an ancestor of the synced tip; the applied check runs at `<merge>`; RenameNotApplied is refused; a finding the check cannot prove (NoAppliedCheck rename, type, restructure) needs `--by` and records `person_read_by`. All refusals before the first write. Without `--commit` the ticket path is unchanged.
-
-**Files:** `scripts/style/style_plan.py`, `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, their `test_*.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`
-
-**Workers:** 1 writer (one Claude agent; the files share the ledger types and do not split).
-
-**Constraints from prior phases:** phase 23's `PersonReading` and migration 14; a move into built clears `person_read_by` except when this command sets it.
-
-**Acceptance gate:** `merge_gate.py --tests-only` green on a frozen copy; basedpyright zero errors and warnings on the changed files.
+**Gotchas:**
+- `held built --commit` takes the code repo's merge, and that merge must be an ancestor of the ledger's synced tip and not older than each finding's judged commit; a merge on the style branch that the last sync did not take is refused until the next sync.
 
 ### Phase 25 — refill never reissues a ticket that cannot change a cell  · status: todo
 
@@ -725,3 +718,22 @@ Do not take the fingerprint at the ticket base (it would mark current a cell who
 **Constraints from prior phases:** phase 24 changes `approved_rename_pairs`, `phase_text` and `held built` in the same files.
 
 **Acceptance gate:** stale stays stale after a same-crate change on the style branch; refill skips and returns the new outcome with no ticket added; after the merge the ticket takes the merged base and its verdict is awaiting merge; no false skip when inputs differ; held skip with waived + filed findings, not with an unfiled one. `merge_gate.py --tests-only` green on a frozen copy; basedpyright clean.
+
+### Phase 26 — a waived finding can be filed again  · status: todo
+
+**Depends on:** Phase 25
+
+#### Work Order
+
+**Goal:** a person can undo a waive: the finding goes back to unfiled and the row says who did it.
+
+**Spec (ruled by the showrunner, (x)):** production case: cargo-liner findings e905399a, 3e86fba4, a5e2b756, 07a1d8b6 and 821e2bc9 were waived and must be held again; no command moves a waived finding back.
+`style_ledger.py held unwaive --id <id>... --by <who>` moves each named waived finding to unfiled. Unique prefixes as other held commands take. Refused before the first write: an id that is not a waived finding, a blank `--by`, a finding an open ticket holds. The row records who unwaived it (the existing `person_read_by` shape or a new column through the next migration, whichever fits the schema code). The ticket gate does not write the ledger. Update the held-commands section of `docs/style_production.md`.
+
+**Files:** `scripts/style/style_ledger.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+
+**Workers:** 1 writer.
+
+**Constraints from prior phases:** phase 24's `held built --commit` and migration 15; phase 25 changes the held-cell skip, which reads waived findings.
+
+**Acceptance gate:** unwaive moves waived to unfiled and records who; each refusal leaves the ledger unchanged; a later `held add` or proposal sees the finding as unfiled. `merge_gate.py --tests-only` green on a frozen copy; basedpyright clean.
