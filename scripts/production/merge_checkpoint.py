@@ -510,11 +510,20 @@ def record_changes(request: MergeRequest, commits: list[change_review.Commit], m
         report("change review", "drift", line)
 
 
+def merge_paths(checkout: Path, base: str, tip: str) -> tuple[str, ...]:
+    """The paths a merge of `tip` into `base` changes. A three-dot diff picks one merge base, so after a
+    criss-cross merge it also lists paths `base` already holds; the merged tree does not. A conflicted
+    merge still writes a tree, with the conflicted paths in it, and the conflicts step holds that merge."""
+    tree = git(checkout, "merge-tree", "--write-tree", base, tip)
+    if tree.returncode not in (0, 1):
+        _ = good(tree, "scope")
+    output = good(git(checkout, "diff", "--name-only", base, tree.stdout.split("\n", 1)[0].strip()), "scope")
+    return tuple(line for line in output.splitlines() if line)
+
+
 def changed_paths(request: MergeRequest, base: str = "") -> tuple[str, ...]:
     """The paths the checkpoint changes from `base`, by default the merge branch's tip."""
-    output = good(git(request.production.checkout, "diff", "--name-only",
-                      f"{base or request.production.merge_branch}...{request.commit}"), "scope")
-    return tuple(line for line in output.splitlines() if line)
+    return merge_paths(request.production.checkout, base or request.production.merge_branch, request.commit)
 
 
 def allowed(path: str, ownership: tuple[str, ...]) -> bool:
@@ -1206,7 +1215,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     if staged:
         raise Refusal(f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}")
     if isinstance(delivery, NotMerged):
-        paths = tuple(good(git(checkout, "diff", "--name-only", f"{branch}...{checkpoint}"), "scope").splitlines())
+        paths = merge_paths(checkout, branch, checkpoint)
         _ = good(git(checkout, "merge-tree", "--write-tree", branch, checkpoint), "conflicts")
         subject = f"Merge {request.child.slug} hand-off ({checkpoint[:7]}) into {branch}"
         _ = good(git(checkout, "merge", "--no-ff", "-m", subject, checkpoint), "merge")

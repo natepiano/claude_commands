@@ -960,6 +960,22 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertNotIn("unblocks: G1", result.process.stdout)
         self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
 
+    def test_shrink_after_criss_cross_merge_scopes_only_its_doc(self) -> None:
+        code = self.checkpoint()
+        self.write(self.checkout, "src/beta.txt", "beta on the merge branch\n")
+        _ = self.git("commit", "-am", "beta lands first")
+        _ = self.git("push", "origin", "production")
+        _ = self.git("merge", "--no-ff", "-m", "merge production", "production", cwd=self.unit)
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        first = self.run_checkpoint(code)
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        shrink = self.checkpoint("docs/plans/alpha.md", "short as built\n", subject="shrink")
+        bases = self.git("merge-base", "--all", "production", shrink).splitlines()
+        self.assertEqual(len(bases), 2, bases)
+        result = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths are allowed", result.process.stdout)
+
     def test_promote_none_merges_and_records_without_promotion(self) -> None:
         self.promotions = "none"
         self.production_doc()
