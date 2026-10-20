@@ -31,7 +31,8 @@ class HomeCutoverTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(patch.object(sys, "platform", "linux"))
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         (self.home / ".claude").mkdir()
@@ -264,7 +265,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True)))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
@@ -593,7 +594,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
                    + b"\0".join(os.fsencode(word) for word in arguments) + b"\0HOME=/scratch\0")
         with (patch.object(sys, "platform", "darwin"),
               patch.object(subprocess, "run", return_value=listing),
-              patch.object(account, "_kern_procargs2", return_value=payload),
+              patch.object(account, "kern_procargs2", return_value=payload),
               patch.object(accounts, "list_codex_home_processes", side_effect=self.process_lister)):
             self.assertNotEqual(self.run_cutover(), 0)
         self.assertIn(f"321 ({shlex.join(arguments)}) uses {self.source}", self.errors.getvalue())
@@ -716,7 +717,7 @@ class CodexCutoverProcessListingTests(unittest.TestCase):
         listing = subprocess.CompletedProcess([], 0, "  321 codex           \n  654 codex           \n  987 codex           \n  777 python          \n  888 Codex (Service) \n", "")
         with (patch.object(sys, "platform", "darwin"),
               patch.object(subprocess, "run", return_value=listing) as listed,
-              patch.object(account, "_kern_procargs2", side_effect=kernel_record),
+              patch.object(account, "kern_procargs2", side_effect=kernel_record),
               patch.object(account, "process_codex_home", wraps=account.process_codex_home) as read_home):
             found = accounts.list_codex_home_processes()
         listed.assert_called_once_with(("ps", "-u", str(os.getuid()), "-o", "pid=,ucomm="),
@@ -765,7 +766,7 @@ class MacHomeCutoverTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(patch.dict(os.environ, {"HOME": str(self.home),
             "AGENT_NOTES_DIR": str(self.home / "notes")}, clear=True))
         self.keychain = CutoverKeychain()
@@ -1013,8 +1014,8 @@ class MacHomeCutoverTests(unittest.TestCase):
         self.assertGreaterEqual(mutations.count("write"), 3)
         for stop_after in range(1, len(mutations) + 1):
             with self.subTest(step=stop_after), tempfile.TemporaryDirectory() as directory:
-                self.home = Path(directory)
-                with patch.dict(os.environ, {"HOME": directory, "AGENT_NOTES_DIR": str(self.home / "notes")}):
+                self.home = Path(directory).resolve()
+                with patch.dict(os.environ, {"HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes")}):
                     self.keychain.entries.clear()
                     self.keychain.calls.clear()
                     self.initialize_home()

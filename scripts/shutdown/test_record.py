@@ -103,7 +103,6 @@ def entry(
     progress: object = None,
     *,
     number: int = 1,
-    timer_footer: record.ShowrunnerFooter | record.NoFooter | None = None,
     settle_message: record.SettleMessage | None = None,
     where: record.Where | None = None,
 ) -> LegacyEntryFixture:
@@ -113,7 +112,6 @@ def entry(
             record.TimerRestore(
                 instance=f"timer-{number}",
                 was_enabled=True,
-                footer=timer_footer or record.NoFooter(kind="no footer"),
             )
         ],
         settle_message=settle_message or record.SettleMessageNotSent(kind="not sent"),
@@ -389,8 +387,8 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.parse_session_records(json.dumps([first, second])), [first, second])
         self.assertFalse((self.directory / "record.json").exists())
 
-    def test_unit_session_leftover_issues_round_trip_for_both_hosts(self) -> None:
-        for host in ("tmux", "herdr"):
+    def test_herdr_unit_session_leftover_issues_round_trip(self) -> None:
+        for host in ("herdr",):
             with self.subTest(host=host):
                 saved = session_shutdown()
                 saved["stop_issues"] = [record.UnitSessionLeftRunning(
@@ -470,8 +468,8 @@ class SessionRecordTests(ShutdownTestCase):
 
     def test_old_tmux_leftover_issue_is_normalized_on_read_and_written_canonically(self) -> None:
         saved = session_shutdown()
-        saved["stop_issues"] = [record.UnitSessionLeftRunning(
-            kind="unit session left running", at=NOW, host="tmux",
+        saved["stop_issues"] = [record.LegacyTmuxSessionLeftRunning(
+            kind="legacy tmux session left running", at=NOW,
             session_name="old-unit", cause="owner identity lost")]
         wire = cast(dict[str, object], json.loads(json.dumps(saved)))
         wire["stop_issues"] = [{"kind": "unit tmux session left running", "at": NOW,
@@ -505,27 +503,56 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
         self.assertEqual(record.parse_session_records(json.dumps([saved])), [saved])
 
-    def test_unit_host_without_transport_defaults_to_tmux_with_either_name_key(self) -> None:
+    def test_legacy_unit_wire_forms_normalize_in_records_and_snapshots(self) -> None:
+        for transport in (None, "tmux"):
+            for key in ("session_name", "tmux_session"):
+                with self.subTest(transport=transport, key=key):
+                    host: dict[str, object] = {"kind": "unit", "production": "build", "unit": "one",
+                        "doc": "/tmp/build.md", key: "unit-session"}
+                    if transport is not None:
+                        host["session_host"] = transport
+                    saved = session_shutdown()
+                    document = cast(dict[str, object], json.loads(json.dumps(saved)))
+                    wire_session = cast(dict[str, object], document["session"])
+                    wire_session.update(kind="unit", host=host)
+                    expected = {"kind": "legacy tmux unit", "production": "build", "unit": "one",
+                        "doc": "/tmp/build.md", "session_name": "unit-session"}
+                    parsed = record.parse_session_records(json.dumps([document]))[0]
+                    self.assertEqual(parsed["session"]["host"], expected)
+                    snapshot = record.parse_snapshot(dict[str, object]({"machine": "natedev", "login": saved["login"],
+                        "label": saved["label"], "taken_at": NOW, "sessions": [
+                            {"agent": "claude", "session": wire_session, "workers": list[object](), "timers": list[object](),
+                             "last_seen": NOW, "state": "unresolved", "crash": "host gone"}]}))
+                    self.assertEqual(snapshot["sessions"][0]["session"]["host"], expected)
+                    path = self.directory / "sessions/session-1.json"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    _ = path.write_text(json.dumps(document))
+                    self.assertEqual(record.find_session(saved["login"], "session-1"), parsed)
+
+    def test_old_tmux_hosts_normalize_in_records_and_snapshots(self) -> None:
         saved = session_shutdown()
-        unit = cast(inventory.UnitSession, cast(object, {
-            **session(), "kind": "unit",
-            "host": inventory.UnitHost(kind="unit", production="build", unit="one", doc="/tmp/build.md",
-                                       session_name="unit-session", session_host="tmux", plan=inventory.NoRunRecord(kind="no run record")),
-        }))
-        saved["session"] = unit
-        for key in ("session_name", "tmux_session"):
-            with self.subTest(key=key):
-                document = cast(dict[str, object], json.loads(json.dumps(saved)))
-                wire_session = cast(dict[str, object], document["session"])
-                host = cast(dict[str, object], wire_session["host"])
-                del host["session_host"]
-                del host["session_name"]
-                host[key] = "unit-session"
-                self.assertEqual(record.parse_session_records(json.dumps([document])), [saved])
-                path = self.directory / "sessions" / "session-1.json"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                _ = path.write_text(json.dumps(document))
-                self.assertEqual(record.find_session(saved["login"], "session-1"), saved)
+        document = cast(dict[str, object], json.loads(json.dumps(saved)))
+        owner = cast(dict[str, object], document["session"])
+        owner["host"] = {"kind": "tmux", "tmux_session": "old:name", "pane": {"kind": "not recorded"}}
+        parsed = record.parse_session_records(json.dumps([document]))[0]
+        self.assertEqual(parsed["session"]["host"], {"kind": "legacy tmux", "session_name": "old:name"})
+        snapshot = record.parse_snapshot(dict[str, object]({"machine": "natedev", "login": saved["login"], "label": saved["label"],
+            "taken_at": NOW, "sessions": [{"agent": "claude", "session": owner, "workers": list[object](), "timers": list[object](),
+                "last_seen": NOW, "state": "unresolved", "crash": "host gone"}]}))
+        self.assertEqual(snapshot["sessions"][0]["session"], parsed["session"])
+
+    def test_both_legacy_leftover_forms_require_time_and_normalize(self) -> None:
+        expected = {"kind": "legacy tmux session left running", "at": NOW,
+            "session_name": "old-unit", "cause": "stop not confirmed"}
+        for old in ({"kind": "unit tmux session left running", "tmux_session": "old-unit"},
+                    {"kind": "unit session left running", "host": "tmux", "session_name": "old-unit"}):
+            document = cast(dict[str, object], json.loads(json.dumps(session_shutdown())))
+            issue = {**old, "at": NOW, "cause": "stop not confirmed"}
+            document["stop_issues"] = [issue]
+            self.assertEqual(record.parse_session_records(json.dumps([document]))[0]["stop_issues"], [expected])
+            del issue["at"]
+            with self.assertRaises(record.InvalidRecord):
+                _ = record.parse_session_records(json.dumps([document]))
 
     def test_herdr_unit_transport_round_trips_through_the_record_store(self) -> None:
         saved = session_shutdown()
@@ -704,6 +731,40 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertIsInstance(record.forget_session(foreign["login"], "session-9", "natedev"), record.SessionRetained)
         self.assertEqual(record.find_session(foreign["login"], "session-9"), foreign)
         self.assertFalse((self.directory / "history").exists())
+
+    def test_failed_restart_archive_checks_request_progress_and_machine_under_the_lock(self) -> None:
+        failed = record.SessionRestartFailed(kind="restart failed", at=NOW, reason="prompt unconfirmed")
+        cases: tuple[tuple[str, record.SessionProgress, str, bool], ...] = (
+            ("expected-request", failed, "natedev", True),
+            ("another-request", failed, "natedev", False),
+            ("expected-request", record.SessionNeedsManualRestart(kind="manual restart", command="resume"), "natedev", False),
+            ("expected-request", failed, "Mac", False),
+        )
+        original_replace = os.replace
+
+        def archive_locked(source: Path, target: Path) -> None:
+            with (self.directory / "lock").open("a+") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            original_replace(source, target)
+
+        for number, (request_id, progress, machine, closes) in enumerate(cases, 1):
+            with self.subTest(request=request_id, progress=progress, machine=machine):
+                saved = session_shutdown(number, progress=progress)
+                saved["request_id"], saved["machine"] = request_id, machine
+                self.assertTrue(record.create_session(saved))
+                with patch.object(os, "replace", side_effect=archive_locked):
+                    outcome = record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
+                        "natedev", "expected-request")
+                archived = self.directory / "history" / f"{NOW}-session-{number}.json"
+                if closes:
+                    self.assertIsInstance(outcome, record.SessionForgotten)
+                    self.assertEqual(json.loads(archived.read_text()), saved)
+                    self.assertIsNone(record.find_session(saved["login"], saved["session"]["session_id"]))
+                else:
+                    self.assertEqual(outcome, record.SessionRetained(saved))
+                    self.assertEqual(record.find_session(saved["login"], saved["session"]["session_id"]), saved)
+                    self.assertFalse(archived.exists())
 
     def test_forget_legacy_restore_does_not_reappear_and_preserves_siblings_and_hold(self) -> None:
         old = shutdown_record(state="restart partial",
@@ -1305,7 +1366,7 @@ class SessionRecordTests(ShutdownTestCase):
                     if issues:
                         saved["stop_issues"] = [record.UnitSessionLeftRunning(
                             kind="unit session left running", at=NOW,
-                            host="tmux", session_name="unit", cause="stop not confirmed")]
+                            host="herdr", session_name="unit", cause="stop not confirmed")]
                     self.assertEqual(record.stop_incomplete(saved), kind == "stop failed" or (
                         issues and kind in {"stopped", "already gone", "process identity lost"}))
 
@@ -1512,8 +1573,7 @@ class RecoverySnapshotTests(ShutdownTestCase):
         entries: list[record.SnapshotSession] = []
         for number in numbers:
             entries.append(record.SnapshotClaudeSession(agent="claude", session=session(number), workers=[],
-                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True,
-                    footer=record.ShowrunnerFooter(kind="footer", slug="show"))], last_seen=NOW, state="running", boot_id="boot-one"))
+                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True)], last_seen=NOW, state="running", boot_id="boot-one"))
         return record.RecoverySnapshot(machine="natedev", login="owner@example.com", label="owner",
                                        taken_at=NOW, sessions=entries, boot_id="boot-one")
 
@@ -1706,6 +1766,33 @@ class RecoverySnapshotTests(ShutdownTestCase):
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual((result["progress"], result.get("target"), result["requested_by"]),
                          (existing["progress"], "claude2", existing["requested_by"]))
+
+    def test_newer_snapshot_replaces_materialized_recovery_and_keeps_new_host_on_disk(self) -> None:
+        snapshot = self.snapshot(1)
+        candidate = snapshot["sessions"][0]
+        assert candidate["agent"] == "claude"
+        previous = record.materialize_snapshot(snapshot, candidate)
+        snapshot["taken_at"] = LATER
+        owner = candidate["session"]
+        assert owner["kind"] == "top-level"
+        owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="new-host",
+            pane_id="w2:p1", presentation="attached window")
+        current = record.materialize_snapshot(snapshot, candidate)
+        self.assertNotEqual(current["request_id"], previous["request_id"])
+        self.assertEqual(current["session"]["host"], candidate["session"]["host"])
+        self.assertEqual(record.session_records(snapshot["login"]), [current])
+        self.assertEqual(current["requested_by"]["kind"], "snapshot")
+        self.assertEqual(current["requested_at"], LATER)
+
+    def test_shutdown_request_newer_than_snapshot_is_not_replaced(self) -> None:
+        existing = session_shutdown()
+        existing["requested_at"] = LATER
+        self.assertTrue(record.create_session(existing))
+        snapshot = self.snapshot(1)
+        candidate = snapshot["sessions"][0]
+        assert candidate["agent"] == "claude"
+        self.assertEqual(record.materialize_snapshot(snapshot, candidate), existing)
+        self.assertEqual(record.session_records(snapshot["login"]), [existing])
 
     def test_codex_snapshot_preserves_resume_id_or_picker_and_cannot_become_a_claude_record(self) -> None:
         for resume in (record.CodexSessionId(kind="session id", session_id="rollout-id"), record.CodexResumePicker(kind="picker")):

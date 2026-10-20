@@ -24,16 +24,30 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+import tomllib
+from dataclasses import dataclass, field
+from enum import Enum
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
+# herdr refuses a longer `agent start --timeout`.
+_AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
+PROMPT_SETTLE_SECONDS = 10
 _PLATFORM = sys.platform
+# The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
+# server started from inside a unit, drops them so that the unit's lookup never finds a second session.
+UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+
+
+def _platform() -> str:
+    """The platform herdr reads processes as: HERDR_PLATFORM names the one a test's fake process tree was built for."""
+    return os.environ.get("HERDR_PLATFORM", _PLATFORM)
 
 
 class HerdrFailure(Exception):
@@ -46,6 +60,10 @@ class HerdrFailure(Exception):
 
 class HerdrMissing(HerdrFailure):
     """No herdr binary is available."""
+
+
+class _DarwinProcessGone(HerdrFailure):
+    """An empty failed ps read was confirmed by the pid no longer existing."""
 
 
 class SessionTaken(HerdrFailure):
@@ -77,6 +95,67 @@ class ServerAdopted:
     """The server was already running and belongs to an earlier launch."""
 
 
+@dataclass(frozen=True)
+class DesktopSession:
+    """The caller belongs to the Mac desktop's Aqua security session."""
+
+
+@dataclass(frozen=True)
+class NonDesktopSession:
+    """The caller cannot start a server with desktop keychain access."""
+
+
+@dataclass(frozen=True)
+class SessionKindUnreadable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class NotMacSession:
+    """Security-session routing is unnecessary on this platform."""
+
+
+SecuritySession = DesktopSession | NonDesktopSession | SessionKindUnreadable | NotMacSession
+
+
+@dataclass(frozen=True)
+class SessionKindNotRead:
+    """A command boundary still needs to determine its security session."""
+
+
+_SESSION_KIND_NOT_READ = SessionKindNotRead()
+MAC_DESKTOP_REQUIRED = "the Mac desktop is locked or signed out: unlock it and restart"
+MAC_DESKTOP_TERMINAL_REQUIRED = "herdr must start from the Mac desktop: run this from a Mac terminal"
+
+
+class MacDesktopUnavailable(HerdrFailure):
+    def __init__(self) -> None:
+        super().__init__(MAC_DESKTOP_REQUIRED, "mac_desktop_unavailable")
+
+
+class MacDesktopTerminalRequired(HerdrFailure):
+    def __init__(self) -> None:
+        super().__init__(MAC_DESKTOP_TERMINAL_REQUIRED, "mac_desktop_terminal_required")
+
+
+@dataclass(frozen=True)
+class WindowServerCreated:
+    """A desktop window started this server; the user owns its cleanup."""
+
+
+def security_session() -> SecuritySession:
+    """Read the command's security context once; a failed query grants no access."""
+    if _platform() != "darwin":
+        return NotMacSession()
+    try:
+        result = run_program([os.environ.get("LAUNCHCTL", "launchctl"), "managername"])
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        return SessionKindUnreadable(str(error))
+    if result.returncode:
+        return SessionKindUnreadable(result.stderr.strip() or "launchctl managername failed")
+    return DesktopSession() if result.stdout.strip() == "Aqua" else NonDesktopSession()
+
+
 class AgentNotReady(HerdrFailure):
     """Startup stopped before interactive readiness, with its visible screen."""
 
@@ -86,13 +165,323 @@ class AgentNotReady(HerdrFailure):
 
 
 @dataclass(frozen=True)
+class SessionTranscript:
+    config_dir: Path
+    session_id: str
+
+
+@dataclass(frozen=True)
+class UnspecifiedPromptTranscript:
+    """The caller has not identified the conversation that must receive the prompt."""
+
+
+UNSPECIFIED_PROMPT_TRANSCRIPT = UnspecifiedPromptTranscript()
+
+
+@dataclass(frozen=True)
+class PromptScreenNotRead:
+    """No visible screen has been read for this submission."""
+
+
+@dataclass(frozen=True)
+class PromptInputReady:
+    """The destination session can accept its opening prompt."""
+
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+    idle: bool = False
+
+
+@dataclass(frozen=True)
+class PromptInputNotReady:
+    reason: str
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+
+
+@dataclass(frozen=True)
+class PromptInputTimedOut:
+    """The destination did not become ready before the launch deadline."""
+
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+
+
+@dataclass(frozen=True)
+class PromptRecipientProcess:
+    pid: int
+    started_at: str
+
+
+@dataclass(frozen=True)
+class PromptRecipientUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class PromptSubmitted:
+    at: datetime
+    process: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("prompt recipient was not identified")
+
+
+@dataclass(frozen=True)
+class PromptNotSubmitted:
+    reason: str
+    screen: str | PromptScreenNotRead = PromptScreenNotRead()
+    # True only when the launcher never typed the prompt: the session then holds no work of it.
+    never_typed: bool = False
+
+
+@dataclass(frozen=True)
+class PromptSubmissionNotRequired:
+    """The launch intentionally leaves the session without an opening prompt."""
+
+
+PromptSubmitOutcome = PromptSubmitted | PromptNotSubmitted
+
+
+@dataclass(frozen=True)
 class OpeningPrompt:
     text: str
+    transcript: SessionTranscript | UnspecifiedPromptTranscript = UnspecifiedPromptTranscript()
 
 
 @dataclass(frozen=True)
 class NoOpeningPrompt:
     """Leave the ready agent waiting for the user to type."""
+
+
+@dataclass(frozen=True)
+class TranscriptReadable:
+    """Every matching transcript file was read successfully."""
+
+
+@dataclass(frozen=True)
+class TranscriptUnreadable:
+    """A matching transcript file could not be read; absence of a turn is unproven."""
+
+
+@dataclass
+class TranscriptCursor:
+    """The complete new turns seen by one submission, with per-file byte positions."""
+
+    transcript: SessionTranscript
+    since: datetime
+    offsets: dict[Path, int] = field(default_factory=dict)
+    sizes: dict[Path, int] = field(default_factory=dict)
+    turns: dict[Path, list[tuple[datetime, dict[str, object]]]] = field(default_factory=dict)
+    readability: TranscriptReadable | TranscriptUnreadable = field(default_factory=TranscriptReadable)
+
+    def read_turns(self) -> list[tuple[datetime, dict[str, object]]]:
+        self.readability = TranscriptReadable()
+        # A session id is a file component, never a glob supplied by a caller.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", self.transcript.session_id):
+            return []
+        try:
+            paths = tuple((self.transcript.config_dir / "projects").glob(f"*/{self.transcript.session_id}.jsonl"))
+        except OSError:
+            self.readability = TranscriptUnreadable()
+            paths = ()
+        for path in paths:
+            try:
+                with path.open("rb") as stream:
+                    offset = self.offsets.get(path, 0)
+                    size = os.fstat(stream.fileno()).st_size
+                    if size < self.sizes.get(path, 0):
+                        offset = 0
+                        self.turns[path] = []
+                    self.sizes[path] = size
+                    self.offsets[path] = offset
+                    _ = stream.seek(offset)
+                    while line := stream.readline():
+                        # Leave partial UTF-8 and partial JSON unread until the writer
+                        # completes this row. Offsets always fall after a newline.
+                        if not line.endswith(b"\n"):
+                            break
+                        self.offsets[path] = stream.tell()
+                        try:
+                            value = cast(object, json.loads(line))
+                            if not isinstance(value, dict):
+                                continue
+                            row = cast(dict[str, object], value)
+                            stamp = row.get("timestamp")
+                            if not isinstance(stamp, str):
+                                continue
+                            at = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                            if at.tzinfo is not None and at > self.since:
+                                self.turns.setdefault(path, []).append((at, row))
+                        except (ValueError, TypeError, UnicodeError):
+                            continue
+            except OSError:
+                self.readability = TranscriptUnreadable()
+                continue
+        return [turn for turns in self.turns.values() for turn in turns]
+
+    def submitted_prompt(self, text: str) -> PromptSubmitOutcome:
+        for at, row in self.read_turns():
+            if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
+                return PromptSubmitted(at)
+        return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+
+def _turn_text(row: dict[str, object]) -> str:
+    message = row.get("message", row)
+    if not isinstance(message, dict):
+        return ""
+    content: object = cast(dict[str, object], message).get("content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for value in cast(list[object], content):
+            if isinstance(value, dict):
+                block = cast(dict[str, object], value)
+                text = block.get("text")
+                if block.get("type") == "text" and isinstance(text, str):
+                    texts.append(text)
+        return "\n".join(texts)
+    return ""
+
+
+def _prompt_matches(text: str, recorded_text: str) -> bool:
+    if text in recorded_text:
+        return True
+    if text.startswith("/"):
+        command, *arguments = text.split(maxsplit=1)
+        return (f"<command-name>{command}</command-name>" in recorded_text
+                and (not arguments or f"<command-args>{arguments[0].strip()}</command-args>" in recorded_text))
+    return False
+
+
+def submitted_prompt(transcript: SessionTranscript, text: str, launched_at: datetime) -> PromptSubmitOutcome:
+    return TranscriptCursor(transcript, launched_at).submitted_prompt(text)
+
+
+@dataclass(frozen=True)
+class ComposerInput:
+    text: str
+
+    def contains(self, text: str) -> bool:
+        # Physical wraps can split words, but spaces in the prompt must still
+        # match whitespace. This is the same match used for Enter-only retries.
+        pattern = r"\s+".join(r"\n?".join(re.escape(char) for char in word) for word in text.split())
+        return bool(pattern) and re.search(pattern, self.text) is not None
+
+
+@dataclass(frozen=True)
+class NoComposer:
+    """The visible screen has no current input box."""
+
+
+_SGR = re.compile(r"\x1b\[([0-9;:]*)m")
+_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _prompt_screen(screen: str) -> str:
+    return _ESCAPE.sub("", screen)
+
+
+def _faint_after(parameters: str, faint: bool) -> bool:
+    """The faint state after one SGR sequence; colour arguments (38/48/58 ;5;n or ;2;r;g;b) are skipped."""
+    values = parameters.split(";")
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value in {"", "0", "22"}:
+            faint = False
+        elif value == "2":
+            faint = True
+        elif value in {"38", "48", "58"} and index + 1 < len(values):
+            index += {"5": 2, "2": 4}.get(values[index + 1], 0)
+        index += 1
+    return faint
+
+
+def _typed_text(screen: str) -> str:
+    """The screen without escapes and without faint text, which is Claude's placeholder hint, never input."""
+    kept: list[str] = []
+    faint, position = False, 0
+    for match in _SGR.finditer(screen):
+        segment = _ESCAPE.sub("", screen[position:match.start()])
+        kept.append("".join(char for char in segment if char in "\r\n") if faint else segment)
+        faint = _faint_after(match.group(1), faint)
+        position = match.end()
+    segment = _ESCAPE.sub("", screen[position:])
+    kept.append("".join(char for char in segment if char in "\r\n") if faint else segment)
+    return "".join(kept)
+
+
+def _composer_input(screen: str) -> ComposerInput | NoComposer:
+    """Parse the final live composer, excluding old input and its footer.
+
+    An ANSI screen (`--format ansi`) lets faint placeholder text such as `Try "fix lint errors"` read as empty.
+    """
+    lines = _prompt_screen(screen).splitlines()
+    typed = _typed_text(screen).splitlines()
+    closing_borders = [i for i, line in enumerate(lines) if re.fullmatch(r"\s*[─━-]{3,}\s*", line)]
+    if not closing_borders:
+        return NoComposer()
+    closing = closing_borders[-1]
+    # A rule-like input row is not a top border. The actual marker is at column 0.
+    top_borders = [i for i, line in enumerate(lines[:closing])
+                   if re.fullmatch(r"\s*[─━-]{3,}(?:\s+.+\s+[─━-]+)?\s*", line)
+                   and re.match(r"^[❯>]", lines[i + 1])]
+    if not top_borders:
+        return NoComposer()
+    # Column-zero output below the last box makes that box scrollback.
+    if any(line.strip() and not line[0].isspace() for line in lines[closing + 1:]):
+        return NoComposer()
+    region = typed[top_borders[-1] + 1:closing]
+    region[0] = re.sub(r"^[❯>]\s*", "", region[0])
+    return ComposerInput("\n".join(line.strip() for line in region))
+
+
+def prompt_recipient_process(session_id: str) -> PromptRecipientProcess | PromptRecipientUnavailable:
+    """Identify the process receiving input, including before its socket opens."""
+    import sessions
+
+    try:
+        identities = {PromptRecipientProcess(row["pid"], row.get("procStart", ""))
+                      for row in sessions.running_sessions() if row["sessionId"] == session_id}
+    except (OSError, ValueError) as error:
+        return PromptRecipientUnavailable(str(error))
+    if len(identities) != 1:
+        return PromptRecipientUnavailable("prompt recipient is missing or ambiguous")
+    process = identities.pop()
+    if not process.started_at:
+        return PromptRecipientUnavailable("prompt recipient start is unrecorded")
+    return process
+
+
+def encode_prompt_outcome(outcome: PromptSubmitOutcome) -> str:
+    if isinstance(outcome, PromptNotSubmitted):
+        return json.dumps({"kind": "not submitted", "reason": outcome.reason,
+                           **({"screen": outcome.screen} if isinstance(outcome.screen, str) else {})})
+    process = outcome.process
+    return json.dumps({"kind": "submitted", "at": outcome.at.isoformat(),
+                       "process": {"pid": process.pid, "started_at": process.started_at}
+                       if isinstance(process, PromptRecipientProcess) else {}})
+
+
+def decode_prompt_outcome(text: str) -> PromptSubmitOutcome:
+    try:
+        value = cast(object, json.loads(text))
+        if isinstance(value, dict):
+            row = cast(dict[str, object], value)
+            if row.get("kind") == "submitted" and isinstance(row.get("at"), str):
+                at = datetime.fromisoformat(cast(str, row["at"]))
+                if at.tzinfo is not None:
+                    process = row.get("process")
+                    if isinstance(process, dict):
+                        fields = cast(dict[str, object], process)
+                        pid, started_at = fields.get("pid"), fields.get("started_at")
+                        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and isinstance(started_at, str) and started_at:
+                            return PromptSubmitted(at, PromptRecipientProcess(pid, started_at))
+                    return PromptSubmitted(at)
+            if row.get("kind") == "not submitted" and isinstance(row.get("reason"), str):
+                screen = row.get("screen")
+                return PromptNotSubmitted(cast(str, row["reason"]),
+                                          screen if isinstance(screen, str) else PromptScreenNotRead())
+    except (ValueError, TypeError):
+        pass
+    return PromptNotSubmitted("launcher supplied no valid submit proof")
 
 
 @dataclass(frozen=True)
@@ -311,6 +700,23 @@ class TabIdentity(TypedDict):
     tab_id: str
 
 
+class _StartupShellEvidence(Enum):
+    UNTOUCHED = "untouched startup shell"
+    PRESERVE = "activity or incomplete startup evidence"
+
+
+@dataclass(frozen=True)
+class _WorkspaceStartupState:
+    workspace_id: str
+    evidence: _StartupShellEvidence
+
+
+@dataclass(frozen=True)
+class _PaneStartupState:
+    pane_id: str
+    evidence: _StartupShellEvidence
+
+
 class AgentLifecycle(TypedDict):
     agent_status: str
 
@@ -363,10 +769,16 @@ def json_items(value: object, context: str) -> list[object]:
     return cast(list[object], value)
 
 
+def unmarked_environment() -> dict[str, str]:
+    """This process's environment without a unit's marks, so that no server it starts carries them."""
+    return {key: value for key, value in os.environ.items() if key not in UNIT_MARKS}
+
+
 def run_program(argv: list[str], timeout: float = 10.0, *,
                 environment: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout, env=environment)
+        return subprocess.run(argv, capture_output=True, text=True, check=False, timeout=timeout,
+                              env=unmarked_environment() if environment is None else environment)
     except OSError as error:
         raise HerdrFailure(f"{argv[0]}: {error}") from error
 
@@ -471,17 +883,132 @@ class Herdr:
         _ = self.run("pane", "rename", pane, label)
         return pane
 
+    def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first."""
+        options = ["--label", title, "--cwd", cwd]
+        for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
+            options.extend(["--env", f"{key}={value}"])
+        workspaces = [json_object(item, "herdr workspace") for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        found = [item for item in workspaces if item.get("label") == space]
+        workspace = json_text(found[0].get("workspace_id"), "herdr workspace id") if found else None
+        if workspace is not None:
+            result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
+        else:
+            options[1] = space
+            result = self.result("workspace", "create", *options, "--no-focus")
+            tab = json_text(json_object(result.get("tab"), "herdr workspace tab").get("tab_id"), "herdr tab id")
+            _ = self.run("tab", "rename", tab, title)
+        root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
+        pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
+        _ = self.run("pane", "rename", pane, title)
+        return pane if workspace is None else self.order_tabs(workspace).get(pane, pane)
+
+    def retitle(self, pane: str, title: str) -> bool:
+        """Give the pane and its tab the name `title`, then order the workspace's tabs again.
+
+        False when both already carry it, after two reads and no change.
+        """
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        row = next((row for row in rows if row.get("pane_id") == pane), None)
+        if row is None:
+            raise HerdrFailure(f"no pane {pane!r}")
+        tab = json_text(row.get("tab_id"), "herdr pane tab id")
+        workspace = json_text(row.get("workspace_id"), "herdr pane workspace id")
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
+        shown = next((item.get("label") for item in tabs if item.get("tab_id") == tab), None)
+        if shown == title and row.get("label") == title:
+            return False
+        if row.get("label") != title:
+            _ = self.run("pane", "rename", pane, title)
+        if shown != title:
+            _ = self.run("tab", "rename", tab, title)
+            _ = self.order_tabs(workspace)
+        return True
+
+    def order_tabs(self, workspace: str) -> dict[str, str]:
+        """Put the workspace's showrunner tab first and its other tabs in alphabetical order.
+
+        The showrunner's tab carries the workspace's own name. herdr 0.9.5 cannot move a tab, but a
+        pane moved into a new tab puts that tab last: so every tab from the first one out of place
+        moves, in order. Each pane keeps its process, and focus goes back where it was. A tab with
+        several panes leaves the order as it is. Returns each moved pane's new id by its old one.
+        """
+        spaces = [json_object(item, "herdr workspace") for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        name = next((item.get("label") for item in spaces if item.get("workspace_id") == workspace), None)
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
+        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
+        order = sorted(range(len(tabs)), key=lambda index: (titles[index] != name, titles[index]))
+        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
+        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+            return {}
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        pane_of = {json_text(row.get("tab_id"), "herdr pane tab id"): json_text(row.get("pane_id"), "herdr pane id")
+                   for row in rows}
+        focused = next((item for item in spaces if item.get("focused") is True), None)
+        active = next((item.get("active_tab_id") for item in spaces if item.get("workspace_id") == workspace), None)
+        moved: dict[str, str] = {}
+        active_tab = active
+        for index in order[start:]:
+            tab = json_text(tabs[index].get("tab_id"), "herdr tab id")
+            pane = pane_of[tab]
+            result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
+                                 .get("move_result"), "herdr pane move")
+            created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
+            moved[pane] = json_text(json_object(result.get("pane"), "herdr moved pane").get("pane_id"), "herdr pane id")
+            _ = self.run("tab", "rename", created, titles[index])
+            if tab == active:
+                active_tab = created
+        if isinstance(active_tab, str):
+            _ = self.run("tab", "focus", active_tab)
+        if focused is not None and focused.get("workspace_id") != workspace:
+            self.focus_workspace(json_text(focused.get("workspace_id"), "herdr workspace id"))
+        return moved
+
+    def close_tab_of(self, pane: str) -> None:
+        """Close the tab holding `pane`; a pane already gone leaves nothing to close."""
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        for row in rows:
+            if row.get("pane_id") == pane:
+                _ = self.run("tab", "close", json_text(row.get("tab_id"), "herdr pane tab id"))
+                return
+
     def focus_workspace(self, workspace_id: str) -> None:
         """Show a workspace in the session's attached clients."""
         _ = self.run("workspace", "focus", workspace_id)
 
+    def close_startup_workspaces(self, restored_workspace: str) -> None:
+        """Remove only untouched home shells left by this restore's attach window."""
+        candidates = [_workspace_startup_state(item) for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        for candidate in candidates:
+            if candidate.workspace_id == restored_workspace:
+                continue
+            # A previous close can take long enough for another shell to receive input.
+            workspaces = [_workspace_startup_state(item) for item in json_items(
+                self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+            panes = [_pane_startup_state(item) for item in json_items(
+                self.result("pane", "list").get("panes"), "herdr pane list")]
+            if any(workspace.workspace_id == candidate.workspace_id and _untouched_startup_shell(workspace, panes)
+                   for workspace in workspaces):
+                _ = self.run("workspace", "close", candidate.workspace_id)
+
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> None:
-        """Wait through busy-pane refusals, start the executable, then prompt once."""
+                    opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
+        """Start once, then prove the opening prompt arrived as this session's user turn."""
         _check_agent_arguments(kind, agent_arguments)
         _timeout(timeout_ms)
-        deadline = time.monotonic() + timeout_ms / 1000
-        attempt_timeout_ms = timeout_ms
+        launched_at = datetime.now(timezone.utc)
+        # A loaded machine starts Claude slowly: the start and the opening prompt wait longer.
+        budget_ms = int(timeout_ms * load_factor())
+        deadline = time.monotonic() + budget_ms / 1000
+        attempt_timeout_ms = min(budget_ms, _AGENT_START_TIMEOUT_MAXIMUM_MS)
         try:
             while True:
                 result = self.start_command(
@@ -500,7 +1027,7 @@ class Herdr:
                     if remaining_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
                         raise
                     time.sleep(0.1)
-                    attempt_timeout_ms = int((deadline - time.monotonic()) * 1000)
+                    attempt_timeout_ms = min(int((deadline - time.monotonic()) * 1000), _AGENT_START_TIMEOUT_MAXIMUM_MS)
                     if attempt_timeout_ms <= _AGENT_START_TIMEOUT_MINIMUM_MS:
                         raise
                     continue
@@ -514,7 +1041,9 @@ class Herdr:
                 screen = f"agent_not_ready; startup screen could not be read: {read_error}"
             raise AgentNotReady(screen) from error
         if isinstance(opening, OpeningPrompt):
-            self.prompt(pane, opening.text)
+            return self.submit_opening_prompt(pane, opening, launched_at,
+                                              max(0, int((deadline - time.monotonic()) * 1000)))
+        return PromptSubmissionNotRequired()
 
     def start_command(self, argv: list[str], kind: str, pane: str,
                       timeout: float) -> subprocess.CompletedProcess[str]:
@@ -614,6 +1143,219 @@ class Herdr:
             raise HerdrFailure("herdr agent readiness: expected interactive_ready boolean")
         return {"agent_status": status, "interactive_ready": ready}
 
+    def prompt_input_state(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript,
+                           launched_at: datetime, *,
+                           cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
+                           ) -> PromptInputReady | PromptInputNotReady:
+        ready, idle = False, False
+        try:
+            observation = self.readiness(pane)
+            idle = observation["agent_status"] == "idle"
+            ready = observation["agent_status"] in {"working", "idle"} and observation["interactive_ready"]
+        except (OSError, subprocess.SubprocessError, HerdrFailure):
+            pass
+        if not ready and isinstance(transcript, SessionTranscript):
+            reader = cursor if isinstance(cursor, TranscriptCursor) else TranscriptCursor(transcript, launched_at)
+            ready = any(row.get("type") == "system" and "/remote-control is active" in _turn_text(row)
+                        for _, row in reader.read_turns())
+        if not ready:
+            return PromptInputNotReady("destination session is still loading")
+        raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+        screen = _prompt_screen(raw)
+        composer = _composer_input(raw)
+        if isinstance(composer, ComposerInput) and not composer.text.strip():
+            return PromptInputReady(screen, idle)
+        return PromptInputNotReady("destination has no empty composer", screen)
+
+    def wait_for_prompt_input(self, pane: str, transcript: SessionTranscript | UnspecifiedPromptTranscript, launched_at: datetime,
+                              timeout_ms: int, *,
+                              cursor: TranscriptCursor | UnspecifiedPromptTranscript = UNSPECIFIED_PROMPT_TRANSCRIPT,
+                              ) -> PromptInputReady | PromptInputTimedOut:
+        if isinstance(cursor, UnspecifiedPromptTranscript) and isinstance(transcript, SessionTranscript):
+            cursor = TranscriptCursor(transcript, launched_at)
+        deadline = time.monotonic() + timeout_ms / 1000
+        screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        while time.monotonic() < deadline:
+            state = self.prompt_input_state(pane, transcript, launched_at, cursor=cursor)
+            if isinstance(state.screen, str):
+                screen = state.screen
+            if isinstance(state, PromptInputReady):
+                return state
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+        return PromptInputTimedOut(screen)
+
+    def prompt_in_input(self, pane: str, text: str) -> bool:
+        """Read only the visible composer's last input region, never transcript scrollback."""
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
+        return isinstance(composer, ComposerInput) and composer.contains(text)
+
+    def prompt_input_empty(self, pane: str) -> bool:
+        composer = _composer_input(self.run("pane", "read", pane, "--source", "visible", "--format", "ansi"))
+        return isinstance(composer, ComposerInput) and not composer.text.strip()
+
+    def _wait_for_submit(self, cursor: TranscriptCursor, text: str, deadline: float) -> PromptSubmitOutcome:
+        while True:
+            result = cursor.submitted_prompt(text)
+            if isinstance(result, PromptSubmitted):
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result
+            time.sleep(min(0.1, remaining))
+
+    def submit_opening_prompt(self, pane: str, opening: OpeningPrompt, launched_at: datetime,
+                              timeout_ms: int) -> PromptSubmitOutcome:
+        if timeout_ms <= 0 or not opening.text.strip():
+            return PromptNotSubmitted("opening prompt deadline elapsed or text is empty")
+        deadline = time.monotonic() + timeout_ms / 1000
+        cursor = (TranscriptCursor(opening.transcript, launched_at)
+                  if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
+        screen: str | PromptScreenNotRead = PromptScreenNotRead()
+        typings, enters = 0, 0
+        recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
+
+        def failure(reason: str) -> PromptSubmitOutcome:
+            if typings and isinstance(cursor, TranscriptCursor):
+                proof = cursor.submitted_prompt(opening.text)
+                if isinstance(proof, PromptSubmitted):
+                    if (isinstance(recipient, PromptRecipientProcess)
+                            and prompt_recipient_process(cursor.transcript.session_id) != recipient):
+                        reason = "prompt recipient changed during submission"
+                    else:
+                        return PromptSubmitted(proof.at, recipient)
+            detail = f"{reason}; prompt typed {typings} times" if typings else reason
+            visible = "\n".join(screen.splitlines()[-40:]) if isinstance(screen, str) else screen
+            return PromptNotSubmitted(detail, visible, never_typed=typings == 0)
+
+        def deadline_failure() -> PromptSubmitOutcome:
+            reason = "opening prompt deadline elapsed"
+            if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
+                reason += ": transcript unreadable"
+            return failure(reason)
+
+        try:
+            ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at, timeout_ms, cursor=cursor)
+            screen = ready.screen
+            if isinstance(ready, PromptInputTimedOut):
+                if isinstance(cursor, TranscriptCursor) and isinstance(cursor.readability, TranscriptUnreadable):
+                    return deadline_failure()
+                return failure("destination never became ready for input")
+            recipient = (prompt_recipient_process(opening.transcript.session_id)
+                         if isinstance(opening.transcript, SessionTranscript)
+                         else PromptRecipientUnavailable("transcript identity not supplied"))
+
+            def bound_outcome(outcome: PromptSubmitted) -> PromptSubmitOutcome:
+                if (isinstance(recipient, PromptRecipientProcess)
+                        and isinstance(opening.transcript, SessionTranscript)
+                        and prompt_recipient_process(opening.transcript.session_id) != recipient):
+                    return failure("prompt recipient changed during submission")
+                return PromptSubmitted(outcome.at, recipient)
+
+            # Readiness can take time: a matching turn may have arrived meanwhile.
+            if isinstance(cursor, TranscriptCursor):
+                existing = cursor.submitted_prompt(opening.text)
+                if isinstance(existing, PromptSubmitted):
+                    return bound_outcome(existing)
+                while isinstance(cursor.readability, TranscriptUnreadable):
+                    result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
+                    if isinstance(result, PromptSubmitted):
+                        return bound_outcome(result)
+                    screen = _prompt_screen(self.run("pane", "read", pane, "--source", "visible"))
+                    if time.monotonic() >= deadline:
+                        return deadline_failure()
+                    if isinstance(cursor.readability, TranscriptReadable):
+                        ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
+                            max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                        if isinstance(ready.screen, str):
+                            screen = ready.screen
+                        if isinstance(ready, PromptInputTimedOut):
+                            return deadline_failure()
+                        existing = cursor.submitted_prompt(opening.text)
+                        if isinstance(existing, PromptSubmitted):
+                            return bound_outcome(existing)
+            while time.monotonic() < deadline:
+                typings += 1
+                try:
+                    self.prompt(pane, opening.text)
+                except HerdrFailure as error:
+                    if error.code != "agent_prompt_stalled":
+                        if isinstance(cursor, TranscriptCursor):
+                            proof = cursor.submitted_prompt(opening.text)
+                            if isinstance(proof, PromptSubmitted):
+                                return bound_outcome(proof)
+                        return failure(str(error))
+                last_input = time.monotonic()
+                if not isinstance(cursor, TranscriptCursor):
+                    return failure("caller did not identify the transcript; submit is unproven")
+                while True:
+                    result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
+                    if isinstance(result, PromptSubmitted):
+                        return bound_outcome(result)
+                    raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
+                    screen = _prompt_screen(raw)
+                    composer = _composer_input(raw)
+                    if time.monotonic() >= deadline:
+                        return deadline_failure()
+                    if isinstance(cursor.readability, TranscriptUnreadable):
+                        continue
+                    if isinstance(composer, NoComposer):
+                        continue
+                    if composer.contains(opening.text):
+                        if enters == 3:
+                            return failure("no user turn after three Enter retries")
+                        if (isinstance(recipient, PromptRecipientProcess)
+                                and prompt_recipient_process(cursor.transcript.session_id) != recipient):
+                            return failure("prompt recipient changed before Enter retry")
+                        # A turn can land during the screen/process reads too.
+                        proof = cursor.submitted_prompt(opening.text)
+                        if isinstance(proof, PromptSubmitted):
+                            return bound_outcome(proof)
+                        if isinstance(cursor.readability, TranscriptUnreadable):
+                            continue
+                        if time.monotonic() >= deadline:
+                            return deadline_failure()
+                        self.send_keys(pane, "Enter")
+                        enters += 1
+                        last_input = time.monotonic()
+                        continue
+                    if composer.text.strip():
+                        return failure("destination input contains other text")
+                    # Working can mean queued input, even with an empty box. Only
+                    # an idle recipient after a quiet settle window may be re-typed.
+                    observation = self.readiness(pane)
+                    if (observation["agent_status"] != "idle"
+                            or time.monotonic() - last_input < PROMPT_SETTLE_SECONDS):
+                        continue
+                    if typings == 3:
+                        return failure("no user turn after three typings")
+                    ready = self.wait_for_prompt_input(pane, opening.transcript, launched_at,
+                        max(0, int((deadline - time.monotonic()) * 1000)), cursor=cursor)
+                    if isinstance(ready.screen, str):
+                        screen = ready.screen
+                    if isinstance(ready, PromptInputTimedOut):
+                        if isinstance(cursor.readability, TranscriptUnreadable):
+                            return deadline_failure()
+                        return failure("destination never became ready for re-type")
+                    if not ready.idle:
+                        continue
+                    if not isinstance(recipient, PromptRecipientProcess):
+                        return failure("prompt recipient unavailable before re-type")
+                    if prompt_recipient_process(cursor.transcript.session_id) != recipient:
+                        return failure("prompt recipient changed before re-type")
+                    # The last guard immediately before another typing: a late
+                    # accepted turn wins over every readiness or idle observation.
+                    proof = cursor.submitted_prompt(opening.text)
+                    if isinstance(proof, PromptSubmitted):
+                        return bound_outcome(proof)
+                    if isinstance(cursor.readability, TranscriptUnreadable):
+                        continue
+                    break
+            return deadline_failure()
+        except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+            return failure(str(error))
+
     def prompt(self, pane: str, text: str) -> None:
         _ = self.run("agent", "prompt", pane, text)
 
@@ -694,6 +1436,40 @@ def claude_trust(folder: Path, claude_json: Path) -> Trusted | Untrusted | Unrea
     return Untrusted(folder, claude_json, keys)
 
 
+def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Untrusted | UnreadableTrustFile:
+    """Give the target account file the source account's trust for this folder, and nothing more.
+
+    The target gains only the one key the source already trusts. The file is replaced in one step,
+    so Claude never reads half of it; every other value in it stays as it was.
+    """
+    present = claude_trust(folder, target)
+    if not isinstance(present, Untrusted):
+        return present
+    granted = claude_trust(folder, source)
+    if not isinstance(granted, Trusted):
+        return granted
+    try:
+        raw = cast(object, json.loads(target.read_text(encoding="utf-8")))
+        if not isinstance(raw, dict):
+            raise ValueError()
+        settings = cast(dict[str, object], raw)
+        projects = settings.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError()
+        entry = cast(dict[str, object], projects).setdefault(str(granted.project_key), {})
+        if not isinstance(entry, dict):
+            raise ValueError()
+        cast(dict[str, object], entry)["hasTrustDialogAccepted"] = True
+        staged = target.with_name(f".{target.name}.trust-{os.getpid()}")
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(settings, output, indent=2)
+        os.replace(staged, target)
+    except (OSError, UnicodeError, ValueError) as error:
+        return UnreadableTrustFile(folder, target, type(error).__name__)
+    return Trusted(folder, target, granted.project_key)
+
+
 def repository_root(directory: Path) -> Path:
     return _repository_key(directory, "--show-toplevel")
 
@@ -760,6 +1536,15 @@ def generated_session_name(text: str, suffix: str = "") -> str:
     return base + tail
 
 
+def load_factor() -> float:
+    """How many times its limit a launch may wait: the one-minute load per CPU, from 1 to 6."""
+    try:
+        per_cpu = os.getloadavg()[0] / (os.cpu_count() or 1)
+    except OSError:
+        return 1.0
+    return min(6.0, max(1.0, per_cpu))
+
+
 def _timeout(timeout_ms: object) -> None:
     if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms < 0:
         raise HerdrFailure("timeout must be a nonnegative integer in milliseconds")
@@ -769,8 +1554,59 @@ def server_answering(status: subprocess.CompletedProcess[str]) -> bool:
     return status.returncode == 0 and "status: running" in status.stdout.splitlines()
 
 
+def _workspace_startup_state(value: object) -> _WorkspaceStartupState:
+    workspace = json_object(value, "herdr workspace")
+    workspace_id = json_text(workspace.get("workspace_id"), "herdr workspace id")
+    tab_count, pane_count = workspace.get("tab_count"), workspace.get("pane_count")
+    untouched = (workspace.get("label") == "~" and type(tab_count) is int and tab_count == 1
+                 and type(pane_count) is int and pane_count == 1 and workspace.get("agent_status") == "unknown")
+    return _WorkspaceStartupState(workspace_id,
+        _StartupShellEvidence.UNTOUCHED if untouched else _StartupShellEvidence.PRESERVE)
+
+
+def _pane_startup_state(value: object) -> _PaneStartupState:
+    pane = json_object(value, "herdr pane")
+    pane_id = json_text(pane.get("pane_id"), "herdr pane id")
+    revision, scroll = pane.get("revision"), pane.get("scroll")
+    scrollback = (json_object(cast(object, scroll), "herdr pane scroll").get("max_offset_from_bottom")
+                  if isinstance(scroll, dict) else None)
+    untouched = (pane.get("agent") is None and pane.get("agent_status") == "unknown"
+                 and pane.get("cwd") == str(Path.home()) and pane.get("foreground_cwd") == str(Path.home())
+                 and type(revision) is int and revision == 0 and type(scrollback) is int and scrollback == 0)
+    return _PaneStartupState(pane_id,
+        _StartupShellEvidence.UNTOUCHED if untouched else _StartupShellEvidence.PRESERVE)
+
+
+def _untouched_startup_shell(workspace: _WorkspaceStartupState, panes: list[_PaneStartupState]) -> bool:
+    """Missing evidence preserves the workspace rather than risking live work."""
+    members = [pane for pane in panes if pane.pane_id.split(":", 1)[0] == workspace.workspace_id]
+    return (workspace.evidence is _StartupShellEvidence.UNTOUCHED and len(members) == 1
+            and members[0].evidence is _StartupShellEvidence.UNTOUCHED)
+
+
+def _herdr_resumes_agents() -> bool:
+    """False only when herdr's config sets `[session] resume_agents_on_restore = false`."""
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "config.toml"
+    try:
+        session = tomllib.loads(path.read_text(encoding="utf-8")).get("session")
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    return not (isinstance(session, dict) and cast(dict[str, object], session).get("resume_agents_on_restore") is False)
+
+
+def keeps_restored_layout(session: str) -> bool:
+    """The shared session keeps a restored layout while herdr resumes no agent itself."""
+    return session == shared_session() and not _herdr_resumes_agents()
+
+
 def _clear_restored_workspaces(client: Herdr) -> None:
-    """A server we just spawned holds restored layout, never live work."""
+    """A server we just spawned holds restored layout, never live work.
+
+    The shared session keeps its layout for `pane_restore.py` only when herdr resumes no agent
+    itself: else herdr would resume each pane on the server's account (herdr review, 2026-10-19).
+    """
+    if keeps_restored_layout(client.session):
+        return
     result = client.result("workspace", "list")
     workspaces = [json_text(json_object(item, "herdr workspace").get("workspace_id"),
                             "herdr workspace id")
@@ -791,7 +1627,19 @@ def _server_unit_active(name: str) -> bool:
     ]).returncode == 0
 
 
+def _installed_server_unit(name: str) -> bool:
+    """True when a unit file defines the server's unit (the boot unit); a transient unit does not count."""
+    shown = run_program([
+        os.environ.get("SYSTEMCTL", "systemctl"), "--user", "show", "-p", "FragmentPath", "--value", server_unit(name),
+    ])
+    path = shown.stdout.strip()
+    return shown.returncode == 0 and bool(path) and "/transient/" not in path
+
+
 def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
+    # The shared session's server has a boot unit; a transient unit of its name cannot start beside it.
+    if client.session == shared_session() and _installed_server_unit(client.session):
+        return run_program([os.environ.get("SYSTEMCTL", "systemctl"), "--user", "start", server_unit(client.session)])
     return run_program([
         os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(client.session)}",
         "--collect", *client.argv("server"),
@@ -806,8 +1654,8 @@ def _server_start_failure(name: str) -> HerdrFailure:
     return HerdrFailure(message)
 
 
-def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> ServerCreated | ServerAdopted:
-    from detached import DiscardOutput, InheritEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
+def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
+    from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
     try:
@@ -820,6 +1668,8 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> 
         pass
     if time.monotonic() >= deadline:
         raise _server_start_failure(client.session)
+    if not isinstance(session_kind, DesktopSession):
+        raise MacDesktopTerminalRequired()
     holders: set[int] = set()
 
     def ready() -> bool:
@@ -840,7 +1690,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> 
 
     try:
         pid = start_detached(client.argv("server"), ready=ready, within=deadline - time.monotonic(),
-                             output=DiscardOutput(), environment=InheritEnvironment())
+                             output=DiscardOutput(), environment=ExplicitEnvironment(unmarked_environment()))
     except DetachedChildExited as error:
         if holders and holders != {error.pid}:
             if exclusive:
@@ -862,12 +1712,14 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool) -> 
     return ServerCreated()
 
 
-def start_server(name: str, timeout_ms: int) -> ServerCreated | ServerAdopted:
+def start_server(name: str, timeout_ms: int, *,
+                 session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> ServerCreated | ServerAdopted:
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
-        return _start_darwin_server(herdr, timeout_ms, exclusive=False)
+    if _platform() == "darwin":
+        return _start_darwin_server(herdr, timeout_ms, exclusive=False,
+            session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
     deadline = time.monotonic() + timeout_ms / 1000
     try:
         if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
@@ -892,13 +1744,15 @@ def start_server(name: str, timeout_ms: int) -> ServerCreated | ServerAdopted:
             time.sleep(min(0.1, remaining))
 
 
-def start_new_server(name: str, timeout_ms: int) -> None:
+def start_new_server(name: str, timeout_ms: int, *,
+                     session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> None:
     """Create an exclusive server; never adopt a server another launch started."""
     _validate_session_name(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
-        _ = _start_darwin_server(herdr, timeout_ms, exclusive=True)
+    if _platform() == "darwin":
+        _ = _start_darwin_server(herdr, timeout_ms, exclusive=True,
+            session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
         return
     deadline = time.monotonic() + timeout_ms / 1000
     try:
@@ -929,10 +1783,93 @@ def start_new_server(name: str, timeout_ms: int) -> None:
             time.sleep(min(0.1, remaining))
 
 
+def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
+                   exclusive: bool) -> ServerCreated | ServerAdopted | WindowServerCreated:
+    """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
+    _validate_session_name(name)
+    _timeout(timeout_ms)
+    if _platform() != "darwin" or isinstance(session_kind, DesktopSession):
+        if exclusive:
+            if _platform() == "darwin":
+                start_new_server(name, timeout_ms, session_kind=session_kind)
+            else:
+                start_new_server(name, timeout_ms)
+            return ServerCreated()
+        if _platform() == "darwin":
+            return start_server(name, timeout_ms, session_kind=session_kind)
+        return start_server(name, timeout_ms)
+    client = Herdr(name)
+    deadline = time.monotonic() + min(15.0, timeout_ms / 1000)
+    try:
+        if server_answering(run_program(client.argv("status", "server"),
+                                        timeout=max(0.001, deadline - time.monotonic()))):
+            if exclusive:
+                raise SessionTaken(name)
+            return ServerAdopted()
+        # An existing listener that has not answered yet is also another launch's.
+        if any(item.path == _session_socket(name) for item in _darwin_bound_sockets(
+                timeout=max(0.001, deadline - time.monotonic()))):
+            raise SessionTaken(name)
+    except SessionTaken:
+        raise
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        raise HerdrFailure(f"herdr session {name}: could not check existing listener: {error}") from error
+    try:
+        require_success(run_program([
+            os.environ.get("SHUTDOWN_OPEN", "open"), "-na", "/Applications/Nix Apps/Ghostty.app",
+            "--args", "-e", herdr_binary(), "session", "attach", name,
+        ], timeout=max(0.001, deadline - time.monotonic())), "open Mac desktop window")
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if server_answering(run_program(client.argv("status", "server"), timeout=max(0.001, remaining))):
+                _clear_restored_workspaces(client)
+                return WindowServerCreated()
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+    except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
+        raise MacDesktopUnavailable() from error
+    raise MacDesktopUnavailable()
+
+
+def stop_created_server(name: str, ownership: ServerCreated | ServerAdopted | WindowServerCreated) -> None:
+    """Only directly created servers are ours to stop; desktop windows stay open."""
+    if isinstance(ownership, (ServerAdopted, WindowServerCreated)):
+        return
+    stop_session(name)
+
+
+def shared_session() -> str:
+    """The one herdr session every production lives in, one workspace per production and one tab
+    per Claude session, named in `herdr/shared-session` under the config directory. Empty when the
+    file is absent: each Claude session then gets a herdr session of its own."""
+    path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "shared-session"
+    try:
+        name = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    _validate_session_name(name)
+    return name
+
+
+def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+    return Herdr(name).open_tab(space, title, cwd, environment)
+
+
+def close_agent(session: str, pane: str) -> None:
+    """End one Claude session's place: its tab in the shared session, else its own session."""
+    if session and session == shared_session():
+        Herdr(session).close_tab_of(pane)
+        return
+    stop_session(session)
+
+
 def stop_session(name: str) -> None:
     _validate_session_name(name)
+    if name == shared_session():
+        raise HerdrFailure(f"herdr session {name} holds every production; close one tab instead")
     herdr = Herdr(name)
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         require_success(run_program(herdr.argv("server", "stop")), f"stop herdr session {name}")
         return
     try:
@@ -972,6 +1909,11 @@ def _is_agent_process(arguments: list[str], kind: str) -> bool:
         kind == "claude" and script.endswith("/@anthropic-ai/claude-code/cli.js")
         or kind == "codex" and script.endswith("/@openai/codex/bin/codex.js")
     )
+
+
+def is_claude_process(arguments: list[str]) -> bool:
+    """The argv is a Claude Code process, native or through node."""
+    return _is_agent_process(arguments, "claude")
 
 
 def _startup_processes(shell: PaneShell, kind: str, tracked: set[AgentProcessIdentity]) -> AgentProcessPresent | PaneAtShell | PaneRunning | PaneProcessesUnreadable:
@@ -1062,7 +2004,7 @@ def _herdr_command(arguments: list[str], default_session: str) -> tuple[str, lis
 
 
 def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _darwin_attached_clients(name)
     try:
         processes = list(_proc_root().iterdir())
@@ -1080,7 +2022,7 @@ def attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsU
             if session and not command:
                 environment = _process_environment(process)
                 session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue
         except OSError as error:
             return ClientsUnreadable(str(error))
@@ -1121,18 +2063,29 @@ def darwin_open_files(pid: int) -> list[Path]:
     return [Path(field[1:]) for field in result.stdout.splitlines() if field.startswith("n/")]
 
 
+def _require_darwin_process_read(result: subprocess.CompletedProcess[str], pid: int, context: str) -> None:
+    if result.returncode != 0 and not result.stdout and not result.stderr:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError as error:
+            raise _DarwinProcessGone(f"process {pid}: exited") from error
+        except OSError:
+            pass
+    require_success(result, context)
+
+
 def darwin_process_environment(pid: int) -> dict[str, str]:
     """Read only the environment following a stable, separately read argv."""
     ps = os.environ.get("HERDR_PS", "ps")
     command = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(command, f"process {pid} command")
+    _require_darwin_process_read(command, pid, f"process {pid} command")
     arguments = command.stdout.rstrip("\r\n").lstrip()
     if arguments.startswith("(") and arguments.endswith(")"):
         raise HerdrFailure(f"process {pid}: arguments are unreadable")
     expanded = run_program([ps, "eww", "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(expanded, f"process {pid} environment")
+    _require_darwin_process_read(expanded, pid, f"process {pid} environment")
     confirmed = run_program([ps, "-o", "command=", "-p", str(pid)], timeout=5)
-    require_success(confirmed, f"process {pid} command confirmation")
+    _require_darwin_process_read(confirmed, pid, f"process {pid} command confirmation")
     text = expanded.stdout.rstrip("\r\n").lstrip()
     if not arguments or confirmed.stdout != command.stdout or not text.startswith(arguments):
         raise HerdrFailure(f"process {pid}: environment does not follow stable command")
@@ -1180,7 +2133,7 @@ def server_environment(name: str) -> dict[str, str]:
     """Read the environment of the process holding this session's listener."""
     context = f"herdr session {name} server environment"
     socket_path = str(_session_socket(name))
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         try:
             holders = {listener.pid for listener in _darwin_bound_sockets() if str(listener.path) == socket_path}
             if len(holders) != 1:
@@ -1229,10 +2182,13 @@ def server_environment(name: str) -> dict[str, str]:
 
 
 def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
     try:
-        pane = _process_environment(_proc_root() / str(pid)).get("HERDR_PANE_ID", "")
+        environment = _process_environment(_proc_root() / str(pid))
+        if environment.get("TMUX_PANE"):
+            return NotInHerdr()
+        pane = environment.get("HERDR_PANE_ID", "")
         if not pane:
             return NotInHerdr()
         candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
@@ -1240,6 +2196,26 @@ def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
         return NotInHerdr()
     session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid, "")
     return HerdrPlace(session, pane) if session else NotInHerdr()
+
+
+def herdr_places() -> dict[int, HerdrPlace]:
+    """Every herdr process's place from one scan, by pid: herdr_place_of for many pids at once."""
+    if _platform() == "darwin":
+        return {process.pid: process.place for process in herdr_processes()}
+    try:
+        candidates = [path for path in _proc_root().iterdir() if path.name.isdecimal()]
+    except OSError:
+        return {}
+    places: dict[int, HerdrPlace] = {}
+    for pid, session in _process_sessions(candidates, _live_server_processes(candidates)).items():
+        try:
+            environment = _process_environment(_proc_root() / str(pid))
+        except OSError:
+            continue
+        pane = environment.get("HERDR_PANE_ID", "")
+        if pane and not environment.get("TMUX_PANE"):
+            places[pid] = HerdrPlace(session, pane)
+    return places
 
 
 def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
@@ -1428,6 +2404,14 @@ def _darwin_processes() -> list[_UserProcess]:
         if uid != os.getuid() or pid <= 0:
             continue
         executable = fields[3].rstrip()
+        if pid not in commands:
+            try:
+                current = run_program([os.environ.get("HERDR_PS", "ps"), "-o", "command=", "-p", str(pid)], timeout=5)
+                _require_darwin_process_read(current, pid, f"process {pid} command")
+            except _DarwinProcessGone:
+                continue
+            except (HerdrFailure, subprocess.TimeoutExpired):
+                pass
         command = commands.get(pid, "")
         arguments: ReadProcessArguments | UnreadableProcessArguments = UnreadableProcessArguments(
             f"process {pid}: arguments are unreadable or changed")
@@ -1443,7 +2427,7 @@ def _darwin_processes() -> list[_UserProcess]:
 def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | ClientsUnreadable:
     try:
         processes = _darwin_processes()
-    except (HerdrFailure, subprocess.TimeoutExpired) as error:
+    except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
         return ClientsUnreadable(str(error))
     count = 0
     for process in processes:
@@ -1456,7 +2440,9 @@ def _darwin_attached_clients(name: str) -> ClientsAttached | NoClientAttached | 
         if session and not command:
             try:
                 environment = darwin_process_environment(process.pid)
-            except (HerdrFailure, subprocess.TimeoutExpired) as error:
+            except _DarwinProcessGone:
+                continue
+            except (HerdrFailure, subprocess.TimeoutExpired, OSError) as error:
                 return ClientsUnreadable(str(error))
             session, command = _herdr_command(arguments, environment.get("HERDR_SESSION") or "default")
         if (session == name and not command) or command == ["session", "attach", name]:
@@ -1517,9 +2503,9 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
                 continue
             environment = darwin_process_environment(pid)
             pane = environment.get("HERDR_PANE_ID", "")
-            if not pane:
+            if environment.get("TMUX_PANE") or not pane:
                 continue
-            marks = {key: environment[key] for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID") if key in environment}
+            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks,
                                           Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
@@ -1528,7 +2514,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
 
 
 def herdr_processes() -> list[HerdrProcess]:
-    if _PLATFORM == "darwin":
+    if _platform() == "darwin":
         return _darwin_herdr_processes()
     processes: list[HerdrProcess] = []
     try:
@@ -1543,13 +2529,13 @@ def herdr_processes() -> list[HerdrProcess]:
                 continue
             environment = _process_environment(process)
             pane = environment.get("HERDR_PANE_ID", "")
-            if not pane:
+            if environment.get("TMUX_PANE") or not pane:
                 continue
             arguments = _process_arguments(process)
             if not arguments:
                 continue
             cwd = str(process.joinpath("cwd").resolve(strict=True))
-            marks = {key: environment[key] for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID") if key in environment}
+            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue
@@ -1569,10 +2555,10 @@ def _agent_name(name: str) -> str:
 
 
 def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
-                opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int) -> None:
-    """Start in the named session, using the pane's label as the agent label."""
+                opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int, *, agent: str) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
+    """Start the agent named `agent` in the named session.
+
+    `agent` is the full session name: a pane carries only the short tab title.
+    """
     _check_agent_arguments(kind, agent_arguments)
-    herdr = Herdr(name)
-    labels = [row.get("label") for row in herdr.panes() if row["pane_id"] == pane]
-    label = labels[0] if labels else pane
-    herdr.start_agent(label or pane, pane, kind, agent_arguments, opening, timeout_ms)
+    return Herdr(name).start_agent(agent, pane, kind, agent_arguments, opening, timeout_ms)

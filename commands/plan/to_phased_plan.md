@@ -161,9 +161,9 @@ block — nothing else. The prompt must include:
      the package name filled in (never raw cargo commands — Cargo's default
      target selection compiles a package's examples even under `-p <pkg>`,
      and the delegate must have no flag choices to make):
-     Build = `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
-     Test = `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
-     Lint = `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
+     Build = `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
+     Test = `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
+     Lint = `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`.
      <PhaseChecks/> defines the lint scope and the phase's style review in
      the unit director's main review; workers never load the guide. For
      non-Rust projects, record the exact commands the project uses (read
@@ -206,7 +206,9 @@ not codebase searching.
    - **`**Scope now:**` sets the working repo** for the early phases. When the
      placement names a worktree, the Delegation Context's paths and `verify.sh`
      package names refer to *that* checkout, not the primary — getting this wrong
-     sends every delegate to the wrong tree.
+     sends every delegate to the wrong tree. Write those paths relative to the
+     repository, never the worktree's absolute path or its branch: /unit:direct
+     reads both from git at dispatch, so a renamed worktree needs no plan edit.
    - **Open questions in the placement become phases or blockers**, never silent
      assumptions. A gate that reads "decide publish vs git-rev pin" is a decision
      the plan must surface, not resolve on its own.

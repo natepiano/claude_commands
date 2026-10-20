@@ -22,8 +22,6 @@ from typing import Literal, NotRequired, Protocol, TypedDict, cast
 
 from session_types import Session, parse_session
 from session_types import (
-    ShowrunnerFooter as ShowrunnerFooter,
-    NoFooter as NoFooter,
     TimerRestore as TimerRestore,
     CodexSessionId as CodexSessionId,
     CodexResumePicker as CodexResumePicker,
@@ -196,18 +194,17 @@ class CodexServerLeftRunning(TypedDict):
     cause: StopLeftRunningCause
 
 
-class UnitTmuxLeftRunning(TypedDict):
-    """Legacy wire form; readers normalize it to UnitSessionLeftRunning."""
-    kind: Literal["unit tmux session left running"]
+class LegacyTmuxSessionLeftRunning(TypedDict):
+    kind: Literal["legacy tmux session left running"]
     at: str
-    tmux_session: str
+    session_name: str
     cause: StopLeftRunningCause
 
 
 class UnitSessionLeftRunning(TypedDict):
     kind: Literal["unit session left running"]
     at: str
-    host: Literal["tmux", "herdr"]
+    host: Literal["herdr"]
     session_name: str
     cause: StopLeftRunningCause
 
@@ -218,7 +215,13 @@ SessionStopIssue = (
     | AccountUnreadableAtStop
     | CodexServerLeftRunning
     | UnitSessionLeftRunning
+    | LegacyTmuxSessionLeftRunning
 )
+
+
+def legacy_tmux_leftovers(record: SessionShutdown) -> list[LegacyTmuxSessionLeftRunning]:
+    """Every legacy leftover requires explicit manual cleanup, whatever its cause."""
+    return [issue for issue in record["stop_issues"] if issue["kind"] == "legacy tmux session left running"]
 
 
 class _LegacyStopClaimFailed(TypedDict):
@@ -454,6 +457,16 @@ class ProgressStep(TypedDict):
     detail: str
 
 
+class PausedSeat(TypedDict):
+    """A director's worker thread and the launcher needed to continue its task."""
+    run_dir: str
+    seat: str
+    role: str
+    thread_id: str
+    turn_live: bool
+    launcher_command: list[str]
+
+
 class SessionShutdown(TypedDict):
     move_id: NotRequired[str]
     login: str
@@ -469,6 +482,7 @@ class SessionShutdown(TypedDict):
     probe: bool
     session: Session
     workers: list[Session]
+    codex_seats: NotRequired[list[PausedSeat]]
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
@@ -490,6 +504,10 @@ class SessionShutdown(TypedDict):
     target: NotRequired[str]
     source_label: NotRequired[str]
     why: NotRequired[str]
+    # Set by rename_unit while the unit is stopped: the restart note tells the session its new names.
+    renamed: NotRequired[str]
+    # A move stopped the session mid-turn; its last tool call, or "" when the transcript showed none.
+    cut_off: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -697,23 +715,14 @@ def _conductor(value: object, place: str) -> _LegacyConductor:
     return cast(_LegacyConductor, cast(object, values))
 
 
-def _footer(value: object, place: str) -> ShowrunnerFooter | NoFooter:
-    values = _mapping(value, place)
-    kind = _kind(values, place, frozenset({"footer", "no footer"}))
-    if kind == "footer":
-        _ = _string(_required(values, "slug", place), f"{place}.slug")
-    return cast(ShowrunnerFooter | NoFooter, cast(object, values))
-
-
 def _timer(value: object, place: str) -> TimerRestore:
     values = _mapping(value, place)
     _ = _string(_required(values, "instance", place), f"{place}.instance")
     _ = _boolean(
         _required(values, "was_enabled", place), f"{place}.was_enabled"
     )
-    values["footer"] = _footer(
-        _required(values, "footer", place), f"{place}.footer"
-    )
+    # A record written while reply footers existed also has `footer`, which nothing restores now.
+    _ = values.pop("footer", None)
     return cast(TimerRestore, cast(object, values))
 
 
@@ -801,6 +810,7 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
                 "worker still live",
                 "codex server left running",
                 "unit tmux session left running",
+                "legacy tmux session left running",
                 "unit session left running",
             }
         ),
@@ -821,25 +831,19 @@ def _session_stop_issue(value: object, place: str, *, legacy: bool = False) -> S
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
-    elif kind in {"unit tmux session left running", "unit session left running"}:
-        if kind == "unit tmux session left running":
-            values = {
-                **values,
-                "kind": "unit session left running",
-                "host": "tmux",
-                "session_name": _string(
-                    _required(values, "tmux_session", place), f"{place}.tmux_session"
-                ),
-            }
-            del values["tmux_session"]
-        else:
-            _ = _string(_required(values, "session_name", place), f"{place}.session_name")
-            host = _string(_required(values, "host", place), f"{place}.host")
-            if host not in {"tmux", "herdr"}:
-                raise InvalidRecord(f"{place}.host is invalid")
+    elif kind in {"unit tmux session left running", "unit session left running", "legacy tmux session left running"}:
+        key = "tmux_session" if kind == "unit tmux session left running" else "session_name"
+        name = _string(_required(values, key, place), f"{place}.{key}")
+        host = "tmux" if kind != "unit session left running" else _string(
+            _required(values, "host", place), f"{place}.host")
+        if host not in {"tmux", "herdr"}:
+            raise InvalidRecord(f"{place}.host is invalid")
         cause = _string(_required(values, "cause", place), f"{place}.cause")
         if cause not in {"stop not confirmed", "owner identity lost"}:
             raise InvalidRecord(f"{place}.cause is invalid")
+        if host == "tmux":
+            values = {"kind": "legacy tmux session left running", "at": values["at"],
+                      "session_name": name, "cause": cause}
     return cast(SessionStopIssue, cast(object, values))
 
 
@@ -1118,6 +1122,18 @@ def _shutdown_request_fields(values: dict[str, object], place: str) -> None:
         raise InvalidRecord(f"{place}.then is invalid")
 
 
+def _paused_seat(value: object, place: str) -> PausedSeat:
+    fields = _mapping(value, place)
+    return PausedSeat(
+        run_dir=_string(_required(fields, "run_dir", place), f"{place}.run_dir"),
+        seat=_string(_required(fields, "seat", place), f"{place}.seat"),
+        role=_string(_required(fields, "role", place), f"{place}.role"),
+        thread_id=_string(_required(fields, "thread_id", place), f"{place}.thread_id"),
+        turn_live=_boolean(_required(fields, "turn_live", place), f"{place}.turn_live"),
+        launcher_command=_strings(fields.get("launcher_command", []), f"{place}.launcher_command"),
+    )
+
+
 def _session_shutdown(value: object, place: str) -> SessionShutdown:
     values = _mapping(value, place)
     _shutdown_request_fields(values, place)
@@ -1134,7 +1150,7 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")
         values["target"] = canonical_label(target)
-    for field in ("source_label", "why"):
+    for field in ("source_label", "why", "renamed", "cut_off"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (
@@ -1149,6 +1165,11 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     if not isinstance(probe, bool):
         raise InvalidRecord(f"{place}.probe must be a boolean")
     values["probe"] = probe
+    if "codex_seats" in values:
+        values["codex_seats"] = [
+            _paused_seat(seat, f"{place}.codex_seats[{index}]")
+            for index, seat in enumerate(_items(values["codex_seats"], f"{place}.codex_seats"))
+        ]
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
@@ -1481,6 +1502,36 @@ def archive_session(login: str, session_id: str) -> None:
         os.replace(path, target)
 
 
+def taken_over(saved: SessionShutdown) -> bool:
+    """Whether a later request on any account holds this session, live or archived (a stop, a forget, a new move)."""
+    root = _state_root()
+    if not _record_directory(root):
+        return False
+    since = datetime.fromisoformat(saved["requested_at"])
+    session_id = saved["session"]["session_id"]
+    name = _session_filename(session_id)
+
+    def later(requested_at: str) -> bool:
+        try:
+            return datetime.fromisoformat(requested_at) > since
+        except ValueError:
+            return False
+
+    if any(item["session"]["session_id"] == session_id and later(item["requested_at"]) for item in all_session_records()):
+        return True
+    for directory in root.iterdir():
+        history = directory / "history"
+        try:
+            if _is_root_metadata(directory.name) or not _record_directory(directory) or not _record_directory(history):
+                continue
+            names = [path.name for path in history.iterdir()]
+        except (OSError, ValueError):
+            continue
+        if any(entry.endswith("-" + name) and later(entry[:-len(name) - 1]) for entry in names):
+            return True
+    return False
+
+
 def restarted_history() -> list[SessionShutdown]:
     """Read completed per-session history once, ignoring each unreadable entry.
 
@@ -1790,6 +1841,34 @@ def forget_session(login: str, session_id: str, machine: str) -> SessionForgotte
         if saved["machine"].casefold() != machine.casefold() or saved["progress"]["kind"] not in {
             "stopped", "already gone", "process identity lost", "restart failed", "manual restart",
         }:
+            return SessionRetained(saved)
+        history = directory / "history"
+        _ = _record_directory(history, create=True)
+        target = history / f"{saved['requested_at']}-{path.name}"
+        if _lstat(target) is not None:
+            raise InvalidRecord(f"{target} already exists")
+        os.replace(path, target)
+        return SessionForgotten(saved)
+
+
+def forget_failed_restart(
+    login: str, session_id: str, machine: str, expected_request_id: str,
+) -> SessionForgotten | SessionRetained | NoShutdown:
+    """Archive only the expected request's failed restart under the account lock."""
+    if _existing_account_directory(login) is None:
+        return NoShutdown()
+    _ = migrate(login)
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "sessions" / _session_filename(session_id)
+        if not _regular_record(path):
+            return NoShutdown()
+        saved = _session_shutdown(_read_json(path), str(path))
+        _check_account(login, saved["login"], path)
+        if saved["session"]["session_id"] != session_id:
+            raise InvalidRecord(f"{path} is used by a different session id")
+        if (saved["machine"].casefold() != machine.casefold()
+                or saved["request_id"] != expected_request_id
+                or saved["progress"]["kind"] != "restart failed"):
             return SessionRetained(saved)
         history = directory / "history"
         _ = _record_directory(history, create=True)
@@ -2212,15 +2291,26 @@ def snapshot_restore_record(snapshot: RecoverySnapshot, entry: SnapshotClaudeSes
     return _session_shutdown(saved, "recovery record")
 
 
+def snapshot_supersedes_record(snapshot: RecoverySnapshot, existing: SessionShutdown) -> bool:
+    """A later snapshot replaces older restore intent, including an earlier recovery."""
+    origin = existing["requested_by"]
+    requested_at = origin["taken_at"] if origin["kind"] == "snapshot" else existing["requested_at"]
+    return datetime.fromisoformat(snapshot["taken_at"]) > datetime.fromisoformat(requested_at)
+
+
 def materialize_snapshot(snapshot: RecoverySnapshot, entry: SnapshotClaudeSession) -> SessionShutdown:
-    """Persist a recovery request before launch; an existing request takes precedence."""
+    """Persist recovery before launch, retaining an equally recent or newer request."""
     saved = snapshot_restore_record(snapshot, entry)
     login, identity = saved["login"], saved["session"]["session_id"]
     with launch_barrier():
         with _session_store_lock(login, create=True) as directory:
             for existing in _session_records_in_directory(directory, login):
                 if existing["session"]["session_id"] == identity:
-                    return existing
+                    if not snapshot_supersedes_record(snapshot, existing):
+                        return existing
+                    _ = _record_directory(directory / "sessions", create=True)
+                    _write_record(directory / "sessions" / _session_filename(identity), saved)
+                    return saved
             target = directory / "sessions" / _session_filename(identity)
             _ = _record_directory(target.parent, create=True)
             if _regular_record(target):

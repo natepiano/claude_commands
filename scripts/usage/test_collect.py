@@ -41,7 +41,7 @@ MAC_CHILD = "a0000000000000001"
 READABLE_SESSION = "11223344-3333-4333-8333-333333333333"
 ACTIVITY_THREAD = "a1b2c3d4-5555-4555-8555-555555555555"
 ACTIVITY_SESSION = "a1b2c3d4-6666-4666-8666-666666666666"
-BOARD = "bash ~/.claude/scripts/delegate/board.sh"
+BOARD = "bash ~/.claude/scripts/direct/board.sh"
 # One request per entry, in time order: (activity, wait_action).
 CODEX_ACTIVITIES: list[tuple[object, ...]] = [
     ("wait", "empty write_stdin"), ("status", None), ("wait", "sleep tool"),

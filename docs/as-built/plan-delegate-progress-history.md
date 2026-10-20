@@ -1,6 +1,6 @@
 # Plan-delegate progress history
 
-`scripts/delegate/progress_history.py` is the shared progress recorder for
+`scripts/direct/progress_history.py` is the shared progress recorder for
 Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
@@ -23,7 +23,7 @@ Schema version 1 records these event types:
 - `progress_reported`
 - `eta_stated`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
-  `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
+  `finding_gate`, appended by `scripts/direct/findings.py` to the same stream
 
 Every event repeats its query dimensions: run and phase identity, worktree,
 branch, working directory, plan doc, project/phase/pass timestamps, current pass
@@ -39,10 +39,13 @@ calibration evidence used for that report. The phase decision also repeats the
 historical bias, suggested adjustment, and chosen adjustment so downstream
 analysis does not need to unpack the calibration snapshot.
 
-`eta_stated` records the active phase's promised arrival as epoch `eta_at` and
-its `basis`. A ranged statement also carries epoch `eta_earliest_at` and
-`eta_latest_at`; an exact statement carries neither range key. The event is the
-only recorder copy of a stated ETA. The live state does not duplicate it.
+`eta_stated` records a phase's promised arrival as epoch `eta_at`, its
+`basis`, and `eta_phase_id`, the phase the promise names: `--phase-id` when
+given, else the active phase. Readers place the promise by `eta_phase_id`,
+never by `phase_id`, which names the phase active when it was recorded. A ranged
+statement also carries epoch `eta_earliest_at` and `eta_latest_at`; an exact
+statement carries neither range key. The event is the only recorder copy of a
+stated ETA. The live state does not duplicate it.
 
 ## Project clock
 
@@ -158,7 +161,7 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/delegate/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
+`scripts/direct/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
 `FIX_PASS < 10` counter, which could not converge: the re-review after each fix
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.
@@ -239,8 +242,8 @@ progress_history.py finish-pass ...       # launcher only, or --orphaned-launche
 progress_history.py start-activity --session-dir <dir> --label <label> --activity <text>
 progress_history.py finish-activity --session-dir <dir> [--status completed|error|canceled|interrupted] [--result <outcome>]
 progress_history.py calibrate --session-dir <dir> --candidate-percent <N>
-progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>]
-progress_history.py eta --session-dir <dir> --time <YYYY-MM-DDTHH:MM> [--earliest <YYYY-MM-DDTHH:MM> --latest <YYYY-MM-DDTHH:MM>] --basis <text>
+progress_history.py progress --session-dir <dir> --project-raw-percent <N> --project-percent <N> --phase-raw-percent <N> --phase-percent <N> --cap-stage <stage> --activity <text> [--phase-override-reason <evidence>] [--tables]
+progress_history.py eta --session-dir <dir> --time <t> [--phase-id <id>] [--earliest <t> --latest <t>] --basis stated|checkpoint|eta-command
 progress_history.py finish-phase --session-dir <dir> --status completed|stopped|error [--phase-id <id>] [--finished-at <ISO with zone>]
 progress_history.py finish-run ...
 progress_history.py review-trial --session-dir <dir> [--phase-id <id>]
@@ -274,11 +277,17 @@ neither the command's output nor its exit status. Plans without a
 `> **Production:` line skip the subprocess. [Phase tables](phase-tables.md)
 covers the note, the table built from these events and the hook's limits.
 
-`eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`), requires an active phase, appends
-one `eta_stated` event, and prints `ETA recorded: <HH:MM zone>`. It exits 2 on
-a malformed or past time, a time the local clock skips, a range that does not
-enclose the target, one range end alone, a blank basis, or no active phase.
-`/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the process `TZ` is not read.
+`eta` reads its times in the user's zone setting (`scripts/lib/user_zone.py`):
+`<t>` is `HH:MM` (today) or `YYYY-MM-DDTHH:MM`, so a later-day ETA needs the
+full date. It appends one `eta_stated` event for `--phase-id`, else the active
+phase, and prints `ETA recorded: <HH:MM zone>`; the unit director records every
+ETA before stating it and states that printed time. `--basis` is `checkpoint`
+(the checkpoint notice's next-phase ETA), `eta-command` (`/unit:eta`,
+`/unit:eta_breakdown`) or `stated` (any other message). It exits 2 on a
+malformed or past time, a time the local clock skips, a range that does not
+enclose the target, one range end alone, a blank basis, or no active phase and
+no `--phase-id`. `/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the
+process `TZ` is not read.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
 `PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
@@ -292,16 +301,42 @@ no pass: the unit director's `UX review` activity carries that time. A pooled
 review records its pass under the slot `pool_<reviewer>`
 (`docs/as-built/review-pool.md`).
 
-`progress` writes the event and prints two tables under a line naming the
-worktree, and the branch when it differs. The line carries no position: how
-far through the plan the run is belongs to the first table's Phases column,
-and a plan with deferred earlier phases or retired ids puts the active phase
-at an ordinal that matches neither number. The first table holds the clocks: a project
-row and a phase row carrying the reported percentage, elapsed, ETA, unchanged,
-— when the plan's headings can be counted — how many phases are done, and last
-the best and worst arrival the percentage still allows.
+`progress` writes the event and prints a short report under a line naming the
+worktree, and the branch when it differs: the phase heading, one ETA line, the
+verification block's gate notes when there is one, one `- **Agent N**` line per
+worker, less a worker whose stretch is `done` with its window and board line both
+over 10 minutes old (`FINISHED_WORKER_SECONDS`), the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
+In the dual layout the clocks table prints above the phase heading in every
+report. `--tables` adds the round table with its `Earlier:` line under the ETA
+line. The legacy layout prints the clocks table only under `--tables`.
+`/unit:report tables` passes `--tables`; ordinary reports do
+not. The
+worktree line carries no position: how far through the plan the run is belongs
+to the clocks table's Phases column, and a plan with deferred earlier phases or
+retired ids puts the active phase at an ordinal that matches neither number.
+The Phases count adds the run's active phase when the run's own plan has no
+heading for it, so "Phase 32" never sits beside "of 31". `start-phase` refuses
+such a phase: an id other than `ad hoc` that the run's plan does not list exits
+and names the heading to add. hana cables, 2026-10-19: Phase 32's heading was
+only in a scratch clone, and the report read "19 of 31 done" beside "Phase 32".
 
-The second is the round table, under the phase heading: one row per round,
+The ETA line comes from `_phase_eta_line(session_dir, phase_number)`, which
+reads only the reported phase's own row and gate from
+`phase_table.build_plan`. Its forms are `ETA HH:MM (first HH:MM, +H:MM, moved
+N×, …)`, `ETA HH:MM (on its first ETA, …)`, a leading `passed` when an open
+phase is overdue, fix rounds as `N fix rounds`, `+ 1 running` or `1 fix round
+running`, `gated until Wed 22 Oct 11:47`, `gated by <gate>: <Waits on>`, and
+`ETA unavailable` when no plan, state, row or promise exists; a promise on
+another local day shows weekday and date. The ETA is the latest stated promise,
+never the schedule end an overdue phase is advanced to. The legacy (non-dual)
+layout prints its own header lines with this ETA line after the phase line.
+
+The clocks table holds a project row and a phase row carrying the reported
+percentage, elapsed, ETA, unchanged, — when the plan's headings can be counted
+— how many phases are done, and last the best and worst arrival the
+percentage still allows.
+
+The round table sits under the phase heading: one row per round,
 oldest first, led by `Stage`, `Start` and `Elapsed`, then a column for each
 worker — `Agent 1` and `Agent 2`, the `impl` and `test` slots in that order, then
 one `Agent N` per extra worker (`review`, `review2`, `fix2`, …) in the order workers
@@ -388,11 +423,17 @@ events, `board.sh` and the recorder read the same clock: both honour
 outside a ledger stamped from an override and drop every role change out of
 every round.
 
-Under the table sits one line per worker — `- **Agent 1** (impl) <model> <effort> · 3m ago ·
-rerunning the scoped test` — naming the delegate in it for the round in flight
-and the last thing that worker said on the board, with its age. It is one answer
-per phase rather than per row, so a column repeating the same values down every
-row would crowd out the roles for nothing. The words are the worker's own: the
+Every report carries one line per worker. In the short report it reads
+`- **Agent 1** (impl) fix 11m running · <model> <effort> · 3m ago · rerunning
+the scoped test`: slot, role, elapsed and state from `_current_worker_cells`,
+the delegate, and the last thing that worker said on the board, with its age.
+`_current_worker_windows` picks each slot's live window, else its most recent
+finished one, so the line holds when the unit director opens an activity of its
+own. Under `--tables` the line drops the role cell, which the round table
+carries, and names the delegate only for a window still open:
+`- **Agent 1** (impl) <model> <effort> · 3m ago · rerunning the scoped test`.
+It is one answer per phase rather than per row, so a column repeating the same
+values down every row would crowd out the roles for nothing. The words are the worker's own: the
 launcher prefixes its exit posts `launcher:`, and the note keeps the worker's
 latest unprefixed line behind the launcher's kind — `done: hana_catalyst tests
 240 passed` rather than the launcher's `done:` line on every worker. A worker that never
@@ -437,9 +478,18 @@ activity's name is its `--label`, and its `Delegate` cell is empty: the unit
 director ran that window itself. Both identity columns are read per window rather
 than per run, and `start-pass` and `start-activity` re-detect the unit director
 as they open, so a unit director that changes model or effort part way through
-shows the change on the rows after it. Detection that comes back unknown leaves
-the stored identity alone, because a window that cannot answer must not erase
-the answer already recorded.
+shows the change on the rows after it. Windows are also opened from inside
+workers: a Codex worker inherits the director's `CLAUDE_CODE_SESSION_ID` but
+detects as its own `CODEX_THREAD_ID`, and a Claude worker is a Claude Code session
+of its own. So `_refresh_main_identity` replaces `main_agent` only when the
+detected session is the run's director (`unit_runs.director`, the run folder's
+`director` file, else the `run_started` event's session), else the stored
+identity's session; with neither known it takes any detection. The director is
+read from the run folder rather than from `main_agent` because until 2026-10-17
+every window rewrote it, and three live runs then carried a worker's thread there;
+the director's next window repairs such a run. Detection that comes back unknown
+leaves the stored identity alone, because a window that cannot answer must not
+erase the answer already recorded.
 
 A round's result is every finding the ledger stamped with that round: verdicts
 make it `N fixed` plus `M open` where those apply, findings opened make it
@@ -455,17 +505,21 @@ what does the attributing there — the unit director opens, dispatches, and set
 findings in the gap after a window closes, not while it runs — and it holds
 because those windows are sequential. `timeline` attributes every row this way.
 
-Project and phase percentages have independent unchanged timers. Each also
-carries an ETA: the elapsed clock extended across what the displayed percentage
-says remains, added to the current time, and printed as an arrival —
-`today HH:MM`, `tomorrow HH:MM`, or `YYYY-MM-DD HH:MM` further out, always on a
-24-hour clock. A remaining duration has to be added to the clock by hand every
-time it is read, and the answer changes with every report; an arrival is that
-addition already done. It is omitted at 0 and 100, where there is no rate to
-extend or nothing left to extend it over. Because the projection reads the same
-capped number the row displays, it never contradicts the percentage beside it,
-and it inherits that number's accuracy: derived phase counts for the project,
-the reporter's estimate for the phase.
+Project and phase percentages have independent unchanged timers. Each row
+also carries an ETA, printed as an arrival — `today HH:MM`, `tomorrow HH:MM`,
+or `YYYY-MM-DD HH:MM` further out, always on a 24-hour clock. A remaining
+duration has to be added to the clock by hand every time it is read, and the
+answer changes with every report; an arrival is that addition already done.
+The phase row's ETA is the elapsed clock extended across what the displayed
+percentage says remains, added to the current time. It is omitted at 0 and
+100, where there is no rate to extend or nothing left to extend it over.
+Because the projection reads the same capped number the row displays, it never
+contradicts the percentage beside it, and it inherits the reporter's estimate's
+accuracy. The project row's ETA is the plan chain's finish
+(`_project_chain_eta`, from `phase_table.build_plan`), the same finish the
+phase table and vault note show: the open phase ends at its latest stated
+promise and later phases are predicted from it. Under a gate with no clear
+time it reads `after G<k>`.
 
 `eta_band_seconds` names both outcomes. `EtaBand` carries the projected
 `remaining`, `earliest`, and `latest` seconds in that order;
@@ -480,58 +534,48 @@ a plausible distance each way, which makes the band asymmetric on purpose: at
 20% a few points of optimism cost far more hours than the same few points of
 pessimism save, and a symmetric band would hide exactly that. The distance is
 the phase estimate's own measured error when a calibration cleared its sample
-floor, and ten percentage points otherwise; the project row always takes the
-default, where it reads as the phases left being worth more or less time than
-their share of the count. Neither end may stray past double or half the reported
-rate whatever the measured error says — a spread wider than the percentage
-itself would otherwise push the pessimistic end to 1% and quote an arrival
-ninety-nine times the elapsed clock. Both cells are blank wherever the ETA is.
+floor, and ten percentage points otherwise. Neither end may stray past double or
+half the reported rate whatever the measured error says — a spread wider than
+the percentage itself would otherwise push the pessimistic end to 1% and quote
+an arrival ninety-nine times the elapsed clock. Both cells are blank wherever
+the ETA is. The project row's low and high shift the chain's finish by the
+open phase's own band: its projection's band, or the range of its stated
+promise. With neither, or under a gate with no clear time, both read `—`.
 
 An active phase with no pass or activity open — reviews closed, repair writers
-not started — still gets every section. `progress` reads the phase's last
-`progress_reported` event and prints the clocks table from it: that call's
+not started — still gets every section. `progress` (`_print_last_recorded`)
+reads the phase's last `progress_reported` event and prints the short report
+from it, with the clocks table: that call's
 percentages, unchanged clocks, and calibration spread, with elapsed and ETA
 measured at the event's timestamp and each arrival's day named from now. The
 `Phases` cell counts the plan as it stands. A `*Percentages and clocks as of <time>,
-the last progress report.*` line above the table names that moment, dated only
+the last progress report.*` line under the worktree line names that moment, dated only
 when it falls on another day. A phase never reported reads as of its start: 0
 for the phase, and the project at the plan's phase count held below 100, or the
-last reported project percent when the plan cannot be counted. The round table
-is the phase's windows as they stand, and a phase with none yet draws one
-`no stage yet` row. In place of the activity sentence goes `No pass or activity
+last reported project percent when the plan cannot be counted. Under `--tables`
+the round table is the phase's windows as they stand, and a phase with none yet
+draws one `no stage yet` row. In place of the stage line goes `No pass or activity
 is open.` and the warning that the records say nothing about whether a worker
 is still running. The percent options are neither required nor checked. The
-call appends no event and opens no window; like every `progress` call it
-restarts the notifier clock, and it writes state only to resolve a missing
-project clock.
+call appends no event and opens no window, and it writes state only to resolve
+a missing project clock.
 A missing phase, or a closed phase with no open activity, is refused with
 `No active phase to report`. When the last phase is closed and an activity is
-still open, `progress` prints both tables from that phase's last recorded values
-and shows the activity as the running row.
+still open, `progress` prints the short report from that phase's last recorded
+values, clocks table included, and shows the activity as the stage line. The
+round table needs `--tables`.
 
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the
 fact — how many fix passes a phase took, how long each review ran — without
 reading the event stream by hand.
 
-The last line is the wall clock: `now <local timestamp>` and, when it can be
-resolved, `next report <time>` — the date is repeated there only when the next
-tick lands on a later day. The elapsed and unchanged columns are durations, which
-say how long but never when, and an ETA says when the work lands rather than when
-this report was made; this line is what tells a reader whether the report in
-front of them is current and how long until the next one. The next tick comes
-from the Claude unit's `unit-<run id>` notifier instance (`delegate-<run id>` for a run started before the folder rename): every `progress`
-call runs `notifier.sh restart` on it as its first act, before it reads state,
-and a rendered report names the `next_due` that restart prints. A refused call
-(no active phase, a failed percent check, a missing override reason or
-`--cap-stage`) keeps its message and exit status but still restarts the clock,
-so the next tick lands one interval after the call. With no instance, or a
-restart that fails, the recorder falls
-back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
-plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
-the Codex poll timeout and the default interval of a Claude unit's notifier
-instance; `/unit:report_interval` changes one run's interval. An unusable interval
-drops the clause instead of stopping the header.
+The last line is the wall clock: `now <local timestamp>`. The elapsed and
+unchanged columns are durations, which say how long but never when, and an ETA
+says when the work lands rather than when this report was made; this line is what
+tells a reader whether the report in front of them is current. Until 2026-10-19
+it also named the next scheduled report; reports now come only when asked, so the
+recorder restarts no notifier and names no next report.
 
 `aggregate` calibrates phase estimates by
 raw percentage and pass kind and emits raw/suggested/reported error plus

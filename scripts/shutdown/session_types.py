@@ -1,7 +1,6 @@
 """Session and recovery data shared by observation and shutdown storage."""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Literal, NotRequired, TypedDict, cast
 
@@ -24,45 +23,21 @@ class UnitHost(TypedDict):
     unit: str
     doc: str
     session_name: str
-    session_host: Literal["tmux", "herdr"]
+    session_host: Literal["herdr"]
     plan: UnitPlan
 
 
-class TmuxPane(TypedDict):
-    kind: Literal["pane"]
-    pane_id: str
-    pane_pid: int
+class LegacyTmuxUnitHost(TypedDict):
+    kind: Literal["legacy tmux unit"]
+    production: str
+    unit: str
+    doc: str
+    session_name: str
 
 
-class PaneNotRecorded(TypedDict):
-    kind: Literal["not recorded"]
-
-
-class TmuxSessionId(TypedDict):
-    kind: Literal["session id"]
-    session_id: str
-
-
-class TmuxSessionIdNotRecorded(TypedDict):
-    kind: Literal["not recorded"]
-
-
-class TmuxServer(TypedDict):
-    kind: Literal["server"]
-    pid: int
-    started_at: int
-
-
-class TmuxServerNotRecorded(TypedDict):
-    kind: Literal["not recorded"]
-
-
-class TmuxHost(TypedDict):
-    kind: Literal["tmux"]
-    tmux_session: str
-    session_ref: TmuxSessionId | TmuxSessionIdNotRecorded
-    server: TmuxServer | TmuxServerNotRecorded
-    pane: TmuxPane | PaneNotRecorded
+class LegacyTmuxHost(TypedDict):
+    kind: Literal["legacy tmux"]
+    session_name: str
 
 
 class HerdrHost(TypedDict):
@@ -110,10 +85,10 @@ class UnknownHost(TypedDict):
     kind: Literal["unknown"]
 
 
-Host = UnitHost | TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
+Host = UnitHost | LegacyTmuxUnitHost | LegacyTmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
 
 
-SessionHost = TmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
+SessionHost = LegacyTmuxHost | HerdrHost | WindowHost | TerminalHost | UnknownHost
 
 
 class OnBranch(TypedDict):
@@ -215,7 +190,7 @@ class ShowrunnerSession(SessionFields):
 
 class UnitSession(SessionFields):
     kind: Literal["unit"]
-    host: UnitHost
+    host: UnitHost | LegacyTmuxUnitHost
 
 
 class WorkerSession(SessionFields):
@@ -232,19 +207,9 @@ class TopLevelSession(SessionFields):
 Session = ShowrunnerSession | UnitSession | WorkerSession | TopLevelSession
 
 
-class ShowrunnerFooter(TypedDict):
-    kind: Literal["footer"]
-    slug: str
-
-
-class NoFooter(TypedDict):
-    kind: Literal["no footer"]
-
-
 class TimerRestore(TypedDict):
     instance: str
     was_enabled: bool
-    footer: ShowrunnerFooter | NoFooter
 
 
 class CodexSessionId(TypedDict):
@@ -401,87 +366,24 @@ def _parse_desktop(value: object, place: str) -> Desktop:
     raise InvalidInventory(f"{place}.kind is invalid")
 
 
-def _parse_tmux_pane(value: object, place: str) -> TmuxPane | PaneNotRecorded:
-    data = wire_object(value, place)
-    kind = wire_kind(data, place)
-    if kind == "pane":
-        return {
-            "kind": "pane",
-            "pane_id": wire_string(
-                wire_required(data, "pane_id", place), f"{place}.pane_id"
-            ),
-            "pane_pid": wire_integer(
-                wire_required(data, "pane_pid", place), f"{place}.pane_pid"
-            ),
-        }
-    if kind == "not recorded":
-        return {"kind": "not recorded"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_tmux_session_ref(
-    value: object, place: str,
-) -> TmuxSessionId | TmuxSessionIdNotRecorded:
-    data = wire_object(value, place)
-    kind = wire_kind(data, place)
-    if kind == "session id":
-        session_id = wire_string(
-            wire_required(data, "session_id", place), f"{place}.session_id"
-        )
-        if re.fullmatch(r"\$[0-9]+", session_id) is None:
-            raise InvalidInventory(f"{place}.session_id is invalid")
-        return {"kind": "session id", "session_id": session_id}
-    if kind == "not recorded":
-        return {"kind": "not recorded"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
-def _parse_tmux_server(
-    value: object, place: str,
-) -> TmuxServer | TmuxServerNotRecorded:
-    data = wire_object(value, place)
-    kind = wire_kind(data, place)
-    if kind == "server":
-        if "pid" not in data:
-            return {"kind": "not recorded"}
-        return {
-            "kind": "server",
-            "pid": wire_integer(data["pid"], f"{place}.pid"),
-            "started_at": wire_integer(
-                wire_required(data, "started_at", place), f"{place}.started_at"
-            ),
-        }
-    if kind == "not recorded":
-        return {"kind": "not recorded"}
-    raise InvalidInventory(f"{place}.kind is invalid")
-
-
 def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
     data = wire_object(value, place)
     kind = wire_kind(data, place)
-    if kind == "unit" and allow_unit:
+    if kind in {"unit", "legacy tmux unit"} and allow_unit:
         name_key = "tmux_session" if "tmux_session" in data and "session_name" not in data else "session_name"
         session_host = data.get("session_host", "tmux")
         if session_host not in ("tmux", "herdr"):
             raise InvalidInventory(f"{place}.session_host is invalid")
-        return {
-            "kind": "unit",
-            "production": wire_string(
-                wire_required(data, "production", place), f"{place}.production"
-            ),
-            "unit": wire_string(
-                wire_required(data, "unit", place), f"{place}.unit"
-            ),
-            "doc": wire_string(wire_required(data, "doc", place), f"{place}.doc"),
-            "session_name": wire_string(
-                wire_required(data, name_key, place),
-                f"{place}.{name_key}",
-            ),
-            "session_host": session_host,
-            "plan": _parse_unit_plan(
-                wire_required(data, "plan", place), f"{place}.plan"
-            ),
-        }
+        production = wire_string(wire_required(data, "production", place), f"{place}.production")
+        unit = wire_string(wire_required(data, "unit", place), f"{place}.unit")
+        doc = wire_string(wire_required(data, "doc", place), f"{place}.doc")
+        name = wire_string(wire_required(data, name_key, place), f"{place}.{name_key}")
+        if session_host == "tmux" or kind == "legacy tmux unit":
+            return LegacyTmuxUnitHost(kind="legacy tmux unit", production=production,
+                                     unit=unit, doc=doc, session_name=name)
+        return UnitHost(kind="unit", production=production, unit=unit, doc=doc,
+                        session_name=name, session_host="herdr",
+                        plan=_parse_unit_plan(wire_required(data, "plan", place), f"{place}.plan"))
     if kind == "herdr":
         presentation = wire_string(data.get("presentation", "detached"), f"{place}.presentation")
         if presentation not in {"attached window", "detached"}:
@@ -496,30 +398,10 @@ def _parse_host(value: object, place: str, allow_unit: bool) -> Host:
             ),
             "presentation": cast(Literal["attached window", "detached"], presentation),
         }
-    if kind == "tmux":
-        pane: TmuxPane | PaneNotRecorded = (
-            _parse_tmux_pane(data["pane"], f"{place}.pane")
-            if "pane" in data
-            else {"kind": "not recorded"}
-        )
-        return {
-            "kind": "tmux",
-            "tmux_session": wire_string(
-                wire_required(data, "tmux_session", place),
-                f"{place}.tmux_session",
-            ),
-            "pane": pane,
-            "session_ref": (
-                _parse_tmux_session_ref(data["session_ref"], f"{place}.session_ref")
-                if "session_ref" in data
-                else {"kind": "not recorded"}
-            ),
-            "server": (
-                _parse_tmux_server(data["server"], f"{place}.server")
-                if "server" in data
-                else {"kind": "not recorded"}
-            ),
-        }
+    if kind in {"tmux", "legacy tmux"}:
+        key = "tmux_session" if kind == "tmux" else "session_name"
+        return LegacyTmuxHost(kind="legacy tmux", session_name=wire_string(
+            wire_required(data, key, place), f"{place}.{key}"))
     if kind in {"ghostty", "zed"}:
         window = {
             "kind": kind,
@@ -722,9 +604,9 @@ def parse_session(value: object, place: str, *, require_updated_at: bool = False
     host = _parse_host(
         wire_required(data, "host", place), f"{place}.host", kind == "unit"
     )
-    if kind == "unit" and host["kind"] != "unit":
+    if kind == "unit" and host["kind"] not in {"unit", "legacy tmux unit"}:
         raise InvalidInventory(f"{place}.host.kind is invalid")
-    if kind != "unit" and host["kind"] == "unit":
+    if kind != "unit" and host["kind"] in {"unit", "legacy tmux unit"}:
         raise InvalidInventory(f"{place}.host.kind is invalid")
     parsed["host"] = host
     if kind == "showrunner":

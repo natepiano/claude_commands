@@ -16,12 +16,9 @@ from pathlib import Path
 from dailies_input import (ClaudeNotRunning, Decision, SessionGone, StatusBlock, StillWaiting, UnitRow,
                            status_blocks)
 from unit_lookup import UnitState
-import fake_tmux
-from fake_tmux import FakeSession
-from fake_herdr import CommandResponse, herdr_listener
-from herdr import SessionEntry, SessionListResult
+import fake_unit_host
+from fake_unit_host import HostedUnit
 from sessions import SessionRecord
-from test_session_pane import tmux_adapter
 
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
@@ -45,7 +42,6 @@ class UnitStatusTests(unittest.TestCase):
         panes: tuple[dict[str, str], ...],
         units: tuple[str, ...] = ("hook",),
         retired_units: tuple[str, ...] = (),
-        herdr_units: tuple[str, ...] = (),
         stopped_units: tuple[str, ...] = (),
         missing_units: tuple[str, ...] = (),
         unreadable_units: tuple[str, ...] = (),
@@ -77,7 +73,6 @@ exit "$NOTIFIER_HEALTH_EXIT"
             call_log = root / "notifier_calls"
             records = root / "sessions"
             records.mkdir()
-            state = root / "tmux.json"
             responses_file = root / "herdr-responses.json"
             environment = {
                 **os.environ,
@@ -90,19 +85,16 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 "NOTIFIER_HEALTH_TEXT": health_text,
                 "NOTIFIER_HEALTH_EXIT": str(health_exit),
                 "NOTIFIER_SESSIONS_DIR": str(records),
-                "UNIT_LOOKUP_TMUX": tmux_adapter(root),
-                "FAKE_PANE_LOG": str(root / "tmux.log"),
-                "FAKE_TMUX_STATE": str(state),
                 "HERDR_BIN": str(SCRIPT.parent.parent / "herdr" / "fake_herdr.py"),
                 "HERDR_PROC": str(root / "proc"),
+                "HERDR_PLATFORM": "linux",
                 "FAKE_HERDR_LOG": str(root / "herdr.jsonl"),
                 "FAKE_HERDR_RESPONSES": str(responses_file),
             }
-            tmux_sessions: dict[str, FakeSession] = {}
-            native_sessions: list[SessionEntry] = []
-            responses: dict[str, CommandResponse] = {"default": {"code": 1, "stdout": ""}}
+            pids: dict[str, int] = {}
+            _ = responses_file.write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
             rows: list[str] = []
-            for index, unit in enumerate(units, start=1):
+            for unit in units:
                 worktree = root / "worktrees" / unit
                 worktree.mkdir(parents=True)
                 _ = (worktree / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
@@ -110,24 +102,6 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 rows.append(f"| {unit} | {plan} | {worktree} | {unit} | — | — |")
                 if unit in missing_units:
                     continue
-                pane = f"w{index}:p1" if unit in herdr_units else f"%{index}"
-                marks = {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit}
-                if unit in herdr_units:
-                    native_sessions.append(SessionEntry(name=unit, running=True, default=False,
-                        session_dir="/fixture", socket_path="/fixture/sock"))
-                    server = root / "proc" / "991000"
-                    server.mkdir(parents=True, exist_ok=True)
-                    _ = (server / "cmdline").write_bytes(f"herdr\0--session\0{unit}\0server\0".encode())
-                    herdr_listener(root / "proc", 991000, unit, environment)
-                    process = root / "proc" / str(os.getpid())
-                    process.mkdir(parents=True, exist_ok=True)
-                    _ = (process / "cmdline").write_bytes(b"claude\0")
-                    _ = (process / "stat").write_text(f"{os.getpid()} (fixture) S 991000 0 0")
-                    _ = (process / "environ").write_bytes("\0".join(
-                        f"{key}={value}" for key, value in {**marks, "HERDR_PANE_ID": pane}.items()).encode())
-                    (process / "cwd").symlink_to(root)
-                else:
-                    tmux_sessions[f"${index}"] = FakeSession(label=f"label-of-{unit}", panes=[pane], env=marks)
                 if unit not in stopped_units:
                     address = root / f"{unit}.sock"
                     held = socket.socket(socket.AF_UNIX)
@@ -136,13 +110,12 @@ exit "$NOTIFIER_HEALTH_EXIT"
                     session_id = f"{SESSION_ID}-{unit}"
                     if marker is not None:
                         _ = (active_dir / session_id).write_text(marker, encoding="utf-8")
-                    record = SessionRecord(pid=os.getpid(), sessionId=session_id, name=f"claude-{unit}",
+                    pids[unit] = fake_unit_host.live_pid(self)
+                    record = SessionRecord(pid=pids[unit], sessionId=session_id, name=f"claude-{unit}",
                         messagingSocketPath=str(address), updatedAt=1,
-                        tmux="" if unit in herdr_units else f"renamed:@1.{pane}", formerNames=[])
+                        tmux="", formerNames=[])
                     _ = (records / f"{unit}.json").write_text(
                         "{" if unit in unreadable_units else json.dumps(record))
-            responses["--session default session list --json"] = {
-                "code": 0, "stdout": json.dumps(SessionListResult(sessions=native_sessions))}
             production_doc = root / "example-production.md"
             _ = production_doc.write_text("\n".join((
                 "# Production", "## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
@@ -152,15 +125,14 @@ exit "$NOTIFIER_HEALTH_EXIT"
                 raise RuntimeError("zsh is required for unit status tests")
             outputs: list[str] = []
             for pane_by_unit in panes:
-                for index, unit in enumerate(units, start=1):
-                    screen = pane_by_unit.get(unit, "— holding: waiting on x\n")
-                    if unit in herdr_units:
-                        responses[f"--session {unit} pane read w{index}:p1 --source recent-unwrapped --lines 400"] = {
-                            "code": 0, "stdout": screen}
-                    elif unit not in missing_units:
-                        tmux_sessions[f"${index}"]["screens"] = {f"%{index}": screen}
-                fake_tmux.write(state, tmux_sessions)
-                _ = responses_file.write_text(json.dumps(responses))
+                hosted = [
+                    HostedUnit(unit, f"w{index}:p1", {"SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": unit},
+                               pane_by_unit.get(unit, "— holding: waiting on x\n"))
+                    for index, unit in enumerate(units, start=1) if unit not in missing_units]
+                fake_unit_host.write(environment, hosted)
+                for unit in hosted:
+                    if unit.session in pids:
+                        fake_unit_host.place_process(environment, pids[unit.session], unit.pane)
                 result = subprocess.run(
                     [zsh, str(script), str(root / "status"), "America/Los_Angeles", "--production", str(production_doc)],
                     check=True, capture_output=True, text=True, env=environment,
@@ -241,15 +213,13 @@ exit "$NOTIFIER_HEALTH_EXIT"
         self.assertIsNone(calls)
 
     def test_unreadable_claude_records_report_unknown_instead_of_not_running(self) -> None:
-        for herdr_units in ((), ("hook",)):
-            with self.subTest(herdr_units=herdr_units):
-                outputs, calls, _ = self.run_statuses(
-                    "/tmp/test-run\n", "ok", 0, panes=({"hook": "— holding: waiting on x\n"},),
-                    herdr_units=herdr_units, unreadable_units=("hook",),
-                )
-                self.assertIn("CLAUDE STATE UNKNOWN", outputs[0].splitlines())
-                self.assertNotIn("CLAUDE NOT RUNNING", outputs[0])
-                self.assertIsNone(calls)
+        outputs, calls, _ = self.run_statuses(
+            "/tmp/test-run\n", "ok", 0, panes=({"hook": "— holding: waiting on x\n"},),
+            unreadable_units=("hook",),
+        )
+        self.assertIn("CLAUDE STATE UNKNOWN", outputs[0].splitlines())
+        self.assertNotIn("CLAUDE NOT RUNNING", outputs[0])
+        self.assertIsNone(calls)
 
     def test_gate_first_sight_prints_decision_and_records_seen_key(self) -> None:
         gate = "● Choose the release path\n\n— gate: approve the blue path\n"
@@ -390,16 +360,16 @@ exit "$NOTIFIER_HEALTH_EXIT"
         self.assertIsInstance(gone.state, SessionGone, outputs[0])
         self.assertIsInstance(live.state, ClaudeNotRunning, outputs[0])
 
-    def test_tmux_and_herdr_units_report_activity_and_tick_health(self) -> None:
+    def test_herdr_units_report_activity_and_tick_health(self) -> None:
         outputs, calls, seen = self.run_statuses(
             "/tmp/native-run\n", "failing: no instance", 1,
-            units=("hook", "native"), herdr_units=("native",),
-            panes=({"hook": "● Check tmux progress\nPhase ETA: 12:00 EDT\n— holding: running\n",
+            units=("hook", "native"),
+            panes=({"hook": "● Check hook progress\nPhase ETA: 12:00 EDT\n— holding: running\n",
                     "native": "● Check herdr progress\nPhase ETA: 13:00 EDT\n— gate: approve release\n"},),
         )
         output = outputs[0]
         self.assertIn("== hook", output)
-        self.assertIn("● Check tmux progress", output)
+        self.assertIn("● Check hook progress", output)
         self.assertIn("== native", output)
         self.assertIn("● Check herdr progress", output)
         self.assertIn("Phase ETA: 13:00 EDT", output)

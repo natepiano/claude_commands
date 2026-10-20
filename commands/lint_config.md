@@ -1,5 +1,5 @@
 ---
-description: Show or edit which lint checks run — across /unit:direct phases, the lint CLI, and the fix pipeline
+description: Show or edit which lint checks run — across /unit:direct phases and the lint CLI
 ---
 
 # lint_config
@@ -49,15 +49,15 @@ effect on the next run of each consumer; nothing needs restarting.
 
 | Check | Runs | Where it applies |
 |---|---|---|
-| `mend` | `cargo mend` check pass and `--fix` | `invoke.sh mend` (lint CLI, fix pipeline, validate_ci mend steps, `verify.sh lint`) |
+| `mend` | `cargo mend` check pass and `--fix` | `invoke.sh mend` (lint CLI, validate_ci mend steps, `verify.sh lint`) |
 | `style_review` | style-guide walk and banned-words scan over the caller's diff | `/unit:style_review` · `/unit:direct` main phase review |
-| `clippy` | `cargo clippy` | `invoke.sh clippy` (lint CLI, fix pipeline, `verify.sh lint`) |
+| `clippy` | `cargo clippy` | `invoke.sh clippy` (lint CLI, `verify.sh lint`) |
 | `doc` | `cargo doc -D warnings` | `invoke.sh doc` (`lint doc`, `verify.sh lint`) |
 | `fmt` | `cargo +nightly fmt` | `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`) |
 
 Consumers: `/unit:style_review` reads the style switch, and
-`scripts/lint/invoke.sh` reads the tool switches for the `lint` CLI,
-`scripts/delegate/verify.sh`, and `scripts/fix/fix.sh`.
+`scripts/lint/invoke.sh` reads the tool switches for the `lint` CLI
+and `scripts/direct/verify.sh`.
 <PhaseChecks/> defines each phase's checks. `LINT_OP_STYLE_REVIEW=off` makes
 the phase style review report `Off`.
 

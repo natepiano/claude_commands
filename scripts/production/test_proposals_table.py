@@ -13,13 +13,14 @@ from typing import final, override
 from unittest import mock
 
 import issues
+import proposals_folder
 import proposals_table
 import showrunners
-from proposals_table import ADD_ON_STATE, REVIEW_STATE, Row
+from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 
-# Importable once proposals_table has put scripts/delegate on the path.
+# Importable once proposals_table has put scripts/direct on the path.
 import phase_table
-import progress_history
+from scripts.direct import plan_history
 
 
 @final
@@ -31,13 +32,16 @@ class ProposalsTableTests(unittest.TestCase):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         self.root = Path(folder.name)
+        # No live update timer names a production below the test's own.
+        _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
+        _ = self.enterContext(mock.patch.object(showrunners, "descendants_of", return_value=[]))
 
     @contextlib.contextmanager
     def runs_of(self, runs: dict[Path, list[Path]]) -> Generator[None]:
         """Give each plan path the run files named for it, and every other path none."""
         def plan_runs(plan: Path) -> list[Path]:
             return runs.get(plan, [])
-        with mock.patch.object(progress_history, "plan_runs", side_effect=plan_runs):
+        with mock.patch.object(plan_history, "plan_runs", side_effect=plan_runs):
             yield
 
     def write(self, relative: str, text: str) -> Path:
@@ -73,22 +77,25 @@ class ProposalsTableTests(unittest.TestCase):
         """An issue file whose frontmatter holds the given lines, with a body below it."""
         return self.write(f"{folder}/{name}.md", "\n".join(["---", *fields, "---", "Body text.", ""]))
 
-    def test_an_open_proposal_issue_reads_its_state_from_stage_and_plan(self) -> None:
+    def test_the_table_lists_waiting_proposals_before_in_progress_ones(self) -> None:
         _ = self.issue("selection widgets toggle", 'date_created: "[[2026-10-09]]"', 'project: "[[hana]]"',
                        "stage: backlog", "status: open", "tags:", "  - issue", "  - proposal",
-                       "proposed_by: organon-unit", 'plan: ""')
+                       "proposed_by: organon-unit", 'plan: ""', 'proposal_id: "P3"')
         _ = self.issue("camera jack panel", 'date_created: "[[2026-10-10]]"', "stage: backlog", "status: open",
                        "tags: [issue, proposal]", "proposed_by: '[[demo-unit]]'",
-                       "plan: docs/plans/jacks.md Phase 4–6")
+                       "plan: docs/plans/jacks.md Phase 4–6", "unit: demo-unit")
         _ = self.issue("rich text", "date_created: 2026-10-11", "stage: active", "status: open",
                        "tags: [issue, proposal]", "proposed_by:", "unit: widget-unit")
         _ = self.issue("unowned build", "date_created: 2026-10-12", "stage: active", "status: open",
                        'tags: ["issue", "proposal"]', "unit: ")
-        self.assertEqual(proposals_table.issue_rows(self.root / "issues"), [
-            Row("organon-unit", "selection widgets toggle", "2026-10-09", REVIEW_STATE),
-            Row("demo-unit", "camera jack panel", "2026-10-10", "approved, not started: docs/plans/jacks.md Phase 4–6"),
-            Row("—", "rich text", "2026-10-11", "being built by widget-unit"),
-            Row("—", "unowned build", "2026-10-12", "being built"),
+        _ = self.issue("late idea", "date_created: 2026-10-13", "stage: backlog", "status: open",
+                       "tags: [issue, proposal]", "proposed_by: organon-unit", "plan: docs/plans/late.md")
+        self.assertEqual(proposals_table.issue_rows(issues.open_issues(self.root / "issues", "proposal")), [
+            Row("organon-unit", "P3 selection widgets toggle", "2026-10-09", REVIEW_STATE),
+            Row("organon-unit", "late idea", "2026-10-13", REVIEW_STATE),
+            Row("demo-unit", "camera jack panel", "2026-10-10", "in progress by demo-unit"),
+            Row("—", "rich text", "2026-10-11", "in progress by widget-unit"),
+            Row("—", "unowned build", "2026-10-12", IN_PROGRESS_STATE),
         ])
 
     def test_closed_untagged_and_subfolder_issues_give_no_rows(self) -> None:
@@ -97,8 +104,8 @@ class ProposalsTableTests(unittest.TestCase):
         _ = self.issue("research notes", "status: open", "tags: [issue, proposal]", folder="issues/rich text")
         _ = self.write("issues/no frontmatter.md", "status: open\ntags: [proposal]\n")
         _ = self.write("issues/unclosed.md", "---\nstatus: open\ntags: [proposal]\n")
-        self.assertEqual(proposals_table.issue_rows(self.root / "issues"), [])
-        self.assertEqual(proposals_table.issue_rows(self.root / "absent"), [])
+        self.assertEqual(proposals_table.issue_rows(issues.open_issues(self.root / "issues", "proposal")), [])
+        self.assertEqual(proposals_table.issue_rows(issues.open_issues(self.root / "absent", "proposal")), [])
 
     def test_a_wiki_link_value_reads_as_its_alias_or_target(self) -> None:
         self.assertEqual([issues.plain(value) for value in (
@@ -109,9 +116,9 @@ class ProposalsTableTests(unittest.TestCase):
         home = self.write("trunk/docs/plans/home-production.md", "## Production Context\n\n- **Proposals:** `~/notes/issues` — tagged proposal\n")
         inside = self.write("trunk/docs/plans/inside-production.md", "- **Proposals:** docs/issues\n")
         none = self.write("trunk/docs/plans/none-production.md", "- **UX guide:** `~/notes/ux`\n")
-        self.assertEqual(proposals_table.issues_folder(home), Path.home() / "notes/issues")
-        self.assertEqual(proposals_table.issues_folder(inside), self.root / "trunk/docs/issues")
-        self.assertIsNone(proposals_table.issues_folder(none))
+        self.assertEqual(proposals_folder.issues_folder(home), Path.home() / "notes/issues")
+        self.assertEqual(proposals_folder.issues_folder(inside), self.root / "trunk/docs/issues")
+        self.assertIsNone(proposals_folder.issues_folder(none))
 
     def test_an_add_on_title_is_read_in_each_way_units_write_it(self) -> None:
         pending = self.write("run/next_items_pending.md", "\n".join([
@@ -205,9 +212,13 @@ class ProposalsTableTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
-        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n")
+        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n\n"
+                         + "## Units\n\n| Unit | Plan |\n| --- | --- |\n| footer-unit | `docs/plans/footers.md` |\n")
         _ = self.issue("footer colours", "date_created: 2026-10-09", "status: open", "tags: [issue, proposal]",
                        "proposed_by: footer-unit", folder="trunk/issues")
+        # Another production's proposal in the same folder is not this one's.
+        _ = self.issue("style rule", "date_created: 2026-10-09", "status: open", "tags: [issue, proposal]",
+                       "proposed_by: cargo-liner-style", folder="trunk/issues")
         plan = self.write("unit/docs/plans/footers.md", "# Plan\n")
         _ = self.write("backlog/ledger.md", "- 2026-10-11 Codex dots — proposed\n")
         _ = self.write("sessions/run-1/next_items_pending.md", "- add: Keep the old footer\n")

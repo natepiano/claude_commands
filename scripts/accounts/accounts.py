@@ -18,9 +18,9 @@ import stat
 import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -50,14 +50,18 @@ from scripts.accounts.refusals import (  # noqa: E402
     StaleReading as StaleReading, NoReading as NoReading,
 )
 
+from scripts.accounts import next_moves
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
     StoredGroupSelection as StoredGroupSelection, StoredGroupSelections as StoredGroupSelections,
+    TransitionReason as TransitionReason, RecordedTransitionReason as RecordedTransitionReason,
+    UnavailableTransitionReason as UnavailableTransitionReason,
 )
 
 if TYPE_CHECKING:
     from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
+    from scripts.shutdown.record import SessionShutdown
 
 
 class PromptTakingMember(Protocol):
@@ -79,6 +83,14 @@ class MovePromptReader(Protocol):
 
 class MoveFollower(Protocol):
     def follow(self, login: str, request_id: str) -> int: ...
+
+
+class RestartRecordLiveness(Protocol):
+    def restart_failed_session_running(self, saved: SessionShutdown) -> bool: ...
+
+
+class ShutdownLocation(Protocol):
+    def local_machine(self) -> str: ...
 
 
 MoveAlerts = Literal["user", "none"]
@@ -184,7 +196,7 @@ CODEX_ROLE = "workers"
 # A table cell with nothing to show: the folder has no login, or is not set up.
 NO_VALUE = "—"
 TABLE_HEADINGS = (
-    "Folder", "Label", "Login", "Role", "Weekly left", "Weekly resets",
+    "Folder", "Label", "Role", "Weekly left", "Weekly resets",
     "On credits", "Credits left", "Read",
 )
 # A stored reading older than this is read again before the table shows it.
@@ -429,6 +441,15 @@ class CodexStatus:
 
 
 class CommandLine(argparse.Namespace):
+    next_action: str = ""
+    group: next_moves.NextMoveGroup = "units"
+    percent: float = 0
+    hold_mode: next_moves.HoldMode = next_moves.FixedHold(0)
+    next_expect: list[str] = []
+    next_position: next_moves.GroupPosition = next_moves.GroupPosition(1)
+    next_destination: next_moves.GroupPosition = next_moves.GroupPosition(1)
+    insertion: next_moves.AppendToGroup | next_moves.InsertAt = next_moves.AppendToGroup()
+    entries: str = ""
     action: str = ""
     label: str = ""
     role: str = ""
@@ -441,12 +462,11 @@ class CommandLine(argparse.Namespace):
     session: str = ""
     source: str = ""
     target: str = ""
-    tool: str = "claude"
-    exclude: list[str] = []
-    keep: str = ""
     explain: bool = False
     why: str = ""
     detail: bool = False
+    as_json: bool = False
+    stored: bool = False
     change: str = ""
 
 
@@ -1246,7 +1266,11 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         _ = environment.pop(name, None)
     environment.update(prepared.variables)
     if probe:
+        from scripts.herdr.herdr import UNIT_MARKS
+
         environment[PROBE_ENV] = "1"
+        for name in UNIT_MARKS:
+            _ = environment.pop(name, None)
     try:
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
@@ -1269,7 +1293,7 @@ def read_role_map() -> RoleMap:
         raise AccountsError(str(error)) from error
 
 
-def write_role_map(change: RoleMapChange) -> None:
+def write_role_map(change: RoleMapChange | role_map.WorkersClaudeRouteChange) -> None:
     try:
         role_map.write_role_map(change)
     except role_map.RoleMapWriteRefused as error:
@@ -1343,8 +1367,17 @@ class LegacyHomeLaunch:
     """This machine still launches unscoped Claude with no account setting."""
 
 
-def account_for_unscoped_launch(environment: Mapping[str, str]) -> ClaudeLaunchAccount | LegacyHomeLaunch:
-    """Retain an uncut legacy home, otherwise choose the caller or showrunners."""
+@role_map.role_map_command
+def account_for_unscoped_launch(environment: Mapping[str, str], *, workers: bool = False) -> ClaudeLaunchAccount | LegacyHomeLaunch:
+    """Use a named workers route, else retain the caller or showrunners choice."""
+    if workers:
+        target = read_role_map().workers_claude
+        if isinstance(target, role_map.NamedWorkersClaudeAccount) and datetime.now(timezone.utc) < target.until:
+            selected = claude_workers_account(target.label)
+            prepared = prepared_account(target.label, resume=True)
+            if isinstance(prepared, AccountRefused):
+                raise AccountsError(prepared.reason)
+            return selected
     configured = environment.get("CLAUDE_CONFIG_DIR", "")
     if not configured:
         if account.claude_account(main_config_dir()) is not None:
@@ -1450,6 +1483,19 @@ def claude_account_dir(label: str) -> Path:
     if not isinstance(expected, ExpectedAccountLogin):
         raise AccountsError(expected.problem)
     return account_dir(parsed.label)
+
+
+def claude_workers_account(label: str) -> NamedAccount:
+    """Check a queued workers destination without changing its folder."""
+    directory = claude_account_dir(label)
+    if not directory.exists():
+        raise AccountsError(f"accounts: {label} is not set up; run accounts.py setup {label}")
+    prepared = prepared_account_preview(label, resume=True)
+    if isinstance(prepared, AccountRefused):
+        if isinstance(account_directory_readiness(label), AccountDirectoryLoggedOut):
+            raise AccountsError(f"accounts: {label} is not logged in; run CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude and /login")
+        raise AccountsError(prepared.reason)
+    return NamedAccount(label, directory)
 
 
 def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
@@ -1708,17 +1754,24 @@ class RefusalOrigin:
     reset: KnownReset | NoResetKnown = field(default_factory=NoResetKnown)
 
 
-MoveOrigin = RefusalOrigin | HandOrigin
+@dataclass(frozen=True)
+class AutoOrigin:
+    """A configured automatic group-move rule requested this transition."""
+
+
+MoveOrigin = RefusalOrigin | HandOrigin | AutoOrigin
 
 
 class MoveOriginFields(TypedDict):
-    cause: Literal["refusal", "by hand"]
+    cause: Literal["refusal", "by hand", "auto"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: NotRequired[str]
 
 
 def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
     fields = MoveOriginFields(cause="by hand", window="unknown")
+    if isinstance(origin, AutoOrigin):
+        fields["cause"] = "auto"
     if isinstance(origin, RefusalOrigin):
         fields["cause"] = "refusal"
         fields["window"] = origin.window
@@ -1728,6 +1781,8 @@ def move_origin_fields(origin: MoveOrigin) -> MoveOriginFields:
 
 
 def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
+    if isinstance(origin, AutoOrigin):
+        return ("--auto",)
     if isinstance(origin, HandOrigin):
         return ()
     arguments: tuple[str, ...] = ("--refused", origin.window)
@@ -1740,6 +1795,7 @@ def move_origin_arguments(origin: MoveOrigin) -> tuple[str, ...]:
 class GroupTransition:
     move_id: str
     origin: MoveOrigin
+    why: TransitionReason = field(default_factory=UnavailableTransitionReason)
 
 
 @dataclass(frozen=True)
@@ -1791,7 +1847,9 @@ def group_transition(group: ClaudeGroup) -> GroupTransition | NoGroupTransition:
     if selection["cause"] == "refusal":
         reset = KnownReset(datetime.fromisoformat(selection["reset"])) if "reset" in selection else NoResetKnown()
         origin = RefusalOrigin(selection["window"], reset)
-    return GroupTransition(selection["move_id"], origin)
+    elif selection["cause"] == "auto":
+        origin = AutoOrigin()
+    return GroupTransition(selection["move_id"], origin, role_map.selection_reason(selection))
 
 
 def session_group(session: Session | ListedSession) -> ClaudeGroup | Literal["ungrouped"]:
@@ -1948,7 +2006,7 @@ def set_group_account(group: ClaudeGroup, label: str, *, why: str,
         selection["reset"] = fields["reset"]
     write_role_map(RoleMapChange(group, label, why, at.isoformat(), selection["move_id"],
         fields["cause"], fields["window"], fields.get("reset", "")))
-    return GroupTransition(selection["move_id"], origin)
+    return GroupTransition(selection["move_id"], origin, RecordedTransitionReason(why))
 
 
 def placement_report(now: datetime | AccountDecisionNow = ACCOUNT_DECISION_NOW) -> str:
@@ -2697,12 +2755,13 @@ def _roles_lock() -> Generator[None]:
         yield
 
 
-def _write_role(role: str, label: str) -> None:
+def _write_role(role: str, label: str, *, why: str = "by hand",
+                cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> None:
     _validate_role(role)
     if role != "workers":
         raise AccountsError(UNIT_ROLE_GONE)
-    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), "by hand",
-                               datetime.now(timezone.utc).isoformat()))
+    write_role_map(RoleMapChange("workers", note_file.canonical_label(label), why,
+                               datetime.now(timezone.utc).isoformat(), cause=cause))
 
 
 def set_role(role: str, label: str) -> None:
@@ -2760,6 +2819,32 @@ def _move_down_argv(source: str, ids: tuple[str, ...], target: str, why: str, al
         "--restart", "--to", target, "--why", why) + (("--no-alert",) if alerts == "none" else ())
 
 
+@dataclass(frozen=True)
+class MoveShutdownReady:
+    lines: tuple[str, ...] = ()
+
+
+def _prepare_move_shutdown(saved: SessionShutdown, *, dry_run: bool) -> MoveShutdownReady | MoveRefused:
+    """Close only a proven live session's unconfirmed restart before moving it."""
+    if TYPE_CHECKING:
+        from scripts.shutdown import record
+    else:
+        record = import_module("record")
+    restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
+    settle = cast(ShutdownLocation, cast(object, import_module("settle")))
+    if not restart.restart_failed_session_running(saved):
+        return MoveRefused("already has a shutdown in progress")
+    name = saved["session"]["name"]
+    if dry_run:
+        return MoveShutdownReady((f"{name}: would close its unconfirmed restart record; the session is running",))
+    outcome = record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
+                                         settle.local_machine(), saved["request_id"])
+    if not isinstance(outcome, record.SessionForgotten):
+        return MoveRefused("already has a shutdown in progress")
+    _ = record.acknowledge_snapshot(saved["login"], saved["session"]["session_id"])
+    return MoveShutdownReady((f"{name}: closed its unconfirmed restart record; the session is running",))
+
+
 def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOrigin, move_id: str = "", alerts: MoveAlerts = "user") -> tuple[SessionMoveRequested | SessionMoveRefused, ...]:
     """Start one selected shutdown for each source login and report each owner's record."""
     target = numbered_account_label(target, "claude").label
@@ -2788,7 +2873,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                 refuse(session_id, destination.reason)
             return tuple(outcomes[session_id] for session_id in ids)
         live = {item.session_id: item for item in inventory.listing()}
-        before = {saved["session"]["session_id"] for saved in record.all_session_records()}
+        before = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
         for session_id in ids:
             found = live.get(session_id)
             if found is None:
@@ -2797,13 +2882,17 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
             if found.kind == "worker":
                 refuse(session_id, "workers move with their unit director")
                 continue
-            if session_id in before:
-                refuse(session_id, "already has a shutdown in progress")
-                continue
             owners[session_id] = found
             if found.login.casefold() == destination.login.casefold():
                 refuse(session_id, "already on " + destination.label)
                 continue
+            if session_id in before:
+                prepared = _prepare_move_shutdown(before[session_id], dry_run=False)
+                if isinstance(prepared, MoveRefused):
+                    refuse(session_id, prepared.reason)
+                    continue
+                for line in prepared.lines:
+                    print(line)
             groups.setdefault(found.login, []).append(session_id)
         for login, selected_ids in groups.items():
             source = account.label_for("Claude", login)
@@ -2940,8 +3029,9 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True) -> Mov
                 if isinstance(window, ReadingWindow) and window.left <= 0:
                     reset = (window.reset.at.astimezone(agent_accounts.user_zone()).strftime("%a %-I:%M %p")
                              if isinstance(window.reset, KnownReset) else "unknown")
-                    return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); "
-                        + f"pick another: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick claude --exclude {shlex.quote(destination.label)} in this terminal")
+                    chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())
+                    room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
+                    return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); {room}")
         return MoveTargetReady(destination)
     windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
     times = [window.at for window in windows if isinstance(window, ReadingWindow)]
@@ -2955,10 +3045,10 @@ def move_preview_line(member: ListedSession, now: datetime) -> str:
     state = reader.prompt_state(reader.PromptSubject(member.session_id, member.login, member.config_dir), now)
     source = session_account_label(member)
     if state.because in {"refused in its transcript", "account out of usage"}:
-        plan = f"reap and restart now ({source} out of usage: {cast(MemberNeedingReap, state).detail})"
+        plan = f"will stop and move now ({source} out of usage: {cast(MemberNeedingReap, state).detail})"
     else:
         reason = "has room" if state.because == "room" else state.because
-        plan = f"move when idle ({source} {reason})"
+        plan = f"will move once idle ({source} {reason})"
     return f"{member.name}: {member.session_id} · {plan}"
 
 
@@ -3022,9 +3112,10 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     if isinstance(checked, MoveRefused):
         return checked
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory
+        from scripts.shutdown import inventory, record
     else:
         inventory = import_module("inventory")
+        record = import_module("record")
     registrations = inventory.showrunner_registrations()
     members = live_group_members(registrations=registrations)[group]
     selected = [session for session in members if not session_on_account(session, target)]
@@ -3037,7 +3128,15 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             + f"in any Claude session on {socket.gethostname().split('.', 1)[0]}, inside that showrunner's own session: ~/.claude/scripts/lib/py ~/.claude/scripts/production/update_registration.py register --production {shlex.quote(runner['doc'])}"
             for runner in inventory.unregistered_showrunners(members, registrations=registrations))
     if dry_run:
+        closing: tuple[str, ...] = ()
+        for saved in record.all_session_records():
+            if saved["session"]["session_id"] not in ids:
+                continue
+            prepared = _prepare_move_shutdown(saved, dry_run=True)
+            if isinstance(prepared, MoveShutdownReady):
+                closing += prepared.lines
         return GroupMoveDryRun(ids, (*checked.notices, f"{group}: would select {target}",
+            *closing,
             *(move_preview_line(item, now) for item in selected),
             *_move_preview_commands(selected, target, reason, alerts), *notices))
     previous_target = group_label(group_accounts(), group)
@@ -3098,11 +3197,17 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
             return MoveRefused(f"{owner.name} belongs to {group}; in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move {group} {target}")
         if session_on_account(owner, target):
             return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
-        if any(saved["session"]["session_id"] == owner.session_id for saved in record.all_session_records()):
-            return MoveRefused(f"{owner.name} already has a shutdown in progress")
+        closing: tuple[str, ...] = ()
+        for saved in record.all_session_records():
+            if saved["session"]["session_id"] != owner.session_id:
+                continue
+            prepared = _prepare_move_shutdown(saved, dry_run=True)
+            if isinstance(prepared, MoveRefused):
+                return MoveRefused(f"{owner.name} {prepared.reason}")
+            closing += prepared.lines
         reason = why or f"{session_account_label(owner)} is out of usage"
         if dry_run:
-            return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, now),
+            return MoveDryRun(owner.session_id, (*checked.notices, *closing, move_preview_line(owner, now),
                 *_move_preview_commands([owner], target, reason, alerts)))
         results = move_sessions((owner.session_id,), target, why=reason, origin=HAND_ORIGIN, alerts=alerts)
         stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)
@@ -3236,7 +3341,8 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
     return (*lines, *leftover_server_lines(switches, dry_run=dry_run))
 
 
-def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
+def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
+                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> WorkersSwapOutcome:
     refuse_default(label)
     try:
         workers_home = _workers_home()
@@ -3266,7 +3372,7 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
         switches = _retire_workers_servers(target_home, account_label, dry_run=True)
         return WorkersSwapDryRun(_workers_swap_lines(switches, workers_home, account_label, dry_run=True))
     try:
-        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label)
+        _ = _write_role("workers", account_label if _label_is(account_label, "codex") else label, why=why, cause=cause)
     except OSError as error:
         raise AccountsError(f"accounts: could not move the workers role: {error}") from error
     try:
@@ -3278,11 +3384,12 @@ def _swap_workers(label: str, *, dry_run: bool) -> WorkersSwapOutcome:
     return WorkersSwapStarted(lines)
 
 
-def swap(role: str, label: str, *, dry_run: bool = False) -> SwapOutcome | WorkersSwapOutcome:
+def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
+         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> SwapOutcome | WorkersSwapOutcome:
     """Select the new unit account only after every old-account session can move."""
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause)
     raise AccountsError(UNIT_ROLE_GONE)
 
 
@@ -3523,11 +3630,28 @@ def _is_stale(usage: usage_store.StoredUsage | None, now: datetime) -> bool:
     return read is None or now - read > STALE_AFTER
 
 
+@dataclass(frozen=True)
+class RefreshStaleUsage:
+    """Refresh signed-in accounts whose last good usage reading is stale."""
+
+
+@dataclass(frozen=True)
+class StoredUsageOnly:
+    """Observe saved usage and roles without starting processes or networking."""
+
+
+UsageSource = RefreshStaleUsage | StoredUsageOnly
+REFRESH_STALE_USAGE = RefreshStaleUsage()
+
+
 def _stored_usage(
     statuses: list[AccountStatus], codex: list[CodexStatus], now: datetime,
+    source: UsageSource = REFRESH_STALE_USAGE,
 ) -> dict[str, usage_store.StoredUsage]:
     """Each login's stored readings. A login with none read lately is read live first, all at once."""
     stored = usage_store.load()
+    if isinstance(source, StoredUsageOnly):
+        return stored
     stale = [
         status.config_dir for status in statuses
         if status.login and _is_stale(stored.get(usage_store.key("Claude", status.login)), now)
@@ -3536,21 +3660,29 @@ def _stored_usage(
                    if status.login and _is_stale(stored.get(usage_store.key("Codex", status.login)), now)]
     if stale or stale_codex:
         with ThreadPoolExecutor() as pool:
-            reads = [pool.submit(agent_accounts.claude_live, config_dir) for config_dir in stale]
-            reads.extend(pool.submit(_codex_live, home) for home in stale_codex)
-            reports = [read.result() for read in reads]
+            reads: list[tuple[Future[agent_accounts.Report],
+                              agent_accounts.ClaudeDirectorySource | agent_accounts.CodexHomeSource, str]] = [
+                     (pool.submit(agent_accounts.claude_live, status.config_dir),
+                      agent_accounts.ClaudeDirectorySource(status.config_dir), status.login)
+                     for status in statuses if status.config_dir in stale]
+            reads.extend((pool.submit(_codex_live, status.home),
+                          agent_accounts.CodexHomeSource(status.home), status.login)
+                         for status in codex if status.home in stale_codex)
+            reports = [replace(read.result(), source=directory,
+                               last_known_login=agent_accounts.KnownUsageLogin(login))
+                       for read, directory, login in reads]
         for report in reports:
             startup = report.codex_startup
             if isinstance(startup, agent_accounts.CodexStartupFailure):
                 for index, status in enumerate(codex):
                     if status.home == startup.home:
                         codex[index] = replace(status, startup=startup, problems=(*status.problems, startup.problem))
-        if usage_store.merge(stored, reports, now):
-            try:
-                usage_store.write(stored)
-            except OSError:
-                # The table still shows what was read; only the next run reads it again.
-                pass
+        try:
+            usage_store.save(reports, now)
+            stored = usage_store.load()
+        except OSError:
+            # Keep this reading visible even if the store cannot be written.
+            _ = usage_store.merge(stored, reports, now)
     return stored
 
 
@@ -3562,31 +3694,79 @@ def _is_current(window: usage_store.StoredWindow, now: datetime) -> bool:
     return resets is not None and resets > now
 
 
-def _window_cells(
-    window: usage_store.StoredWindow | None, now: datetime, zone: tzinfo | None, pattern: str,
-) -> tuple[str, str]:
-    """What is left of one window and when it resets."""
-    if window is None or not _is_current(window, now):
-        return ("unavailable", "unavailable")
-    resets = _stored_time(window["resets"])
-    return (f"{window['left']:.0f}%", NO_VALUE if resets is None else resets.astimezone(zone).strftime(pattern))
+@dataclass(frozen=True)
+class StatusUnavailable:
+    """No usable value; cell retains the table's reason or dash."""
+    cell: str = NO_VALUE
 
 
-def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, str]:
-    """Whether Codex work now draws on the account's credits, and the credits left.
+@dataclass(frozen=True)
+class WeeklyNotReadSince:
+    """The last reading predates a weekly reset; it cannot describe this week's allowance."""
 
-    Codex spends credits once an allowance window is used up.
-    """
+    read_at: datetime
+    reason: agent_accounts.StaleTokenSkip | agent_accounts.NoWeeklyReadSkip
+
+
+@dataclass(frozen=True)
+class StatusRow:
+    """One account's values, shared by the table and JSON renderers."""
+    label: str
+    tool: Literal["claude", "codex"]
+    folder: str
+    login: str
+    roles: tuple[str, ...]
+    weekly_left_percent: float | StatusUnavailable | WeeklyNotReadSince
+    resets_at: datetime | StatusUnavailable
+    credits: float | Literal["unlimited"] | StatusUnavailable
+    on_credits: str
+    use_credits: bool
+    read_at: datetime | StatusUnavailable
+    read_outcome: agent_accounts.UsageReadOutcome
+    attempted_at: datetime | StatusUnavailable
+
+
+@dataclass(frozen=True)
+class StatusReading:
+    rows: tuple[StatusRow, ...]
+    notes: tuple[str, ...]
+    detail_lines: tuple[str, ...]
+    zone: tzinfo
+    checked_at: datetime
+
+
+class StatusAccountDocument(TypedDict):
+    label: str
+    tool: Literal["claude", "codex"]
+    roles: list[str]
+    weekly_left_percent: float | None
+    resets_at: str | None
+    credits: float | Literal["unlimited"] | None
+    use_credits: bool
+    read_at: str | None
+    read_ok: bool
+    credits_in_use: bool
+
+
+class StatusDocument(TypedDict):
+    accounts: list[StatusAccountDocument]
+    problems: list[str]
+
+
+def _credit_reading(
+    usage: usage_store.StoredUsage, now: datetime,
+) -> tuple[str, float | Literal["unlimited"] | StatusUnavailable]:
     credits = usage.get("credits")
     if credits is None:
-        return ("unavailable", "unavailable")
+        return ("unavailable", StatusUnavailable("unavailable"))
     balance = credits["balance"]
     try:
         amount = math.inf if balance == "unlimited" else float(balance)
     except ValueError:
-        # Codex reported no balance.
-        return ("unavailable", "unavailable")
-    left = "unlimited" if math.isinf(amount) else f"{amount:,.0f}"
+        return ("unavailable", StatusUnavailable("unavailable"))
+    if math.isnan(amount):
+        return ("unavailable", StatusUnavailable("unavailable"))
+    left: float | Literal["unlimited"] = "unlimited" if math.isinf(amount) else amount
     windows = [window for window in (usage.get("five_hour"), usage.get("weekly")) if window is not None]
     current = [window for window in windows if _is_current(window, now)]
     if any(window["left"] <= 0 for window in current):
@@ -3594,54 +3774,110 @@ def _credit_cells(usage: usage_store.StoredUsage, now: datetime) -> tuple[str, s
     return ("no" if "weekly" in usage and len(current) == len(windows) else "unavailable", left)
 
 
-def _reading_cells(
-    usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None, *, has_credits: bool,
-) -> tuple[str, ...]:
-    """The cells after the role: the weekly window, credits, and when they were read."""
-    held = usage or usage_store.StoredUsage()
-    read = _read_at(usage)
-    return (
-        *_window_cells(held.get("weekly"), now, zone, "%a %m-%d %H:%M %Z"),
-        *(_credit_cells(held, now) if has_credits else (NO_VALUE, NO_VALUE)),
-        NO_VALUE if read is None else read.astimezone(zone).strftime("%H:%M %Z"),
-    )
+def _status_row(
+    status: AccountStatus | CodexStatus, usage: usage_store.StoredUsage | None, now: datetime,
+    roles: tuple[str, ...],
+) -> StatusRow:
+    tool = "codex" if isinstance(status, CodexStatus) else "claude"
+    weekly: float | StatusUnavailable | WeeklyNotReadSince = StatusUnavailable()
+    resets: datetime | StatusUnavailable = StatusUnavailable()
+    credits: float | Literal["unlimited"] | StatusUnavailable = StatusUnavailable()
+    read_at: datetime | StatusUnavailable = StatusUnavailable()
+    on_credits = NO_VALUE
+    login = status.login if status.is_set_up and status.account_is_safe_to_inspect else ""
+    if login:
+        read_at = _read_at(usage) or StatusUnavailable()
+        if isinstance(status, CodexStatus) and isinstance(status.startup, agent_accounts.CodexStartupFailure):
+            weekly = StatusUnavailable(status.startup.setup_command)
+        else:
+            held = usage or usage_store.StoredUsage()
+            window = held.get("weekly")
+            if window is not None and _is_current(window, now):
+                weekly = window["left"]
+                resets = _stored_time(window["resets"]) or StatusUnavailable()
+            else:
+                weekly = StatusUnavailable("unavailable")
+                resets = StatusUnavailable("unavailable")
+            if (window is not None and isinstance(read_at, datetime)
+                    and (reset := _stored_time(window["resets"])) is not None and reset <= now):
+                weekly = WeeklyNotReadSince(read_at, usage_store.weekly_read_skip(held))
+            if tool == "codex":
+                on_credits, credits = _credit_reading(held, now)
+    return StatusRow(status.label, tool, status.folder, login, roles,
+        weekly, resets, credits, on_credits,
+        tool == "codex" and isinstance(agent_accounts.codex_credits_setting(status.label), agent_accounts.CreditsOn),
+        read_at, usage_store.latest_read_outcome(usage or usage_store.StoredUsage()) if login
+        else agent_accounts.UsageReadOutcome.OK,
+        _stored_time((usage or {}).get("attempted_at", "")) or StatusUnavailable())
 
 
-NO_READING = (NO_VALUE,) * 5
+def _status_row_cells(row: StatusRow, zone: tzinfo, checked_at: datetime) -> tuple[str, ...]:
+    weekly = row.weekly_left_percent
+    reset = row.resets_at
+    credits = row.credits
+    read = row.read_at
+    role_cell = ", ".join(row.roles) if row.roles else NO_VALUE if row.tool == "codex" else ""
+    if isinstance(weekly, WeeklyNotReadSince):
+        weekly_cell = f"not read since {weekly.read_at.astimezone(zone):%H:%M}"
+        if isinstance(weekly.reason, agent_accounts.StaleTokenSkip):
+            weekly_cell += ": no session to refresh its login"
+    else:
+        weekly_cell = weekly.cell if isinstance(weekly, StatusUnavailable) else f"{weekly:.0f}%"
+    failed = row.read_outcome != agent_accounts.UsageReadOutcome.OK
+    if isinstance(read, StatusUnavailable):
+        read_cell = read.cell
+    else:
+        local = read.astimezone(zone)
+        date_format = "%m-%d %H:%M %Z" if failed and local.date() != checked_at.astimezone(zone).date() else "%H:%M %Z"
+        read_cell = local.strftime(date_format)
+    if failed:
+        read_cell += "*"
+    return (row.folder, row.label, role_cell,
+        weekly_cell,
+        reset.cell if isinstance(reset, StatusUnavailable) else reset.astimezone(zone).strftime("%a %m-%d %H:%M %Z"),
+        row.on_credits,
+        credits.cell if isinstance(credits, StatusUnavailable) else credits if isinstance(credits, str) else f"{credits:,.0f}",
+        read_cell)
 
 
-def _table_row(
-    status: AccountStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
-) -> tuple[str, ...]:
-    """One Claude folder's row. `usage` is its login's stored reading, if it has one."""
-    if not status.is_set_up:
-        return (status.folder, status.label, "not set up", status.role, *NO_READING)
-    if not status.account_is_safe_to_inspect:
-        return (status.folder, status.label, "unavailable", status.role, *NO_READING)
-    if not status.login:
-        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
-    return (
-        status.folder, status.label, status.login, status.role,
-        *_reading_cells(usage, now, zone, has_credits=False),
-    )
+def render_status_json(reading: StatusReading) -> str:
+    accounts: list[StatusAccountDocument] = []
+    for row in reading.rows:
+        item = StatusAccountDocument(label=row.label, tool=row.tool, roles=list(row.roles),
+            weekly_left_percent=None if isinstance(row.weekly_left_percent, (StatusUnavailable, WeeklyNotReadSince)) else row.weekly_left_percent,
+            resets_at=None if isinstance(row.resets_at, StatusUnavailable) else row.resets_at.astimezone(timezone.utc).isoformat(),
+            credits=None if isinstance(row.credits, StatusUnavailable) else row.credits,
+            use_credits=row.use_credits,
+            read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat(),
+            read_ok=isinstance(row.read_at, datetime) and row.read_outcome in (
+                agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD),
+            credits_in_use=row.on_credits == "yes")
+        accounts.append(item)
+    return json.dumps(StatusDocument(accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
-def _codex_row(
-    status: CodexStatus, usage: usage_store.StoredUsage | None, now: datetime, zone: tzinfo | None,
-) -> tuple[str, ...]:
-    """One Codex row. `usage` is its login's stored reading, if it has one."""
-    if not status.is_set_up:
-        return (status.folder, status.label, "not set up", status.role, *NO_READING)
-    if not status.account_is_safe_to_inspect:
-        return (status.folder, status.label, "unavailable", status.role, *NO_READING)
-    if not status.login:
-        return (status.folder, status.label, "not logged in", status.role, *NO_READING)
-    if isinstance(status.startup, agent_accounts.CodexStartupFailure):
-        return (status.folder, status.label, status.login, status.role, status.startup.setup_command, *NO_READING[1:])
-    return (
-        status.folder, status.label, status.login, status.role,
-        *_reading_cells(usage, now, zone, has_credits=True),
-    )
+def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:
+    previous = (f", so this shows the reading from {row.read_at.astimezone(zone):%H:%M}"
+                if isinstance(row.read_at, datetime) else " and no reading is stored yet")
+    match row.read_outcome:
+        case agent_accounts.UsageReadOutcome.STALE_TOKEN:
+            reason = "login token expired; start a session on it to refresh"
+        case agent_accounts.UsageReadOutcome.REFUSED_401:
+            reason = "the usage service did not accept this login; start a session on it to check it"
+        case agent_accounts.UsageReadOutcome.RATE_LIMITED_429:
+            retry = (f"after {(row.attempted_at + timedelta(minutes=10)).astimezone(zone):%H:%M}"
+                     if isinstance(row.attempted_at, datetime) else "in 2 min")
+            reason = f"the usage service is busy{previous}; next try {retry}"
+        case agent_accounts.UsageReadOutcome.ERROR:
+            reason = f"the usage read failed{previous}; next try in 2 min"
+        case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
+            return ""
+    return f"* {row.label}: {reason}"
+
+
+def render_status_table(reading: StatusReading) -> str:
+    return "\n".join([_render_table([_status_row_cells(row, reading.zone, reading.checked_at) for row in reading.rows]), "",
+        *reading.notes, *reading.detail_lines])
 
 
 def _render_table(rows: list[tuple[str, ...]]) -> str:
@@ -3658,9 +3894,32 @@ def _render_table(rows: list[tuple[str, ...]]) -> str:
     ])
 
 
+def _account_state_notes(status: AccountStatus | CodexStatus) -> list[str]:
+    """Explain an empty row unless a folder or sign-in check already explains it."""
+    if status.is_set_up and status.account_is_safe_to_inspect and status.login:
+        return []
+    directory = status.home if isinstance(status, CodexStatus) else status.config_dir
+    identity = directory / ("auth.json" if isinstance(status, CodexStatus) else ".claude.json")
+    for problem in status.problems:
+        if any(problem.startswith(f"accounts: {path} {reason}")
+               for path in (str(directory), status.folder, str(identity))
+               for reason in ("is missing", "is not a directory", "is a link", "is not logged in")):
+            return []
+        if any(problem.startswith(f"accounts: could not {action} {path}:")
+               for action in ("read", "inspect") for path in (str(directory), str(identity))):
+            return []
+    if not status.is_set_up:
+        reason = "not set up: no folder holds this account"
+    elif not status.account_is_safe_to_inspect:
+        reason = "its folder could not be read"
+    else:
+        reason = "not logged in"
+    return [f"* {status.label}: {reason}"]
+
+
 def _status_notes(status: AccountStatus, *, detail: bool) -> list[str]:
     """What is wrong or unusual in one folder. Nothing for a folder in order."""
-    notes = list(status.problems)
+    notes = [*status.problems, *_account_state_notes(status)]
     if detail and status.unclassified:
         notes.append(f"{status.folder}: unclassified: {', '.join(status.unclassified)}")
     mcp_differences = [
@@ -3672,8 +3931,7 @@ def _status_notes(status: AccountStatus, *, detail: bool) -> list[str]:
     return notes
 
 
-@role_map.role_map_command
-def status_report(*, detail: bool = False) -> str:
+def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     """One table row per account folder, then one line for each thing wrong in a folder.
 
     With `detail`, also unknown entries, each live session, the Codex workers and recent moves.
@@ -3689,12 +3947,22 @@ def status_report(*, detail: bool = False) -> str:
     if not selected_workers.label:
         codex = [replace(status, role="spare") if status.role == CODEX_ROLE else status for status in codex]
     now = datetime.now(timezone.utc)
-    usage = _stored_usage(statuses, codex, now)
+    usage = _stored_usage(statuses, codex, now, source)
     zone = agent_accounts.user_zone()
-    groups = group_accounts()
+    try:
+        groups = group_accounts()
+    except AccountsError as error:
+        if isinstance(source, RefreshStaleUsage):
+            raise
+        if str(error) not in role_problems:
+            role_problems.append(str(error))
+        groups = GroupAccounts()
+        codex = [replace(status, role=NO_VALUE) for status in codex]
     group_directories: dict[ClaudeGroup, Path] = {}
     for group in CLAUDE_GROUPS:
         label = group_label(groups, group)
+        if isinstance(label, GroupNotConfigured):
+            role_problems.append(f"accounts: {group} has no account; run accounts.py move {group} <claudeN>")
         if isinstance(label, str) and _label_is(label, "claude"):
             try:
                 group_directories[group] = _claude_role_selection(group, label).dir
@@ -3702,14 +3970,16 @@ def status_report(*, detail: bool = False) -> str:
                 role_problems.append(str(error))
                 # The folder's status reports its unreadable note without selecting it.
                 continue
-    statuses = [replace(status, role=", ".join(group for group, directory in group_directories.items()
-        if status.config_dir == directory)) for status in statuses]
-    table = _render_table([
-        *(_table_row(status, usage.get(usage_store.key("Claude", status.login)), now, zone) for status in statuses),
-        *(_codex_row(status, usage.get(usage_store.key("Codex", status.login)), now, zone) for status in codex),
-    ])
+    rows = (
+        *(_status_row(status, usage.get(usage_store.key("Claude", status.login)), now,
+            tuple(group for group, directory in group_directories.items() if status.config_dir == directory))
+          for status in statuses),
+        *(_status_row(status, usage.get(usage_store.key("Codex", status.login)), now,
+            (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
+    )
     home_step = MAC_HOME_LOGIN_STEP if sys.platform == "darwin" else "run accounts.py cutover-home"
     notes = [
+        *(note for row in rows if (note := _read_failure_note(row, zone))),
         *role_problems,
         *([f"~/.claude holds a login; {home_step}"]
           if account.claude_account(main_config_dir()) is not None else []),
@@ -3717,16 +3987,30 @@ def status_report(*, detail: bool = False) -> str:
           if _codex_home_login(accounts_home() / ".codex") else []),
         *(note for status in statuses for note in _status_notes(status, detail=detail)),
         *(problem for status in codex for problem in status.problems),
+        *(note for status in codex for note in _account_state_notes(status)),
         *(f"{status.folder}: unclassified: {', '.join(status.unclassified)}"
           for status in codex if detail and status.unclassified),
     ]
-    summary = [group_status_line(groups), table, "", *notes]
-    if not detail:
-        return "\n".join(summary)
-    journal = moves.read_journal()
-    return "\n".join([*summary,
-        *_live_status_lines(groups), *_workers_status_lines(now, selected_workers),
-        *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone)])
+    detail_lines: tuple[str, ...] = ()
+    if detail:
+        journal = moves.read_journal()
+        live_lines = ((*_live_status_lines(groups), *_workers_status_lines(now, selected_workers))
+                      if isinstance(source, RefreshStaleUsage) else ())
+        detail_lines = (*live_lines,
+            *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
+    return StatusReading(rows, tuple(notes), detail_lines, zone, now)
+
+
+@role_map.role_map_command
+def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False) -> StatusReading:
+    """Read each account once for either renderer; stored mode performs no live work."""
+    with role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext():
+        return _read_status(source, detail=detail)
+
+
+def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE) -> str:
+    """The account table, with optional session, worker and move details."""
+    return render_status_table(read_status(source=source, detail=detail))
 
 
 # Run folders under unit/, and under delegate/ for a run started before the rename.
@@ -3874,7 +4158,43 @@ def _parser() -> argparse.ArgumentParser:
     _ = commands.add_parser("role-map-read")
     writer = commands.add_parser("role-map-write")
     _ = writer.add_argument("change")
-    parser.set_defaults(action="status")
+    _ = commands.add_parser("next-read")
+    next_writer = commands.add_parser("next-write")
+    _ = next_writer.add_argument("entries")
+    def insertion(text: str) -> next_moves.InsertAt:
+        return next_moves.InsertAt(next_moves.GroupPosition(int(text)))
+    _ = next_writer.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
+    next_command = commands.add_parser("next")
+    next_verbs = next_command.add_subparsers(dest="next_action", required=True)
+    next_add = next_verbs.add_parser("add")
+    _ = next_add.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    _ = next_add.add_argument("percent", type=float)
+    _ = next_add.add_argument("label")
+    hold_options = next_add.add_mutually_exclusive_group()
+    _ = hold_options.add_argument("--hold-minutes", dest="hold_mode",
+                                  type=lambda text: next_moves.FixedHold(float(text)), default=next_moves.FixedHold(0))
+    def half_point_hold(text: str) -> next_moves.HalfPointHold:
+        if text != "half-point":
+            raise argparse.ArgumentTypeError("hold must be half-point")
+        return next_moves.HalfPointHold()
+    _ = hold_options.add_argument("--hold", dest="hold_mode", type=half_point_hold)
+    _ = next_add.add_argument("--at", dest="insertion", type=insertion, default=next_moves.AppendToGroup())
+    _ = next_verbs.add_parser("list")
+    next_remove = next_verbs.add_parser("remove")
+    _ = next_remove.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    def position(text: str) -> next_moves.GroupPosition:
+        return next_moves.GroupPosition(int(text))
+    _ = next_remove.add_argument("next_position", type=position)
+    next_move = next_verbs.add_parser("move")
+    _ = next_move.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    _ = next_move.add_argument("next_position", type=position)
+    _ = next_move.add_argument("next_destination", type=position)
+    next_hold = next_verbs.add_parser("hold")
+    _ = next_hold.add_argument("group", choices=(*CLAUDE_GROUPS, "workers"))
+    _ = next_hold.add_argument("next_position", type=position)
+    _ = next_hold.add_argument("hold_mode", type=next_moves.parse_hold_mode)
+    _ = next_hold.add_argument("--expect", dest="next_expect", nargs=2, default=[], metavar=("PERCENT", "TARGET"))
+    parser.set_defaults(action="status", as_json=False, stored=False)
     _ = parser.add_argument("--detail", action="store_true")
     for action in ("setup", "check"):
         command = commands.add_parser(action)
@@ -3882,14 +4202,12 @@ def _parser() -> argparse.ArgumentParser:
     cutover = commands.add_parser("cutover-home")
     _ = cutover.add_argument("label", nargs="?", default="")
     _ = cutover.add_argument("--undo", action="store_true")
-    _ = commands.add_parser("status")
+    status = commands.add_parser("status")
+    _ = status.add_argument("--json", dest="as_json", action="store_true")
+    _ = status.add_argument("--stored", action="store_true")
+    _ = status.add_argument("--detail", action="store_true", default=argparse.SUPPRESS)
     placer = commands.add_parser("placement")
     _ = placer.add_argument("--explain", action="store_true")
-    picker = commands.add_parser("pick")
-    _ = picker.add_argument("tool", choices=("claude", "codex"))
-    _ = picker.add_argument("--exclude", action="append", default=[])
-    _ = picker.add_argument("--keep", default="")
-    _ = picker.add_argument("--explain", action="store_true")
     exec_command = commands.add_parser("exec")
     _ = exec_command.add_argument("--probe", action="store_true", help="mark the session as a throwaway probe: no shutdown, restart or move for it ever pushes to the phone")
     _ = exec_command.add_argument("label")
@@ -3918,12 +4236,75 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def group_half_point_hold(group: ClaudeGroup, now: datetime) -> next_moves.ResolvedHold:
+    label = group_label(group_accounts(), group)
+    return (next_moves.resolve_hold(next_moves.HalfPointHold(), label, now) if isinstance(label, str)
+            else next_moves.ResolvedHold(40, next_moves.NoUsablePace()))
+
+
+def validate_next_move_target(entry: next_moves.NextMove) -> None:
+    if isinstance(entry, next_moves.ClaudeGroupMove):
+        _ = claude_account_dir(entry.to)
+    elif isinstance(entry.to, next_moves.CodexWorkersTarget):
+        _ = check_codex_target(entry.to.label, accounts_home() / ".codex", repair=False)
+    elif isinstance(entry.to.account, next_moves.ClaudeWorkersTarget):
+        _ = claude_workers_account(entry.to.account.label)
+
+
 @role_map.role_map_command
 def main(argv: list[str]) -> int:
-    options = cast(CommandLine, _parser().parse_args(argv))
+    parser = _parser()
+    options = cast(CommandLine, parser.parse_args(argv))
+    if options.as_json and options.detail:
+        parser.error("--json and --detail cannot be used together")
     if hasattr(options, "label"):
         options.label = note_file.canonical_label(options.label)
     try:
+        if options.action in ("next-read", "next-write"):
+            if not role_map.is_role_map_host():
+                raise AccountsError("accounts: account moves belong on natedev")
+            if options.action == "next-read":
+                print(next_moves.encode_next_moves(next_moves.read_next_moves()))
+            else:
+                entries = next_moves.decode_next_moves(options.entries)
+                if len(entries) != 1:
+                    raise AccountsError("accounts: next-write requires one entry")
+                entry = entries[0]
+                validate_next_move_target(entry)
+                next_moves.insert_next_move(entry, options.insertion)
+                print(next_moves.encode_next_moves(entries))
+            return 0
+        if options.action == "next":
+            if options.next_action == "add":
+                if role_map.is_role_map_host():
+                    candidate = next_moves.decode_next_moves(json.dumps([dict(id="validation", group=options.group,
+                        at_percent=options.percent, **next_moves.encode_hold_mode(options.hold_mode), to=options.label,
+                        added_at=datetime.now(timezone.utc).isoformat())]))[0]
+                    validate_next_move_target(candidate)
+                _ = next_moves.add_next_move(options.group, options.percent, options.label,
+                                             options.hold_mode, insertion=options.insertion)
+                print(next_moves.list_next_moves() if role_map.is_role_map_host()
+                      else f"added {options.group} account move")
+            elif options.next_action == "remove":
+                next_moves.remove_next_move(options.group, options.next_position)
+                print(f"removed {options.group} {options.next_position.value}")
+            elif options.next_action == "move":
+                next_moves.move_next_move(options.group, options.next_position, options.next_destination)
+                print(f"moved {options.group} {options.next_position.value} to {options.next_destination.value}")
+            elif options.next_action == "hold":
+                expected: next_moves.ExpectedNextMove | next_moves.UncheckedNextMove = next_moves.UncheckedNextMove()
+                if options.next_expect:
+                    try:
+                        percent = float(options.next_expect[0])
+                    except ValueError as error:
+                        raise next_moves.NextMoveError("next: expected percent must be from 0 to 100") from error
+                    if not math.isfinite(percent) or not 0 <= percent <= 100:
+                        raise next_moves.NextMoveError("next: expected percent must be from 0 to 100")
+                    expected = next_moves.ExpectedNextMove(percent, options.next_expect[1])
+                print(next_moves.update_next_move_hold(options.group, options.next_position, options.hold_mode, expected))
+            else:
+                print(next_moves.list_next_moves())
+            return 0
         if options.action in ("role-map-read", "role-map-write"):
             if not role_map.is_role_map_host():
                 raise AccountsError(f"accounts: role map belongs on {role_map.ROLE_MAP_HOST}")
@@ -3945,14 +4326,6 @@ def main(argv: list[str]) -> int:
         if options.action == "placement":
             print(placement_report())
             return 0
-        if options.action == "pick":
-            chosen = pick(cast(Literal["claude", "codex"], options.tool), datetime.now(timezone.utc),
-                          exclude=frozenset(options.exclude), keep=KeepAccount(options.keep) if options.keep else NoKeep())
-            print(chosen.label if isinstance(chosen, PickedAccount) else no_room_line(options.tool, chosen))
-            if options.explain:
-                for reason in chosen.reasons:
-                    print(_pick_explanation(reason))
-            return 0 if isinstance(chosen, PickedAccount) else 1
         if options.action == "exec":
             exec_account(options.label, options.claude_args, probe=options.probe)
             return 0
@@ -3994,7 +4367,11 @@ def main(argv: list[str]) -> int:
                 print(problem)
             return 1 if problems else 0
         if options.action == "status":
-            print(status_report(detail=options.detail))
+            source: UsageSource = StoredUsageOnly() if options.stored else RefreshStaleUsage()
+            if options.as_json:
+                print(render_status_json(read_status(source=source)))
+            else:
+                print(status_report(detail=options.detail, source=source))
             return 0
         if options.action == "role":
             selected = role_account(options.role)
@@ -4038,7 +4415,7 @@ def main(argv: list[str]) -> int:
                 print("No paired quota readings in this window.")
             return 0
         raise AccountsError(f"accounts: unknown action {options.action}")
-    except (AccountsError, role_map.RoleMapUnavailable, role_map.RoleMapWriteRefused) as error:
+    except (AccountsError, next_moves.NextMoveError, role_map.RoleMapUnavailable, role_map.RoleMapWriteRefused) as error:
         print(error, file=sys.stderr)
         return 2 if options.action == "exec" else 1
 

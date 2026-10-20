@@ -33,10 +33,13 @@ Loop/verbose only:
 2. Confirm status contains only this phase, source-comment edits left by the
    previous phase's plan review, its plan doc, and an approved change to
    `${NEXT_ITEMS_PATH}` when present. The current phase may still have its Work
-   Order. Refuse the checkpoint if any earlier `done` phase still has a Work
-   Order; its shrink must be repaired first.
+   Order. For a header `**Standing:** style_plan.py`, expect no plan doc in
+   status: it is excluded, and earlier done ticket phases keep their Work
+   Orders until refill discards them. Otherwise refuse the checkpoint if any
+   earlier `done` phase still has a Work Order; its shrink must be repaired first.
 3. Formatting is covered by <PhaseChecks/>; do not rerun it here.
-4. Mark the phase `status: done`. Never put its commit hash in the plan.
+4. Mark the phase `status: done`. For a standing plan, defer this until step 6's
+   ticket checkpoint succeeds. Never put its commit hash in the plan.
 5. First record a first touch no hook recorded. When the state is still
    `EnrolledAwaitingFirstTouch`, this checks every path of this phase changed
    since `${PHASE_DIR}/phase_baseline` and writes `Active` from the clear
@@ -86,21 +89,67 @@ Loop/verbose only:
    says drift requires a live session mapping, active coordination-run marker,
    or `CARGO_BERTH_RUN`. Exit `6` has already spent the engine's single
    ten-second deadline: invoke no retry.
-6. Stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when approved and
-   changed; commit exactly once:
+6. **Standing plans:** rerun the ticket's
+   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket <id>`
+   before staging. Exit 1 is a review: it retains the reservation and returns
+   to repair. Exit 2 means the gate could not run (`error: <reason>`, such as a
+   locked ledger): retain the reservation, do not repair, and rerun the gate.
+   If the same error comes back, stop and report it.
+   On exit 0, stage only this phase's code paths from
+   `git status --porcelain`, handling renamed paths as pairs; never name the
+   plan doc, `docs/style-production/` or pinned rule files in `git add`.
+   Commit exactly the gated tree once using the message below, then capture
+   and persist its full id through the durable transition below. Before marking
+   the phase done, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured code commit>`.
+   If recording fails, retain the commit and reservation, repair the ticket
+   record, and do not create another commit.
+
+   **No-change standing ticket:** with every cell recorded `clean`, `exception`
+   or `held` at the unit's HEAD and no tracked diff, make no commit. Capture
+   `git rev-parse HEAD` once and require
+   `git merge-base --is-ancestor <captured HEAD> refs/heads/<style merge branch>`.
+   The standing-unit fast-forward exception in `docs/production_format.md`
+   item 5 keeps HEAD on the style merge branch's history after a phase-start sync.
+   On failure, report one line to the style showrunner and leave the ticket
+   assigned until it answers. On success, run `style_ledger.py ticket checkpoint
+   --repo . --id <ticket> --commit <captured HEAD>` then
+   `style_ledger.py ticket merge --repo . --id <ticket>` through
+   `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py`.
+   For each `has no applied check` line that merge prints, check the change in
+   the code and run the printed `held built` command when the change is there.
+   A finding whose change is not there waits for a person, who makes the change
+   and runs that command, or waives the finding with `style_ledger.py held waive`.
+   From `Active`, atomically replace the durable record with
+   `CheckpointCommittedAwaitingReleaseConfirmation` carrying that same captured
+   full id as `checkpoint_commit`, and read it back. This is the one case where
+   that state carries a commit the phase did not make. A failed transition or
+   read-back retains the valid durable state and invokes no release. Run step
+   7 unchanged; inactive states release nothing. After confirmation, mark the
+   phase done, skip staging, <PushCheckpoint/> and the merge request, send
+   `From <unit>: ticket <id> closed with no code change; <n> held.`, and refill
+   at once through <StandingPlanRefill/>.
+
+   **Other plans:** stage the phase, its plan doc, and `${NEXT_ITEMS_PATH}` when
+   approved and changed. Every code checkpoint uses this message:
 
    ```
    checkpoint(<plan-slug>): phase N — <title>
 
    <what the phase built>
 
-   Change-Review: <what you see change> | <how to check it>
+   Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>
    Claude-Session: <session url>
    ```
 
    Every `checkpoint(...)` commit that changes more than Markdown carries
-   `Change-Review: <what you see change> | <how to check it>`, one line per
-   visible change, or `Change-Review: none — <why nothing visible changes>`.
+   `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
+   `Change-Review: none — <why nothing visible changes>`. Write each line for a
+   person with no context. "Where" names the machine (natedev or the Mac) and
+   the session (a terminal, a showrunner session, a unit session, any Claude
+   session). Example:
+   `Change-Review: The unit board shows each unit's phase | In a showrunner session on natedev, type /showrunner:unit_board | Each row has a Phase column`.
+   A line without all three parts is refused.
    A change the user can check outside the app counts as visible too: a
    table's columns, a status line, a command's output.
    A hook refuses the commit without it and the merge refuses the checkpoint;
@@ -113,11 +162,17 @@ Loop/verbose only:
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that value as
    `checkpoint_commit`, and read the new record back. That durable transition
    must succeed before release is invoked, and its value comes only from the
-   commit that just succeeded, never from conversation or from a later reading
-   of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
+   commit that just succeeded (or the ancestry-checked, captured HEAD of the
+   no-change standing ticket above), never from conversation or from a later
+   reading of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
    release and apply <RetainDelegatedPhaseReservation/> to whichever valid
    durable state remains.
 7. Read and validate the durable record again.
+
+   For a standing ticket with a pending release record, finish any interrupted
+   `ticket checkpoint` using that record's `checkpoint_commit` before release
+   and before marking the phase done; repeating the same checkpoint is safe.
+   A no-change ticket is already `merged` and needs no repeated transition.
 
    | State | Action |
    | --- | --- |
@@ -191,12 +246,16 @@ Loop/verbose only:
    `Checkpoint <short hash> — phase N: <title>.` with its push note, if any.
    This report follows successful release when the phase was active.
 9. In a production unit, run
-   `python3 ~/.claude/scripts/delegate/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
-   and `python3 ~/.claude/scripts/delegate/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
+   `python3 ~/.claude/scripts/direct/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
+   and `python3 ~/.claude/scripts/direct/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
    and keep both lines for <ProductionUnit/> item 3's checkpoint notice.
 </CheckpointCommit>
 
 <ShrinkCommit>
+Standing plans (`**Standing:** style_plan.py`) skip this entire section: no
+shrink, shrink commit, shrink notice or `--shrink` merge request; never stage
+their excluded plan or pinned rule files.
+
 Loop/verbose only, after <RunPhaseShrink/> passes its structural check. The
 next phase's workers may be editing, but they never stage files.
 

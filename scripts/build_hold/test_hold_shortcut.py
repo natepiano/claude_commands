@@ -142,11 +142,29 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
                     empty = kind == "empty" and setting in ("shopt -s nullglob", "shopt -s dotglob")
                     self.assert_checks(shortcut=0 if empty else 1, setting=setting, starts=not empty)
 
-    def test_other_callers_are_unchanged(self) -> None:
+    def test_mac_runs_are_unchanged(self) -> None:
         _ = (self.holders / "holder").write_text("held")
-        for extra in ({"BUILDLOG_CALL_ID": ""}, {"BUILDLOG_CALLER": "verify-mac"}):
-            with self.subTest(extra=extra):
-                self.assert_checks(shortcut=1, extra=extra, starts=False)
+        for setting, extra in (("", {"BUILDLOG_CALLER": "verify-mac"}),
+                               ("OSTYPE=darwin23", {"BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "cargo-port"})):
+            with self.subTest(setting=setting, extra=extra):
+                self.assert_checks(shortcut=1, setting=setting, extra=extra, starts=False)
+
+    def test_caller_without_a_call_id_waits_under_its_own_id(self) -> None:
+        _ = (self.holders / "holder").write_text("held")
+        script = MEMORY_GATE.parent.parent / "build_targets" / "build_targets.py"
+        for caller, name in (("cargo-port", "cargo-port"), ("", "lint")):
+            with self.subTest(caller=caller):
+                result = self.run_checks(extra={"BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": caller})
+                self.assertEqual((result.returncode, result.stdout.strip(), result.stderr), (0, "1 0 0", ""))
+                wait, admission = self.starts.read_text().splitlines()
+                call_id = wait.split()[3]
+                self.assertRegex(call_id, r"^v[0-9]{8}T[0-9]{6}-[0-9]+-[0-9]+$")
+                self.assertEqual(wait, f"{script} wait-local --call-id {call_id} --pid 12345 --caller {name}")
+                self.assertEqual(admission, f"{script} check-admission --call-id {call_id} --caller {name}")
+
+    def test_caller_without_a_holder_directory_starts_no_check(self) -> None:
+        extra = {"BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "cargo-port", "BUILD_HOLD_DIR": str(self.scratch / "missing")}
+        self.assert_checks(shortcut=1, extra=extra, starts=False)
 
     def test_nothing_held_starts_no_process(self) -> None:
         empty_path = self.scratch / "empty-path"

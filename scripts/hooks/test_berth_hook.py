@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
@@ -81,6 +81,8 @@ class BerthHookTests(unittest.TestCase):
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
         }
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
+        # A test run from inside a seat inherits its run; each test names the run it wants.
+        _ = self.environment.pop("PLAN_DELEGATE_BOARD_DIR", None)
         self.answer(envelope("clear", acquisition=acquired()))
         _ = self.state(AWAITING)
 
@@ -180,6 +182,40 @@ class BerthHookTests(unittest.TestCase):
             "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD,
         }})
 
+    def side_run(self) -> Path:
+        """A second run of the same director, its phase 7 open; the marker still names run-1."""
+        run = self.root / "unit" / "run-2"
+        directory = phase_reservation.phase_directory(run, "7")
+        directory.mkdir(parents=True)
+        _ = (directory / phase_reservation.STATE_FILE).write_text(json.dumps(
+            {"kind": "enrolled_awaiting_first_touch", "phase": "7"}))
+        return run
+
+    def test_a_seat_of_a_side_run_checks_its_own_runs_phase_not_the_markers(self) -> None:
+        run = self.side_run()
+        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-7"])
+        state_path = phase_reservation.phase_directory(run, "7") / phase_reservation.STATE_FILE
+        self.assertEqual(cast(dict[str, object], json.loads(state_path.read_text()))["kind"], "active")
+        self.assertEqual(self.state(), AWAITING)
+
+    def test_without_a_board_dir_the_marker_names_the_run(self) -> None:
+        _ = self.side_run()
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-15"])
+        self.assertEqual(self.state()["kind"], "active")
+
+    def test_a_board_dir_that_is_gone_falls_back_to_the_marker(self) -> None:
+        _ = self.side_run()
+        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(self.root / "unit" / "ended-run")
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-15"])
+        self.assertEqual(self.state()["kind"], "active")
+
     def test_an_already_active_phase_keeps_its_reservation(self) -> None:
         active: dict[str, object] = {"kind": "active", "active_phase_reservation": {
             "reservation_id": "earlier", "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD}}
@@ -201,6 +237,14 @@ class BerthHookTests(unittest.TestCase):
 
     def test_an_unenrolled_repository_is_allowed_silently(self) -> None:
         self.answer(envelope("unconfigured", "this repository has no cargo-berth configuration"))
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state(), AWAITING)
+
+    def test_an_unreadable_ledger_allows_the_edit_as_the_engine_does(self) -> None:
+        # A scratch clone carries the berth configuration but no ledger (hana, 2026-10-20).
+        self.answer(envelope("ledger_unreadable", "cargo-berth could not establish edit safety; "
+                             + "editing is allowed because ledger loss fails open."))
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(self.state(), AWAITING)

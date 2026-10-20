@@ -14,7 +14,7 @@ import tempfile
 from dataclasses import dataclass
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -229,7 +229,7 @@ class MacProcessRecord:
     executable: Path
 
 
-def _kern_procargs2(pid: int) -> bytes:
+def kern_procargs2(pid: int) -> bytes:
     """Read one kernel argument record, without exposing it in diagnostics."""
     query = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
     buffer = ctypes.create_string_buffer(1024 * 1024)
@@ -246,36 +246,56 @@ def _kern_procargs2(pid: int) -> bytes:
     return buffer.raw[:size.value]
 
 
-def mac_process_record(pid: int) -> MacProcessRecord | ProcessEnvironmentUnread:
-    """Separate exactly argc arguments from the following environment strings."""
-    unread = ProcessEnvironmentUnread("process argument record could not be read")
-    try:
-        payload = _kern_procargs2(pid)
-    except OSError:
-        return unread
+class ProcessArguments(NamedTuple):
+    executable: Path
+    arguments: tuple[str, ...]
+    # Only the names the caller keeps.
+    environment: dict[str, str]
+
+
+def procargs2_parts(payload: bytes, keep: Callable[[str], bool]) -> ProcessArguments:
+    """Separate exactly argc arguments from the following environment strings.
+
+    The record is argc, the executable path, NUL padding, the arguments, then the environment and
+    the kernel's own `key=value` strings, each NUL-terminated. Only a value whose name `keep`
+    accepts is decoded; every other value is dropped as it is read. A malformed record raises
+    ValueError, which names no part of the record.
+    """
+    malformed = ValueError("process argument record is malformed")
     if len(payload) < 5 or not payload.endswith(b"\0"):
-        return unread
+        raise malformed
     count = int.from_bytes(payload[:4], sys.byteorder, signed=True)
     executable_end = payload.find(b"\0", 4)
     if count <= 0 or executable_end <= 4:
-        return unread
+        raise malformed
     offset = executable_end + 1
     while offset < len(payload) and payload[offset] == 0:
         offset += 1
     words = payload[offset:].split(b"\0")
     if len(words) <= count or not words[0]:
-        return unread
-    arguments = tuple(os.fsdecode(word) for word in words[:count])
-    setting: ProcessCodexHome | ProcessWithoutCodexHome = ProcessWithoutCodexHome()
+        raise malformed
+    environment: dict[str, str] = {}
     for entry in words[count:]:
         if not entry:
             continue
         key, separator, value = entry.partition(b"=")
         if not separator or not key:
-            return unread
-        if key == b"CODEX_HOME":
-            setting = ProcessCodexHome(Path(os.fsdecode(value))) if value else ProcessWithoutCodexHome()
-    return MacProcessRecord(arguments, setting, Path(os.fsdecode(payload[4:executable_end])))
+            raise malformed
+        if keep(name := os.fsdecode(key)):
+            environment[name] = os.fsdecode(value)
+    return ProcessArguments(Path(os.fsdecode(payload[4:executable_end])),
+                            tuple(os.fsdecode(word) for word in words[:count]), environment)
+
+
+def mac_process_record(pid: int) -> MacProcessRecord | ProcessEnvironmentUnread:
+    """The arguments, the CODEX_HOME setting and the executable of a Mac process."""
+    try:
+        parts = procargs2_parts(kern_procargs2(pid), lambda name: name == "CODEX_HOME")
+    except (OSError, ValueError):
+        return ProcessEnvironmentUnread("process argument record could not be read")
+    home = parts.environment.get("CODEX_HOME")
+    setting = ProcessCodexHome(Path(home)) if home else ProcessWithoutCodexHome()
+    return MacProcessRecord(parts.arguments, setting, parts.executable)
 
 
 def process_codex_home(pid: int) -> ProcessCodexHome | ProcessWithoutCodexHome | ProcessEnvironmentUnread:

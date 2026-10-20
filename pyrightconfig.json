@@ -20,7 +20,7 @@
       ]
     },
     {
-      "root": "scripts/delegate",
+      "root": "scripts/direct",
       "extraPaths": [
         ".",
         "scripts/production",
@@ -55,17 +55,21 @@
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks",
-        "scripts/delegate",
+        "scripts/direct",
         "scripts/message",
         "scripts/notify",
         "scripts/production",
-        "scripts/lib"
+        "scripts/lib",
+        "scripts/shutdown",
+        "scripts/herdr"
       ]
     },
     {
-      "root": "scripts/fix",
+      "root": "scripts/style",
       "extraPaths": [
-        "scripts/fix",
+        ".",
+        "scripts/style",
+        "scripts/production",
         "scripts/lib"
       ]
     },
@@ -95,7 +99,7 @@
       "extraPaths": [
         "scripts/message",
         "scripts/production",
-        "scripts/delegate",
+        "scripts/direct",
         "scripts/notify",
         "scripts/shutdown",
         "scripts/lib",
@@ -160,7 +164,7 @@
         ".",
         "scripts/production",
         "scripts/build_hold",
-        "scripts/delegate",
+        "scripts/direct",
         "scripts/hooks",
         "scripts/mac_test",
         "scripts/message",
@@ -208,6 +212,19 @@
       "extraPaths": [
         "scripts/bevy_migration_plan",
         "scripts/bevy_upgrade"
+      ]
+    },
+    {
+      "root": "scripts/statusline",
+      "extraPaths": [
+        ".",
+        "scripts/statusline",
+        "scripts/hooks",
+        "scripts/direct",
+        "scripts/message",
+        "scripts/notify",
+        "scripts/production",
+        "scripts/lib"
       ]
     },
     {

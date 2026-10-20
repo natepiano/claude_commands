@@ -104,15 +104,16 @@ production format, with status `planned`:
 - **Units:**
   - **Worktree:** `<parent of ${REPO}>/<name>-<area>`, with a branch of the
     same name.
-  - **Session:** the unit name. If a herdr or tmux session with that name already
+  - **Session:** the unit name. If a herdr session with that name already
     exists, add the production name as a prefix.
   - **Port:** a distinct app port per unit, only when the project launches an
     app for smoke tests. Never the user's default port. The repository's
     memory names the default.
   - **Owns:** the files greenlight gave the unit.
 - **Hub files** and **Gates** are copied from the greenlight result.
-- **Merge tests:** the app package whose tests catch cross-crate breaks, if
-  one exists.
+- **Merge tests:** the command that runs the app package's tests, which catch
+  cross-crate breaks, e.g. `./verify.sh test -p app`, if one exists; a command,
+  never a bare package name.
 - **Log:** `docs/handoff/<name>-production-log.md`.
 - **Updates:** every 15 minutes (user, 2026-09-28).
 - **Change review:** `~/rust/hanadocs/change-review/change-review - <showrunner>.md`,

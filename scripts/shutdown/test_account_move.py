@@ -17,6 +17,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
 
@@ -27,17 +28,45 @@ import settle
 import shutdown
 import showrunners
 import stop as stop_work
+import restart
 from importlib import import_module
 import account
 import agent_accounts
 from scripts.accounts import accounts, refusals
-from test_restart import entry, worker_session, showrunner, top_level, tmux_host, unit
+from test_restart import RESTARTED, STOPPED, entry, worker_session, showrunner, top_level, unit
 from test_support import ShutdownTestCase
 
 
 class AccountMoveTests(ShutdownTestCase):
     root: Path = Path()
     owner: inventory.Session = top_level("move-id", name="kept name")
+
+    def test_move_opening_note_dates_the_pause_and_resume_even_when_delivered_late(self) -> None:
+        saved = entry(top_level("dated-move"))
+        saved.update(target="claude3", source_label="claude1", why="weekly allowance exhausted")
+        note = restart.restart_note(saved, RESTARTED)
+        paused = restart._user_time(STOPPED)  # pyright: ignore[reportPrivateUsage]
+        resumed = restart._user_time(RESTARTED)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn(paused, note)
+        self.assertIn(resumed, note)
+        self.assertLess(note.index(paused), note.index(resumed))
+        self.assertIn("claude1", note)
+        self.assertIn("claude3", note)
+        self.assertIn(saved["where"]["text"] if saved["where"]["kind"] == "said" else "", note)
+
+    def test_move_opening_note_points_to_resume_message_only_when_workers_were_paused(self) -> None:
+        director = unit("moved-director")
+        saved = entry(director)
+        saved["target"] = "claude3"
+        saved["source_label"] = "claude1"
+        sentence = "Your Codex workers are paused, not ended; a message lists the command that resumes each."
+        self.assertNotIn(sentence, restart.restart_note(saved, saved["requested_at"]))
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="private-thread", turn_live=True, launcher_command=[])]
+        note = restart.restart_note(saved, saved["requested_at"])
+        self.assertEqual(note.count(sentence), 1)
+        self.assertIn("message/send.py pending", note)
+        self.assertIn("Continue your /unit:direct run", note)
+        self.assertNotIn("private-thread", note)
 
     @override
     def setUp(self) -> None:
@@ -64,7 +93,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.named_account("claude2", "default@example.invalid")
         self.named_account("claude1", "current@example.invalid")
         self.named_account("claude3", "target@example.invalid")
-        self.owner = top_level("move-id", name="kept name", host=tmux_host("kept tmux"))
+        self.owner = top_level("move-id", name="kept name", host=inventory.HerdrHost(kind="herdr", herdr_session="kept-host", pane_id="w1:p1", presentation="detached"))
         self.owner["config_dir"] = str(accounts.account_dir("claude1"))
         _ = self.enterContext(patch.object(sessions, "live_sessions", side_effect=self.live_registry))
         _ = self.enterContext(patch.object(account, "process_config_dir", return_value=account.ConfiguredClaudeFolder(accounts.account_dir("claude1"))))
@@ -394,13 +423,13 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(self.disk_state(), before)
 
     def showrunner_inventory(self) -> inventory.Inventory:
-        first = showrunner("sr-one", host=tmux_host("first-pane"))
+        first = showrunner("sr-one", host=inventory.HerdrHost(kind="herdr", herdr_session="first-pane", pane_id="w1:p1", presentation="detached"))
         first["config_dir"] = str(accounts.account_dir("claude1"))
         first["name"] = "first showrunner"
         first["cwd"] = "/tmp/first workspace"
         first["doc"] = "/tmp/first production.md"
         first["model"] = inventory.ModelName(kind="model", name="opus")
-        second = showrunner("sr-two", host=tmux_host("second-pane"))
+        second = showrunner("sr-two", host=inventory.HerdrHost(kind="herdr", herdr_session="second-pane", pane_id="w1:p1", presentation="detached"))
         second["config_dir"] = str(accounts.account_dir("claude1"))
         second["name"] = "second showrunner"
         second["cwd"] = "/tmp/second workspace"
@@ -484,8 +513,10 @@ class AccountMoveTests(ShutdownTestCase):
                 self.assertIn("shutdown.py ready --where", text)
             return {"kind": "sent"}
 
-        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop") -> record.SessionShutdown:
+        def stopped(saved: record.SessionShutdown, *, idle_reason: stop_work.IdleStopReason = "not an idle stop",
+                    forced: bool = False) -> record.SessionShutdown:
             self.assertEqual(idle_reason, "not an idle stop")
+            self.assertFalse(forced)
             events.append("stop")
             self.assertEqual(saved["progress"]["kind"], "ready")
             checkpoint = saved["where"]
@@ -514,6 +545,7 @@ class AccountMoveTests(ShutdownTestCase):
               patch.object(settle, "merge_in_progress", return_value=False),
               patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "requester-outside-group"}),
               patch.object(subprocess, "run", side_effect=request),
+              patch.object(settle, "_carry_trust"),
               patch.object(settle, "send_message", side_effect=delivered),
               patch.object(runner_registry, "current_name", return_value="parent-runner"),
               patch.object(stop_work, "stop_session", side_effect=stopped) as stop):
@@ -539,7 +571,7 @@ class AccountMoveTests(ShutdownTestCase):
             saved = record.session_records(report["login"])[0]
             self.assertIsInstance(settle.next_step(saved, observed, [saved], datetime.now(timezone.utc)),
                                   settle.StopSession)
-            _ = settle._stop_after_telling(saved)  # pyright: ignore[reportPrivateUsage]
+            _ = settle._stop_after_telling(saved, settle.StopSession())  # pyright: ignore[reportPrivateUsage]
             stop.assert_called_once()
         self.assertTrue(events[1].startswith(f"{director['name']} is stopping:"), events)
         self.assertEqual(events[-1], "stop")
@@ -779,10 +811,10 @@ class AccountMoveTests(ShutdownTestCase):
         listing.assert_called()
         self.assertIn("sr-one", output)
         self.assertIn("first showrunner:", output)
-        self.assertIn("move when idle (claude1 has room)", output)
+        self.assertIn("will move once idle (claude1 has room)", output)
         self.assertIn("sr-two", output)
         self.assertIn("second showrunner:", output)
-        self.assertIn("reap and restart now (claude1 out of usage: weekly limit, resets Thu 9:00 AM)", output)
+        self.assertIn("will stop and move now (claude1 out of usage: weekly limit, resets Thu 9:00 AM)", output)
         subjects = [cast(settle.PromptSubject, call.args[0]) for call in prompt.call_args_list]
         self.assertEqual([subject.session_id for subject in subjects], ["sr-one", "sr-two"])
         self.assertTrue(all(subject.login == report["login"] for subject in subjects))
@@ -794,19 +826,30 @@ class AccountMoveTests(ShutdownTestCase):
         empty = refusals.FreshReading(refusals.ReadingWindow(0,
             refusals.KnownReset(at + timedelta(days=1)), at), refusals.NoWindow(), "")
         for group in (False, True):
-            with self.subTest(group=group):
-                before = self.disk_state()
-                with (patch.object(refusals, "stored_reading", return_value=empty),
-                      patch.object(subprocess, "run") as process):
-                    result, output, error = self.batch_cli() if group else self.cli()
-                self.assertNotEqual(result, 0)
-                self.assertIn("claude3 is out of usage", output + error)
-                self.assertIn("weekly 0% left", output + error)
-                self.assertIn("resets", output + error)
-                self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py pick", output + error)
-                self.assertIn("in this terminal", output + error)
-                self.assertEqual(self.disk_state(), before)
-                process.assert_not_called()
+            for has_room in (False, True):
+                with self.subTest(group=group, has_room=has_room):
+                    def reading(_tool: str, login: str, _now: datetime) -> refusals.FreshReading:
+                        if not has_room or login == "target@example.invalid":
+                            return empty
+                        days = 2 if login == "default@example.invalid" else 3
+                        return refusals.FreshReading(refusals.ReadingWindow(50,
+                            refusals.KnownReset(at + timedelta(days=days)), at), refusals.NoWindow(), "")
+
+                    before = self.disk_state()
+                    with (patch.object(refusals, "stored_reading", side_effect=reading),
+                          patch.object(subprocess, "run") as process):
+                        result, output, error = self.batch_cli() if group else self.cli()
+                    self.assertNotEqual(result, 0)
+                    self.assertIn("claude3 is out of usage", output + error)
+                    self.assertIn("weekly 0% left", output + error)
+                    self.assertIn("resets", output + error)
+                    if has_room:
+                        self.assertIn("; claude2 has room", output + error)
+                    else:
+                        self.assertIn("; no claude account has room; the earliest reset is", output + error)
+                    self.assertNotIn("pick", output + error)
+                    self.assertEqual(self.disk_state(), before)
+                    process.assert_not_called()
 
     def test_target_with_exhausted_window_and_credits_can_still_be_previewed(self) -> None:
         at = datetime.now(timezone.utc)
@@ -884,7 +927,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual((result, error.getvalue()), (0, ""))
         self.assertIn("kept name:", output.getvalue())
         self.assertIn("move-id", output.getvalue())
-        self.assertIn("move when idle", output.getvalue())
+        self.assertIn("will move once idle", output.getvalue())
         self.assertEqual(self.disk_state(), before)
         process.assert_not_called()
 

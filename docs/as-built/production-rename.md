@@ -21,7 +21,7 @@ pushed.
 | `scripts/production/showrunners.py` | Reads timer CHECK paths and resolves Formerly names. |
 | `scripts/production/unit_lookup.py` | Groups marked sessions by current slug and reports Claude state. |
 | `scripts/production/stall_watch.py` | Supplies hashed state paths and matches inherited process marks by current slug. |
-| `scripts/delegate/review_pool.py` | `_production` resolves the production argument to its current pool. |
+| `scripts/direct/review_pool.py` | `_production` resolves the production argument to its current pool. |
 | `commands/showrunner/rename.md` | Showrunner workflow and recovery instructions. |
 | `docs/production_format.md` | Production Context's Formerly field. |
 
@@ -123,23 +123,8 @@ a branch starting `<old>-`, a linked worktree on that branch, no existing
 showrunner checkout on the new merge branch. An unfinished move must be
 completed before another unit starts, and a finished rename refuses new moves.
 
-Liveness comes from `marked_units(new, every_host=True)`, checked when the
-command starts and again just before the worktree move. Both session sources
-(tmux and herdr) must be readable; failure to discover sessions, or two
-sessions carrying one unit's mark, refuses. `LiveClaude` and `ClaudeUnknown`
-refuse; `ClaudeNotRunning`, or no marked session at all, proceeds. Other
-callers keep tolerant discovery by default:
-
-```python
-def marked_units(slug: str, *, every_host: bool = False) -> dict[str, MarkedUnit]
-def every_marked_unit(*, include_tmux: bool = True, every_host: bool = False) -> MarkedProductions
-# Claude = LiveClaude | ClaudeNotRunning | ClaudeUnknown
-```
-
-By default one failing host is tolerated and the call raises only when all
-fail; `every_host=True` raises on any failure, prefixing the host name unless
-the error already starts with it. The old local branch, while it exists, must
-stay at the recorded tip before each later change.
+Herdr observation failures refuse the move. The old local branch, while it
+exists, must stay at the recorded tip before each later change.
 
 | Unit step | Completed work |
 | --- | --- |
@@ -165,10 +150,6 @@ The old path's `projects` entry is copied to the new key, keeping the old
 key and unrelated settings. Each atomic write is read back after two seconds,
 with at most three attempts if the new key disappears. Persistent loss refuses
 and names the file; the next launch needs a trust prompt.
-
-Session names and tmux marks stay as they are during the move. `add_unit`
-writes the new production mark at the next launch. The showrunner tells each
-unit director its new worktree path before it resumes.
 
 ## Journal and recovery
 
@@ -244,31 +225,26 @@ and 2 for invalid arguments.
 
 - **Unknown slugs pass through.** A resolver that raised on an unknown slug
   would break the review pool and unit lookup for timer-less productions.
+
 - **Units move separately, between runs.** A moved cwd breaks a live session,
   and the rename must not modify another session's claims. That is also why
   discovery is strict: one failing host could hide a live unit.
+
 - **The old merge branch stays until finish.** Apply leaves units on their
   old branches; finish deletes the old merge branch only once every
   non-retired row has moved, and only at the saved tip, so no commit is lost.
-- **Old names resolve through the production doc.** The update timer and the
-  doc it checks are the one record of a production, and messages already in
-  flight and existing tmux marks still carry the old slug.
+
 - **Merge history survives the rename.** `merge_checkpoint.py` derives the
   last merge per unit from subjects `Merge <unit> phase <N> (<hash>)`, which
   hold no branch name, so old subjects need no rewrite.
+
 - **The trust copy is read back.** A running Claude can rewrite its account
   file from memory and drop the new key.
+
 - **Commit detection reads HEAD.** Merges onto the merge branch between unit
   steps must not block a resume or cause a second unit commit.
 
 ## State roots and tests
-
-Tests set `HOME`, `CLAUDE_CONFIG_DIR`, `NOTIFIER_STATE_DIR`,
-`SHOWRUNNER_STATE_DIR`, `STALL_WATCH_STATE_DIR`, `REVIEW_POOL_STATE` and
-`NOTIFIER_SESSIONS_DIR` to temporary directories, point `UNIT_LOOKUP_TMUX`
-at `fake_tmux.py` and `HERDR_BIN`/`HERDR_PROC` at the herdr fakes, and use a
-local bare origin and disposable linked worktrees. The default state roots are
-`~/.local/state/{notifier,showrunner,stall-watch,review-pool}`.
 
 `test_rename.py` covers moves, kept history, interrupted steps, branch
 changes, account data, trust retries, refusals and repeated completion.
@@ -290,15 +266,6 @@ python3 scripts/production/merge_gate.py --repo <checkout> --tests-only
 
 ## Live check
 
-A scratch production completes `plan`, `apply`, `unit` and `finish` with a
-local bare origin, isolated account and state roots and fake tmux/herdr
-discovery; no branch reaches GitHub. A socket-backed showrunner fixture and an
-old-marked stopped unit stay discoverable under both `old` and `new`:
-`showrunners.py address`, `unit_lookup.py list` and `pane` return identical
-non-empty answers after apply, before and after the unit move, and after
-finish. Canonicalized stall-watch paths and review-pool lease paths resolve to
-the same kept files under both names at every checkpoint.
-
 A worktree path containing `.` and `_` moves; transcripts move and trust
 entries are copied in both the default and the separate account layouts. Plan
 writes nothing; finish retires the old local and origin branches and marks the
@@ -306,12 +273,9 @@ journal done. Historical commit subjects, saved logs and transcript contents
 are kept. The scratch root holds every path the check creates and is removed
 afterwards.
 
-A rerun needs `HOME`, `CLAUDE_CONFIG_DIR`, `NOTIFIER_STATE_DIR`,
-`SHOWRUNNER_STATE_DIR`, `STALL_WATCH_STATE_DIR`, `REVIEW_POOL_STATE`,
-`NOTIFIER_SESSIONS_DIR`, `UNIT_LOOKUP_TMUX`, `HERDR_BIN` and `HERDR_PROC` all
-inside the scratch root; with the real `HOME`, `unit` writes the real account
-files. Both hosts must answer and the marked unit must read as
-`ClaudeNotRunning`. Git needs explicit identities, `GIT_CONFIG_NOSYSTEM=1` and
-signing off; an `env -i` environment must carry the git and Python directories
-on `PATH`. The check does not cover a real Claude process, a real tmux or
-herdr server, or a network git remote.
+## Herdr liveness
+
+Unit liveness uses `marked_units(new)` before each move. Observation failures,
+duplicate marks and live or unknown Claudes refuse. Existing herdr marks keep
+their slug until relaunch and resolve through aliases. Tests use herdr and
+process fixtures under isolated account and state roots.

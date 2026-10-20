@@ -13,6 +13,7 @@ import unittest
 from contextlib import chdir, nullcontext
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import TypedDict, cast, override
 from unittest.mock import MagicMock, Mock, patch
 
@@ -186,6 +187,75 @@ class HerdrSessionsTests(unittest.TestCase):
         self.assertEqual(self.call("list"), (0, "", ""))
         self.assertEqual(self.commands(), [["--session", "default", "session", "list", "--json"]])
 
+    def test_remote_list_runs_the_hosts_cli_and_preserves_its_output(self) -> None:
+        output = "writing\tstandalone\tmy conversation\nunit\tunit production/unit\tdirector\n"
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["ssh"], 0, output, "")) as remote:
+            self.assertEqual(self.call("list", "--on", "user@mac"), (0, output, ""))
+        remote.assert_called_once_with(
+            ["ssh", "user@mac", "~/.claude/scripts/lib/py", "~/.claude/scripts/herdr/herdr_sessions.py", "list"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        self.assertEqual(self.commands(), [])
+
+    def test_remote_list_failures_name_the_host_and_return_one_line(self) -> None:
+        for status, reason in ((255, "ssh: host unreachable\nConnection closed\n"),
+                               (1, "herdr_sessions: cannot read sessions\n"), (3, "")):
+            with (self.subTest(status=status), patch.object(subprocess, "run", return_value=
+                    subprocess.CompletedProcess(["ssh"], status, "partial output", reason))):
+                code, output, error = self.call("list", "--on", "mac")
+            self.assertEqual((code, output), (1, ""))
+            self.assertEqual(len(error.splitlines()), 1)
+            self.assertIn(f"mac: remote list failed (ssh exit {status})", error)
+            self.assertIn(" ".join(reason.split()) or "no error message", error)
+        self.assertEqual(self.commands(), [])
+
+    def test_remote_list_timeout_and_missing_ssh_return_one_without_a_traceback(self) -> None:
+        for failure, reason in ((subprocess.TimeoutExpired(["ssh"], 15), "timed out after 15 seconds"),
+                                (FileNotFoundError("ssh not installed"), "ssh not installed")):
+            with self.subTest(reason=reason), patch.object(subprocess, "run", side_effect=failure):
+                code, output, error = self.call("list", "--on", "mac")
+            self.assertEqual((code, output), (1, ""))
+            self.assertEqual(len(error.splitlines()), 1)
+            self.assertIn("mac: remote list", error)
+            self.assertIn(reason, error)
+            self.assertNotIn("Traceback", error)
+        self.assertEqual(self.commands(), [])
+
+    def test_remote_attach_executes_herdr_without_querying_local_sessions(self) -> None:
+        self.respond([], error="local sessions unreadable")
+        with patch.object(os, "execvp", side_effect=SystemExit(0)) as execute:
+            with self.assertRaises(SystemExit) as replaced:
+                _ = self.call("attach-remote", "user@mac", "writing")
+        self.assertEqual(replaced.exception.code, 0)
+        binary = os.environ["HERDR_BIN"]
+        execute.assert_called_once_with(binary, [binary, "--remote", "user@mac", "--session", "writing"])
+        self.assertEqual(self.commands(), [])
+
+    def test_remote_attach_exec_failure_names_its_host(self) -> None:
+        with patch.object(os, "execvp", side_effect=OSError("attach failed")):
+            self.assertEqual(self.call("attach-remote", "mac", "writing"),
+                             (1, "", "herdr_sessions: mac: attach failed: attach failed\n"))
+        self.assertEqual(self.commands(), [])
+
+    def test_remote_commands_reject_option_targets_without_executing_them(self) -> None:
+        with patch.object(subprocess, "run") as remote, patch.object(os, "execvp") as execute:
+            for target in ("", "-oProxyCommand=anything", "two hosts"):
+                for arguments in (("list", "--on", target), ("attach-remote", target, "writing")):
+                    with self.subTest(arguments=arguments):
+                        code, output, error = self.call(*arguments)
+                        self.assertEqual((code, output), (2, ""))
+                        self.assertIn("remote host must be an SSH target", error)
+        remote.assert_not_called()
+        execute.assert_not_called()
+
+    def test_help_explains_remote_list_and_attach(self) -> None:
+        code, output, error = self.call("--help")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("list --on <host>: list herdr sessions on that host over SSH", output)
+        self.assertIn("attach-remote <host> <name>: attach to that host's herdr session", output)
+        self.assertEqual(self.commands(), [])
+
     def test_session_without_a_registry_has_an_empty_claude_name(self) -> None:
         self.respond(["empty"])
         self.records.rmdir()
@@ -271,7 +341,9 @@ class HerdrSessionsTests(unittest.TestCase):
 
     def test_usage_errors_do_not_call_herdr(self) -> None:
         for arguments in ((), ("unknown",), ("list", "extra"), ("attach",), ("attach", ""),
-                          ("attach", "one", "extra")):
+                          ("attach", "one", "extra"), ("list", "--on"),
+                          ("list", "--on", "mac", "extra"), ("attach-remote", "mac"),
+                          ("attach-remote", "mac", ""), ("attach-remote", "mac", "one", "extra")):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.call(*arguments), (2, "", herdr_sessions.USAGE + "\n"))
         self.assertEqual(self.commands(), [])
@@ -409,6 +481,25 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertIn(f"CLAUDE_CODE_REMOTE_MEMORY_DIR={Path.home() / '.claude'}", workspace)
         self.assertEqual(len(self.agent_starts()), 1)
 
+    def test_mac_start_and_resume_refuse_non_desktop_before_any_server_or_agent(self) -> None:
+        for verb, arguments in (
+            ("start", ["--name", "solo", "--cwd", str(self.root)]),
+            ("resume", ["solo", "--session-id", "saved-id", "--cwd", str(self.root)]),
+        ):
+            for kind in (herdr.NonDesktopSession(), herdr.SessionKindUnreadable("query failed")):
+                with (self.subTest(verb=verb, kind=kind),
+                      patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
+                      patch.object(herdr, "security_session", return_value=kind) as query,
+                      patch.object(herdr, "start_new_server") as start,
+                      patch.object(herdr, "start_agent") as agent,
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(self.call(verb, *arguments), (1, ""))
+                self.assertEqual(output.getvalue().splitlines(), [herdr.MAC_DESKTOP_TERMINAL_REQUIRED])
+                query.assert_called_once_with()
+                start.assert_not_called()
+                agent.assert_not_called()
+                self.assertEqual(self.attachments, [])
+
     def test_start_opens_promptless_default_account_and_attaches(self) -> None:
         self.destination("solo")
         self.assertEqual(self.call("start", "--name", "solo", "--cwd", str(self.root), "--", "--model", "opus"), (0, ""))
@@ -462,6 +553,22 @@ class StandaloneLaunchTests(unittest.TestCase):
         prompt = self.root / "prompt"
         _ = prompt.write_text("first line\nsecond line\n")
         self.destination("solo")
+        transcript = directory / "projects/fixture/recorded-id.jsonl"
+        self.responses["--session solo agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
+            "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
+        self.responses["--session solo pane read w1:p1 --source visible --format ansi"] = CommandResponse(
+            code=0, stdout="────────\n❯ \n────────")
+        # This fixture turn is written by the fake command, after launch, not before it.
+        original_prompt = herdr.Herdr.prompt
+
+        def submitted(client: herdr.Herdr, pane: str, text: str) -> None:
+            original_prompt(client, pane, text)
+            transcript.parent.mkdir(parents=True, exist_ok=True)
+            _ = transcript.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                "message": {"role": "user", "content": text}}) + "\n")
+
+        self.save()
+        _ = self.enterContext(patch.object(herdr.Herdr, "prompt", submitted))
         arguments = ("resume", "solo", "--session-id", "recorded-id", "--cwd", str(self.root),
                      "--config-dir", str(directory), "--prompt-file", str(prompt), "--attach", "--",
                      "--model", "opus", "--remote-control", "kept name", "--settings", '{"x":true}')
@@ -483,6 +590,22 @@ class StandaloneLaunchTests(unittest.TestCase):
         self.assertIn(f"CLAUDE_CONFIG_DIR={directory}", workspace)
         self.assertIn(f"CLAUDE_CODE_REMOTE_MEMORY_DIR={self.root / 'home/.claude'}", workspace)
         self.assertIn("HERDR_AGENT_PANE=1", workspace)
+
+    def test_resume_with_unsubmitted_prompt_reports_failure_without_attaching(self) -> None:
+        directory = self.numbered_account()
+        prompt = self.root / "prompt"
+        _ = prompt.write_text("first prompt")
+        self.destination("solo")
+        for outcome in (herdr.PromptNotSubmitted("fixture absent user turn"), herdr.PromptSubmissionNotRequired()):
+            with (self.subTest(outcome=outcome), patch.object(herdr, "start_new_server"),
+                  patch.object(herdr, "start_agent", return_value=outcome) as start):
+                code, error = self.call("resume", "solo", "--session-id", "recorded-id", "--cwd", str(self.root),
+                    "--config-dir", str(directory), "--prompt-file", str(prompt), "--attach")
+            self.assertEqual(code, 1)
+            self.assertIn("solo: opening prompt not submitted", error)
+            self.assertEqual(start.call_args.kwargs["opening"], herdr.OpeningPrompt("first prompt",
+                herdr.SessionTranscript(directory, "recorded-id")))
+        self.assertEqual(self.attachments, [])
 
     def test_resume_without_prompt_or_attach_leaves_user_input_untouched(self) -> None:
         self.destination("solo")

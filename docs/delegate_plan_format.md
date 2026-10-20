@@ -39,6 +39,11 @@ to rediscover after a context compaction lives in the doc.
      it and applies <ProductionUnit/> from ~/.claude/docs/production_format.md. -->
 > **Production: <name>** — unit `<unit>`; production doc `<path>`
 
+<!-- Optional; a standing plan never closes its run. <NextPhase/> refills it
+     through style_plan.py. Git-exclude the plan:
+     the ledger is its record; checkpoint and shrink never commit or shrink it. -->
+> **Standing:** style_plan.py
+
 <!-- Optional; the hanadocs issues whose work this plan builds (/showrunner:proposal).
      Preserved verbatim by every command that edits this doc. /unit:direct marks each
      active at run start; its end-of-run as-built pass closes each. -->
@@ -52,15 +57,17 @@ to rediscover after a context compaction lives in the doc.
   `progress_history.py start-run` recorder; if absent, the recorder derives it
   from the oldest Git commit touching this plan and persists it>
 - **Stack:** <language + key frameworks/versions the work touches>
-- **Layout:** <only the dirs/files phases touch, as a short map>
+- **Layout:** <only the dirs/files phases touch, as a short map. Paths are
+  repository-relative; the plan never names its worktree or branch, which
+  /unit:direct reads from git at dispatch>
 - **Key files:** <path — role> for each file a phase reads or modifies
 - **Test lanes:** <for each crate a phase touches, its `tests/` directory or
   `none` — what a Work Order's **Workers** opens the `test` worker against>
-- **Build:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
+- **Build:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
   otherwise the project's exact build command>
-- **Test:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
+- **Test:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
   otherwise the project's exact test command>
-- **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`;
+- **Lint:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`;
   never raw cargo commands. <PhaseChecks/> defines scope and the phase's
   style review in the unit director's main review; workers never load the guide>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
@@ -115,7 +122,7 @@ re-derive — what earlier phases built, decisions that bind this phase. Empty f
 Phase 1. Maintained by /plan:phase_review.>
 
 **Acceptance gate:** <the build/test/behavior that proves this phase done —
-e.g. `bash ~/.claude/scripts/delegate/verify.sh test <pkg>` green + a named
+e.g. `bash ~/.claude/scripts/direct/verify.sh test <pkg>` green + a named
 test + an observable behavior. Gate commands are `verify.sh` lines only —
 `example`/integration-test lines appear solely in phases whose Files own
 them; nothing workspace-wide.>

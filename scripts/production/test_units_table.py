@@ -13,17 +13,18 @@ from unittest.mock import patch
 import live_units
 import showrunners
 import unit_lookup
+from herdr import HerdrPlace
 import units_table
 
-# Importable once units_table has put scripts/delegate on the path.
+# Importable once units_table has put scripts/direct on the path.
 import phase_table
-import progress_history
+from scripts.direct import plan_history
 
 
 def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:
     if claude is None:
         return live_units.LiveUnit(name, None)
-    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, f"label-of-{name}", claude, unit_lookup.TmuxPlace("%1")))
+    return live_units.LiveUnit(name, unit_lookup.MarkedUnit(name, claude, HerdrPlace(f"label-of-{name}", "w1:p1")))
 
 
 def live(name: str) -> unit_lookup.LiveClaude:
@@ -57,7 +58,7 @@ class UnitsTableTests(unittest.TestCase):
 
     def task(self, *events: str) -> str:
         record = open_record(self.root / "plan.md")
-        with patch.object(progress_history, "plan_runs", return_value=[self.run_file(*events)]):
+        with patch.object(plan_history, "plan_runs", return_value=[self.run_file(*events)]):
             return units_table.task_cell(record)
 
     def test_session_names_the_live_claude_or_says_why_there_is_none(self) -> None:
@@ -119,7 +120,7 @@ class UnitsTableTests(unittest.TestCase):
         self.assertTrue(task.endswith("…"))
 
     def test_a_unit_with_no_open_phase_shows_no_task(self) -> None:
-        with patch.object(progress_history, "plan_runs") as runs:
+        with patch.object(plan_history, "plan_runs") as runs:
             self.assertEqual(units_table.task_cell({"plan": "/p.md", "current": None, "phases": []}), "—")
         runs.assert_not_called()
 

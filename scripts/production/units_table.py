@@ -20,9 +20,9 @@ import showrunners
 import unit_lookup
 from production_units import Refusal
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
-import progress_history
+from scripts.direct import plan_history
 
 NONE = "—"
 # A task longer than this is cut, so one verification command cannot widen the whole table.
@@ -121,7 +121,7 @@ def task_cell(record: object) -> str:
     plan = fields.get("plan")
     if not isinstance(fields.get("current"), dict) or not isinstance(plan, str):
         return NONE
-    runs = progress_history.plan_runs(Path(plan))
+    runs = plan_history.plan_runs(Path(plan))
     step = open_step(run_events(runs[-1])) if runs else NoOpenStep()
     if isinstance(step, NoOpenStep):
         return NONE

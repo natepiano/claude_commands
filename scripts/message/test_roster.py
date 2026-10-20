@@ -22,18 +22,18 @@ from unittest import mock
 SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "delegate"))
+sys.path.insert(0, str(SCRIPTS / "direct"))
 
 import codex_daemon
 import process_table
 import remove_workers
 import roster
+import unit_lookup
 import unit_runs
 import herdr
 from fake_herdr import CommandResponse, herdr_listener
 import sessions
 import showrunners
-import unit_lookup
 if TYPE_CHECKING:
     from ..whoami import account, agent_accounts
 else:
@@ -55,7 +55,6 @@ class RosterTests(unittest.TestCase):
     sessions: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     notifier: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     delegate: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    tmux_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     ps_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     production_doc: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     director_run: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -78,7 +77,6 @@ class RosterTests(unittest.TestCase):
         ):
             directory.mkdir(parents=True, exist_ok=True)
 
-        self.tmux_state = self.root / "tmux.json"
         self.ps_state = self.root / "ps.txt"
         fake_ps = binaries / "ps"
         _ = fake_ps.write_text(
@@ -124,8 +122,6 @@ class RosterTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNERS_CONFIG": str(config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
-            "UNIT_LOOKUP_TMUX": str(Path(__file__).parents[1] / "production" / "fake_tmux.py"),
-            "FAKE_TMUX_STATE": str(self.tmux_state),
             "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
             "ROSTER_DELEGATE_ROOT": str(self.delegate),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
@@ -150,10 +146,16 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(
             process_table, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],
         ))
-        _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")))
+        _ = self.enterContext(mock.patch.object(herdr, "herdr_binary", return_value=self._herdr_fixture(self._herdr_sessions())))
+        running_session = sessions.running_session
+        def fixture_running(record: sessions.SessionRecord) -> bool:
+            return record["pid"] == 991100 or running_session(record)
+        _ = self.enterContext(mock.patch.object(sessions, "running_session", side_effect=fixture_running))
         self.environment["HERDR_PROC"] = str(self.root / "herdr-proc")
         os.environ["HERDR_PROC"] = self.environment["HERDR_PROC"]
         self._build_complete_roster()
+        self._herdr_process(991099, 0, ["herdr", "--session", "native", "server"])
+        self._herdr_process(991100, 991099, ["claude"], HERDR_PANE_ID="w1:p1", SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
 
     def _write_session(
         self,
@@ -175,11 +177,10 @@ class RosterTests(unittest.TestCase):
             listener = socket.socket(socket.AF_UNIX)
             listener.bind(str(socket_path))
             self.addCleanup(listener.close)
-        record_pid = os.getpid() if pid is None else pid
+        record_pid = (991100 if file_name == "director" else os.getpid()) if pid is None else pid
         if not with_socket and not proc_start:
             started = sessions.process_start(record_pid)
-            assert started is not None
-            proc_start = started
+            proc_start = started or "fixture"
         _ = (self.sessions / f"{file_name}.json").write_text(json.dumps({
             "pid": record_pid,
             "sessionId": session_id,
@@ -231,14 +232,6 @@ class RosterTests(unittest.TestCase):
             f"| unit-one | docs/plan.md | {director_cwd} | unit-one | — | — |",
         )), encoding="utf-8")
         self._write_showrunner_timer()
-        _ = self.tmux_state.write_text(json.dumps({
-            "$1": {
-                "label": "unit-renamed",
-                "panes": ["%1"],
-                "env": {"SHOWRUNNER_UNIT": "alpha", "SHOWRUNNER_UNIT_ID": "unit-one"},
-            },
-        }), encoding="utf-8")
-
         self._write_session(str(os.getpid()), "runner", "sid-runner", runner_cwd, status="ready")
         self._write_session(
             "director", "director", "sid-director", director_cwd,
@@ -1092,10 +1085,10 @@ class RosterTests(unittest.TestCase):
     def test_marked_unit_without_live_claude_does_not_claim_other_panes_by_worktree(self) -> None:
         (self.sessions / "director.json").unlink()
         worktree = self.home / "projects" / "unit-one"
-        for name, pane in (("other-pane", "helper:@2.%2"), ("outside-tmux", "")):
+        for name, pane in (("other-pane", "helper:@2.%2"), ("outside-herdr", "")):
             self._write_session(name, name, f"sid-{name}", worktree, tmux=pane)
         entries = self._entries()
-        for name in ("other-pane", "outside-tmux"):
+        for name in ("other-pane", "outside-herdr"):
             with self.subTest(session=name):
                 self.assertEqual(entries[name].role, "freestanding")
                 self.assertEqual(entries[name].director, roster.NoDirector())
@@ -1103,7 +1096,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(self.ssh_calls(), [])
 
     def test_unit_without_marked_session_does_not_claim_a_worktree_session(self) -> None:
-        _ = self.tmux_state.write_text("{}", encoding="utf-8")
+        _ = (self.root / "herdr-proc/991100/environ").write_bytes(b"HERDR_PANE_ID=w1:p1\0")
         worktree = self.home / "projects" / "unit-one"
         worktree.mkdir(parents=True)
         _ = (worktree / ".git").write_text("gitdir: fixture\n", encoding="utf-8")
@@ -1116,6 +1109,23 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(helper.director, roster.NoDirector())
         self.assertTrue(roster.is_top_level(helper))
         self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
+        read = unit_lookup.every_marked_unit
+
+        def with_duplicate() -> unit_lookup.MarkedProductions:
+            found = read()
+            return unit_lookup.MarkedProductions(
+                found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
+
+        with mock.patch.object(unit_lookup, "every_marked_unit", side_effect=with_duplicate), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual(found.problems, [
+            "unit hosts left out under alpha: unit-two: its mark is on herdr sessions copy and first"])
+        director = next(entry for entry in found.entries if entry.name == "director")
+        self.assertEqual(director.role, "unit director")
+        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
 
     def test_socketless_director_in_marked_pane_keeps_unit_without_worktree_match(self) -> None:
         self._write_session(
@@ -1160,11 +1170,12 @@ class RosterTests(unittest.TestCase):
                           "session_dir": "/fixture", "socket_path": "/fixture/socket"}]
         })}, "--session native agent list": {"code": 0, "stdout": '{"ok": true, "result": {"agents": []}}'}}
 
-    def test_a_herdr_director_without_tmux_is_placed_without_resolving_tmux(self) -> None:
+    def test_socketless_herdr_director_is_placed_by_pid(self) -> None:
         # A socketless live record is deliberately excluded from _claudes; the
         # roster must join it by place rather than worktree ownership.
         (self.sessions / "director.json").unlink()
         self._write_session("director", "director", "sid-director", self.home / "elsewhere", with_socket=False, pid=991001, proc_start="fixture")
+        _ = (self.root / "herdr-proc/991100/environ").write_bytes(b"HERDR_PANE_ID=w1:p2\0")
         self._herdr_process(991000, 0, ["herdr", "--session", "native", "server"])
         self._herdr_process(991001, 991000, ["claude"], HERDR_PANE_ID="w1:p1",
                             SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
@@ -1175,11 +1186,8 @@ class RosterTests(unittest.TestCase):
             return record["pid"] == 991001 or running_session(record)
 
         with mock.patch.object(herdr, "herdr_binary", return_value=binary), \
-                mock.patch.object(sessions, "running_session", side_effect=running), \
-                mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}), \
-                mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver:
+                mock.patch.object(sessions, "running_session", side_effect=running):
             director = self._entries()["director"]
-        resolver.assert_not_called()
         self.assertEqual(director.role, "unit director")
         self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
         self.assertEqual(director.showrunner, roster.UnderShowrunner("alpha", "runner", "session:sid-runner"))
@@ -1225,9 +1233,10 @@ class RosterTests(unittest.TestCase):
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         self.assertTrue(any(entry.name == "director" for entry in found.entries))
-        self.assertEqual(len(found.problems), 1)
-        self.assertIn("herdr sessions", found.problems[0])
-        self.assertIn("fixture herdr unavailable", found.problems[0])
+        self.assertEqual(len(found.problems), 2)
+        self.assertTrue(any("unit hosts for alpha" in problem for problem in found.problems))
+        self.assertTrue(any("herdr sessions" in problem for problem in found.problems))
+        self.assertTrue(all("fixture herdr unavailable" in problem for problem in found.problems))
 
     def test_an_unreadable_herdr_session_keeps_codex_rows_from_other_sessions(self) -> None:
         responses = self._herdr_sessions()
@@ -1246,33 +1255,13 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(found.problems), 1)
         self.assertIn("herdr session broken", found.problems[0])
 
-    def test_unreadable_tmux_keeps_worktree_directors_and_reports_the_problem(self) -> None:
-        broken_tmux = self.root / "bin" / "broken-tmux"
-        _ = broken_tmux.write_text(
-            "#!/bin/sh\necho 'fixture cannot list panes' >&2\nexit 2\n", encoding="utf-8",
-        )
-        broken_tmux.chmod(0o755)
-        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(broken_tmux)}), \
-                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            found = roster.roster(os.environ, roster.ThisMachine())
-        director = next(entry for entry in found.entries if entry.name == "director")
-        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
-        self.assertEqual(director.showrunner, roster.UnderShowrunner(
-            "alpha", "runner", "session:sid-runner",
-        ))
-        self.assertEqual(found.problems, [
-            "unit hosts for alpha were not read: tmux could not list panes: fixture cannot list panes; herdr is not installed",
-        ])
-        self.assertEqual(self.ssh_calls(), [])
 
-    def test_tmux_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
-        missing_tmux = self.root / "bin" / "missing-tmux"
+    def test_unreadable_herdr_fallback_places_director_but_never_ledger_worker_by_cwd(self) -> None:
         worker_path = self.sessions / "worker.json"
         worker = cast(dict[str, object], json.loads(worker_path.read_text(encoding="utf-8")))
         worker["cwd"] = str(self.home / "projects" / "unit-one")
         _ = worker_path.write_text(json.dumps(worker), encoding="utf-8")
-        with mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(missing_tmux)}), \
-                mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+        with mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")), mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
         director = next(entry for entry in found.entries if entry.name == "director")
         worker_entry = next(entry for entry in found.entries if entry.name == "claude-worker")
@@ -1580,13 +1569,11 @@ class RosterTests(unittest.TestCase):
         self.assertIn("not reached: timed out after 20 s", result.problems[0])
         self.assertEqual(len(calls), 1)
 
-    def test_mac_without_hosts_keeps_worktree_directors_without_resolving_tmux(self) -> None:
+    def test_mac_without_hosts_keeps_worktree_directors(self) -> None:
         with (mock.patch.object(sys, "platform", "darwin"),
-              mock.patch.dict(os.environ, {"UNIT_LOOKUP_TMUX": str(self.root / "missing-tmux")}),
-              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]),
-              mock.patch.object(unit_lookup, "tmux_binary", side_effect=AssertionError("tmux must be skipped")) as resolver):
+              mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")),
+              mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
             result = roster.roster(os.environ, roster.ThisMachine())
-        resolver.assert_not_called()
         director = next(row for row in result.entries if row.name == "director")
         self.assertEqual(director.role, "unit director")
         self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in result.problems))
