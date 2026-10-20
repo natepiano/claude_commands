@@ -360,7 +360,7 @@ Source: the user, 2026-10-19 15:44, with a screenshot of the board: "i want unit
 
 **Acceptance gate:** mod tsc, mod tests, strict validate, the full merge gate.
 
-### Phase 18 — The accounts board fits the pane  · status: todo
+### Phase 18 — The accounts board fits the pane  · status: done
 
 #### Work Order
 

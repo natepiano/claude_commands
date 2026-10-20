@@ -94,7 +94,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 - `overdueText` gives ` · overdue <elapsedText>`; `elapsedText` gives `Nm`, `Nh Mm` or `Nd Mh`. |
 | `hooks/board.tsx` | `BoardView`, `RulerView` (the detail view's ruler), `healthTone`, and the detail view's text helpers `etaText`, `gateText`, `finishText`. |
 | `hooks/unit.tsx` | `UnitView`: one unit's detail. |
-| `hooks/accounts.tsx` | `AccountsView`, `accountsTable`, `accountDisplay` and the display types. |
+| `hooks/accounts.tsx` | `AccountsView`, `accountDisplay`, the account line layout (`accountRow`, `accountLines`, `wrapFacts`) and the display types. It uses the line helpers `span`, `wrapLine` and `pairedLines` that `board.tsx` exports. |
 | `types/board.d.ts`, `types/accounts.d.ts` | Wire contracts of the generator and of `accounts.py`. |
 | `types/index.d.ts` | `BoardSnapshot`, `PaneState`, `AccountsPaneState`, the `PluginState` keys. |
 | `tests/` | `kit.ts` fixtures; `geometry`, `register` and `accounts` tests. |
@@ -109,7 +109,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 **State.** Plugin state `unit-board` holds two keys, each a record keyed by pane id; a missing entry is a closed pane.
 
 - `panes`: `PaneState<BoardData>` = `loading` | `board {data, now}` | `unit {data, production, unit, now}` | `failed {reason}`. `data` is a `BoardSnapshot {files, watch, loadedAt, boards}`.
-- `accountsPanes`: `AccountsPaneState<StoredAccountsStatus>` = `loading` | `accounts {data, zone}` | `failed {reason}`.
+- `accountsPanes`: `AccountsPaneState<StoredAccountsStatus>` = `loading` | `accounts {data, zone, now}` | `failed {reason}`. `now` (seconds) is set on each load, and each unchanged 10 s tick sets a fresh `now` with no process run.
 
 Timers stay module-level and are never persisted: `OpenPane {timer, cwd, busy, paths, selection}` (`Selection = {kind:'board'} | {kind:'unit'; production; unit}`) and `OpenAccountsPane {timer, busy, paths, zone}`. Paths and selection survive a failed refresh. An `accountsLifecycle` counter, bumped on `session.start`, open and `ui.close`, cancels an accounts load or zone lookup that a close overtook.
 
@@ -157,7 +157,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
   - Older done rows fold into `+N earlier: <ids>`, and todo rows past the next three into `+N later`.
   - Older steps fold into `+N earlier steps`.
   - An empty record reads `no phases recorded`. A block with nothing in it is not drawn.
-- Accounts: the table Label, Roles, Left, Resets, Credits, Read is the first line of the pane, then Problems. There is no Login column and no `units: …, showrunners: …` line: the user found the table already shows the roles, and the space is better spent on the table. `accountDisplay` maps the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`). `accountsTable(rows, zone): AccountsTable` makes the cell strings: Left is the rounded percent; Resets and Read are `Oct 18 14:00` (`Intl.DateTimeFormat` in the resolved zone, no weekday, comma removed); Credits is the balance (`42`, `unlimited`) with ` in use` when the account uses credits; a missing reading or invalid date is `—`, never 0. Its `width` is the column widths in terminal columns (`cellWidth`) plus two spaces between columns, and the last column has no padding: a pane at least `width` columns wide draws each account on one line, and only a narrower pane wraps. Row text is the default colour.
+- Accounts: `AccountsView(elements, columns, status, zone, now)` uses the pane's `bodyColumns`; every drawn line is at most `columns` cells, with no `…`. There is no table and no heading row: each account is `● <label>  <roles>` with the label in bold, then its facts joined by ` · `: `<n>% left` (or `no reading`), `resets <time>`, `credits <amount|unlimited>` with ` in use` when the account uses credits, and `read <time>`. A missing reset, credit or read part is left out, never `—` or 0. Accounts sort by label (`localeCompare`, `sensitivity: 'base'`). Labels and roles are padded to the widest (`cellWidth`), so labels, roles and percents form columns. The form is picked once for the whole list: one line per account when every account fits; else two lines, the percent on line 1 and the other facts on line 2, indented 2; when line 1 does not fit, the padding goes and the percent leads line 2. A line breaks only at a ` · ` (the separator is dropped), so a fact never splits; only a fact wider than the line wraps inside. Times are short, in the resolved zone: same day `14:00`, within six days `Sat 14:00`, else `24 Oct`. Problems follow after a blank line: `Problems` in bold, then `• <text>` in `warning`, wrapped with indent 2. There is no Login column and no `units: …, showrunners: …` line. `accountDisplay` maps the wire shape into `AccountReading<T>` (`available`/`unavailable`) and `CreditBalance` (`finite`/`unlimited`/`unavailable`).
 - `resolveUserZone(calls, isActive): Promise<ZoneLookup>` follows [`scripts/lib/user_zone.py`](../../scripts/lib/user_zone.py): `USER_ZONE`, then the `zone=` line of `USER_ZONE_CONF` or `~/.claude/config/user_zone.conf`, then `America/New_York`, validated through `Intl.DateTimeFormat`; it returns `{kind: 'cancelled'}` once the lifecycle moves on.
 
 ### The short report
@@ -193,7 +193,7 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Ruler horizon: 10 % beyond the later of the promise and now; board ruler width is `bodyColumns - 4`, unit `bodyColumns - 2`, minimum 8.
 - `doing` is cut to 80 characters, after the `launcher: ` prefix and the summary or findings path are removed.
 - `local_run` stops at the `run_started` line: parsing every line of every run file once per unit took 35 s for three productions, past the mod's 30 s process limit. Reading to that line brings it to about 4.5 s.
-- Left under 10 % is `error`, under 25 % `warning`, else the default colour (`leftTone`); no account row is `subtle`, which made the table hard to read.
+- The dot and the percent are `error` under 10 % and `warning` under 25 %; at 25 % or more the dot is `success` and the percent the default colour; `no reading` has an `inactive` dot (`leftTone`). ` in use` is `warning`. `inactive` is used only for the words `resets`, `credits`, `read` and the separators; labels, roles, numbers and times are the default colour. No account text is `subtle`, which made the table hard to read.
 - `HH:MM` for `--time`, `--earliest`, `--latest` means today only; a later-day ETA needs the full date.
 - A phase record's `first_eta` comes from `_instance_eta_events`, so a checkpoint-notice ETA recorded before the phase starts counts as its first.
 - `build_plan` can select an older resumed phase as open, so the newest `phase_started` is the wrong instance for `steps` and `stage`; both follow `OpenPhase.instance_id`.
@@ -219,6 +219,8 @@ The mod draws and Python computes. The chain, gates and history live in `phase_t
 The panes open only on demand because the user asked for it, and a closed pane costs nothing for the same reason a background watcher was ruled out: no session should pay for a view nobody is looking at. While open, stat-based refresh is cheap: the sources are files the run already writes, so an unchanged tick is a handful of stats and a redraw, and the generator runs only after something changed. The `discovery` paths exist so a production or input that appears later still triggers a refresh without a scan.
 
 The accounts view draws `accounts.py`'s stored status straight to the screen. It first showed login addresses; the user removed the Login column (2026-10-19) to give the table room, so the mod no longer asks for logins at all. It reads stored values (`--stored`) rather than probing accounts, and reruns only when one of its four input files changes, so an open pane spends no quota and no network.
+
+The accounts view became account lines (phase 18) because the user could not read it: the fixed table was about 88 columns wide and ignored the pane width, so in a docked pane each row wrapped through its columns. The lines follow the phase 17 board style. One shape for every account, aligned columns and whole facts make the list easy to scan at any width.
 
 The terminal report leaves out the round table because it answers questions most ticks do not ask; the board carries the visual view, and `tables` keeps the full recorder output one word away.
 
