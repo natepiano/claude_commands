@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -13,11 +14,24 @@ import tempfile
 import time
 import unittest
 from collections.abc import Callable
+from contextlib import redirect_stdout
 from pathlib import Path
-from typing import cast, final, override
+from typing import TYPE_CHECKING, NamedTuple, cast, final, override
+from unittest import mock
 
 import fake_showrunner
 import fake_unit_host
+import rename_unit
+import retire_unit
+import unit_lookup
+import unit_move
+from rename_state import RenameRefused
+
+if TYPE_CHECKING:
+    from scripts.shutdown import record as shutdown_record
+else:
+    # rename_unit puts the shutdown folder on the path.
+    import record as shutdown_record
 
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
@@ -614,6 +628,139 @@ class UnitRenameTests(unittest.TestCase):
         self.write(self.state / SLUG / "rename.json", '{"done": false}\n')
         self.assert_refused(self.rename("apply"), "finish the production rename first")
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
+
+
+# An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.
+WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir "$3" --pid "$1" --port "$2"; done'
+STOPPED_RECORD = {"login": "owner@example.com", "then": "stop", "progress": {"kind": "stopped"},
+                  "session": {"session_id": "sid-alpha",
+                              "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit"}}}
+
+
+class FakeProcess(NamedTuple):
+    cwd: Path
+    session: int
+    arguments: list[str]
+
+
+@final
+class RunProcessTests(unittest.TestCase):
+    """What a stopped unit's runs leave in its worktree. The processes are records: nothing real is signalled."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.root = Path()
+        self.worktree = Path()
+        self.processes: dict[int, FakeProcess] = {}
+        self.signalled: list[int] = []
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.worktree = self.root / "claude-demo-alpha"
+        other = self.root / "claude-demo-beta"
+        mine = self.run_folder("run-a", self.worktree)
+        theirs = self.run_folder("run-b", other)
+        lint = ["python3", "mesh_runs.py", "supervise", str(self.run_record(mine, "lint", 101))]
+        _ = self.run_record(mine, "test", 104)
+        self.processes = {
+            # The unit's detached lint run: the supervisor leads its session, verify.sh and tee are in it.
+            101: FakeProcess(self.worktree, 101, lint),
+            102: FakeProcess(self.worktree, 101, ["bash", "verify.sh", "lint", "pkg"]),
+            103: FakeProcess(self.worktree, 101, ["tee", "-a", "run.log"]),
+            # The idle-stop watcher of the run's stopped app-server, and its sleep.
+            201: FakeProcess(self.worktree, 201, self.watcher(mine)),
+            202: FakeProcess(self.worktree, 201, ["sleep", "300"]),
+            # A record whose pid now names another process; another unit's watcher; the user's shell.
+            104: FakeProcess(self.worktree, 104, ["cargo", "build"]),
+            203: FakeProcess(self.worktree, 203, self.watcher(theirs)),
+            900: FakeProcess(self.worktree, 900, ["zsh"]),
+            # Another unit's detached run, in its own worktree.
+            301: FakeProcess(other, 301, ["python3", "mesh_runs.py", "supervise",
+                                          str(self.run_record(theirs, "lint", 301))]),
+            302: FakeProcess(other, 301, ["bash", "verify.sh", "lint", "pkg"]),
+        }
+        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(self.root / "runs")}))
+        _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
+        _ = self.enterContext(mock.patch.object(retire_unit, "command_line", self.arguments))
+        _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
+        _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
+        _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
+
+    def run_folder(self, name: str, worktree: Path) -> Path:
+        worktree.mkdir(parents=True, exist_ok=True)
+        folder = self.root / "runs" / name
+        (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
+        _ = (folder / "progress_history_state.json").write_text(json.dumps({"working_dir": str(worktree)}))
+        return folder
+
+    def run_record(self, folder: Path, label: str, pid: int) -> Path:
+        path = folder / retire_unit.DETACHED_RUNS / f"{label}.json"
+        _ = path.write_text(json.dumps({"status": "running", "pid": pid, "label": label, "cwd": str(self.worktree)}))
+        return path
+
+    def watcher(self, folder: Path) -> list[str]:
+        return ["sh", "-c", WATCHER, "/scripts/agents/codex_mesh.py", "555", "51101", str(folder.resolve()),
+                "python3", "300"]
+
+    def no_units(self, _slug: str) -> dict[str, object]:
+        return {}
+
+    def survive(self, _pid: int, _signal: int) -> None:
+        pass
+
+    def inside(self, worktree: Path) -> list[int]:
+        return sorted(pid for pid, item in self.processes.items() if item.cwd == worktree)
+
+    def arguments(self, pid: int) -> list[str]:
+        return self.processes[pid].arguments if pid in self.processes else []
+
+    def session(self, pid: int) -> int:
+        if pid not in self.processes:
+            raise ProcessLookupError(pid)
+        return self.processes[pid].session
+
+    def kill(self, pid: int, signal_number: int) -> None:
+        if pid not in self.processes:
+            raise ProcessLookupError(pid)
+        if signal_number:
+            self.signalled.append(pid)
+            del self.processes[pid]
+
+    def rename(self) -> rename_unit.UnitRename:
+        return rename_unit.UnitRename(SLUG, "alpha-unit", "gamma-unit", "", "", SLUG, "demo-alpha", "demo-gamma",
+                                      str(self.worktree), str(self.root / "claude-demo-gamma"), "", "")
+
+    def stop(self) -> str:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rename_unit._stop(self.rename(), lambda: None)  # pyright: ignore[reportPrivateUsage]
+        return output.getvalue()
+
+    def test_the_stop_ends_the_runs_supervisor_and_watcher_and_leaves_the_rest(self) -> None:
+        printed = self.stop()
+        self.assertEqual(sorted(self.signalled), [101, 102, 103, 201, 202])
+        self.assertIn("stopped: process 101 (", printed)
+        self.assertIn("of the run supervisor 101 of lint in run run-a", printed)
+        self.assertIn("of the app-server watcher 201 of run run-a", printed)
+        # What the unit's runs do not own still blocks the move.
+        with self.assertRaisesRegex(RenameRefused, r"^processes 104, 203, 900 work inside "):
+            rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+
+    def test_with_only_its_runs_left_the_stopped_unit_can_move(self) -> None:
+        for pid in (104, 203, 900):
+            del self.processes[pid]
+        _ = self.stop()
+        rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(sorted(self.processes), [301, 302])
+
+    def test_a_process_that_outlives_its_sigterm_refuses_the_rename(self) -> None:
+        self.processes = {pid: item for pid, item in self.processes.items() if pid in (101, 102)}
+        _ = self.enterContext(mock.patch.object(os, "kill", self.survive))
+        _ = self.enterContext(mock.patch.object(retire_unit, "TERM_WAIT_SECONDS", 0.0))
+        with self.assertRaisesRegex(RenameRefused, r"of lint in run run-a: still runs after SIGTERM"):
+            _ = self.stop()
 
 
 if __name__ == "__main__":

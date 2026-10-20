@@ -76,6 +76,8 @@ WAIT_MINUTES = 20.0
 POLL_SECONDS = 10.0
 # How long a process has to exit after SIGTERM before it is reported as still running.
 TERM_WAIT_SECONDS = 10.0
+# A run's folder of detached-run records (codex_mesh.DETACHED_RUNS_DIR).
+DETACHED_RUNS = "mesh_runs"
 RETIRED_NOTE = "(retired {date}, worktree removed{session})"
 # The note names the unit director's last session, which /showrunner:resume_unit resumes.
 SESSION_NOTE = ", session {id}"
@@ -275,6 +277,49 @@ def mesh_runs(runs: list[Path]) -> tuple[MeshRun, ...]:
                       if isinstance(entry, dict) and cast(dict[str, object], entry).get("status") != "ended")
         found.append(MeshRun(folder, pid, seats))
     return tuple(found)
+
+
+def command_line(pid: int) -> list[str]:
+    """The process's arguments; empty once it has gone. The Mac has no /proc: ps splits them at spaces."""
+    if sys.platform == "darwin":
+        return run(["ps", "-o", "args=", "-p", str(pid)]).stdout.split()
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+    except OSError:
+        return []
+
+
+def _session_of(pid: int) -> int:
+    try:
+        return os.getsid(pid)
+    except OSError:
+        return 0
+
+
+def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
+    """The processes inside the worktree that its runs leave behind once their sessions stop, each named.
+
+    A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
+    supervisor's pid and is in the supervisor's arguments; an app-server's idle-stop watcher by the
+    run folder in its arguments. Each leads its own session, so its children go with it.
+    """
+    runs = runs_of(worktree)
+    leaders: dict[int, str] = {}
+    for folder in runs:
+        for path in sorted((folder / DETACHED_RUNS).glob("*.json")):
+            record = _json(path)
+            pid = record.get("pid")
+            if (record.get("status") == "running" and isinstance(pid, int) and not isinstance(pid, bool)
+                    and pid > 0 and str(path) in command_line(pid)):
+                leaders[pid] = f"run supervisor {pid} of {record.get('label', path.stem)} in run {folder.name}"
+    folders = {str(folder.resolve()): folder.name for folder in runs}
+    for pid in inside:
+        words = command_line(pid)
+        named = [folders[word] for word in words if word in folders]
+        if words[:2] == ["sh", "-c"] and named and any("idle-stop" in word for word in words):
+            leaders[pid] = f"app-server watcher {pid} of run {named[0]}"
+    return {pid: f"process {pid} ({_command_name(pid)}) of the {leaders[leader]}"
+            for pid in inside if (leader := _session_of(pid)) in leaders}
 
 
 def _same_unit(lease: str, unit: str) -> bool:
