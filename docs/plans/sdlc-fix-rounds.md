@@ -15,6 +15,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, docs and Python scripts that run every production. This unit measures repair rounds per `/unit:direct` phase, studies the phases with the most, and proposes process changes.
+- **Project started:** 2026-10-20T20:56:57.500+00:00
 - **Stack:** Python 3.13, standard library only; basedpyright strict (`pyrightconfig.json`); unittest. Markdown for commands and docs.
 - **Layout:**
   - `scripts/history/history.py` — the `/history` CLI (1,160 lines). It reads every `~/.local/state/<skill>/runs/*.jsonl` store and writes nothing. `phases` (`_phase_rows` :873, `_cmd_phases` :907) counts fix *passes* per `(run_id, phase_id)`; `compare` (:986) compares a window before a date with the window after; `summary` (:1041) names the fix tail.
@@ -50,7 +51,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 ## Phases
 
-### Phase 1 — A true count of repair rounds per phase  · status: todo
+### Phase 1 — A true count of repair rounds per phase  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -110,6 +111,7 @@ For active process redesigns, as we are currently undergoing with promotions and
   Each line names its evidence: the pass activity, finding ids and titles, the plan's Work Order at the phase start (`git log -p -- <plan>`), the production log line, or the attempts log.
 - **Rule check:** for each phase, the rounds past the hard landing (`past_landing`) and whether the findings they repaired were the kind item 7 lets stay (regression the phase caused, broke what worked, fails a test or gate). This tells "the rule does not stop it" from "the rule was not followed".
 - **Totals table:** root causes by rounds and by fix time, over the 15 phases, most first. Then the same table for causes from Phase 1 over the full 60-day window, for scale.
+- **Reference case outside the run records** (the sdlc showrunner, 2026-10-20): experiments-unit (cargo-liner) ran 3 `/astra_review` rounds on a design doc, with 8, 6 and 5 findings, all fixed. The rounds did not converge, because each fix added a mechanism that the next round found gaps in (the doc grew from 568 to 696 lines). Notes: `~/rust/hanadocs/showrunners/cargo-liner/experiments/astra-design-notes.md`, sections (b) and (d). Give it its own short section with root causes (`fix-regressed` / `target-moved` on a design, not on code), and keep it out of the run-record totals.
 - Tune Phase 1's word lists in `scripts/history/rounds.py` where the hand reading shows a wrong cause, with a test per change in `test_rounds.py`.
 - No proposals in this phase. The study states facts and evidence only.
 
@@ -141,7 +143,8 @@ For active process redesigns, as we are currently undergoing with promotions and
   - **Risk:** what a defect could reach the user or a merge because of it.
   - **Measure:** the `history.py rounds` and `review_regime.py report` numbers Phase 5 compares, with the target for each.
   - **Answers:** the buildable answers (adopt, adopt with a named change, do not adopt) and the one recommended.
-- Send the proposals to the showrunner as one message: per proposal, the question, the answers and the recommendation, and the study path. Name it as a process change for the user (production rule). Then write the user's answers into Phase 4's Spec when they arrive.
+- File each proposal as a hanadocs issue through `/issue` with tag `proposal`, `proposed_by: fix-rounds-unit`, and its five ranking values on a `Proposed ranking:` line (<ProductionUnit/> item 17).
+- Send the proposals to the showrunner as one message: per proposal, the question, the answers and the recommendation, its issue path, and the study path. Name it as a process change for the user (production rule). Then write the user's answers into Phase 4's Spec when they arrive.
 - A proposal that only changes this unit's own tooling (`scripts/history/`) is not a process change: build it in Phase 4 without a question, and state it in one line.
 
 **Files:**
