@@ -118,9 +118,9 @@ def issue_state(issue: Issue) -> str:
 
 
 def issue_rows(found: list[Issue]) -> list[Row]:
-    """One row per open proposal issue, oldest first; its title is the file's name."""
-    rows = [Row(issue.value("proposed_by") or NONE, issue.path.stem, issue.value("date_created") or NONE,
-                issue_state(issue)) for issue in found]
+    """One row per open proposal issue, oldest first; its title is its P number and the file's name."""
+    rows = [Row(issue.value("proposed_by") or NONE, f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
+                issue.value("date_created") or NONE, issue_state(issue)) for issue in found]
     return sorted(rows, key=lambda row: (row.date, row.proposal))
 
 

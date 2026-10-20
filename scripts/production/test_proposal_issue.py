@@ -110,6 +110,38 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(self.run_cli(*arguments)[0], 2)
         self.assertEqual(issue.read_bytes(), original)
 
+    def test_number_gives_each_proposal_the_next_free_number_oldest_first(self) -> None:
+        folder = self.root / "issues"
+        # The vault indents a list's items.
+        issue = ISSUE.replace("- issue\n- proposal\n", "  - issue\n  - proposal\n")
+        archived = self.root / "archive/hana/old.md"
+        archived.parent.mkdir(parents=True)
+        _ = archived.write_text(issue.replace("stage: backlog", 'proposal_id: "P4"\nstage: backlog'))
+        newer, older, plain = folder / "newer.md", folder / "older.md", folder / "plain.md"
+        folder.mkdir()
+        _ = newer.write_text(issue.replace("2026-10-01]]\"\ndate_modified", "2026-10-09]]\"\ndate_modified"))
+        _ = older.write_text(issue)
+        _ = plain.write_text(issue.replace("  - proposal\n", ""))
+        self.assertEqual(self.run_cli("number", str(newer), str(plain), str(older)),
+                         (0, "number older.md: P5\nnumber plain.md: not a proposal\nnumber newer.md: P6\n", ""))
+        self.assertIn('proposal_id: "P5"\n', older.read_text())
+        self.assertNotIn("proposal_id", plain.read_text())
+        before = newer.read_bytes()
+        self.assertEqual(self.run_cli("number", str(newer)), (0, "number newer.md: P6\n", ""))
+        self.assertEqual(newer.read_bytes(), before)
+
+    def test_create_numbers_a_new_decision(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        body = self.root / "body.md"
+        _ = body.write_text("# Findings\n")
+        issue = self.root / "decision.md"
+        code, out, err = self.run_cli("create", str(issue), "--project", "alpha", "--short", "a", "--proposed-by",
+                                      "style", "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob",
+                                      "abc", "--count", "1", "--body-file", str(body), "--template", str(template))
+        self.assertEqual((code, out), (0, "create decision.md: created\n"), err)
+        self.assertIn('proposal_id: "P1"\n', issue.read_text())
+
     def test_create_with_rules_preserves_existing_decision_and_answer(self) -> None:
         template = self.root / "template.yaml"
         _ = template.write_text("---\nstatus: open\n---\n")
