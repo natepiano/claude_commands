@@ -870,124 +870,31 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 ### Phase 32 — an old-text finding is withdrawn once judged again  · status: done
 
-**Depends on:** Phase 30, Phase 31
+#### As-built
 
-#### Work Order
-
-**Goal:** An unfiled finding judged under an older rule text is withdrawn, with that judgment's row, when a judgment under the rule's current text judged its cell again. `file` prints a `withdraw` line for it, not `skipped <id>: rule changed since judged` at every run.
-
-**Spec:**
-
-The showrunner ruled this current on 2026-10-20, after phase 30: it fixes a wrong result. On cargo-liner, 4 unfiled `forbidden-words` findings (blob `14d9edad`, ticket `names-unit-63`) print `skipped <id>: rule changed since judged` at every `file`. Each cell has a newer `held` judgment under the current blob `ab23f42d`, and each finding has a twin at the same `path:line` that is already filed in `style forbidden-words crates+cargo-port ab23f42d.md`:
-
-| Unfiled finding | Site | Newer judgment | Filed twin |
-| --- | --- | --- | --- |
-| `8cb7a212cbb15ecd` | `crates/cargo-port/src/lint/read_write.rs:84` | 15049 held (names-unit-67) | `c1639d3c9fc11a01` |
-| `dd75bdcda313aef9` | `crates/cargo-port/src/tui/keymap/load.rs:162` | 14830 held (names-unit-66) | `6965270c55e88e7a` |
-| `0f8db6f99f9dd586` | `crates/cargo-port/src/tui/state/git_status.rs:68` | 14832 held (names-unit-66) | `47a1603791ab0193` |
-| `6e5f8a1a19e0ac84` | `crates/cargo-port/src/tui/state/sync.rs:117` | 14834 held (names-unit-66) | `38f67cd83223822d` |
-
-These 4 are the only unfiled findings whose rule text changed. No filed finding withdraws today (2312 filed findings have a changed text; none has an `exception` as the newest judgment under the current text).
-
-Today: `file_proposals` (`scripts/style/style_proposals.py:438-470`) runs the declaration step, then `run_withdrawal` (:1268-1307), then batches the unfiled findings and prints `skipped <id>: rule changed since judged` (:453-454) for each one that `style_ledger.rule_changed_since_judged` names. `Ledger._changed_rule_findings` (`style_ledger.py`) reads only `filed` findings, and `_superseded` withdraws only on an `exception`. So nothing retires such an unfiled finding. Refill (`style_plan.py`) does not run the withdrawal step and needs no change: it judges the stale cell again, and the next `file` withdraws the finding.
-
-1. **The rule.** The withdrawal step reads filed and unfiled findings whose rule's current blob is not their own blob. For each one, the query of `_superseded` does not change: the newest judgment at the finding's cell (`_finding_cell`) whose `rule_blob` is the current blob or the finding's own blob.
-   - The newest row must be under the current blob. That makes it newer than every judgment under the finding's own text, its own judgment too (the restored-text rule of today).
-   - Filed finding: the verdict must be `exception`, as today.
-   - Unfiled finding: any verdict (`held`, `clean`, `exception`, `fixed` or `waived`) withdraws it. Author's call: the ruling named held, clean and exception. `fixed` and `waived` are also a judgment of the cell under the current text (a fix at the site, or a person's decline of the new findings), so one rule, "any verdict", is simpler and correct.
-   - A finding that a ticket that is not final builds is kept (`KeptForBuild`), as today. An unfiled finding has no build ticket, so this applies only to filed findings in practice.
-   - An unfiled finding whose judging ticket is `assigned` or `checkpointed` is not read. It waits for its ticket, as filing makes it wait (`UnfiledFindingsFromOpenTickets`, `style_ledger.py` `held_findings`).
-   - An unfiled finding with no such newer judgment, or whose rule is not in the catalog, is not withdrawn. `file` prints its skip line, as today.
-
-2. **Types** (`scripts/style/style_ledger.py`):
-   - Rename `SupersedingException` to `SupersedingJudgment` and add the verdict:
-     ```python
-     @dataclass(frozen=True)
-     class SupersedingJudgment:
-         """The newest judgment at a finding's cell under the rule's current text, also newer than its own: an exception
-         for a filed finding, any verdict for an unfiled one."""
-
-         judgment_id: int
-         verdict: Verdict
-         rule_blob: str
-     ```
-     Change the field type in `WithdrawnFinding` and `KeptForBuild`. No test names `SupersedingException`.
-   - Add a `WithdrawnBy` variant beside `ExceptionVerdict`:
-     ```python
-     @dataclass(frozen=True)
-     class JudgedAgain:
-         """A judgment under the rule's newer text judged the unfiled finding's cell again; the findings it holds replace this one."""
-
-         judgment_id: int
-     ```
-     `WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone`.
-   - `withdrawn_line`: `case JudgedAgain(): return f"judged again in judgment {by.judgment_id}"`.
-   - `Withdrawal` docstring: "The findings that a newer judgment under their rule's current text withdraws, and those an open build keeps."
-
-3. **Reading the row back** (`Ledger._held`). No migration. A withdrawn row with `withdrawn_by` set and no `duplicate_of` or `declaration_gone_at` reads as `ExceptionVerdict(withdrawn_by)` when `proposal` is set, and as `JudgedAgain(withdrawn_by)` when `proposal` is empty (`Withdrawn(NoDecision(), …)`):
-   ```python
-   case "withdrawn":
-       state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
-                         DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20]
-                         else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
-   ```
-   Author's call: the exception withdrawal writes only filed findings, so every row it wrote has a decision. The live ledger has 25 withdrawn rows, all with a decision, so none reads differently. A verdict column would add a migration for a fact the row already holds.
-   - `_held_json`: `withdrawn_by` is `by.judgment_id` for `ExceptionVerdict` or `JudgedAgain`, else `0`. `held list` prints `withdrawn_line`, so it shows `judged again in judgment <row>` with no other change.
-
-4. **The step** (`scripts/style/style_ledger.py`):
-   - `_changed_rule_findings` reads `self.held_findings(HeldFindingsInState("unfiled"))` and `HeldFindingsInState("filed")`. It leaves out each unfiled finding in `self.held_findings(UnfiledFindingsFromOpenTickets())` (read that set once per call). Docstring: "Each unfiled or filed finding whose rule's current text is not the text it was judged under, with that rule. An unfiled finding that an open ticket holds is not read. Filing skips an unfiled one that this step leaves."
-   - `_superseded`: after the query, `withdraws = rows and rows[0][2] == definition.blob and (isinstance(finding.state, Unfiled) or rows[0][1] == "exception")`; `continue` when it is false. Then `verdict = SupersedingJudgment(rows[0][0], rows[0][1], definition.blob)`. The build-ticket check and the rest do not change. Keep the comment on the "newer than its own" rule.
-   - `withdraw_superseded`: the write does not change. The `UPDATE` sets `state='withdrawn'`, `withdrawn_by=<row>` and keeps `proposal` (empty for an unfiled finding). The plan, the lock, the recheck and `retry_on_change` stay. Docstring first line: "Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text, and each unfiled finding whose cell has any newer judgment under that text."
-   - `superseded_findings` docstring: "The synced tip loads only when an unfiled or filed finding's rule text changed."
-
-5. **Lines** (`scripts/style/style_proposals.py`; keep it to these two functions, phase 31 owns `join_action` and `file_decision`):
-   - `superseded_line` (:1263-1265) takes `style_ledger.SupersedingJudgment` and prints `judgment {verdict.judgment_id} {verdict.verdict} under {verdict.rule_blob[:8]}`. A filed finding's line does not change (`… judgment <row> exception under <blob>`). An unfiled one reads `withdraw <id> <rule> <path>:<line>: judgment <row> held under <blob>`.
-   - `run_withdrawal` (:1268-1307): no code change. Its `plan_withdrawal` input already takes only `Filed` items (:1278-1279), and `plan_withdrawal` (:1185-1187) reads only withdrawn rows with a `Path` decision, so an unfiled withdrawal closes and refreshes no decision. `totals: withdraw <n>, kept <n>, close <n>` counts it in `withdraw`. Docstring first line: "Withdraw each filed finding that an exception under its rule's newer text supersedes, and each unfiled finding whose cell that text judged again, then close or refresh the decisions of the filed ones."
-   - `file_proposals` (:438-470): no change. The withdrawal runs before the batch loop, so a withdrawn finding is no longer `unfiled` there and prints no skip line.
-
-6. **Docs:**
-   - `docs/style_production.md:428`: "Findings judged under an older rule text stay unfiled." becomes "Findings judged under an older rule text stay unfiled until a judgment under the current text judges their cell again; then filing withdraws them."
-   - `docs/style_production.md:434-435`: after "…does not change the exit status." add "Its cell has no judgment under the current text yet: a refill judges the stale cell, and the next `file` withdraws the finding."
-   - `docs/style_production.md:437-451`, after "The judgment must also be newer than the finding's own judgment.": add "An unfiled finding judged under an older text is withdrawn when the newest judgment at its site is under the current text, whatever its verdict, and records that row. It has no decision, so no decision changes. An unfiled finding of an open ticket waits for that ticket." In the same paragraph, the printed line becomes `withdraw <finding> <rule> <path>:<line>: judgment <row> <verdict> under <blob>`.
-   - `docs/style_production.md:699-701`: "shows `duplicate of <finding id>` or `judgment <row> exception` after the state of a withdrawn row" becomes "shows `duplicate of <finding id>`, `judgment <row> exception` or `judged again in judgment <row>` after the state of a withdrawn row".
-   - `commands/showrunner/proposal.md:104-105`: "Filing withdraws a filed finding that an `exception` under its rule's newer text supersedes, and closes a decision left with no filed finding." becomes "Filing withdraws a filed finding that an `exception` under its rule's newer text supersedes, and an unfiled finding whose site that text judged again, and closes a decision left with no filed finding."
+- `_changed_rule_findings` reads unfiled and filed findings whose rule text changed, excluding unfiled findings held by assigned or checkpointed tickets. `_superseded` selects the newest judgment at the current cell across the current and original rule blobs, ordered by `recorded_at` then id; it must use the current blob and postdate the finding's creation. Any verdict withdraws an unfiled finding; only `exception` withdraws a filed one. An unfinished build keeps its finding as `KeptForBuild`.
+- `SupersedingJudgment(judgment_id, verdict, rule_blob)` carries the qualifying judgment. `JudgedAgain(judgment_id)` extends `WithdrawnBy`; a withdrawn row with no decision reads as `Withdrawn(NoDecision(), JudgedAgain(...))`, while an exception withdrawal with a decision retains `ExceptionVerdict`. Existing duplicate and declaration-gone reasons retain precedence; no migration is needed.
+- Filing runs declaration follow, withdrawal, then batching. An unfiled withdrawal changes no decision and no longer prints the stale-rule skip line. Filing uses `superseded_line` to print `withdraw <id> <rule> <path>:<line>: judgment <row> <verdict> under <blob8>`; `held list` shows `judged again in judgment <row>`, and JSON retains `withdrawn_by`. Dry runs print the withdrawal lines and totals without writes; reruns find no further withdrawal.
+- `withdraw_superseded` plans before `BEGIN IMMEDIATE`, rechecks the same eligibility and synced commit under the lock, and retries on change. Tests cover all verdicts, read-back, dry runs, restored text, open tickets, moved findings and unrelated-cell judgments.
 
 **Files:**
-- `scripts/style/style_ledger.py` — `SupersedingJudgment` (renamed from `SupersedingException`), `JudgedAgain`, `WithdrawnBy`, `withdrawn_line`, `_held` decode, `_held_json`, `_changed_rule_findings`, `_superseded`, docstrings
-- `scripts/style/style_proposals.py` — `superseded_line`, `run_withdrawal` docstring
-- `scripts/style/test_style_proposals.py` — the withdrawal tests below
-- `scripts/style/test_style_ledger.py` — the read-back test below
-- `docs/style_production.md` — the filing and withdrawal paragraphs, the `held list` sentence
-- `commands/showrunner/proposal.md` — the withdrawal sentence
 
-**Workers:** `1 writer + 1 tester`. The change is one rule in one ledger step and its print line, so the code does not split. The Spec gives exact lines, states and rows, so the tests go to the tester.
-- `impl` — `scripts/style/style_ledger.py`, `scripts/style/style_proposals.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`; hub: `scripts/style/style_ledger.py` (it holds `JudgedAgain` and `SupersedingJudgment`, which the tester imports).
-- `test` — `scripts/style/test_style_proposals.py` and `scripts/style/test_style_ledger.py`, from the Spec alone. Every test name states the behavior it checks.
-  - **test_style_proposals.py** (`StyleProposalsTests`; helpers `hold` :150-159 (records a `held` judgment under the current blob with the finding's ticket), `file` :161-163, `assign_ticket` :165-169, `newer_rule_text` :2117-2120, `newer_verdict` :2122-2127, `withdraw` :2129-2133; `self.calls` holds every `proposal_command` call):
-    1. `test_an_unfiled_finding_that_a_newer_rule_text_judged_again_is_withdrawn_not_skipped`: `finding = self.hold(ledger)`; `blob = self.newer_rule_text()`; `row = self.newer_verdict(ledger, blob, "held")`; then `file_proposals`. Output holds `withdraw {id} {self.rename} alpha/src/lib.rs:1: judgment {row} held under {blob[:8]}` and `totals: withdraw 1, kept 0, close 0`, and not `skipped {id}: rule changed since judged`. The state is `Withdrawn(NoDecision(), JudgedAgain(row))`. `self.calls == []` (no decision written). A second `file` prints `totals: withdraw 0, kept 0, close 0` and no line for the finding.
-    2. `test_any_newer_verdict_under_the_current_text_withdraws_an_unfiled_finding`: four findings `self.hold(ledger, file=f"{verdict}.rs")` for `clean`, `exception`, `fixed` and `waived`; one `newer_rule_text`; one `newer_verdict(ledger, blob, verdict, f"alpha/src/{verdict}.rs")` each. `self.withdraw(ledger)` prints one `withdraw … judgment <row> <verdict> under <blob8>` line per finding and `totals: withdraw 4, kept 0, close 0`; each state is `Withdrawn(NoDecision(), JudgedAgain(<its row>))`.
-    3. `test_withdraw_dry_run_lists_an_unfiled_finding_judged_again_and_writes_nothing`: the setup of test 1; `run_withdrawal(..., dry_run=True)` prints the same `withdraw` line and totals; the finding stays `Unfiled()`, and the ledger rows are unchanged (`held_findings(AllHeldFindings())` before and after).
-    4. `test_an_unfiled_finding_with_no_newer_judgment_at_its_site_keeps_the_skip_line` (limit): the newer `held` verdict is at `alpha/src/other.rs`. `file` prints `skipped {id}: rule changed since judged` and `totals: withdraw 0, kept 0, close 0`; the finding stays `Unfiled()`.
-    5. `test_an_unfiled_finding_judged_after_a_judgment_under_a_restored_rule_text_is_not_withdrawn` (limit), as `test_an_older_exception_under_a_restored_rule_text_withdraws_no_finding_judged_after_it` (:2360) does for a filed one: save the rule text; `newer = self.newer_rule_text()`; `self.newer_verdict(ledger, newer, "held")`; write the saved text back; `self.hold(ledger)`; `self.newer_rule_text()` again (the same blob `newer`). `file` prints the skip line and withdraws nothing.
-    6. `test_an_unfiled_finding_of_an_open_ticket_is_not_withdrawn` (limit): `ticket = self.assign_ticket(ledger, "names-unit")`; `self.hold(ledger, ticket=ticket)`; newer rule text and a newer `held` verdict at its site. `file` prints `held for open ticket {ticket}: 1 findings` and `totals: withdraw 0, kept 0, close 0`; the finding stays `Unfiled()`.
-    - Keep unchanged: `test_a_newer_clean_or_held_verdict_or_an_exception_at_another_site_withdraws_nothing` (a filed finding still withdraws only on an exception) and `test_changed_rule_is_skipped_while_other_batches_file`.
-  - **test_style_ledger.py** (`StyleLedgerTests`; helpers `rule` :120, `hold_finding` :183, `cli` :128, `ledger` :153):
-    7. `test_an_unfiled_finding_withdrawn_by_a_newer_judgment_reads_and_lists_as_judged_again`: `finding = self.hold_finding(self.rule("read"), 2)`; a direct sqlite `UPDATE held_findings SET state='withdrawn',withdrawn_by=7 WHERE finding_id=?`. `held_findings(HeldFindingsInState("withdrawn"))` gives `Withdrawn(NoDecision(), JudgedAgain(7))`; `held list` gives `["withdrawn", "judged again in judgment 7"]` after the site; `held list --json` gives `withdrawn_by` 7. Keep `test_duplicate_migration_fifteen_keeps_version_fourteen_withdrawals_by_their_exception` (:784) unchanged: a row with a decision still reads `ExceptionVerdict(7)`.
+- `scripts/style/style_ledger.py` — withdrawal reasons, judgment selection, follow timing guards, row decoding and JSON output
+- `scripts/style/style_proposals.py` — verdict-bearing withdrawal lines and withdrawal-step documentation
+- `scripts/style/test_style_ledger.py` — `JudgedAgain` read-back and text/JSON listing
+- `scripts/style/test_style_proposals.py` — filing, withdrawal limits and moved-finding regressions
+- `docs/style_production.md` — stale-text filing, withdrawal and held-list behavior
+- `commands/showrunner/proposal.md` — filing withdraws unfiled findings judged again
 
-**Constraints from prior phases:**
-- Phase 30 (a finding on a renamed item follows the rename) changes `style_ledger.py` in the declaration step (`ItemRename`, `RenameScope`, `BuiltRename`, `RenamedByBuilds`, `NoBuiltRename`, `_built_renaming`, `_followed_rename`, `_gaining_files`) and `test_style_ledger.py`. Keep its edits. This Work Order cites `style_ledger.py` by name only, because phase 30 moves its lines.
-- Phase 31 (a closed approved decision takes a new finding) changes `join_action` and `file_decision` in `style_proposals.py`, the "answer covers later findings" sentences in `docs/style_production.md` (:497-499) and `commands/showrunner/proposal.md` (:97-98), and `test_style_proposals.py`. Keep its edits. This phase edits other lines of these files only.
-- `style_ledger.py` cannot import `style_proposals` (two module copies under `__main__`).
-- `file` runs the declaration step first, then this withdrawal step, then the batch loop (phase 27). Rows are read fresh at each step, so the withdrawal reads the path a follow wrote. Refill runs only the declaration step (phase 27); this phase does not change refill.
-- An unfiled finding that a step withdraws has `Withdrawn.proposal == NoDecision()` (phase 27). `plan_withdrawal` reads only withdrawn rows with a `Path` decision.
-- Every ledger write plans before `BEGIN IMMEDIATE`, rechecks the plan and the synced commit under the lock, and starts again through `retry_on_change` on a change. `withdraw_superseded` keeps this.
-- The rule blob is `git hash-object` of the whole rule file (`rules.py:118`), so a frontmatter-only edit changes it. This phase does not change that (filer diagnosis, 2026-10-20: revisit only if `pre_filter` edits start to force large re-judges).
+**Binds later work:** A moved finding withdraws only by a judgment newer than its row's `updated_at`, in addition to the creation-time and current-cell checks. A judgment between its own judgment and its move, or before a later row edit, can therefore leave it in place; this conservative limit avoids closing a decision too soon. Refill still runs only declaration follow; the next filing runs withdrawal against the followed location.
 
-**Acceptance gate:** from the worktree root `<W>`:
-- Tests 1, 2, 3 and 7 each fail without this phase (today the finding stays unfiled with the skip line, or the row reads as `ExceptionVerdict`). Tests 4, 5 and 6 pin the limits and pass before and after. All 7 are present and pass.
-- `env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_proposals scripts.style.test_style_plan` is green.
-- `basedpyright scripts/style` reports `0 errors, 0 warnings`.
-- Observable behavior, after the merge to `~/.claude` main: `style_proposals.py withdraw --repo ~/rust/cargo-liner-style --proposals ~/rust/hanadocs/issues --dry-run` prints `withdraw <id> global:rust/forbidden-words.md <path>:<line>: judgment <row> held under ab23f42d` for the 4 findings in the Spec table, with `totals: withdraw 4, kept 0, close 0`. After the next `file`, `held list --state unfiled` names none of them, and `file` prints no `rule changed since judged` line for them.
+**Gotchas:**
+
+- Declaration following changes the cell used by the judgment query; an older judgment at the destination must not withdraw either an unfiled or a filed finding, whose withdrawal can close its decision.
+- Original-text judgments at other cells, even from the same ticket, do not order this cell and must not block its withdrawal. The newest-row comparison stays local to the current cell and preserves restored-text protection.
+- Creation time alone cannot order a finding against a later re-judgment of its original cell. `followed_at` stores a commit, not a timestamp; `updated_at` and judgment `recorded_at` share UTC ISO timestamps, so the follow guard compares those instead.
+
+**Ruled out:** ticket-wide original-judgment guards; timestamp comparisons against commit-valued `followed_at`; a verdict-column migration for withdrawal reasons already distinguished by decision presence.
 
 ### Phase 33 — a trait-qualified rename follows to the trait's impl methods  · status: todo
 
@@ -1072,7 +979,7 @@ All references below are at HEAD `e7a45401`; use the named functions after inter
 - Phase 30’s `RenameScope`, `ItemRename`, `BuiltRename`, `RenamedByBuilds` and `NoBuiltRename` remain semantic states. Extend them only where the new relationship needs to travel.
 - Do not replace an implementation’s owner with its trait, or broadly change `Declaration` equality to achieve the new match.
 - Preserve Phase 31’s in-progress proposal changes and Phase 32’s withdrawal changes. Neither phase is redundant or invalidated by Phase 30.
-- Phase 32 already cites ledger functions by name. Its numeric `test_style_ledger.py` references remain correct at `e7a45401`: `rule:120`, `cli:128`, `ledger:153`, `hold_finding:183`, and the migration test at :784; no correction is needed.
+- Phase 32 (done, `d0a3f9ec`) renamed `SupersedingException` to `SupersedingJudgment` (it carries the verdict) and added `JudgedAgain`. `_superseded` withdraws an unfiled finding on any newer verdict at its current cell and a filed one only on an exception, and the judgment must be newer than the finding's `created_at`; for a followed finding (`followed_at` set; it holds a commit) it must also be newer than the row's `updated_at`. A follow that this phase adds writes `updated_at` in the same update, which keeps that bound correct; keep it.
 - `file` runs declaration following before withdrawal and batching. Refill runs declaration following only; preserve that ordering.
 - `style_ledger.py` must not import `style_proposals`.
 - No compiler, dependency resolution or general Rust name-resolution service is introduced. Unsupported aliases and ambiguous paths must not establish trait membership.
