@@ -3848,7 +3848,7 @@ def render_status_json(reading: StatusReading) -> str:
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat())
         accounts.append(item)
-    return json.dumps(StatusDocument(accounts=accounts, problems=list(reading.notes)))
+    return json.dumps(StatusDocument(accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:
