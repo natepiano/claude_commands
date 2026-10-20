@@ -11,6 +11,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import tomllib
 import uuid
@@ -191,7 +192,9 @@ class Waived:
 
 @dataclass(frozen=True)
 class Built:
-    """The approved finding has merged into the style branch."""
+    """The approved finding has merged into the style branch. proposal is the decision that approved it."""
+
+    proposal: Path
 
 
 @dataclass(frozen=True)
@@ -1448,7 +1451,7 @@ class Ledger:
             case "waived":
                 state = Waived()
             case "built":
-                state = Built()
+                state = Built(Path(row[11]))
             case "withdrawn":
                 state = Withdrawn(Path(row[11]), row[13])
             case "unfiled":
@@ -2322,7 +2325,7 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
     result: dict[str, object] = asdict(finding)
     result["build_ticket"] = finding.build_ticket.ticket if isinstance(finding.build_ticket, BuildTicket) else ""
     result["state"] = held_state_name(finding.state)
-    if isinstance(finding.state, (Filed, Withdrawn)):
+    if isinstance(finding.state, (Filed, Built, Withdrawn)):
         result["proposal"] = str(finding.state.proposal)
     if isinstance(finding.state, Withdrawn):
         result["withdrawn_by"] = finding.state.judgment_id
@@ -2510,6 +2513,18 @@ def main() -> None:
                     finding = ledger.hold(args.rule, args.path, args.line, args.text, cast(FindingKind, args.kind),
                                           args.before, args.after, args.rule_blob, args.ticket)
                     print(finding.finding_id)
+                    # A re-add changes no state, so a built row whose rename is not in the code waits for reopen.
+                    # The add already succeeded, so a hint that cannot be checked is left out.
+                    if isinstance(finding.state, Built):
+                        try:
+                            tip = ledger.synced_commit()
+                            check = ledger.applied_check(finding, tip)
+                        except LedgerError:
+                            pass
+                        else:
+                            if isinstance(check, RenameNotApplied):
+                                print(f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all "
+                                      + f"(decision {finding.state.proposal})", file=sys.stderr)
                 elif args.action == "file":
                     ledger.file_held(args.id, Path(args.proposal))
                 elif args.action == "waive":

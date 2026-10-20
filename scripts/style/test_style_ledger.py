@@ -365,6 +365,33 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.cli("held", "built", "--id", finding.finding_id)
         self.assertEqual(self.cli("ticket", "merge", "--id", "names-1").stdout, "")
 
+    def held_rows(self, database: Path) -> list[tuple[object, ...]]:
+        with closing(sqlite3.connect(database)) as connection:
+            return cast(list[tuple[object, ...]], connection.execute("SELECT * FROM held_findings ORDER BY finding_id").fetchall())
+
+    def test_held_add_of_a_built_row_names_reopen_only_when_its_rename_is_not_in_the_code(self) -> None:
+        rule, issue, ids = self.decision_findings()
+        self.write(self.sources[0], "pub enum Outcome { New }\n")
+        self.write(self.sources[1], "pub enum Outcome { Old }\n")
+        tip = self.commit("Rename one of two")
+        ledger = self.ledger()
+        ledger.set_tip(tip, "main")
+        # Merges before the applied check marked each finding built without reading the code.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='built'")
+        before = self.held_rows(ledger.database)
+        hint = f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all (decision {issue})\n"
+        for index, (finding_id, notice) in enumerate(((ids[0], ""), (ids[1], hint))):
+            result = self.cli(
+                "held", "add", "--rule", rule, "--path", self.sources[index], "--line", str(index + 1),
+                "--text", "required change", "--kind", "rename", "--before", "Outcome::Old",
+                "--after", "Outcome::New", "--rule-blob", self.blob(rule), "--ticket", "outside",
+            )
+            self.assertEqual((result.stdout, result.stderr), (finding_id + "\n", notice))
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertEqual([finding.state for finding in self.ledger().proposal_findings(issue)],
+                         [style_ledger.Built(issue), style_ledger.Built(issue)])
+
     def test_held_built_refuses_a_finding_with_no_merged_build_ticket(self) -> None:
         _, issue, ids = self.decision_findings()
         result = self.cli("held", "built", "--id", ids[0], success=False)
