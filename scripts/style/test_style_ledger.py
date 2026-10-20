@@ -901,16 +901,16 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual((held_parent.finding_id, held_parent.line), (parent, 6))
         self.assertEqual(len(ledger.held_findings(style_ledger.AllHeldFindings())), 2)
 
-    def test_a_removed_declaration_whose_twin_was_already_in_another_file_is_withdrawn(self) -> None:
+    def test_a_removed_declaration_whose_twin_was_already_in_another_file_leaves_the_filed_finding(self) -> None:
         ledger = self.ledger()
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT, TWIN_FILE: TWIN})
         _, (parent,) = self.judge_parent(ledger, ((2, "old: u32,"),))
-        tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
-        removed, = ledger.follow_declarations([parent]).outcomes
-        self.assertIsInstance(removed, style_ledger.DeclarationRemoved)
+        filed, = ledger.held_findings(style_ledger.AllHeldFindings())
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
+        gone, = ledger.follow_declarations([parent]).outcomes
+        self.assertIsInstance(gone, style_ledger.FiledDeclarationGone)
         finding, = ledger.held_findings(style_ledger.AllHeldFindings())
-        self.assertEqual((finding.path, finding.state),
-                         (PARENT_FILE, style_ledger.Withdrawn(self.root / "decision.md", style_ledger.DeclarationGone(tip))))
+        self.assertEqual((finding.path, finding.state), (PARENT_FILE, filed.state))
 
     def test_a_move_to_one_file_follows_when_a_changed_third_file_already_declared_a_twin(self) -> None:
         ledger = self.ledger()
