@@ -713,22 +713,21 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 ### Phase 26 — a waived finding can be filed again  · status: done
 
-**Depends on:** Phase 25
+#### As-built
 
-#### Work Order
-
-**Goal:** a person can undo a waive: the finding goes back to unfiled and the row says who did it.
-
-**Spec:** ruled by the showrunner, (x). production case: cargo-liner findings e905399a, 3e86fba4, a5e2b756, 07a1d8b6 and 821e2bc9 were waived and must be held again; no command moves a waived finding back.
-`style_ledger.py held unwaive --id <id>... --by <who>` moves each named waived finding to unfiled. Unique prefixes as other held commands take. Refused before the first write: an id that is not a waived finding, a blank `--by`, a finding an open ticket holds. The row records who unwaived it (the existing `person_read_by` shape or a new column through the next migration, whichever fits the schema code). The ticket gate does not write the ledger. Update the held-commands section of `docs/style_production.md`.
+- `style_proposals.py unwaive --repo <style checkout> --proposals <folder> --id <id>... --by <who>` moves each named waived finding back to unfiled (no proposal, build ticket or move) and prints `unwaived <id> by <who>` per finding. Ids take unique prefixes (`Ledger.named_held`). It refuses before any write when an id names no finding or several, the finding is not waived, its rule text changed since it was judged (`rule_changed_since_judged`), an open ticket judges or builds it, its decision is declined, or `--by` is blank.
+- `Ledger.unwaive_held` runs every check and the one write in a single transaction; a cell whose newest judgment is 'waived' goes back to 'held' with detail `unwaived by <who>`. The command adds only the decline check.
+- Migration 16 adds `held_findings.unwaived_by`, read as `WaiveUndo = NoWaiveUndo | WaiveUndoneBy` (`HeldFinding.waive_undo`). `held list` shows `unwaived by <who>`, `--json` carries `unwaived_by`; no later change clears it, a new waive included.
+- `file_decision` returns its `JoinAction`; `file` prints `waived <n> findings in <decision>: declined: <words>`.
 
 **Files:**
-- `scripts/style/style_ledger.py`
-- `scripts/style/test_style_ledger.py`
-- `docs/style_production.md`
+- `scripts/style/style_ledger.py` — schema, `WaiveUndo`, `unwaive_held`, `named_held`
+- `scripts/style/style_proposals.py` — `unwaive` command, decline check, `file` output
+- `scripts/style/test_style_ledger.py`, `scripts/style/test_style_proposals.py`
+- `docs/style_production.md` — waived line and unwaive paragraph
 
-**Workers:** 1 writer.
+**Gotchas:**
+- `style_ledger.py` cannot import `style_proposals` (two module copies under `__main__`), so vault-aware checks live in `style_proposals.py`.
 
-**Constraints from prior phases:** phase 24's `held built --commit` and migration 15; phase 25 changes the held-cell skip, which reads waived findings.
-
-**Acceptance gate:** unwaive moves waived to unfiled and records who; each refusal leaves the ledger unchanged; a later `held add` or proposal sees the finding as unfiled. `merge_gate.py --tests-only` green on a frozen copy; basedpyright clean.
+**Ruled out:**
+- The command in `style_ledger.py` without the decline check: a declined decision waived an unwaived finding again at the next `file`, with no message.
