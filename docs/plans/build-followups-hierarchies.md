@@ -65,36 +65,26 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 ### Phase 1 — One command measures how fast the hierarchy delivers Hana, and the design doc lists the user's constraints  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `measure.py baseline` prints the hierarchy's delivery numbers on real data, and the design doc holds the constraints, the map and that baseline.
-
-**Spec:**
-- `scripts/hierarchies/measure.py baseline [--since DATE] [--until DATE]` (default window: the last 7 days). Each measure is one function that takes parsed records and returns a typed result, so tests feed fixtures. Output: one aligned table per group, each row with its window and n.
-  1. **Capacity on Hana.** Live units per production and repository (from `showrunners.py list` and `units_table.py`), split Hana (`~/rust/hana_catalyst` worktrees) or other. Workers by worktree from the `codex_mesh.py` roster, with the count whose director is not running. Build and test minutes by repository from the buildlog index. Tokens by repository from the usage records where they carry a cwd.
-  2. **Flow to Hana main.** For hana units in the window: phases done, median and p90 phase time, and the time phases waited (on the user, the showrunner, a gate, or idle) where `progress_history.py` records it. Hanadocs issues on goal `1 - Ship Hana` moved to active and closed in the window, with median active-to-closed time. Where no source records a wait kind, print `not recorded` and name the source that would.
-  3. **User attention.** Phone pushes per day and how many went out after a failed review; agent messages per day split by sender kind (agent, automation, user-bound); items waiting on the user by kind (changes, proposals, efficiency items, questions) with the age of the oldest; questions answered in the window with median time to answer.
-  4. **Rank coverage.** Of the top 20 ranked open issues on goal 1, how many have a unit; of the live units, how many name an issue.
-  - The script reads natedev's records. A table whose source the Mac also keeps (transcripts, message log) says `natedev only`.
-- The design doc `docs/plans/build-followups-hierarchies-design.md`, sections:
-  - **Constraints.** Every constraint on how the hierarchy works, one line each, each with its source (user words with date, memory name, CLAUDE.md, `decision_criteria.md`, a production doc). At least: the user's attention and how they want to be reached (on demand, no forms, one plain question, STE, EDT); what only the user decides; build capacity on natedev and the Mac; Claude and Codex account quotas and moves; model choice for judgment roles; worker lifetime; the three gods and the decision economy. Mark each `user` or `derived`; a derived constraint names the user words it comes from.
-  - **Map.** Each role, the file that defines it, what it does, who it reports to, and each channel with sender, receiver and script. It includes sdlc and the two guild heads as planned, marked planned.
-  - **Baseline.** The `measure.py baseline` output for the 7 days to the run, with the command and its window.
-  - **Questions for the user.** Only what the constraints need from the user: a constraint the sources do not settle, or two that conflict. Each one plain line with its recommended answer.
+- `scripts/hierarchies/measure.py baseline [--since DATE] [--until DATE]` prints one aligned table per group: capacity, resource use, phase flow, issue flow, attention, pending attention and rank coverage. Each row shows its window and n. The default window is the 7 days to now, end excluded. A run on natedev takes about 23 s.
+- Each measure is one function over typed domain records. Loaders read every source read-only. A missing or corrupt source prints a source-problem row and the command continues. The command keeps no state.
+- Items waiting on the user come from showrunner/outstanding through `dailies_render.read_outstanding`. Held-push files are not questions. Messages are sorted by their kind field. A deleted Hana worktree is classified from its run record, with a name fallback.
+- The design doc `docs/plans/build-followups-hierarchies-design.md` holds Constraints C01-C50, each with its source and a `user` or `derived` mark; Map (roles, productions, channels, ownership beside sdlc); Baseline (run 2026-10-20 17:24 EDT); and Questions for the user Q1-Q5.
 
 **Files:**
-- `scripts/hierarchies/measure.py` — new
-- `scripts/hierarchies/test_measure.py` — new
-- `docs/plans/build-followups-hierarchies-design.md` — new
-- `pyrightconfig.json` — one `executionEnvironments` entry for `scripts/hierarchies` with the `extraPaths` it imports
+- `scripts/hierarchies/measure.py` — the measure command, typed records, read-only loaders, measure functions
+- `scripts/hierarchies/test_measure.py` — 19 fixture tests, source-problem rows included
+- `pyrightconfig.json` — the `scripts/hierarchies` execution environment
+- `docs/plans/build-followups-hierarchies-design.md` — the design doc
 
-**Workers:** `2 writers` — the script and the design doc are disjoint.
-- `impl` — `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py`; hub: `pyrightconfig.json` (one entry; another unit may also add one)
-- `test` — opens as impl — the design doc's Constraints, Map and Questions sections; it fills Baseline from `impl`'s output when the script runs
+**Binds later work:** The comparison command reuses the baseline CLI shape, the measure functions over typed records and the same source-problem rows. Flow-wait rows stay `not recorded` until a source records wait kinds. The candidate designs read the Constraints, Map and Baseline sections.
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/hierarchies -p 'test_*.py'` green; `basedpyright scripts/hierarchies` ends `0 errors, 0 warnings, 0 notes`; the merge gate (Delegation Context → Test) green; `measure.py baseline` runs on real data on natedev in under 60 s and its output is in the doc; every constraint line names a source. At phase end the unit director sends the showrunner the Questions section as one message for the user.
+**Gotchas:**
+- basedpyright exits 3 in every checkout; read its last line, not its exit code.
+- No source records wait kinds, issue activation times or question answer times. Those rows print `not recorded` and name the source that would hold them.
+- 51 of 187 workers record no cwd. They count as unclassified, not as Hana or other.
+- The merge gate test `accounts/test_cutover_home` checks access times. It fails under heavy load and passes when run alone.
 
 ### Phase 2 — The design doc recommends the best hierarchy and the steps to reach it  · status: todo
 **Depends on:** Phase 1
@@ -117,11 +107,16 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Files:**
 - `docs/plans/build-followups-hierarchies-design.md` — new sections above
 
-**Workers:** `1 writer + 1 tester` — nothing splits: one doc. `impl` takes it.
+**Workers:** `2 writers` — nothing splits: one doc. `impl` takes it; `test` has no test lane, so it opens as impl and only checks numbers.
 - `impl` — `docs/plans/build-followups-hierarchies-design.md`
 - `test` — opens as impl — re-runs `measure.py baseline` for the doc's Comparison window and checks each number the doc cites against it; it writes no doc text
 
-**Constraints from prior phases:** the constraints, the map, the baseline and the user's answers to the Phase 1 questions are in the design doc. Rank 1 of the user's goals is `1 - Ship Hana`.
+**Constraints from prior phases:**
+- The design doc holds Constraints C01–C50 (each marked `user` or `derived`, with its source), the Map, the Baseline (run 2026-10-20 17:24 EDT, 7 days, natedev) and Questions Q1–Q5. Rank 1 of the user's goals is `1 - Ship Hana`.
+- Baseline facts the candidates answer: Hana has 11 of 41 live units (27%) and 66 of 187 workers, but 80% of build and check minutes, 82% of test minutes and 41% of tokens; 51 workers record no cwd and have no running director; 598 items wait on the user (315 changes, 161 proposals, 121 efficiency items, 1 question).
+- No source records phase wait kinds, issue activation times or question answer times; those rows print `not recorded`. A candidate that needs one of them to show its effect names the record it adds.
+- Q1–Q5 went to the user through the showrunner on 2026-10-20 at 17:43 EDT. Write the user's answers into the doc's Questions section as they arrive. While an answer is open, each candidate states its result under the recommended answer and under the other answer, and the Recommendation names which answers it rests on.
+- Re-run the baseline with `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline` from the worktree root (about 23 s).
 
 **Acceptance gate:** the doc has the four sections; each candidate has a score on every measure and constraint; each step names its measure, its size and how to undo it; the adversarial and astra findings are folded in. At phase end the unit director sends the showrunner the Recommendation and Step 1 as one question for the user.
 
@@ -148,7 +143,8 @@ Step 1 from the design doc's Steps section.
 
 **Spec:** set by the decision above.
 
-**Files:** set by the decision above. A file another unit owns is edited after the showrunner settles it.
+**Files:**
+- `docs/plans/build-followups-hierarchies-design.md` — mark the approved step as built in Steps. The step's own files are set by the decision above; a file another unit owns is edited after the showrunner settles it.
 
 **Workers:** set by the decision above.
 
@@ -177,6 +173,11 @@ Step 1 from the design doc's Steps section.
 - `impl` — `scripts/hierarchies/measure.py` and the design doc
 - `test` — `scripts/hierarchies/test_measure.py`: `compare` on fixtures with known before and after values
 
-**Constraints from prior phases:** `measure.py baseline` and its measure functions from Phase 1; the step built in Phase 3 and the measure it should move.
+**Constraints from prior phases:**
+- `measure.py baseline [--since DATE] [--until DATE]` exists: default window the 7 days to now, end excluded. Each measure is a function over typed domain records built by read-only loaders; `compare` runs the same functions on both windows and does not add new loaders.
+- A missing or corrupt source prints a source-problem row instead of failing; `compare` keeps that row in each window and shows no change for it.
+- Rows with no recording source (phase wait kinds, issue activation times, question answer times) print `not recorded`; `compare` prints them the same way, unless the Phase 3 step added the record.
+- Items waiting on the user come from showrunner/outstanding through `dailies_render.read_outstanding`.
+- The step built in Phase 3 and the measure it should move.
 
 **Acceptance gate:** unit tests green; `basedpyright scripts/hierarchies` ends `0 errors, 0 warnings, 0 notes`; the merge gate (Delegation Context → Test) green; the doc's Results row for Step 1 holds real before and after numbers. At phase end the unit director sends the showrunner the Results and the next step as one question for the user.
