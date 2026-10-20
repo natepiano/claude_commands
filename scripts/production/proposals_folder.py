@@ -11,10 +11,11 @@ from pathlib import Path
 
 import showrunners
 from issues import Issue, open_issues
+# Callers such as rename_unit read the tag here.
+from issues import PROPOSAL_TAG as PROPOSAL_TAG
 from production_units import Refusal, production_field, unit_table
 
 PROPOSALS_FIELD = "Proposals"
-PROPOSAL_TAG = "proposal"
 PRODUCTION_SUFFIX = "-production.md"
 # `types-unit (cargo-liner-style)`: a unit with the production it works in.
 UNIT_IN_PRODUCTION = re.compile(r".+?\s*\((?P<production>[^()]+)\)")
