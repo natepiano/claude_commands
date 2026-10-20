@@ -80,7 +80,7 @@ class ProposalsTableTests(unittest.TestCase):
     def test_an_open_proposal_issue_reads_its_state_from_stage_and_plan(self) -> None:
         _ = self.issue("selection widgets toggle", 'date_created: "[[2026-10-09]]"', 'project: "[[hana]]"',
                        "stage: backlog", "status: open", "tags:", "  - issue", "  - proposal",
-                       "proposed_by: organon-unit", 'plan: ""')
+                       "proposed_by: organon-unit", 'plan: ""', 'proposal_id: "P3"')
         _ = self.issue("camera jack panel", 'date_created: "[[2026-10-10]]"', "stage: backlog", "status: open",
                        "tags: [issue, proposal]", "proposed_by: '[[demo-unit]]'",
                        "plan: docs/plans/jacks.md Phase 4–6")
@@ -89,7 +89,7 @@ class ProposalsTableTests(unittest.TestCase):
         _ = self.issue("unowned build", "date_created: 2026-10-12", "stage: active", "status: open",
                        'tags: ["issue", "proposal"]', "unit: ")
         self.assertEqual(proposals_table.issue_rows(issues.open_issues(self.root / "issues", "proposal")), [
-            Row("organon-unit", "selection widgets toggle", "2026-10-09", REVIEW_STATE),
+            Row("organon-unit", "P3 selection widgets toggle", "2026-10-09", REVIEW_STATE),
             Row("demo-unit", "camera jack panel", "2026-10-10", "approved, not started: docs/plans/jacks.md Phase 4–6"),
             Row("—", "rich text", "2026-10-11", "being built by widget-unit"),
             Row("—", "unowned build", "2026-10-12", "being built"),

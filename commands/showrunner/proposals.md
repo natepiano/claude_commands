@@ -15,8 +15,8 @@ production from this session's update timer and prints one Markdown table,
   `tags` hold `proposal`, and its `proposed_by` names this production, one of
   its units, a production below it, or a unit of one (`unit (production)`
   names the production). Productions share one issues folder, so the others'
-  proposals are left out. The row is the issue's title under its
-  `proposed_by`, dated by its `date_created`. A production with no
+  proposals are left out. The row is the issue's P number and title
+  under its `proposed_by`, dated by its `date_created`. A production with no
   `Proposals` line has no issue rows.
   Each style decision is one row for one rule and crate under one rule text.
   Rule candidates are not proposals: `style_proposals.py candidates` lists them,

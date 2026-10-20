@@ -31,9 +31,10 @@ Record the user's verdict through `/change_review` → verdict.
 The next proposal waiting for the user's review. Run `/showrunner:proposals`
 and take the first row whose State is `waiting for your review`; with none,
 say `no proposal is waiting for your review`. Read the proposal in full: an
-issue is `<title>.md` in the folder the production doc's `Proposals` line
-names, and a plan backlog line names its file. Say what it changes and why in
-plain words, then its proposed ranking values in one plain-text line. Record
+issue is `<title without its P number>.md` in the folder the production doc's `Proposals` line
+names, and a plan backlog line names its file. Lead with its P number and
+title, then say what it changes and why in plain words, then its proposed
+ranking values in one plain-text line. Record
 the user's answer through `/showrunner:proposal`.
 
 ## efficiency
