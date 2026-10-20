@@ -711,7 +711,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Gotchas:**
 - Refill does not fetch: it reads the local `origin/<style>` ref, so a stale tracking ref gives exit 3 until a fetch or push updates it.
 
-### Phase 26 — a waived finding can be filed again  · status: todo
+### Phase 26 — a waived finding can be filed again  · status: done
 
 **Depends on:** Phase 25
 

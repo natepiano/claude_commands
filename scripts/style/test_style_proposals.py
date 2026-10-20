@@ -243,6 +243,59 @@ class StyleProposalsTests(unittest.TestCase):
             with closing(sqlite3.connect(ledger.database)) as connection:
                 self.assertEqual(connection.execute("SELECT verdict_detail FROM judgments").fetchall(), [("Keep these names",)])
 
+    def test_file_prints_the_findings_that_a_declined_decision_waives(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            style_proposals.decline(ledger, issue, "Keep these names")
+            _, _ = self.hold(ledger, line=2), self.hold(ledger, line=3)
+            with redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(style_proposals.file_proposals(ledger, self.proposals, "parent").filed, ())
+            self.assertIn(f"waived 2 findings in {issue}: declined: Keep these names", output.getvalue().splitlines())
+
+    def test_unwaive_files_a_waived_finding_into_its_decision_again(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            ledger.waive_held(finding.finding_id)
+        with redirect_stdout(io.StringIO()) as output:
+            code = style_proposals.main(["unwaive", "--repo", str(self.repo), "--proposals", str(self.proposals),
+                                         "--id", finding.finding_id[:8], "--by", " nate "])
+        self.assertEqual((code, output.getvalue()), (0, f"unwaived {finding.finding_id} by nate\n"))
+        with self.ledger() as ledger:
+            self.assertEqual(self.file(ledger), (issue,))
+            filed, = ledger.proposal_findings(issue)
+            self.assertEqual((filed.finding_id, filed.state, filed.waive_undo),
+                             (finding.finding_id, style_ledger.Filed(issue), style_ledger.WaiveUndoneBy("nate")))
+
+    def test_unwaive_refuses_every_finding_when_a_declined_decision_would_waive_one_again(self) -> None:
+        with self.ledger() as ledger:
+            declined = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            style_proposals.decline(ledger, issue, "Keep these names")
+            waived = self.hold(ledger, crate="beta")
+            _ = self.file(ledger)
+            ledger.waive_held(waived.finding_id)
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            code = style_proposals.main(["unwaive", "--repo", str(self.repo), "--proposals", str(self.proposals),
+                                         "--id", waived.finding_id, "--id", declined.finding_id, "--by", "nate"])
+        self.assertEqual((code, output.getvalue()), (1, ""))
+        self.assertEqual(errors.getvalue(), f"style_proposals: {declined.finding_id}: declined decision {issue} waives it again "
+                         + "at the next file; answer the decline again first\n")
+        with self.ledger() as ledger:
+            self.assertEqual({(finding.finding_id, finding.waive_undo) for finding in ledger.held_findings(style_ledger.HeldFindingsInState("waived"))},
+                             {(declined.finding_id, style_ledger.NoWaiveUndo()), (waived.finding_id, style_ledger.NoWaiveUndo())})
+
+    def test_unwaive_refuses_a_blank_name_or_id_and_a_missing_name(self) -> None:
+        for arguments, error in ((["--id", "abc", "--by", "  "], "unwaive --by requires a name"),
+                                 (["--id", " ", "--by", "nate"], "unwaive --id requires a finding id"),
+                                 (["--id", "abc"], "the following arguments are required: --by")):
+            with (self.subTest(arguments=arguments), redirect_stderr(io.StringIO()) as errors,
+                  self.assertRaises(SystemExit) as stop):
+                _ = style_proposals.main(["unwaive", "--repo", str(self.repo), "--proposals", str(self.proposals), *arguments])
+            self.assertEqual(stop.exception.code, 2)
+            self.assertIn(error, errors.getvalue())
+
     def test_a_new_rule_text_gets_a_separate_decision(self) -> None:
         with self.ledger() as ledger:
             _ = self.hold(ledger)

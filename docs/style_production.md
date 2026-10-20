@@ -451,7 +451,9 @@ close or refresh gets a `skipped <issue>: <reason>` line, the other decisions
 go on, and `withdraw` exits 1 as `file` does.
 
 One style decision covers one rule and crate under one rule blob. An answer
-also covers later findings under that rule text. A new rule blob needs a new
+also covers later findings under that rule text: a declined decision waives
+them with its stored words, and `file` prints
+`waived <n> findings in <decision>: declined: <words>`. A new rule blob needs a new
 answer. Each decision shows counts and up to three examples from different
 files. The ledger holds its full site list. Show decisions only when the user
 asks through `/showrunner:proposals` or `/adhoc_review`.
@@ -506,6 +508,23 @@ that record. It prints `built <finding id> at <merge>` for each finding, with
 Without `--commit`, `held built` takes one `--id` and refuses `--by`.
 A rename also has no check when its file declares neither name under one
 parent, or when more than one item in the file has the parent's name.
+
+To undo a waive, run
+`style_proposals.py unwaive --repo <checkout> --proposals <folder> --id <finding id> [--id <finding id> ...] --by <who>`.
+The id can be a unique prefix. Each finding goes back to unfiled, with no
+decision and no build ticket, so the next `file` puts it in a decision again.
+It prints `unwaived <finding id> by <who>` for each finding. The row records the
+person in its `unwaived_by` column; `held list` shows `unwaived by <who>` after
+the state (`unwaived_by` with `--json`). The record stays after every later
+change, a new waive included, so a later `file` never erases it. A second
+unwaive records the newer person. When a decline set the cell's newest
+judgment to `waived`, unwaive sets it back to `held`.
+Unwaive refuses an id that names no finding or more than one, a finding that is
+not waived, a finding judged under an older rule text (`file` skips it), a
+finding that an open ticket judged or builds, and a blank `--by`. It also
+refuses a finding whose decision is declined, because the next `file` waives it
+again: answer the decline again first. It strips `--by`. A refusal writes
+nothing for any id.
 
 A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
 where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
