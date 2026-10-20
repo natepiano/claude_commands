@@ -138,7 +138,9 @@ roster.
 ## statusline.conf
 
 Colors for each role and account in the status line, plus usage-level colors
-and thresholds for context tokens used and quota percentages left.
+and thresholds for context tokens used and quota percentages left. `counts.<type>`
+colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,
+`proposals` and `projects`.
 `scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;
 an edit applies on the next refresh. A missing or bad entry leaves that piece
 uncolored. Colors use ANSI names (`cyan`, `bright-magenta`, and so on) or the

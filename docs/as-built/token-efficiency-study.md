@@ -2,7 +2,7 @@
 
 ## What it is
 
-The status line's `For you:` row shows how many efficiency proposals wait on the user, as "N efficiency proposals". The number comes from the nightly-review ledger at `~/.local/state/nightly-review/ledger.md`. A one-week token-efficiency study (2026-10-12..19, both machines, Claude and Codex) feeds that ledger. The study changed nothing in real work. It mapped where weighted tokens go, priced the fixed cost of every request, measured wasted turn patterns and ran offline replays. It then added twelve ranked proposals to the ledger. Its scripts, data and reports are in `~/.local/state/nightly-review/token-study/`, outside git. The ledger backlog is worked only on demand, with the user, through `/efficiency_next`. A proposal is built only after the user approves it.
+The status line's `For you:` row shows how many efficiency proposals wait on the user, as "N efficiency" in its own color. The number comes from the nightly-review ledger at `~/.local/state/nightly-review/ledger.md`. A one-week token-efficiency study (2026-10-12..19, both machines, Claude and Codex) feeds that ledger. The study changed nothing in real work. It mapped where weighted tokens go, priced the fixed cost of every request, measured wasted turn patterns and ran offline replays. It then added twelve ranked proposals to the ledger. Its scripts, data and reports are in `~/.local/state/nightly-review/token-study/`, outside git. The ledger backlog is worked only on demand, with the user, through `/efficiency_next`. A proposal is built only after the user approves it.
 
 ## How it works
 
@@ -14,7 +14,7 @@ The status line's `For you:` row shows how many efficiency proposals wait on the
 - An absent field, a missing file, a directory, or a file that is not UTF-8 counts 0. The other counts stay as they are.
 - `read_counts(doc, *, questions)` fills all five counts. `total(each)` adds them by column across productions.
 - `sources(doc)` includes the ledger path even before the file exists. This makes the status line cache refresh when the ledger appears or changes.
-- `counts_line` puts the efficiency count right after proposals and leaves out zero counts: `For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question`. `plural` gives `1 efficiency proposal`.
+- `counts_line` puts the counts in the order the user set (2026-10-20): questions, changes, efficiency, proposals, projects, and leaves out zero counts: `For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects`. "efficiency" has no plural.
 - `scripts/hooks/showrunner_footer.py`, `scripts/statusline/counts_row.py` and the dailies footer (`dailies_render.py`) pass `FooterCounts` through without change.
 - Tests: `scripts/production/test_footer_counts.py` covers the parser, missing and non-UTF-8 ledgers, sources and render order. `scripts/statusline/test_statusline.py` covers the count end to end in the status line.
 

@@ -147,14 +147,15 @@ def plural(count: int, word: str) -> str:
 
 
 def counts_line(counts: FooterCounts) -> str | None:
-    """`For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question`.
+    """`For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects`.
 
-    Zero counts are left out; None when all are zero.
+    Questions come first because they need the user most (user, 2026-10-20). "efficiency" has
+    no plural. Zero counts are left out; None when all are zero.
     """
     parts = [text for count, text in (
-        (counts.changes, f"{plural(counts.changes, 'change')} to review"),
+        (counts.questions, plural(counts.questions, "question")),
+        (counts.changes, plural(counts.changes, "change")),
+        (counts.efficiency, f"{counts.efficiency} efficiency"),
         (counts.proposals, plural(counts.proposals, "proposal")),
-        (counts.efficiency, plural(counts.efficiency, "efficiency proposal")),
-        (counts.projects, plural(counts.projects, "project")),
-        (counts.questions, plural(counts.questions, "question"))) if count]
+        (counts.projects, plural(counts.projects, "project"))) if count]
     return COUNTS_HEAD + ", ".join(parts) if parts else None
