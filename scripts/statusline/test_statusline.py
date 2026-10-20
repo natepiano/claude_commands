@@ -79,7 +79,7 @@ class ColorTests(unittest.TestCase):
                 self.assertEqual(status_lines(payload, showrunner=record, colors=SHIPPED_COLORS,
                                               SHOWRUNNER_UNIT="show"), [
                     "\x1b[94munit\x1b[0m | /tmp/project",
-                    "\x1b[36mclaude1\x1b[0m | Opus | weekly \x1b[92m40% left\x1b[0m",
+                    "\x1b[38;5;137mclaude1\x1b[0m | Opus | weekly \x1b[92m40% left\x1b[0m",
                 ])
 
     def test_the_user_s_examples_render_the_role_with_its_path_then_the_account_model_tokens_and_weekly(self) -> None:
@@ -116,7 +116,7 @@ class ColorTests(unittest.TestCase):
 
     def test_shipped_account_colors_and_unknown_label(self) -> None:
         for account, expected in (
-            ("claude1", "\x1b[36mclaude1\x1b[0m"), ("claude2", "\x1b[35mclaude2\x1b[0m"),
+            ("claude1", "\x1b[38;5;137mclaude1\x1b[0m"), ("claude2", "\x1b[35mclaude2\x1b[0m"),
             ("claude3", "\x1b[34mclaude3\x1b[0m"), ("claude4", "\x1b[38;5;208mclaude4\x1b[0m"),
             ("claude99", "claude99"),
         ):
@@ -192,7 +192,7 @@ class ColorTests(unittest.TestCase):
                 with self.subTest(family=family, threshold=threshold):
                     config = SHIPPED_COLORS.read_text(encoding="utf-8") + f"\n{family}.{threshold}=not-a-number\n"
                     lines = status_lines({**payload, **usage}, colors=config)
-                    account = "\x1b[36mclaude1\x1b[0m"
+                    account = "\x1b[38;5;137mclaude1\x1b[0m"
                     if family == "tokens":
                         self.assertEqual(lines[1], f"{account} | 90,000 | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[93m10% left\x1b[0m")
                     else:
@@ -209,7 +209,7 @@ class ColorTests(unittest.TestCase):
         self.assertEqual([ANSI.sub("", line) for line in colored], plain)
         self.assertEqual(colored, [
             "\x1b[95mshowrunner\x1b[0m | /tmp/project",
-            "\x1b[36mclaude1\x1b[0m | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
+            "\x1b[38;5;137mclaude1\x1b[0m | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
         ])
 
 

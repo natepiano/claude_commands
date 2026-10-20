@@ -41,8 +41,9 @@ at the top of the issue body, and sends the showrunner the issue path, one line,
 and the five values.
 
 Do not show a new proposal to the user unasked (user, 2026-10-09: proposals
-accumulate for them to review). When they review one, show its proposed values
-in one plain-text line; they confirm or change them in their reply. Then write
+accumulate for them to review). They ask for one at a time (`/next proposal`),
+and after their answer the next waits until they ask. When they review one,
+show its proposed values in one plain-text line; they confirm or change them in their reply. Then write
 all five and delete the `Proposed ranking:` line:
 
 ```sh

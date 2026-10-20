@@ -190,11 +190,11 @@ Use `--no-alert` for live checks: it adds `--no-alert` to each `shutdown.py down
 `--dry-run` writes nothing, for a group or a single session. Selection reads shutdown's lightweight listing (`ListedSession`), without worktrees, restart resources or desktop inventory; each member's line reads only its newest transcript exchange and the stored usage reading. A warm preview takes about 0.3 to 0.4 s on natedev. A group preview first prints `<group>: would select <target>`, then one line per member:
 
 ```text
-<name>: <session id> · move when idle (<source> has room)
-<name>: <session id> · reap and restart now (<source> out of usage: weekly limit, resets Sat 9:00 AM)
+<name>: <session id> · will move once idle (<source> has room)
+<name>: <session id> · will stop and move now (<source> out of usage: weekly limit, resets Sat 9:00 AM)
 ```
 
-A source with no fresh reading prints `move when idle (<source> no fresh reading)`. An idle member stops without a pause; a busy member is asked to stop at once and mark ready; a member whose transcript ends in a refusal, or whose source account has a fresh reading at 0%, is reaped and restarted at once with no pause message. Process identity checks still precede every signal. Showrunner previews read the update timers once in-process, sharing that snapshot with the registration check without resolving messaging sockets, and name each production whose timer's target session is absent, with the full repair command to run inside that showrunner's own session.
+A source with no fresh reading prints `will move once idle (<source> no fresh reading)`. An idle member stops without a pause; a busy member is asked to stop at once and mark ready; a member whose transcript ends in a refusal, or whose source account has a fresh reading at 0%, is reaped and restarted at once with no pause message. Process identity checks still precede every signal. Showrunner previews read the update timers once in-process, sharing that snapshot with the registration check without resolving messaging sockets, and name each production whose timer's target session is absent, with the full repair command to run inside that showrunner's own session.
 
 ### Target check and refusals
 
