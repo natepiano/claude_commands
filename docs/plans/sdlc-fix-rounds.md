@@ -120,41 +120,33 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** Joining by fix-pass number alone — restarted numbers give one batch to several rounds.
 
 ### Phase 4 — Proposals to the user that cut rounds and keep the work  · status: done
-**Depends on:** Phase 2, Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** the study ends with ranked proposals, each sent to the user as a question through the showrunner, each with the rounds it would have saved and how the deferred work still gets done.
+- `docs/plans/sdlc-fix-rounds-study.md` holds a `## Proposals` section with five process-change questions, P1 to P5. Each has a question, change, rounds saved, work kept, risk, measure and answers. One shared evaluation section applies to all five.
+- Each proposal names one root cause and its certain rounds saved:
+  - P1 run command-only follow-through without a repair worker — mechanical, 8.
+  - P2 route missing acceptance criteria after landing — spec-gap, 5.
+  - P3 route repeated repairs outside the kept categories — fix-failed, 3.
+  - P4 verify phase and activity boundaries — record, 0.
+  - P5 preserve accepted behavior touched by a repair — fix-regressed, 0.
+- The totals are 16 rounds removed, 25,417 recorded agent-seconds moved (P1 holds 24,033 of them) and 0 s saved. The counted round sets of the proposals do not overlap.
+- Issues P699 to P703 in `~/rust/hanadocs/issues/` track P1 to P5.
+- The questions went to the user through the showrunner. The study adopts none of them.
+- All five proposals are process changes. No tooling-only item exists.
 
-**Spec:**
-- Add `## Proposals` to `docs/plans/sdlc-fix-rounds-study.md`. One proposal per root cause that holds at least 10% of the studied rounds, most rounds saved first; at most six.
-- Each proposal has:
-  - **Change:** the rule or tool change, in the words it would have in its target file (`commands/unit/direct.md`, `docs/production_format.md` item 7, `scripts/direct/findings.py`, `config/delegate.conf`, a Work Order rule in `docs/delegate_plan_format.md`, or a `/plan:to_phased_plan` check). Name the file and section.
-  - **Rounds saved:** applied by hand to the 15 studied phases: rounds that would not have run, and fix time that would not have been spent. Count only rounds the change removes for certain; a round it might remove counts as zero.
-  - **Work kept:** where each finding the change stops repairing goes (follow-up phase, owning unit, routed to the showrunner), and what tells us it got done.
-  - **Risk:** what a defect could reach the user or a merge because of it.
-  - **Measure:** the `history.py rounds` and `review_regime.py report` numbers Phase 6 compares, with the target for each.
-  - **Answers:** the buildable answers (adopt, adopt with a named change, do not adopt) and the one recommended.
-- File each proposal as a hanadocs issue through `/issue` with tag `proposal`, `proposed_by: fix-rounds-unit`, and its five ranking values on a `Proposed ranking:` line (<ProductionUnit/> item 17).
-- Send the proposals to the showrunner as one message: per proposal, the question, the answers and the recommendation, its issue path, and the study path. Name it as a process change for the user (production rule). Then write the user's answers into Phase 5's Spec when they arrive.
-- A proposal that only changes this unit's own tooling (`scripts/history/`) is not a process change: build it in Phase 5 without a question, and state it in one line.
-
-- A change that only corrects the record (a `record` row, a cause label) gets no work-saving credit unless the work itself goes away; both windows of Phase 6 use the same corrected measurement.
-- Each proposal states, beside its round target, the work-kept margins Phase 6 judges it by, the sample it needs, and that missing follow-up or review evidence makes the result inconclusive, not a pass.
 **Files:**
-- `docs/plans/sdlc-fix-rounds-study.md` — `## Proposals`.
+- `docs/plans/sdlc-fix-rounds-study.md` — the study; `## Proposals` holds P1 to P5 and the shared evaluation section.
 
-**Workers:** `2 writers`
-- `impl` — `docs/plans/sdlc-fix-rounds-study.md`: the proposals.
-- `test` — opens as `impl`, writes nothing: recounts each proposal's **Rounds saved** from the study's round lines and sends `impl` each count that differs, with the round lines it read.
+**Binds later work:**
+- The proposals keep their titles and numbers P1 to P5 in the study and in the issues.
+- Rounds are counted as `history.py rounds` counts repair intervals. Any later comparison uses the same count.
+- The user's answers to P1 to P5 decide which files change. The hub files are `commands/unit/direct.md` and `docs/production_format.md`.
+- No proposal is tooling-only, so no tooling item gets built without a question.
 
-**Constraints from prior phases:**
-- From Phase 2: `docs/plans/sdlc-fix-rounds-study.md` holds the evidence: 15 non-mixed records, 260 rounds, 975,069 agent-seconds (270.85 h). Roots by rounds (share of fix time): fix-failed 94 (48.5%), spec-gap 43 (19.1%), mechanical 39 (11.0%), record 35 (5.5%), fix-regressed 30 (8.1%), out-of-scope 12 (6.8%), target-moved 7 (1.0%), serial-check 0. These are the counts after the batch-join fix. Its `## Totals` and `## Rule check` sections are the base each proposal cites.
-- From Phase 2: no normal record shows the one-defect-per-check pattern; the study treats that as a limit of the evidence, not proof. `fix-failed` counts interrupted continuations and failed gate batches as well as rejected patches. Spec-gap rows name a missing target or test case in the start Work Order; they are inferences, not proof that the test would have stopped the repair.
-- From Phase 2: the three largest mixed records (189487ea/6, 03f9b80e/20 and 8f4c2e88/38) are outside the totals; the Astra reference case is outside them too.
-- From Phase 3: proposal measures use the `history.py rounds` numbers after Phase 3's batch-join fix, not the earlier Phase 1 cause shares.
-
-**Acceptance gate:** every proposal has all six parts; each **Rounds saved** matches the recount; the message to the showrunner is sent, and the turn ends `— decision:` on the user's answers.
+**Gotchas:**
+- The routing proposals (P2, P3) count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. `findings.py` numbers ledger dispatches differently.
+- Moved time is work that leaves the phase. It is not saved time.
 
 ### Phase 5 — Apply the changes the user approved  · status: todo
 **Depends on:** Phase 4
@@ -181,42 +173,59 @@ Write the user's answers into this Spec, Files and Acceptance gate when they arr
 - One edit per adopted proposal, in the words the user approved.
 - Edits to `commands/unit/direct.md` (owner phases-unit) and `docs/production_format.md` (owner roles-unit) go through cargo-berth's normal flow; the checkpoint notice names each as `also touches <path> (owner <unit>), tested against <owner tip>`, and names the build-followups owner too.
 - Tooling proposals in `scripts/history/` need no question.
-- Add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <checkpoint hash> on main, <date>`. Phase 6 compares from that date.
+- Add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <checkpoint hash> on main, <YYYY-MM-DDTHH:MM:SS±HH:MM>`, the time the change reached main, with its offset. A bare date reads as local midnight in `rounds.run` and can take in work from before the change. Phase 6 compares from that time.
+- When P2 or P3 is adopted, a routed finding stays unresolved but leaves the current dispatch batch. Today `_dispatch` in `scripts/direct/findings.py` refuses to omit a gating finding. Define that lifecycle in `findings.py`, make `<FindingsLedger/>` and `<Synthesize/>` in `commands/unit/direct.md` agree with it, and test a batch that mixes kept and routed findings in `scripts/direct/test_findings.py`.
+- When P2 or P3 is adopted, one counter decides when routing starts. The proposals count repair rounds as `history.py rounds` numbers its repair intervals; `findings.py` numbers ledger dispatches as `len(_rounds(state)) + 1` (:865, :949), and the two differ with concurrent workers, repairs outside the ledger and abandoned starts. Make the approved counter the one the check reads, test that routing starts at the approved round, and leave the existing advisory limits unchanged.
+- For each adopted proposal, name who records each field Phase 6 needs and where: exposure (recorded before the treated step runs), routing reason, receiving owner, due checkpoint, closure evidence and director-command cost. Name where a director or showrunner sees routed work that is still open. Add an acceptance check that fails when a field is missing.
 
 - When the user adopts no process change, record `No process change adopted` at the head of the study with the date, mark this phase and Phase 6 done with that reason, and build only the tooling-only items Phase 4 named.
-**Files:** set by the decision.
+**Files:**
+- `commands/unit/direct.md` — `<FixDispatch/>`, `<FindingsLedger/>`, `<Synthesize/>` (owner phases-unit).
+- `docs/production_format.md` — item 7, the repair rules (owner roles-unit).
+- `config/delegate.conf` — repair limits.
+- `scripts/direct/findings.py` — routed-finding lifecycle and the round counter, for P2 or P3.
+- `scripts/direct/test_findings.py` — tests for that lifecycle and counter.
+- `docs/plans/sdlc-fix-rounds-study.md` — the `Changes took effect` line.
+
+The user's answers pick which of these files change.
 
 **Workers:** set by the decision.
 
-**Constraints from prior phases:** set at Phase 4's checkpoint.
+**Constraints from prior phases:**
+- The proposals are in `## Proposals` of `docs/plans/sdlc-fix-rounds-study.md` (from :950): P1 run command-only follow-through without a repair worker (8 rounds), P2 route missing acceptance criteria after landing (5), P3 route repeated repairs outside the kept categories (3), P4 verify phase and activity boundaries (0), P5 preserve accepted behavior touched by a repair (0). Together they remove 16 rounds, move 24,033 s of work and save 0 s.
+- Issues P699–P703 in `~/rust/hanadocs/issues/` track P1–P5; close each adopted one at this phase's checkpoint and record each declined one as declined.
+- Every proposal is a process change. Phase 4 named no tooling-only item, so the no-adoption branch builds nothing.
+- `scripts/history/rounds.py` stays an importable API: phases-unit imports it.
 
 **Acceptance gate:** set by the decision; at least the merge gate green and `basedpyright scripts/direct scripts/production scripts/history` `0 errors, 0 warnings`.
 
 ### Phase 6 — Did the changes cut rounds and keep the work  · status: todo
 **Depends on:** Phase 5
-**Blocked by:** 30 phases with at least one repair round recorded after the date Phase 5 records, counted by `history.py rounds --since <date> --status all`.
+**Blocked by:** for each adopted proposal, 30 completed, non-mixed exposed phases that started after the time Phase 5 records, zero-repair phases included, with exposure as that proposal's **Measure** defines it.
 
 #### Work Order
 
 **Goal:** `docs/plans/sdlc-fix-rounds-study.md` ends with a before-and-after table per adopted change, a verdict on each, and any revert sent to the user as a question.
 
 **Spec:**
-- Before window: the 30 days before the Phase 5 date. After window: from that date to the run.
+- Before window: the 30 days that end just before the time Phase 5 records. After window: from that time to the run. The windows do not overlap; a phase that started before the time and ended after it is listed apart and not judged.
 - **Fewer rounds:** from `history.py rounds`: median rounds per phase, share of phases with ≥3 rounds, share of fix time those hold, rounds past the hard landing, and rounds by root cause class for the causes each change targets.
 - **Work kept:** follow-up phases written after a landing and how many reached `done` (plan docs under each production's units); merge design-check defects per phase and holds per phase from `review_regime.py report` on rows in each window; findings routed to other units and whether their phases ran.
 - A change passes when its round measure meets the target Phase 4 set and no work-kept measure is worse by more than its stated margin. A change that fails goes to the user as a question through the showrunner: keep, change, or revert, with the numbers and the one recommended.
-- State the sample sizes beside every number; a window under 20 phases is reported, not judged.
+- State the sample sizes beside every number. Each window needs at least 20 completed phases, 10 exposed phases and 12 merge design-check rows that are not excluded; a window under any minimum is reported, not judged.
+- Apply `### Evaluation shared by all five questions` and each adopted proposal's **Measure** in `## Proposals` of the study as written: exposure decided before the treated step runs, zero-repair exposed phases kept, the work-kept margins, combined parent-plus-follow-up rounds and agent-seconds, moved seconds apart from saved seconds, closure of each follow-up due in the window, and defects that reach the user or merge. Missing evidence or unfinished due work gives `inconclusive`, never a pass. When adopted changes cannot be separated, each one's attribution is `inconclusive`.
+- When P4 is adopted, its accuracy target is not read from `history.py rounds` alone: `load_phases` drops a launch with no recorded `phase_started`, and the `mixed` check cannot prove each launch's phase. Reconcile launch evidence with phase boundaries and recorded activities, list each missing or wrong association, and count it against the target.
 
 - Root counts use the Phase 2 study method by hand, one evidence line per round, with the second writer recounting each window on its own; `history.py rounds` gives only the Phase 1 causes.
-- Review rows come from `review_regime.py`'s shared row reader with both window bounds applied in the study's extraction, not from `report`'s fixed regimes; state the boundary field, the excluded rows and each window's sample size.
-- The readiness count takes phases from `history.py rounds --since <date> --status all --format json --top 100000` with at least one round, a `check` of `ok`, and a start on or after the date; open and mixed phases are listed apart and not judged.
+- Review rows come from `review_regime.py`'s shared row reader with both window bounds applied in the study's extraction, not from `report`'s fixed regimes; state the boundary field, the excluded rows and each window's sample size. Bound review rows on `merged`. Before any total, sort each `Row` as usable, excluded or insufficient evidence: an absent plan identity, review minutes or repair minutes is not a measured zero, and a required field that is absent blocks a pass instead of making the sample smaller.
+- The readiness count takes phases from `history.py rounds --since <time> --status all --format json --top 100000` with a `check` of `ok`, a start at or after the time, and exposure as each proposal's **Measure** defines it, zero rounds included; open and mixed phases are listed apart and not judged.
 **Files:**
 - `docs/plans/sdlc-fix-rounds-study.md` — `## Effect`.
 
 **Workers:** `2 writers`
 - `impl` — `docs/plans/sdlc-fix-rounds-study.md`: the effect tables and verdicts.
-- `test` — opens as `impl`, writes nothing: reruns each command the tables cite and sends `impl` each number that differs.
+- `test` — opens as `impl`, writes no repository file: recounts on its own the roots, exposure, routing, follow-up closure evidence and each number taken from a command, and sends `impl` each one that differs.
 
 **Constraints from prior phases:** set at Phase 5's checkpoint.
 
-**Acceptance gate:** every number in `## Effect` names the command that produced it and matches a rerun; each adopted change has a verdict; each failed change's question is sent to the showrunner.
+**Acceptance gate:** every number in `## Effect` names the command that produced it and matches a rerun; the test recount agrees with each root, exposure and closure call; each window meets the sample minimums or is marked reported, not judged; each adopted change has a verdict of pass, fail or inconclusive; each failed change's question is sent to the showrunner.
