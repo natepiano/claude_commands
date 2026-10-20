@@ -699,31 +699,17 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 ### Phase 25 — refill never reissues a ticket that cannot change a cell  · status: done
 
-**Depends on:** Phase 24
+#### As-built
 
-#### Work Order
-
-**Goal:** refill stops issuing a ticket at a base where the cell was already judged; the director is told to merge the style branch first; the held-cell skip ignores findings in a final state.
-
-**Spec:** ruled by the showrunner, (w). production case: cargo-liner values tickets 124/125, cell `crates/cargo-port/src/lint/trigger.rs` × `derive-test-values-from-production-constants.md#uncovered` (crate scope), judged at the values branch tip 2181135d after style/main moved on (same crate) — stale is correct; the ticket base (`ticket_base`, style_ledger.py:1280, the unit branch tip) cannot change it.
-(a) `_refill_cells` / `candidate_tickets` (style_plan.py ~1013, ~1559) take the unit branch; leave out a stale cell whose newest judgment (current blob, newest declared scope) matches the inputs at the unit branch tip, through a ledger helper that reuses `_judgment_inputs_match`.
-(b) When that leaves no candidate and a cell was left out for this reason, `next_phase` returns a new outcome "merge the style branch first" with its own exit code and line (not waiting-for-sync); `commands/unit/direct.md` <StandingPlanRefill/> table and `docs/style_production.md` get the row: merge the style branch, then refill.
-(c) The held-cell skip (style_plan.py ~1024) ignores waived, built and withdrawn findings; it needs at least one remaining finding and every remaining finding filed on an open proposal.
-Do not take the fingerprint at the ticket base (it would mark current a cell whose inputs changed).
+- Refill leaves a stale cell out of ticket selection when its newest judgment (current rule blob, newest declared scope, scope at the synced tip) is in the unit branch tip and in the style branch and saw the inputs the unit tip has (`Ledger.judged_at_base`, through `_repeated_judgments` and `_judgment_inputs_match`). Only the unit's own ticketable cells are checked; ranking and structure blocking still see every cell. `RefillCells` is built once per selection.
+- `next-phase` exit 6, `MergeStyleBranchFirst(cell_count, unit_tip, style_branch)`: `merge the style branch first: <n> cells judged at <tip7> wait for <style branch>`, only when a style branch is stored (`StoredStyleBranch | NoStoredStyleBranch`), the unit tip is in the pushed style tip, and that tip changes at least one left-out cell (`Ledger.style_merge_changes`). Otherwise refill waits for sync. A style branch missing on origin stops refill with the `fetch origin first` error. The unit runs `git fetch origin <style merge branch> && git merge --ff-only origin/<style merge branch>`, then refills; a refused or empty fast-forward ends blocked on the showrunner.
+- The held-cell skip ignores waived, built and withdrawn findings and needs at least one remaining finding, each filed on an open proposal.
 
 **Files:**
-- `scripts/style/style_plan.py`
-- `scripts/style/style_ledger.py`
-- `scripts/style/test_style_plan.py`
-- `scripts/style/test_style_ledger.py`
-- `docs/style_production.md`
-- `commands/unit/direct.md`
+- `scripts/style/style_plan.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_plan.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`, `commands/unit/direct.md`
 
-**Workers:** 1 writer.
-
-**Constraints from prior phases:** phase 24 changes `approved_rename_pairs`, `phase_text` and `held built` in the same files.
-
-**Acceptance gate:** stale stays stale after a same-crate change on the style branch; refill skips and returns the new outcome with no ticket added; after the merge the ticket takes the merged base and its verdict is awaiting merge; no false skip when inputs differ; held skip with waived + filed findings, not with an unfiled one. `merge_gate.py --tests-only` green on a frozen copy; basedpyright clean.
+**Gotchas:**
+- Refill does not fetch: it reads the local `origin/<style>` ref, so a stale tracking ref gives exit 3 until a fetch or push updates it.
 
 ### Phase 26 — a waived finding can be filed again  · status: todo
 
