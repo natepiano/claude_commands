@@ -97,34 +97,27 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** a wider `mechanical` root, and `serial-check` for batched checks — both blur the defined roots.
 
 ### Phase 3 — Each repair round joins only its own ledger batch  · status: done
-**Depends on:** Phase 2
 
-#### Work Order
+#### As-built
 
-**Goal:** `load_phases` and `phase_rounds` give each repair round only the ledger batch it repaired, also when fix-pass numbers repeat inside one phase instance.
-
-**Spec:**
-- Today `_rounds` in `scripts/history/rounds.py` joins a fix-worker group to every `finding_batch_dispatched` event whose `round` equals one of the group's `fix_pass` numbers. When fix-pass numbers restart inside one phase instance, a later group takes an earlier batch's findings and cause, and a repeated ledger round number is hidden. Evidence: run `8f4c2e88-92c3-44c4-ac27-36ab13c68327`, phase 38: the ledger sent batch 1 (F001–F006) and batch 2 (F007–F009) once each, but rounds 10, 22, 38, 39 and 40 also claim them and read as `review-ux`. Also seen in run `7b115092`, phase 137, where batch 3 has no matching worker after its dispatch.
-- Join each batch dispatch to at most one group: the group holding the first fix pass, in start order, that starts at or after the dispatch time and carries its number. A pass inside an already open group counts, so a batch sent during a group joins that group (22 recorded batches do this, for example `fcc29db9` phase 7 batch 2). Each dispatch is used once. A dispatch that no pass takes stays a ledger-only round, as today. A group with no batch keeps the word-list causes.
-- Keep the public API: `load_phases(events) -> list[PhaseRounds]`, `phase_rounds(events) -> list[Round]`, and every `Round` / `PhaseRounds` field. phases-unit's `phase_process.py baseline` imports them.
-- Add tests in `scripts/history/test_rounds.py`: restarted fix-pass numbers give the later group no covered findings and a word-list cause; a batch dispatched after an earlier group with the same number joins the later group; a repeated ledger round number with no group stays a ledger-only round; a batch sent while a group is open joins that group. Check causes, covered findings and counts through `phase_rounds`, `load_phases` and a synthetic `history.py rounds --format json` report.
-- Re-run `python3 scripts/history/history.py rounds --since 60d --status all --format json --top 40`. In `docs/plans/sdlc-fix-rounds-study.md`, correct each Phase 1 cause, covered-finding list and count that the fix changes, and the full-window Phase 1 cause table, with the new capture date. The study keeps its 15 ranked records as a fixed cohort; where the fix adds or removes a round in one of them, renumber its rows, assign the new row a root with evidence, and recompute the rule check, totals and the Phase 4 constraints copied from them. Hand root labels change only where a row's evidence changes. Tell phases-unit which causes and counts changed.
+- `_rounds` in `scripts/history/rounds.py` joins each `finding_batch_dispatched` event to at most one fix-worker group: the first group, in start order, that holds a fix pass with the dispatch's round number and a start at or after the dispatch time. A pass inside a group that is already open counts.
+- Each dispatch joins once. A dispatch that no pass takes is its own zero-time ledger-only round, also when ledger round numbers repeat. A group with no batch keeps the word-list causes.
+- `load_phases`, `phase_rounds` and every `Round` / `PhaseRounds` field are unchanged.
+- The study is recounted: the 15 normal records hold 260 rounds and 975,069 agent-seconds (fix-failed 94, spec-gap 43, mechanical 39, record 35, fix-regressed 30, out-of-scope 12, target-moved 7, serial-check 0); the 3 mixed records hold 139 rounds; the full 60-day window holds 2,287 rounds, 24 more ledger-only rounds than before.
 
 **Files:**
-- `scripts/history/rounds.py` — `_rounds` batch join.
-- `scripts/history/test_rounds.py` — join tests.
-- `docs/plans/sdlc-fix-rounds-study.md` — Phase 1 causes and the full-window table.
+- `scripts/history/rounds.py` — round classifier and the time-ordered batch join.
+- `scripts/history/test_rounds.py` — synthetic join tests, `load_phases` checks and `test_json_cli_reports_each_batch_once_after_fix_numbers_restart`.
+- `docs/plans/sdlc-fix-rounds-study.md` — corrected round rows, root totals, the dispatch-join correction section and the full-window cause table.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/history/rounds.py`, then `docs/plans/sdlc-fix-rounds-study.md`; hub: `scripts/history/rounds.py`.
-- `test` — `scripts/history/test_rounds.py`.
+**Binds later work:** Any work that copies the study cohort uses 260 rounds and the root counts above; the set of roots at or above 10% of rounds is unchanged. Recounts use the corrected join.
 
-**Constraints from prior phases:**
-- From Phase 1: `rounds.py` is an importable API that phases-unit imports; `run()` alone prints. A round's `fix_seconds` is summed worker time; a ledger-only round adds no time; `finished_at` 0.0 means open.
-- From Phase 1: the merge gate runs the `history` suite, so `python3 -m unittest discover -s scripts/history -p 'test_*.py'` must stay green.
-- From Phase 2: the study's 15 normal records hold 255 rounds and 975,069 agent-seconds; roots: fix-failed 91, spec-gap 44, mechanical 38, record 34, fix-regressed 29, out-of-scope 12, target-moved 7, serial-check 0. `LIVE_WORDS` now holds `"ux review"`.
+**Gotchas:**
+- A ledger-only round has zero worker time by design; never invent time for it.
+- A dispatch can come after the last pass with its number (run 7b115092 phase 137 batch 3); it stays a ledger-only round.
+- The fix moves many rounds from review causes to gate and other, because restarted numbers gave review batches to unrelated passes.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` green; `basedpyright scripts/history` `0 errors, 0 warnings`; phase 38 of run 8f4c2e88 gives batch 1 and batch 2 to one round each; the study's cause columns match the new report.
+**Ruled out:** Joining by fix-pass number alone — restarted numbers give one batch to several rounds.
 
 ### Phase 4 — Proposals to the user that cut rounds and keep the work  · status: todo
 **Depends on:** Phase 2, Phase 3
