@@ -191,4 +191,13 @@ ENTRIES = (
         "The natedev computer is shutting down because its backup battery is low. "
         + "Work cannot resume until it starts again. It should start automatically when mains power returns.",
         (PushExample("typical", {}),)),
+    # /nate templates (user spec, 2026-10-20): the sending agent fills each value; the last body line names the template.
+    PushText("nate.adhoc", "{sender}", "note", "{sender} {title}", NoActionNeeded(),
+        "{description}\n\nadhoc",
+        (PushExample("typical", {"sender": "natedev", "title": "the /nate skill is ready",
+                                 "description": "You asked to be told when the /nate skill is ready. It is ready now: "
+                                 + "/nate adhoc <instructions> sends you an update like this one."}),
+         PushExample("long_sender", {"sender": "cargo-liner-style", "title": "renames are done",
+                                     "description": "You asked to be told when the tile and handler renames finish. "
+                                     + "Both are done, and both units run under their new names."}))),
 )
