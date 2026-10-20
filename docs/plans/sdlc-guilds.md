@@ -103,7 +103,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** nullable `session_dir` / `worker` / `pid` on the in-memory types — the lifetime union replaces them; keeping a mesh record whose run folder or roster worker is gone.
 
-### Phase 2 — The design doc defines the designer and reviewer roles, their names and the two guilds  · status: todo
+### Phase 2 — The design doc defines the designer and reviewer roles, their names and the two guilds  · status: done
 **Depends on:** none
 
 #### Work Order
