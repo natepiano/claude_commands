@@ -33,6 +33,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts that run the user's productions. This plan measures the agent hierarchy and changes it one approved step at a time.
+- **Project started:** 2026-10-20T20:46:48.678+00:00
 - **Stack:** Python 3.13, standard library only; Markdown.
 - **Layout:**
   - `scripts/hierarchies/` — `measure.py` and `test_measure.py` (new)
@@ -61,7 +62,8 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 ## Phases
 
-### Phase 1 — One command measures how fast the hierarchy delivers Hana, and the design doc lists the user's constraints  · status: todo
+### Phase 1 — One command measures how fast the hierarchy delivers Hana, and the design doc lists the user's constraints  · status: done
+**Depends on:** none
 
 #### Work Order
 
@@ -73,6 +75,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
   2. **Flow to Hana main.** For hana units in the window: phases done, median and p90 phase time, and the time phases waited (on the user, the showrunner, a gate, or idle) where `progress_history.py` records it. Hanadocs issues on goal `1 - Ship Hana` moved to active and closed in the window, with median active-to-closed time. Where no source records a wait kind, print `not recorded` and name the source that would.
   3. **User attention.** Phone pushes per day and how many went out after a failed review; agent messages per day split by sender kind (agent, automation, user-bound); items waiting on the user by kind (changes, proposals, efficiency items, questions) with the age of the oldest; questions answered in the window with median time to answer.
   4. **Rank coverage.** Of the top 20 ranked open issues on goal 1, how many have a unit; of the live units, how many name an issue.
+  - The script reads natedev's records. A table whose source the Mac also keeps (transcripts, message log) says `natedev only`.
 - The design doc `docs/plans/build-followups-hierarchies-design.md`, sections:
   - **Constraints.** Every constraint on how the hierarchy works, one line each, each with its source (user words with date, memory name, CLAUDE.md, `decision_criteria.md`, a production doc). At least: the user's attention and how they want to be reached (on demand, no forms, one plain question, STE, EDT); what only the user decides; build capacity on natedev and the Mac; Claude and Codex account quotas and moves; model choice for judgment roles; worker lifetime; the three gods and the decision economy. Mark each `user` or `derived`; a derived constraint names the user words it comes from.
   - **Map.** Each role, the file that defines it, what it does, who it reports to, and each channel with sender, receiver and script. It includes sdlc and the two guild heads as planned, marked planned.
@@ -94,6 +97,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Acceptance gate:** `python3 -m unittest discover -s scripts/hierarchies -p 'test_*.py'` green; `basedpyright scripts/hierarchies` ends `0 errors, 0 warnings, 0 notes`; the merge gate (Delegation Context → Test) green; `measure.py baseline` runs on real data on natedev in under 60 s and its output is in the doc; every constraint line names a source. At phase end the unit director sends the showrunner the Questions section as one message for the user.
 
 ### Phase 2 — The design doc recommends the best hierarchy and the steps to reach it  · status: todo
+**Depends on:** Phase 1
 
 #### Work Order
 
@@ -122,6 +126,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Acceptance gate:** the doc has the four sections; each candidate has a score on every measure and constraint; each step names its measure, its size and how to undo it; the adversarial and astra findings are folded in. At phase end the unit director sends the showrunner the Recommendation and Step 1 as one question for the user.
 
 ### Phase 3 — Build the first approved step  · status: todo
+**Depends on:** Phase 2
 
 #### Work Order
 
@@ -152,6 +157,7 @@ Step 1 from the design doc's Steps section.
 **Acceptance gate:** set by the decision above, and the merge gate (Delegation Context → Test) green.
 
 ### Phase 4 — Measure the first step and propose the next  · status: todo
+**Depends on:** Phase 3
 
 #### Work Order
 
