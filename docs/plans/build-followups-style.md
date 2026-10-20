@@ -760,3 +760,325 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Ruled out:**
 - Merging `KeptForOpenBuild` into `KeptForBuild`: different outcome families.
 - A `--to` override for a left finding: a person waives it or changes the code until a real case needs one.
+
+### Phase 28 — a renamed item keeps its approved finding  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** The declaration step no longer withdraws a filed finding while its file is still there. When a filed rename finding's own new name is now declared, the finding becomes built. When the item is gone from a file that is still there, the finding stays filed for a person, with a `left` line. Withdrawal is now only for a filed finding whose file is gone, and for an unfiled finding.
+
+**Spec:**
+
+Today `_declaration_outcome` (`scripts/style/style_ledger.py:2095-2146`) returns `DeclarationRemoved` whenever no other file gained the old declaration, and `follow_declarations` (:2157-2188) withdraws every one of those with `DeclarationGone(<tip>)`. On the live ledger this withdrew 61 approved findings whose items were renamed (for example `EscapeStripState` to `AnsiScanState`) or deleted. The showrunner ruled the new behavior below.
+
+1. **New outcomes** (style_ledger.py, next to `DeclaredInAnotherCrate` :560 and `KeptForOpenBuild` :569):
+   ```python
+   @dataclass(frozen=True)
+   class DeclarationRenamed:
+       """A filed rename finding whose own change is in the code. Its declaration is gone, and its after name is declared
+       with the same keyword and owner, in its file or in the one file that gained it. The finding is built there."""
+
+       finding: HeldFinding
+       declaration: Declaration
+       renamed: Declaration
+       path: str
+       line: int
+
+
+   @dataclass(frozen=True)
+   class DeclarationGoneFromFile:
+       """No file declares a filed finding's subject at the synced tip, and its file is still there. The finding stays
+       filed until a person waives it or declares the item again."""
+
+       finding: HeldFinding
+       declaration: Declaration
+   ```
+   Add both to `DeclarationOutcome` (:576-577). Add the alias `DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile` after it. `follow_totals`, the `follow` exit and the refill `left` dict all use this alias, so the three places cannot disagree. Change the `DeclarationRemoved` docstring (:543) to: "No file declares the finding's subject at the synced tip. The finding is unfiled, or its file is gone there, so it is withdrawn."
+
+2. **`_declaration_outcome`**: the order up to the move search (:2125-2135) stays the same. Replace the tail (:2136-2146) with this order:
+   - Several gaining files declare the old declaration: `DeclaredInSeveralFiles` (no change).
+   - One gaining file declares it: `DeclaredInAnotherCrate` for a filed finding in another crate, else `DeclarationMoved` (no change).
+   - No file declares it, and the finding is `Filed` with `kind == "rename"`: run the rename test below. When it finds a site, the outcome is `DeclarationRenamed`. When it finds several gaining files, the outcome is `DeclaredInSeveralFiles(finding, renamed, paths)`. When the one site is in another crate, the outcome is `DeclaredInAnotherCrate(finding, renamed, path)`. These are the rules a move uses.
+   - Otherwise, a `Filed` finding whose `finding.path in rust_files` (still at the tip) gives `DeclarationGoneFromFile(finding, declaration)`.
+   - Otherwise (unfiled, or the file is gone at the tip) gives `DeclarationRemoved` (no change).
+   - The open-build check (:2142-2145) stays last and covers every outcome above. A finding that an open ticket builds gives `KeptForOpenBuild` and nothing is written.
+
+   **Rename test** (a private helper on `Ledger`, for example `_renamed_site(finding, read, old_file, old, tip, rust_files, changed)`):
+   - `old_name = finding.before.strip().split("::")[-1]` and `new_name = finding.after.strip().split("::")[-1]`.
+   - The test applies only when `old_name == declaration.name`, `new_name != old_name`, and `style_footprint.IDENTIFIER.fullmatch(new_name)`. A prose or code-line `after` (for example "Rename `group` to …") never matches, and neither does a variant or field rename, whose line reads as its enum or struct.
+   - `renamed = Declaration(declaration.keyword, new_name, declaration.owner)`.
+   - A file holds the rename when it declares `renamed` at the tip (`_declared_file(tip.commit, path).declared_items`) and did not declare it at `read`. "Gained since the read commit" applies to the finding's own file as well, so an item that was already there is never taken for the rename.
+   - The finding's own file is checked first. If it holds the rename, the site is `(finding.path, line)`.
+   - Otherwise, search `_files_naming(tip.commit, new_name)` (:2074) with the same filters as the move loop (:2128-2135): not `finding.path`, in `rust_files`, in `changed`, not declared at `read`. One file is the site. Several files give `DeclaredInSeveralFiles`.
+   - The line is `moved_site_line(old_file, finding.line, old, new_file, item)` (`declarations.py:206`). The site text holds the old name, so in practice this is the new item's keyword line.
+   - Guard: `applied_check(replace(finding, path=site_path), tip.commit)` (:1361) must not be `RenameNotApplied`. This keeps `reopen` from filing the finding again at once. A bare pair is `NoAppliedCheck` and passes. A `<parent>::<name>` pair is `AppliedInCode`.
+
+3. **Route to built: the step writes it itself, inside `follow_declarations`' transaction.** It uses the same column write that `ticket merge` (`_ticket_transition` :1436-1440) and `mark_built` (:2226) use: `state='built',person_read_by=''`. A person's reading was of an old build, so the new build clears it.
+   - Why this route and not the other two:
+     - `Ledger.mark_built` (:2190) refuses a finding with no merged build ticket. These renames came from other work and have no ticket.
+     - `mark_built_at_merge` (`held built --commit`, :2231) runs `applied_check`. That check is `NoAppliedCheck` for every bare pair: `approved_rename` (`approved_renames.py:175`) needs `<parent>::<name>`, and 3839 of the 5035 live rename findings are bare identifier pairs. So it would need a person's `--by` for almost every finding, which is what `ticket merge` asks for with `has no applied check` (`not_built_line` :674). It is also its own transaction, outside the step's lock and recheck.
+     - The declaration test is the proof in place of `applied_check`. The finding's own declaration (before name, keyword, owner) is gone, and its after name is now declared with the same keyword and owner. The step writes inside its `BEGIN IMMEDIATE` and `retry_on_change` recheck.
+   - In `follow_declarations`:
+     - Collect `renames = [item for item in plan.outcomes if isinstance(item, DeclarationRenamed)]` and include them in the "nothing to write" early return (:2170).
+     - A rename at `finding.path`: `UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?`.
+     - A rename into another file: the move's column write (:2176-2180) plus `state='built',person_read_by=''`. Path, line, `followed_from`, `followed_from_line` and `followed_at` are written, so `held list` shows `followed from …` and reopen checks the right file.
+     - `DeclarationGoneFromFile` writes nothing.
+     - Update the docstring.
+   - Consequence, a scope note by the author: `reopen` does not change. A built bare rename has no applied check, so `reopen --all` lists it as `cannot check` and exits 1. It does the same today for every bare rename marked built through `held built`. A person passes `--applied <id> --by <who>`.
+
+4. **Built only in an approved decision** (style_proposals.py `run_follow` :1354). This is the author's call. `Built` is read as approved and in the code: `reopen_all` (:960) skips, with exit 1, every issue that holds a built finding and is not approved, and `close_finished_decision` (:573) closes only approved decisions.
+   - Before the write, alongside the existing `refused` set (:1378), compute `awaiting`: the ids of `DeclarationRenamed` outcomes whose `finding.state.proposal` is not a file, or whose `decision_answer(Issue(path, frontmatter(path)))` is not `ApprovedDecision` (both are already imported :34-35).
+   - Leave those ids out of `follow_declarations`, and out of the dry-run outcomes, the same way as `refused`. They stay filed with no line. The first step after approval builds them; refill runs the step only on approved decisions (style_plan.py :1577).
+   - The pre-write generated-body and `Parent:` check (:1367-1377) does not take renamed outcomes, because a built finding does not refresh its decision.
+
+5. **Lines** (`follow_line` :1324, `DeclarationChange` :1320). Add both new outcomes to `DeclarationChange`. Exact text, where `site` is `<finding> <rule> <path>:<line>` as today:
+   - `built <site>: <declaration_line(declaration)> renamed to <new_name> in <path>:<line>`. For example: `built 3cd2cba6… names-rule alpha/src/a.rs:1: struct Parent renamed to Renamed in alpha/src/a.rs:1`.
+   - `left <site>: <declaration_line(declaration)> declaration gone; waive it or declare it again`
+   - `follow_totals` (:1313) becomes `totals: follow <n>, built <n>, withdraw <n>, left <n>, kept <n>, close <n>`. `left` counts `DeclarationLeft`.
+   - The `follow` command (:1513-1523) counts `left` with `DeclarationLeft`. It still exits 1 on a left finding or a skipped decision, and prints `style_proposals: left <n> findings for a person` to stderr.
+   - `file` (:437-441) prints the same lines. Its exit code still ignores left lines.
+   - A dry run prints the same lines and writes nothing (no change in how it works).
+
+6. **Close reason** (`close_finished_decision` :591-599, author's call; it fixes a false reason the new route would hit). When no merged ticket built the decision, the reasons are checked in this order:
+   1. Removed files: `nothing left to build: <files> not in synced commit <commit>` (no change).
+   2. Else, when any finding is `Built`: `BUILT_REASON + f"synced commit {commit}"`, which reads `built in synced commit <commit>`.
+   3. Else: `nothing left to build: every finding is waived`.
+
+   Today a decision whose findings a plain merge or this step built would close as "every finding is waived". The new reason begins with `BUILT_REASON`, so `FINISHED_REASONS` (:367, read at :402) still accepts it.
+
+7. **Refill** (style_plan.py `_select_phase`, :1595-1603 and :1623):
+   - The `left` dict takes `style_ledger.DeclarationLeft`.
+   - A `DeclarationGoneFromFile` prints `waiting <decision>: <finding> declaration gone`. The existing two wordings stay.
+   - The finding is left out of the ticket, as the other left findings are.
+   - Add `built = any(isinstance(outcome, style_ledger.DeclarationRenamed) for outcome in own)`, and close on `(gone or withdrew or built)`. `_unbuilt_findings` (:1525) already leaves out built rows, so a decision whose last filed finding the step built closes with `built in synced commit <commit>`.
+
+8. **Unfiled findings do not change.** An unfiled finding whose item was renamed or removed is withdrawn with `NoDecision`, as today. Item 2 limits the rename test to `Filed`.
+
+9. **Docs.**
+   - `docs/style_production.md` step paragraph (:453-475). Replace "No file: the finding is withdrawn, with no decision when it was unfiled." with these three cases:
+     - (a) A filed rename whose after name its file, or one file that gained it, now declares with the same keyword and owner, in an approved decision, is built there. It prints `built …`. A rename in a decision that is not approved waits for the answer.
+     - (b) A filed finding whose file is still there stays filed. It prints `left …: <keyword> <name> declaration gone; waive it or declare it again`. A person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or puts the item back in the code.
+     - (c) An unfiled finding, or a filed finding whose file is gone, is withdrawn (no change).
+   - In the same paragraph, add the new `totals` shape. State that a decision whose last finding the step built closes at the next refill or `complete`, with `built in synced commit <commit>`.
+   - Refill paragraph (:498-509): add the `waiting <decision>: <finding> declaration gone` line, and say that a decision the step built closes.
+   - `commands/showrunner/proposal.md:93-96`: change "or withdraws it when no file does" to "marks a filed rename built when its new name is declared, leaves a filed finding whose item is gone from its file, and withdraws the rest".
+   - The held list does not change: no new column, no new state, no new `--json` key.
+
+**Files:**
+- `scripts/style/style_ledger.py`
+- `scripts/style/style_proposals.py`
+- `scripts/style/style_plan.py`
+- `docs/style_production.md`
+- `commands/showrunner/proposal.md`
+- `scripts/style/test_style_ledger.py`
+- `scripts/style/test_style_proposals.py`
+- `scripts/style/test_style_plan.py`
+
+**Workers:** `1 writer + 1 tester`. The ledger outcomes, the command lines and refill are one chain, so the code does not split. The tests go to the tester, because the Spec gives exact lines and states.
+- `impl`: style_ledger.py, style_proposals.py, style_plan.py, docs/style_production.md, commands/showrunner/proposal.md. Hub: `scripts/style/style_ledger.py` (the outcome types and `DeclarationLeft` that the tester imports).
+- `test`: test_style_ledger.py, test_style_proposals.py, test_style_plan.py, beside the modules. Every test name states the behavior it checks.
+  - **Ledger.** Fixtures use `commit_tip`/`judge_parent` (:861-884). Judge a rename at line 1 (`pub struct Parent {`) with `before="Parent"`, `after="Renamed"`.
+    - `test_a_filed_rename_whose_after_name_its_file_now_declares_is_built_not_withdrawn`
+    - `test_a_filed_rename_whose_after_name_one_gaining_file_declares_is_built_and_followed_there` (path, line and `FollowedDeclaration` are written)
+    - `test_a_filed_rename_of_an_impl_method_is_built_and_its_applied_check_passes` (an `impl Parent { fn old() }` rename with `Parent::old` to `Parent::new`; `applied_check` at the tip is `AppliedInCode`)
+    - `test_a_filed_finding_whose_item_was_renamed_otherwise_is_left_and_nothing_is_written`
+    - `test_a_filed_finding_whose_file_is_gone_is_withdrawn`
+    - `test_an_unfiled_rename_whose_after_name_is_declared_is_withdrawn`
+    - `test_a_renamed_finding_that_an_open_build_ticket_holds_is_kept`
+    - Change `test_a_removed_declaration_whose_twin_was_already_in_another_file_is_withdrawn` (:904) to remove `PARENT_FILE` (`None`), so it still tests a withdrawal.
+  - **Proposals.** Use the `commit_tip`/`judge`/`follow`/`approved_decision` helpers (:391-430, :708).
+    - `test_follow_builds_a_filed_rename_of_an_approved_decision_whose_new_name_is_declared` (exact `built …` line and totals; state `Built(issue)`; never withdrawn)
+    - `test_follow_leaves_a_renamed_finding_of_an_unanswered_decision_filed_with_no_line`
+    - `test_follow_leaves_a_filed_finding_whose_declaration_is_gone_from_its_kept_file_and_exits_one` (exact `left …: struct Parent declaration gone; waive it or declare it again`; nothing written)
+    - Rename and rework :2478 into `test_follow_withdraws_findings_whose_file_is_gone_and_closes_their_decision` (`alpha/src/ci_cache.rs: None`).
+    - `test_an_unfiled_finding_whose_item_was_renamed_is_withdrawn_with_no_decision`
+    - `test_follow_dry_run_prints_the_same_built_and_left_lines_and_writes_nothing`
+    - `test_complete_closes_a_decision_the_declaration_step_built_with_the_synced_commit_reason`
+    - Update every `totals: follow …` assertion (12 in all, across the three test files) to include `built 0`.
+  - **Plan.**
+    - `test_decision_refill_waits_on_a_finding_whose_declaration_is_gone_from_its_kept_file` (exact `waiting <issue>: <finding> declaration gone`; not ticketed; still `Filed`)
+    - `test_decision_refill_closes_a_decision_whose_only_finding_the_declaration_step_built` (reason `built in synced commit <tip>`)
+
+**Constraints from prior phases:**
+- Phase 27 built the step:
+  - `declarations.py`: `Declaration(keyword, name, owner)` with `ModuleItem | ImplOrTraitItem`, `read_declarations`, `DeclaredFile.declaration_at`, `declaration_line` (:44) and `moved_site_line` (:206).
+  - The caches `_changed_since`, `_files_naming` and `_declared_file` (style_ledger.py :2067-2093), keyed by commit. Use them and add no new git reads per finding.
+  - `DeclarationReading(tip, outcomes)` is computed with no write (`declaration_reading` :2153). `follow_declarations` rechecks the synced commit and the plan under `BEGIN IMMEDIATE` and raises `ChangedBeforeLock` for `retry_on_change`.
+- Declaration identity collides across files often (test helpers, `fn main`, two trait impls), so a file counts only when it gained the declaration since the read commit. This plan applies that rule to the renamed declaration too.
+- `style_ledger.py` cannot import `style_proposals` (two module copies under `__main__`), so the approval check (decision answers in the vault) lives in `run_follow`, not in the ledger. `follow_declarations` writes built for every `DeclarationRenamed` it is given, so its docstring states that the caller passes only findings whose decision is approved.
+- `plan_withdrawal` (:1170) and the follow refresh (:1401-1417) are unchanged. A built finding does not refresh or close its decision in the step. `complete` and refill close it.
+- `Built(proposal)` keeps the decision path in the `proposal` column. Do not clear it.
+- The `nate_style` test fixture has no origin, so a decision refresh in plan tests can fail with no error. Stub `proposal_command` and `github_rule_root` as `refill_decisions` does (test_style_plan.py :2703).
+- At draft time the worktree had uncommitted comment-only edits at style_plan.py:1590 and :1605 and test_style_plan.py:2629 (phase 27 wording). Keep them.
+
+**Acceptance gate:** from the worktree root:
+- `python3 -m unittest discover -s scripts/style -p 'test_declarations.py'`, then the same command for `test_style_ledger.py`, `test_style_proposals.py` and `test_style_plan.py`. All four are green, and every test named above is present and passes.
+- `basedpyright scripts/style` reports `0 errors, 0 warnings`.
+- The Delegation Context merge gate `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` is green.
+- Observable behavior: in a scratch repo, `style_proposals.py follow --dry-run` prints `built …` for a renamed approved rename, `left …: <keyword> <name> declaration gone; waive it or declare it again` for a kept file, and `withdraw …` only for a removed file or an unfiled finding. The run without `--dry-run` prints the same lines.
+
+### Phase 29 — an approved proposal leaves the waiting count  · status: todo
+
+**Depends on:** Phase 28
+
+#### Work Order
+
+**Goal:** The footer's `N proposals` and the `/showrunner:proposals` table's `waiting for your review` rows count only proposals that the user has not approved. Every path that records an approval sets the issue's stage to `active` (in progress). A one-time, idempotent `proposal_issue.py move-approved` moves the proposals that were approved before this phase.
+
+**Spec:**
+
+The user said: "when i mean list i mean the count that is listed below in the footer - i want that number to reflect the proposals i have not approved for implementation - if i have approved them them for implementation they should move into an in-progress state - please update the style unit director to have it make this change and make sure it can happen automatically through skills and scripts". The showrunner ruled it current, with a migration for proposals already approved.
+
+Today:
+- `footer_counts.proposals` (`scripts/production/footer_counts.py:49-50`) is `len(proposals_folder.open_proposals(doc))`. This counts every open proposal issue of the production (`proposals_folder.py:72-78`), approved or not.
+- `proposal_issue.py approve` (`fields_for` :214-219) writes `showrunner`, `unit` and `plan`. Its help (:368) says "stage stays backlog". So an approved proposal stays `status: open`, `stage: backlog` until it is built and closed.
+- The approval record is `unit` and `plan` both set: `decision_answer` (:260-265) gives `ApprovedDecision` then, unless `style_answer: declined`.
+- `proposals_table.issue_state` (:111-117) reads `stage: active` as `being built by <unit>`, `plan` alone as `approved, not started: <plan>`, else `waiting for your review`.
+- The vault's stages are `backlog`, `active` and `waiting` (`commands/prioritize.md:80`). `active` is the vault's in-progress stage. `start` (:220-221) already writes it.
+
+1. **State model** (author's call: no new stage value). The vault ranks and shows stages that are already defined, and `active` means in progress. So an approved proposal moves to `stage: active`. "Approved, not started" and "being built" become one state, **in progress**. The state table becomes:
+
+   | State | `status` / `stage` | Set by |
+   | --- | --- | --- |
+   | waiting for approval | open / backlog | filing (`proposed_by`) |
+   | in progress | open / active | `approve` (`showrunner`, `unit`, `plan`), or `start` for a plan issue that has no approval |
+   | built | closed | `close` (`as_built` or `reason`) |
+
+   In `scripts/production/proposal_issue.py`, next to `decision_answer`:
+   ```python
+   IN_PROGRESS_STAGE = "active"
+
+
+   @dataclass(frozen=True)
+   class AwaitingApproval:
+       """An open proposal the user has not approved: no approval is recorded and its stage is not active."""
+
+
+   @dataclass(frozen=True)
+   class InProgress:
+       """An open proposal approved for implementation, or started, and not yet built."""
+
+
+   ProposalProgress = AwaitingApproval | InProgress
+
+
+   def proposal_progress(issue: Issue) -> ProposalProgress:
+       """In progress when the approval is recorded, or when no answer is recorded and the stage is active."""
+   ```
+   - The rule: `ApprovedDecision` gives `InProgress`. `UnansweredDecision` with `stage == IN_PROGRESS_STAGE` gives `InProgress`. Everything else gives `AwaitingApproval`.
+   - Readers use the approval record and not only the stage. So the count is correct for a proposal approved before the migration, and for an approved one that a person put in `stage: waiting`.
+   - A declined decision that is still open is a `decline` that stopped before its close. It reads as `AwaitingApproval`, so the user sees it. A rerun of `style_proposals.py decline` closes it.
+   - `start` keeps writing `stage: active`. `/unit:direct` (`commands/unit/direct.md:729-732`) runs it on plan issues, and style refill runs it (`style_plan.py` `proposal_command("start", …)` at :1551, :1644, :1710 before phase 28's edits). For an approved proposal it now prints `start <name>: unchanged`. Scope note, author's call: the refill calls stay. They also mark active a decision approved by a hand edit of `unit` and `plan`.
+   - Use `IN_PROGRESS_STAGE` in place of the `"active"` literal at :221.
+
+2. **Write paths** (all in `proposal_issue.py`; `style_proposals.py` changes no code, because every style approval goes through these):
+   - **approve**: `fields_for` (:214-219) returns `{"showrunner", "unit", "plan", "stage": IN_PROGRESS_STAGE}`, in that order. The output is `approve <name>: set showrunner, unit, plan, stage, date_modified`. Help (:368) becomes `"record the user's approval; stage active (in progress)"`. This is the style decision approve path too (`commands/showrunner/proposal.md:56-61`, `docs/style_production.md:485-486`).
+   - **create with an inherited approval**: `create` (:313-350) gets `inherited` from `--initial-fields`. `style_proposals.py` migrate passes it (`NewDecision` at style_proposals.py :805-806, written by `DecisionWriter.create` :321-335 with `--initial-fields`). An old issue can hold `unit`, `plan` and `stage: backlog` (see the `legacy_issue` fixture, test_style_proposals.py :330-338). At :339, after `**inherited`, set `"stage": IN_PROGRESS_STAGE` when `isinstance(decision_answer(Issue(path, {key: [value] for key, value in inherited.items()})), ApprovedDecision)`. Otherwise keep the inherited stage, else `backlog`. This is the same rule as `decision_answer`.
+   - **reopen** (:200-209): inside the lock, read `decision_answer(Issue(path, frontmatter(path)))`. When it is `ApprovedDecision`, set `{"status": "open", "stage": IN_PROGRESS_STAGE}`. Otherwise set `{"status": "open"}` as today. This covers both style reopen calls: `apply_answer` (style_proposals.py :420-421, a later finding joins a built decision) and `file_again` (:1108-1109). A decision closed at `stage: backlog` before this phase opens in progress.
+   - **close** (:222-224): no change. The stage stays as it was, and every reader reads only `status: open` issues (`issues.open_issues` :71-74). Built from in progress is `open/active` to `closed/active`.
+   - **decline-answer**, **stars**, **rules**, **refresh_decision**, **fill_ranking**: no change.
+
+3. **Migration**: a new verb, `proposal_issue.py move-approved <folder> [--dry-run]`.
+   ```python
+   def move_approved(folder: Path, today: date, *, dry_run: bool) -> list[Path]:
+       """Move each open proposal in the folder whose approval is recorded and whose stage is backlog to stage active.
+
+       Returns the issues it moves, or would move on a dry run. A second run finds none.
+       """
+   ```
+   - It finds the proposals through the approval record. Candidates are `open_issues(folder, PROPOSAL_TAG)` (import `PROPOSAL_TAG` from `proposals_folder`; that module does not import `proposal_issue`, so there is no cycle), with `decision_answer(issue)` an `ApprovedDecision` and `issue.value("stage") == "backlog"`.
+   - It leaves `stage: waiting` alone (a person set it), and also every unanswered, declined, closed or untagged issue.
+   - For each candidate, a private helper takes `_issue_lock(path)`, reads the frontmatter again and writes `{"stage": IN_PROGRESS_STAGE, "date_modified": _vault_date(today)}` only when the issue still qualifies. This is the same set-and-write that `edit` (:191-197) does.
+   - Lines: one `move-approved <file name>: stage active` per issue, then `move-approved: <n> moved`. A dry run prints the same lines and writes nothing.
+   - A rerun prints only `move-approved: 0 moved` and changes no byte and no mtime.
+   - A folder that is not a directory raises `Refusal(f"{folder} is not a folder")` and exits 2.
+   - In `main` (:365-427), the verb takes a positional `folder` (Path, `expanduser`) and `--dry-run`. It is not in the `issue` loop (:397-398). Add it to the module docstring's usage. Change "Edits one issue file's frontmatter in place and reads nothing else" to say that `move-approved` reads the folder and edits each open approved proposal in it.
+   - How it is run: by hand, once. It is never automatic on read: the footer and the table read only and write nothing. The vault is read-only to the unit director, so after this phase is on main the unit director sends the showrunner the run order, and the showrunner runs `~/.claude/scripts/lib/py scripts/production/proposal_issue.py move-approved ~/rust/hanadocs/issues --dry-run`, then the same command without `--dry-run`, then the command again. The last run must print `move-approved: 0 moved`. The showrunner reports the moved count.
+   - The folder is shared, so every production's approved proposals move. That is correct, because an approval is global.
+   - The Mac's vault is the showrunner's to run with the same command if it is a separate copy.
+   - The readers count by the approval record, so the count is correct before and after this step. The step only aligns the stage the vault shows.
+
+4. **Readers**:
+   - `footer_counts.proposals` (:49-50): `sum(isinstance(proposal_issue.proposal_progress(issue), proposal_issue.AwaitingApproval) for issue in proposals_folder.open_proposals(doc))`. Add `import proposal_issue`.
+   - `footer_counts.sources` (:116-140) does not change. It still names every open proposal, because an approval edits that file and so changes the count.
+   - `counts_line` (:147-158) keeps the word: `For you: … 2 proposals …`. This is the author's call: the user named this number and asked only what it counts.
+   - Module docstring (:4-6): "proposals the open proposal issues in its Proposals folder that are its own and that the user has not approved (see proposals_folder and proposal_issue.proposal_progress)".
+   - `proposals_table.py`:
+     - `issue_state` (:111-117) matches on `proposal_progress(issue)`. `AwaitingApproval` gives `REVIEW_STATE`. `InProgress` gives `f"in progress by {unit}"`, or `IN_PROGRESS_STATE = "in progress"` when `unit` is empty.
+     - The `approved, not started: <plan>` and `being built` texts go.
+     - `issue_rows` (:120-124) lists the waiting rows first, oldest first, then the in-progress rows, oldest first. Sort key: `(isinstance(proposal_progress(issue), InProgress), date, proposal)`.
+     - Add `IN_PROGRESS_STATE` beside `REVIEW_STATE` (:47).
+   - `proposals_folder.open_proposals` does not change. It is the "own open proposals" set that both readers filter.
+   - Other readers, checked, with no change needed:
+     - `rename_unit.py:610-617` matches by `unit` and `plan`.
+     - `style_proposals.approved_decisions` (:61-65), `close_finished_decision` (:573-602), `reopen_all` (:960-997) and `style_plan.py:906-919` read `decision_answer`, not the stage.
+     - `refresh_decision` (:280-299) reads `decision_answer`.
+   - Scope notes, author's call:
+     - `dailies_counts.py` `issues` kind (:115-118, conf line `tool-based-ui.proposals=issues ~/rust/hanadocs/issues proposal`) counts all open issues with a tag, from every production, for a user count set 2026-10-10. It does not change in this phase.
+     - The dailies style line `proposals <n>` (`style_ledger.py:2547`, decisions holding filed findings) does not change.
+
+5. **Docs**:
+   - `commands/showrunner/proposal.md`:
+     - The state table (:18-23) becomes the table in item 1.
+     - Under it, add one line: the footer's proposal count and the table's `waiting for your review` rows are the waiting proposals only; approval moves a proposal to in progress.
+     - Change "The stage stays backlog until work starts." (:74-75) to "Approve sets the stage active: the proposal is in progress and leaves the waiting count."
+     - Add after the Approve section's first command block: proposals approved before 2026-10-20 move with `proposal_issue.py move-approved <issues folder>` (`--dry-run` first); a second run moves none.
+     - Keep phase 28's edit of :93-96.
+   - `commands/showrunner/proposals.md:29-30`: the states are `waiting for your review`, `in progress by <unit>` (or `in progress`) and `deferred until you ask for it`. Waiting issue rows come before in-progress ones.
+   - `docs/style_production.md:485-486`: after the approve command, add "Approval sets the decision's stage active (in progress), so it leaves the footer's proposal count."
+   - `docs/as-built/showrunner-automation.md:160`: replace the issue-state sentence with the new states and the order. `docs/as-built/build-followups-fn-length-hook.md:64`: `proposals` counts the open own proposals that `proposal_progress` reads as `AwaitingApproval`. These are stale as-builts; correct them in place.
+
+**Files:**
+- `scripts/production/proposal_issue.py`
+- `scripts/production/footer_counts.py`
+- `scripts/production/proposals_table.py`
+- `commands/showrunner/proposal.md`
+- `commands/showrunner/proposals.md`
+- `docs/style_production.md`
+- `docs/as-built/showrunner-automation.md`
+- `docs/as-built/build-followups-fn-length-hook.md`
+- `scripts/production/test_proposal_issue.py`
+- `scripts/production/test_footer_counts.py`
+- `scripts/production/test_proposals_table.py`
+- `scripts/style/test_style_proposals.py`
+
+**Workers:** `1 writer + 1 tester`. The state type, its writers and its two readers are one small chain, so the code does not split. The Spec gives exact states, lines and stages, so the tests go to the tester.
+- `impl`: proposal_issue.py, footer_counts.py, proposals_table.py, and the five docs. Hub: `scripts/production/proposal_issue.py` (it holds `ProposalProgress`, `proposal_progress`, `IN_PROGRESS_STAGE` and `move_approved`, which the tester imports).
+- `test`: the four test files, beside the modules. Every test name states the behavior it checks.
+  - **test_proposal_issue.py** (fixtures `ISSUE` :24-45, `run_cli` :62, `today` :68, `text` :71):
+    - Rename and change `test_approve_sets_three_fields_and_keeps_stage` (:271-283) to `test_approve_moves_the_proposal_to_in_progress`: `stage: active`, and output `approve a proposal.md: set showrunner, unit, plan, stage, date_modified`.
+    - `test_a_decision_created_with_an_inherited_approval_starts_in_progress`: `--initial-fields '{"unit": "names-unit", "plan": "unit.md", "stage": "backlog"}'` gives `stage: active`. Fields with no `unit` keep `backlog`. Extend or sit beside :228-246.
+    - `test_reopen_of_an_approved_proposal_closed_at_backlog_puts_it_in_progress`, and in the same test an unanswered closed one reopens with its stage unchanged.
+    - `test_close_from_in_progress_closes_the_proposal_and_keeps_its_stage`: approve, then `close --reason`, gives `status: closed`, `stage: active`.
+    - `test_proposal_progress_reads_an_approval_or_an_active_stage_as_in_progress`: approved at backlog, approved at waiting, unanswered at active (in progress); unanswered at backlog, declined open with `unit`/`plan` (awaiting).
+    - `test_move_approved_moves_only_open_approved_proposals_at_backlog`: in one folder, approved at backlog (moved); unanswered, approved at waiting, approved and closed, declined, and an approved file not tagged `proposal` (all unchanged bytes). Exact lines.
+    - `test_a_second_move_approved_changes_nothing`: the same bytes and `st_mtime_ns`, and output `move-approved: 0 moved`.
+    - `test_move_approved_dry_run_prints_the_same_lines_and_writes_nothing`.
+    - `test_move_approved_refuses_a_missing_folder` (exit 2).
+  - **test_footer_counts.py** (fixture `issue()` :51-54 takes extra frontmatter lines, or write files directly):
+    - `test_the_proposal_count_leaves_out_approved_and_active_proposals`: own open proposals are waiting, approved at backlog, approved at active, and unanswered at active. `footer_counts.proposals(doc) == 1`, and `counts_line` reads `For you: 1 proposal`.
+    - The shared-folder test (:147-170) still passes unchanged.
+  - **test_proposals_table.py**:
+    - Replace `test_an_open_proposal_issue_reads_its_state_from_stage_and_plan` (:80-96) with `test_the_table_lists_waiting_proposals_before_in_progress_ones`. Give "camera jack panel" a `unit` beside its `plan`, because an approval is `unit` and `plan`. Expected rows: the waiting rows (oldest first), then `in progress by demo-unit`, `in progress by widget-unit`, `in progress` (oldest first).
+  - **test_style_proposals.py** (helpers `issue_command` :140, `legacy_issue` :330-338, `approved_decision` :708-713):
+    - `test_approving_a_style_decision_moves_it_to_in_progress`: a filed decision is `stage: backlog` and `AwaitingApproval`. After `approve` it is `stage: active` and `InProgress`.
+    - `test_a_decision_migrate_creates_from_an_approved_old_issue_starts_in_progress`.
+    - `test_a_built_decision_a_later_finding_reopens_is_in_progress`.
+    - `test_complete_closes_an_in_progress_decision`: approve, then merge a ticket that builds every finding. `complete` gives `status: closed`.
+
+**Constraints from prior phases:**
+- Phase 28 edits `commands/showrunner/proposal.md:93-96` (the declaration step sentence) and `scripts/style/test_style_proposals.py` (new follow tests and `built 0` in every `totals: follow …` line). Keep its edits. This phase's proposal.md edits are the state table (:18-23), :74-75 and the Approve section.
+- `style_ledger.py` cannot import `style_proposals` (two module copies under `__main__`), and nothing in this phase needs that.
+- `proposals_folder.py` is a leaf for the footer; it must not import `proposal_issue`. `footer_counts` and `proposals_table` import `proposal_issue` directly. `proposal_issue` puts `scripts/lib` on `sys.path` itself (:33), so the hook's footer (`scripts/hooks/showrunner_footer.py:195-198`) imports it as it is.
+- Every `proposal_issue` write holds `_issue_lock` (:136-144) for its whole read, change and write, and writes only when bytes change. `move_approved` keeps both rules.
+- Style test stubs call `proposal_issue.main` in-process through `issue_command` (test_style_proposals.py :140-146), so the new stage writes show in the style tests' issue files.
+- The `nate_style` test fixture has no origin, so a decision refresh in plan tests can fail with no error (phase 27).
+
+**Acceptance gate:** from the worktree root:
+- One rule for every proposal kind (showrunner, 2026-10-20, from the user: "make sure that this rule applies to all proposals"), with one test per approval path: `test_an_approved_plain_proposal_leaves_the_footer_count` (a non-style `proposal` issue approved with `proposal_issue.py approve`) in `scripts/production/test_footer_counts.py`, and `test_an_approved_style_decision_leaves_the_footer_count` (a style decision approved through the style decision approve path, `commands/showrunner/proposal.md`) in `scripts/style/test_style_proposals.py`. Each reads `footer_counts.proposals` before and after the approval and fails without this phase.
+- `python3 -m unittest discover -s scripts/production -p 'test_proposal_issue.py'`, then the same for `test_footer_counts.py` and `test_proposals_table.py`, and `python3 -m unittest discover -s scripts/style -p 'test_style_proposals.py'`. All are green, and every test named above is present and passes.
+- `basedpyright scripts/production` and `basedpyright scripts/style` each report `0 errors, 0 warnings`.
+- The merge gate `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` is green.
+- Observable behavior: `move-approved ~/rust/hanadocs/issues --dry-run` lists the approved open proposals at backlog. The real run moves them. A third run prints `move-approved: 0 moved`. `proposals_table.py --production <doc>` then shows waiting rows first and `in progress by <unit>` for approved ones. The footer's `N proposals` equals the number of `waiting for your review` issue rows for the same doc.

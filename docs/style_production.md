@@ -457,16 +457,34 @@ impl or trait it is in. The step reads only a finding whose commit is in the
 synced commit. When that file at the synced commit no longer declares the
 item, the step searches every Rust file. One other file: the finding follows it
 to the line with the same text in the item, else the item's first line, and
-keeps its id. No file: an unfiled finding is withdrawn with no decision; a
-filed finding is approved work, so it stays as it is for a person to waive or
-build again. Two or more files, or a filed finding's file in another crate: the
-finding stays as it is for a person to waive or fix in the code. A finding that an open ticket builds is kept. The step prints
+keeps its id. Two or more files, or a filed finding's file in another crate:
+the finding stays as it is for a person to waive or fix in the code. No file:
+
+- A filed rename is built when its own file, or the one file that gained it,
+  now declares its after name with the same keyword and owner, and its decision
+  is approved. A built rename follows to its new declaration, also in its own
+  file. Two or more such files, or one in another crate, leave the finding as a
+  move does. A rename in a decision that is not approved waits for the answer,
+  with no line. The step reads the answer again when it writes.
+- Another filed finding whose file is still there stays filed for a person. A
+  person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
+  puts the item back in the code.
+- An unfiled finding, or a filed finding whose file is gone, is withdrawn, with
+  no decision when it was unfiled.
+
+A finding that an open ticket builds is kept. When the synced commit moves
+after the step reads the declarations, it writes nothing and exits 1; run it
+again. The step prints
 `follow <finding> <rule> <path>:<line> -> <path>:<line>: <keyword> <name>`,
-`withdraw … declaration gone at <commit>`, `left … declared in <files>` or
-`left … declared in another crate: <file>`, `left … declaration gone; waive it
-or build it again`, `kept …: open ticket <ticket> builds
-it`, a `close` line per decision and a `totals` line. A decision that it changes
-refreshes its sites, and one with no finding left closes. Each run refreshes
+`built <finding> <rule> <path>:<line>: <keyword> <name> renamed to <new name> in <path>:<line>`,
+`withdraw … declaration gone at <commit>`, `left … declared in <files>`,
+`left … declared in another crate: <file>`, `left … declaration gone; waive it or
+declare it again`, `kept …: open ticket <ticket> builds it`, a `close` line per
+decision and
+`totals: follow <n>, built <n>, withdraw <n>, left <n>, kept <n>, close <n>`. A
+decision that it changes refreshes its sites, and one with no finding left
+closes. A decision whose last finding the step built closes at the next refill
+or `complete`, with `built in synced commit <commit>`. Each run refreshes
 every open decision that holds a followed finding, so a rerun completes a run
 that stopped before its refresh.
 `style_proposals.py follow --repo <style checkout> --proposals <folder>
@@ -498,8 +516,11 @@ Other findings stay held. Package checks still run. The parent schedules
 changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
 Refill first runs the declaration step once, on the findings of all approved
 decisions, so a finding tickets at the file its declaration moved to. A finding
-that the step leaves gets `waiting <decision>: <finding> declared in <n> files`
-or `waiting <decision>: <finding> declared in another crate: <file>`. A decision
+that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
+`waiting <decision>: <finding> declared in another crate: <file>` or
+`waiting <decision>: <finding> declaration gone`, and stays out of the ticket. A
+decision whose last finding the step built closes. A decision whose answer
+changes during the refill gets `waiting <decision>: no longer approved`. A decision
 that the step skips gets `waiting <decision>: skipped by the declaration step`,
 and refill writes none of its findings. For a finding
 that the step cannot read, refill waives it when its file is not in the synced

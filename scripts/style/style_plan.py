@@ -1572,8 +1572,9 @@ def _select_phase(
     sites = style_proposals.MovedSites(ledger, tip)
     unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions if issue.value("style_rule") in definitions}
     # The declaration step runs once for the proposals folder that holds every decision, before the loop, so a finding
-    # whose declaration moved tickets at its new file and one whose declaration is gone is withdrawn. Each refresh
-    # keeps the parent its decision names, and the step renumbers after its own closes.
+    # whose declaration moved tickets at its new file, a rename whose new name is declared is built, and one whose
+    # declaration is gone waits for a person or is withdrawn with its file. Each refresh keeps the parent its decision
+    # names, and the step renumbers after its own closes.
     follow = (style_proposals.run_follow(style_proposals.decision_writer(ledger, next(iter(unbuilt)).parent, ""),
                                          (finding for findings in unbuilt.values() for finding in findings), dry_run=False)
               if any(unbuilt.values()) else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
@@ -1587,26 +1588,31 @@ def _select_phase(
         findings = unbuilt[issue.path]
         if not findings or issue.path in follow.closes:
             continue
-        # The step wrote none of a skipped decision's findings, so phase 20's waives must not write them either.
+        # The step wrote none of a skipped decision's findings, so the gone-file and moved-site waives must not write them either.
         if issue.path in follow.skipped:
             print(f"waiting {issue.path}: skipped by the declaration step")
             continue
         own = tuple(outcomes[finding.finding_id] for finding in findings)
-        left: dict[str, style_ledger.DeclaredInSeveralFiles | style_ledger.DeclaredInAnotherCrate | style_ledger.FiledDeclarationGone] = {
-            outcome.finding.finding_id: outcome for outcome in own if isinstance(outcome, style_proposals.LEFT)}
+        # The answer changed after this refill read the decision as approved, so it waits for the next refill.
+        if any(isinstance(outcome, style_ledger.RenameAwaitingApproval) for outcome in own):
+            print(f"waiting {issue.path}: no longer approved")
+            continue
+        left: dict[str, style_ledger.DeclarationLeft] = {
+            outcome.finding.finding_id: outcome for outcome in own if isinstance(outcome, style_ledger.DeclarationLeft)}
         for finding_id, outcome in left.items():
             match outcome:
                 case style_ledger.DeclaredInSeveralFiles():
                     where = f"declared in {len(outcome.paths)} files"
                 case style_ledger.DeclaredInAnotherCrate():
                     where = f"declared in another crate: {outcome.path}"
-                case style_ledger.FiledDeclarationGone():
+                case style_ledger.DeclarationGoneFromFile():
                     where = "declaration gone"
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
+        built = any(isinstance(outcome, style_ledger.DeclarationRenamed) for outcome in own)
         findings = tuple(finding for finding in _unbuilt_findings(ledger, issue.path) if finding.finding_id not in left)
-        # Phase 20's waives read only the findings whose declaration the step could not read.
+        # The gone-file and moved-site waives read only the findings whose declaration the step could not read.
         unread_findings = tuple(finding for finding in findings if finding.finding_id not in read)
         present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in unread_findings})))
         moved = sites.destinations(tuple(finding for finding in unread_findings if finding.path in present))
@@ -1624,7 +1630,7 @@ def _select_phase(
         for words, finding_ids in sorted(gone.items()):
             _ = ledger.decline_findings(finding_ids, words)
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
-        if (gone or withdrew) and style_proposals.close_finished_decision(ledger, issue.path):
+        if (gone or withdrew or built) and style_proposals.close_finished_decision(ledger, issue.path):
             closed = True
             continue
         outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}

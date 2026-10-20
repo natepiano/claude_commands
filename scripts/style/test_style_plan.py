@@ -2586,8 +2586,12 @@ class StylePlanTests(unittest.TestCase):
             style_proposals.complete(ledger)
         command.assert_called_once_with("close", str(issue), "--reason", f"built in {ticket['id']}")
 
-    def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...]) -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
-        """Files type findings at sites in an approved decision, judged by a dropped ticket that started at the tip."""
+    def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...], *, kind: style_ledger.FindingKind = "type",
+                        before: str = "before", after: str = "after") -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
+        """Files findings at sites in an approved decision, judged by a dropped ticket that started at the tip.
+
+        They are type findings unless named.
+        """
         issue = self.approved_decision(rule, (), "type")
         ledger = self.ledger()
         ledger.ticket_add("modules-unit-1", "modules-unit", "read", "names", "crates/alpha", sorted({site[0] for site in sites}), [rule])
@@ -2595,7 +2599,7 @@ class StylePlanTests(unittest.TestCase):
         _ = ledger.ticket_base("modules-unit-1")
         ledger.ticket_drop("modules-unit-1")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-        findings = tuple(ledger.hold(rule, path, line, text, "type", "before", "after", blob, "modules-unit-1")
+        findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "modules-unit-1")
                          for path, line, text in sites)
         for finding in findings:
             ledger.file_held(finding.finding_id, issue)
@@ -2626,7 +2630,7 @@ class StylePlanTests(unittest.TestCase):
     def test_a_merge_that_moves_a_site_into_a_judged_file_stales_it_and_waives_the_moved_finding(self) -> None:
         rule = self.rule("read")
         target, source = self.sources[:2]
-        # Macro calls name no item, so the declaration step cannot read them and phase 20's waive applies.
+        # Macro calls name no item, so the declaration step cannot read them and the moved-site waive applies.
         moved_text, kept_text = "moved_away!(1);", "stays_here!(2);"
         self.write(source, f"{moved_text}\n{kept_text}\n")
         self.commit_to_every_checkout()
@@ -2759,6 +2763,49 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
                          [(finding.path, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
         self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
+
+    def test_decision_refill_waits_on_a_finding_whose_declaration_is_gone_from_its_kept_file(self) -> None:
+        site = self.sources[0]
+        self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
+        issue, (finding,) = self.judged_findings(self.rule("read"), ((site, 2, "old: u32,"),))
+        self.commit_files({site: "pub fn other() {}\n"})
+        output = self.refill_decisions()
+        self.assertIn(f"waiting {issue}: {finding.finding_id} declaration gone\n", output)
+        self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
+                         [(site, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
+        self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
+        self.assertEqual(frontmatter(issue)["status"], ["open"])
+
+    def test_decision_refill_closes_a_decision_whose_only_finding_the_declaration_step_built(self) -> None:
+        site = self.sources[0]
+        parent = "pub struct Parent {\n    old: u32,\n}\n"
+        self.commit_files({site: parent})
+        issue, (finding,) = self.judged_findings(self.rule("read"), ((site, 1, "pub struct Parent {"),),
+                                                 kind="rename", before="Parent", after="Renamed")
+        self.commit_files({site: parent.replace("Parent", "Renamed")})
+        code, output, errors, _ = self.refill_closing()
+        self.assertEqual(code, 0, errors)
+        reason = f"built in synced commit {self.tip}"
+        self.assertIn(f"built {finding.finding_id} {finding.rule} {site}:1: struct Parent renamed to Renamed in {site}:1\n", output)
+        self.assertIn(f"closed {issue}: {reason}\n", output)
+        self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], [reason]))
+        self.assertEqual(self.ledger().proposal_findings(issue)[0].state, style_ledger.Built(issue))
+
+    def test_decision_refill_waits_on_a_decision_whose_answer_changes_before_its_rename_is_built(self) -> None:
+        site = self.sources[0]
+        parent = "pub struct Parent {\n    old: u32,\n}\n"
+        self.commit_files({site: parent})
+        issue, (finding,) = self.judged_findings(self.rule("read"), ((site, 1, "pub struct Parent {"),),
+                                                 kind="rename", before="Parent", after="Renamed")
+        self.commit_files({site: parent.replace("Parent", "Renamed")})
+        # The refill reads the decision as approved; the declaration step then reads another answer.
+        with mock.patch.object(style_proposals, "approved_decision", return_value=False):
+            output = self.refill_decisions()
+        self.assertIn(f"waiting {issue}: no longer approved\n", output)
+        self.assertEqual([(held.finding_id, held.state) for held in self.ledger().proposal_findings(issue)],
+                         [(finding.finding_id, style_ledger.Filed(issue))])
+        self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
+        self.assertEqual(frontmatter(issue)["status"], ["open"])
 
     def test_decision_refill_after_a_merge_builds_only_the_unbuilt_findings(self) -> None:
         rule = self.rule("read")
