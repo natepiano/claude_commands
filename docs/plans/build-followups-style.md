@@ -669,24 +669,59 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - The issue's `showrunner` field is a session name, not a parent slug; the body's `Parent:` line is the source.
 
 ### Phase 23 — reopen names unchecked built findings and takes a person's override  · status: done
-**Depends on:** Phase 22
+
+#### As-built
+
+- reopen (`--issue`, `--all`) prints `cannot check <id> in <path>: <before> -> <after>; pass --finding <id> or --applied <id>` for each built rename the applied check cannot judge, and exits 1; restructure and type rows count only in `restructure not checked R`. `--all` totals: `reopen N, filed again M, cannot check K, restructure not checked R, skipped S`.
+- `reopen --issue <p> --parent <s> --finding <id>... --by <who>` files built findings again without the check; `--applied <id>... --by <who>` keeps them built (refused when the check finds the rename not applied). Unique prefixes; blank names, `--by` alone, and either with `--all` are refused; `--by` is stripped. All refusals come before the first write.
+- Migration 14: `held_findings.person_read_by`; `PersonReading = NotReadByPerson | ReadByPerson(by)`; the state shows the verdict; `held list` (and `--json` field `reading`) shows it. A move into built (ticket merge AppliedInCode, `mark_built`) clears it. `held add` leaves its reopen hint out for a row a person read.
+
+**Files:**
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`
+
+**Gotchas:**
+- A non-std derive (for example serde `Serialize`) on the parent gives no applied check; in production, 3 built renames in old issue 1d00e8b8 (57b9f36a, 00093229, 0cdf4372) are false built and need `--finding`.
+
+### Phase 24 — proposal gate takes the pairs it has; duplicates and plain-merge builds  · status: done
+
+**Depends on:** Phase 23
 
 #### Work Order
 
-**Goal:** reopen never passes over a built finding without a word: each built finding the applied check cannot judge gets a line, and a person can file it again by hand with `--finding`, recorded in the ledger row.
+**Goal:** a proposal ticket's gate accepts reference edits for every qualified rename even when other findings have no pair; bare old-form duplicates are never moved into a decision and the existing ones can be dropped; the phase text names the exact cells; a finding built by a plain merge can be marked built.
 
-**Spec:**
-- reopen (`--issue` and `--all`) prints, for each built rename whose applied check is NoAppliedCheck, `cannot check <id> in <path>: <before> -> <after>; pass --finding <id> or --applied <id>`. Totals: `cannot check K, restructure not checked R`; exit 1 when K > 0. Dry run prints the same.
-- `reopen --issue <path> --parent <slug> --finding <id> [--finding <id>...] --by <who>` files those built findings of that issue again without the applied check. Every other refusal (open ticket, unsynced merge, not approved, finding not built, finding not in the issue) and `--dry-run` stay. `--finding` needs `--by`. Ruled by natedev, 2026-10-20.
-- The ledger row records the override: who filed it again and why (a person read the code), so a later reader sees it was not the check. Schema change with migration.
-- The `cannot check` line, its count and exit 1 apply only to rename findings; restructure rows get one totals word, `restructure not checked R`, and no exit 1. `reopen --issue ... --applied <id> --by <who>` records that a person read the code and found the change in it: the row stays built, records the person, and its line stops. One column, `person_read_by`, serves `--finding` and `--applied`; the state shows the verdict. Ruled by natedev, 2026-10-20.
-- Tests: a built finding in a file with a serde derive gives the `cannot check` line in a dry run; `--finding` files it again and the row holds the override; the dry run writes nothing.
+**Spec (ruled by the showrunner, (v)):**
+1. `approved_rename_pairs` (`scripts/style/style_plan.py:225`) skips a rename finding with no `<parent>::<name>` pair (bare name, dot-form field, prose) instead of returning no pairs; a type or restructure finding still returns `()`. Approval stays exact per token.
+2. A bare duplicate is a rename finding whose `before` and `after` equal the last `::` segment of a qualified rename finding with the same rule and path. Migrate and reopen never move a bare duplicate into a decision that holds (or receives in the same run) its qualified finding. A new `style_proposals.py drop-duplicates [--dry-run]` command drops every bare duplicate in every open decision: state withdrawn, the row records which finding it duplicates, the decision body is regenerated; a finding held by an open ticket is refused before the first write. Prints `drop <id> in <decision>: duplicate of <id>` and totals.
+3. For a proposal ticket, `phase_text` (`style_plan.py:1198`) lists the exact cells to record: the parent rule only for files with a listed site at the synced tip, plus `#uncovered` for each ticket file.
+4. `style_ledger.py held built --id <id>... --commit <merge> [--by <who>]` marks filed findings built after a plain merge: `<merge>` must be an ancestor of the synced tip; the applied check runs at `<merge>`; RenameNotApplied is refused; a finding the check cannot prove (NoAppliedCheck rename, type, restructure) needs `--by` and records `person_read_by`. All refusals before the first write. Without `--commit` the ticket path is unchanged.
 
-**Files:** `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+**Files:** `scripts/style/style_plan.py`, `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, their `test_*.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`
 
-**Workers:** 1 writer — nothing splits.
-- `impl` — all of the above
+**Workers:** 1 writer (one Claude agent; the files share the ledger types and do not split).
 
-**Constraints from prior phases:** Phase 22: `reopen_all`, `old_issue_parent`, `file_unapplied_again`, `run_moves` refreshers. Phase 21: `Built(proposal)`, `return_to_filed`.
+**Constraints from prior phases:** phase 23's `PersonReading` and migration 14; a move into built clears `person_read_by` except when this command sets it.
 
-**Acceptance gate:** the tests above; `scripts/style` green; basedpyright clean; merge gate `--tests-only` green.
+**Acceptance gate:** `merge_gate.py --tests-only` green on a frozen copy; basedpyright zero errors and warnings on the changed files.
+
+### Phase 25 — refill never reissues a ticket that cannot change a cell  · status: todo
+
+**Depends on:** Phase 24
+
+#### Work Order
+
+**Goal:** refill stops issuing a ticket at a base where the cell was already judged; the director is told to merge the style branch first; the held-cell skip ignores findings in a final state.
+
+**Spec (ruled by the showrunner, (w)):** production case: cargo-liner values tickets 124/125, cell `crates/cargo-port/src/lint/trigger.rs` × `derive-test-values-from-production-constants.md#uncovered` (crate scope), judged at the values branch tip 2181135d after style/main moved on (same crate) — stale is correct; the ticket base (`ticket_base`, style_ledger.py:1280, the unit branch tip) cannot change it.
+(a) `_refill_cells` / `candidate_tickets` (style_plan.py ~1013, ~1559) take the unit branch; leave out a stale cell whose newest judgment (current blob, newest declared scope) matches the inputs at the unit branch tip, through a ledger helper that reuses `_judgment_inputs_match`.
+(b) When that leaves no candidate and a cell was left out for this reason, `next_phase` returns a new outcome "merge the style branch first" with its own exit code and line (not waiting-for-sync); `commands/unit/direct.md` <StandingPlanRefill/> table and `docs/style_production.md` get the row: merge the style branch, then refill.
+(c) The held-cell skip (style_plan.py ~1024) ignores waived, built and withdrawn findings; it needs at least one remaining finding and every remaining finding filed on an open proposal.
+Do not take the fingerprint at the ticket base (it would mark current a cell whose inputs changed).
+
+**Files:** `scripts/style/style_plan.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_plan*.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`, `commands/unit/direct.md`
+
+**Workers:** 1 writer.
+
+**Constraints from prior phases:** phase 24 changes `approved_rename_pairs`, `phase_text` and `held built` in the same files.
+
+**Acceptance gate:** stale stays stale after a same-crate change on the style branch; refill skips and returns the new outcome with no ticket added; after the merge the ticket takes the merged base and its verdict is awaiting merge; no false skip when inputs differ; held skip with waived + filed findings, not with an unfiled one. `merge_gate.py --tests-only` green on a frozen copy; basedpyright clean.

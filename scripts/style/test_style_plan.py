@@ -2618,6 +2618,14 @@ class StylePlanTests(unittest.TestCase):
                                                 for parent, names in declared.items()))
         return "names-unit-1"
 
+    def write_approved_phase(self) -> None:
+        """Write the phase of the queued approved ticket at a synced tip, where the ledger finds the cells that record takes."""
+        self.sync()
+        ledger = self.ledger()
+        ticket = ledger.queued_tickets("names-unit")[0]
+        ledger.ticket_assign(ticket["id"], "demo-style-names")
+        style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
+
     def reference_gate(self, ticket: str) -> tuple[int, str]:
         output = io.StringIO()
         with redirect_stdout(output):
@@ -2872,33 +2880,86 @@ class StylePlanTests(unittest.TestCase):
 
     def test_approved_rename_ticket_requires_comment_and_markdown_updates(self) -> None:
         _ = self.approved_reference_ticket()
-        ledger = self.ledger()
-        ticket = ledger.queued_tickets("names-unit")[0]
-        ledger.ticket_assign(ticket["id"], "demo-style-names")
-        style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
-        sentence = ("For a rename, find every use through the compiler, not a text search, and update each one "
-                    + "in other files. Also update every comment and Markdown doc in the repo that means the "
+        self.write_approved_phase()
+        sentence = ("For each of these renames, find every use through the compiler, not a text search, and update each one "
+                    + "in other files: `Outcome::OldName` -> `Outcome::NewName`. "
+                    + "Also update every comment and Markdown doc in the repo that means the "
                     + "renamed item, and leave mentions of other items with the same name. "
                     + "Change nothing else in those files.")
         self.assertIn("Apply the approved findings. " + sentence, self.plan.read_text())
 
+    def test_a_proposal_phase_names_each_qualified_pair_and_keeps_a_bare_rename_in_its_own_file(self) -> None:
+        _ = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"), ("helper", "assistant")))
+        self.write_approved_phase()
+        text = self.plan.read_text()
+        self.assertIn("update each one in other files: `Outcome::OldName` -> `Outcome::NewName`. ", text)
+        self.assertNotIn("`helper`", text)
+        self.assertIn("Apply any other rename only in its own file; when other files use its old name, hold it. ", text)
+
+    def test_a_proposal_phase_with_only_qualified_pairs_has_no_own_file_rename_line(self) -> None:
+        _ = self.approved_reference_ticket()
+        self.write_approved_phase()
+        self.assertNotIn("Apply any other rename only in its own file", self.plan.read_text())
+
     def test_nonrename_approval_ticket_omits_comment_and_markdown_instruction(self) -> None:
         _ = self.approved_reference_ticket(kinds=("type",))
+        self.write_approved_phase()
+        self.assertNotIn("find every use through the compiler", self.plan.read_text())
+
+    def test_a_proposal_phase_lists_only_the_cells_record_takes_and_leaves_out_a_tier_b_cell_with_no_listed_site(self) -> None:
+        rule = self.rule("partial", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: absent\n  surface: partial\n"
+                         + "  uncovered: Read everything else.\n")
+        uncovered = rule + "#uncovered"
+        self.sync()
+        issue = self.root / "partial-approval.md"
         ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        ids = tuple(ledger.hold(held_rule, self.sources[0], line, "rename", "rename", "Outcome::Old", "Outcome::New", blob,
+                                "outside").finding_id for line, held_rule in enumerate((rule, uncovered), start=1))
+        for finding_id in ids:
+            ledger.file_held(finding_id, issue)
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0]],
+                          [rule, uncovered], proposal=str(issue), finding_ids=ids)
         ticket = ledger.queued_tickets("names-unit")[0]
         ledger.ticket_assign(ticket["id"], "demo-style-names")
         style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
-        self.assertNotIn("For a rename, find every use", self.plan.read_text())
+        text = self.plan.read_text()
+        self.assertIn("`style_ledger.py record --ticket names-unit-1 --rule <rule> --path <file>`", text)
+        self.assertIn(f"- `{uncovered}` · `{self.sources[0]}`", text)
+        self.assertNotIn(f"- `{rule}` · `{self.sources[0]}`", text)
+        self.assertNotIn("Record every judged cell", text)
+
+    def test_a_proposal_phase_gives_no_cell_at_a_ticket_file_that_record_refuses_for_its_rule(self) -> None:
+        rule = self.rule("approved-cells")
+        self.write("docs/notes.md", "Outcome::Old\n")
+        self.tip = self.commit()
+        self.sync()
+        issue = self.root / "cells-approval.md"
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        ids = tuple(ledger.hold(rule, path, 1, "rename", "rename", "Outcome::Old", "Outcome::New", blob, "outside").finding_id
+                    for path in (self.sources[0], "docs/notes.md"))
+        for finding_id in ids:
+            ledger.file_held(finding_id, issue)
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names-unit\nplan: approved\n"
+                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0], "docs/notes.md"],
+                          [rule], proposal=str(issue), finding_ids=ids)
+        ticket = ledger.queued_tickets("names-unit")[0]
+        ledger.ticket_assign(ticket["id"], "demo-style-names")
+        style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
+        text = self.plan.read_text()
+        self.assertIn(f"- `{rule}` · `{self.sources[0]}`", text)
+        self.assertNotIn(f"- `{rule}` · `docs/notes.md`", text)
 
     def test_prose_rename_approval_ticket_omits_reference_update_instruction(self) -> None:
         _ = self.approved_reference_ticket((("The file contains MutationLock.",
                                              "Rename ledger/lock.rs to ledger/mutation_lock.rs."),))
-        ledger = self.ledger()
-        ticket = ledger.queued_tickets("names-unit")[0]
-        ledger.ticket_assign(ticket["id"], "demo-style-names")
-        style_plan.write_phase(ledger, ticket, self.plan, self.plan_header())
+        self.write_approved_phase()
         self.assertIn("Apply the approved findings.", self.plan.read_text())
-        self.assertNotIn("For a rename, find every use", self.plan.read_text())
+        self.assertNotIn("find every use through the compiler", self.plan.read_text())
 
     def test_bare_rename_mention_ignores_unknown_tokens_without_the_old_name(self) -> None:
         self.write(self.sources[0], "enum Outcome { OldName, Other }\n")
@@ -2932,7 +2993,7 @@ class StylePlanTests(unittest.TestCase):
         _ = self.rule("read")
         self.sync()
         self.assertEqual(self.run_next()[0], 0)
-        self.assertNotIn("For a rename, find every use", self.plan.read_text())
+        self.assertNotIn("find every use through the compiler", self.plan.read_text())
 
     def test_approved_rename_allows_bare_comment_mentions_of_a_unique_item(self) -> None:
         self.write(self.sources[0], "enum Outcome { OldName, Other }\nimpl Outcome { fn read() { Self::OldName; } }\n")
@@ -3064,6 +3125,20 @@ class StylePlanTests(unittest.TestCase):
         result, output = self.reference_gate(ticket)
         self.assertEqual(result, 1, output)
         self.assertIn(self.sources[1], output)
+
+    def test_a_bare_rename_beside_a_qualified_pair_leaves_the_pair_approved_and_approves_nothing_itself(self) -> None:
+        before = "fn read() { Outcome::OldName; helper(); }\n"
+        self.write(self.sources[1], before)
+        _ = self.commit()
+        ticket = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"), ("helper", "assistant")))
+        self.write(self.sources[1], before.replace("OldName", "NewName"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for after in (before.replace("helper", "assistant"), before.replace("OldName", "NewName").replace("read", "load")):
+            with self.subTest(after=after):
+                self.write(self.sources[1], after)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(self.sources[1] + " (change is not an approved rename reference)", output)
 
     def test_approved_rename_refuses_a_pair_that_changes_the_parent_path(self) -> None:
         self.write(self.sources[1], "fn read() { Outcome::OldName; }\n")

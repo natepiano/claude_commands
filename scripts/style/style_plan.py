@@ -28,7 +28,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
 from approved_renames import (RUST_KEYWORDS, AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
-                              MissingFile, NoQualifiedRename, RenameNotApplied, UncertainScan, applied_check,
+                              MissingFile, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, declaration_sites, enclosing, file_rename, inline_modules, item_starts)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
@@ -229,9 +229,12 @@ def approved_rename_pairs(findings: tuple[style_ledger.HeldFinding, ...]) -> tup
         if isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename):
             continue
         pair = approved_rename(finding.kind, finding.before, finding.after)
-        if isinstance(pair, NoQualifiedRename):
+        if isinstance(pair, ApprovedRename):
+            pairs.append(pair)
+        elif finding.kind != "rename":
+            # A type or restructure finding can change code that no pair proves, so no reference edit is approved.
             return ()
-        pairs.append(pair)
+        # A rename with no qualified pair (a bare name, a field or prose) approves no reference edit of its own.
     return tuple(pairs)
 
 
@@ -391,6 +394,11 @@ def approved_reference_file(
     if target.suffix == ".md":
         return before != after and approved_word_swaps(before, after, pairs, unique)
     return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
+
+
+def rename_pair_text(pair: ApprovedRename) -> str:
+    parent = "::".join((*pair.qualifier, pair.parent))
+    return f"`{parent}::{pair.old}` -> `{parent}::{pair.new}`"
 
 
 def approved_file_renames(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[FileRename, ...]:
@@ -1198,7 +1206,8 @@ def _is_two_judge_ticket(ticket: style_ledger.TicketRecord,
 def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
                context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
                file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
-               crate_targets: CrateTargets = CrateTargets.LIBRARY) -> str:
+               crate_targets: CrateTargets = CrateTargets.LIBRARY,
+               proposal_cells: tuple[style_ledger.ProposalCell, ...] = ()) -> str:
     ticket_id = ticket["id"]
     number = ticket_id.rsplit("-", 1)[1]
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -1222,6 +1231,16 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                   + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
                      for finding in held_findings]) if per_file_structure and held_findings else []
     approved = ticket["kind"] == "proposal"
+    # The gate takes reference edits in other files only for these pairs, so the text names them.
+    pairs = approved_rename_pairs(held_findings)
+    own_file_renames = any(finding.kind == "rename" and not isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)
+                           and approved_rename(finding.kind, finding.before, finding.after) not in pairs
+                           for finding in held_findings)
+    # A proposal ticket names its exact cells, because the ledger refuses a tier B cell at a file with no listed site.
+    record_lines = ([f"Record exactly these cells, each with `style_ledger.py record --ticket {ticket_id} --rule <rule> --path <file>`; "
+                     + "the ledger takes its pinned rule blob:"] + [f"- `{cell.rule}` · `{cell.path}`" for cell in proposal_cells]
+                    if proposal_cells else ["Record no cell: the ledger takes no cell of this ticket."]) if approved else [
+        f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob."]
     files: list[str] = []
     for path in ticket["files"]:
         line = f"- `{path}`"
@@ -1322,11 +1341,14 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
         (("Apply the approved findings. "
-          + ("For a rename, find every use through the compiler, not a text search, and update each one "
-             + "in other files. Also update every comment and Markdown doc in the repo that means the "
+          + ("For each of these renames, find every use through the compiler, not a text search, and update each one "
+             + "in other files: " + ", ".join(rename_pair_text(pair) for pair in dict.fromkeys(pairs)) + ". "
+             + "Also update every comment and Markdown doc in the repo that means the "
              + "renamed item, and leave mentions of other items with the same name. "
              + "Change nothing else in those files. "
-             if approved_rename_pairs(held_findings) else "")
+             if pairs else "")
+          + ("Apply any other rename only in its own file; when other files use its old name, hold it. "
+             if own_file_renames else "")
           + ("For a file rename, rename the file, then update its `mod` line and each path that names the module "
              + "in other files; change nothing else in those files, comments included. "
              if approved_file_renames(held_findings) else "")
@@ -1335,7 +1357,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         + "record that cell with `record --verdict held`.",
         "Hold a finding only when the cited rule's text requires the change.",
         f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
-        f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
+        *record_lines,
         "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
         "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
         "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
@@ -1388,7 +1410,8 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
         identities = set(ticket["finding_ids"])
         held = tuple(finding for finding in ledger.proposal_findings(Path(ticket["proposal"]))
                      if finding.finding_id in identities)
-    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets)
+    cells = ledger.proposal_cells(ticket["id"]) if ticket["kind"] == "proposal" else ()
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells)
     for pinned in texts:
         path = plan.parent.parent / "rules" / (pinned.blob + ".md")
         if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:

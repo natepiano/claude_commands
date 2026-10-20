@@ -27,7 +27,7 @@ import coverage_report
 import rules
 import style_ledger
 import style_rules
-from approved_renames import NoAppliedCheck, RenameNotApplied
+from approved_renames import ApprovedRename, NoAppliedCheck, RenameNotApplied, approved_rename
 from add_style import StandingStyleProduction, standing_style_production
 from issues import Issue, frontmatter, open_issues, plain
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
@@ -68,6 +68,34 @@ def issue_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledg
     """The findings the issue shows: each finding filed to it, but not one a newer verdict withdrew."""
     return tuple(finding for finding in ledger.proposal_findings(issue)
                  if not isinstance(finding.state, style_ledger.Withdrawn))
+
+
+def bare_duplicates(candidates: tuple[style_ledger.HeldFinding, ...],
+                    holders: tuple[style_ledger.HeldFinding, ...]) -> dict[str, str]:
+    """The qualified finding in holders that each bare duplicate in candidates duplicates, by finding id.
+
+    A bare duplicate is a rename whose before has no `::` and whose before and after are the old and new name of a
+    qualified rename in the same file under the same rule; the parent rule and its `#uncovered` part count as one.
+    When several match, the nearest line wins, then the lower finding id. Only filed and built findings count: the
+    ledger withdraws no other state, and a waived finding is not built.
+    """
+    pairs = [(finding, pair) for finding in holders if isinstance(finding.state, (style_ledger.Filed, style_ledger.Built))
+             if isinstance(pair := approved_rename(finding.kind, finding.before, finding.after), ApprovedRename)]
+    duplicates: dict[str, str] = {}
+    for bare in candidates:
+        if (bare.kind != "rename" or "::" in bare.before
+                or not isinstance(bare.state, (style_ledger.Filed, style_ledger.Built))):
+            continue
+        matches = [finding for finding, pair in pairs
+                   if (pair.old, pair.new, finding.path) == (bare.before, bare.after, bare.path)
+                   and finding.rule.removesuffix("#uncovered") == bare.rule.removesuffix("#uncovered")]
+        if matches:
+            duplicates[bare.finding_id] = min(matches, key=lambda item: (abs(item.line - bare.line), item.finding_id)).finding_id
+    return duplicates
+
+
+def duplicate_line(duplicate: style_ledger.BareDuplicate) -> str:
+    return f"drop {duplicate.finding_id} in {duplicate.decision}: duplicate of {duplicate.qualified}"
 
 
 def repository_name(repo: Path) -> str:
@@ -684,6 +712,8 @@ class MovePlan:
     decisions: Mapping[str, Path]
     # The refused and kept lines of the old issues, in order.
     issue_lines: tuple[str, ...]
+    # The bare duplicates that leave their old issue as withdrawn rows of the decision that holds their qualified finding.
+    duplicates: tuple[style_ledger.BareDuplicate, ...] = ()
 
 
 def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue], scope: MoveScope) -> MovePlan:
@@ -738,11 +768,20 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
         for finding in source.owned:
             groups[keys[finding.finding_id]].append(finding)
     moves: list[DecisionMove] = []
-    for key, findings in sorted(groups.items()):
+    duplicates: list[style_ledger.BareDuplicate] = []
+    for key, grouped in sorted(groups.items()):
         issue = find_decision(proposals, key)
+        # A bare duplicate never moves into the decision that holds, or receives now, its qualified finding.
+        held = issue_findings(ledger, issue) if issue.exists() else ()
+        dropped = bare_duplicates(tuple(grouped), held + tuple(grouped))
+        duplicates.extend(style_ledger.BareDuplicate(finding_id, qualified, issue) for finding_id, qualified in dropped.items())
+        findings = [finding for finding in grouped if finding.finding_id not in dropped]
         join: NewDecision | JoinAction
         if issue.exists():
+            # The answer is read also when every finding is a duplicate, so its refusal comes before any write.
             join = join_action(issue)
+            if not findings:
+                continue
         else:
             origins = sorted({origin[finding.finding_id].path: origin[finding.finding_id] for finding in findings}.values(),
                              key=lambda item: item.path)
@@ -754,14 +793,18 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
         moves.append(DecisionMove(key, issue, tuple(findings), join, pending,
                                   sum(finding.finding_id not in moved_before for finding in findings)))
     decisions = {finding.finding_id: move.issue for move in moves for finding in move.findings}
+    destinations = decisions | {duplicate.finding_id: duplicate.decision for duplicate in duplicates}
     closes: list[OldIssueClose] = []
     for source in sources:
         # A closed old issue that reopen repairs keeps its close reason.
         if source.issue.value("status") != "open":
             continue
-        names = sorted({decisions[finding.finding_id].name for finding in source.owned})
+        names = sorted({destinations[finding.finding_id].name for finding in source.owned})
         closes.append(OldIssueClose(source.issue.path, "merged into " + ", ".join(names) if names else "no filed findings"))
-    return MovePlan(tuple(sources), tuple(moves), tuple(closes), refile, tuple(refusals), decisions, tuple(lines))
+    dropped_ids = {duplicate.finding_id for duplicate in duplicates}
+    return MovePlan(tuple(sources), tuple(moves), tuple(closes),
+                    {finding_id: reading for finding_id, reading in refile.items() if finding_id not in dropped_ids},
+                    tuple(refusals), decisions, tuple(lines), tuple(sorted(duplicates, key=lambda item: item.finding_id)))
 
 
 def run_moves(ledger: style_ledger.Ledger, proposals: Path, parent: str, plan: MovePlan,
@@ -790,13 +833,18 @@ def run_moves(ledger: style_ledger.Ledger, proposals: Path, parent: str, plan: M
             say(f"reopen {move.issue}")
             if not dry_run:
                 apply_answer(ledger, move.issue, move.join, move.pending)
+    for duplicate in plan.duplicates:
+        say(duplicate_line(duplicate))
     if not dry_run:
         if plan.refile:
             ledger.return_to_filed(plan.refile)
         for source in plan.sources:
-            if source.owned:
-                ledger.move_issue_findings(source.issue.path, {
-                    finding.finding_id: plan.decisions[finding.finding_id] for finding in source.owned})
+            moving = {finding.finding_id: plan.decisions[finding.finding_id] for finding in source.owned
+                      if finding.finding_id in plan.decisions}
+            if moving:
+                ledger.move_issue_findings(source.issue.path, moving)
+        if plan.duplicates:
+            ledger.withdraw_duplicates(plan.duplicates)
         for move in plan.moves:
             if isinstance(move.join, WaiveWithAnswer):
                 apply_answer(ledger, move.issue, move.join, move.pending)
@@ -1012,8 +1060,7 @@ def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, 
             unbuilt.append(finding)
         elif isinstance(check, NoAppliedCheck) and isinstance(finding.state, style_ledger.Built):
             (unchecked_renames if finding.kind == "rename" else unjudged_restructures).append(finding)
-    if unbuilt:
-        file_again(ledger, source, parent, tuple(unbuilt), verdicts.not_applied, dry_run=dry_run)
+    filed_again = file_again(ledger, source, parent, tuple(unbuilt), verdicts.not_applied, dry_run=dry_run) if unbuilt else ()
     if applied and not dry_run:
         ledger.record_person_applied(verdicts.applied)
     for finding in applied:
@@ -1022,17 +1069,21 @@ def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, 
     for finding in unchecked_renames:
         print(f"cannot check {finding.finding_id} in {finding.path}: {finding.before} -> {finding.after}; "
               + f"pass --finding {finding.finding_id} or --applied {finding.finding_id}")
-    return Reopening(tuple(unbuilt), tuple(applied), tuple(unchecked_renames), tuple(unjudged_restructures))
+    return Reopening(filed_again, tuple(applied), tuple(unchecked_renames), tuple(unjudged_restructures))
 
 
 def file_again(ledger: style_ledger.Ledger, source: Issue, parent: str, unbuilt: tuple[style_ledger.HeldFinding, ...],
-               readings: Mapping[str, style_ledger.ReadByPerson], *, dry_run: bool) -> None:
-    """File the findings again in an approved decision and print a line for each; refusals come before the first write."""
+               readings: Mapping[str, style_ledger.ReadByPerson], *, dry_run: bool) -> tuple[style_ledger.HeldFinding, ...]:
+    """File the findings again in an approved decision and print a line for each; refusals come before the first write.
+
+    A bare duplicate of a qualified finding in its decision is dropped, not filed again. Returns the findings filed again.
+    """
     issue = source.path
     decision = is_decision(source)
     built: dict[str, style_ledger.PersonReading] = {
         finding.finding_id: readings.get(finding.finding_id, style_ledger.NotReadByPerson())
         for finding in unbuilt if isinstance(finding.state, style_ledger.Built)}
+    dropped: tuple[style_ledger.BareDuplicate, ...] = ()
     if decision:
         decisions = {finding.finding_id: issue for finding in unbuilt}
         if not dry_run:
@@ -1058,14 +1109,19 @@ def file_again(ledger: style_ledger.Ledger, source: Issue, parent: str, unbuilt:
             if isinstance(answer, UnansweredDecision):
                 raise style_ledger.LedgerError(f"{issue}: decision {move.issue} has no answer")
         decisions = plan.decisions
+        dropped = plan.duplicates
         # Reopen prints only its own lines; the notices of a new decision go to stderr.
         with redirect_stdout(sys.stderr):
             run_moves(ledger, issue.parent, parent, plan, lambda _: None, dry_run=dry_run)
-    for finding in unbuilt:
+    for duplicate in dropped:
+        print(duplicate_line(duplicate))
+    filed = tuple(finding for finding in unbuilt if finding.finding_id in decisions)
+    for finding in filed:
         cause = (f"in {finding.path} by {readings[finding.finding_id].by}: a person read the code"
                  if finding.finding_id in readings else f"not applied in {finding.path}")
         print(f"filed again {finding.finding_id} in {decisions[finding.finding_id]}: "
               + f"{finding.before} -> {finding.after} {cause}")
+    return filed
 
 
 PARENT_LINE = re.compile(r"^Parent: (.+)$", re.MULTILINE)
@@ -1104,7 +1160,7 @@ def plan_withdrawal(ledger: style_ledger.Ledger, withdrawal: style_ledger.Withdr
     verdicts = {item.finding.finding_id: item.verdict.judgment_id for item in withdrawal.withdrawn}
     issues = {item.finding.state.proposal for item in withdrawal.withdrawn if isinstance(item.finding.state, style_ledger.Filed)}
     issues.update(finding.state.proposal for finding in ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn"))
-                  if isinstance(finding.state, style_ledger.Withdrawn))
+                  if isinstance(finding.state, style_ledger.Withdrawn) and isinstance(finding.state.by, style_ledger.ExceptionVerdict))
     closes: list[EmptiedDecisionClose] = []
     refreshes: list[Path] = []
     for issue in sorted(issues):
@@ -1118,12 +1174,67 @@ def plan_withdrawal(ledger: style_ledger.Ledger, withdrawal: style_ledger.Withdr
             if is_decision(Issue(issue, fields)):
                 refreshes.append(issue)
             continue
-        rows = {finding.finding_id: finding.state.judgment_id for finding in findings
-                if isinstance(finding.state, style_ledger.Withdrawn)}
-        rows.update((finding.finding_id, verdicts[finding.finding_id]) for finding in findings if finding.finding_id in verdicts)
-        withdrawn = ", ".join(f"{finding_id} (judgment {row})" for finding_id, row in sorted(rows.items()))
-        closes.append(EmptiedDecisionClose(issue, f"{NOTHING_LEFT_REASON}withdrawn by an exception: {withdrawn}"))
+        rows: dict[str, style_ledger.WithdrawnBy] = {finding.finding_id: finding.state.by for finding in findings
+                                                     if isinstance(finding.state, style_ledger.Withdrawn)}
+        rows.update((finding.finding_id, style_ledger.ExceptionVerdict(verdicts[finding.finding_id]))
+                    for finding in findings if finding.finding_id in verdicts)
+        withdrawn = ", ".join(f"{finding_id} ({style_ledger.withdrawn_line(row)})" for finding_id, row in sorted(rows.items()))
+        closes.append(EmptiedDecisionClose(issue, f"{NOTHING_LEFT_REASON}withdrawn: {withdrawn}"))
     return WithdrawalPlan(tuple(closes), tuple(refreshes))
+
+
+def drop_duplicates(ledger: style_ledger.Ledger, *, dry_run: bool) -> tuple[Path, ...]:
+    """Drop each bare duplicate of every open decision, then refresh the decision; print a line for each and the totals.
+
+    A decision whose count still includes a row that an earlier run dropped also refreshes, so a run that stopped
+    before its refresh ends on a rerun. A decision with a duplicate that an open ticket holds, or with no generated
+    body, prints a skip line and is not written. Every refusal and each decision's parent come before the first
+    write. Returns the skipped decisions.
+    """
+    open_ids = {ticket["id"] for ticket in ledger.proposal_tickets() if ticket["state"] not in style_ledger.FINAL_TICKET_STATES}
+    planned: list[tuple[Issue, DecisionWriter, tuple[style_ledger.BareDuplicate, ...]]] = []
+    writers: dict[Path, DecisionWriter] = {}
+    skipped: list[Path] = []
+    for path in ledger.proposal_paths():
+        if not path.is_file():
+            continue
+        decision = Issue(path, frontmatter(path))
+        if not is_decision(decision) or decision.value("status") != "open":
+            continue
+        findings = issue_findings(ledger, path)
+        by_id = {finding.finding_id: finding for finding in findings}
+        dropped = bare_duplicates(findings, findings)
+        stale = decision.value("style_count") != str(len(findings)) and any(
+            isinstance(finding.state, style_ledger.Withdrawn) and isinstance(finding.state.by, style_ledger.DuplicateOf)
+            for finding in ledger.proposal_findings(path))
+        if not dropped and not stale:
+            continue
+        try:
+            for finding_id in sorted(dropped):
+                build = by_id[finding_id].build_ticket
+                if isinstance(build, style_ledger.BuildTicket) and build.ticket in open_ids:
+                    raise style_ledger.LedgerError(f"open ticket {build.ticket} holds {finding_id}")
+            require_generated_body(path)
+            parent = decision_parent(path)
+        except (style_ledger.LedgerError, Refusal) as error:
+            skipped.append(path)
+            print(skip_line(path, error))
+            continue
+        if path.parent not in writers:
+            writers[path.parent] = decision_writer(ledger, path.parent, "")
+        planned.append((decision, replace(writers[path.parent], parent=parent),
+                        tuple(style_ledger.BareDuplicate(finding_id, qualified, path) for finding_id, qualified in sorted(dropped.items()))))
+    for decision, writer, duplicates in planned:
+        for duplicate in duplicates:
+            print(duplicate_line(duplicate))
+        if not dry_run:
+            if duplicates:
+                ledger.withdraw_duplicates(duplicates)
+            # The command prints only its own lines, as a dry run does; the notices of the refresh go to stderr.
+            with redirect_stdout(sys.stderr):
+                writer.refresh(Issue(decision.path, frontmatter(decision.path)))
+    print(f"totals: drop {sum(len(duplicates) for _, _, duplicates in planned)}, skipped {len(skipped)}")
+    return tuple(skipped)
 
 
 def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingException) -> str:
@@ -1201,6 +1312,8 @@ def main(argv: list[str]) -> int:
     _ = migration.add_argument("--proposals", type=Path, required=True)
     _ = migration.add_argument("--parent", required=True)
     _ = migration.add_argument("--dry-run", action="store_true")
+    deduplicating = sub.add_parser("drop-duplicates")
+    _ = deduplicating.add_argument("--dry-run", action="store_true")
     dropping = sub.add_parser("drop-candidate")
     _ = dropping.add_argument("--idea", required=True)
     declining = sub.add_parser("decline")
@@ -1219,7 +1332,7 @@ def main(argv: list[str]) -> int:
     if read and any(not name.strip() for name in (*args.finding, *args.applied)):
         parser.error("reopen --finding and --applied require a finding id")
     try:
-        source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen", "withdraw") and args.dry_run
+        source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen", "withdraw", "drop-duplicates") and args.dry_run
                   else style_ledger.open_ledger(args.repo))
         with source as ledger:
             if args.command == "file":
@@ -1244,6 +1357,11 @@ def main(argv: list[str]) -> int:
             elif args.command == "withdraw":
                 # Each refresh keeps the parent its decision names, so the writer takes none.
                 skipped = run_withdrawal(decision_writer(ledger, args.proposals.expanduser().resolve(), ""), dry_run=args.dry_run)
+                if skipped:
+                    print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
+                    return 1
+            elif args.command == "drop-duplicates":
+                skipped = drop_duplicates(ledger, dry_run=args.dry_run)
                 if skipped:
                     print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
                     return 1

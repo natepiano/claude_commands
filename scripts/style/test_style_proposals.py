@@ -2025,12 +2025,12 @@ class StyleProposalsTests(unittest.TestCase):
             for finding in (first, second):
                 self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/lib.rs:{finding.line}: "
                               + f"judgment {row} exception under {blob[:8]}", output)
-            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)}, {style_ledger.Withdrawn(issue, row)})
+            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)}, {style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row))})
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
             reason = frontmatter(issue)["reason"][0]
             self.assertTrue(reason.startswith(style_proposals.NOTHING_LEFT_REASON))
             for finding in (first, second):
-                self.assertIn(f"{finding.finding_id} (judgment {row})", reason)
+                self.assertIn(f"{finding.finding_id} (judgment {row} exception)", reason)
             self.assertIn(f"close {issue}: {reason}", output)
             self.assertIn("totals: withdraw 2, kept 0, close 1", output)
             closed = issue.read_bytes()
@@ -2078,7 +2078,7 @@ class StyleProposalsTests(unittest.TestCase):
             row = self.newer_verdict(ledger, blob, "exception")
             self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
-                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, row), filed.finding_id: style_ledger.Filed(issue)})
+                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row)), filed.finding_id: style_ledger.Filed(issue)})
             self.assertEqual(frontmatter(issue)["status"], ["open"])
             self.assertEqual(frontmatter(issue)["style_count"], ["1"])
             body = issue.read_text()
@@ -2103,6 +2103,129 @@ class StyleProposalsTests(unittest.TestCase):
         self.assertEqual(dry.getvalue(), written.getvalue())
         self.assertIn("totals: withdraw 1, kept 0, close 1", written.getvalue())
         self.assertEqual(frontmatter(issue)["status"], ["closed"])
+
+    def bare_duplicate_decision(self, ledger: style_ledger.Ledger) -> tuple[Path, style_ledger.HeldFinding, style_ledger.HeldFinding]:
+        """A decision that holds a qualified rename and its bare duplicate at another line of the same file."""
+        qualified = self.hold(ledger)
+        bare = self.hold(ledger, line=2, before="Value", after="Count")
+        issue, = self.file(ledger)
+        self.assertEqual(frontmatter(issue)["style_count"], ["2"])
+        return issue, qualified, bare
+
+    def test_drop_duplicates_dry_run_writes_nothing_and_the_run_withdraws_the_bare_row_from_the_body(self) -> None:
+        with self.ledger() as ledger:
+            issue, qualified, bare = self.bare_duplicate_decision(ledger)
+            state = ledger.database.parent.parent
+        before = {path: path.read_bytes() for path in state.rglob("*") if path.is_file()}
+        issue_bytes = issue.read_bytes()
+        arguments = ["drop-duplicates", "--repo", str(self.repo)]
+        with redirect_stdout(io.StringIO()) as dry:
+            self.assertEqual(style_proposals.main([*arguments, "--dry-run"]), 0)
+        self.assertEqual(dry.getvalue().splitlines(),
+                         [f"drop {bare.finding_id} in {issue}: duplicate of {qualified.finding_id}", "totals: drop 1, skipped 0"])
+        self.assertEqual({path: path.read_bytes() for path in state.rglob("*") if path.is_file()}, before)
+        self.assertEqual(issue.read_bytes(), issue_bytes)
+        with redirect_stdout(io.StringIO()) as written:
+            self.assertEqual(style_proposals.main(arguments), 0)
+        self.assertEqual(written.getvalue(), dry.getvalue())
+        with self.ledger() as ledger:
+            self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
+                             {qualified.finding_id: style_ledger.Filed(issue),
+                              bare.finding_id: style_ledger.Withdrawn(issue, style_ledger.DuplicateOf(qualified.finding_id))})
+        self.assertEqual(frontmatter(issue)["style_count"], ["1"])
+        body = issue.read_text()
+        self.assertIn("Parent: parent", body)
+        self.assertEqual(re.findall(r"^Site: (.*)$", body, re.MULTILINE), ["alpha/src/lib.rs:1"])
+        with redirect_stdout(io.StringIO()) as rerun:
+            self.assertEqual(style_proposals.main(arguments), 0)
+        self.assertEqual(rerun.getvalue(), "totals: drop 0, skipped 0\n")
+
+    def test_drop_duplicates_leaves_a_waived_bare_row_alone_in_the_dry_run_and_the_run(self) -> None:
+        with self.ledger() as ledger:
+            issue, _, bare = self.bare_duplicate_decision(ledger)
+            ledger.waive_held(bare.finding_id)
+            before = self.written(ledger)
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(style_proposals.main(["drop-duplicates", "--repo", str(self.repo), *(["--dry-run"] if dry_run else [])]), 0)
+            self.assertEqual(output.getvalue(), "totals: drop 0, skipped 0\n")
+            with self.ledger() as ledger:
+                self.assertEqual(self.written(ledger), before)
+        self.assertEqual(frontmatter(issue)["style_count"], ["2"])
+
+    def test_drop_duplicates_refreshes_a_decision_whose_body_still_lists_a_row_withdrawn_as_a_duplicate(self) -> None:
+        with self.ledger() as ledger:
+            issue, qualified, bare = self.bare_duplicate_decision(ledger)
+            # A run that stopped after the ledger write and before the refresh.
+            ledger.withdraw_duplicates((style_ledger.BareDuplicate(bare.finding_id, qualified.finding_id, issue),))
+        stale = issue.read_bytes()
+        arguments = ["drop-duplicates", "--repo", str(self.repo)]
+        with redirect_stdout(io.StringIO()) as dry:
+            self.assertEqual(style_proposals.main([*arguments, "--dry-run"]), 0)
+        self.assertEqual(dry.getvalue(), "totals: drop 0, skipped 0\n")
+        self.assertEqual(issue.read_bytes(), stale)
+        with redirect_stdout(io.StringIO()) as written:
+            self.assertEqual(style_proposals.main(arguments), 0)
+        self.assertEqual(written.getvalue(), "totals: drop 0, skipped 0\n")
+        self.assertEqual(frontmatter(issue)["style_count"], ["1"])
+        body = issue.read_text()
+        self.assertIn("Parent: parent", body)
+        self.assertEqual(re.findall(r"^Site: (.*)$", body, re.MULTILINE), ["alpha/src/lib.rs:1"])
+
+    def test_a_decision_emptied_by_an_exception_after_a_dropped_duplicate_names_each_reason_in_its_close(self) -> None:
+        with self.ledger() as ledger:
+            issue, qualified, bare = self.bare_duplicate_decision(ledger)
+            with redirect_stdout(io.StringIO()):
+                _ = style_proposals.drop_duplicates(ledger, dry_run=False)
+            row = self.newer_verdict(ledger, self.newer_rule_text(), "exception")
+            _ = self.withdraw(ledger)
+        self.assertEqual(frontmatter(issue)["status"], ["closed"])
+        self.assertEqual(frontmatter(issue)["reason"][0],
+                         f"{style_proposals.NOTHING_LEFT_REASON}withdrawn: "
+                         + ", ".join(sorted((f"{qualified.finding_id} (judgment {row} exception)",
+                                             f"{bare.finding_id} (duplicate of {qualified.finding_id})"))))
+
+    def test_drop_duplicates_skips_a_decision_whose_duplicate_an_open_ticket_holds_and_exits_1(self) -> None:
+        with self.ledger() as ledger:
+            issue, _, bare = self.bare_duplicate_decision(ledger)
+            self.issue_command("approve", str(issue), "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
+            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "alpha", [bare.path], [self.rename],
+                              proposal=str(issue), finding_ids=(bare.finding_id,))
+            before = self.written(ledger)
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(style_proposals.main(["drop-duplicates", "--repo", str(self.repo)]), 1)
+        self.assertEqual(output.getvalue().splitlines(),
+                         [f"skipped {issue}: open ticket names-unit-1 holds {bare.finding_id}", "totals: drop 0, skipped 1"])
+        self.assertEqual(errors.getvalue(), "style_proposals: skipped 1 decisions\n")
+        with self.ledger() as ledger:
+            self.assertEqual(self.written(ledger), before)
+
+    def test_migrate_drops_a_bare_duplicate_of_a_qualified_finding_in_its_decision_instead_of_moving_it(self) -> None:
+        with self.ledger() as ledger:
+            qualified = self.hold(ledger)
+            decision, = self.file(ledger)
+            bare = self.hold(ledger, line=2, before="Value", after="Count")
+            old = self.legacy_issue(ledger, "old", bare)
+            before = self.written(ledger)
+            lines = [f"drop {bare.finding_id} in {decision}: duplicate of {qualified.finding_id}",
+                     f"close {old}: merged into {decision.name}", "totals: create 0, move 0, close 1, off-rule 0"]
+            for dry_run in (True, False):
+                with self.subTest(dry_run=dry_run), redirect_stdout(io.StringIO()) as output:
+                    style_proposals.migrate(ledger, self.proposals, "parent", dry_run=dry_run)
+                self.assertEqual(output.getvalue().splitlines(), lines)
+                if dry_run:
+                    self.assertEqual(self.written(ledger), before)
+            self.assertEqual({finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())},
+                             {qualified.finding_id: style_ledger.Filed(decision),
+                              bare.finding_id: style_ledger.Withdrawn(decision, style_ledger.DuplicateOf(qualified.finding_id))})
+            self.assertEqual(ledger.moved_findings(old), {bare.finding_id: decision})
+            self.assertEqual(frontmatter(decision)["style_count"], ["1"])
+            self.assertEqual(frontmatter(old)["status"], ["closed"])
+            snapshot = self.written(ledger)
+            with redirect_stdout(io.StringIO()) as rerun:
+                style_proposals.migrate(ledger, self.proposals, "parent")
+            self.assertEqual(rerun.getvalue(), "totals: create 0, move 0, close 0, off-rule 0\n")
+            self.assertEqual(self.written(ledger), snapshot)
 
     def test_the_filing_run_withdraws_before_it_files(self) -> None:
         with self.ledger() as ledger:
@@ -2149,7 +2272,7 @@ class StyleProposalsTests(unittest.TestCase):
             row = self.newer_verdict(ledger, self.newer_rule_text(), "exception", withdrawn.path)
             self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
-                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, row), built.finding_id: style_ledger.Built(issue)})
+                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row)), built.finding_id: style_ledger.Built(issue)})
             self.assertEqual(frontmatter(issue)["status"], ["open"])
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
