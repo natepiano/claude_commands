@@ -641,25 +641,14 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - Only approved decisions of the refilling unit are checked; unapproved decisions wait for approval.
 
 ### Phase 21 — Reopen every false built rename  · status: done
-**Depends on:** Phase 20
 
-#### Work Order
+#### As-built
 
-**Goal:** built rename findings whose rename is not in the synced code, left from merges before the applied check, go back to filed across every approved decision in one command, and a re-add of such a row says so.
-
-**Spec:**
-- `style_proposals.py reopen --all [--dry-run]` (beside `--issue`, mutually exclusive): runs the per-decision `reopen` (style_proposals.py:813) over every approved decision that has built rename findings, with the same refusals for each (an open ticket builds it, a merged ticket is not synced). A refused decision is skipped with one line and the run goes on, exit 1 when any was skipped; a totals line at the end. Ruled by the showrunner (natedev, 2026-10-19).
-- `style_ledger.py held add`: when it returns an existing built row whose applied check is `RenameNotApplied` at the synced tip, it prints `built, but not in the code at <tip7>: run style_proposals.py reopen --issue <decision>` and changes no state. A re-add never reopens a row by itself.
-- One doc line each in `docs/style_production.md` beside `reopen`.
+- `style_proposals.py reopen --all [--dry-run]` (`reopen_all`; the per-decision body is `file_unapplied_again`): every approved decision that holds a built finding, found from the ledger's built rows (closed decisions too), gets the same check and refusals as `--issue`; a refused decision prints a skip line and the run exits 1; `totals: reopen N, filed again M, skipped K`; one renumber after real reopens. `--parent` is needed only with `--issue`.
+- `held add` returning a built row whose rename is not in the code at the synced tip prints `built, but not in the code at <tip7>: run style_proposals.py reopen --all (decision <path>)` to stderr and changes no state; a check that cannot run leaves the hint out. `Built` carries `proposal`.
 
 **Files:**
 - `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
 
-**Workers:** 1 writer — one flag, one print and their tests; nothing splits.
-- `impl` — all of the above
-
-**Constraints from prior phases:** Phase 19: `applied_check` gives `AppliedInCode | RenameNotApplied | NoAppliedCheck`; ledger writers follow the lock rule (`retry_on_change`); `reopen --issue --parent [--dry-run]` exists.
-
-**Acceptance gate:**
-- Tests: `--all` reopens false built renames in two decisions and leaves applied ones built; a refused decision is skipped with its line while the others reopen, exit 1; `--dry-run` writes nothing and prints the same lines; `held add` on a false built row prints the hint and changes nothing; on an applied built row prints nothing new.
-- `scripts/style` tests green, basedpyright 0 errors and 0 warnings, merge gate `--tests-only` green.
+**Gotchas:**
+- A built finding whose decision file is missing is skipped without a line.
