@@ -226,7 +226,10 @@ def _session_name(slug: str, unit: str) -> str:
 
 
 def _check_stopped(rename: UnitRename) -> None:
-    """The unit runs no Claude under either id, and nothing works inside its worktree."""
+    """The unit runs no Claude under either id, and nothing works inside its worktree.
+
+    Its runs' leftovers are ended here too: a rename resumed past its stop step never ran that
+    step's `_stop_runs`, such as one stopped before the stop ended runs."""
     try:
         marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
@@ -237,6 +240,7 @@ def _check_stopped(rename: UnitRename) -> None:
             raise RenameRefused(f"{unit} has a live Claude; stop it first")
         if found and isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {found.claude.reason}")
+    _stop_runs(rename)
     pids = unit_move.processes_inside(rename.worktree())
     if pids:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")

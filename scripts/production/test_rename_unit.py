@@ -25,6 +25,7 @@ import rename_unit
 import retire_unit
 import unit_lookup
 import unit_move
+import unit_runs
 from rename_state import RenameRefused
 
 if TYPE_CHECKING:
@@ -761,6 +762,25 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(retire_unit, "TERM_WAIT_SECONDS", 0.0))
         with self.assertRaisesRegex(RenameRefused, r"of lint in run run-a: still runs after SIGTERM"):
             _ = self.stop()
+
+    def test_a_resumed_rename_ends_a_run_left_under_the_former_root(self) -> None:
+        """The real case: the journal was past its stop step before the stop ended runs, and the
+        run started under /tmp/claude/delegate, before the rename to /tmp/claude/unit."""
+        former = self.root / "delegate"
+        folder = former / "run-old"
+        (folder / retire_unit.DETACHED_RUNS).mkdir(parents=True)
+        _ = (folder / unit_runs.STATE_FILE).write_text(json.dumps({"working_dir": str(self.worktree)}))
+        record = self.run_record(folder, "lint-old", 401)
+        self.processes = {401: FakeProcess(self.worktree, 401, ["python3", "mesh_runs.py", "supervise", str(record)]),
+                          402: FakeProcess(self.worktree, 401, ["bash", "verify.sh", "lint", "pkg"])}
+        self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": ""}))
+        _ = self.enterContext(mock.patch.object(unit_runs, "RUN_ROOT", self.root / "unit"))
+        _ = self.enterContext(mock.patch.object(unit_runs, "FORMER_RUN_ROOT", former))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(sorted(self.signalled), [401, 402])
+        self.assertIn("of the run supervisor 401 of lint-old in run run-old", output.getvalue())
 
 
 if __name__ == "__main__":
