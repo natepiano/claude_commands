@@ -669,24 +669,15 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - The issue's `showrunner` field is a session name, not a parent slug; the body's `Parent:` line is the source.
 
 ### Phase 23 — reopen names unchecked built findings and takes a person's override  · status: done
-**Depends on:** Phase 22
 
-#### Work Order
+#### As-built
 
-**Goal:** reopen never passes over a built finding without a word: each built finding the applied check cannot judge gets a line, and a person can file it again by hand with `--finding`, recorded in the ledger row.
+- reopen (`--issue`, `--all`) prints `cannot check <id> in <path>: <before> -> <after>; pass --finding <id> or --applied <id>` for each built rename the applied check cannot judge, and exits 1; restructure and type rows count only in `restructure not checked R`. `--all` totals: `reopen N, filed again M, cannot check K, restructure not checked R, skipped S`.
+- `reopen --issue <p> --parent <s> --finding <id>... --by <who>` files built findings again without the check; `--applied <id>... --by <who>` keeps them built (refused when the check finds the rename not applied). Unique prefixes; blank names, `--by` alone, and either with `--all` are refused; `--by` is stripped. All refusals come before the first write.
+- Migration 14: `held_findings.person_read_by`; `PersonReading = NotReadByPerson | ReadByPerson(by)`; the state shows the verdict; `held list` (and `--json` field `reading`) shows it. A move into built (ticket merge AppliedInCode, `mark_built`) clears it. `held add` leaves its reopen hint out for a row a person read.
 
-**Spec:**
-- reopen (`--issue` and `--all`) prints, for each built rename whose applied check is NoAppliedCheck, `cannot check <id> in <path>: <before> -> <after>; pass --finding <id> or --applied <id>`. Totals: `cannot check K, restructure not checked R`; exit 1 when K > 0. Dry run prints the same.
-- `reopen --issue <path> --parent <slug> --finding <id> [--finding <id>...] --by <who>` files those built findings of that issue again without the applied check. Every other refusal (open ticket, unsynced merge, not approved, finding not built, finding not in the issue) and `--dry-run` stay. `--finding` needs `--by`. Ruled by natedev, 2026-10-20.
-- The ledger row records the override: who filed it again and why (a person read the code), so a later reader sees it was not the check. Schema change with migration.
-- The `cannot check` line, its count and exit 1 apply only to rename findings; restructure rows get one totals word, `restructure not checked R`, and no exit 1. `reopen --issue ... --applied <id> --by <who>` records that a person read the code and found the change in it: the row stays built, records the person, and its line stops. One column, `person_read_by`, serves `--finding` and `--applied`; the state shows the verdict. Ruled by natedev, 2026-10-20.
-- Tests: a built finding in a file with a serde derive gives the `cannot check` line in a dry run; `--finding` files it again and the row holds the override; the dry run writes nothing.
+**Files:**
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`
 
-**Files:** `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
-
-**Workers:** 1 writer — nothing splits.
-- `impl` — all of the above
-
-**Constraints from prior phases:** Phase 22: `reopen_all`, `old_issue_parent`, `file_unapplied_again`, `run_moves` refreshers. Phase 21: `Built(proposal)`, `return_to_filed`.
-
-**Acceptance gate:** the tests above; `scripts/style` green; basedpyright clean; merge gate `--tests-only` green.
+**Gotchas:**
+- A non-std derive (for example serde `Serialize`) on the parent gives no applied check; in production, 3 built renames in old issue 1d00e8b8 (57b9f36a, 00093229, 0cdf4372) are false built and need `--finding`.
