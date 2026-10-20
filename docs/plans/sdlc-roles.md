@@ -31,6 +31,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts that run the user's productions. This plan maps the duties of each role and the names of things, measures their overlaps and other names, and changes them one approved step at a time.
+- **Project started:** 2026-10-20T20:55:49.927+00:00
 - **Stack:** Python 3.13, standard library only (`tomllib` for the term list); Markdown.
 - **Layout:**
   - `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py` — the measure script and its tests (new)
@@ -59,7 +60,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 ## Phases
 
-### Phase 1 — One command counts each name and its other names, and the design doc maps who does each duty  · status: todo
+### Phase 1 — One command counts each name and its other names, and the design doc maps who does each duty  · status: done
 **Depends on:** none
 
 #### Work Order
