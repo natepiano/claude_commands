@@ -21,7 +21,7 @@ import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
 import change_review
@@ -63,7 +63,8 @@ class NoMac(NamedTuple):
 
 
 class MacCheckout(NamedTuple):
-    path: Path
+    path: PurePosixPath
+    """As written in the doc; a leading ~ is the Mac's home, so the Mac's shell expands it."""
 
 
 class PromoteTo(NamedTuple):
@@ -259,7 +260,7 @@ def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
     for item in promote_raw.split(","):
         item = item.strip()
         if item.startswith("mac "):
-            mac = MacCheckout(Path(item[4:].strip()).expanduser())
+            mac = MacCheckout(PurePosixPath(item[4:].strip()))
         elif item:
             local.append(Path(item).expanduser())
     return PromoteTo(tuple(local), mac) if local or isinstance(mac, MacCheckout) else NoPromotion()
@@ -606,7 +607,7 @@ def gate_names(request: MergeRequest, first_code_merge: bool) -> str:
     return ", ".join(found) if found else "no gate"
 
 
-def into(path: Path, branch: str, why: str, unblocks: str) -> None:
+def into(path: PurePath, branch: str, why: str, unblocks: str) -> None:
     print(f"into: {path} ({branch}) — {why}; unblocks: {unblocks}", flush=True)
 
 
@@ -858,8 +859,18 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
     return PromotionAdvanced(tip)
 
 
-def pull_mac_checkout(mac: Path, source: Path) -> None:
-    remote = (f"cd {shlex.quote(str(mac))} && git pull --ff-only "
+def remote_path(path: PurePosixPath) -> str:
+    """Quote a Mac path for its shell, leaving a leading ~ for the Mac to expand to its own home."""
+    text = str(path)
+    if text == "~":
+        return '"$HOME"'
+    if text.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(text[2:])
+    return shlex.quote(text)
+
+
+def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+    remote = (f"cd {remote_path(mac)} && git pull --ff-only "
               f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
     result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
     match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)

@@ -4633,6 +4633,31 @@ def _finding_lenses(event: dict[str, object]) -> set[str]:
     return {part.strip() for part in lens.split(",") if part.strip()}
 
 
+def _raised_code_findings(session_dir: Path, instance_id: str) -> int | None:
+    """The code findings the phase's reviewers raised, from review.sh's turn records.
+
+    Sums `raised` over the phase's finished (`reviewed`) code-review turns, as
+    review_pool_report.py's `Raised` does. None when the phase has no such turn:
+    a solo review writes no record.
+    """
+    raised: int | None = None
+    root = plan_history.history_root() / "review_turns" / session_dir.name
+    for path in sorted(root.glob("*.json")):
+        try:
+            record = _object_dict(cast(object, json.loads(path.read_text(encoding="utf-8"))))
+        except (OSError, ValueError):
+            continue
+        if (
+            record is None
+            or _string(record.get("phase_instance_id")) != instance_id
+            or _string(record.get("status")) != "reviewed"
+            or _string(record.get("kind")) == "ux"
+        ):
+            continue
+        raised = (raised or 0) + _integer(record.get("raised"))
+    return raised
+
+
 def _review_trial(args: argparse.Namespace) -> None:
     """Print one line: the phase's UX and code findings, and review time.
 
@@ -4640,7 +4665,9 @@ def _review_trial(args: argparse.Namespace) -> None:
     review_regime.py. The phase is the one --phase-id names -- an open one, else
     the latest this run started under that id -- or, without it, the one in
     state, active or just closed by finish-phase. Only events stamped with its
-    instance count. Review-worker
+    instance count. The code number is what the reviewers raised, from the
+    phase's review turn records; a phase with none counts the code findings
+    the unit director opened. Review-worker
     minutes are every worker's finished review passes, whatever their status, plus
     the UX review activities. The screenshot check's own cost follows: its `UX
     review` activities alone, then every fix pass of a round whose dispatched
@@ -4714,6 +4741,9 @@ def _review_trial(args: argparse.Namespace) -> None:
         for event in fix_passes
         if _integer(event.get("fix_pass")) in ux_rounds
     )
+    raised = _raised_code_findings(session_dir, instance_id)
+    if raised is not None:
+        code_findings = raised
     print(
         f"review trial: ux {ux_findings} findings, code {code_findings} findings, "
         + f"review-worker minutes {(review_seconds + 30) // 60}, "
