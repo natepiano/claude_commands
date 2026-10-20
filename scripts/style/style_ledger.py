@@ -374,6 +374,24 @@ def reading_line(state: HeldState, reading: ReadByPerson) -> str:
 
 
 @dataclass(frozen=True)
+class NoWaiveUndo:
+    """No person undid a waive of the finding: it was never waived, or its waive stands."""
+
+
+@dataclass(frozen=True)
+class WaiveUndoneBy:
+    """A person undid the finding's waive, so it went back to unfiled.
+
+    The record stays after every later change of the finding, a new waive included, so a later `file` never erases it.
+    """
+
+    by: str
+
+
+WaiveUndo = NoWaiveUndo | WaiveUndoneBy
+
+
+@dataclass(frozen=True)
 class RuleCandidate:
     ticket: str
     unit: str
@@ -398,6 +416,13 @@ class HeldFinding:
     state: HeldState
     build_ticket: NoBuildTicket | BuildTicket
     reading: PersonReading
+    waive_undo: WaiveUndo
+
+
+def rule_changed_since_judged(finding: HeldFinding, definitions: Mapping[str, Rule]) -> bool:
+    """Whether the catalog has no rule for the finding, or the rule's text is not the text the finding was judged under."""
+    definition = definitions.get(finding.rule.removesuffix("#uncovered"))
+    return definition is None or definition.blob != finding.rule_blob
 
 
 @dataclass(frozen=True)
@@ -911,6 +936,8 @@ MIGRATIONS = {
     14: "ALTER TABLE held_findings ADD COLUMN person_read_by TEXT NOT NULL DEFAULT '';",
     # The qualified finding that a withdrawn bare rename duplicates; '' when no duplicate withdrew it.
     15: "ALTER TABLE held_findings ADD COLUMN duplicate_of TEXT NOT NULL DEFAULT '';",
+    # The person who undid the finding's last waive; '' while none did.
+    16: "ALTER TABLE held_findings ADD COLUMN unwaived_by TEXT NOT NULL DEFAULT '';",
 }
 
 
@@ -1569,8 +1596,8 @@ class Ledger:
         return self._held(finding_id)
 
     def _held(self, finding_id: str) -> HeldFinding:
-        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str]], self._connection.execute(
-            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by,person_read_by,duplicate_of FROM held_findings WHERE finding_id=?", (finding_id,),
+        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str]], self._connection.execute(
+            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by,person_read_by,duplicate_of,unwaived_by FROM held_findings WHERE finding_id=?", (finding_id,),
         ).fetchall())
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
@@ -1588,7 +1615,7 @@ class Ledger:
             case "unfiled":
                 state = Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
-                           ReadByPerson(row[14]) if row[14] else NotReadByPerson())
+                           ReadByPerson(row[14]) if row[14] else NotReadByPerson(), WaiveUndoneBy(row[16]) if row[16] else NoWaiveUndo())
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
         rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -1955,24 +1982,15 @@ class Ledger:
             raise LedgerError(f"{merge} is not on the synced branch at {tip[:7]}")
 
         def named(name: str, identities: list[str]) -> HeldFinding:
-            """The one held finding that name names; refuses a name that is not one."""
-            matches = [identity for identity in identities if identity.startswith(name)]
-            if not matches:
-                raise LedgerError(f"no finding {name}")
-            if len(matches) > 1:
-                raise LedgerError(f"{name} matches {len(matches)} findings")
-            finding = self._held(matches[0])
+            """The one filed finding that name names; refuses a name that is not one."""
+            finding = self._named_finding(name, identities)
             if not isinstance(finding.state, Filed):
                 raise LedgerError(f"{finding.finding_id}: cannot mark a {held_state_name(finding.state)} finding built")
-            if isinstance(finding.build_ticket, BuildTicket):
-                ticket = self._ticket(finding.build_ticket.ticket)
-                if ticket["state"] not in FINAL_TICKET_STATES:
-                    raise LedgerError(f"{finding.finding_id}: build ticket {ticket['id']} still holds the finding")
+            self._refuse_open_build_ticket(finding)
             return finding
 
         def attempt() -> tuple[BuiltAtMerge, ...]:
-            identities = [row[0] for row in cast(list[tuple[str]], self._connection.execute(
-                "SELECT finding_id FROM held_findings").fetchall())]
+            identities = self._held_identities()
             findings = {finding.finding_id: finding for finding in (named(name, identities) for name in names)}
             built: list[BuiltAtMerge] = []
             for finding_id, finding in sorted(findings.items()):
@@ -2005,6 +2023,72 @@ class Ledger:
             return tuple(built)
 
         return retry_on_change(attempt)
+
+    def _held_identities(self) -> list[str]:
+        return [row[0] for row in cast(list[tuple[str]], self._connection.execute("SELECT finding_id FROM held_findings").fetchall())]
+
+    def _named_finding(self, name: str, identities: list[str]) -> HeldFinding:
+        """The one held finding that name, a finding id or a unique prefix of one, names; refuses a name that is not one."""
+        matches = [identity for identity in identities if identity.startswith(name)]
+        if not matches:
+            raise LedgerError(f"no finding {name}")
+        if len(matches) > 1:
+            raise LedgerError(f"{name} matches {len(matches)} findings")
+        return self._held(matches[0])
+
+    def _refuse_open_build_ticket(self, finding: HeldFinding) -> None:
+        if isinstance(finding.build_ticket, BuildTicket):
+            ticket = self._ticket(finding.build_ticket.ticket)
+            if ticket["state"] not in FINAL_TICKET_STATES:
+                raise LedgerError(f"{finding.finding_id}: build ticket {ticket['id']} still holds the finding")
+
+    def named_held(self, names: Iterable[str]) -> tuple[HeldFinding, ...]:
+        """The held findings that the names name, each once and in finding-id order; refuses a name that is not one."""
+        identities = self._held_identities()
+        findings = {finding.finding_id: finding for finding in (self._named_finding(name, identities) for name in names)}
+        return tuple(findings[finding_id] for finding_id in sorted(findings))
+
+    def unwaive_held(self, names: tuple[str, ...], person: WaiveUndoneBy) -> tuple[str, ...]:
+        """Set waived findings back to unfiled, with no decision and no build ticket, and record who did it.
+
+        Each name is a finding id or a unique prefix of one. A finding that an open ticket judged or builds, or whose
+        rule text changed since it was judged, is refused; style_proposals.unwaive also refuses a finding that its
+        declined decision waives again. Every refusal comes before the write. A cell whose newest judgment a decline
+        set to waived is held again.
+        """
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            findings = self.named_held(names)
+            self._catalog = rule_catalog.load_rules(self.repo)
+            definitions = {rule.rule_id: rule for rule in self._catalog}
+            for finding in findings:
+                if not isinstance(finding.state, Waived):
+                    raise LedgerError(f"{finding.finding_id}: cannot unwaive a {held_state_name(finding.state)} finding")
+                # Filing skips such a finding, so it would stay unfiled.
+                if rule_changed_since_judged(finding, definitions):
+                    raise LedgerError(f"{finding.finding_id}: rule changed since judged")
+                self._refuse_open_build_ticket(finding)
+                # An unfiled finding of an open ticket waits for that ticket, and a yield of its file deletes it.
+                judging = cast(list[tuple[str]], self._connection.execute(
+                    "SELECT state FROM tickets WHERE id=? AND state IN ('assigned','checkpointed')", (finding.ticket,),
+                ).fetchall())
+                if judging:
+                    raise LedgerError(f"{finding.finding_id}: {judging[0][0]} ticket {finding.ticket} still holds the finding")
+            tip = self._synced_tip()
+            cells = {(finding.rule, _finding_cell(self._component_rule(finding.rule), finding.path, tip)) for finding in findings}
+            now = _now()
+            _ = self._connection.executemany(
+                "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',unwaived_by=?,updated_at=? WHERE finding_id=?",
+                [(person.by, now, finding.finding_id) for finding in findings],
+            )
+            for rule, path in sorted(cells):
+                newest = cast(list[tuple[int, Verdict]], self._connection.execute(
+                    "SELECT id,verdict FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1", (rule, path),
+                ).fetchall())
+                if newest and newest[0][1] == "waived":
+                    _ = self._connection.execute("UPDATE judgments SET verdict='held',verdict_detail=?,recorded_at=? WHERE id=?",
+                                                 (f"unwaived by {person.by}", now, newest[0][0]))
+        return tuple(finding.finding_id for finding in findings)
 
     def return_to_filed(self, refilings: Mapping[str, PersonReading]) -> None:
         """Set built findings whose change is not in the code back to filed, with no build ticket.
@@ -2047,7 +2131,8 @@ class Ledger:
             # A withdrawn finding keeps the verdict that withdrew it.
             if isinstance(finding.state, (Waived, Withdrawn)):
                 return
-            _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?", (_now(), finding_id))
+            _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?",
+                                         (_now(), finding_id))
 
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
         branch_tip = pushed_branch_point_tip(self.repo, branch_point)
@@ -2685,6 +2770,7 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
         result["withdrawn_by"] = by.judgment_id if isinstance(by, ExceptionVerdict) else 0
         result["duplicate_of"] = by.finding_id if isinstance(by, DuplicateOf) else ""
     result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
+    result["unwaived_by"] = finding.waive_undo.by if isinstance(finding.waive_undo, WaiveUndoneBy) else ""
     return result
 
 
@@ -2914,7 +3000,8 @@ def main() -> None:
                     else:
                         for finding in findings:
                             details = ([withdrawn_line(finding.state.by)] if isinstance(finding.state, Withdrawn) else []) + (
-                                [reading_line(finding.state, finding.reading)] if isinstance(finding.reading, ReadByPerson) else [])
+                                [reading_line(finding.state, finding.reading)] if isinstance(finding.reading, ReadByPerson) else []) + (
+                                [f"unwaived by {finding.waive_undo.by}"] if isinstance(finding.waive_undo, WaiveUndoneBy) else [])
                             print("\t".join([finding.finding_id, finding.rule, f"{finding.path}:{finding.line}",
                                              held_state_name(finding.state), *details]))
     except (LedgerError, rule_catalog.RuleValidationError, OSError, sqlite3.Error, ValueError) as error:

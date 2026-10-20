@@ -420,18 +420,17 @@ def apply_answer(ledger: style_ledger.Ledger, issue: Path, action: JoinAction, f
         proposal_command("reopen", str(issue))
 
 
-def file_decision(writer: DecisionWriter, key: DecisionKey, items: tuple[style_ledger.HeldFinding, ...]) -> bool:
-    """File the findings to their decision. True when they are filed, False when the answer waived them."""
+def file_decision(writer: DecisionWriter, key: DecisionKey, items: tuple[style_ledger.HeldFinding, ...]) -> JoinAction:
+    """File the findings to their decision, or waive them when it is declined. Return what its answer did to them."""
     issue = find_decision(writer.proposals, key)
     if not issue.exists():
         issue = writer.create(key, items, {})
     action = join_action(issue)
     apply_answer(writer.ledger, issue, action, tuple(finding.finding_id for finding in items))
-    if isinstance(action, WaiveWithAnswer):
-        return False
-    for finding in items:
-        writer.ledger.file_held(finding.finding_id, issue)
-    return True
+    if not isinstance(action, WaiveWithAnswer):
+        for finding in items:
+            writer.ledger.file_held(finding.finding_id, issue)
+    return action
 
 
 def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) -> FilingResult:
@@ -446,8 +445,7 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
     for finding in ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")):
         if finding.finding_id in waiting_ids:
             continue
-        definition = writer.definitions.get(finding.rule.removesuffix("#uncovered"))
-        if definition is None or definition.blob != finding.rule_blob:
+        if style_ledger.rule_changed_since_judged(finding, writer.definitions):
             print(f"skipped {finding.finding_id}: rule changed since judged")
         else:
             batches[decision_key(finding, directories)].append(finding)
@@ -455,7 +453,10 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
     for key, items in sorted(batches.items()):
         issue = proposals / batch_name(key)
         try:
-            if file_decision(writer, key, tuple(items)):
+            action = file_decision(writer, key, tuple(items))
+            if isinstance(action, WaiveWithAnswer):
+                print(f"waived {len(items)} findings in {issue}: declined: {action.words}")
+            else:
                 written.append(issue)
                 print(f"filed {issue}")
         except (style_ledger.LedgerError, Refusal) as error:
@@ -617,6 +618,18 @@ def decline(ledger: style_ledger.Ledger, issue: Path, words: str) -> None:
     if frontmatter(issue).get("status") != ["closed"]:
         proposal_command("close", str(issue), "--reason", f"declined: {words}")
     renumber()
+
+
+def unwaive(ledger: style_ledger.Ledger, proposals: Path, names: tuple[str, ...], person: style_ledger.WaiveUndoneBy) -> None:
+    """Set waived findings back to unfiled. Refuse all of them when a declined decision would waive one again at the next file."""
+    directories = workspace_directories(ledger)
+    for finding in ledger.named_held(names):
+        issue = find_decision(proposals, decision_key(finding, directories))
+        if issue.exists() and isinstance(decision_answer(Issue(issue, frontmatter(issue))), DeclinedDecision):
+            raise style_ledger.LedgerError(
+                f"{finding.finding_id}: declined decision {issue} waives it again at the next file; answer the decline again first")
+    for finding_id in ledger.unwaive_held(names, person):
+        print(f"unwaived {finding_id} by {person.by}")
 
 
 def sites(ledger: style_ledger.Ledger, issue: Path) -> None:
@@ -1319,6 +1332,10 @@ def main(argv: list[str]) -> int:
     declining = sub.add_parser("decline")
     _ = declining.add_argument("--issue", type=Path, required=True)
     _ = declining.add_argument("--words", required=True)
+    unwaiving = sub.add_parser("unwaive")
+    _ = unwaiving.add_argument("--proposals", type=Path, required=True)
+    _ = unwaiving.add_argument("--id", dest="ids", action="append", required=True)
+    _ = unwaiving.add_argument("--by", required=True)
     for command in sub.choices.values():
         _ = command.add_argument("--repo", type=Path, default=Path.cwd())
     args = cast(ProposalArguments, parser.parse_args(argv))
@@ -1331,6 +1348,10 @@ def main(argv: list[str]) -> int:
         parser.error("reopen --finding and --applied require --by, and --by requires one of them")
     if read and any(not name.strip() for name in (*args.finding, *args.applied)):
         parser.error("reopen --finding and --applied require a finding id")
+    if args.command == "unwaive" and any(not name.strip() for name in args.ids):
+        parser.error("unwaive --id requires a finding id")
+    if args.command == "unwaive" and not args.by.strip():
+        parser.error("unwaive --by requires a name")
     try:
         source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen", "withdraw", "drop-duplicates") and args.dry_run
                   else style_ledger.open_ledger(args.repo))
@@ -1346,6 +1367,8 @@ def main(argv: list[str]) -> int:
                 link_rules(ledger, args.proposals.expanduser().resolve())
             elif args.command == "decline":
                 decline(ledger, args.issue.expanduser().resolve(), args.words)
+            elif args.command == "unwaive":
+                unwaive(ledger, args.proposals.expanduser().resolve(), tuple(args.ids), style_ledger.WaiveUndoneBy(args.by.strip()))
             elif args.command == "sites":
                 sites(ledger, args.issue.expanduser().resolve())
             elif args.command == "candidates":
@@ -1404,6 +1427,7 @@ class ProposalArguments(argparse.Namespace):
     finding: list[str] = []
     applied: list[str] = []
     by: str = ""
+    ids: list[str] = []
 
 
 if __name__ == "__main__":
