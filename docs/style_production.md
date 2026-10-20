@@ -466,6 +466,20 @@ the finding stays as it is for a person to waive or fix in the code. No file:
   file. Two or more such files, or one in another crate, leave the finding as a
   move does. A rename in a decision that is not approved waits for the answer,
   with no line. The step reads the answer again when it writes.
+- A finding whose item, or the impl or trait that holds it, has a new name from
+  built rename or type findings of approved decisions in the same crate follows
+  the item to its newest name, in its own file or in the one file that gained
+  it, and keeps its id. The renames apply one after another; a name with two
+  new names, or a rename back to an earlier name, stops the chain. A rename
+  qualified by a module names only the items of that module's files and the
+  impl items of a type declared there; `crate::` names the crate root. A rename
+  qualified by a type names only the impl or trait items of that type under any
+  of its names, and a `Self` path names the type of its own impl or trait. A
+  trait path does not reach the items of the trait's impls, and a `self::` or
+  `super::` path names no item. Two or more gaining files, or a filed finding's
+  file in another crate, leave the finding as a move does. A finding whose own
+  rename names its item keeps the rule above; a filed rename whose impl type a
+  built rename renamed is built at the renamed type.
 - Another filed finding whose file is still there stays filed for a person. A
   person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
   puts the item back in the code.
