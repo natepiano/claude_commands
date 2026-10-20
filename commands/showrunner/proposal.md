@@ -94,8 +94,13 @@ declined proposals close through `/close_issue`.
 Style refill marks a decision active. Run `style_proposals.py complete` after
 each merge. It closes only approved decisions, when all findings are built or
 waived. It also closes an approved decision with no merged ticket when no
-finding is left to build. A decision closed with nothing left to build opens
-again with its approval for a later finding, as a decision closed as built does.
+finding is left to build. A later finding opens a closed, approved decision
+again with its approval when each of its findings is built, waived or withdrawn, whatever its close
+reason says. `file` skips a closed decision that still has a filed finding
+(`closed decision has unbuilt findings`): open it with
+`proposal_issue.py reopen <issue>`, then file again. A closed decision with no
+answer takes a later finding only when its close reason starts with `built in `
+or `nothing left to build: ` (else `closed decision has no approval`).
 A finding is built only when its change is in the code. Repair a decision
 or an old issue that closed too early with `style_proposals.py reopen --repo
 <style checkout> --issue <issue> --parent <slug>`; add `--dry-run` to see the
