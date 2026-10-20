@@ -22,7 +22,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
 
 ### Recording ETAs
 
-[`progress_history.py`](../../scripts/delegate/progress_history.py) `eta` subcommand:
+[`progress_history.py`](../../scripts/direct/progress_history.py) `eta` subcommand:
 
 ```
 progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
@@ -36,7 +36,7 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 
 ### Chained predictions
 
-[`plan_history.py`](../../scripts/delegate/plan_history.py) holds the plan readers both sides share (`plan_runs`, `plan_phases`, `PlanPhase`, `history_root`, `now_epoch`, `resolve_plan_path`, `eta_band_seconds`, `percent_spread`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME`, `EtaProjectionUnavailable`). [`phase_table.py`](../../scripts/delegate/phase_table.py) builds the chain:
+[`plan_history.py`](../../scripts/direct/plan_history.py) holds the plan readers both sides share (`plan_runs`, `plan_phases`, `PlanPhase`, `history_root`, `now_epoch`, `resolve_plan_path`, `eta_band_seconds`, `percent_spread`, `BLOCKED_BY_PATTERN`, `STATE_FILENAME`, `EtaProjectionUnavailable`). [`phase_table.py`](../../scripts/direct/phase_table.py) builds the chain:
 
 - `_instance_eta_events(runs, instance)` selects a phase instance's `eta_stated` events by `eta_phase_id` (falling back to `phase_id` for older events), within the same run, after the previous start or finish of that phase id and before its next start. An ETA recorded before its phase starts counts for that phase. `_latest_stated_eta` builds on it.
 - `PhaseHistory` is the base of the `DonePhase`/`OpenPhase`/`TodoPhase` rows: `first_eta`, `moves` (time changes only; unchanged restatements are recorded but do not count), `eta_trail` (`[(eta_at, stated_at)]`, the real promises), `finished_at`, `delta_minutes`, `fix_done`, `fix_open_passes`, `fix_running` (0 or 1), `fix_rounds` (done plus open), `findings`. History reads only the row's own title family, so a retired task's attempts under a reused phase number are excluded.
@@ -48,14 +48,14 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 ### The board generator
 
 ```
-~/.claude/scripts/lib/py ~/.claude/scripts/delegate/board_json.py (--cwd <path> [--session <id>] | --production <slug>)
+~/.claude/scripts/lib/py ~/.claude/scripts/direct/board_json.py (--cwd <path> [--session <id>] | --production <slug>)
 ```
 
-[`board_json.py`](../../scripts/delegate/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. It logs nothing.
+[`board_json.py`](../../scripts/direct/board_json.py) resolves productions, writes each one's board atomically (temp file in the same directory, then `os.replace`) to `${UNIT_BOARD_DIR:-${XDG_STATE_HOME:-~/.local/state}/unit-board}/<slug>.json`, and prints one line `{"files": [...], "watch": [...]}`. Nothing resolved exits 0 with `"files": []`. It logs nothing.
 
 - Resolve (`showrunners.registered_showrunners()`): a `--session <id>` whose update timer `showrunners.production_of` finds gives the registered production with that doc (paths compared resolved); failing that, `--cwd` inside a showrunner checkout gives that production. Either is followed by each production in `showrunners.descendants_of(slug)` (nearest level first), each only when registered. `--production <slug>` gives the same list. Any other session and `--cwd`, a unit worktree included, gives no files.
 - `watch` holds the notifier registry dir (`NOTIFIER_STATE_DIR`, default `~/.local/state/notifier`), so an open pane notices a production started later. It also holds `SHOWRUNNER_STATE_DIR` and `SHOWRUNNER_STATE_DIR/<slug>` for every registered slug: `showrunners.attach` and `detach` write or remove `<child>/parent`, which moves that dir's mtime. Existing paths only; registration creates `<slug>/` before the update timer, so the dir exists before any attach.
-- The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/delegate/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
+- The JSON contract is [`mods/unit-board/types/board.d.ts`](../../mods/unit-board/types/board.d.ts), field for field, and [`test_board_json.py`](../../scripts/direct/test_board_json.py) checks every output key against it. Top level: `production`, `as_of`, `zone`, `utc_offset_minutes`, `units`, `sources`. Every time is `BoardTime {at: epoch s, text}` in the production's zone, `text` `HH:MM` today, else `ddd DD Mon HH:MM`.
 - `BoardUnit`: `key` (Unit cell less `-unit`), `plan`, `state` (`running` | `run-finished` | `standing-by`, from the unit's own newest run via `unit_run.local_run`), `phase` (tagged by `kind`: `plan {id, of, title}`, or `ticket {id, title, merged}` when the plan holds a `> **Standing:**` line; one read-only ledger read gives `merged`, the unit's `merged` tickets, and `id`, its newest `assigned` or `checkpointed` ticket, else the title's leading `<unit>-<n>`, else the phase id; `title` drops that leading id) or null, `phases` (`BoardPhase`: `status` `done|open|todo|gated`, `took`, `fix_done`, `fix_running`, `findings {blocker, minor, nit}`, `eta {first, trail, finished, delta_minutes}`, todo `start`/`finish`, `gate` `none|timed|untimed`; a non-`none` gate makes the status `gated`), `finish` (`predicted`/`finished` with `at`, `after_gate` with `gate`/`waits_on`, or `unknown`), `stage`, `eta` (`BoardEta {at, first, trail, moved, delta_minutes, schedule_end, fix_done, fix_running}`) or null, `summary` (newest `progress_reported` text), `steps` (`[state, what, started, took_seconds]` for the open instance's passes and activities), `workers` (`slot`, `role`, `state`, `model`, `doing`).
 - `stage`, in order:
   - the open pass as `Build`/`Tests`/`Review`/`Repair round <n>`;

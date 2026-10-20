@@ -22,7 +22,7 @@ if not __package__:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(REPOSITORY_ROOT / "scripts" / "production"))
 
-from scripts.delegate import phase_table, plan_history
+from scripts.direct import phase_table, plan_history
 from scripts.lib import unit_runs
 from scripts.production import production_units, showrunners, unit_run, units_table
 

@@ -4,7 +4,7 @@
 # Usage: end_session.sh
 #
 # Removes the run-active marker written by prepare_session.sh. Until it is gone,
-# stop-delegate-continue.py refuses to let the turn end near the auto-compaction
+# stop-direct-continue.py refuses to let the turn end near the auto-compaction
 # threshold, on the assumption that the run still has phases to go.
 #
 # Acts on every run folder this session directs (`unit_runs.py held`): the

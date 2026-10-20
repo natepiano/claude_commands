@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.delegate.worker_state import worker_claim_lock, worker_ledger, worker_record_path, worker_slot
+from scripts.direct.worker_state import worker_claim_lock, worker_ledger, worker_record_path, worker_slot
 
 
 class WorkerStateTests(unittest.TestCase):

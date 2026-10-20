@@ -180,7 +180,7 @@ class LocalAdmissionWait(Protocol):
 # This CLI's import root excludes delegate; keep the runtime import at a typed
 # provider boundary rather than expanding the shared checker configuration.
 release_waiter = cast(Callable[[Path, Path], LocalAdmissionWait], getattr(
-    importlib.import_module("scripts.delegate.local_release_wait"), "local_release_waiter"))
+    importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))
 
 LOCAL_ADMISSION_WAIT: ContextVar[LocalAdmissionWait | NoActiveLocalAdmissionWait] = ContextVar(
     "local_admission_wait", default=NoActiveLocalAdmissionWait())

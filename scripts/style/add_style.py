@@ -217,9 +217,9 @@ def _plan_text(style: StyleProduction, family: rules.Family, catalog: tuple[rule
         "- **Layout:** Ticket files are selected at refill; this unit owns no files.",
         "- **Key files:** `~/.claude/docs/style_production.md` — standing procedure, yielding and mechanical criteria",
         "- **Test lanes:** The touched packages' unit and integration tests.",
-        "- **Build:** For each touched package: `bash ~/.claude/scripts/delegate/verify.sh check <package>`",
-        "- **Test:** For each touched package: `bash ~/.claude/scripts/delegate/verify.sh test <package>`",
-        "- **Lint:** For each touched package: `bash ~/.claude/scripts/delegate/verify.sh lint <package>`",
+        "- **Build:** For each touched package: `bash ~/.claude/scripts/direct/verify.sh check <package>`",
+        "- **Test:** For each touched package: `bash ~/.claude/scripts/direct/verify.sh test <package>`",
+        "- **Lint:** For each touched package: `bash ~/.claude/scripts/direct/verify.sh lint <package>`",
         f"- **Family:** {family}; current rules: `~/.claude/scripts/lib/py ~/.claude/scripts/style/rules.py list --repo {style.checkout}`",
         *family_rules,
         "- **Invariants:** Follow `~/.claude/docs/style_production.md`. Product work wins; skip reserved, unmerged or dirty files. "

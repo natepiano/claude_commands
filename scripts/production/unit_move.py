@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import progress_history  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
@@ -289,7 +289,8 @@ def processes_inside(worktree: Path) -> list[int]:
         if not entry.name.isdigit():
             continue
         try:
-            cwd = os.readlink(entry / "cwd")
+            # A working directory that was removed reads "<path> (deleted)".
+            cwd = os.readlink(entry / "cwd").removesuffix(" (deleted)")
         except OSError:
             continue
         if cwd == root or cwd.startswith(f"{root}/"):

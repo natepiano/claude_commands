@@ -25,7 +25,7 @@ from scripts.production import change_review, merge_gate
 SCRIPT = Path(__file__).with_name("merge_gate.py")
 EXPECTED_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
-    "mac_test", "usage", "bevy_upgrade", "production", "delegate", "buildlog",
+    "mac_test", "usage", "bevy_upgrade", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style",
 )
@@ -735,13 +735,13 @@ class MergeGateTests(unittest.TestCase):
 
     def test_recorded_durations_start_unknown_then_slowest_modules(self) -> None:
         timings = {f"{suite}/test_first.py": 1.0 for suite in EXPECTED_SUITES}
-        timings["delegate/test_first.py"] = 100.0
+        timings["direct/test_first.py"] = 100.0
         self.write(self.state / "runner" / "module_seconds.json", json.dumps(timings))
         result = self.run_gate("--tests-only", "--memory-cap-mib", "48")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         starts = [event for event in self.module_events() if event["event"] == "start"]
         self.assertEqual([(event["suite"], event["module"]) for event in starts[:2]],
-                         [("lib", "test_second.py"), ("delegate", "test_first.py")])
+                         [("lib", "test_second.py"), ("direct", "test_first.py")])
         updated = cast(object, json.loads((self.state / "runner" / "module_seconds.json").read_text()))
         self.assertIsInstance(updated, dict)
         assert isinstance(updated, dict)

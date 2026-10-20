@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")

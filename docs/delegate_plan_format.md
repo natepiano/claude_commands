@@ -63,11 +63,11 @@ to rediscover after a context compaction lives in the doc.
 - **Key files:** <path — role> for each file a phase reads or modifies
 - **Test lanes:** <for each crate a phase touches, its `tests/` directory or
   `none` — what a Work Order's **Workers** opens the `test` worker against>
-- **Build:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
+- **Build:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
   otherwise the project's exact build command>
-- **Test:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
+- **Test:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
   otherwise the project's exact test command>
-- **Lint:** <for Rust always `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`;
+- **Lint:** <for Rust always `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`;
   never raw cargo commands. <PhaseChecks/> defines scope and the phase's
   style review in the unit director's main review; workers never load the guide>
 - **Invariants:** <project-wide rules every phase must preserve; omit if none>
@@ -122,7 +122,7 @@ re-derive — what earlier phases built, decisions that bind this phase. Empty f
 Phase 1. Maintained by /plan:phase_review.>
 
 **Acceptance gate:** <the build/test/behavior that proves this phase done —
-e.g. `bash ~/.claude/scripts/delegate/verify.sh test <pkg>` green + a named
+e.g. `bash ~/.claude/scripts/direct/verify.sh test <pkg>` green + a named
 test + an observable behavior. Gate commands are `verify.sh` lines only —
 `example`/integration-test lines appear solely in phases whose Files own
 them; nothing workspace-wide.>

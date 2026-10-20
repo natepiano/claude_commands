@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.delegate import remove_workers
+from scripts.direct import remove_workers
 
 
 END_SESSION = Path(__file__).with_name("end_session.sh")
@@ -50,7 +50,7 @@ class EndSessionTests(unittest.TestCase):
         self.runs.mkdir()
 
         scripts = self.root / "scripts"
-        delegate = scripts / "delegate"
+        delegate = scripts / "direct"
         agents = scripts / "agents"
         delegate.mkdir(parents=True)
         agents.mkdir()

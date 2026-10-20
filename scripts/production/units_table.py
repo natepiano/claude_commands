@@ -20,9 +20,9 @@ import showrunners
 import unit_lookup
 from production_units import Refusal
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
-from scripts.delegate import plan_history
+from scripts.direct import plan_history
 
 NONE = "—"
 # A task longer than this is cut, so one verification command cannot widen the whole table.

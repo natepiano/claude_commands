@@ -246,8 +246,8 @@ Loop/verbose only:
    `Checkpoint <short hash> — phase N: <title>.` with its push note, if any.
    This report follows successful release when the phase was active.
 9. In a production unit, run
-   `python3 ~/.claude/scripts/delegate/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
-   and `python3 ~/.claude/scripts/delegate/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
+   `python3 ~/.claude/scripts/direct/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
+   and `python3 ~/.claude/scripts/direct/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
    and keep both lines for <ProductionUnit/> item 3's checkpoint notice.
 </CheckpointCommit>
 

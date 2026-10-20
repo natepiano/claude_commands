@@ -46,14 +46,14 @@ from scripts.production import change_review  # noqa: E402
 
 TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
-    "mac_test", "usage", "bevy_upgrade", "production", "delegate", "buildlog",
+    "mac_test", "usage", "bevy_upgrade", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style",
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
 MODULE_MEMORY_MIB = 48
 # A module still running this long is killed and the run is red: a hung module holds every gate
-# behind it. The slowest measured module took 387 s at load 152 (delegate/test_verify_mac_offload.py,
+# behind it. The slowest measured module took 387 s at load 152 (direct/test_verify_mac_offload.py,
 # 2026-10-18); the limit is about 4.6 times that.
 DEFAULT_MODULE_TIME_LIMIT_S = 1800
 # basedpyright resolves bpy (Blender's interpreter only) and PIL (a PEP 723 dependency) from this

@@ -10,7 +10,7 @@
 # Runs started before the rename keep /tmp/claude/delegate/ until they end; a
 # new run in the same Claude session replaces that session's marker there.
 #
-# The marker tells the Stop hook (stop-delegate-continue.py) that this Claude
+# The marker tells the Stop hook (stop-direct-continue.py) that this Claude
 # session is mid-run, so an approaching context limit cannot end the turn and
 # strand the run. end_session.sh removes it.
 #

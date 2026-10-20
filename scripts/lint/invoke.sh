@@ -2,7 +2,7 @@
 # invoke.sh — sourced library holding every cargo invocation policy: canonical
 # flags, config/lint.conf gating, and macOS sandbox-failure detection.
 # The lint CLI in this directory serves shell aliases, validate_ci.sh and
-# pre_release_checks.sh. delegate/verify.sh sources this file directly and adds
+# pre_release_checks.sh. direct/verify.sh sources this file directly and adds
 # only its per-package scope rules on top. Nothing
 # outside this directory composes policy flags like -D warnings or the nextest
 # profile.

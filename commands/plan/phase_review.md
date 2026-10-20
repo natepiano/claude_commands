@@ -155,7 +155,7 @@ Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`. In a delegate
 run, select an open worker per `/unit:direct`'s `<RunPhaseReview/>`, then:
 
 ```
-bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" --phase <phase> \
+bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" --phase <phase> \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/architect_prompt_<phase>.md" \
   review \

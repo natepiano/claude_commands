@@ -21,7 +21,7 @@ pushed.
 | `scripts/production/showrunners.py` | Reads timer CHECK paths and resolves Formerly names. |
 | `scripts/production/unit_lookup.py` | Groups marked sessions by current slug and reports Claude state. |
 | `scripts/production/stall_watch.py` | Supplies hashed state paths and matches inherited process marks by current slug. |
-| `scripts/delegate/review_pool.py` | `_production` resolves the production argument to its current pool. |
+| `scripts/direct/review_pool.py` | `_production` resolves the production argument to its current pool. |
 | `commands/showrunner/rename.md` | Showrunner workflow and recovery instructions. |
 | `docs/production_format.md` | Production Context's Formerly field. |
 

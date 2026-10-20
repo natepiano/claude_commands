@@ -23,7 +23,7 @@ from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import berth_board
 
-PHASE_TABLE = Path(__file__).resolve().parent.parent / "delegate" / "phase_table.py"
+PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
 
 
 class PlanLanded(NamedTuple):
