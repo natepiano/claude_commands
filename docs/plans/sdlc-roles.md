@@ -61,42 +61,24 @@ For active process redesigns, as we are currently undergoing with promotions and
 ## Phases
 
 ### Phase 1 — One command counts each name and its other names, and the design doc maps who does each duty  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `roles_audit.py baseline` prints how often each defined term and each of its other names appears in live files, and the design doc holds the duty matrix, the term table, that baseline, the friction and the questions for the user.
-
-**Spec:**
-- `scripts/production/role_terms.toml`: one table per term, with `name` (the defined name), `kind` (`role`, `document`, `step` or `record`), `defined_in` (file and section), and `other_names` (each name that means the same thing, for example `seat` for worker, `trunk` for merge branch, `/unit:delegate` for `/unit:direct`, `orchestrator` for showrunner or unit director). Seed it from **Words** in `docs/production_format.md` and the names the doc worker finds; a term with no definition has `defined_in = "none"`.
-- `scripts/production/roles_audit.py baseline [--root DIR] [--since DATE] [--until DATE]` (default root: the repository; default window: the last 14 days). Each measure is one function that takes parsed records and returns a typed result, so tests feed fixtures. Output: one aligned table per group, each row with its file set or window and n.
-  1. **Names.** For each term: hits and files for the defined name and for each other name, in live files (`commands/`, `docs/` without `docs/plans/`, `skills/`, `CLAUDE.md`, and the user-facing strings of `scripts/` — string literals only, not identifiers or paths). A match inside a path or a command name the term list marks `kept` (for example `docs/delegate/`) does not count. A total row: other-name hits as a share of all hits.
-  2. **Definitions.** Terms with no `defined_in`; terms defined in more than one file, with each file.
-  3. **Unit and session names.** For every production doc that `showrunners.py list` prints: each **Units** row name that does not follow `<area>-unit`, and each showrunner slug or unit name that two productions both use.
-  4. **Wrong-party asks.** In the message log for the window: messages from a unit director to the user, and from a unit director to another production's showrunner, by sender. Where the log does not tell a role, print `not recorded` and name the source that would.
-  - The script reads natedev's records. A table whose source the Mac also keeps says `natedev only`.
-- Wording fix, approved by the showrunner 2026-10-20 as not a redesign: `docs/production_format.md` **Words** ("reports on a schedule") and the `description` line of `commands/showrunner/produce.md` ("report each unit's ETA on a schedule") say the showrunner reports when asked, to match the rule the user set (updates on demand, user 2026-10-13). The Friction list records the conflict as found.
-- The design doc `docs/plans/sdlc-roles-design.md`, sections:
-  - **Duty matrix.** One row per duty (for example: merge a checkpoint, push, promote to main, settle a design, write a Work Order, dispatch a worker, run a gate, ask the user, relay the user's words, report an ETA, give dailies, retire a unit, move an account, rename a unit, place a build hold). Columns: the role that does it, every other role a file also gives it to, and each source as `file` and tag or section. Mark each row `one owner`, `duplicate` (two files give it to one role in different words), `conflict` (two files give it to different roles, or say different things), or `no owner`. Roles come from hierarchies-unit's **Map**, by its row names; the designer and reviewer roles come from guilds-unit's plan, marked planned.
-  - **Term table.** Each term in `role_terms.toml`, its definition in one line, its other names and the files that use each, and the term the doc recommends. The table includes documents (Work Order, as-built, add-on, proposal, change, dailies), steps (checkpoint, shrink, phase review, landing call) and records, not only roles.
-  - **Baseline.** The `roles_audit.py baseline` output, with the command, its file set and its window.
-  - **Friction.** Each recorded problem with a duty or a name, one line each with its source: memories (for example `relay-directly-not-via-user`, `unit-asks-go-through-the-showrunner`, `process-redesigns-are-questions`, `ask-director-before-moving-unit`, `herdr-work-owner`, `name-work-not-phase-numbers`, `small-fixes-by-subagent-in-main`), the user's words in production docs, and each `conflict` and `no owner` row of the duty matrix. Mark each `measured` or `reported`.
-  - **Questions for the user.** Only what the matrix and the term table need from the user: a duty the sources give to no one or to two roles, and a name with two current uses. Each one plain line with the answers it can build and its recommended answer.
+- `roles_audit.py baseline [--root DIR] [--since DATE] [--until DATE]` reads natedev's records. The default root is the repository. The default window is the last 14 days. It prints one aligned table per group, and each row shows its file set or window and n.
+- The tables are: names and other names in live files (`commands/`, `docs/` without `docs/plans/`, `skills/`, `CLAUDE.md`, and the string literals of `scripts/`), with a total row for the other-name share; definitions (terms with no definition, terms defined in more than one file); production unit and session names; and sent contacts per recipient in the window, with request intent `not recorded`.
+- `role_terms.toml` holds 36 terms. Each term has `name`, `kind`, `defined_in`, `other_names`, `kept` (paths and command names that do not count) and `other_meaning_files` (files where the word has an unrelated meaning).
+- The design doc has these sections: Sources, Duty matrix (D01–D52; the designer and reviewer rows are marked planned), Term table, Baseline, Friction (18 lines), Questions for the user (Q1–Q8) and Next steps.
+- **Words** in `docs/production_format.md` and the `description` of `commands/showrunner/produce.md` say the showrunner reports when asked.
 
 **Files:**
-- `scripts/production/roles_audit.py` — new
-- `scripts/production/test_roles_audit.py` — new
-- `scripts/production/role_terms.toml` — new
-- `docs/plans/sdlc-roles-design.md` — new
-- `docs/production_format.md`, `commands/showrunner/produce.md` — the wording fix only (hub files this unit owns)
+- `scripts/production/roles_audit.py` — the measure
+- `scripts/production/test_roles_audit.py` — 18 fixture tests
+- `scripts/production/role_terms.toml` — the term list
+- `docs/plans/sdlc-roles-design.md` — the design doc
 
-**Workers:** `2 writers` — the script and the design doc are disjoint.
-- `impl` — `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py`, `scripts/production/role_terms.toml`
-- `test` — opens as impl — the wording fix; the design doc's Duty matrix, Term table, Friction and Questions sections; it sends `impl` each term and other name it finds for `role_terms.toml`, and fills Baseline from `impl`'s output when the script runs
+**Binds later work:** The measure command is `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline [--root DIR] [--since DATE] [--until DATE]`. Wrong-party asks are not measurable. The message log has no role or intent fields, so the tool counts sent contacts per recipient only. A real wrong-party measure needs role fields in message records. Python and shell counts are lower bounds. Work that depends on an answer to Q1–Q8 marks that dependency.
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/production -p 'test_roles_audit.py'` green; `basedpyright scripts/direct scripts/production` has the `0 errors, 0 warnings` line; the merge gate (Delegation Context → Test) green; `roles_audit.py baseline` runs on real data on natedev in under 60 s and its output is in the doc; every matrix row and Friction line names a source. At phase end the unit director sends the showrunner the Questions section as one message for the user, and sends the duty matrix and the term table to guilds-unit, phases-unit and fix-rounds-unit, and through the showrunner to hierarchies-unit (build-followups).
+**Gotchas:** The tool follows Python output references in lexical scope only. It does not follow helper call arguments into parameters; the report header says so. It does not count shell `cat >&2 <<EOF` stderr heredocs. The term `change` also means menu actions in some files; `other_meaning_files` excludes those files.
 
 ### Phase 2 — The design doc recommends who owns each duty and what each thing is called, split into steps  · status: todo
 **Depends on:** Phase 1
@@ -124,7 +106,13 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `docs/plans/sdlc-roles-design.md`
 - `test` — opens as impl — re-runs `roles_audit.py baseline` and checks each number the doc cites against it, and each Steps file list against the files the measure names; it writes no doc text
 
-**Constraints from prior phases:** the duty matrix, the term table, the baseline, the friction and the user's answers to the Phase 1 questions are in the design doc.
+**Constraints from prior phases:**
+- The duty matrix (D01–D52), the term table, the baseline, the friction (18 items) and the questions Q1–Q8 are in the design doc. The questions went to the showrunner on 2026-10-20 17:50 EDT. Do not wait for the answers: write each answer that has arrived into the doc, and mark each candidate that depends on an open question with its Q number.
+- The message log has no sender role, recipient role or request intent. `roles_audit.py baseline` prints sent contacts per recipient with intent `not recorded`. No candidate is scored on wrong-party asks: score it on sent contacts, or say that it needs role fields in message records first.
+- `roles_audit.py` counts Python names in their lexical scope only and does not follow helper call arguments; it does not count shell `cat >&2 <<EOF` stderr heredocs. Shell and Python counts are lower bounds; say so beside any number taken from them.
+- Run the measure with `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline` from the worktree root.
+- Phase 1 read hierarchies-unit's **Map** from its uncommitted draft. The committed Map is `git -C /home/natepiano/worktrees/claude-build-followups-hierarchies show d0b07aec:docs/plans/build-followups-hierarchies-design.md`, section **Map** (also on main as merge 83a0ad28). Check every duty matrix row that cites the Map against it and correct the row first. A later Map change arrives as a new pointer from the showrunner.
+- fix-rounds-unit checked the repair-round rows against `docs/production_format.md` <ProductionUnit/> item 7 (2026-10-20). Fold in before the new sections: D26's primary is "Top-level showrunner for the early landing call; Unit director when another unit waits on the phase". Add three rows, owner Unit director, source PF item 7: "A fix that fails twice" (find the cause, write it in the attempts log, then one pass with a new approach); "One batch per check" (each live check or shot set after a fix covers every changed view, and all its findings go to the next round together; also direct.md <UXReview/>, <FixDispatch/>); "Own change only" (the unit director sends a defect from before the phase to the showrunner, and the showrunner routes it to the owning unit). Rule changes stay with fix-rounds-unit.
 
 **Acceptance gate:** the doc has the four sections; each candidate has a score on every measure and rule; each step names its measure, its size and how to undo it; the adversarial and astra findings are folded in. At phase end the unit director sends the showrunner the Recommendation and Step 1 as one question for the user, with the answers it can build and the one it recommends.
 
@@ -144,7 +132,6 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Files:**
 - `docs/plans/sdlc-roles-design.md` — Step log
 - `scripts/production/role_terms.toml` — when the step changes a name
-- the files the approved step names
 
 **Workers:** filled from the approved step.
 
@@ -160,7 +147,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Goal:** the design doc says whether Step 1 moved its measure, and the next step goes to the user.
 
 **Spec:**
-- Run `roles_audit.py baseline` after the change, on the same file set; for a measure with a window (wrong-party asks), the after window is at least 3 days from the merge. Add the after numbers to the Step log with n for each.
+- Run `roles_audit.py baseline` after the change, on the same file set; for a measure with a window (sent contacts per recipient), the after window is at least 3 days from the merge. Wrong-party asks are not measurable until message records carry roles; do not report them. Add the after numbers to the Step log with n for each.
 - If the measure did not move by at least half the expected size, the Step log says so, names the likely reason, and proposes undoing it or changing it; that proposal is the question.
 - Otherwise update Steps with what the measure taught, and pick the next step.
 - At phase end, the unit director sends the showrunner the result and the next step as one question for the user. The next approved step becomes a new phase after this one, with the Work Order of Phase 3 and the step's own Spec.
