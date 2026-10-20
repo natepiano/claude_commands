@@ -592,32 +592,171 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `load-rust-style.sh` is a zsh script; bash fails on it by design.
 - The base already carries two basedpyright errors (missing `bpy` and `PIL` imports), so a `0 errors` gate reads as "no new diagnostics".
 
-### Phase 19 — Roll-out  · status: todo
-**Depends on:** Phase 16, Phase 17, Phase 18
-**Blocked by:** pilot pass (as Phase 18).
+### Phase 19 — Roll-out  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** cargo-liner's whole backlog is swept, then hana's main showrunner runs `/showrunner:add_style` and `hana-style` runs on its own from then on.
-
-**Spec:**
-- cargo-liner: the style showrunner removes the `**Pilot scope:**` line from each launched unit's own copy (`<main checkout parent>/cargo-liner-style-<family>/docs/style-production/units/<family>-unit.md`; the showrunner copy never reaches a launched unit) and launches `values-unit`, whose row the pilot bootstrap left out, with `add_unit.py --production <style doc> values --plan docs/style-production/units/values-unit.md` and Owns `none — takes what the board leaves free`. A unit that exhausted its scoped backlog is parked on `— blocked: waiting on the showrunner: sync` (refill exit 3), and a plan edit does not wake it: after removing the scope lines, the style showrunner sends each parked unit director an explicit refill instruction, and the phase records a later ticket in a crate the unit's scope had excluded. hana's bootstrap passes no `--pilot`. The phase watches, through `/showrunner:style_report` and the parent's dailies, until every tier A-D rule reads done at the synced tip (held counts as done), and records the date and counts in `docs/plans/build-followups-style-pilot.md` under `## Roll-out`.
-- hana: ask the build-followups showrunner to relay to hana's showrunner (production `tool-based-ui`, session `hana`, doc `/home/natepiano/rust/hana_catalyst/docs/hana/tool-based-ui-production.md`, branch point `init/catalyst`, Proposals `~/rust/hanadocs/issues`) to run `/showrunner:add_style`. It creates `style/init-catalyst`, the `hana-style` production and its four units. The phase is done when `hana-style`'s first hand-off reaches `init/catalyst` and its line shows in the tool-based-ui dailies. From then on it runs forever: each sync turns affected cells stale and the next tickets recheck them (about 35 hana slices and 8 cargo-liner slices of new code a week at today's rate).
-- Anything the roll-out shows is broken is fixed in `scripts/style/` in this worktree, each fix its own commit named in the phase report.
+- The roll-out runs as a stream of `scripts/style/` fixes that the cargo-liner roll-out showed, each its own checkpoint, merged as it lands. `docs/plans/build-followups-style-pilot.md` has no `## Roll-out` section; the checkpoints are the record.
+- Style decisions: `style_proposals.py file` makes one decision per rule, crate and rule blob. Its answer (approved, declined or unanswered) also covers later findings under the same rule text, and the ledger keeps which decision holds each finding (migration 12, `moved_from`). Refill builds approved decisions in small tickets; `decline` waives the filed findings in one transaction; off-rule finds become rule candidates (`drop-candidate` removes one). Decision names show `/` in a crate path as `+`. `complete` and refill close an approved decision whose findings are all built or waived.
+- `style_proposals.py migrate [--dry-run]` moves open style issues into decisions: `plan_moves` writes nothing, `apply_moves` writes, and a rerun is safe. An off-rule issue (filed by a style unit through `/issue`, no `style ` name prefix, no held finding) is never written; each prints `skipped: off-rule <path>`. The live cargo-liner run gave create 64, move 9306, close 500, off-rule 9.
+- `style_ledger.py record` refuses a clean, exception or held verdict on a crate or module cell of an included Rust file without `--input-scope file` (the verdict rests on that file and stays current when other files change) or `--input-scope rule`. Local rules follow the same path.
+- `style_plan.py gate` and `style_footprint.py check` print `error: <reason>` and exit 2 when the check could not run (`CheckCouldNotRun`, a `LedgerError`); `review:` with exit 1 is a real review result. Every ledger connection uses `BUSY_TIMEOUT_SECONDS = 30`. Check 5 counts changed lines per file (`FILE_CHANGED_LINE_LIMIT = 200`), reason `check 5: <path>: 200 or more changed lines (size only)`.
+- `approved_renames.py`: `applied_check(kind, before, after, path, read) -> AppliedInCode | RenameNotApplied | NoAppliedCheck`. A merged ticket marks a rename finding built only on `AppliedInCode`; `RenameNotApplied` stays filed and loses its build ticket; `NoAppliedCheck` keeps its merged ticket and a person settles it with `held built --id`. `ticket merge` prints a `not built` line for each finding left open. `reopen --issue --parent [--dry-run]` refiles the built findings of an approved issue whose rename is not in the code. `FileRename` lets the gate accept one approved module file rename, its `mod` line and the paths that name the module.
+- Ledger writers (`set_tip`, `ticket_add`, the ticket moves, `ticket_base`, `mark_built`, `decline_findings`) do git, file and catalog work before `BEGIN IMMEDIATE`, check the rows again under the lock, and retry up to 3 times when they changed (`retry_on_change`); the third failure refuses with `...; rerun`.
+- Held state `withdrawn` (migration 13, `withdrawn_by` records the judgment row): `style_proposals.py withdraw --repo --proposals [--dry-run]`, also run first by `file`, withdraws a filed finding when a judgment newer than the finding records exception at its cell. A finding an open ticket builds is kept and listed. A decision whose findings are all withdrawn closes with a reason that names them.
+- Earlier fixes: the gate proves import, variant-rename, local-rename and lint-attribute edits as mechanical; an approved qualified rename may update its uses in other files; proposals carry `style_rules` links (`proposal_issue.py --rules`, `rules` verb, `style_proposals.py link-rules`); ranking takes the project's most common `backlog_goal`; a unit plan's `**First files:**` line ranks those files first; `/new_style` writes a rule with complete metadata and `/local_style` runs it.
 
 **Files:**
-- `docs/plans/build-followups-style-pilot.md` — `## Roll-out`
-- `scripts/style/*` — fixes the roll-out shows, each named in the phase report
+- `scripts/style/style_proposals.py` — `file`, `rank`, `link-rules`, `complete`, `candidates`, `sites`, `reopen`, `withdraw`, `migrate`, `drop-candidate`, `decline`
+- `scripts/style/style_ledger.py` — decisions, `withdrawn`, input scope, busy wait, `retry_on_change`, migrations 12-13
+- `scripts/style/style_plan.py` — gate exit codes, applied check at gate and merge, first files
+- `scripts/style/style_footprint.py` — per-file size check, error exit 2
+- `scripts/style/approved_renames.py` — applied check and file renames
+- `scripts/production/proposal_issue.py` — `--rules`, `rules`
+- `docs/style_production.md`, `commands/unit/checkpoint.md`, `commands/unit/direct.md` — input scope flag, exit 2 handling (rerun the gate, keep the reservation, stop if the same error comes back)
+- `commands/new_style.md`, `commands/local_style.md` — rule creation
 
-**Workers:** 1 writer + 1 tester — mostly operational; nothing splits until a fix appears.
-- `impl` — the roll-out steps, the report section and any script fix
-- `test` (opens as impl) — tests for any script fix, beside the module
+**Gotchas:**
+- The ledger stores absolute proposal paths: a dry run on a copied issues folder needs those paths rewritten in the copy ledger.
+- The applied check gives a firm result only when it is certain; `paste!`, `include!`, a non-std derive on the parent, a keyword file name or a folder of child modules give no answer.
+- A decision's approval does not carry over to a new decision; `reopen` refuses a declined or unanswered decision, an open ticket and unsynced merged tickets.
+- hana's `/showrunner:add_style` roll-out stays with the showrunners.
 
-**Constraints from prior phases:** Phase 17: `cargo-liner-style` runs under `remove-running-section` with three pilot units and `**Pilot scope:**` lines; pilot report in `docs/plans/build-followups-style-pilot.md`. Phase 17 shipped: style tools read `origin/<branch point>`, so hana's `init/catalyst` must be pushed before its first sync (fix AI); refill exit 4 (unavailable board) and a sync whose lint step exits 1 were not seen live, and tests cover both, so `## Roll-out` records either if it occurs; the approved ranking backfill filled 279 style issues in `~/rust/hanadocs/issues`, left untracked. Phase 18: the fix pipeline is gone; `scripts/style/` is the only style tooling. The held files and `.claude/settings.local.json` still name it until the showrunner takes their edits to the user. Pilot results landed after Phase 18 (user approval, 2026-10-18): nate_style 34f4bb2 sets `input_scope: file` on 13 file-local rules, so each of those rules turns stale once and is rechecked through normal tickets. nate_style c8b3855 adds the keep-reasons sentence to `comments-name-code-constructs.md`, and 15c2b174 removes fix AD's stopgap copy from `style_plan.py`. `/showrunner:style_report` counts read that one recheck as stale cells, not a regression. The forbidden-words `pre_filter` (line 9: `shape` and an unbounded `rid(e|es|ing|den)` that matches inside `override`) caused empty tickets. The user approved the fix on 2026-10-18: nate_style 33266d5 matches each term only at a word start, drops `shape` and adds the stem the pattern missed. `## Roll-out` records any empty tickets seen before each checkout pulled it. Phase 16 shipped: `add_style.py --pilot` left `values-unit` without a Units row and wrote scope lines before the first launch. Phase 7 shipped: `scripts/style/add_style.py --production <parent doc> --model <m> --effort <e> [--check]` (run by the repo's main showrunner) bootstraps or attaches the repository's one style production. Slug `<main checkout basename>-style` (main checkout through `git rev-parse --git-common-dir`); checkout `<main checkout parent>/<slug>` on `style/<branch point with / as ->`; doc `docs/<slug>-production.md` with `**Kind:** style`, `**Branch point:**`, `**Parent production:**`, `**Proposals:**`, `**Push:** git`, `**Updates:** on demand`, and a Units table `Unit | Plan | Worktree | Branch | Port | Owns` whose four rows are `<family>-unit`, `docs/style-production/units/<family>-unit.md`, `<main checkout parent>/<slug>-<family>`, `<slug>-<family>`, `—`, `none — takes what the board leaves free`. An existing production (doc present and `<slug>` in `showrunners.timer_slugs()`) is attached: detached from an old parent, attached under the caller, its `**Parent production:**` and `**Proposals:**` rewritten (`_attach`, add_style.py:215-224), then `style_sync.py resume` runs (add_style.py:222-224; Phase 11 replaced printing pending hand-offs as JSON); a doc with no update timer is an interrupted bootstrap that reruns the create path, where `_write_missing` keeps every file already written. The standing plans (`> **Standing:** style_plan.py`; a Delegation Context with a `**Family:**` snapshot of rule ids and tiers plus the live `rules.py list --repo <checkout>` line; an empty `## Phases` heading where ticket phases go), the doc and its log are excluded through the shared `.git/info/exclude` (`/docs/style-production/`, `/docs/<slug>-production.md`, `/docs/<slug>-log.md`), so `git add` on them exits 1. `add_unit.py` launches an excluded standing plan from the showrunner checkout (`_is_excluded_standing_plan`, add_unit.py:476-483) and `ensure_worktree` (:632-636) copies it into the unit worktree only when the unit's copy is missing: the unit's copy is its own record and is never overwritten, so a later edit to the showrunner copy never reaches a launched unit. add_style exits 2 on a refusal (missing Proposals naming the field, `StyleBranchPointTaken`, a checkout on the wrong branch or repository, a live herdr session named `<slug>` with no update timer); a launcher exit 1 or 3 prints open-session guidance (`herdr session attach <slug>`; rerun once it has its timer, else end it) and returns that code. `--check` on an existing production prints the attach line, steps 3-6 `skipped: <slug> already exists` and step 7 `update Parent production and Proposals, run style_sync.py resume; synced tip unchanged` (add_style.py:252).
+**Ruled out:**
+- An off-rule issue build ticket: approved proposals build as plain numbered code phases outside the style ledger.
+- A restructure split command: style decisions replace it.
 
-**Acceptance gate:**
-- `/showrunner:style_report` for `cargo-liner-style` shows every tier A-D rule done.
-- `grep -c 'Pilot scope' <each unit worktree copy>` prints 0 for all four units, and `values-unit` has a Units row and a running director.
-- `names-unit` and `types-unit` each take a ticket in a crate outside their former scope after the refill instruction (recorded under `## Roll-out`).
-- `hana-style` is attached under `tool-based-ui` (`showrunners.py parent hana-style`), and one hand-off is merged on `init/catalyst` (`git log --grep 'hand-off'`).
-- Any script fixed: its folder's tests green, `basedpyright` clean, merge gate `--tests-only` green.
+### Phase 20 — Values work starts per file  · status: done
+
+#### As-built
+
+- `blocked_by_structure` (`scripts/style/style_plan.py`): a cell at a file waits only for open or stale tier-D cells at its own path; a crate-level cell (path == crate) waits for every one in its crate. Busy files still block. `waiting for structure` names only crates where every own cell is still blocked.
+- Move-in: a file whose content changes goes stale through its file-scope fingerprint (no new code). Refill's waive loop also waives a filed finding with no build ticket whose one-line text left its file and went into exactly one file that gained the line since the finding was judged, with reason `<file> site moved to <file> in synced commit <tip>`. `style_proposals.MovedSites` (one per refill; one `git diff` per judged commit), `Ledger.judged_commit -> JudgedCommit | NoJudgedCommit` (judging ticket's checkpoint, else base), `unit_files.file_text` (bytes decoded with `errors="replace"`).
+
+**Files:**
+- `scripts/style/style_plan.py`, `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/unit_files.py`, `scripts/style/test_style_plan.py`, `docs/style_production.md`
+
+**Gotchas:**
+- A finding text that is a description, not a source line, never matches a destination, so it stays filed.
+- Only approved decisions of the refilling unit are checked; unapproved decisions wait for approval.
+
+### Phase 21 — Reopen every false built rename  · status: done
+
+#### As-built
+
+- `style_proposals.py reopen --all [--dry-run]` (`reopen_all`; the per-decision body is `file_unapplied_again`): every approved decision that holds a built finding, found from the ledger's built rows (closed decisions too), gets the same check and refusals as `--issue`; a refused decision prints a skip line and the run exits 1; `totals: reopen N, filed again M, skipped K`; one renumber after real reopens. `--parent` is needed only with `--issue`.
+- `held add` returning a built row whose rename is not in the code at the synced tip prints `built, but not in the code at <tip7>: run style_proposals.py reopen --all (decision <path>)` to stderr and changes no state; a check that cannot run leaves the hint out. `Built` carries `proposal`.
+
+**Files:**
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+
+**Gotchas:**
+- A built finding whose decision file is missing was skipped without a line; phase 22 prints `skipped <issue>: missing file`.
+
+### Phase 22 — reopen --all covers old-form issues  · status: done
+
+#### As-built
+
+- `reopen --all [--parent <slug>]` takes every issue that holds a built finding: approved decisions and approved old-form issues. An old issue moves under the parent its own `Parent:` line names (`old_issue_parent`); `--parent` is used only for an old issue with no such line, else it is skipped with `no Parent line; pass --parent`.
+- Each issue with a built finding that the run leaves out prints `skipped <issue>: <reason>` (`missing file`, `not approved`, `closed without answer`, or the reopen refusal) and counts in `skipped`; stderr says `skipped N issues`.
+- `run_moves` refreshes a decision it did not create with that decision's own parent, read before the first write, as withdraw does. `join_action` turns a missing generated body into a `LedgerError`, so it is refused before any write and the dry run matches the real run.
+- The `held add` hint says `(issue <path>)`.
+
+**Files:**
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+
+**Gotchas:**
+- The issue's `showrunner` field is a session name, not a parent slug; the body's `Parent:` line is the source.
+
+### Phase 23 — reopen names unchecked built findings and takes a person's override  · status: done
+
+#### As-built
+
+- reopen (`--issue`, `--all`) prints `cannot check <id> in <path>: <before> -> <after>; pass --finding <id> or --applied <id>` for each built rename the applied check cannot judge, and exits 1; restructure and type rows count only in `restructure not checked R`. `--all` totals: `reopen N, filed again M, cannot check K, restructure not checked R, skipped S`.
+- `reopen --issue <p> --parent <s> --finding <id>... --by <who>` files built findings again without the check; `--applied <id>... --by <who>` keeps them built (refused when the check finds the rename not applied). Unique prefixes; blank names, `--by` alone, and either with `--all` are refused; `--by` is stripped. All refusals come before the first write.
+- Migration 14: `held_findings.person_read_by`; `PersonReading = NotReadByPerson | ReadByPerson(by)`; the state shows the verdict; `held list` (and `--json` field `reading`) shows it. A move into built (ticket merge AppliedInCode, `mark_built`) clears it. `held add` leaves its reopen hint out for a row a person read.
+
+**Files:**
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`
+
+**Gotchas:**
+- A non-std derive (for example serde `Serialize`) on the parent gives no applied check; in production, 3 built renames in old issue 1d00e8b8 (57b9f36a, 00093229, 0cdf4372) are false built and need `--finding`.
+
+### Phase 24 — proposal gate takes the pairs it has; duplicates and plain-merge builds  · status: done
+
+#### As-built
+
+- `approved_rename_pairs` skips a rename finding with no `<parent>::<name>` pair (bare name, dot-form field, prose); a type or restructure finding still returns no pairs. Approval stays exact per token.
+- Bare duplicates: migrate and reopen print `drop <id> in <decision>: duplicate of <id>` and never move one beside its qualified finding. `style_proposals.py drop-duplicates --repo <repo> [--dry-run]` withdraws every bare duplicate that is filed or built, regenerates each decision body (also a stale one), and exits 1 on any skip. Migration 15: `held_findings.duplicate_of`; `WithdrawnBy = ExceptionVerdict(judgment) | DuplicateOf(finding)`.
+- A proposal ticket's phase text lists the exact cells to record (`Ledger.proposal_cells`, through the same `_check_cell_path` checks as record) and names the rename pairs; a rename with no pair is applied in its own file only. A git failure while listing cells stops the command.
+- `style_ledger.py held built --id <id>... --commit <merge> [--by <who>]` (`mark_built_at_merge`, `BuiltAtMerge`) marks filed findings built after a plain merge. The applied check runs at `<merge>`; a rename not applied is refused; a finding the check cannot prove needs `--by` and records `person_read_by`. All refusals come before the first write.
+
+**Files:**
+- `scripts/style/style_plan.py`, `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, their `test_*.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`
+
+**Gotchas:**
+- `held built --commit` takes the code repo's merge, and that merge must be an ancestor of the ledger's synced tip and not older than each finding's judged commit; a merge on the style branch that the last sync did not take is refused until the next sync.
+
+### Phase 25 — refill never reissues a ticket that cannot change a cell  · status: done
+
+#### As-built
+
+- Refill leaves a stale cell out of ticket selection when its newest judgment (current rule blob, newest declared scope, scope at the synced tip) is in the unit branch tip and in the style branch and saw the inputs the unit tip has (`Ledger.judged_at_base`, through `_repeated_judgments` and `_judgment_inputs_match`). Only the unit's own ticketable cells are checked; ranking and structure blocking still see every cell. `RefillCells` is built once per selection.
+- `next-phase` exit 6, `MergeStyleBranchFirst(cell_count, unit_tip, style_branch)`: `merge the style branch first: <n> cells judged at <tip7> wait for <style branch>`, only when a style branch is stored (`StoredStyleBranch | NoStoredStyleBranch`), the unit tip is in the pushed style tip, and that tip changes at least one left-out cell (`Ledger.style_merge_changes`). Otherwise refill waits for sync. A style branch missing on origin stops refill with the `fetch origin first` error. The unit runs `git fetch origin <style merge branch> && git merge --ff-only origin/<style merge branch>`, then refills; a refused or empty fast-forward ends blocked on the showrunner.
+- The held-cell skip ignores waived, built and withdrawn findings and needs at least one remaining finding, each filed on an open proposal.
+
+**Files:**
+- `scripts/style/style_plan.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_plan.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`, `commands/unit/direct.md`
+
+**Gotchas:**
+- Refill does not fetch: it reads the local `origin/<style>` ref, so a stale tracking ref gives exit 3 until a fetch or push updates it.
+
+### Phase 26 — a waived finding can be filed again  · status: done
+
+#### As-built
+
+- `style_proposals.py unwaive --repo <style checkout> --proposals <folder> --id <id>... --by <who>` moves each named waived finding back to unfiled (no proposal, build ticket or move) and prints `unwaived <id> by <who>` per finding. Ids take unique prefixes (`Ledger.named_held`). It refuses before any write when an id names no finding or several, the finding is not waived, its rule text changed since it was judged (`rule_changed_since_judged`), an open ticket judges or builds it, its decision is declined, or `--by` is blank.
+- `Ledger.unwaive_held` runs every check and the one write in a single transaction; a cell whose newest judgment is 'waived' goes back to 'held' with detail `unwaived by <who>`. The command adds only the decline check.
+- Migration 16 adds `held_findings.unwaived_by`, read as `WaiveUndo = NoWaiveUndo | WaiveUndoneBy` (`HeldFinding.waive_undo`). `held list` shows `unwaived by <who>`, `--json` carries `unwaived_by`; no later change clears it, a new waive included.
+- `file_decision` returns its `JoinAction`; `file` prints `waived <n> findings in <decision>: declined: <words>`.
+
+**Files:**
+- `scripts/style/style_ledger.py` — schema, `WaiveUndo`, `unwaive_held`, `named_held`
+- `scripts/style/style_proposals.py` — `unwaive` command, decline check, `file` output
+- `scripts/style/test_style_ledger.py`, `scripts/style/test_style_proposals.py`
+- `docs/style_production.md` — waived line and unwaive paragraph
+
+**Gotchas:**
+- `style_ledger.py` cannot import `style_proposals` (two module copies under `__main__`), so vault-aware checks live in `style_proposals.py`.
+
+**Ruled out:**
+- The command in `style_ledger.py` without the decline check: a declined decision waived an unwaived finding again at the next `file`, with no message.
+
+### Phase 27 — a held finding follows its declaration  · status: done
+
+#### As-built
+
+- `declarations.py` reads Rust items: `Declaration(keyword, name, owner)` with `owner` `ModuleItem()` (file top level, inline module or fn body) or `ImplOrTraitItem(name)` (impl type's last segment, after `for` for a trait impl; trait name in a trait body). Inline module names are not part of the identity, so a split of `mod a { … }` into `a.rs` follows. `read_declarations(text)` gives a `DeclaredFile` with `declared_items` and `declaration_at(line) -> DeclaredItem | NoDeclarationAtLine` (innermost item; a blank or comment line reads as the next token line; an impl or `use` line is `NoDeclarationAtLine`); `moved_site_line` gives the new line (same stripped text in the item's own span, else its keyword line).
+- The ledger declaration step reads each unfiled or filed `.rs` finding at its read commit (the judged commit, or the last follow's commit) when that commit is an ancestor of the synced tip. Outcomes, computed with no write (`declaration_reading`): `DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved | DeclaredInSeveralFiles | DeclaredInAnotherCrate | KeptForOpenBuild`. A destination is a file that gained the declaration since the read commit; one destination follows, none withdraws with `DeclarationGone(<tip>)`, several are left. A filed finding whose destination is in another crate is left; an unfiled one follows. A move or withdrawal of a finding that an open ticket builds is kept.
+- `follow_declarations` writes every follow and withdrawal in one `BEGIN IMMEDIATE` transaction and rechecks the synced commit and each row under the lock (`retry_on_change`); a git failure stops before any write.
+- Migration 17 adds `followed_from`, `followed_from_line`, `followed_at`, `declaration_gone_at`. `HeldFinding.follow: NotFollowed | FollowedDeclaration`; a second follow overwrites, so the record is the last move and `finding_id` never changes. `WithdrawnBy` gains `DeclarationGone`; `Withdrawn.proposal` is `Path | NoDecision` (unfiled when withdrawn). `held list` shows `followed from <path>:<line> at <commit7>`; `--json` adds `followed_from`, `followed_at`, `declaration_gone_at`.
+- `Ledger.hold` of an absent id returns a followed unfiled or filed row with the same rule, path, text, kind, before, after and blob, nearest line, not a new row.
+- `style_proposals.py follow --repo --proposals [--dry-run]` (`run_follow`) prints `follow`, `withdraw`, `left`, `kept`, `close` and `totals` lines, then closes a decision whose findings are all withdrawn (`plan_withdrawal` close) or refreshes it with its own `Parent:` line. A decision with no generated body or `Parent:` line prints `skipped <issue>: <reason>` and its findings stay unchanged. Exit 1 on a left finding or a skipped decision. Every run refreshes open decisions holding followed findings, so a rerun finishes a stopped run.
+- `file` runs the step first, before the withdrawal step; left lines do not change its exit code. Refill runs it once per proposals folder before its decision loop; followed findings ticket at their new path, a left finding prints `waiting <decision>: <id> declared in <n> files`, and a decision the step skips waits. The missing-file and moved-site waives apply only to findings the step could not read. `reopen` does not run it.
+
+**Files:**
+- `scripts/style/declarations.py` — Rust item reading
+- `scripts/style/style_ledger.py` — the step, migration 17, `hold` fallback, caches
+- `scripts/style/style_proposals.py` — `run_follow`, `follow` command, `file` wiring
+- `scripts/style/style_plan.py` — refill wiring
+- `scripts/style/test_declarations.py`, `test_style_ledger.py`, `test_style_proposals.py`, `test_style_plan.py`
+- `docs/style_production.md`, `commands/showrunner/proposal.md` — the step, its lines and the command
+
+**Gotchas:**
+- Declaration identity (keyword, name, owner) collides across files often (test helpers, `fn main` in bins, two trait impls on one type), so a file counts only when it gained the declaration since the read commit.
+- Judged commits and declared files are cached per `Ledger` by commit; rows are read fresh so the lock recheck sees other writers.
+- The `nate_style` test fixture has no origin, so a decision refresh in plan tests can fail with no error.
+
+**Ruled out:**
+- Merging `KeptForOpenBuild` into `KeptForBuild`: different outcome families.
+- A `--to` override for a left finding: a person waives it or changes the code until a real case needs one.

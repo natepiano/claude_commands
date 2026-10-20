@@ -84,6 +84,21 @@ again with its approval for a later finding, as a decision closed as built does.
 A finding is built only when its change is in the code. Repair a decision
 or an old issue that closed too early with `style_proposals.py reopen --repo
 <style checkout> --issue <issue> --parent <slug>`; add `--dry-run` to see the
-lines first.
+lines first. It exits 1 when a built rename has no check; read the code and
+pass `--finding <id>` (not applied) or `--applied <id>`, with `--by <who>`.
+Filing withdraws a filed finding that an `exception` under its rule's newer
+text supersedes, and closes a decision left with no filed finding. Run that step
+alone with `style_proposals.py withdraw --repo <style checkout> --proposals
+<folder>`; add `--dry-run` to see the lines first.
+Filing first moves a finding to the one file that now declares its item, or,
+when no file does, withdraws an unfiled one and leaves a filed one for a person; run that step alone with `style_proposals.py
+follow --repo <style checkout> --proposals <folder>`, and add `--dry-run` to see
+the lines first.
+Drop the bare duplicates of qualified renames from every open decision with
+`style_proposals.py drop-duplicates --repo <style checkout>`; add `--dry-run`
+to see the lines first. When a plain merge, not a ticket, built filed findings,
+mark them built with `style_ledger.py held built --repo <style checkout> --id
+<id> [--id <id> ...] --commit <merge>`; add `--by <who>` after reading the code
+of a finding the check cannot prove.
 For other proposals, `/unit:direct` marks plan issues active, and its final
 as-built pass closes them with the as-built doc.

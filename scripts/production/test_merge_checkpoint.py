@@ -559,13 +559,13 @@ class MergeCheckpointTests(unittest.TestCase):
                               + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
         self.production_doc(change_review=review)
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\n"
-                                    + "Change-Review: The grid fades gently | Look across the floor\n"
+                                    + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                     + "Change-Review: none — the merge script")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         merged = self.git("rev-parse", "--short=8", "HEAD")
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Look across the floor \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")

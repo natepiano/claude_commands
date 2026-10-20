@@ -1293,7 +1293,7 @@ def read_role_map() -> RoleMap:
         raise AccountsError(str(error)) from error
 
 
-def write_role_map(change: RoleMapChange) -> None:
+def write_role_map(change: RoleMapChange | role_map.WorkersClaudeRouteChange) -> None:
     try:
         role_map.write_role_map(change)
     except role_map.RoleMapWriteRefused as error:
@@ -1367,8 +1367,17 @@ class LegacyHomeLaunch:
     """This machine still launches unscoped Claude with no account setting."""
 
 
-def account_for_unscoped_launch(environment: Mapping[str, str]) -> ClaudeLaunchAccount | LegacyHomeLaunch:
-    """Retain an uncut legacy home, otherwise choose the caller or showrunners."""
+@role_map.role_map_command
+def account_for_unscoped_launch(environment: Mapping[str, str], *, workers: bool = False) -> ClaudeLaunchAccount | LegacyHomeLaunch:
+    """Use a named workers route, else retain the caller or showrunners choice."""
+    if workers:
+        target = read_role_map().workers_claude
+        if isinstance(target, role_map.NamedWorkersClaudeAccount) and datetime.now(timezone.utc) < target.until:
+            selected = claude_workers_account(target.label)
+            prepared = prepared_account(target.label, resume=True)
+            if isinstance(prepared, AccountRefused):
+                raise AccountsError(prepared.reason)
+            return selected
     configured = environment.get("CLAUDE_CONFIG_DIR", "")
     if not configured:
         if account.claude_account(main_config_dir()) is not None:
@@ -1474,6 +1483,19 @@ def claude_account_dir(label: str) -> Path:
     if not isinstance(expected, ExpectedAccountLogin):
         raise AccountsError(expected.problem)
     return account_dir(parsed.label)
+
+
+def claude_workers_account(label: str) -> NamedAccount:
+    """Check a queued workers destination without changing its folder."""
+    directory = claude_account_dir(label)
+    if not directory.exists():
+        raise AccountsError(f"accounts: {label} is not set up; run accounts.py setup {label}")
+    prepared = prepared_account_preview(label, resume=True)
+    if isinstance(prepared, AccountRefused):
+        if isinstance(account_directory_readiness(label), AccountDirectoryLoggedOut):
+            raise AccountsError(f"accounts: {label} is not logged in; run CLAUDE_CONFIG_DIR={shlex.quote(str(directory))} claude and /login")
+        raise AccountsError(prepared.reason)
+    return NamedAccount(label, directory)
 
 
 def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
@@ -4220,6 +4242,8 @@ def validate_next_move_target(entry: next_moves.NextMove) -> None:
         _ = claude_account_dir(entry.to)
     elif isinstance(entry.to, next_moves.CodexWorkersTarget):
         _ = check_codex_target(entry.to.label, accounts_home() / ".codex", repair=False)
+    elif isinstance(entry.to.account, next_moves.ClaudeWorkersTarget):
+        _ = claude_workers_account(entry.to.account.label)
 
 
 @role_map.role_map_command
@@ -4233,7 +4257,7 @@ def main(argv: list[str]) -> int:
     try:
         if options.action in ("next-read", "next-write"):
             if not role_map.is_role_map_host():
-                raise AccountsError("accounts: next moves belong on natedev")
+                raise AccountsError("accounts: account moves belong on natedev")
             if options.action == "next-read":
                 print(next_moves.encode_next_moves(next_moves.read_next_moves()))
             else:
@@ -4255,7 +4279,7 @@ def main(argv: list[str]) -> int:
                 _ = next_moves.add_next_move(options.group, options.percent, options.label,
                                              options.hold_mode, insertion=options.insertion)
                 print(next_moves.list_next_moves() if role_map.is_role_map_host()
-                      else f"added {options.group} next move")
+                      else f"added {options.group} account move")
             elif options.next_action == "remove":
                 next_moves.remove_next_move(options.group, options.next_position)
                 print(f"removed {options.group} {options.next_position.value}")
