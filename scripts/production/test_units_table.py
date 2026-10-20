@@ -16,9 +16,9 @@ import unit_lookup
 from herdr import HerdrPlace
 import units_table
 
-# Importable once units_table has put scripts/delegate on the path.
+# Importable once units_table has put scripts/direct on the path.
 import phase_table
-from scripts.delegate import plan_history
+from scripts.direct import plan_history
 
 
 def unit(name: str, claude: unit_lookup.Claude | None) -> live_units.LiveUnit:

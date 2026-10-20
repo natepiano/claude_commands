@@ -231,7 +231,7 @@ from pathlib import Path
 root = Path(root_text)
 compact_above = int(compact_above_text)
 claim_file = root / f"impl_claim_{slot}.json"
-sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
+sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
 from worker_state import worker_claim_lock, worker_ledger, worker_record_path, worker_slot
 
 identity_file = worker_record_path(root, name, slot)

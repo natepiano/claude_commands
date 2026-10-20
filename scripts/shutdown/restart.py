@@ -1929,10 +1929,10 @@ def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
     if resumed is not None:
         return resumed
-    start = [str(SCRIPTS / "delegate" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
+    start = [str(SCRIPTS / "direct" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
     if launcher == "review.sh":
         return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
-    from scripts.delegate.worker_state import worker_slot
+    from scripts.direct.worker_state import worker_slot
 
     # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
     team_role = worker_slot(Path(seat["run_dir"]), seat["seat"]) or seat["role"]

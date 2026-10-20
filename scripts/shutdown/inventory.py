@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib", "hooks"):
+for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
@@ -28,7 +28,7 @@ from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
     from record import PausedSeat
-    from ..delegate.worker_state import worker_ledger
+    from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
 import herdr

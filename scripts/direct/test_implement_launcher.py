@@ -24,8 +24,8 @@ from typing import TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts
-from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
-from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
+from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -312,7 +312,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
 
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
-        delegate = self.root / "scripts" / "delegate"
+        delegate = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
         lib = self.root / "scripts" / "lib"
         delegate.mkdir(parents=True)
@@ -670,7 +670,7 @@ printf '%s\\n' '{answer}'
         _ = roster_path.write_text(json.dumps(roster), encoding="utf-8")
 
     def open_repair_round(self, session_dir: Path) -> None:
-        findings = self.root / "scripts" / "delegate" / "findings.py"
+        findings = self.root / "scripts" / "direct" / "findings.py"
         for arguments in (
             ("open", "--severity", "blocker", "--title", "Repair retry",
              "--caught-by", "delegate"),
@@ -692,7 +692,7 @@ printf '%s\\n' '{answer}'
 
     def observe_status_at_records(self, *, fail_landed: bool = False) -> None:
         """Record the status each copied helper sees before it updates its ledger."""
-        delegate = self.root / "scripts" / "delegate"
+        delegate = self.root / "scripts" / "direct"
         for name, commands in (
             ("progress_history.py", ("finish-pass",)),
             ("findings.py", ("landed", "abandon")),

@@ -18,9 +18,9 @@ import proposals_table
 import showrunners
 from proposals_table import ADD_ON_STATE, IN_PROGRESS_STATE, REVIEW_STATE, Row
 
-# Importable once proposals_table has put scripts/delegate on the path.
+# Importable once proposals_table has put scripts/direct on the path.
 import phase_table
-from scripts.delegate import plan_history
+from scripts.direct import plan_history
 
 
 @final

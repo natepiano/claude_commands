@@ -21,13 +21,13 @@ The session notifier sends a message to a live Claude session on a schedule: the
 | `scripts/production/unit_status.sh` | The showrunner's per-unit status script; prints `TICKS FAILING (…)`. |
 
 
-| `scripts/delegate/prepare_session.sh` | Run start: writes the run-active marker, then creates the instance. |
+| `scripts/direct/prepare_session.sh` | Run start: writes the run-active marker, then creates the instance. |
 
-| `scripts/delegate/end_session.sh` | Run end: removes the instance, then the marker. |
+| `scripts/direct/end_session.sh` | Run end: removes the instance, then the marker. |
 
 | `scripts/hooks/delegate_run.py` | `check` CLI: the unit instance's check. Also a library the delegate hooks import. |
 
-| `scripts/delegate/progress_history.py` | `progress` restarts the unit's instance on every call, refused ones included, and names its next tick in the report's clock line. |
+| `scripts/direct/progress_history.py` | `progress` restarts the unit's instance on every call, refused ones included, and names its next tick in the report's clock line. |
 
 | `scripts/production/dailies_input.py` | `--user-run` restarts the showrunner instance for a dailies the user runs. |
 
@@ -42,9 +42,9 @@ The session notifier sends a message to a live Claude session on a schedule: the
 
 | `/etc/nixos/modules/common/session-notifier.nix` | The 15 s job. |
 
-| `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/delegate/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
+| `scripts/message/test_notifier.py`, `test_sessions.py`, `scripts/direct/test_delegate_check.py` | CLI tests, run through the `NOTIFIER_*` variables. |
 
-| `scripts/delegate/test_progress_history.py` | The `progress` restart, refused calls included (missing `--cap-stage`, no active phase): `LAST_RESTART` at the call time and `NEXT_DUE` one interval later. |
+| `scripts/direct/test_progress_history.py` | The `progress` restart, refused calls included (missing `--cap-stage`, no active phase): `LAST_RESTART` at the call time and `NEXT_DUE` one interval later. |
 
 ### Instance state
 
@@ -177,7 +177,7 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 
 - Check contract: 0 sends, 2 removes the instance, other nonzero skips, and the check finishes within `TIMEOUT`. `delegate_run.py check` stays a quick file read and never treats an old run as gone.
 
-- Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`), never a "delegate run" (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Identifiers keep the word "delegate": the directories `scripts/delegate/` and `docs/delegate/`, `config/delegate.conf`, the `PLAN_DELEGATE_*` variables, `scripts/hooks/delegate_run.py`, and the name "delegate session directory" for a run's directory, as in the `Delegate session directory:` line the session-start hook prints; so does "delegate" where it means the agent that receives the work. The check: `git grep -niE 'delegate[ -]run' -- scripts`. Its identifier hits are the `delegate-run` temporary directory names in `scripts/delegate/test_delegate_check.py`, `test_verify_hold_wait.py` and `test_verify_release_ack.py`, `scripts/build_hold/test_build_hold.py` and `scripts/build_targets/test_build_targets.py`; any other hit breaks the rule.
+- Every message, `--help` text, comment and docstring under `scripts/` that names a run of `/unit:direct` calls it a "unit run" (`Unit run`, `unit run`, `mid-unit-run`), never a "delegate run" (user, 2026-10-08); `phase_table.py --help` reads `Show or refresh a unit run's plan phases.` Identifiers keep the word "delegate": the directories `scripts/direct/` and `docs/delegate/`, `config/delegate.conf`, the `PLAN_DELEGATE_*` variables, `scripts/hooks/delegate_run.py`, and the name "delegate session directory" for a run's directory, as in the `Delegate session directory:` line the session-start hook prints; so does "delegate" where it means the agent that receives the work. The check: `git grep -niE 'delegate[ -]run' -- scripts`. Its identifier hits are the `delegate-run` temporary directory names in `scripts/direct/test_delegate_check.py`, `test_verify_hold_wait.py` and `test_verify_release_ack.py`, `scripts/build_hold/test_build_hold.py` and `scripts/build_targets/test_build_targets.py`; any other hit breaks the rule.
 
 - **Run folders renamed (user, 2026-10-15).** A run started on or after 2026-10-15 keeps its folder in `/tmp/claude/unit/<run id>/`, its marker in `/tmp/claude/unit/active/<session id>` and its notifier instance in `~/.local/state/notifier/unit-<run id>/`. A run started before keeps `/tmp/claude/delegate/` and `delegate-<run id>` until it ends; nothing moves a live run's folder, and finished runs' folders stay where they are. `scripts/lib/unit_runs.py` holds both roots, new first: every Python reader takes its roots, markers and instance names from it, and the shell readers (`unit_notifier.sh`, `end_session.sh`, `unit_status.sh`) check both folders the same way. A sweep `--root` naming either real root covers both, so one root's sweep never takes the other root's live servers for unused ones. **Removal step, on or after 2026-10-22.** The former name stops being read only in its own change, and only once no running session owns a marker under `/tmp/claude/delegate/active/`: the date alone never ends it, since runs such as two-accounts' and screenshot's stay open past it. `unit_runs.py removal-check` exits 0 when none does and 1 naming each owner (session name, id and run folder); on 2026-10-15 it named 18. The step runs it first and stops on 1, then drops `FORMER_RUN_ROOT` and the shell fallbacks, and clear the 17 stale markers that ended runs left in `/tmp/claude/delegate/active/` (dating from 2026-10-05).
 
@@ -191,7 +191,7 @@ For each unit with a live Claude, `unit_status.sh` takes its session id from `un
 
 - Delegate scripts run with `dangerouslyDisableSandbox: true`.
 
-- `scripts/delegate/progress_timer.sh` stays, and `settings.json` still allows it, but nothing in this repo launches it. `progress_history.py` reads its `progress_timer` marker only when one exists; a unit run's next report time comes from its notifier instance.
+- `scripts/direct/progress_timer.sh` stays, and `settings.json` still allows it, but nothing in this repo launches it. `progress_history.py` reads its `progress_timer` marker only when one exists; a unit run's next report time comes from its notifier instance.
 
 - Times shown to the user are in the machine's local zone, with UTC beside them where the logs show it.
 

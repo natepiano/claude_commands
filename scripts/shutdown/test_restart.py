@@ -400,7 +400,7 @@ class RestartTests(ShutdownTestCase):
                 run = self.root / "worker run"
                 run.mkdir(exist_ok=True)
                 old_prompt = str(run / "old prompt.md")
-                launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", *(["--to", "impl"] if moved else []), str(run), owner["cwd"], old_prompt,
+                launcher = ["bash", "/config/scripts/direct/implement.sh", "--phase", "1", *(["--to", "impl"] if moved else []), str(run), owner["cwd"], old_prompt,
                             "task", "task instructions", "impl", "continue task", "0", "impl", "mesh-prefix"]
                 seats = [
                     record.PausedSeat(run_dir=str(run), seat="impl", role="impl", thread_id="private-thread-impl", turn_live=True, launcher_command=launcher),
@@ -441,15 +441,15 @@ class RestartTests(ShutdownTestCase):
                 # Seats with no readable launcher get every launcher argument, ready to run as pasted.
                 idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
                 self.assertTrue(idle_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "delegate" / "review.sh"), "--to", "review", str(run), owner["cwd"],
+                    str(restart.SCRIPTS / "direct" / "review.sh"), "--to", "review", str(run), owner["cwd"],
                     str(run / "review.resume-prompt.md"), "review", "resume after a move", "resuming after a move"])))
                 unread_line = next(line for line in lines if line.startswith("test (test, was working):"))
                 self.assertTrue(unread_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
+                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
                     str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
                 repaired_line = next(line for line in lines if line.startswith("project-impl (fix, idle):"))
                 self.assertTrue(repaired_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
+                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
                     str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"])))
                 self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)

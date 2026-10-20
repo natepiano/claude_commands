@@ -32,8 +32,11 @@ the reason:
    of each Mac claim on the worktree stops.
 5. Each process still working inside the worktree, a build or a test, gets SIGTERM.
 
-When nothing is left running, the Units row's Plan cell gets `(retired <date>, worktree removed)`,
-committed on the merge branch (the next merge push takes it out). Then the worktree, the local
+When nothing is left running, the Units row's Plan cell gets
+`(retired <date>, worktree removed, session <id>)`, committed on the merge branch (the next merge
+push takes it out). The session is the unit director's last one: the live session that carries the
+unit's mark, else the newest interactive transcript under the worktree. `/showrunner:resume_unit`
+resumes it. Then the worktree, the local
 branch and the origin branch are removed. When something still runs, nothing is marked or removed:
 the output says what, and a rerun resumes.
 

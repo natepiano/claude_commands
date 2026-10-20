@@ -234,7 +234,7 @@ working.
 </TurnEndGate>
 
 <ToolingContract>
-Run every command under `~/.claude/scripts/delegate/` with
+Run every command under `~/.claude/scripts/direct/` with
 `dangerouslyDisableSandbox: true`; do not try sandboxed first. Ledger and history
 calls run in the foreground. Unqualified delegate script names below resolve
 under that directory. This avoids half-applied durable-state writes.
@@ -359,7 +359,7 @@ Codex only; no timer process:
 
 <BackgroundVerificationContract>
 Run every `verify.sh` call as one plain command,
-`bash ~/.claude/scripts/delegate/verify.sh --session-dir "${SESSION_DIR}" <verb> …`,
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" <verb> …`,
 with no env prefix, redirect or trailing command: the settings allow rule
 matches only that shape, and the task notification already carries its exit
 code. For `verify.sh final`, launch under <ToolingContract/> so `verify.sh`
@@ -448,18 +448,18 @@ implementation, fix, or review prompt. It also defines <PhaseTeam/>,
 
 <VerificationContract>
 Rust delegates run only exact prompt lines using
-`~/.claude/scripts/delegate/verify.sh`:
+`~/.claude/scripts/direct/verify.sh`:
 
 | Intent | Command |
 | --- | --- |
-| compile feedback | `bash ~/.claude/scripts/delegate/verify.sh check <package>` |
-| package tests | `bash ~/.claude/scripts/delegate/verify.sh test <package>` |
-| one integration target alone | `bash ~/.claude/scripts/delegate/verify.sh test <package> <test>` |
-| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/delegate/verify.sh test <package> --filter <name> [--filter <name> …]` |
-| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/delegate/verify.sh test <package> --local "<why it cannot pass on macOS>"`; never to keep tests off the Mac: a reason that names a reservation is refused, and a Mac hold (`/build:hold hold <why> target mac`) does that |
-| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/delegate/verify.sh lint <package>` |
-| changed example | `bash ~/.claude/scripts/delegate/verify.sh example <package> <name>` |
-| final workspace gate | `bash ~/.claude/scripts/delegate/verify.sh final` |
+| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check <package>` |
+| package tests | `bash ~/.claude/scripts/direct/verify.sh test <package>` |
+| one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test <package> <test>` |
+| only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test <package> --filter <name> [--filter <name> …]` |
+| a test that cannot pass on macOS, run on natedev (before CI either machine answers a test, merge gates included; user, 2026-10-16) | `bash ~/.claude/scripts/direct/verify.sh test <package> --local "<why it cannot pass on macOS>"`; never to keep tests off the Mac: a reason that names a reservation is refused, and a Mac hold (`/build:hold hold <why> target mac`) does that |
+| phase lint checks under <PhaseChecks/> | `bash ~/.claude/scripts/direct/verify.sh lint <package>` |
+| changed example | `bash ~/.claude/scripts/direct/verify.sh example <package> <name>` |
+| final workspace gate | `bash ~/.claude/scripts/direct/verify.sh final` |
 
 Rules:
 
@@ -516,7 +516,7 @@ recording the result.
 </VerificationNarration>
 
 <FindingsLedger>
-Use `python3 ~/.claude/scripts/delegate/findings.py <command> --session-dir
+Use `python3 ~/.claude/scripts/direct/findings.py <command> --session-dir
 "${SESSION_DIR}" --phase "<phase id>"` for confirmed style violations in the
 main review, or after <Synthesize/> confirms another issue. Each open phase has
 its own ledger, and `--phase` names which one: with two phases open, a call
@@ -721,7 +721,7 @@ phase's gates pass. Follow its order through the next turn boundary.
 </PhaseEnd>
 
 <PrepareSession>
-Run `bash ~/.claude/scripts/delegate/prepare_session.sh` under
+Run `bash ~/.claude/scripts/direct/prepare_session.sh` under
 <ToolingContract/>. Capture `SESSION_DIR` and set `WORKING_DIR`. The script also
 creates the run-active marker; every exit must
 eventually run `end_session.sh`
@@ -985,7 +985,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
+   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
@@ -1013,7 +1013,7 @@ always may — early launch is opportunistic, never required.
 Every path that ends an early launch before its real pass starts also drops the
 row it was given:
 
-`python3 ~/.claude/scripts/delegate/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
+`python3 ~/.claude/scripts/direct/progress_history.py disarm-review --session-dir "${SESSION_DIR}" --reason "<canceled|reviewer error|void verdict>"`
 
 Run it alongside clearing `${REVIEW_DISPATCH_HANDLE}`, `${EARLY_REVIEW_SLOT}`,
 and `EARLY_REVIEW`. The
@@ -1385,7 +1385,7 @@ plan-doc edit acquires that phase's reservation in an enrolled repository.
 <PhaseCleanup>
 In `single`, run both halves under <ExecutionSteps/> step 9.
 At <PhaseEnd/>'s worker cleanup point, run
-`python3 ~/.claude/scripts/delegate/remove_workers.py --session-dir "${SESSION_DIR}"`.
+`python3 ~/.claude/scripts/direct/remove_workers.py --session-dir "${SESSION_DIR}"`.
 It removes the completed phase's Claude workers and any worker a dead run left
 alive; a failure is one line in the report, never a stop. Under
 <LongLivedWorkers/>, do not end this run's Codex workers: their turns finish, their
@@ -1396,7 +1396,7 @@ Mid-phase, stop each helper once its result is read and each app once no step
 uses it.
 
 At <PhaseEnd/>'s review-prose cleanup point, run
-`bash ~/.claude/scripts/delegate/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`.
+`bash ~/.claude/scripts/direct/clear_phase_review.sh "${SESSION_DIR}" <phase-id>`.
 It removes only the completed phase's review prose; structured progress
 history remains.
 User, 2026-10-03.
@@ -1417,7 +1417,7 @@ survives, the phase is not complete and this section must not run.
 
 In `single`, also run `finish-run --status completed`, then run <RunAsBuilt/>,
 apply <RetainDelegatedPhaseReservation/>, report that no checkpoint release was
-attempted, run `bash ~/.claude/scripts/delegate/end_session.sh`, and end. Other
+attempted, run `bash ~/.claude/scripts/direct/end_session.sh`, and end. Other
 modes continue.
 </RecordPhaseCompletion>
 
@@ -1573,7 +1573,7 @@ reason this run stopped, or coordination not active]
 Apply <UserFacingText/> and <RetainDelegatedPhaseReservation/> for every ending
 that did not complete <CheckpointCommit/>. Then run `progress_history.py finish-run` with
 `completed`, `stopped`, or `error`; it closes active pass/phase as incomplete
-when needed. Finally run `bash ~/.claude/scripts/delegate/end_session.sh` on
+when needed. Finally run `bash ~/.claude/scripts/direct/end_session.sh` on
 every exit so the Stop hook cannot revive a finished run. Then run
 <ReviewPendingAddOns/>; the summary and its commits never wait on it.
 </RunSummary>

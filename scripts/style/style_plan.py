@@ -1429,9 +1429,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
-        "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",
-        "`bash ~/.claude/scripts/delegate/verify.sh test <package>`",
-        "`bash ~/.claude/scripts/delegate/verify.sh lint <package>`",
+        "`bash ~/.claude/scripts/direct/verify.sh check <package>`",
+        "`bash ~/.claude/scripts/direct/verify.sh test <package>`",
+        "`bash ~/.claude/scripts/direct/verify.sh lint <package>`",
         f"`~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket {ticket_id}`",
         "Every ticket cell has a recorded verdict.", "",
     ])

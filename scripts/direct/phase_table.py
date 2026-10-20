@@ -24,7 +24,7 @@ if not __package__:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 
-from scripts.delegate import plan_history
+from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 from scripts.production import showrunners, unit_lookup
 from scripts.production.add_unit import Production, read_production

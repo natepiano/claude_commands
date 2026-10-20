@@ -18,8 +18,8 @@ from typing import cast, override
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
-from scripts.delegate import phase_table
-from scripts.delegate.recorder_fixture import invoke_recorder
+from scripts.direct import phase_table
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production import fake_showrunner, fake_unit_host, showrunners
 
 

@@ -1124,7 +1124,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
    With a **Review pool** line, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop --production <slug>`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py stop --production <slug>`.
    On failure, report its reason and run `stop` again; do not finish wrap
    until it succeeds. `<slug>` is the production doc's file name without
    `-production.md`.

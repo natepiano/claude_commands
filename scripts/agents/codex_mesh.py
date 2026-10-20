@@ -81,7 +81,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Te
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
-from scripts.delegate import plan_history
+from scripts.direct import plan_history
 from scripts.lib import unit_runs
 from scripts.message import sessions, process_table
 from scripts.whoami import account
@@ -230,7 +230,7 @@ ROSTER_FILE = "mesh_roster.json"
 DETACHED_RUNS_DIR = "mesh_runs"
 # A run record written before its supervisor's pid counts as live for this long.
 DETACHED_RUN_START_GRACE_SECS = 60.0
-BOARD_HELPER = Path(__file__).resolve().parent.parent / "delegate" / "board.sh"
+BOARD_HELPER = Path(__file__).resolve().parent.parent / "direct" / "board.sh"
 # The folders that hold unit run folders. An app-server whose session directory is one of their
 # children serves that run alone, so its seats get the run as PLAN_DELEGATE_BOARD_DIR.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()

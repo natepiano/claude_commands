@@ -755,7 +755,7 @@ class StopTests(ShutdownTestCase):
         other = self.root / "another directors run"
         run.mkdir()
         other.mkdir()
-        launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "task", "worker instructions", "impl", "resume task", "0", "impl", "prefix"]
+        launcher = ["bash", "/config/scripts/direct/implement.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "task", "worker instructions", "impl", "resume task", "0", "impl", "prefix"]
         proc = self.root / "proc"
         for pid, parent, argv in ((800, 801, ["python3", "codex_mesh.py", "start"]), (801, 1, launcher)):
             path = proc / str(pid)
