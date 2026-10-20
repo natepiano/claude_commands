@@ -55,19 +55,19 @@ Everything below is the contract.
    archived phase. That mistake reported a 68%-complete plan as 36%. To read the
    count directly, without an active phase and pass:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
+   `python3 ~/.claude/scripts/direct/progress_history.py phase-count --plan-doc "<plan>" [--phase-percent N]`
 4. Apply <EarlyReviewArm/>: steps 2-3 are its evidence and this report is one of
    its trigger points. It runs **before** the recorder, so a reviewer it launches is
    already listed among this report's workers.
 5. Run:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
+   `python3 ~/.claude/scripts/direct/progress_history.py calibrate --session-dir "${SESSION_DIR}" --candidate-percent "${PHASE_RAW_PERCENT}" --cap-stage "<stage>"`
 
    Pass the same stage to both calls; `progress` refuses a calibration drawn
    for another. Use its phase suggestion when applicable; otherwise keep the raw value. Then
    run:
 
-   `python3 ~/.claude/scripts/delegate/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"] [--tables]`
+   `python3 ~/.claude/scripts/direct/progress_history.py progress --session-dir "${SESSION_DIR}" --project-raw-percent "${PROJECT_RAW_PERCENT}" --project-percent "${PROJECT_RAW_PERCENT}" --phase-raw-percent "${PHASE_RAW_PERCENT}" --phase-percent "${PHASE_REPORTED_PERCENT}" --cap-stage "<stage>" --activity "<current activity>" [--phase-override-reason "<specific evidence>"] [--tables]`
 
    Pass `--tables` only for `/unit:report tables`. The call also rewrites this
    unit's phase note, which keeps the full phase list; write nothing there by
@@ -188,7 +188,7 @@ Everything below is the contract.
 **Questions about work already finished** — how many fix passes there have been,
 how long a review took, what an earlier phase ran — are answered by
 
-`python3 ~/.claude/scripts/delegate/progress_history.py timeline --session-dir "${SESSION_DIR}" [--phase <id>]`
+`python3 ~/.claude/scripts/direct/progress_history.py timeline --session-dir "${SESSION_DIR}" [--phase <id>]`
 
 which renders one row per pass, with the agent that ran each, for one phase or
 the whole run. Read the answer from it rather than counting from memory or

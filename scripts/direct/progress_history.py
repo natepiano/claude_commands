@@ -24,7 +24,7 @@ from typing import NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.delegate import phase_reservation, plan_history  # noqa: E402
+from scripts.direct import phase_reservation, plan_history  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -3950,7 +3950,7 @@ def _summary_table(
 
 def _project_chain_eta(state: dict[str, object], now: float) -> tuple[str, str, str]:
     """Render the same plan finish used by the phase table and vault note."""
-    from scripts.delegate import phase_table
+    from scripts.direct import phase_table
 
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
     if not plan_doc:
@@ -3988,7 +3988,7 @@ def _project_chain_eta(state: dict[str, object], now: float) -> tuple[str, str, 
 
 def _phase_eta_line(session_dir: Path, phase_number: str) -> str:
     """Describe the phase's promises, never its advanced schedule end."""
-    from scripts.delegate import phase_table
+    from scripts.direct import phase_table
 
     try:
         record = phase_table.build(session_dir)

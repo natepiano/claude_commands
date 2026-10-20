@@ -676,7 +676,7 @@ def test_steps(production: Production, paths: tuple[str, ...],
         match = re.search(r"(?:^|/)crates/([^/]+)/examples/([^/.]+)", raw)
         if match:
             examples.add((match.group(1), match.group(2)))
-    verify = tool("verify.sh", Path.home() / ".claude/scripts/delegate/verify.sh", "MERGE_CHECKPOINT_VERIFY")
+    verify = tool("verify.sh", Path.home() / ".claude/scripts/direct/verify.sh", "MERGE_CHECKPOINT_VERIFY")
     verify_command = [verify] if os.access(verify, os.X_OK) else ["bash", verify]
     steps = [(f"package {package}", [*verify_command, "test", package]) for package in sorted(packages)]
     steps.extend((f"example {package}/{name}", [*verify_command, "example", package, name])

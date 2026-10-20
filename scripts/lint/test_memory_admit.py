@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -19,6 +20,7 @@ from typing import cast, override
 from unittest.mock import patch
 
 import memory_admit as gate
+import nextest_budget as budget
 store = gate.store
 
 GIB = gate.GIB
@@ -101,16 +103,16 @@ class HistoryTests(unittest.TestCase):
         self.add_index()
         self.assertEqual(self.peak().source, "buildlog")
 
-    def test_measured_history_is_keyed_by_test_width(self) -> None:
+    def test_measured_history_pools_every_width_unless_one_is_named(self) -> None:
         self.add_measured(5, test_threads=16)
-        self.add_measured(5, start_gib=6)
+        self.add_measured(5, test_threads=4, start_gib=6)
         self.assertEqual(
             gate.expected_peak("hana", "nextest", self.host, NOW, self.root, test_threads=16),
             gate.ExpectedPeak(5 * GIB, "measured", 5),
         )
         self.assertEqual(
             gate.expected_peak("hana", "nextest", self.host, NOW, self.root),
-            gate.ExpectedPeak(10 * GIB, "measured", 5),
+            gate.ExpectedPeak(9 * GIB, "measured", 10),
         )
 
     def test_future_measured_records_do_not_override_prior_index_history(self) -> None:
@@ -217,6 +219,30 @@ class LedgerTests(unittest.TestCase):
         line = cast(dict[str, object], json.loads((self.root / "admission/anon_peaks.jsonl").read_text()))
         self.assertEqual((line["anon_peak_bytes"], line["status"]), (8 * GIB, 7))
         self.assertEqual((line["test_threads"], line["call_id"]), (16, "call-width-16"))
+
+    def test_a_run_is_admitted_on_the_history_of_every_width(self) -> None:
+        # One width's history is thin; a run asking for 32 threads may claim 4 after admission.
+        (self.root / "admission").mkdir()
+        with (self.root / "admission/anon_peaks.jsonl").open("a") as out:
+            for _ in range(5):
+                _ = out.write(json.dumps({"host": "test-host", "repo": "hana", "step": "nextest",
+                                          "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+                                          "anon_peak_bytes": 2 * GIB, "test_threads": 4}) + "\n")
+        decision, path = self.check(4 * GIB, argv=["cargo", "nextest", "run", "--test-threads", "32"])
+        self.assertEqual(decision.state, "admit")
+        self.assertIsNotNone(path)
+
+    def test_the_width_claimed_after_admission_is_the_one_recorded(self) -> None:
+        _ = self.sidecar.write_text("unused\n")
+        _, path = self.check(12 * GIB, sidecar=str(self.sidecar),
+                             argv=["cargo", "nextest", "run", "--test-threads", "32"])
+        assert path is not None
+        gate.set_width(path, 8, self.root)
+        _ = path.with_suffix(".max").write_text(str(GIB))
+        with patch.object(store, "host_name", return_value="test-host"):
+            gate.release(path, 0, self.root)
+        line = cast(dict[str, object], json.loads((self.root / "admission/anon_peaks.jsonl").read_text()))
+        self.assertEqual(line["test_threads"], 8)
 
     def test_unscoped_step_writes_no_peak(self) -> None:
         _, path = self.check(12 * GIB)
@@ -664,8 +690,45 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
         self.assertFalse(self.ran.exists())
-        self.assertEqual([path.name for path in (self.root / "log/admission/nextest").iterdir()], ["lock"])
+        # A run still waiting for memory claims no share, so it leaves no marker behind.
+        self.assertEqual(list((self.root / "log/admission/nextest").iterdir()), [])
         self.assertEqual(self.reservations(), [])
+
+    def nextest_step(self, ran_args: Path, reservation: Path) -> str:
+        return ('LINT_TEST_WIDTH=logical; cargo() { [[ "$*" == "nextest --version" ]] && return 0; '
+                + f'printf "%s\\n" "$*" > "{ran_args}"; cat "$BUILDLOG_MEM_RESERVATION" > "{reservation}"; }}; '
+                + 'run_nextest --workspace')
+
+    def test_a_run_waiting_for_memory_claims_its_share_only_once_admitted(self) -> None:
+        listing, ran_args, reservation = self.root / "listing", self.root / "args", self.root / "reservation"
+        free = (f'ls -A "$BUILDLOG_DIR/admission/nextest" >> "{listing}"; echo waited >> "{listing}"; '
+                + 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";')
+        result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[-1].split("|")[:2], ["0", "Granted"])
+        self.assertEqual(listing.read_text().splitlines(), ["waited"])
+        width = os.sysconf("SC_NPROCESSORS_ONLN")
+        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(width)])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], width)
+        self.assertEqual([path.name for path in (self.root / "log/admission/nextest").iterdir()], ["lock"])
+
+    def test_an_admitted_run_shares_the_threads_with_a_run_in_flight(self) -> None:
+        width = os.sysconf("SC_NPROCESSORS_ONLN")
+        shared = budget.shared_width(width, 2)
+        if shared == width:
+            self.skipTest("this machine has too few cores to share")
+        ran_args, reservation = self.root / "args", self.root / "reservation"
+        markers = self.root / "log/admission/nextest"
+        markers.mkdir(parents=True)
+        free = 'printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO";'
+        with (markers / "other.run").open("a") as other:
+            fcntl.flock(other, fcntl.LOCK_EX)
+            result = self.run_step(None, free, self.nextest_step(ran_args, reservation))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"nextest: {shared} of {width} test threads, shared with the runs in flight", result.stdout)
+        self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(shared)])
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], shared)
+        self.assertEqual(sorted(path.name for path in markers.iterdir()), ["lock", "other.run"])
 
 
 if __name__ == "__main__":

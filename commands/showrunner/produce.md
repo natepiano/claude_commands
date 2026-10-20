@@ -264,6 +264,8 @@ State:
   The user sees the count at all times in the Claude Code status line's
   `For you: …` row, under the quota row, with the changes, proposals and
   projects.
+  When the user asks for the next question, show only the oldest due item
+  (`/next question`).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
@@ -492,7 +494,7 @@ whatever arrived:
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
-| the user asks for "change review" or "the next change" | `/change_review` show; each verdict through <CloseChangeReview/> |
+| the user asks for "change review" or the next change, proposal, efficiency proposal or question | `/next <thing>`: one item, then stop; a change's verdict through <CloseChangeReview/> |
 | a change for the user to check that no checkpoint `Change-Review:` line carries | `/change_review` add |
 | a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
@@ -1122,7 +1124,7 @@ condition: wrap neither waits on it nor retires its worktree or branch.
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
    With a **Review pool** line, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop --production <slug>`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py stop --production <slug>`.
    On failure, report its reason and run `stop` again; do not finish wrap
    until it succeeds. `<slug>` is the production doc's file name without
    `-production.md`.

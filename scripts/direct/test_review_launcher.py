@@ -17,10 +17,10 @@ from unittest.mock import patch
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.delegate import wait_for_test_state
-from scripts.delegate.local_release_wait import IntervalReleasePolling
-from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
-from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct import wait_for_test_state
+from scripts.direct.local_release_wait import IntervalReleasePolling
+from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
+from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -350,7 +350,7 @@ class ReviewLauncherPassTests(unittest.TestCase):
         Mesh, agent execution, pool allocation and the waiting heartbeat watcher
         are controlled so tests spend no model tokens or minute-long sleeps.
         """
-        delegate = self.root / "scripts" / "delegate"
+        delegate = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
         lib = self.root / "scripts" / "lib"
         delegate.mkdir(parents=True)

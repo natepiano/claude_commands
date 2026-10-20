@@ -12,8 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.delegate import test_verify_untested_examples
-from scripts.delegate.test_verify_hold_wait import read_cycle_file, release_registered_call
+from scripts.direct import test_verify_untested_examples
+from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
 
 
 INVOKE = Path(__file__).resolve().parent.parent / "lint" / "invoke.sh"

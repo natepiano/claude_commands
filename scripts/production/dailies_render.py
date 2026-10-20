@@ -48,7 +48,7 @@ production's own plumbing words (PLUMBING).
 --reports-to  With --footer, for a showrunner under a root: adds the bullet
          `reports to <root slug>`.
 --doc    With --footer, the production doc: the line after the header counts
-         its changes to review, proposals and projects (footer_counts.py). A
+         its changes, efficiency, proposals and projects (footer_counts.py). A
          report reads the doc from its input's `doc`.
 
 The input format is in ~/.claude/commands/showrunner/dailies.md.

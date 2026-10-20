@@ -308,7 +308,7 @@ def post(message):
         text=True,
     )
 
-sys.path.insert(0, str(Path(mesh_script).parent.parent / "delegate"))
+sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
 from worker_state import worker_claim_lock
 
 with worker_claim_lock(root):

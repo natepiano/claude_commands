@@ -8,6 +8,8 @@ export interface StoredAccount {
   credits: number | 'unlimited' | null;
   use_credits: boolean;
   read_at: string | null;
+  read_ok?: boolean;
+  credits_in_use?: boolean;
 }
 export interface StoredAccountsStatus {
   accounts: StoredAccount[];

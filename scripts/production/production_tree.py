@@ -49,7 +49,7 @@ ROSTER_FILE = "mesh_roster.json"
 SERVER_FILE = "mesh_server.json"
 # A Claude worker's short id and name, one `<id>\t<name>` line each, appended by agent_bg.sh.
 WORKER_LEDGER = "workers"
-BOARD = Path(__file__).resolve().parent.parent / "delegate" / "board.sh"
+BOARD = Path(__file__).resolve().parent.parent / "direct" / "board.sh"
 
 
 class Edge(TypedDict):

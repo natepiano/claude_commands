@@ -12,15 +12,24 @@ is no index to add a row to. Every frontmatter change after filing goes through:
 "$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposal_issue.py" <verb> <issue> …
 ```
 
-It edits that one file, sets `date_modified`, and prints what changed. On a
+It edits that one file, sets `date_modified`, and prints what changed.
+
+Each proposal carries a number, `proposal_id: "P12"`, as a change row carries
+`C12`. `number <issue>…` gives the next free number to each proposal without
+one, oldest first, and skips other issues; `create` numbers a new style
+decision. Numbers are never used again: the highest in the issues folder and
+in the vault's `archive/` beside it is taken. Name a proposal to the user by
+its number and title, such as `P12 selection widgets toggle`. On a
 missing file or one without frontmatter it exits 2: report the line.
 
-| State | `status` / `stage` | Set |
+| State | `status` / `stage` | Set by |
 | --- | --- | --- |
-| written | open / backlog | `proposed_by` |
-| approved, not started | open / backlog | `showrunner`, `unit`, `plan` |
-| being built | open / active | |
-| built | closed | `as_built` |
+| waiting for approval | open / backlog | filing (`proposed_by`) |
+| in progress | open / active | `approve` (`showrunner`, `unit`, `plan`), or `start` for a plan issue that has no approval |
+| built | closed | `close` (`as_built` or `reason`) |
+
+The footer's proposal count and the table's `waiting for your review` rows are
+the waiting proposals only; approval moves a proposal to in progress.
 
 ## File
 
@@ -31,7 +40,8 @@ for all findings and `candidates` for off-rule ideas. A candidate is never a
 proposal; drop one with `style_proposals.py drop-candidate --idea "<text>"`. Other finished proposals become issues through `/issue`.
 
 For other proposals, tag `proposal` beside
-`issue`, and `proposed_by` the unit or session that wrote it. Drafts stay out.
+`issue`, and `proposed_by` the unit or session that wrote it; `/issue` then
+gives it its number. Drafts stay out.
 The writer proposes all five ranking values (`backlog_goal`,
 `backlog_alignment`, `backlog_impact`, `backlog_urgency`, `backlog_effort`) at
 once. The values reach the frontmatter only after the user confirms them, since
@@ -41,8 +51,9 @@ at the top of the issue body, and sends the showrunner the issue path, one line,
 and the five values.
 
 Do not show a new proposal to the user unasked (user, 2026-10-09: proposals
-accumulate for them to review). When they review one, show its proposed values
-in one plain-text line; they confirm or change them in their reply. Then write
+accumulate for them to review). They ask for one at a time (`/next proposal`),
+and after their answer the next waits until they ask. When they review one,
+show its proposed values in one plain-text line; they confirm or change them in their reply. Then write
 all five and delete the `Proposed ranking:` line:
 
 ```sh
@@ -60,6 +71,9 @@ copy and no phase numbers:
 … proposal_issue.py approve <issue> --showrunner "<name>" --unit <unit> --plan "<unit plan copy>"
 ```
 
+Proposals approved before 2026-10-20 move with `proposal_issue.py
+move-approved <issues folder>` (`--dry-run` first); a second run moves none.
+
 Refill builds its approved findings in small tickets. The decision stays open
 until every finding is built or waived. Decline only through:
 
@@ -71,8 +85,9 @@ For other proposals, send the approved issue to the unit that builds it.
 The unit adds phases that cite it and puts it on the plan's `> **Issues:**`
 line. Record that plan and its phases with the same `approve` command.
 `--showrunner` is the session name from `showrunners.py name <slug>`;
-`--unit` is the full name in the production's Units table. The stage stays
-backlog until work starts. Other declined proposals close through `/close_issue`.
+`--unit` is the full name in the production's Units table. Approve sets the
+stage active: the proposal is in progress and leaves the waiting count. Other
+declined proposals close through `/close_issue`.
 
 ## Start and close
 
@@ -90,8 +105,9 @@ Filing withdraws a filed finding that an `exception` under its rule's newer
 text supersedes, and closes a decision left with no filed finding. Run that step
 alone with `style_proposals.py withdraw --repo <style checkout> --proposals
 <folder>`; add `--dry-run` to see the lines first.
-Filing first moves a finding to the one file that now declares its item, or
-withdraws it when no file does; run that step alone with `style_proposals.py
+Filing first moves a finding to the one file that now declares its item, marks a
+filed rename built when its new name is declared, leaves a filed finding whose
+item is gone from its file, and withdraws the rest; run that step alone with `style_proposals.py
 follow --repo <style checkout> --proposals <folder>`, and add `--dry-run` to see
 the lines first.
 Drop the bare duplicates of qualified renames from every open decision with

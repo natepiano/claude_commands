@@ -28,11 +28,12 @@ from typing import NamedTuple, cast
 import showrunners
 from production_units import Refusal
 from issues import Issue
+from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
 from proposals_folder import open_proposals
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
-from scripts.delegate import plan_history
+from scripts.direct import plan_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import unit_runs
@@ -45,6 +46,7 @@ PENDING_NAME = "next_items_pending.md"
 # The Production Context line that names the issues folder a production files its proposals in.
 # A state says what the user can do, in their terms.
 REVIEW_STATE = "waiting for your review"
+IN_PROGRESS_STATE = "in progress"
 # An add-on is the showrunner's to settle, not the user's (user, 2026-10-12).
 ADD_ON_STATE = "the showrunner decides: build, save for later, or drop"
 BACKLOG_STATES = {"proposed": REVIEW_STATE, "deferred": "deferred until you ask for it"}
@@ -108,20 +110,38 @@ def backlog_rows(backlog: Path) -> list[Row]:
     return rows
 
 
-def issue_state(issue: Issue) -> str:
-    """Being built once its stage is active, approved once it names a plan, else the user's to review."""
-    if issue.value("stage") == "active":
-        unit = issue.value("unit")
-        return f"being built by {unit}" if unit else "being built"
-    plan = issue.value("plan")
-    return f"approved, not started: {plan}" if plan else REVIEW_STATE
+def issue_state(issue: Issue, progress: ProposalProgress) -> str:
+    """In progress by its unit once approved or started, else the user's to review."""
+    match progress:
+        case AwaitingApproval():
+            return REVIEW_STATE
+        case InProgress():
+            unit = issue.value("unit")
+            return f"{IN_PROGRESS_STATE} by {unit}" if unit else IN_PROGRESS_STATE
+
+
+class IssueRow(NamedTuple):
+    """A proposal issue's row and the progress it was built from."""
+    progress: ProposalProgress
+    row: Row
+
+    def order(self) -> tuple[bool, str, str]:
+        """The waiting rows first, then the ones in progress, each oldest first."""
+        in_progress = isinstance(self.progress, InProgress)
+        return in_progress, self.row.date, self.row.proposal
+
+
+def issue_row(issue: Issue) -> IssueRow:
+    """The issue's row, its title the P number and the file's name, with its progress read once."""
+    progress = proposal_progress(issue)
+    return IssueRow(progress, Row(issue.value("proposed_by") or NONE,
+                                  f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
+                                  issue.value("date_created") or NONE, issue_state(issue, progress)))
 
 
 def issue_rows(found: list[Issue]) -> list[Row]:
-    """One row per open proposal issue, oldest first; its title is the file's name."""
-    rows = [Row(issue.value("proposed_by") or NONE, issue.path.stem, issue.value("date_created") or NONE,
-                issue_state(issue)) for issue in found]
-    return sorted(rows, key=lambda row: (row.date, row.proposal))
+    """One row per open proposal issue: the waiting ones, then the ones in progress, each oldest first."""
+    return [found_row.row for found_row in sorted(map(issue_row, found), key=IssueRow.order)]
 
 
 def file_date(path: Path) -> str:

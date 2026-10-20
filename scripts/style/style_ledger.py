@@ -26,6 +26,7 @@ from types import TracebackType
 from typing import Literal, TypedDict, cast
 
 import rules as rule_catalog
+import style_footprint
 import style_rules
 from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
@@ -541,7 +542,7 @@ class DeclarationMoved:
 
 @dataclass(frozen=True)
 class DeclarationRemoved:
-    """No file declares the finding's subject at the synced tip; the finding is withdrawn."""
+    """No file declares the finding's subject at the synced tip. The finding is unfiled, or its file is gone there, so it is withdrawn."""
 
     finding: HeldFinding
     declaration: Declaration
@@ -566,15 +567,56 @@ class DeclaredInAnotherCrate:
 
 
 @dataclass(frozen=True)
+class DeclarationRenamed:
+    """A filed rename finding whose own change is in the code. Its declaration is gone, and its after name is declared
+    with the same keyword and owner, in its file or in the one file that gained it. The finding is built there."""
+
+    finding: HeldFinding
+    declaration: Declaration
+    renamed: Declaration
+    path: str
+    line: int
+
+
+@dataclass(frozen=True)
+class RenameAwaitingApproval:
+    """A filed rename whose change is in the code, as DeclarationRenamed reads it, in a decision the user has not
+    approved. Built means approved and in the code, so the finding stays filed, with no line, until the answer."""
+
+    finding: HeldFinding
+
+
+@dataclass(frozen=True)
+class DeclarationGoneFromFile:
+    """No file declares a filed finding's subject at the synced tip, and its file is still there. The finding stays
+    filed until a person waives it or declares the item again."""
+
+    finding: HeldFinding
+    declaration: Declaration
+
+
+@dataclass(frozen=True)
+class NoRenamedSite:
+    """The finding is not a filed rename of its own declaration, no file gained its after name with the same keyword
+    and owner, or the applied check finds the rename not applied there."""
+
+
+@dataclass(frozen=True)
 class KeptForOpenBuild:
-    """A finding the step would follow or withdraw, kept because a ticket that is not final builds it."""
+    """A finding whose declaration is gone from its file, kept because a ticket that is not final builds it.
+
+    A declaration that moved to several files or to another crate is left instead.
+    """
 
     finding: HeldFinding
     ticket: str
 
 
 DeclarationOutcome = (DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved
-                      | DeclaredInSeveralFiles | DeclaredInAnotherCrate | KeptForOpenBuild)
+                      | DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationRenamed | RenameAwaitingApproval
+                      | DeclarationGoneFromFile | KeptForOpenBuild)
+# The outcomes that leave a finding as it is for a person to waive or fix in the code.
+DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile
 
 
 @dataclass(frozen=True)
@@ -1069,11 +1111,12 @@ class Ledger:
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         # The declaration step's git reads, by commit: what each stored judged commit resolves to, the paths changed
-        # from a read commit to a tip, the `.rs` files at a tip that hold a name as a word, and a file's items at a
-        # commit. Rows are read fresh, so a recheck under the write lock sees another writer's changes.
+        # from a read commit to a tip, the `.rs` files at a tip that hold a name as a word, and a file's content and
+        # items at a commit. Rows are read fresh, so a recheck under the write lock sees another writer's changes.
         self._resolved_commits: dict[str, JudgedCommit | NoJudgedCommit] = {}
         self._changed_paths: dict[tuple[str, str], frozenset[str]] = {}
         self._named_files: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
@@ -2084,15 +2127,23 @@ class Ledger:
             self._named_files[key] = tuple(entry.removeprefix(f"{tip}:") for entry in result.stdout.split("\0") if entry)
         return self._named_files[key]
 
+    def _commit_file(self, commit: str, path: str) -> bytes | Folder | MissingFile:
+        """What _file_at reads at a resolved commit, read once."""
+        key = (commit, path)
+        if key not in self._commit_files:
+            self._commit_files[key] = self._file_at(commit, path)
+        return self._commit_files[key]
+
     def _declared_file(self, commit: str, path: str) -> DeclaredFile:
         """The items of path at commit. A path that is not a file there reads as no text, so it declares no item."""
         key = (commit, path)
         if key not in self._declared_files:
-            content = self._file_at(commit, path)
+            content = self._commit_file(commit, path)
             self._declared_files[key] = read_declarations(content.decode(errors="replace") if isinstance(content, bytes) else "")
         return self._declared_files[key]
 
-    def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str]) -> DeclarationOutcome:
+    def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
+                             approved: Callable[[Path], bool]) -> DeclarationOutcome:
         if not isinstance(finding.state, (Unfiled, Filed)) or PurePosixPath(finding.path).suffix != ".rs":
             return DeclarationNotRead(finding)
         if isinstance(finding.state, Unfiled):
@@ -2133,51 +2184,130 @@ class Ledger:
                 found[path] = item
         if len(found) > 1:
             return DeclaredInSeveralFiles(finding, declaration, tuple(sorted(found)))
-        outcome: DeclarationMoved | DeclarationRemoved = DeclarationRemoved(finding, declaration)
-        for path, item in found.items():
+        for path in found:
             if isinstance(finding.state, Filed) and tip.crate(path) != tip.crate(finding.path):
                 return DeclaredInAnotherCrate(finding, declaration, path)
-            outcome = DeclarationMoved(finding, declaration, path,
-                                       moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
+        # The open build holds the finding whatever the rename check would find, so the check does not run.
         if isinstance(finding.build_ticket, BuildTicket):
             ticket = self._ticket(finding.build_ticket.ticket)
             if ticket["state"] not in FINAL_TICKET_STATES:
                 return KeptForOpenBuild(finding, ticket["id"])
-        return outcome
+        if found:
+            path, item = next(iter(found.items()))
+            return DeclarationMoved(finding, declaration, path,
+                                    moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
+        renamed = self._renamed_site(finding, read, old_file, old, tip, rust_files, changed, approved)
+        if not isinstance(renamed, NoRenamedSite):
+            return renamed
+        if isinstance(finding.state, Filed) and finding.path in tip.blobs:
+            return DeclarationGoneFromFile(finding, declaration)
+        return DeclarationRemoved(finding, declaration)
 
-    def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip) -> DeclarationReading:
+    def _renamed_site(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem, tip: RepositoryTip,
+                      rust_files: frozenset[str], changed: frozenset[str], approved: Callable[[Path], bool],
+                      ) -> DeclarationRenamed | RenameAwaitingApproval | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite:
+        """Where a filed rename's after name is declared at the tip with the keyword and owner of its gone declaration.
+
+        A file counts only when it gained that declaration since the read commit; this holds for the finding's own
+        file too, which is checked first. Several files or a file in another crate leave the finding, as a move does.
+        The applied check must not find the rename not applied at the site, so reopen does not file it again at once.
+        A rename in a decision that the user has not approved waits for the answer.
+        """
+        declaration = old.declaration
+        state = finding.state
+        old_name = finding.before.strip().split("::")[-1]
+        new_name = finding.after.strip().split("::")[-1]
+        # A variant or field line reads as its enum or struct, so its before name is not the declaration's name.
+        if (not isinstance(state, Filed) or finding.kind != "rename" or old_name != declaration.name
+                or new_name == old_name or not style_footprint.IDENTIFIER.fullmatch(new_name)):
+            return NoRenamedSite()
+        renamed = Declaration(declaration.keyword, new_name, declaration.owner)
+
+        def gained(path: str) -> tuple[DeclaredItem, ...]:
+            """The items of path that declare the new name at the tip; none when path declared it at the read commit."""
+            if any(item.declaration == renamed for item in self._declared_file(read, path).declared_items):
+                return ()
+            return tuple(item for item in self._declared_file(tip.commit, path).declared_items if item.declaration == renamed)
+
+        found: dict[str, DeclaredItem] = {}
+        if own := gained(finding.path):
+            found[finding.path] = own[0]
+        else:
+            for path in self._files_naming(tip.commit, new_name):
+                if path != finding.path and path in rust_files and path in changed and (items := gained(path)):
+                    found[path] = items[0]
+        if len(found) > 1:
+            return DeclaredInSeveralFiles(finding, renamed, tuple(sorted(found)))
+        if not found:
+            return NoRenamedSite()
+        path, item = next(iter(found.items()))
+        if tip.crate(path) != tip.crate(finding.path):
+            return DeclaredInAnotherCrate(finding, renamed, path)
+        if isinstance(applied_check(finding.kind, finding.before, finding.after, path,
+                                    lambda read_path: self._commit_file(tip.commit, read_path)), RenameNotApplied):
+            return NoRenamedSite()
+        if not approved(state.proposal):
+            return RenameAwaitingApproval(finding)
+        return DeclarationRenamed(finding, declaration, renamed, path,
+                                  moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
+
+    def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
+                             approved: Callable[[Path], bool]) -> DeclarationReading:
         rust_files = frozenset(tip.rust_files)
-        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files)
+        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved)
                                                     for finding_id in finding_ids))
 
-    def declaration_reading(self, finding_ids: Iterable[str]) -> DeclarationReading:
-        """What follow_declarations writes for the findings; it writes nothing."""
-        return self._declaration_reading(tuple(finding_ids), self._synced_tip())
+    def declaration_reading(self, finding_ids: Iterable[str], approved: Callable[[Path], bool]) -> DeclarationReading:
+        """What follow_declarations writes for the findings at the synced tip; it writes nothing.
 
-    def follow_declarations(self, finding_ids: Iterable[str]) -> DeclarationReading:
-        """Move each finding whose declaration moved to one other file there, and withdraw each whose declaration is gone.
+        approved tells whether the user approved the decision at a path.
+        """
+        return self._declaration_reading(tuple(finding_ids), self._synced_tip(), approved)
 
-        The plan comes before the write lock; if the synced tip or a row it read changes before the lock, the step
-        starts again. A git failure stops before any write.
+    def follow_declarations(self, finding_ids: Iterable[str], at: str, approved: Callable[[Path], bool]) -> DeclarationReading:
+        """Move each finding whose declaration moved to one other file there, build each filed rename whose new name
+        is declared and whose decision is approved, and withdraw each finding whose declaration is gone when it is
+        unfiled or its file is gone.
+
+        at is the synced tip of the caller's reading; when the synced tip is no longer at, the step refuses. A filed
+        finding whose item is gone from its file stays filed. approved tells whether the user approved the decision
+        at a path, and it is read again under the write lock. The plan comes before the write lock; if a row it read
+        changes before the lock, the step starts again. A git failure stops before any write.
         """
         ids = tuple(finding_ids)
 
+        def moved_tip() -> LedgerError:
+            return LedgerError(f"the synced tip moved from {at} since the declarations were read; rerun")
+
         def attempt() -> DeclarationReading:
-            tip = self._synced_tip()
-            plan = self._declaration_reading(ids, tip)
+            if self.synced_commit() != at:
+                raise moved_tip()
+            tip = self._tip(at)
+            plan = self._declaration_reading(ids, tip, approved)
             moves = [item for item in plan.outcomes if isinstance(item, DeclarationMoved)]
+            renames = [item for item in plan.outcomes if isinstance(item, DeclarationRenamed)]
             removals = [item for item in plan.outcomes if isinstance(item, DeclarationRemoved)]
-            if not moves and not removals:
+            if not moves and not renames and not removals:
                 return plan
             with self._connection:
                 _ = self._connection.execute("BEGIN IMMEDIATE")
-                if self.synced_commit() != tip.commit or self._declaration_reading(ids, tip) != plan:
-                    raise ChangedBeforeLock("the findings or the synced tip changed while their declarations were read; rerun")
+                if self.synced_commit() != at:
+                    raise moved_tip()
+                if self._declaration_reading(ids, tip, approved) != plan:
+                    raise ChangedBeforeLock("the findings or their decisions changed while their declarations were read; rerun")
                 now = _now()
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET path=?,line=?,followed_from=?,followed_from_line=?,followed_at=?,updated_at=? WHERE finding_id=?",
                     [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
                      for item in moves],
+                )
+                # A person's reading was of an old build, so the new build clears it. A rename follows to its new
+                # declaration, in its own file too, so reopen checks that site and its line reads at the tip.
+                _ = self._connection.executemany(
+                    "UPDATE held_findings SET state='built',person_read_by='',path=?,line=?,followed_from=?,followed_from_line=?,"
+                    + "followed_at=?,updated_at=? WHERE finding_id=?",
+                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
+                     for item in renames],
                 )
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET state='withdrawn',declaration_gone_at=?,updated_at=? WHERE finding_id=?",

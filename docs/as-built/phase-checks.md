@@ -25,7 +25,7 @@
 - `docs/delegate/dual_review.md` — on pass 1 the main review reads `style_review.md` and applies `<StyleReview/>` with `since <phase_baseline commit>` and `${SESSION_DIR}` as the diff directory. It saves the result, `Off` or an error included, to `${SESSION_DIR}/phase_style_review_<phase-id>.md`. Blind reviewers never audit style, and later passes do not walk the checklist again.
 - `docs/delegate/write_prompt_contract.md` — item 2 tells every worker not to open `rust_style` or run `load-rust-style.sh`; item 6 puts the fixing rules into every repair prompt's Work Specification.
 - `commands/unit/direct.md` — names `<PhaseChecks/>` in TagReferenceContract, names `verify.sh lint` in VerificationContract as the phase lint checks under `<PhaseChecks/>`, and runs the step at ExecutionSteps step 6 (`<PhaseChecks/>` at `<DualReview/>`). It also holds `<FixDispatch/>`, `<FinalGate/>`, and the RunSummary `**Style review:**` line (each phase's reviewed range and result).
-- `scripts/delegate/verify.sh` — the `lint` and `final` arms. There is no `fmt` arm.
+- `scripts/direct/verify.sh` — the `lint` and `final` arms. There is no `fmt` arm.
 - `config/lint.conf` and `scripts/lint/lint_config.sh` — the on/off switches.
 
 **The style review** (`<StyleReview/>`)

@@ -10,7 +10,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 
 | File | Role |
 | --- | --- |
-| `scripts/delegate/verify.sh` | `TEST_TARGETS_PY` picks the targets from `cargo metadata`; `take_test_targets` reads them into `TEST_SELECTION`; the `test` arm builds with them. |
+| `scripts/direct/verify.sh` | `TEST_TARGETS_PY` picks the targets from `cargo metadata`; `take_test_targets` reads them into `TEST_SELECTION`; the `test` arm builds with them. |
 | `scripts/buildlog/report.py` | `report()` assembles the day. `rebuilds_section` with the rebuild-bin constants, `PACKAGE_PATTERN`, `KnownCrateStep`, `RebuildTiming`, `PackageRebuilds`, `rebuild_bin`, `known_crate_steps`, `rebuild_timings`, `rebuild_rows`, `whole_percent`, `nextest_rebuild_lines`, `rebuild_package`, `package_rebuild_rows`; `SCRATCH`, `GROUP_AS_SCRATCH`, `SCRATCH_LABEL`, `kind_section`, `summary` for scratch rows; `test_builds_section`; `disk_section`. |
 | `scripts/buildlog/disk.py` | The Disk rows (`FOLDERS`), the walk (`measure`), the floor (`read_floor`, `InvalidFloor`), the snapshot file, and the directories outside the build caches that the disk-floor alerts read (`docs/as-built/build-memory-admission.md`). |
 | `scripts/buildlog/cli.py` | `buildlog disk`, listed in the usage docstring. |

@@ -13,7 +13,7 @@
 #                                 waiting on a summary
 #   env AGENT_BG_LEDGER=<file>    append `<id>\t<mesh_name>` to <file> once the
 #                                 session is registered, for the caller's
-#                                 cleanup -- delegate/remove_workers.py reads it
+#                                 cleanup -- direct/remove_workers.py reads it
 #
 # Why this exists rather than agent_exec.sh: a delegate launched with
 # `claude --print` is INVISIBLE. It holds the ListAgents/SendMessage tools but
@@ -35,7 +35,7 @@
 # The session is deliberately LEFT ALIVE when its turn ends. A message resumes a
 # stopped-turn session from its transcript, so a finished implementer can still
 # answer the tester's question. The caller ends it: a delegate worker through the
-# AGENT_BG_LEDGER record and delegate/remove_workers.py, a friend through the id
+# AGENT_BG_LEDGER record and direct/remove_workers.py, a friend through the id
 # in <id_file>.
 
 set -euo pipefail
@@ -148,7 +148,7 @@ PY
   # The transcript index identifies this turn even if it finishes before the
   # first poll. Keep it with the launcher's claim for killed-launch recovery.
   if [[ -n "${PLAN_DELEGATE_BOARD_DIR:-}" && -n "${PLAN_DELEGATE_TEAM_ROLE:-}" ]]; then
-    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../delegate" <<'PY'
+    FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" <<'PY'
 import fcntl
 import json
 import os
@@ -251,7 +251,7 @@ if [[ -z "${BG_ID}" ]]; then
 fi
 printf '%s\n' "${BG_ID}" > "${ID_FILE}"
 if [[ -n "${LEDGER}" ]]; then
-  LEDGER="$("$PY" - "$(dirname "${BASH_SOURCE[0]}")/../delegate" "${LEDGER}" <<'PY'
+  LEDGER="$("$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" "${LEDGER}" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])

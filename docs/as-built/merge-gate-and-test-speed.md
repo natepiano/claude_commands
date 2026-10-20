@@ -59,7 +59,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 **Session host fakes.** Production, message and shutdown tests reach herdr only through `scripts/herdr/fake_herdr.py` (`HERDR_BIN`) and `scripts/production/fake_unit_host.py`, which publishes marked unit panes, their pane reads and a fake `/proc` (see [herdr-adoption.md](herdr-adoption.md), Test doubles). Most production suites use them, `test_waiting.py` and `test_dailies_input.py` among them. The `ci_points` fake `gh` is a shell + jq stub (`GH_STUB` in `test_ci_points.py`).
 
-**`scripts/delegate/recorder_fixture.py`**
+**`scripts/direct/recorder_fixture.py`**
 - `invoke_recorder(arguments, environment, cwd, *, check=False) -> CompletedProcess[str]` runs the real `progress_history.main()` through `invoke_cli`, with the recorder lock and real child integrations.
   - It patches `DEFAULT_CONFIG_PATH`, `DEFAULT_AGENTS_CONFIG_PATH` and `user_zone.CONF` from the fixture HOME.
   - It clears `_config_digest`'s cache before and after the call.
@@ -68,11 +68,11 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 - `communicate_launcher(process, timeout=300) -> tuple[str, str]`: on timeout it SIGKILLs and reaps the launcher's process group, then re-raises.
 - In `test_progress_history.py`, `run_command`, `run_failing_command` and `run_unowned_command` go through `invoke_recorder`.
 
-**`scripts/delegate/local_release_wait.py`**
+**`scripts/direct/local_release_wait.py`**
 - `local_release_waiter(holders, release) -> LocalReleaseEvents | IntervalReleasePolling`. `LocalReleaseEvents` watches the directories and their existing parents through inotify via ctypes, re-arms replaced directories, and treats queue overflow as a change. `IntervalReleasePolling` sleeps the caller's interval; it is used where libc has no inotify (macOS) or the call returns ENOSYS/ENOTSUP.
-- `wait_for_local_release(seconds, call_id)` arms the watch, then reads target and admission state, and returns on release, admission or deadline. `verify.sh` calls it as a script (`VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path). `build_targets.py` imports it as `scripts.delegate.local_release_wait`, with the repo root on `sys.path`.
+- `wait_for_local_release(seconds, call_id)` arms the watch, then reads target and admission state, and returns on release, admission or deadline. `verify.sh` calls it as a script (`VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path). `build_targets.py` imports it as `scripts.direct.local_release_wait`, with the repo root on `sys.path`.
 
-**`scripts/delegate/wait_for_test_state.py`**
+**`scripts/direct/wait_for_test_state.py`**
 - `wait_until(ready, directory, timeout=300, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
 
@@ -84,10 +84,10 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
-| `PLAN_DELEGATE_EARLY_POLL_SECS` | `scripts/delegate/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `PLAN_DELEGATE_WORKER_POLL_SECS` | `scripts/delegate/implement.sh` (worker and turn probes) | `1` (s) | `0.01` |
-| `PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS` | `scripts/delegate/implement.sh` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
-| `PLAN_DELEGATE_TOKEN_CLOCK_FILE` | `scripts/delegate/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
+| `PLAN_DELEGATE_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
+| `PLAN_DELEGATE_WORKER_POLL_SECS` | `scripts/direct/implement.sh` (worker and turn probes) | `1` (s) | `0.01` |
+| `PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS` | `scripts/direct/implement.sh` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
+| `PLAN_DELEGATE_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
 | `PLAN_DELEGATE_SYNC_WRITES` | `progress_history.py`, `findings.py`, `review_pool.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
@@ -153,7 +153,7 @@ The largest module peaks near 0.5 GiB. The gate's wall time is its slowest modul
 - **Inherited SIGINT.** A suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores. `SUITE_BOOTSTRAP` resets dispositions for gate jobs; a signal test still restores `SIG_DFL` itself.
 
 - **Admission is not an OS limit.** It works on samples, so a module can grow past the cap between two samples. A job whose own sample is over the cap is killed at once (its group gets SIGKILL), its result starts `killed: sampled memory <X> GiB is over the <cap> GiB cap`, and the run is red. Before 2026-10-18 an overrun only turned the run red at the end: a shutdown module looping on a failed fake grew to 28 GiB in 56 minutes (10 GiB of it resident, the rest in swap) and filled natedev's swap.
-- **Module time limit.** A module still running `DEFAULT_MODULE_TIME_LIMIT_S` (1800 s, `--module-time-limit-s`) after it starts is killed the same way; its result starts `killed: still running after 1800 s, the module time limit`, and the run is red. A hung module would otherwise hold every gate behind it. The limit is about 4.6 times the slowest measured module: delegate/test_verify_mac_offload.py took 387 s at load 152 (2026-10-18).
+- **Module time limit.** A module still running `DEFAULT_MODULE_TIME_LIMIT_S` (1800 s, `--module-time-limit-s`) after it starts is killed the same way; its result starts `killed: still running after 1800 s, the module time limit`, and the run is red. A hung module would otherwise hold every gate behind it. The limit is about 4.6 times the slowest measured module: direct/test_verify_mac_offload.py took 387 s at load 152 (2026-10-18).
 
 - **macOS has no inotify.** `local_release_wait` and `wait_until` fall back to interval polling there.
 

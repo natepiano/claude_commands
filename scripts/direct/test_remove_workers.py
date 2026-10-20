@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.delegate import remove_workers
+from scripts.direct import remove_workers
 
 SCRIPT = Path(__file__).parent / "remove_workers.py"
 

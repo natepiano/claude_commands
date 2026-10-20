@@ -2,7 +2,7 @@
 
 ## What it is
 
-Two policies in the cargo layer that every session's builds go through. First, every `cargo nextest run` that `scripts/lint/invoke.sh` starts names its test width (`--test-threads N`), chosen by one mode line and divided among the local runs in flight. The memory gate keys its measured reservation by that width, and `scripts/buildlog/width_trial.py` scores a switchback trial between one test process per physical core and one per logical core. Width `logical` is the setting: a 72-hour trial found no memory-wait gain at physical width and slower hana runs. Second, `verify.sh lint` uses CI's clippy target scope (`--workspace --all-targets --all-features`). It adds `--keep-going` and can repair multiply-add warnings before its final judgment. It also checks TOML formatting with taplo.
+Two policies in the cargo layer that every session's builds go through. First, every `cargo nextest run` that `scripts/lint/invoke.sh` starts names its test width (`--test-threads N`), chosen by one mode line and divided among the local runs in flight once the memory gate admits the run. The memory gate pools every width's history for its reservation, and `scripts/buildlog/width_trial.py` scores a switchback trial between one test process per physical core and one per logical core. Width `logical` is the setting: a 72-hour trial found no memory-wait gain at physical width and slower hana runs. Second, `verify.sh lint` uses CI's clippy target scope (`--workspace --all-targets --all-features`). It adds `--keep-going` and can repair multiply-add warnings before its final judgment. It also checks TOML formatting with taplo.
 
 ## How it works
 
@@ -23,23 +23,25 @@ Two policies in the cargo layer that every session's builds go through. First, e
 
 ### Shared width (`scripts/lint/nextest_budget.py`)
 
-In `physical` and `logical` mode, local runs share the mode's width. `run_nextest_shared WIDTH ARGS...` opens fd 9 on `<name>.new` in `${BUILDLOG_DIR:-~/.local/state/buildlog}/admission/nextest/` and runs `nextest_budget.py claim DIR NAME WIDTH 9`. Under the directory's `lock`, the claim flocks fd 9, renames the marker to `<name>.run`, counts the `.run` markers still locked (itself included), unlinks the unlocked ones, and prints `shared_width(full, runs) = min(full, max(FLOOR, full // runs))`, `FLOOR` 4. The run then goes through `run` with `--test-threads <shared>` and fd 9 closed for the step, and the marker is removed after it.
+In `physical` and `logical` mode, local runs share the mode's width. `run_nextest_shared WIDTH ARGS...` runs `run cargo nextest run --test-threads WIDTH ARGS...` with `LINT_NEXTEST_SHARE=<dir>/<name>`, the directory `${BUILDLOG_DIR:-~/.local/state/buildlog}/admission/nextest/`. Once the memory gate admits the step, `run_once` calls `nextest_share_claim`, which opens fd 9 on `<name>.new` and runs `nextest_budget.py claim DIR NAME WIDTH 9`. Under the directory's `lock`, the claim flocks fd 9, renames the marker to `<name>.run`, counts the `.run` markers still locked (itself included), unlinks the unlocked ones, and prints `shared_width(full, runs) = min(full, max(FLOOR, full // runs))`, `FLOOR` 4. A narrower share replaces the width in the step's argv, prints `nextest: <shared> of <full> test threads, shared with the runs in flight`, and is written into the step's memory reservation (`memory_admit.py width`). The test process runs with fd 9 closed, `nextest_share_end` closes fd 9 as soon as it exits, before the build log write and the sweep start, and the marker is removed after `run` returns.
+
+- The claim comes after admission (2026-10-20, nightly 2026-10-16): when it came before, a run waiting for memory counted as in flight, so on 10-14 to 10-16 154 of 230 whole-hana runs ran at width 4, with a mean memory wait of 537 s against 50-113 s at widths 16 and 32. A run that leaves the memory wait for the Mac claims nothing.
 
 - The lock belongs to the file the shell opened, so it ends with the shell: a killed run's marker is unlocked, and the next claim neither counts it nor keeps it. A `.new` older than `PENDING_GRACE_S` (600 s) is a shell killed before it claimed.
 - On natedev: alone 32, 2 runs 16, 3 runs 10, 4 runs 8, 8 or more 4. On the Mac (12): alone 12, 2 runs 6, 3 or more 4.
-- A width is fixed when the run starts; runs that start later do not narrow it, and a run that outlives the others does not widen.
+- A width is fixed when the run is admitted; runs that start later do not narrow it, and a run that outlives the others does not widen.
 - Any failure (no directory, the helper failing or printing a non-number) runs at the full width.
 - `trial` mode is not shared: `width_trial.py` names the arm by width (16 physical, 32 logical), and a shared 16 would read as physical.
 
 natedev has 16 physical and 32 logical cores. The Mac reads 12 for both and has no memory gate. GitHub CI and hand-run `cargo nextest` do not go through `invoke.sh` and keep nextest's default width.
 
-A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry. A shared run records the width it ran at.
+A step records its width through its argv: `invoke.sh` puts `--test-threads N` before the caller's arguments, so the first width in argv is the one the build log's `steps.argv`, the memory gate's reservation row and the `anon_peaks.jsonl` record all carry. A shared run records the width it ran at: the build log takes the argv after the claim, and the reservation's `test_threads` is rewritten by the claim.
 
-### Per-width reservation (`scripts/lint/memory_admit.py`)
+### Width in the reservation (`scripts/lint/memory_admit.py`)
 
 - `test_threads(argv) -> int | None` returns the first width in argv, from `--test-threads N`, `--test-threads=N`, `-j N` or `-jN`; absent or non-integer (`num-cpus`) is `None`.
-- `expected_peak(repo, step, host, now, root, test_threads=None)` reads only history before `now`, so a later call for a past `now` returns the same value. Its measured tier (≥ 5 `anon_peaks.jsonl` records in `HISTORY_DAYS` 14, p90) matches `test_threads` exactly: a width-16 step reads width-16 records, an unlabeled step reads unlabeled records. Its index tier (build-log `peak_mem_bytes` × `ANON_SHARE` 0.65) and `FALLBACK` (12 GiB) do not look at width.
-- `check` passes `test_threads(argv)` to `expected_peak` and writes `test_threads` and `call_id` (`BUILDLOG_CALL_ID`, else `None`) into each reservation row; `release` copies both into the `anon_peaks.jsonl` record.
+- `expected_peak(repo, step, host, now, root, test_threads=None)` reads only history before `now`, so a later call for a past `now` returns the same value. Its measured tier (≥ 5 `anon_peaks.jsonl` records in `HISTORY_DAYS` 14, p90) reads every width when `test_threads` is `None`, and only that width's records when one is given (`width_trial.py`'s R row). Its index tier (build-log `peak_mem_bytes` × `ANON_SHARE` 0.65) and `FALLBACK` (12 GiB) do not look at width.
+- `check` calls `expected_peak` with no width, so the gate pools every width: one width's history was thin and rebuild-heavy (11.4 GiB at width 4, 17.2 at 5, against 10.9 pooled, nightly 2026-10-16), and the shared width is claimed only after admission. It writes `test_threads(argv)` and `call_id` (`BUILDLOG_CALL_ID`, else `None`) into each reservation row; `set_width` (`memory_admit.py width <reservation> <n>`, under the admission lock) rewrites `test_threads` after a narrower claim, and `release` copies both into the `anon_peaks.jsonl` record.
 
 ### Trial scorecard (`scripts/buildlog/width_trial.py`)
 
@@ -64,7 +66,7 @@ A step records its width through its argv: `invoke.sh` puts `--test-threads N` b
 - P pairs each attempt of a call with its own anon peak by end time when the counts match; a retried call missing a peak gives no P for any of its attempts.
 - The header carries the script's own sha256 (first 12 hex) and the window in the user's zone (`user_zone()`).
 
-### CI-scope lint (`scripts/delegate/verify.sh`, `lint` arm)
+### CI-scope lint (`scripts/direct/verify.sh`, `lint` arm)
 
 Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed members, taplo, clippy, rustdoc on changed members.
 
@@ -83,7 +85,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 - `invoke.sh` adds its width before the caller's arguments, and `memory_admit.test_threads` and `width_trial` read the first width in argv. Change both or neither.
 - The trial block in `nextest_width_arm` (6000 s) equals `BLOCK_S` in `width_trial.py`.
 - `invoke.sh`'s ungated set (`buildlog_step_compiles`) and `width_trial._uses_memory_gate` decide which steps count as gated; they must agree. Both exempt `cargo [+tc] fmt`, `*/sweep.py` and `taplo`, so none of those counts in the all-steps gated-wait row.
-- The build log and `anon_peaks.jsonl` are evidence: nothing edits or deletes their records. Per-width keys replace any need to drop stale records.
+- The build log and `anon_peaks.jsonl` are evidence: nothing edits or deletes their records. A width filter replaces any need to drop stale records.
 - `verify.sh lint`'s clippy target scope equals CI's `clippy` job and `pre_release_checks.sh`; change all three together. Its fix passes and its judgment all use `--keep-going`.
 - Tooling failures (exit 2, exit 3, killed runs) are never cached; only a lint failure of the tree is.
 - `invoke.sh` must parse under the Mac's bash 3.2 (no `EPOCHSECONDS`, no associative arrays, `${arr[@]+"${arr[@]}"}` for empty arrays).
@@ -115,7 +117,7 @@ Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed mem
 
 Sample: 22 blocks per arm; 114 and 103 whole-hana runs. Verdict `revert`: W shows no memory-wait gain, and whole-hana runs are 13% slower at 16 threads. The widths stay labeled so a later measure can read them.
 
-The per-width key replaced deleting hana's old anon-peak records: it keeps the baseline and gives each width its own measured reservation.
+The per-width key replaced deleting hana's old anon-peak records. Since 2026-10-20 the gate pools the widths again, and the labels stay for `width_trial.py`.
 
 **Lint runs CI's clippy.** A narrower local clippy (`--lib --bins --tests`, default features) passed on trees CI's Clippy job failed, for example a missing `#[must_use]` in hana_diegetic's `bench_support`. Measured on hana, `verify.sh lint hana --no-cache`, clippy step, memory wait 0 in every run:
 

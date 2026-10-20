@@ -11,7 +11,7 @@ it says nothing, between notice and handoff it reports the count together with
 the point a handoff is actually requested, and at or above the handoff
 threshold it escalates to the instruction to write one and exclude it from git
 locally. All three points are derived from the configured window in
-`context_usage.py`, shared with `stop-delegate-continue.py` so the two hooks
+`context_usage.py`, shared with `stop-direct-continue.py` so the two hooks
 cannot drift apart.
 
 The escalation also names the one case where stopping is the right move: an

@@ -869,19 +869,30 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(tip)
         return tip
 
-    def judge_parent(self, ledger: style_ledger.Ledger, lines: tuple[tuple[int, str], ...]) -> tuple[str, tuple[str, ...]]:
-        """Filed renames of Parent::old in a.rs that a dropped read ticket judged at the head of main."""
+    def hold_parent(self, ledger: style_ledger.Ledger, lines: tuple[tuple[int, str], ...], *, before: str = "Parent::old",
+                    after: str = "Parent::new") -> tuple[str, tuple[str, ...]]:
+        """Unfiled renames in a.rs, of Parent::old unless named, that a dropped read ticket judged at the head of main."""
         rule = self.rule("names")
         ticket = f"judge-{len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
         ledger.ticket_add(ticket, "judge", "read", "names", "crates/alpha", [PARENT_FILE], [rule])
         ledger.ticket_assign(ticket, "main")
         _ = ledger.ticket_base(ticket)
-        findings = tuple(ledger.hold(rule, PARENT_FILE, line, text, "rename", "Parent::old", "Parent::new", self.blob(rule), ticket)
+        findings = tuple(ledger.hold(rule, PARENT_FILE, line, text, "rename", before, after, self.blob(rule), ticket)
                          for line, text in lines)
         ledger.ticket_drop(ticket)
-        for finding in findings:
-            ledger.file_held(finding.finding_id, self.root / "decision.md")
         return rule, tuple(finding.finding_id for finding in findings)
+
+    def judge_parent(self, ledger: style_ledger.Ledger, lines: tuple[tuple[int, str], ...], *, before: str = "Parent::old",
+                     after: str = "Parent::new") -> tuple[str, tuple[str, ...]]:
+        """The renames of hold_parent, filed to decision.md."""
+        rule, ids = self.hold_parent(ledger, lines, before=before, after=after)
+        for finding_id in ids:
+            ledger.file_held(finding_id, self.root / "decision.md")
+        return rule, ids
+
+    def follow_approved(self, ledger: style_ledger.Ledger, finding_ids: list[str]) -> tuple[style_ledger.DeclarationOutcome, ...]:
+        """The declaration step at the synced tip, with every decision approved."""
+        return ledger.follow_declarations(finding_ids, ledger.synced_commit(), lambda _: True).outcomes
 
     def test_hold_after_a_follow_returns_the_followed_finding_only_for_the_same_change(self) -> None:
         ledger = self.ledger()
@@ -889,7 +900,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT, MOVED_FILE: other})
         rule, (parent,) = self.judge_parent(ledger, ((2, "old: u32,"),))
         _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: other + "\n" + PARENT})
-        followed, = ledger.follow_declarations([parent]).outcomes
+        followed, = self.follow_approved(ledger, [parent])
         self.assertEqual((type(followed), ledger.held_findings(style_ledger.AllHeldFindings())[0].line), (style_ledger.DeclarationMoved, 6))
         ledger.ticket_add("read-9", "read", "read", "names", "crates/alpha", [MOVED_FILE], [rule])
         ledger.ticket_assign("read-9", "main")
@@ -905,8 +916,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT, TWIN_FILE: TWIN})
         _, (parent,) = self.judge_parent(ledger, ((2, "old: u32,"),))
-        tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
-        removed, = ledger.follow_declarations([parent]).outcomes
+        tip = self.commit_tip(ledger, {PARENT_FILE: None})
+        removed, = self.follow_approved(ledger, [parent])
         self.assertIsInstance(removed, style_ledger.DeclarationRemoved)
         finding, = ledger.held_findings(style_ledger.AllHeldFindings())
         self.assertEqual((finding.path, finding.state),
@@ -917,7 +928,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT, TWIN_FILE: TWIN})
         _, (parent,) = self.judge_parent(ledger, ((2, "old: u32,"),))
         tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: PARENT, TWIN_FILE: TWIN + "fn helper() {}\n"})
-        moved, = ledger.follow_declarations([parent]).outcomes
+        moved, = self.follow_approved(ledger, [parent])
         self.assertIsInstance(moved, style_ledger.DeclarationMoved)
         finding, = ledger.held_findings(style_ledger.AllHeldFindings())
         self.assertEqual((finding.path, finding.line, finding.follow),
@@ -943,7 +954,7 @@ class StyleLedgerTests(unittest.TestCase):
         with (mock.patch.object(style_ledger, "read_declarations", wraps=declarations.read_declarations) as reads,
               mock.patch.object(subprocess, "run", wraps=subprocess.run) as runs,
               mock.patch.object(style_ledger.Ledger, "judged_commit", judged_with_another_writer)):
-            outcomes = ledger.follow_declarations([field, header]).outcomes
+            outcomes = self.follow_approved(ledger, [field, header])
         resolves = [call for call in runs.call_args_list if "--quiet" in cast(tuple[list[str]], call.args)[0]]
         self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved] * 2)
         # One judged commit, and each of a.rs and b.rs at the judged commit and at the tip, across two findings and
@@ -952,6 +963,227 @@ class StyleLedgerTests(unittest.TestCase):
         rows = {finding.finding_id: (finding.path, finding.line, finding.follow) for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
         self.assertEqual(rows[field], (MOVED_FILE, 3, style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
         self.assertEqual(rows[header][:2], (MOVED_FILE, 1))
+
+    def renamed_parent(self, ledger: style_ledger.Ledger) -> str:
+        """A filed rename of struct Parent to Renamed in a.rs, judged at its keyword line."""
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
+        _, (finding_id,) = self.judge_parent(ledger, ((1, "pub struct Parent {"),), before="Parent", after="Renamed")
+        return finding_id
+
+    def test_a_filed_rename_whose_after_name_its_file_now_declares_is_built_not_withdrawn(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        # A person read an older build; the new build clears that reading.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET person_read_by='nate' WHERE finding_id=?", (finding_id,))
+        # The renamed declaration is two lines lower; the built finding follows it there, as `built` prints it.
+        tip = self.commit_tip(ledger, {PARENT_FILE: "use std::fmt;\n\n" + PARENT.replace("Parent", "Renamed")})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        renamed, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(renamed, style_ledger.DeclarationRenamed(
+            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem()),
+            declarations.Declaration("struct", "Renamed", declarations.ModuleItem()), PARENT_FILE, 3))
+        built, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((built.path, built.line, built.state, built.reading, built.follow),
+                         (PARENT_FILE, 3, style_ledger.Built(self.root / "decision.md"), style_ledger.NotReadByPerson(),
+                          style_ledger.FollowedDeclaration(PARENT_FILE, 1, tip)))
+
+    def test_a_filed_rename_whose_after_name_one_gaining_file_declares_is_built_and_followed_there(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n",
+                                       MOVED_FILE: "use std::fmt;\n\n" + PARENT.replace("Parent", "Renamed")})
+        renamed, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(renamed, style_ledger.DeclarationRenamed)
+        built, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((built.path, built.line, built.state, built.follow),
+                         (MOVED_FILE, 3, style_ledger.Built(self.root / "decision.md"),
+                          style_ledger.FollowedDeclaration(PARENT_FILE, 1, tip)))
+
+    def test_a_filed_rename_of_an_impl_method_is_built_and_its_applied_check_passes(self) -> None:
+        ledger = self.ledger()
+        method = "pub struct Parent;\n\nimpl Parent {\n    pub fn old(&self) {}\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: method})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "pub fn old(&self) {}"),))
+        tip = self.commit_tip(ledger, {PARENT_FILE: method.replace("fn old", "fn new")})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        renamed, = self.follow_approved(ledger, [finding_id])
+        owner = declarations.ImplOrTraitItem("Parent")
+        self.assertEqual(renamed, style_ledger.DeclarationRenamed(
+            filed, declarations.Declaration("fn", "old", owner), declarations.Declaration("fn", "new", owner), PARENT_FILE, 4))
+        built, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual(built.state, style_ledger.Built(self.root / "decision.md"))
+        self.assertEqual(ledger.applied_check(built, tip), AppliedInCode())
+
+    def test_a_filed_finding_whose_item_was_renamed_otherwise_is_left_and_nothing_is_written(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Other")})
+        before = self.held_rows(ledger.database)
+        left, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual((type(left), left.finding.finding_id), (style_ledger.DeclarationGoneFromFile, finding_id))
+        self.assertIsInstance(left, style_ledger.DeclarationLeft)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_filed_finding_whose_file_is_gone_is_withdrawn(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        # While the file is there, the finding stays filed.
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
+        left, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(type(left), style_ledger.DeclarationGoneFromFile)
+        tip = self.commit_tip(ledger, {PARENT_FILE: None})
+        removed, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(removed, style_ledger.DeclarationRemoved)
+        finding, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual(finding.state, style_ledger.Withdrawn(self.root / "decision.md", style_ledger.DeclarationGone(tip)))
+
+    def test_an_unfiled_rename_whose_after_name_is_declared_is_withdrawn(self) -> None:
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
+        # The same rename judged at the field line reads as struct Parent too; only that one is filed.
+        _, (unfiled, filed) = self.hold_parent(ledger, ((1, "pub struct Parent {"), (2, "old: u32,")), before="Parent", after="Renamed")
+        ledger.file_held(filed, self.root / "decision.md")
+        tip = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        outcomes = self.follow_approved(ledger, [unfiled, filed])
+        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationRemoved, style_ledger.DeclarationRenamed])
+        states = {finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+        self.assertEqual(states, {unfiled: style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.DeclarationGone(tip)),
+                                  filed: style_ledger.Built(self.root / "decision.md")})
+
+    def test_a_renamed_finding_that_an_open_build_ticket_holds_is_kept(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [PARENT_FILE], [self.rule("names")],
+                          proposal=str(self.root / "decision.md"), finding_ids=(finding_id,))
+        ledger.ticket_assign("names-1", "main")
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        before = self.held_rows(ledger.database)
+        kept, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual((type(kept), kept.finding.finding_id), (style_ledger.KeptForOpenBuild, finding_id))
+        self.assertEqual(self.held_rows(ledger.database), before)
+        # Once the ticket is final, the step builds the finding.
+        ledger.ticket_drop("names-1")
+        built, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(type(built), style_ledger.DeclarationRenamed)
+
+    def assert_rename_left(self, ledger: style_ledger.Ledger, finding_id: str, expected: style_ledger.DeclarationOutcome) -> None:
+        """The declaration step leaves the filed rename with expected and writes nothing."""
+        before = self.held_rows(ledger.database)
+        left, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(left, expected)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_filed_rename_whose_after_name_its_file_already_declared_is_left(self) -> None:
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT + "\npub struct Renamed;\n"})
+        _, (finding_id,) = self.judge_parent(ledger, ((1, "pub struct Parent {"),), before="Parent", after="Renamed")
+        # Parent is deleted and Renamed stays where it was, so the rename was never applied.
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub struct Renamed;\n"})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
+            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem())))
+
+    def test_a_filed_rename_whose_after_name_is_declared_with_another_keyword_is_left(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub enum Renamed {\n    Old,\n}\n"})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
+            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem())))
+
+    def test_a_filed_rename_whose_after_name_one_file_in_another_crate_gained_is_left(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        other = "crates/beta/src/other.rs"
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", other: PARENT.replace("Parent", "Renamed")})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        self.assert_rename_left(ledger, finding_id, style_ledger.DeclaredInAnotherCrate(
+            filed, declarations.Declaration("struct", "Renamed", declarations.ModuleItem()), other))
+
+    def test_a_filed_rename_whose_after_name_two_gaining_files_declare_is_left(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        renamed = PARENT.replace("Parent", "Renamed")
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: renamed, TWIN_FILE: renamed})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        self.assert_rename_left(ledger, finding_id, style_ledger.DeclaredInSeveralFiles(
+            filed, declarations.Declaration("struct", "Renamed", declarations.ModuleItem()), (MOVED_FILE, TWIN_FILE)))
+
+    def test_a_filed_rename_whose_site_still_declares_the_old_name_under_its_parent_is_left(self) -> None:
+        ledger = self.ledger()
+        method = "pub struct Parent {\n    old: u32,\n}\n\nimpl Parent {\n    pub fn old(&self) {}\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: method})
+        # The applied check reads `r#new` as a name the file does not hold, and the field still declares Parent::old.
+        _, (finding_id,) = self.judge_parent(ledger, ((6, "pub fn old(&self) {}"),), after="Parent::r#new")
+        tip = self.commit_tip(ledger, {PARENT_FILE: method.replace("fn old", "fn r#new")})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        self.assertEqual(ledger.applied_check(filed, tip), RenameNotApplied(PARENT_FILE))
+        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
+            filed, declarations.Declaration("fn", "old", declarations.ImplOrTraitItem("Parent"))))
+
+    def test_a_filed_finding_whose_file_a_format_ignore_drops_from_the_rust_files_stays_filed(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        # The file leaves the synced Rust files but is still in the tree, so the finding waits for a person.
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", "rustfmt.toml": f'ignore = ["{PARENT_FILE}"]\n'})
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
+            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem())))
+
+    def test_a_renamed_finding_whose_decision_loses_its_approval_before_the_lock_stays_filed(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        # The answer is approved at the plan, then not at the recheck under the write lock, nor after.
+        answers = iter((True,))
+        before = self.held_rows(ledger.database)
+        waiting, = ledger.follow_declarations([finding_id], ledger.synced_commit(), lambda _: next(answers, False)).outcomes
+        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
+        self.assertEqual(waiting, style_ledger.RenameAwaitingApproval(filed))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_the_declaration_step_refuses_when_the_synced_tip_moved_since_its_reading(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        read = ledger.synced_commit()
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        before = self.held_rows(ledger.database)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"synced tip moved from {read}"):
+            _ = ledger.follow_declarations([finding_id], read, lambda _: True)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_the_declaration_step_refuses_when_the_synced_tip_moves_between_its_plan_and_the_write_lock(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        planned = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        moved = False
+
+        def read_during_a_sync(text: str) -> declarations.DeclaredFile:
+            # A sync lands while the plan reads its first file.
+            nonlocal moved
+            if not moved:
+                moved = True
+                _ = self.commit_tip(ledger, {MOVED_FILE: "pub fn helper() {}\n"})
+            return declarations.read_declarations(text)
+
+        before = self.held_rows(ledger.database)
+        with (mock.patch.object(style_ledger, "read_declarations", read_during_a_sync),
+              self.assertRaisesRegex(style_ledger.LedgerError, f"synced tip moved from {planned}")):
+            _ = ledger.follow_declarations([finding_id], planned, lambda _: True)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_built_rename_reads_its_file_at_each_commit_once_across_the_plan_and_its_recheck(self) -> None:
+        ledger = self.ledger()
+        finding_id = self.renamed_parent(ledger)
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        with mock.patch.object(subprocess, "run", wraps=subprocess.run) as runs:
+            renamed, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(renamed, style_ledger.DeclarationRenamed)
+        reads = [call for call in runs.call_args_list
+                 if PARENT_FILE in cast(tuple[list[str]], call.args)[0] and "ls-tree" in cast(tuple[list[str]], call.args)[0]]
+        # a.rs at the read commit and at the tip; the applied check and the recheck under the lock read no git.
+        self.assertEqual(len(reads), 2)
 
     def test_withdraw_duplicates_is_idempotent_refuses_an_open_ticket_and_the_held_list_names_the_duplicate(self) -> None:
         rule, issue, ids = self.decision_findings()

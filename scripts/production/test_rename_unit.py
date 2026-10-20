@@ -285,7 +285,12 @@ class UnitRenameTests(unittest.TestCase):
             "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
             "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
             "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": []}
+            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
+            "codex_seats": [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
+                             "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
+                                 "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
+                                 str(old), "/runs/r1/prompt.md", "impl", "task", "impl", "working", "0", "impl"]}]}
+        self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task you were on.\n")
         script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import record; "
                   + "assert record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
@@ -321,6 +326,13 @@ class UnitRenameTests(unittest.TestCase):
         self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha.md")
         self.assertIn(f"you are now gamma-unit, in worktree {new} on branch demo-gamma, and your plan is at "
                       + f"{new}/docs/plans/alpha.md", cast(str, saved["renamed"]))
+        # Each paused Codex seat resumes its own thread in the new worktree, and its resume prompt says so.
+        seat = cast(list[dict[str, object]], saved["codex_seats"])[0]
+        self.assertEqual(cast(list[str], seat["launcher_command"])[5], str(new))
+        self.assertEqual((self.root / "runs/r1/impl.resume-prompt.md").read_text(),
+                         "Continue the task you were on.\nWhile you were paused the showrunner renamed your unit: "
+                         + f"your worktree is now {new} on branch demo-gamma. {self.rust / 'claude-demo-alpha'} no "
+                         + f"longer exists; wherever your instructions name it, use {new}.\n")
 
     def test_a_session_with_its_own_name_takes_the_new_name(self) -> None:
         _ = self.seed_record(name="builder-report")
@@ -368,16 +380,39 @@ class UnitRenameTests(unittest.TestCase):
         self.assert_ok(self.rename("plan", "gamma", "delta"))
 
     def test_apply_waits_while_the_unit_is_stopping(self) -> None:
-        _ = self.seed_record(progress="waiting")
+        log = self.seed_record(progress="waiting")
         result = self.rename("apply")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("alpha-unit is still waiting after 0 s; rerun apply once it has stopped", result.stderr)
         self.assertEqual(self.journal()["step"], 0)
+        # A stop that waits for the unit to go idle is forced at once.
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                         [["now", "--only", "sid-alpha", "--here"]])
+
+    @unittest.skipIf(sys.platform == "darwin", "the Mac reads working directories with lsof")
+    def test_verify_fails_while_a_process_works_in_the_old_worktree(self) -> None:
+        _ = self.seed_record()
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        _ = self.mark_live("gamma-unit", "sid-alpha")
+        old = self.rust / "claude-demo-alpha"
+        old.mkdir()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=old)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        # The folder is gone, but the process still has it as its working directory.
+        old.rmdir()
+        result = self.rename("verify")
+        self.assert_refused(result, f"processes {child.pid} still work in {old}")
+        child.kill()
+        _ = child.wait()
+        self.assert_ok(self.rename("verify"))
 
     def test_verify_fails_on_an_unclassified_stale_reference(self) -> None:
         self.assert_ok(self.rename("apply"))
         self.write(self.root / "state/nightly-review/2026-10-16/report.md", "alpha-unit reviewed\n")
         self.write(self.root / "state/other/names.json", '{"unit": "claude-demo-alphabet"}\n')
+        self.write(self.root / "state/other/__pycache__/names.cpython-313.pyc", "alpha-unit\n")
+        self.write(self.root / "state/other/names.pyc", "alpha-unit\n")
         self.assert_ok(self.rename("verify"))
         stale = self.root / "state/other/cache.json"
         self.write(stale, '{"unit": "alpha-unit"}\n')
@@ -500,7 +535,7 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("alpha-unit", "sid-alpha")
         planned = self.rename("plan")
         self.assert_ok(planned)
-        self.assertIn("1. stop alpha-unit through the shutdown path", planned.stdout)
+        self.assertIn("1. stop alpha-unit and its Codex seats at once through the shutdown path", planned.stdout)
         applied = self.rename("apply")
         self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
         self.assertIn("alpha-unit is still stopping after 0 s; rerun apply once it has stopped", applied.stderr)

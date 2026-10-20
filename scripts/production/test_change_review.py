@@ -289,10 +289,10 @@ class ActionTest(unittest.TestCase):
                                                            "--row", "C76", "--change", "A", "--check", "B")[2])
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
-    def test_show_walks_the_rows_to_review_and_reads_only(self) -> None:
+    def test_show_prints_only_the_first_row_to_review_and_reads_only(self) -> None:
         self.assertEqual(run("show", "--list", str(self.path)), (0, (
             "C76 Panels keep shields\n  How to check: Launch Hana\n  Merged: 2026-10-14\n  On the Mac build: not yet\n\n"
-            + "C77 Fonts redraw\n  How to check: Change a font\n  Merged: 2026-10-14\n  On the Mac build: not yet\n"), ""))
+            + "1 more to review\n"), ""))
         self.assertEqual(run("show", "--list", str(self.fresh)), (0, "nothing to review\n", ""))
         self.assertFalse(self.fresh.parent.exists())
 

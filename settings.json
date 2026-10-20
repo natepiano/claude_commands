@@ -11,6 +11,7 @@
   "permissions": {
     "allow": [
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/accounts/refusal_watch.py --assume-refused *)",
+      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py *)",
       "Read(~/.claude/projects/**/tool-results/**)",
       "Read(~/.claude1/projects/**/tool-results/**)",
       "Read(~/.claude2/projects/**/tool-results/**)",
@@ -62,9 +63,9 @@
       "Read(/private/tmp*)",
       "mcp__brp",
       "Bash(~/.claude/scripts/berth_fix/*)",
-      "Bash(zsh ~/.claude/scripts/delegate/unit_notifier.sh *)",
-      "Bash(bash ~/.claude/scripts/delegate/verify.sh *)",
-      "Bash(bash ~/.claude/scripts/delegate/progress_timer.sh *)",
+      "Bash(zsh ~/.claude/scripts/direct/unit_notifier.sh *)",
+      "Bash(bash ~/.claude/scripts/direct/verify.sh *)",
+      "Bash(bash ~/.claude/scripts/direct/progress_timer.sh *)",
       "Bash(zsh ~/.claude/scripts/message/notifier.sh *)",
       "Bash(\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/conversation_pause.py\" *)",
       "Bash(cat *)",
@@ -340,7 +341,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-delegate-continue.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/stop-direct-continue.py\""
           },
           {
             "type": "command",

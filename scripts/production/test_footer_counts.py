@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +14,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 import footer_counts
+import proposal_issue
 import proposals_folder
 import showrunners
 from footer_counts import FooterCounts
@@ -48,9 +52,10 @@ EFFICIENCY_LEDGER = """# Efficiency proposals
 """
 
 
-def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str = "production") -> None:
-    """An issue; its default proposer is the test doc's own production, `production.md`."""
-    _ = (folder / f"{name}.md").write_text(f"---\nstatus: {status}\ntags: [{tags}]\nproposed_by: {proposed_by}\n---\n",
+def issue(folder: Path, name: str, status: str, tags: str, proposed_by: str = "production", *fields: str) -> None:
+    """An issue with any extra frontmatter lines; its default proposer is the test doc's own production, `production.md`."""
+    extra = "".join(f"{field}\n" for field in fields)
+    _ = (folder / f"{name}.md").write_text(f"---\nstatus: {status}\ntags: [{tags}]\nproposed_by: {proposed_by}\n{extra}---\n",
                                            encoding="utf-8")
 
 
@@ -169,6 +174,31 @@ class FooterCountsTests(unittest.TestCase):
         self.assertIn(child, footer_counts.sources(top))
         self.assertNotIn(folder / "other production.md", footer_counts.sources(top))
 
+    def test_the_proposal_count_leaves_out_approved_and_active_proposals(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        approval = ('unit: "names-unit"', 'plan: "docs/plans/names.md"')
+        issue(folder, "waiting", "open", "issue, proposal", "production", "stage: backlog")
+        issue(folder, "approved at backlog", "open", "issue, proposal", "production", "stage: backlog", *approval)
+        issue(folder, "approved at active", "open", "issue, proposal", "production", "stage: active", *approval)
+        issue(folder, "started without an approval", "open", "issue, proposal", "production", "stage: active")
+        doc = self.doc(f"- **Proposals:** {folder}")
+        self.assertEqual(len(proposals_folder.open_proposals(doc)), 4)
+        self.assertEqual(footer_counts.proposals(doc), 1)
+        self.assertEqual(footer_counts.counts_line(footer_counts.read_counts(doc)), "For you: 1 proposal")
+
+    def test_an_approved_plain_proposal_leaves_the_footer_count(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue(folder, "plain", "open", "issue, proposal", "production", "stage: backlog")
+        doc = self.doc(f"- **Proposals:** {folder}")
+        self.assertEqual(footer_counts.proposals(doc), 1)
+        runtime = self.enterContext(tempfile.TemporaryDirectory())
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}), contextlib.redirect_stdout(io.StringIO()):
+            code = proposal_issue.main(["approve", str(folder / "plain.md"), "--showrunner", "s", "--unit", "u", "--plan", "p"])
+        self.assertEqual(code, 0)
+        self.assertEqual(footer_counts.proposals(doc), 0)
+
     def test_a_doc_without_the_lines_counts_nothing(self) -> None:
         self.assertEqual(footer_counts.read_counts(self.doc()), FooterCounts())
         missing = self.doc(f"- **Change review:** `{self.root / 'absent.md'}`",
@@ -177,16 +207,20 @@ class FooterCountsTests(unittest.TestCase):
 
     def test_the_line_names_each_count_once_and_leaves_out_zeros(self) -> None:
         self.assertEqual(footer_counts.counts_line(FooterCounts(2, 1, 3, 1)),
-                         "For you: 2 changes to review, 1 proposal, 3 projects, 1 question")
+                         "For you: 1 question, 2 changes, 1 proposal, 3 projects")
         self.assertEqual(footer_counts.counts_line(FooterCounts(changes=1, questions=2)),
-                         "For you: 1 change to review, 2 questions")
+                         "For you: 2 questions, 1 change")
         self.assertIsNone(footer_counts.counts_line(FooterCounts()))
 
-    def test_efficiency_proposals_follow_proposals_and_use_their_own_plural(self) -> None:
-        self.assertEqual(footer_counts.counts_line(FooterCounts(1, 2, 3, 1, 130)),
-                         "For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question")
-        self.assertEqual(footer_counts.counts_line(FooterCounts(efficiency=1)),
-                         "For you: 1 efficiency proposal")
+    def test_the_line_orders_questions_changes_efficiency_proposals_then_projects(self) -> None:
+        self.assertEqual(footer_counts.counts_line(FooterCounts(changes=2, proposals=4, projects=3, questions=5,
+                                                                efficiency=130)),
+                         "For you: 5 questions, 2 changes, 130 efficiency, 4 proposals, 3 projects")
+
+    def test_each_count_of_one_takes_the_singular_and_efficiency_has_no_plural(self) -> None:
+        self.assertEqual(footer_counts.counts_line(FooterCounts(1, 1, 1, 1, 1)),
+                         "For you: 1 question, 1 change, 1 efficiency, 1 proposal, 1 project")
+        self.assertEqual(footer_counts.counts_line(FooterCounts(efficiency=2)), "For you: 2 efficiency")
 
     def test_counts_add_across_productions(self) -> None:
         self.assertEqual(footer_counts.total([FooterCounts(1, 0, 2, 0, 4), FooterCounts(0, 3, 1, 0, 7)]),

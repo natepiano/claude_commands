@@ -17,6 +17,7 @@ from contextlib import redirect_stdout
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from types import UnionType
 from typing import cast
 from urllib.parse import quote
 
@@ -591,12 +592,17 @@ def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
     if tickets:
         reason = BUILT_REASON + ", ".join(tickets)
     else:
-        # Refill waives a finding whose file is gone, so nothing was built.
+        # Refill waives a finding whose file is gone, so nothing was built. A plain merge or the declaration step
+        # builds a finding with no ticket, so the synced commit holds its change.
         commit = ledger.synced_commit()
         paths = tuple(sorted({item.path for item in findings}))
         removed = sorted(set(paths) - files_at(ledger.repo, commit, paths))
-        reason = NOTHING_LEFT_REASON + (f"{', '.join(removed)} not in synced commit {commit}" if removed
-                                        else "every finding is waived")
+        if removed:
+            reason = NOTHING_LEFT_REASON + f"{', '.join(removed)} not in synced commit {commit}"
+        elif any(isinstance(item.state, style_ledger.Built) for item in findings):
+            reason = BUILT_REASON + f"synced commit {commit}"
+        else:
+            reason = NOTHING_LEFT_REASON + "every finding is waived"
     proposal_command("close", str(issue), "--reason", reason)
     print(f"closed {issue}: {reason}")
     return True
@@ -1306,19 +1312,20 @@ class FollowRun:
     closes: tuple[Path, ...]
     skipped: tuple[Path, ...]
 
-    def count(self, *kinds: type[style_ledger.DeclarationOutcome]) -> int:
+    def count(self, kinds: type[style_ledger.DeclarationOutcome] | UnionType) -> int:
         return sum(isinstance(outcome, kinds) for outcome in self.reading.outcomes)
 
 
 def follow_totals(run: FollowRun) -> str:
-    return (f"totals: follow {run.count(style_ledger.DeclarationMoved)}, withdraw {run.count(style_ledger.DeclarationRemoved)}, "
-            + f"left {run.count(style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate)}, "
+    return (f"totals: follow {run.count(style_ledger.DeclarationMoved)}, built {run.count(style_ledger.DeclarationRenamed)}, "
+            + f"withdraw {run.count(style_ledger.DeclarationRemoved)}, left {run.count(style_ledger.DeclarationLeft)}, "
             + f"kept {run.count(style_ledger.KeptForOpenBuild)}, close {len(run.closes)}")
 
 
 # The outcomes that print a line: each one changes the finding, or names why the step leaves it.
 DeclarationChange = (style_ledger.DeclarationMoved | style_ledger.DeclarationRemoved | style_ledger.DeclaredInSeveralFiles
-                     | style_ledger.DeclaredInAnotherCrate | style_ledger.KeptForOpenBuild)
+                     | style_ledger.DeclaredInAnotherCrate | style_ledger.DeclarationRenamed | style_ledger.DeclarationGoneFromFile
+                     | style_ledger.KeptForOpenBuild)
 
 
 def follow_line(outcome: DeclarationChange, tip: str) -> str:
@@ -1335,8 +1342,18 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
             return f"left {site}: {declaration_line(outcome.declaration)} declared in {', '.join(outcome.paths)}"
         case style_ledger.DeclaredInAnotherCrate():
             return f"left {site}: {declaration_line(outcome.declaration)} declared in another crate: {outcome.path}"
+        case style_ledger.DeclarationRenamed():
+            return (f"built {site}: {declaration_line(outcome.declaration)} renamed to {outcome.renamed.name} "
+                    + f"in {outcome.path}:{outcome.line}")
+        case style_ledger.DeclarationGoneFromFile():
+            return f"left {site}: {declaration_line(outcome.declaration)} declaration gone; waive it or declare it again"
         case style_ledger.KeptForOpenBuild():
             return f"kept {site}: open ticket {outcome.ticket} builds it"
+
+
+def approved_decision(issue: Path) -> bool:
+    """Whether issue is a decision file that the user approved."""
+    return issue.is_file() and isinstance(decision_answer(Issue(issue, frontmatter(issue))), ApprovedDecision)
 
 
 def open_decision(issue: Path) -> bool:
@@ -1352,17 +1369,19 @@ def unfiled_and_filed(ledger: style_ledger.Ledger) -> tuple[style_ledger.HeldFin
 
 
 def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFinding], *, dry_run: bool) -> FollowRun:
-    """Move each finding whose declaration moved to one other file there, and withdraw each whose declaration is gone.
-    Then close each open decision that has no finding left and refresh each other one that holds such a finding.
+    """Move each finding whose declaration moved to one other file there, build each renamed finding of an approved
+    decision, and withdraw each whose declaration is gone. Then close each open decision that has no finding left
+    and refresh each other one that holds such a finding.
 
-    Print one line per followed, withdrawn, left and kept finding and per closed decision; the caller prints the
-    totals. Before the first write, a decision with no generated body or no Parent line prints a skip line, and the
-    step writes none of its findings; the others go on. A refresh keeps the parent that the decision names. A dry run
-    prints the same lines and writes nothing.
+    Print one line per followed, built, withdrawn, left and kept finding and per closed decision; the caller prints
+    the totals. Before the first write, a decision with no generated body or no Parent line prints a skip line, and
+    the step writes none of its findings; the others go on. A renamed finding whose decision is not approved stays
+    filed with no line. A refresh keeps the parent that the decision names. A dry run prints the same lines and
+    writes nothing. The step refuses when the synced tip moves after its reading.
     """
     ledger = writer.ledger
     ids = tuple(finding.finding_id for finding in findings)
-    planned = ledger.declaration_reading(ids)
+    planned = ledger.declaration_reading(ids, approved_decision)
     skipped: list[Path] = []
     for issue in sorted({outcome.finding.state.proposal for outcome in planned.outcomes
                          if isinstance(outcome, (style_ledger.DeclarationMoved, style_ledger.DeclarationRemoved))
@@ -1377,11 +1396,15 @@ def run_follow(writer: DecisionWriter, findings: Iterable[style_ledger.HeldFindi
             print(skip_line(issue, error))
     refused = {outcome.finding.finding_id for outcome in planned.outcomes
                if isinstance(outcome.finding.state, style_ledger.Filed) and outcome.finding.state.proposal in skipped}
+    # Built means approved and in the code, so the ledger builds a rename only when its decision is approved, reading
+    # the answer again under its write lock. The first step after the approval builds it.
     reading = (style_ledger.DeclarationReading(planned.tip, tuple(outcome for outcome in planned.outcomes
                                                                   if outcome.finding.finding_id not in refused))
-               if dry_run else ledger.follow_declarations(finding_id for finding_id in ids if finding_id not in refused))
+               if dry_run else ledger.follow_declarations((finding_id for finding_id in ids if finding_id not in refused),
+                                                          planned.tip, approved_decision))
     for outcome in reading.outcomes:
-        if not isinstance(outcome, (style_ledger.DeclarationNotRead, style_ledger.DeclarationInPlace)):
+        if not isinstance(outcome, (style_ledger.DeclarationNotRead, style_ledger.DeclarationInPlace,
+                                    style_ledger.RenameAwaitingApproval)):
             print(follow_line(outcome, reading.tip))
     plan = plan_withdrawal(ledger, {outcome.finding.finding_id: (outcome.finding.state.proposal, style_ledger.DeclarationGone(reading.tip))
                                     for outcome in reading.outcomes if isinstance(outcome, style_ledger.DeclarationRemoved)
@@ -1514,7 +1537,7 @@ def main(argv: list[str]) -> int:
                 writer = decision_writer(ledger, args.proposals.expanduser().resolve(), "")
                 follow = run_follow(writer, unfiled_and_filed(ledger), dry_run=args.dry_run)
                 print(follow_totals(follow))
-                left = follow.count(style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate)
+                left = follow.count(style_ledger.DeclarationLeft)
                 if follow.skipped:
                     print(f"style_proposals: skipped {len(follow.skipped)} decisions", file=sys.stderr)
                 if left:

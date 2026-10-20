@@ -1,6 +1,6 @@
 # Plan-delegate progress history
 
-`scripts/delegate/progress_history.py` is the shared progress recorder for
+`scripts/direct/progress_history.py` is the shared progress recorder for
 Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
@@ -23,7 +23,7 @@ Schema version 1 records these event types:
 - `progress_reported`
 - `eta_stated`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
-  `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
+  `finding_gate`, appended by `scripts/direct/findings.py` to the same stream
 
 Every event repeats its query dimensions: run and phase identity, worktree,
 branch, working directory, plan doc, project/phase/pass timestamps, current pass
@@ -161,7 +161,7 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/delegate/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
+`scripts/direct/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
 `FIX_PASS < 10` counter, which could not converge: the re-review after each fix
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.

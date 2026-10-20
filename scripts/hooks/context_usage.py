@@ -3,7 +3,7 @@
 
 Two hooks need the same answer to "how full is this agent's context right now":
 `post-tool-use-context-usage.py`, which reports it after every tool call, and
-`stop-delegate-continue.py`, which refuses to let a unit run end its turn
+`stop-direct-continue.py`, which refuses to let a unit run end its turn
 near the auto-compaction trigger. The measurement lives here so the two can
 never drift onto different thresholds.
 """

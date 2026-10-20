@@ -24,8 +24,8 @@ from typing import TypedDict, cast, override
 from unittest.mock import patch
 
 from scripts.accounts import accounts
-from scripts.delegate.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
-from scripts.delegate.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid, wait_until
+from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 
 
 DELEGATE_DIR = Path(__file__).parent
@@ -312,7 +312,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
 
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
-        delegate = self.root / "scripts" / "delegate"
+        delegate = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
         lib = self.root / "scripts" / "lib"
         delegate.mkdir(parents=True)
@@ -500,6 +500,24 @@ printf '%s\\n' '{answer}'
         events = (session / "mesh_events.txt").read_text(encoding="utf-8").splitlines()
         self.assertNotIn("follow", events[events.index("claim"):], events)
 
+    def test_an_unreadable_ledger_opens_the_seat_with_the_phase_still_awaiting_first_touch(self) -> None:
+        # Ledger loss fails open for edits, so a scratch clone with no ledger still opens its seat.
+        session = self.start_phase("claim-unreadable")
+        initial = self.mesh_launch(session, slot="mac")
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        seat = next(iter(cast("dict[str, object]", json.loads((session / "mesh_roster.json").read_text()))))
+        environment, _ = self.claim_fixture(session, "ledger_unreadable")
+        result = subprocess.run(
+            ["bash", str(self.implement_script), "--to", seat, "--phase", "3", str(session), str(self.working_dir),
+             str(self.prompt_file), "impl", "the retry path", "impl", "writing the retry path", "0", "mac"],
+            check=False, capture_output=True, text=True, env=environment, timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = (session / "phases" / "3" / "delegated_phase_reservation_state.json").read_text(encoding="utf-8")
+        self.assertIn("enrolled_awaiting_first_touch", state)
+        events = (session / "mesh_events.txt").read_text(encoding="utf-8").splitlines()
+        self.assertIn("follow", events[events.index("claim"):], events)
+
     def test_a_dispatch_names_its_director_in_the_run_folder(self) -> None:
         # The production tree reads the director here: its one marker names only one of the runs
         # it has open side by side, and a run opened by hand has none.
@@ -652,7 +670,7 @@ printf '%s\\n' '{answer}'
         _ = roster_path.write_text(json.dumps(roster), encoding="utf-8")
 
     def open_repair_round(self, session_dir: Path) -> None:
-        findings = self.root / "scripts" / "delegate" / "findings.py"
+        findings = self.root / "scripts" / "direct" / "findings.py"
         for arguments in (
             ("open", "--severity", "blocker", "--title", "Repair retry",
              "--caught-by", "delegate"),
@@ -674,7 +692,7 @@ printf '%s\\n' '{answer}'
 
     def observe_status_at_records(self, *, fail_landed: bool = False) -> None:
         """Record the status each copied helper sees before it updates its ledger."""
-        delegate = self.root / "scripts" / "delegate"
+        delegate = self.root / "scripts" / "direct"
         for name, commands in (
             ("progress_history.py", ("finish-pass",)),
             ("findings.py", ("landed", "abandon")),

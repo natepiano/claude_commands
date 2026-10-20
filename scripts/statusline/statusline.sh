@@ -28,7 +28,7 @@
 #                file it names is newer than it, or its deferred question's time
 #                has come; SHOWRUNNER_STATE_DIR overrides the state folder.
 # jq renders the session name, role and path, then the account, model, tokens and
-# quota windows, then the session's counts row;
+# quota windows, then the session's counts row, each part in its counts.<type> color;
 # a unit director with a live showrunner name reads "<session> unit for <name>".
 
 config="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"

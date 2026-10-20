@@ -13,7 +13,7 @@ from unittest import mock
 import process_table
 
 
-MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/delegate/../agents/codex_mesh.py"
+MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/direct/../agents/codex_mesh.py"
 
 
 class ProcessTableTests(unittest.TestCase):
