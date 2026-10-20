@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 # Initialize dependencies before invoke_cli swaps HOME. The recorder currently
 # imports user_zone eagerly; its production integrations remain real children.
-from scripts.delegate import progress_history
+from scripts.direct import progress_history
 from scripts.lib import user_zone
 from scripts.production.cli_fixture import invoke_cli
 

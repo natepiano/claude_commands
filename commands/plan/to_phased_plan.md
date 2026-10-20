@@ -161,9 +161,9 @@ block — nothing else. The prompt must include:
      the package name filled in (never raw cargo commands — Cargo's default
      target selection compiles a package's examples even under `-p <pkg>`,
      and the delegate must have no flag choices to make):
-     Build = `bash ~/.claude/scripts/delegate/verify.sh check <pkg>`;
-     Test = `bash ~/.claude/scripts/delegate/verify.sh test <pkg>`;
-     Lint = `bash ~/.claude/scripts/delegate/verify.sh lint <pkg>`.
+     Build = `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
+     Test = `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
+     Lint = `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`.
      <PhaseChecks/> defines the lint scope and the phase's style review in
      the unit director's main review; workers never load the guide. For
      non-Rust projects, record the exact commands the project uses (read

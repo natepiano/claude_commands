@@ -65,7 +65,7 @@ export async function loadBoard(
   ensureOpen();
   watch({ kind: 'discovery', sources: [registry || `${home}/.local/state/notifier`], loadedAt });
   const result = await calls.run([
-    `${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/delegate/board_json.py`, '--cwd', cwd, '--session', session,
+    `${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/direct/board_json.py`, '--cwd', cwd, '--session', session,
   ]);
   ensureOpen();
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'The board could not be refreshed.');

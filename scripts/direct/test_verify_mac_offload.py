@@ -764,12 +764,12 @@ class VerifyMacOffloadTests(unittest.TestCase):
         release, completed = self.root / "recorder-release", self.root / "recorder-completed"
         self.write_executable(tree / "buildlog/record.py", f'''
 from pathlib import Path
-from scripts.delegate.wait_for_test_state import wait_for_file
+from scripts.direct.wait_for_test_state import wait_for_file
 wait_for_file(Path({str(release)!r}))
 Path({str(completed)!r}).touch()
-'''.replace("from scripts.delegate.wait_for_test_state import wait_for_file",
+'''.replace("from scripts.direct.wait_for_test_state import wait_for_file",
             "import sys\nsys.path.insert(0, " + repr(str(VERIFY.resolve().parents[2])) + ")\n"
-            + "from scripts.delegate.wait_for_test_state import wait_for_file"))
+            + "from scripts.direct.wait_for_test_state import wait_for_file"))
         outside_release = threading.Event()
         outside = threading.Thread(target=outside_release.wait, name="hold-event-recorder", daemon=True)
         outside.start()
@@ -1221,7 +1221,7 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assert_no_pending_calls(cycle)
 
     def test_local_release_before_routing_watcher_starts_needs_no_retry_wait(self) -> None:
-        from scripts.delegate import local_release_wait
+        from scripts.direct import local_release_wait
 
         cycle = self.routing_fixture()
         call_id = "already-released"
@@ -1235,7 +1235,7 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         self.assert_no_pending_calls(cycle)
 
     def test_routing_without_inotify_polls_until_local_release(self) -> None:
-        from scripts.delegate import local_release_wait
+        from scripts.direct import local_release_wait
 
         cycle = self.routing_fixture()
         call_id = "polling-routing"

@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..delegate import phase_table
+    from ..direct import phase_table
     from . import showrunners
     from .production_units import Refusal
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from scripts.delegate import phase_table
+    from scripts.direct import phase_table
     from scripts.production import showrunners
     from production_units import Refusal
 

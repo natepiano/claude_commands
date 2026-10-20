@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import cast, override
 
 
-from scripts.delegate import review_pool
-from scripts.delegate.wait_for_test_state import wait_until
+from scripts.direct import review_pool
+from scripts.direct.wait_for_test_state import wait_until
 
 SCRIPT = Path(__file__).with_name("review_pool.py")
 

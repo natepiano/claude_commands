@@ -166,7 +166,7 @@ class MergeCheckpointTests(unittest.TestCase):
                      "style_sync.py", "style_ledger.py"):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
-        for relative, name in ((".claude/scripts/delegate", "verify.sh"),
+        for relative, name in ((".claude/scripts/direct", "verify.sh"),
                                (".claude/scripts/validate_and_push", "validate_and_push.sh"),
                                (".claude/scripts/production", "review_regime.py")):
             directory = home / relative

@@ -10,7 +10,7 @@ from scripts.usage.activity import (
     Working, activity_name, claude_atoms, codex_atoms, decode_activity, exec_cell_atoms, shell_atoms, wait_action,
 )
 
-BOARD = "bash ~/.claude/scripts/delegate/board.sh"
+BOARD = "bash ~/.claude/scripts/direct/board.sh"
 TASKS = "/tmp/claude-1000/-home-natepiano-project/session/tasks"
 
 
@@ -46,7 +46,7 @@ class ShellTests(unittest.TestCase):
             ("sleep 45", WaitAtom("sleep")),
             ("wait 1234", WaitAtom("wait")),
             (f"{BOARD} read /tmp/board --since 12", WaitAtom("board.sh read")),
-            ("~/.claude/scripts/delegate/board.sh read /tmp/board", WaitAtom("board.sh read")),
+            ("~/.claude/scripts/direct/board.sh read /tmp/board", WaitAtom("board.sh read")),
             ("tail -f /tmp/build.log", WaitAtom("tail *.log")),
             ("tail -n 5 progress", WaitAtom("tail")),
             (f"cat {TASKS}/b37sx2o7k.output", WaitAtom("cat *.output")),

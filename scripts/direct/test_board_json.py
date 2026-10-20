@@ -18,7 +18,7 @@ from time import monotonic
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.delegate import board_json
+from scripts.direct import board_json
 from scripts.lib import unit_runs
 from scripts.production import fake_showrunner, showrunners
 from scripts.production.cli_fixture import invoke_cli

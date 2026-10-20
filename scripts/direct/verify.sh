@@ -147,7 +147,7 @@ set -euo pipefail
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
-build_override_refusal "${BASH_SOURCE[0]}" delegate/verify.sh || exit 2
+build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -1518,7 +1518,7 @@ trap - INT TERM HUP
 # while it runs verification itself: an activity, not a pass, so findings.py
 # never counts it toward convergence. The launcher-owns-its-own-pass
 # rule applies here too — the thing that runs the work opens the window.
-PROGRESS_HISTORY="${HOME}/.claude/scripts/delegate/progress_history.py"
+PROGRESS_HISTORY="${HOME}/.claude/scripts/direct/progress_history.py"
 ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
 
 # A phase runs two delegates against one target/ directory and one Cargo lock,
@@ -1530,7 +1530,7 @@ ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
 # PLAN_DELEGATE_BOARD_DIR is deliberately not PLAN_DELEGATE_SESSION_DIR: that
 # variable also opens a progress activity window, and concurrent windows
 # would collide in a recorder that keeps one.
-BOARD_HELPER="${HOME}/.claude/scripts/delegate/board.sh"
+BOARD_HELPER="${HOME}/.claude/scripts/direct/board.sh"
 BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
 BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
 # The unit director's own run (a session dir, no board, no team role) takes the

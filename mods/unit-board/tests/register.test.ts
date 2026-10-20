@@ -91,7 +91,7 @@ describe("unit board commands and lifetime", () => {
       const result = await $.command.run(command());
       expect(result.text).toBe("Unit board opened.");
       expect(fake.processes).toEqual([["/test-home/.claude/scripts/lib/py",
-        "/test-home/.claude/scripts/delegate/board_json.py", "--cwd", CWD, "--session", SESSION]]);
+        "/test-home/.claude/scripts/direct/board_json.py", "--cwd", CWD, "--session", SESSION]]);
       expect(fake.opened).toEqual(["unit-board"]);
       const ui = await mount($, surface);
       let text = drawnText(await ui.drawn());
@@ -530,7 +530,7 @@ describe("accounts pane clock", () => {
     mock.env(on, { HOME: "/test-home", USER_ZONE: "America/New_York" });
     const data = { accounts: [{ label: "Fixture", tool: "claude", roles: ["workers"],
       weekly_left_percent: 60, resets_at: "2026-10-17T03:59:55Z", credits: null,
-      use_credits: false, read_at: "2026-10-17T03:59:55Z" }], problems: [] };
+      use_credits: false, read_ok: true, credits_in_use: false, read_at: "2026-10-17T03:59:55Z" }], problems: [] };
     const processes: string[][] = [];
     const reads: string[] = [];
     const snapshots: Record<string, unknown>[] = [];
@@ -581,7 +581,7 @@ describe("accounts pane clock", () => {
   });
 
   for (const surface of ["terminal", "desktop"] as const) {
-    test(`${surface}: an unchanged tick across local midnight redraws short times from the new now`, async ($, on) => {
+    test(`${surface}: an unchanged tick across local midnight redraws resets and read age from the new now`, async ($, on) => {
       const fake = accountsClockHost(on);
       const midnight = Date.UTC(2026, 9, 17, 4, 0);
       await fake.clock.advance(midnight - NOW - 5_000);
@@ -589,12 +589,12 @@ describe("accounts pane clock", () => {
       const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts-board", component: "Pane", surface,
         props: { ...props, title: "Accounts", bodyColumns: 120 } });
       const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(before).toContain("Label Roles Left Resets Read");
-      expect(before).toMatch(/● Fixture workers 60% 23:59 23:59\s*$/);
+      expect(before).toContain("account role left resets credits enabled in use read");
+      expect(before).toMatch(/● Fixture workers 60% 23:59 0s\s*$/);
       await fake.clock.advance(10_000);
       const after = drawnText(await ui.drawn()).replace(/\s+/g, " ");
-      expect(after).toContain("Label Roles Left Resets Read");
-      expect(after).toMatch(/● Fixture workers 60% Fri 23:59 Fri 23:59\s*$/);
+      expect(after).toContain("account role left resets credits enabled in use read");
+      expect(after).toMatch(/● Fixture workers 60% Fri 23:59 10s\s*$/);
       expect(fake.snapshots.at(-1)?.now).toBe((midnight + 5_000) / 1000);
       expect(fake.processes.length).toBe(1);
       expect(fake.reads).toEqual([]);

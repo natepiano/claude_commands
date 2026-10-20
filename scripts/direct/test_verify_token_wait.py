@@ -17,7 +17,7 @@ import unittest
 from pathlib import Path
 from typing import cast, override
 
-from scripts.delegate.wait_for_test_state import wait_until
+from scripts.direct.wait_for_test_state import wait_until
 
 VERIFY = Path(__file__).with_name("verify.sh")
 BOARD = VERIFY.with_name("board.sh")
@@ -263,10 +263,10 @@ esac
         # Copy the board boundary into a disposable HOME; acquire deliberately
         # crosses a whole second, so scheduling can only increase the wait.
         home = self.root / "clock-home"
-        delegate = home / ".claude/scripts/delegate"
+        delegate = home / ".claude/scripts/direct"
         delegate.mkdir(parents=True)
         for source in VERIFY.parent.parent.iterdir():
-            if source.name != "delegate":
+            if source.name != "direct":
                 (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
         board = delegate / "board.sh"
         _ = board.write_text('#!/bin/bash\nif [[ "$1" == acquire ]]; then sleep 1.1; fi\n'
@@ -679,10 +679,10 @@ exec "$TEST_REAL_SLEEP" "$@"
     def test_a_long_token_wait_never_gives_up(self) -> None:
         # Each refused acquire moves the clock past the old 1800 s limit.
         home = self.root / "busy-home"
-        delegate = home / ".claude/scripts/delegate"
+        delegate = home / ".claude/scripts/direct"
         delegate.mkdir(parents=True)
         for source in VERIFY.parent.parent.iterdir():
-            if source.name != "delegate":
+            if source.name != "direct":
                 (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
         for source in VERIFY.parent.iterdir():
             if source.name != "board.sh":

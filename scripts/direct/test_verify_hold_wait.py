@@ -21,7 +21,7 @@ from typing import TypedDict, cast, override
 from unittest import mock
 
 from scripts.build_hold import build_hold
-from scripts.delegate import test_verify_mac_offload
+from scripts.direct import test_verify_mac_offload
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -574,7 +574,7 @@ if arguments[:1] == ["metadata"]:''',
 
     def test_local_admission_waits_for_release_notifications_instead_of_sleeping(self) -> None:
         from scripts.build_targets import build_targets
-        from scripts.delegate.local_release_wait import LocalReleaseEvents
+        from scripts.direct.local_release_wait import LocalReleaseEvents
 
         self.hold()
         def grant_on_notification(_seconds: float) -> None:
@@ -605,7 +605,7 @@ if arguments[:1] == ["metadata"]:''',
                           for call in entry.get("calls", [])], [])
 
     def test_local_release_waiter_keeps_linux_notifications(self) -> None:
-        from scripts.delegate import local_release_wait
+        from scripts.direct import local_release_wait
 
         holders = self.fixture.root / "event-holders"
         release = self.fixture.root / "event-release"
@@ -619,7 +619,7 @@ if arguments[:1] == ["metadata"]:''',
             waiter.wait(HANG_GUARD_S)
 
     def test_local_release_waiter_polls_when_kernel_lacks_inotify(self) -> None:
-        from scripts.delegate import local_release_wait
+        from scripts.direct import local_release_wait
 
         for unavailable in (errno.ENOSYS, errno.ENOTSUP):
             with self.subTest(errno=unavailable), \
@@ -632,7 +632,7 @@ if arguments[:1] == ["metadata"]:''',
                 polling.assert_called_once_with(15)
 
     def test_local_release_waiter_does_not_hide_resource_errors(self) -> None:
-        from scripts.delegate import local_release_wait
+        from scripts.direct import local_release_wait
 
         with mock.patch.object(local_release_wait, "LocalReleaseEvents", side_effect=OSError(errno.EMFILE, "exhausted")), \
              self.assertRaises(OSError) as failed:

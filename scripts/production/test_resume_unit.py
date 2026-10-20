@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""resume_unit.py in process. Git runs in temporary repositories; add_unit.py is a recording stand-in
+and the transcripts are files the test writes: no Claude starts."""
+from __future__ import annotations
+
+import io
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from typing import final, override
+from unittest import mock
+
+import resume_unit
+import retire_unit
+import unit_lookup
+import unit_move
+from add_unit import Production, read_production
+
+DIRECTOR = "11111111-1111-1111-1111-111111111111"
+
+
+def setUpModule() -> None:
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}))
+
+
+def git(where: Path, *arguments: str) -> str:
+    return subprocess.run(["git", "-C", str(where), *arguments], check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+@final
+class ResumeUnitTests(unittest.TestCase):
+    root: Path = Path()
+    checkout: Path = Path()
+    worktree: Path = Path()
+    doc: Path = Path()
+    configs: list[Path] = []
+    calls: list[list[str]] = []
+    launch_code: int = 0
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        origin = self.root / "origin.git"
+        _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        self.checkout = self.root / "checkout"
+        _ = subprocess.run(["git", "clone", "-q", str(origin), str(self.checkout)], check=True,
+                           capture_output=True)
+        for setting in (("user.email", "test@example.invalid"), ("user.name", "test"), ("commit.gpgsign", "false")):
+            _ = git(self.checkout, "config", *setting)
+        self.worktree = self.root / "alpha-wt"
+        self.doc = self.checkout / "alpha-production.md"
+        self.write_row(f"(retired 2026-10-20, worktree removed, session {DIRECTOR}) docs/plans/alpha.md")
+        _ = git(self.checkout, "add", "-A")
+        _ = git(self.checkout, "commit", "-q", "-m", "production(alpha): retire alpha-unit")
+        _ = git(self.checkout, "push", "-q", "origin", "main")
+        self.configs = [self.root / "claude1", self.root / "claude2"]
+        self.transcript(self.configs[0])
+
+        self.calls = []
+        self.launch_code = 0
+        production = read_production(self.doc)
+
+        def production_of(_slug: str) -> Production:
+            return production
+
+        def not_marked(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
+            return None
+
+        _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
+        _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", not_marked))
+        _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: self.configs))
+
+    def write_row(self, plan: str) -> None:
+        _ = self.doc.write_text(
+            "# Production\n\n- **Merge branch:** main\n"
+            + f"- **Showrunner checkout:** {self.checkout}\n- **Log:** log.md\n\n## Units\n\n"
+            + "| Unit | Plan | Worktree | Branch | Port | Owns |\n| --- | --- | --- | --- | --- | --- |\n"
+            + f"| alpha-unit | {plan} | {self.worktree} | alpha-branch | 1 | scripts |\n",
+            encoding="utf-8")
+
+    def transcript(self, config: Path) -> None:
+        folder = config / "projects" / unit_move.project_folder(str(self.worktree))
+        folder.mkdir(parents=True)
+        _ = (folder / f"{DIRECTOR}.jsonl").write_text('{"entrypoint": "cli"}\n', encoding="utf-8")
+
+    def fake_run(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        """Git runs for real; add_unit.py is recorded and answered."""
+        if argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, check=False)
+        self.calls.append([Path(argv[1]).name, *argv[2:]])
+        return subprocess.CompletedProcess(argv, self.launch_code, "", "launch failed" if self.launch_code else "")
+
+    def resume(self, *arguments: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = resume_unit.main(["alpha", "alpha", *arguments])
+        return code, output.getvalue()
+
+    def row(self) -> str:
+        return next(line for line in self.doc.read_text(encoding="utf-8").splitlines() if line.startswith("| alpha-unit"))
+
+    def assert_resumed(self, code: int, output: str) -> None:
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.calls[-1], ["add_unit.py", "--production", "alpha", "alpha-unit", "--resume", DIRECTOR,
+                                          "--cwd", str(self.worktree), "--plan", "docs/plans/alpha.md"])
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha-branch")
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), git(self.checkout, "rev-parse", "main~1"))
+        self.assertTrue(self.row().startswith("| alpha-unit | docs/plans/alpha.md |"), self.row())
+        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): resume alpha-unit")
+        self.assertIn("alpha-unit resumed", output)
+
+    def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
+        self.assert_resumed(*self.resume())
+
+    def test_a_transcript_under_another_account_resumes(self) -> None:
+        # The units account moved since the retire: the transcript is under the other config dir.
+        self.configs.reverse()
+        self.assert_resumed(*self.resume())
+
+    def test_a_failed_launch_keeps_the_note_and_a_rerun_resumes(self) -> None:
+        self.launch_code = 1
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("refused: add_unit.py --resume: launch failed", output)
+        self.assertIn(f"session {DIRECTOR})", self.row())
+        self.launch_code = 0
+        self.assert_resumed(*self.resume())
+
+    def test_refusals_change_nothing(self) -> None:
+        for plan, expected in (("docs/plans/alpha.md", "alpha-unit is not retired"),
+                               ("(retired 2026-10-20, worktree removed) docs/plans/alpha.md",
+                                "alpha-unit: its Units row names no session to resume")):
+            with self.subTest(plan=plan):
+                self.write_row(plan)
+                code, output = self.resume()
+                self.assertEqual(code, 1, output)
+                self.assertIn(f"refused: {expected}", output)
+        _ = git(self.checkout, "checkout", "-q", "--", self.doc.name)
+        self.configs = [self.root / "claude3"]
+        _ = git(self.checkout, "branch", "alpha-branch", "main")
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"refused: alpha-unit: no account has the transcript of session {DIRECTOR}", output)
+        self.assertIn("refused: branch alpha-branch still exists; retire did not finish", output)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): retire alpha-unit")
+
+    def test_dry_run_changes_nothing(self) -> None:
+        code, output = self.resume("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"would resume: session {DIRECTOR} through add_unit.py --resume", output)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.worktree.exists())
+
+
+if __name__ == "__main__":
+    _ = unittest.main(argv=sys.argv)

@@ -20,7 +20,7 @@
       ]
     },
     {
-      "root": "scripts/delegate",
+      "root": "scripts/direct",
       "extraPaths": [
         ".",
         "scripts/production",
@@ -55,7 +55,7 @@
       "root": "scripts/hooks",
       "extraPaths": [
         "scripts/hooks",
-        "scripts/delegate",
+        "scripts/direct",
         "scripts/message",
         "scripts/notify",
         "scripts/production",
@@ -99,7 +99,7 @@
       "extraPaths": [
         "scripts/message",
         "scripts/production",
-        "scripts/delegate",
+        "scripts/direct",
         "scripts/notify",
         "scripts/shutdown",
         "scripts/lib",
@@ -164,7 +164,7 @@
         ".",
         "scripts/production",
         "scripts/build_hold",
-        "scripts/delegate",
+        "scripts/direct",
         "scripts/hooks",
         "scripts/mac_test",
         "scripts/message",
@@ -220,7 +220,7 @@
         ".",
         "scripts/statusline",
         "scripts/hooks",
-        "scripts/delegate",
+        "scripts/direct",
         "scripts/message",
         "scripts/notify",
         "scripts/production",

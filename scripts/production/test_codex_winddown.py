@@ -26,7 +26,7 @@ from sessions import SessionRecord
 from showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
-MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/delegate/../agents/codex_mesh.py"
+MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/direct/../agents/codex_mesh.py"
 NOTIFIER_STUB = """print -r -- "notifier $*" >> "$LOG"
 case $1 in new) mkdir -p "$NOTIFIER_STATE_DIR/$2" ;; remove) rm -rf "$NOTIFIER_STATE_DIR/$2" ;; esac
 """

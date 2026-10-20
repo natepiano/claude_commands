@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast, override
 from unittest.mock import patch
 
-from scripts.delegate import review_pool_report
+from scripts.direct import review_pool_report
 from scripts.usage import collect
 from scripts.usage.agents_log import RoleLog
 

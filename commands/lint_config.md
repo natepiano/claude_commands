@@ -57,7 +57,7 @@ effect on the next run of each consumer; nothing needs restarting.
 
 Consumers: `/unit:style_review` reads the style switch, and
 `scripts/lint/invoke.sh` reads the tool switches for the `lint` CLI
-and `scripts/delegate/verify.sh`.
+and `scripts/direct/verify.sh`.
 <PhaseChecks/> defines each phase's checks. `LINT_OP_STYLE_REVIEW=off` makes
 the phase style review report `Off`.
 
