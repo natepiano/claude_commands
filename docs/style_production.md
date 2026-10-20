@@ -98,13 +98,14 @@ Refill only the unit worktree's own plan copy:
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
 reporting `repair first`; 3 means `waiting for sync`, or
 `waiting for structure: <crates>` when every pending family cell in those
-in-scope crates is blocked by a structure cell on its file or crate, until the
+in-scope crates is blocked by a structure cell, until the
 modules unit's structure tickets merge
 (an unclassified catalog also says `pull nate_style`); 4 means
 `board unavailable: <reason>`; 5 means
 `waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation
 availability stops selection without recording work. `queue` is a read-only
 preview and also returns 4 when the board is unavailable.
+A file cell waits only for open or stale structure cells at its own file; a crate cell waits for every one in its crate.
 
 The ticket stores its rule text. Workers read the pinned files under the unit
 worktree's `docs/style-production/rules/`, including after an interruption;
@@ -438,8 +439,10 @@ Each ticket permits its own approved findings and proven rename references.
 Other findings stay held. Package checks still run. The parent schedules
 changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
 Refill waives a finding whose file is not in the synced commit, and prints the
-file and the commit. When no finding of the decision is left to build, refill
-closes it. Refill does not assign a queued proposal ticket that was
+file and the commit. It also waives a finding whose one-line site text left its
+file and moved into exactly one file that gained the line since the finding was
+judged, and prints both files and the commit. When no finding of the decision
+is left to build, refill closes it. Refill does not assign a queued proposal ticket that was
 made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
 then run migrate.
 

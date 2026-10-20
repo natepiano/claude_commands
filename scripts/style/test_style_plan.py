@@ -1302,20 +1302,43 @@ class StylePlanTests(unittest.TestCase):
                          ("listed", [listed], [self.sources[1]]))
         self.assertEqual([(site["path"], site["line"]) for site in ticket["sites"]], [(self.sources[1], 1)])
 
-    def test_pending_manifest_structure_cell_keeps_names_crate_closed_after_file_judgments(self) -> None:
+    def test_names_file_whose_structure_cells_are_judged_refills_while_its_crate_and_other_files_wait(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         manifest = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        read = self.rule("read")
+        self.sync()
+        self.record(structure, self.sources[0], self.tip)
+        _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
+        pending = {(cell.rule, cell.path) for cell in self.ledger().cells(crate="crates/alpha") if cell.state == "open"}
+        self.assertLessEqual({(manifest, "crates/alpha"), (structure, self.sources[1])}, pending)
+
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]), ("read", [read], [self.sources[0]]))
+
+    def test_names_waits_for_sync_not_structure_when_its_only_unblocked_file_is_busy(self) -> None:
+        structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
+        _ = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
         _ = self.rule("read")
         self.sync()
-        for path in self.sources:
-            self.record(structure, path, self.tip)
+        self.record(structure, self.sources[0], self.tip)
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
-        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
+            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
         self.assertEqual(self.count_tickets(), 0)
-        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
-        self.record(manifest, "crates/alpha", self.tip)
-        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+
+    def test_a_crate_cell_waits_for_every_structure_cell_in_its_crate_and_a_file_cell_for_its_own(self) -> None:
+        def cell(path: str, tier: rules.Tier, crate: str = "crates/alpha") -> style_ledger.Cell:
+            return style_ledger.Cell("rule", path, crate, tier, "names" if tier == "C" else "modules", "open")
+
+        crate_cell, file_cell = cell("crates/alpha", "C"), cell(self.sources[0], "C")
+        other_file, own_file, crate_structure = cell(self.sources[1], "D"), cell(self.sources[0], "D"), cell("crates/alpha", "D")
+        other_crate = cell(self.sources[2], "D", "crates/beta")
+        self.assertTrue(style_plan.blocked_by_structure(crate_cell, (other_file,)))
+        self.assertFalse(style_plan.blocked_by_structure(crate_cell, (other_crate,)))
+        self.assertTrue(style_plan.blocked_by_structure(file_cell, (other_file, own_file)))
+        self.assertFalse(style_plan.blocked_by_structure(file_cell, (other_file, crate_structure, other_crate)))
 
     def test_names_waits_for_structure_when_every_pending_names_file_is_closed(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
@@ -2291,6 +2314,100 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_proposals, "renumber")):
             style_proposals.complete(ledger)
         command.assert_called_once_with("close", str(issue), "--reason", f"built in {ticket['id']}")
+
+    def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...]) -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
+        """Files type findings at sites in an approved decision, judged by a dropped ticket that started at the tip."""
+        issue = self.approved_decision(rule, (), "type")
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-1", "modules-unit", "read", "names", "crates/alpha", sorted({site[0] for site in sites}), [rule])
+        ledger.ticket_assign("modules-unit-1", "style/main")
+        _ = ledger.ticket_base("modules-unit-1")
+        ledger.ticket_drop("modules-unit-1")
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        findings = tuple(ledger.hold(rule, path, line, text, "type", "before", "after", blob, "modules-unit-1")
+                         for path, line, text in sites)
+        for finding in findings:
+            ledger.file_held(finding.finding_id, issue)
+        return issue, findings
+
+    def commit_files(self, files: dict[str, str | bytes]) -> None:
+        for path, content in files.items():
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_bytes(content if isinstance(content, bytes) else content.encode())
+        self.commit_to_every_checkout()
+
+    def refill_after_site_merge(self, before: dict[str, str | bytes], after: dict[str, str | bytes]) -> tuple[str, style_ledger.HeldState]:
+        """Judges a type finding on the first line of the first source at before, merges after and refills.
+
+        Returns the refill output and the finding's state.
+        """
+        rule = self.rule("read")
+        self.commit_files(before)
+        site = self.sources[0]
+        issue, (finding,) = self.judged_findings(rule, ((site, 1, (self.repo / site).read_text().splitlines()[0]),))
+        self.commit_files(after)
+        with mock.patch.object(style_proposals, "proposal_command"):
+            code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        return output, next(held.state for held in self.ledger().proposal_findings(issue) if held.finding_id == finding.finding_id)
+
+    def test_a_merge_that_moves_a_site_into_a_judged_file_stales_it_and_waives_the_moved_finding(self) -> None:
+        rule = self.rule("read")
+        target, source = self.sources[:2]
+        moved_text, kept_text = "pub fn moved_away() -> u32 { 1 }", "pub fn stays_here() -> u32 { 2 }"
+        self.write(source, f"{moved_text}\n{kept_text}\n")
+        self.commit_to_every_checkout()
+        self.record(rule, target, self.tip)
+        issue, (moved, kept) = self.judged_findings(rule, ((source, 1, moved_text), (source, 2, kept_text)))
+        ledger = self.ledger()
+        self.assertEqual(next(cell.state for cell in ledger.cells(rule) if cell.path == target), "current")
+        self.write(target, f"pub fn value() {{}}\n    {moved_text}\n")
+        self.write(source, f"{kept_text}\n")
+        self.commit_to_every_checkout()
+        self.assertEqual(next(cell.state for cell in ledger.cells(rule) if cell.path == target), "stale")
+
+        with mock.patch.object(style_proposals, "proposal_command"):
+            code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        self.assertIn(f"waived 1 findings in {issue}: {source} site moved to {target} in synced commit {self.tip}\n", output)
+        states = {finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)}
+        self.assertEqual(states, {moved.finding_id: style_ledger.Waived(), kept.finding_id: style_ledger.Filed(issue)})
+        ticket = ledger.ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["files"], ticket["finding_ids"]), ("proposal", [source], [kept.finding_id]))
+        self.assertTrue(any(selection.kind == "read" and target in selection.files for selection in self.candidates()))
+
+    def test_an_edited_site_whose_old_line_another_changed_file_always_held_stays_filed(self) -> None:
+        site, other = self.sources[:2]
+        output, state = self.refill_after_site_merge(
+            {site: "pub count: usize,\n", other: "pub count: usize,\npub fn value() {}\n"},
+            {site: "pub item_count: usize,\n", other: "pub count: usize,\npub fn other() {}\n"})
+        self.assertNotIn("site moved", output)
+        self.assertIsInstance(state, style_ledger.Filed)
+
+    def test_a_site_text_that_went_to_no_other_file_stays_filed(self) -> None:
+        site, other = self.sources[:2]
+        output, state = self.refill_after_site_merge(
+            {site: "pub fn gone() {}\npub fn value() {}\n"},
+            {site: "pub fn value() {}\n", other: "pub fn changed() {}\n"})
+        self.assertNotIn("site moved", output)
+        self.assertIsInstance(state, style_ledger.Filed)
+
+    def test_a_site_text_that_went_to_two_files_stays_filed(self) -> None:
+        site, other = self.sources[:2]
+        output, state = self.refill_after_site_merge(
+            {site: "pub fn twice() {}\npub fn value() {}\n"},
+            {site: "pub fn value() {}\n", other: "pub fn twice() {}\n", "crates/alpha/src/added.rs": "pub fn twice() {}\n"})
+        self.assertNotIn("site moved", output)
+        self.assertIsInstance(state, style_ledger.Filed)
+
+    def test_a_latin_1_file_among_the_changed_files_still_takes_the_moved_site(self) -> None:
+        site, other, notes = *self.sources[:2], "crates/alpha/notes.txt"
+        output, state = self.refill_after_site_merge(
+            {site: "pub fn moved() {}\npub fn value() {}\n", notes: "caf\u00e9\npub fn moved() {}\n".encode("latin-1")},
+            {site: "pub fn value() {}\n", other: "pub fn moved() {}\n", notes: "caf\u00e9s\npub fn moved() {}\n".encode("latin-1")})
+        self.assertIn(f"{site} site moved to {other} in synced commit {self.tip}\n", output)
+        self.assertEqual(state, style_ledger.Waived())
 
     def test_decision_refill_after_a_merge_builds_only_the_unbuilt_findings(self) -> None:
         rule = self.rule("read")

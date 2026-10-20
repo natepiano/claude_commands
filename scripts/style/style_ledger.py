@@ -334,6 +334,18 @@ class HeldFinding:
 
 
 @dataclass(frozen=True)
+class JudgedCommit:
+    """The commit a finding was judged at: its judging ticket's checkpoint, or the ticket's start before one."""
+
+    commit: str
+
+
+@dataclass(frozen=True)
+class NoJudgedCommit:
+    """The finding's judging ticket is not in the ledger, or names no commit in the repo."""
+
+
+@dataclass(frozen=True)
 class SupersedingException:
     """The judgment with the verdict exception under the rule's current text that is newest at a finding's cell, also newer than its own."""
 
@@ -1442,6 +1454,17 @@ class Ledger:
             case "unfiled":
                 state = Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket())
+
+    def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
+        rows = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT checkpoint,base FROM tickets WHERE id=?", (finding.ticket,),
+        ).fetchall())
+        for commit in (commit for commit in (rows[0] if rows else ()) if commit):
+            resolved = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+                                      capture_output=True, text=True, check=False)
+            if not resolved.returncode:
+                return JudgedCommit(resolved.stdout.strip())
+        return NoJudgedCommit()
 
     def held_findings(self, selection: AllHeldFindings | HeldFindingsInState | UnfiledFindingsFromOpenTickets) -> tuple[HeldFinding, ...]:
         if isinstance(selection, UnfiledFindingsFromOpenTickets):
