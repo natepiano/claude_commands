@@ -1,4 +1,4 @@
-/** The disk contract written by scripts/delegate/board_json.py. */
+/** The disk contract written by scripts/direct/board_json.py. */
 export interface BoardTime { at: number; text: string }
 export type EtaTrail = [eta_at: BoardTime, stated_at: BoardTime][];
 export type BoardGate =
@@ -24,9 +24,11 @@ export interface BoardEta {
 }
 export type BoardStep = [state: string, what: string, started: BoardTime, took_seconds: number];
 export interface BoardWorker { slot: string; role: string; state: string; model: string; doing: string }
+export interface PlanPhase { kind: 'plan'; id: string; of: number; title: string }
+export interface TicketPhase { kind: 'ticket'; id: string; title: string; merged: number }
 export interface BoardUnit {
   key: string; plan: string; state: 'running' | 'run-finished' | 'standing-by';
-  phase: { id: string; of: number; title: string } | null;
+  phase: PlanPhase | TicketPhase | null;
   phases: BoardPhase[]; finish: BoardFinish; stage: string; eta: BoardEta | null;
   summary: string; steps: BoardStep[]; workers: BoardWorker[];
 }
@@ -34,4 +36,4 @@ export interface BoardData {
   production: string; as_of: BoardTime; zone: string; utc_offset_minutes: number;
   units: BoardUnit[]; sources: string[];
 }
-export interface BoardResult { files: string[]; focus: string | null; watch: string[] }
+export interface BoardResult { files: string[]; watch: string[] }

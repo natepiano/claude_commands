@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -26,12 +27,22 @@ from fake_unit_host import HostedUnit
 SCRIPT = Path(__file__).with_name("stall_watch.py")
 START = int(datetime(2026, 10, 6, 12, 0, tzinfo=ZoneInfo("America/Los_Angeles")).timestamp())
 PANE = "— holding: waiting on a decision\n"
+EDIT_PROMPT = ("— holding: waiting on the seats\n\n Edit file\n scripts/herdr/panes.py\n"
+               + " Do you want to make this edit to panes.py?\n ❯ 1. Yes\n   2. No\n")
+BASH_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read lines 5 to the end of a saved output\n\n"
+               + " Do you want to proceed?\n ❯ 1. Yes\n   3. No, and tell Claude what to do differently (esc)\n")
+AUTO_DENY_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read lines 5 to the end of a saved output\n"
+                    + " ⚠ Claude Code will automatically deny this request in 0:41, to avoid blocking progress on an"
+                    + " unattended session.\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
 
 
 def executable(path: Path, source: str) -> None:
     _ = path.write_text(source)
     path.chmod(0o755)
 
+
+# A marked worker is python, not sleep: the Mac hides a system binary's environment from ps.
+MARKED_SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
@@ -108,7 +119,10 @@ raise SystemExit(1)
         executable(self.bin / "send.py", """#!/usr/bin/env python3
 import json, os, sys, time
 args = sys.argv[1:]
-record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text')}
+record = {name: args[args.index('--' + name) + 1] for name in ('to', 'from', 'key', 'text', 'text-id', 'need')
+          if '--' + name in args}
+if '--value' in args:
+    record['values'] = dict(args[i + 1].split('=', 1) for i, arg in enumerate(args) if arg == '--value')
 line = (json.dumps(record) + '\\n').encode()
 fd = os.open(os.environ['STALL_TEST_SEND_LOG'], os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
 os.write(fd, line)
@@ -141,6 +155,9 @@ raise SystemExit(1 if record['to'] in fail else 0)
             "STALL_TEST_FAIL_FILE": str(self.fail_file),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
+            # herdr reads a Mac process's marks with the real ps; the fake one answers only the watcher's list.
+            "HERDR_PS": shutil.which("ps") or "ps",
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
         }
@@ -232,7 +249,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
         _ = self.ps_file.write_text("\n".join(self.process_rows) + "\n")
         units = [
             HostedUnit(str(data["label"]), f"w{data['id']}:p1",
-                       {"SHOWRUNNER_UNIT": str(data["slug"]), "SHOWRUNNER_UNIT_ID": name}, str(data["pane"]))
+                       {"SHOWRUNNER_UNIT": str(data["slug"]), "SHOWRUNNER_UNIT_ID": name}, str(data["pane"]),
+                       str(data.get("agent_status", "idle")))
             for name, data in self.panes.items()]
         fake_unit_host.write(self.environment, units)
         for unit, data in zip(units, self.panes.values()):
@@ -333,6 +351,70 @@ raise SystemExit(1 if record['to'] in fail else 0)
         second = self.sent()[2:]
         self.assertEqual(len(second), 2)
         self.assertNotEqual({item["key"] for item in first}, {item["key"] for item in second})
+
+    def test_a_unit_at_a_permission_prompt_alerts_the_user_once_and_is_not_bumped(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        # A failed alert is sent again on the next tick.
+        _ = self.fail_file.write_text('["user"]')
+        failed = self.tick(START + 60)
+        self.assertIn("alert", failed.stderr)
+        _ = self.fail_file.write_text("[]")
+        self.assertEqual(self.tick(START + 120).returncode, 0)
+        self.assertEqual(self.tick(START + 900).returncode, 0)
+        alerts = self.sent()
+        self.assertEqual(len(alerts), 2, alerts)
+        self.assertEqual(alerts[-1]["to"], "user")
+        self.assertEqual(alerts[-1]["text-id"], "stall_watch.permission_prompt")
+        self.assertEqual(alerts[-1]["need"], "blocked")
+        values = cast(dict[str, dict[str, str]], json.loads(self.send_log.read_text().splitlines()[-1]))["values"]
+        self.assertEqual((values["unit"], values["request"], values["since"]), ("unit-one", "edit panes.py", "12:00 PDT"))
+        # No bump and no tell while it waits on the user.
+        self.assertNotIn("uds:", " ".join(item["to"] for item in alerts))
+        # The prompt is answered: the idle clock starts again, and a new prompt alerts again.
+        self.panes["unit-one"]["agent_status"] = "idle"
+        self.panes["unit-one"]["pane"] = "— holding: ready for next step\n"
+        self.assertEqual(self.tick(START + 960).returncode, 0)
+        self.assertEqual(len(self.sent()), 2)
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.assertEqual(self.tick(START + 1000).returncode, 0)
+        self.assertEqual(self.tick(START + 1060).returncode, 0)
+        self.assertEqual([item["to"] for item in self.sent()[2:]], ["user"])
+
+    def test_a_unit_at_a_prompt_with_the_auto_deny_banner_gets_no_alert_and_no_bump(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = AUTO_DENY_PROMPT
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 60).returncode, 0)
+        self.assertEqual(self.tick(START + 900).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        # The same unit at a prompt without the banner waits on the user, and its alert time starts then.
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        self.assertEqual(self.tick(START + 901).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.tick(START + 961).returncode, 0)
+        self.assertEqual([item["to"] for item in self.sent()], ["user"])
+
+    def test_the_request_is_read_from_the_prompt_at_the_bottom_of_the_pane(self) -> None:
+        import stall_watch
+        self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT), "edit panes.py")
+        self.assertEqual(stall_watch.prompt_request(BASH_PROMPT),
+                         "run a shell command to read lines 5 to the end of a saved output")
+        self.assertEqual(stall_watch.prompt_request(" Do you want to create notes.md?\n ❯ 1. Yes\n"), "create notes.md")
+        self.assertEqual(stall_watch.prompt_request("Bash command\n\n   ls\n\n Do you want to proceed?\n"),
+                         "run a shell command")
+        self.assertEqual(stall_watch.prompt_request("— holding: waiting\n"), "go on with its work")
+
+    def test_the_request_skips_the_auto_deny_banner(self) -> None:
+        import stall_watch
+        self.assertEqual(stall_watch.prompt_request(AUTO_DENY_PROMPT),
+                         "run a shell command to read lines 5 to the end of a saved output")
+        self.assertTrue(stall_watch.auto_denied(AUTO_DENY_PROMPT))
+        # The banner quoted in the transcript above a prompt is not the prompt's own banner.
+        quoted = " The push said ⚠ Claude Code will automatically deny this request in 0:41.\n\n" + EDIT_PROMPT
+        self.assertFalse(stall_watch.auto_denied(quoted))
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
@@ -442,6 +524,39 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()},
                          {"bump", "tell"})
 
+    def test_a_hold_that_states_its_end_is_not_bumped_before_then(self) -> None:
+        """START is 12:00 PDT: a hold ending at 14:00, dated or not, bumps only once 14:00 is past."""
+        for status in ("— holding: waiting on the re-measure window, which ends 2026-10-06 14:00 PDT",
+                       "— holding: waiting on the re-measure window until 14:00 PDT",
+                       "— holding: waiting on the window until 21:00 UTC",
+                       "— holding: waiting on the window, which opens Tue 10-06 14:00 PDT"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                for at in (START, START + 300, START + 7199):
+                    self.assertEqual(self.tick(at).returncode, 0)
+                self.assertEqual(self.sent(), [])
+                self.assertEqual(self.tick(START + 7199 + 300).returncode, 0)
+                self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in self.sent()}, {"bump", "tell"})
+
+    def test_a_hold_naming_a_past_time_still_bumps(self) -> None:
+        """A time without a date is the nearest one: 11:50 read at 12:00 is this morning, not tonight."""
+        for status in ("— holding: waiting on the tests since 11:50 PDT",
+                       "— holding: waiting on the window, which ended 2026-10-06 11:00 PDT",
+                       "— holding: waiting on the window, which closed Mon 10-05 14:00 PDT"):
+            with self.subTest(status=status):
+                self.state.mkdir(exist_ok=True)
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                self.send_log.unlink(missing_ok=True)
+                self.panes["unit-one"]["pane"] = status + "\n"
+                self.assertEqual(self.tick(START).returncode, 0)
+                self.assertEqual(self.tick(START + 300).returncode, 0)
+                self.assertEqual(len(self.sent()), 2)
+
     def test_shell_seen_then_gone_starts_a_new_idle_stretch(self) -> None:
         _ = self.tick(START)
         _ = self.tick(START + 300)
@@ -517,7 +632,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
                 self.send_log.unlink(missing_ok=True)
                 _ = self.tick(START)
                 marks = {"SHOWRUNNER_UNIT": "showrunner", "SHOWRUNNER_UNIT_ID": unit}
-                worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                           env={**os.environ, **marks})
                 self.children.append(worker)
                 self.process_rows.append(f"{worker.pid} 1 sleep 60")
@@ -529,7 +644,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
         doc = self.root / "showrunner-production.md"
         _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())
         self.panes["unit-one"]["slug"] = "old-showrunner"
-        worker = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        worker = subprocess.Popen(MARKED_SLEEPER, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   env={**self.environment, "SHOWRUNNER_UNIT": "old-showrunner",
                                        "SHOWRUNNER_UNIT_ID": "unit-one"})
         self.children.append(worker)
@@ -683,22 +798,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
-    def test_an_idle_review_unit_is_not_bumped_while_a_unit_beside_it_is(self) -> None:
-        import stall_watch
-        self.configure_registered({"showrunner": [("review-unit", "running"), ("hook-unit", "running")]},
-                                  review_pool=True)
-        for name in ("review-unit", "hook-unit"):
-            _ = self.unit(name)
-
-        self.assertEqual(self.tick(START).returncode, 0)
-        self.assertEqual(self.tick(START + 600).returncode, 0)
-        sent = self.sent()
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-        self.assertTrue(all(item["key"].startswith("stall-watch:hook-unit:") for item in sent), sent)
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "review-unit").name).exists())
-
-    def test_a_unit_named_review_unit_with_no_review_pool_is_bumped(self) -> None:
-        self.configure_registered({"showrunner": [("review-unit", "running")]})
+    def test_a_unit_named_review_unit_beside_a_review_pool_is_bumped(self) -> None:
+        self.configure_registered({"showrunner": [("review-unit", "running")]}, review_pool=True)
         _ = self.unit("review-unit")
 
         self.assertEqual(self.tick(START).returncode, 0)
@@ -749,7 +850,7 @@ raise SystemExit(1 if record['to'] in fail else 0)
             json.dumps({"pid": "unreadable", "sessionId": "", "name": "", "running": False}))
         result = self.tick(START)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("stall-watch: unit-one: one or more session records could not be read", result.stderr)
+        self.assertIn(f"stall-watch: unit-one: the session record of pid {self.children[0].pid} could not be read", result.stderr)
         self.assertEqual(self.tick(START + 600).returncode, 0)
         self.assertEqual(self.sent(), [])
 

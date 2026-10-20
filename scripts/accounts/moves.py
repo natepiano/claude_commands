@@ -4,13 +4,14 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 from dataclasses import dataclass
 from importlib import import_module
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, Protocol, cast, override, assert_never
 
-from scripts.accounts import worker_names
+from scripts.accounts import role_map, worker_names
 
 if TYPE_CHECKING:
     from scripts.whoami.account import ResolvedHistoryLabel, HistoricalAccountUnresolved
@@ -105,8 +106,10 @@ class RoutingCommon(TypedDict):
 
 class RoutedToClaude(RoutingCommon):
     kind: Literal["routed to claude"]
-    cause: Literal["refusal", "credits off"]
+    cause: Literal["refusal", "credits off", "auto"]
+    why: str
     moved: list[str]
+    claude_account: NotRequired[str]
 
 
 class RoutedBack(RoutingCommon):
@@ -149,8 +152,13 @@ def _valid(value: object) -> bool:
         except ValueError:
             return False
         keys = ("moved",) if kind == "routed to claude" else ("restored", "kept")
-        if kind == "routed to claude" and fields.get("cause") not in ("refusal", "credits off"):
+        if kind == "routed to claude" and (fields.get("cause") not in ("refusal", "credits off", "auto")
+                                               or not isinstance(fields.get("why"), str)):
             return False
+        if "claude_account" in fields:
+            target = fields["claude_account"]
+            if not isinstance(target, str) or not re.fullmatch(r"claude[1-9][0-9]*", target):
+                return False
         if kind == "routing not restored":
             if fields.get("outcome") not in ("partial", "failed"):
                 return False
@@ -199,6 +207,80 @@ def _canonical_entry(entry: MoveEntry) -> MoveEntry:
     return cast(MoveEntry, cast(object, fields))
 
 
+
+def append_journal_line(descriptor: int, document: str) -> None:
+    role_map.append_journal_line(descriptor, document, valid_row=_valid_legacy_journal_row)
+
+
+def _valid_legacy_journal_row(value: object) -> bool:
+    if isinstance(value, dict):
+        fields = dict(cast(dict[str, object], value))
+        if fields.get("kind") == "routed to claude":
+            _ = fields.setdefault("why", fields.get("cause"))
+        return _valid(fields)
+    return False
+
+
+@dataclass(frozen=True)
+class RecordedAutoEntries:
+    entry_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
+class UnreadableMoveJournal:
+    """Workers entries cannot safely run without their replay evidence."""
+
+
+
+@dataclass(frozen=True)
+class ReadCurrentMoveJournal:
+    """A standalone caller requests current replay evidence."""
+
+
+READ_CURRENT_MOVE_JOURNAL = ReadCurrentMoveJournal()
+
+def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
+    """Read replay evidence under the same flock as journal appenders."""
+    path = store_file()
+    try:
+        with path.open("rb") as source:
+            fcntl.flock(source.fileno(), fcntl.LOCK_SH)
+            lines = source.read().splitlines(keepends=True)
+        rows: list[dict[str, object]] = []
+        for index, line in enumerate(lines):
+            try:
+                raw = cast(object, json.loads(line))
+                if not isinstance(raw, dict):
+                    raise ValueError("expected a move journal object")
+                row = cast(dict[str, object], worker_names.journal_entry(cast(dict[str, object], raw)))
+                if row.get("kind") == "routed to claude":
+                    _ = row.setdefault("why", row.get("cause"))
+                if not _valid(row):
+                    raise ValueError("invalid move journal row")
+                rows.append(row)
+            except (ValueError, UnicodeError):
+                if index == len(lines) - 1 and not line.endswith(b"\n"):
+                    print(f"account moves: skipping torn final line in {path}")
+                    continue
+                raise
+        failed = {row.get("move_id") for row in rows if row.get("kind") == "failed"}
+        ids: set[str] = set()
+        for row in rows:
+            why = row.get("why")
+            if not isinstance(why, str) or not why.startswith("auto: "):
+                continue
+            if (row.get("kind") == "routed to claude"
+                    or row.get("kind") == "requested" and row.get("tool") == "codex" and row.get("subject") == "workers"
+                    and row.get("cause") == "auto" and row.get("move_id") not in failed):
+                ids.add(why.removeprefix("auto: "))
+        return RecordedAutoEntries(frozenset(ids))
+    except FileNotFoundError:
+        return RecordedAutoEntries(frozenset())
+    except (OSError, ValueError, UnicodeError) as error:
+        print(f"account moves: cannot read recorded workers moves: {error}")
+        return UnreadableMoveJournal()
+
+
 def append_move(entry: MoveEntry) -> None:
     """Append a complete transition while holding the shared writer lock."""
     if not _valid(entry):
@@ -208,10 +290,10 @@ def append_move(entry: MoveEntry) -> None:
         raise ValueError("name the account by number")
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8") as output:
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
         _ = worker_names.migrate_locked_journal(output)
-        if entry["kind"] in ("confirmed", "wait ended", "room again"):
+        if entry["kind"] in ("confirmed", "wait ended", "room again", "failed"):
             _ = output.seek(0)
             for line in output:
                 try:
@@ -226,8 +308,7 @@ def append_move(entry: MoveEntry) -> None:
                                  (held.get("worker") == entry.get("worker") and held.get("run") == entry.get("run")))):
                         return
         _ = output.seek(0, os.SEEK_END)
-        _ = output.write(json.dumps(entry, sort_keys=True) + "\n")
-        output.flush()
+        append_journal_line(output.fileno(), json.dumps(entry, sort_keys=True))
 
 
 def read_journal() -> list[JournalEntry]:
@@ -278,21 +359,29 @@ def read_journal() -> list[JournalEntry]:
         return numbered(matching[-1].label, tool) if matching else HomeAccountUnresolved(home)
 
     try:
-        with store_file().open("r+", encoding="utf-8") as source:
+        with store_file().open("r+", encoding="utf-8", errors="replace") as source:
             fcntl.flock(source.fileno(), fcntl.LOCK_EX)
             lines = worker_names.migrate_locked_journal(source)
     except FileNotFoundError:
         return []
     entries: list[JournalEntry] = []
-    for line in lines:
+    for index, line in enumerate(lines):
         try:
             value = cast(object, json.loads(line))
         except ValueError:
+            if index == len(lines) - 1 and not line.endswith("\n"):
+                print(f"account moves: skipping torn final line in {store_file()}")
             continue
-        if _valid(value):
+        if isinstance(value, dict):
+            legacy = cast(dict[str, object], value)
+            if legacy.get("kind") == "routed to claude":
+                _ = legacy.setdefault("why", legacy.get("cause"))
+        if _valid(cast(object, value)):
             raw = cast(dict[str, object], value)
             if raw["kind"] in ("routed to claude", "routed back", "routing not restored"):
                 raw["owner"] = _routing_owner(raw["owner"])
+                if raw["kind"] == "routed to claude":
+                    _ = raw.setdefault("why", raw["cause"])
                 entries.append(cast(RoutingEntry, cast(object, raw)))
                 continue
             entry = _canonical_entry(cast(MoveEntry, value))
@@ -354,7 +443,7 @@ def append_routing(entry: RoutingEntry) -> None:
     saved["owner"] = owner if isinstance(owner, str) else "unknown"
     path = store_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8") as output:
+    with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
         _ = worker_names.migrate_locked_journal(output)
         _ = output.seek(0)
@@ -368,8 +457,7 @@ def append_routing(entry: RoutingEntry) -> None:
                 if held.get("kind") == entry["kind"] and held.get("fallback_at") == entry["fallback_at"]:
                     return
         _ = output.seek(0, os.SEEK_END)
-        _ = output.write(json.dumps(saved, sort_keys=True) + "\n")
-        output.flush()
+        append_journal_line(output.fileno(), json.dumps(saved, sort_keys=True))
 
 
 @dataclass(frozen=True)

@@ -16,14 +16,16 @@ from zoneinfo import ZoneInfo
 import showrunners
 import unit_lookup
 from add_unit import Production, read_production
-from production_units import Refusal, cell_value, live_unit_table, unit_table
+from production_units import Refusal, cell_value, live_unit_table, production_field, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
-from dailies_render import (LENGTHS, InputError, StateRefused, as_list, as_map, check_render_state, due, last_report,
+from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,
+                            as_list, as_map, check_render_state, due, last_report,
                             local_now, parse_child_report, parse_range_end, parse_report, parse_time,
-                            read_outstanding)
-from merge_checkpoint import NoMerge, git, merge_branch_history
-from update_registration import RegistrationFailure, UpdatesOnDemand, outstanding_file, update_schedule
+                            parse_style_summary, read_outstanding)
+from merge_checkpoint import ChildHandoffEntry, NoMerge, git, merge_branch_history
+from update_registration import (RegistrationFailure, UpdatesOnDemand, adopt_moved_state, outstanding_file,
+                                 update_schedule)
 from waiting import EtaNotYetRequested, EtaRequested, eta_requested, update_state
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
@@ -556,7 +558,7 @@ def unit_phase_state(value: object, where: str, zone: ZoneInfo) -> UnitPhaseStat
 
 def phase_table_path() -> Path:
     configured = os.environ.get("DAILIES_PHASE_TABLE")
-    return Path(configured) if configured else Path(__file__).resolve().parent.parent / "delegate/phase_table.py"
+    return Path(configured) if configured else Path(__file__).resolve().parent.parent / "direct/phase_table.py"
 
 
 def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
@@ -781,6 +783,32 @@ def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool) -> 
     return fields
 
 
+def style_summary(production: Production) -> JsonMap:
+    """Validate the ledger's summary while keeping every JSON field for the parent."""
+    script = Path(__file__).resolve().parent.parent / "style/style_ledger.py"
+    try:
+        result = command(script, "summary", "--repo", str(production.checkout), "--json")
+        if result.returncode:
+            reason = result.stderr.strip() or result.stdout.strip() or f"summary exited {result.returncode}"
+            return {"unavailable": reason.splitlines()[0]}
+        raw = cast(object, json.loads(result.stdout))
+        if not isinstance(parse_style_summary(raw, "style", production.zone), StyleSummary):
+            raise InputError("style: expected the ledger summary object")
+        return as_map(raw, "style")
+    except (InputError, OSError, ValueError) as error:
+        reason = str(error).strip() or type(error).__name__
+        return {"unavailable": reason.splitlines()[0]}
+
+
+def is_style_production(production: Production) -> bool:
+    # The style production doc is excluded from Git, so its kind comes from disk.
+    lines = production.doc.read_text(encoding="utf-8").splitlines()
+    try:
+        return production_field(lines, "Kind") == "style"
+    except Refusal:
+        return False
+
+
 def save_last_report(slug: str, saved: JsonMap) -> Path:
     path = last_report_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -820,6 +848,9 @@ def run(args: argparse.Namespace) -> int:
     render_state = cast(Path, args.render_state)
     expand = cast(list[str], args.expand)
     production = read_production(production_path)
+    # Before any state is read: a showrunner started before the state move gets its state copied here.
+    for line in adopt_moved_state(production):
+        print(f"state-dir: ok — {line}", file=sys.stderr)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = units_from_doc(lines, production.slug)
@@ -981,7 +1012,9 @@ def run(args: argparse.Namespace) -> int:
     merge = as_map(judgment.get("merge", {}), f"{judgment_path}.merge")
     held, testing = merge.get("held"), merge.get("testing")
     if held or testing or not pushed:
-        latest = "no checkpoint merged" if isinstance(last, NoMerge) else f"{last.unit} phase {last.phase} ({last.short})"
+        latest = ("no checkpoint merged" if isinstance(last, NoMerge) else
+                  f"{last.child} style hand-off ({last.short})" if isinstance(last, ChildHandoffEntry) else
+                  f"{last.unit} phase {last.phase} ({last.short})")
         details = [f"last merge: {latest}", "pushed" if pushed else "not pushed"]
         if held:
             details.append(f"held: {held}")
@@ -1065,9 +1098,12 @@ def run(args: argparse.Namespace) -> int:
     _ = out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     report("input", "ok", f"wrote {out}")
     # What the showrunner above this one shows of it. Failing to save it never costs this report.
-    interval = None if isinstance(schedule, UpdatesOnDemand) else schedule.minutes
+    cadence = ReportsOnDemand() if isinstance(schedule, UpdatesOnDemand) else ReportsEvery(schedule.minutes)
     try:
-        saved_at = save_last_report(production.slug, last_report(result, render_state, at, interval))
+        saved = last_report(result, render_state, at, cadence)
+        if is_style_production(production):
+            saved = {**saved, "style": style_summary(production)}
+        saved_at = save_last_report(production.slug, saved)
     except (InputError, OSError) as error:
         report("saved report", "unavailable", str(error))
     else:

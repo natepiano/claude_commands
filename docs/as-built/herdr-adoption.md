@@ -54,7 +54,7 @@ Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refus
 **Panes and agents.**
 
 - `open_pane(name, label, cwd, environment) -> pane_id` runs `workspace create --label --cwd --env K=V ... --no-focus`, then renames the root pane to the label. Every pane also gets `HERDR_AGENT_PANE=1`. herdr 0.9.0 sets these variables in each pane: `HERDR_PANE_ID`, `HERDR_SESSION`, `HERDR_SOCKET_PATH`, `HERDR_TAB_ID`, `HERDR_WORKSPACE_ID`, `HERDR_BIN_PATH`, `HERDR_ENV=1`.
-- `start_agent(name, pane, kind, agent_arguments, opening: OpeningPrompt | NoOpeningPrompt, timeout_ms)` exists as a module function, which uses the pane label as the agent name, and as a `Herdr` method. It runs `agent start <agent name> --kind <kind> --pane <pane> --timeout <ms> -- <agent_arguments>`. herdr adds the binary itself, so an `agent_arguments` whose first element equals `kind` raises `ValueError` before any herdr call. Agent names are lowercased, other characters become `-`, `a-` is added in front when the name does not start with a letter, and the result is cut to 32 characters.
+- `start_agent(name, pane, kind, agent_arguments, opening: OpeningPrompt | NoOpeningPrompt, timeout_ms, *, agent)` exists as a module function, which names the agent `agent`, and as a `Herdr` method. Its limit is `timeout_ms` times `load_factor()`, the one-minute load per CPU from 1 to 6 (2026-10-18: values-unit missed its 90 s limit at load 125). The limit covers the start and the opening prompt; `agent start --timeout` takes at most herdr's 300000. A `PromptNotSubmitted` that the launcher never typed has `never_typed` set, and add_unit then closes that new session (`close_untyped_session`): its Units row and worktree stay, and the same command starts it again. It runs `agent start <agent name> --kind <kind> --pane <pane> --timeout <ms> -- <agent_arguments>`. herdr adds the binary itself, so an `agent_arguments` whose first element equals `kind` raises `ValueError` before any herdr call. Agent names are lowercased, other characters become `-`, `a-` is added in front when the name does not start with a letter, and the result is cut to 32 characters.
 - `agent_pane_busy` is retried every 0.1 s against one shared deadline. A retry never passes a per-try timeout at or below `_AGENT_START_TIMEOUT_MINIMUM_MS` (3000).
 - While the CLI waits, the library finds the pane shell (`pane process-info`) and walks its process tree on Linux (per-thread `children`). It follows the agent by pid plus start ticks across exec and reparenting. An agent that was seen and is gone, or herdr's `agent_start_failed` with `process exited`, raises `AgentExited`. When `/proc` cannot be read it falls back to herdr observations at most twice a second.
 - `agent_not_ready` reads the visible screen and raises `AgentNotReady(screen)`. No key is sent.
@@ -69,6 +69,10 @@ Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refus
 - `_PLATFORM = sys.platform` is read once at import.
 
 **Clients and server environment.** `attached_clients(name) -> ClientsAttached(count) | NoClientAttached | ClientsUnreadable(detail)` counts this user's `herdr session attach <name>` clients and bare `herdr` TUI clients for that session. The session comes from argv `--session` first, then the client's `HERDR_SESSION`, else `default`. A client that exits mid-read counts as gone. `server_environment(name)` returns the environment of the single process holding the session's listening socket. Callers refuse when it holds a variable that must be unset, since panes inherit the server's environment.
+
+**Shared session layout (user, 2026-10-18).** When `herdr.shared_session()` names a session, every Claude launcher opens a tab in it, never a session of its own. `Herdr.open_tab(space, title, cwd, environment)` finds or creates the workspace `space` and gives the tab and its pane the name `title`. A production's workspace is `showrunners.herdr_space(slug, doc)`: the doc's `- **Showrunner session:**` line, else the slug, so it reads `natedev`, `hana` or `cargo-liner`. The name never depends on whether the showrunner runs, so a unit restarted first finds the same workspace. A session outside any production goes to `ad-hoc`. A tab's title is the Claude session's current name (user, 2026-10-18): a launcher titles the tab with the name it gives `-n`, and a rename later reaches the tab through the Stop hook `scripts/hooks/herdr_tab_title.py`. At the end of each turn in a pane of the shared session, that hook reads the session's record and calls `Herdr.retitle(pane, name)`. `retitle` reads the pane and its tab. When either name differs, it renames the pane and the tab, and runs `order_tabs` again after a tab rename. A fault never stops the turn. The pane has the same name as its tab, because herdr's Go to list shows pane names. No script finds a session by its pane name. The herdr agent name stays the full session name: `start_agent` takes it as `agent`. A stop closes a unit's tab through the pane that carries its marks (`unit_lookup.marked_unit`), never by a title. A title is short and can repeat across workspaces (`review`).
+
+**Tab order (user, 2026-10-18).** In each workspace the showrunner's tab comes first and the other tabs follow in alphabetical order. The showrunner's tab is the one titled with the workspace's own name. `open_tab` calls `Herdr.order_tabs(workspace)` after it adds a tab to an existing workspace. herdr 0.9.5 has no command to move a tab, but `pane move --new-tab` puts the pane in a new tab at the end. So `order_tabs` moves each tab from the first one out of place, in order, and gives each new tab its old title. The pane keeps its id and its process. Focus goes back to the workspace and tab that had it. A tab with several panes leaves the order as it is. It returns each moved pane's new id by its old one.
 
 **Workspaces and focus.** `Herdr.focus_workspace(id)` runs `workspace focus`. `Herdr.close_startup_workspaces(restored_workspace)` closes every other workspace that is still herdr's untouched startup shell, and lists workspaces and panes again before each close. Untouched means a workspace labelled `~` with one tab, one pane and `agent_status` `unknown`, whose pane has no agent, `agent_status` `unknown`, cwd and foreground cwd equal to home, `revision` 0, and `scroll.max_offset_from_bottom` 0. `_StartupShellEvidence` is `UNTOUCHED` or `PRESERVE`. Missing or mistyped evidence keeps the workspace.
 
@@ -199,6 +203,30 @@ Old records and snapshots still parse, and they never become herdr destinations.
 - `fake_unit_host.py`: `environment(root)` sets `HERDR_BIN`, `HERDR_PROC`, `FAKE_HERDR_LOG` and `FAKE_HERDR_RESPONSES` for an empty host. `HostedUnit(session, pane, marks, screen)`. `write(env, units)` publishes a server process (pid `991000 + 2i`), its listener, a marked `zsh` pane shell, the session list, and pane reads (`recent` and `recent-unwrapped`; 3, 60 and 400 lines; with and without ANSI). `place_process(env, pid, pane)` puts a registry process under that pane's shell. `calls(env)` returns logged argv. `live_pid(test)` gives a real live pid for registry checks.
 - Darwin cases fake `LAUNCHCTL`, `HERDR_PS`, `HERDR_LSOF`, `SHUTDOWN_OPEN` and `SHUTDOWN_SYSCTL`, and pin `herdr._PLATFORM`. Linux `/proc` cases use `scripts/shutdown/test_support.linux_process_fixture`, which pins `sys.platform` and `herdr._PLATFORM`.
 
+Use these fixture rules on Linux and macOS:
+
+- Resolve the temporary root in `test_add_unit.py` and `test_add_showrunner.py`. On macOS, `/tmp` points to `/private/tmp`. Trust keys and worktree paths must use the same resolved root as the code under test.
+- Set `HERDR_PLATFORM=linux` in each Linux launcher fixture's environment. Do not set it for the whole run. Darwin tests must still select the Darwin path.
+- Keep `HERDR_BIN=/nonexistent/herdr` in `PromptSubmissionTests`' cleared environment. Its fake pane calls do not need herdr on `PATH`.
+- Build a herdr client only in `setUp`, never as a class attribute: the class body runs at import, before any patched environment. The run-wide `HERDR_BIN` hides such a lookup, so check a new fixture once with an empty `PATH` and no `HERDR_BIN`.
+
+Run the nine suites on the Mac with a scratch home. Run the command from the root of a copy of the tree under test, not from the Mac's live `~/.claude`, which holds main. Remove the scratch home when the run ends:
+
+```sh
+(
+  test_home=$(mktemp -d) || exit
+  trap 'rm -rf "$test_home"' EXIT
+  env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CODEX_HOME \
+    HOME="$test_home" TMPDIR=/private/tmp HERDR_BIN=/nonexistent/herdr \
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest \
+    scripts.herdr.test_herdr scripts.herdr.test_herdr_sessions \
+    scripts.shutdown.test_restart scripts.shutdown.test_account_move \
+    scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle \
+    scripts.production.test_add_unit scripts.production.test_add_showrunner \
+    scripts.notify.test_push_texts
+)
+```
+
 ## Invariants
 
 - Tests never start real herdr, Claude or Codex. They use `fake_herdr.py`, `fake_unit_host.py`, a fake `/proc` and fake session records, in temporary folders.
@@ -206,6 +234,7 @@ Old records and snapshots still parse, and they never become herdr destinations.
 - Trust counts only on an exact key: the folder, its toplevel, or its main checkout. An accepted ancestor folder never counts.
 - The trust survey prints only the key, accepted and kind fields of `.claude.json`, never any other field.
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
+- The prompt goes in only when the composer is empty. Every composer check reads `pane read --source visible --format ansi` and drops faint text (SGR 2, until 22 or 0; colour arguments of 38/48/58 are skipped), because a new session shows a faint hint such as `Try "fix lint errors"` in its empty composer. Read as plain text, that hint looked like input, and add_unit's efficiency launch waited out its limit twice (2026-10-19).
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
 - `start_new_server` is exclusive and raises `SessionTaken` on a taken name. Launchers that create a session use it. Adopting starts are only for restoring into a recorded server.
 - Restored workspaces are cleared on every server spawn. Restart closes only workspaces that pass the untouched startup-shell test, never one it did not create.
@@ -252,6 +281,8 @@ Old records and snapshots still parse, and they never become herdr destinations.
 - Linux discovery skips a process whose cwd no longer resolves, so callers that hold a registry pid place it with `herdr_place_of`.
 - natedev's `claude` alias adds `--remote-control` and `--settings`. herdr types a bare `claude` at the pane prompt, so without the `HERDR_AGENT_PANE` guard every session would get those flags twice.
 - An account move cannot run `accounts.py exec` inside herdr, since it removes credentials and checks readiness, which pane variables cannot do. Moves pass `prepared_account(target, resume=True)` variables and removals instead.
+- A detached run is not a unit's second pane. A worker build that `mesh_runs.py supervise` runs stays in the herdr service's cgroup, so herdr places it in the session. It inherits the unit's marks and a pane id that can be out of date. `unit_lookup` keeps only the places that can hold the unit's Claude when one does. Before this, three tool-based-ui units read as marked twice and `roster.py` exited 1.
+- `herdr_place_of` reads every process for each call. `herdr_places()` places every pid at once; `roster.py` took 10.7 s for 40 calls and now takes about 1 s in total.
 
 **Mac.**
 

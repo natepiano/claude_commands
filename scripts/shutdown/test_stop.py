@@ -29,6 +29,7 @@ import settle
 import sessions
 import stop
 import relaunch
+import unit_lookup
 
 LOGIN = "owner@example.com"
 LABEL = "claude2"
@@ -226,6 +227,37 @@ def machine_inventory(
 
 
 @final
+@final
+class _HeldClaim:
+    def check(self) -> None:
+        pass
+
+
+class SharedHerdrStopTests(unittest.TestCase):
+    def test_a_unit_in_the_shared_session_closes_only_the_tab_of_its_marked_pane(self) -> None:
+        session = cast(inventory.Session, cast(object, {
+            "kind": "unit", "name": "review",
+            "host": {"kind": "unit", "production": "prod", "unit": "review-unit", "session_name": "agents"}}))
+        claim = cast(stop.StopClaim, cast(object, _HeldClaim()))
+        marked = unit_lookup.MarkedUnit("review-unit", unit_lookup.ClaudeNotRunning(), herdr.HerdrPlace("agents", "w3:pE"))
+        cases: list[tuple[unit_lookup.MarkedUnit | None, list[herdr.PaneIdentity], int, int]] = [
+            (marked, [], 1, 0),
+            (marked, [{"pane_id": "w3:pE", "label": "prod-review"}], 1, 1),
+            (None, [], 0, 0),
+        ]
+        for found, panes, closes, issues in cases:
+            with (self.subTest(found=found, panes=panes), patch.object(herdr, "shared_session", return_value="agents"),
+                  patch.object(unit_lookup, "marked_unit", return_value=found) as lookup,
+                  patch.object(herdr.Herdr, "close_tab_of") as closed,
+                  patch.object(herdr.Herdr, "panes", return_value=panes)):
+                result = stop._stop_unit_session(session, lambda: NOW_UTC, claim)  # pyright: ignore[reportPrivateUsage]
+            lookup.assert_called_once_with("prod", "review-unit")
+            self.assertEqual(closed.call_count, closes)
+            if closes:
+                closed.assert_called_once_with("w3:pE")
+            self.assertEqual(len(result), issues)
+
+
 class StopTests(ShutdownTestCase):
     root: Path = Path()
 
@@ -302,6 +334,26 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(signals, [signal.SIGTERM])
         self.assertEqual(finished["progress"], {"kind": "stopped", "at": NOW})
         self.assertEqual(finished["where"], saved["where"])
+
+    def test_move_stops_an_owner_with_unpushed_commits_and_a_full_shutdown_waits(self) -> None:
+        for moving in (True, False):
+            with self.subTest(moving=moving):
+                owner = top_level(f"unpushed-{moving}", 101)
+                owner["checkout"] = checkout()
+                owner["checkout"]["upstream"] = inventory.Tracking(kind="tracking", ahead=2)
+                saved = entry(owner)
+                saved["progress"] = {"kind": "ready", "at": NOW}
+                if moving:
+                    saved["target"] = "claude3"
+                self.create([saved])
+                signals: list[int] = []
+                finished = stop.stop_session(saved, kill=lambda _pid, sent: signals.append(sent),
+                    is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+                    fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                    clock=lambda: NOW_UTC, codex_mesh=lambda _args: 0,
+                    sleep=lambda _seconds: None)
+                self.assertEqual(signals, [signal.SIGTERM] if moving else [])
+                self.assertEqual(finished["progress"]["kind"], "stopped" if moving else "ready")
 
     def test_idle_decision_preserves_ready_checkpoint_arriving_before_stop_claim(self) -> None:
         owner = top_level("became-ready", 101, status="shell")
@@ -602,7 +654,7 @@ class StopTests(ShutdownTestCase):
 
     def test_cancel_during_a_stop_claim_keeps_its_record_and_timers(self) -> None:
         saved = entry(top_level('owner', 101))
-        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True, footer=record.NoFooter(kind='no footer'))]
+        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True)]
         self.create([saved])
         entered = threading.Event()
         release = threading.Event()
@@ -661,6 +713,27 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(report['stop_issues'], [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
+    def test_forced_stop_signals_a_busy_entry(self) -> None:
+        stored = top_level('busy', 101)
+        current = top_level('busy', 101, status='busy')
+        self.create(records_for_test([entry(stored)]))
+        killed: list[int] = []
+        report = stop.stop_session(self.stored_record(), forced=True, kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([current]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+        self.assertEqual(killed, [101])
+        self.assertEqual(report['stop_issues'], [])
+
+    def test_forced_stop_signals_an_account_unreadable_entry_only_when_its_process_is_unchanged(self) -> None:
+        for session_id, pid, running_start, expected in (('same', 101, 'start-same', [101]), ('replaced', 102, 'a later process', [])):
+            with self.subTest(session_id=session_id):
+                self.create(records_for_test([entry(top_level(session_id, pid))]))
+                unattributed = inventory.UnattributedSession(pid=pid, name=session_id, reason='account unreadable')
+                saved = record.find_session(LOGIN, session_id)
+                assert saved is not None
+                killed: list[int] = []
+                with patch.object(sessions, 'process_start', return_value=running_start):
+                    _ = stop.stop_session(saved, forced=True, kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([], unattributed=[unattributed]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
+                self.assertEqual(killed, expected)
+
     def test_now_pauses_codex_run_without_ending_busy_workers(self) -> None:
         run_dir = str(self.root / 'run')
         owned_server = server(run_dir, 900, busy_workers=['impl', 'test'])
@@ -682,7 +755,7 @@ class StopTests(ShutdownTestCase):
         other = self.root / "another directors run"
         run.mkdir()
         other.mkdir()
-        launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "task", "worker instructions", "impl", "resume task", "0", "impl", "prefix"]
+        launcher = ["bash", "/config/scripts/direct/implement.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "task", "worker instructions", "impl", "resume task", "0", "impl", "prefix"]
         proc = self.root / "proc"
         for pid, parent, argv in ((800, 801, ["python3", "codex_mesh.py", "start"]), (801, 1, launcher)):
             path = proc / str(pid)
@@ -1448,7 +1521,8 @@ class StopTests(ShutdownTestCase):
         self.create([saved])
         replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
 
-        def blocker(_session: inventory.Session) -> record.ReadinessCheck:
+        def blocker(_session: inventory.Session, *, moving: bool = False) -> record.ReadinessCheck:
+            _ = moving
             def replace(current: record.SessionShutdown) -> None:
                 current["progress"] = replacement
             _ = record.update_session(LOGIN, "owner", replace)

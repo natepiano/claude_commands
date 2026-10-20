@@ -14,7 +14,7 @@ import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -61,9 +61,58 @@ class StoredGroupSelections(TypedDict, total=False):
 
 
 @dataclass(frozen=True)
+class DefaultWorkersClaudeAccount:
+    """Use the caller's or showrunners' account for Claude workers."""
+
+
+@dataclass(frozen=True)
+class NamedWorkersClaudeAccount:
+    """Use this workers account until the source weekly reset."""
+
+    label: str
+    until: datetime
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"claude[1-9][0-9]*", self.label) is None:
+            raise ValueError("invalid Claude workers account")
+        if self.until.tzinfo is None:
+            raise ValueError("Claude workers route needs an end time with a zone")
+
+
+WorkersClaudeAccount = NamedWorkersClaudeAccount | DefaultWorkersClaudeAccount
+DEFAULT_WORKERS_CLAUDE_ACCOUNT = DefaultWorkersClaudeAccount()
+
+
+def _workers_claude_account(fields: dict[str, object]) -> WorkersClaudeAccount:
+    if "workers_claude" not in fields:
+        return DEFAULT_WORKERS_CLAUDE_ACCOUNT
+    route = fields["workers_claude"]
+    # Older maps had only a label. They cannot keep a route open without an end.
+    if isinstance(route, str):
+        return DEFAULT_WORKERS_CLAUDE_ACCOUNT
+    if not isinstance(route, dict):
+        raise ValueError("invalid Claude workers route")
+    fields = cast(dict[str, object], route)
+    if "until" not in fields:
+        return DEFAULT_WORKERS_CLAUDE_ACCOUNT
+    label, until = fields.get("label"), fields["until"]
+    if not isinstance(label, str) or not isinstance(until, str):
+        raise ValueError("invalid Claude workers route")
+    return NamedWorkersClaudeAccount(label, datetime.fromisoformat(until))
+
+
+@dataclass(frozen=True)
+class WorkersClaudeRouteChange:
+    account: WorkersClaudeAccount
+    why: str
+    at: str
+
+
+@dataclass(frozen=True)
 class RoleMap:
     groups: StoredGroupSelections
     workers: str
+    workers_claude: WorkersClaudeAccount = DEFAULT_WORKERS_CLAUDE_ACCOUNT
 
 
 @dataclass(frozen=True)
@@ -73,7 +122,7 @@ class RoleMapChange:
     why: str
     at: str
     move_id: str = ""
-    cause: Literal["by hand", "refusal", "auto"] = "by hand"
+    cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand"
     window: Literal["weekly", "five_hour", "unknown"] = "unknown"
     reset: str = ""
 
@@ -90,9 +139,15 @@ class RoleMapWriteRefused(ValueError):
     """The authoritative write did not complete."""
 
 
+class WorkersClaudeRouteDocument(TypedDict):
+    label: str
+    until: str
+
+
 class RoleMapDocument(TypedDict):
     groups: StoredGroupSelections
     workers: str
+    workers_claude: NotRequired[WorkersClaudeRouteDocument]
 
 
 class RoleChangeDocument(TypedDict):
@@ -101,7 +156,7 @@ class RoleChangeDocument(TypedDict):
     why: str
     at: str
     move_id: str
-    cause: Literal["by hand", "refusal", "auto"]
+    cause: Literal["by hand", "refusal", "auto", "credits off"]
     window: Literal["weekly", "five_hour", "unknown"]
     reset: str
 
@@ -114,12 +169,16 @@ class RoleHistoryEntry(TypedDict):
     group: NotRequired[Role]
     account_label: NotRequired[str]
     move_id: NotRequired[str]
-    cause: NotRequired[Literal["by hand", "refusal", "auto"]]
+    cause: NotRequired[Literal["by hand", "refusal", "auto", "credits off"]]
     window: NotRequired[Literal["weekly", "five_hour", "unknown"]]
     reset: NotRequired[str]
 
 
-def _change_document(change: RoleMapChange) -> RoleChangeDocument:
+def _change_document(change: RoleMapChange | WorkersClaudeRouteChange) -> RoleChangeDocument | dict[str, str]:
+    if isinstance(change, WorkersClaudeRouteChange):
+        return {"role": "workers_claude", "label": (change.account.label
+            if isinstance(change.account, NamedWorkersClaudeAccount) else ""), "until": (change.account.until.isoformat()
+            if isinstance(change.account, NamedWorkersClaudeAccount) else ""), "why": change.why, "at": change.at}
     return RoleChangeDocument(role=change.role, label=change.label, why=change.why, at=change.at,
         move_id=change.move_id, cause=change.cause, window=change.window, reset=change.reset)
 
@@ -226,13 +285,21 @@ def is_role_map_host() -> bool:
         return True
 
 
+class RemoteCommandRefused(OSError):
+    """The host ran the command and supplied its refusal for the caller to report."""
+
+
 def ssh_role_map(arguments: tuple[str, ...]) -> str:
     """Only transport boundary; callers never invoke remote account launches."""
     command = "python3 ~/.claude/scripts/accounts/accounts.py " + shlex.join(arguments)
     result = subprocess.run(("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
                              ROLE_MAP_HOST, command), capture_output=True, text=True, timeout=20)
     if result.returncode:
-        raise OSError("remote role map command failed")
+        message = next((line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
+                       "remote role map command failed")
+        if result.returncode == 255:
+            raise OSError(message)
+        raise RemoteCommandRefused(message)
     return result.stdout
 
 
@@ -288,11 +355,19 @@ def decode_role_map(text: str) -> RoleMap:
     groups, workers = fields.get("groups"), fields.get("workers")
     if not isinstance(groups, dict) or not isinstance(workers, str):
         raise ValueError("invalid role map")
-    return RoleMap(_groups(cast(dict[str, object], groups)), workers)
+    return RoleMap(_groups(cast(dict[str, object], groups)), workers, _workers_claude_account(fields))
+
+
+def _map_document(value: RoleMap) -> RoleMapDocument:
+    document = RoleMapDocument(groups=value.groups, workers=value.workers)
+    if isinstance(value.workers_claude, NamedWorkersClaudeAccount):
+        document["workers_claude"] = WorkersClaudeRouteDocument(
+            label=value.workers_claude.label, until=value.workers_claude.until.isoformat())
+    return document
 
 
 def encode_role_map(value: RoleMap) -> str:
-    return json.dumps(RoleMapDocument(groups=value.groups, workers=value.workers), sort_keys=True)
+    return json.dumps(_map_document(value), sort_keys=True)
 
 
 def _local_role_map() -> RoleMap:
@@ -307,7 +382,7 @@ def _local_role_map() -> RoleMap:
     workers = values.get("workers", "")
     if not isinstance(workers, str):
         raise ValueError("invalid workers account")
-    return RoleMap(groups, workers)
+    return RoleMap(groups, workers, _workers_claude_account(values))
 
 
 def _atomic_write(path: Path, contents: str) -> None:
@@ -353,7 +428,7 @@ def read_role_map() -> RoleMap:
                       + f"{ROLE_MAP_HOST} unreachable", file=sys.stderr)
             else:
                 saved_map = CachedRoleMap(at=datetime.now(timezone.utc).isoformat(),
-                    map=RoleMapDocument(groups=result.groups, workers=result.workers))
+                    map=_map_document(result))
                 _atomic_write(role_map_cache_file(), json.dumps(saved_map) + "\n")
     except (OSError, ValueError, KeyError) as error:
         reason = f"accounts: cannot read role map from {ROLE_MAP_HOST}; no usable map"
@@ -365,19 +440,31 @@ def read_role_map() -> RoleMap:
     return result
 
 
-def decode_role_map_change(text: str) -> RoleMapChange:
+def decode_role_map_change(text: str) -> RoleMapChange | WorkersClaudeRouteChange:
     value = cast(object, json.loads(text))
     if not isinstance(value, dict):
         raise ValueError("role change must contain an object")
     fields = cast(dict[str, object], value)
     role, label, why, at = (fields.get(key) for key in ("role", "label", "why", "at"))
+    if role == "workers_claude":
+        if not all(isinstance(item, str) for item in (label, why, at)):
+            raise ValueError("invalid Claude workers route change")
+        if datetime.fromisoformat(cast(str, at)).tzinfo is None:
+            raise ValueError("invalid route change time")
+        until = fields.get("until")
+        if label and not isinstance(until, str):
+            raise ValueError("Claude workers route needs an end time")
+        return WorkersClaudeRouteChange(NamedWorkersClaudeAccount(cast(str, label), datetime.fromisoformat(cast(str, until))) if label
+            else DEFAULT_WORKERS_CLAUDE_ACCOUNT, cast(str, why), cast(str, at))
     if role not in ("units", "showrunners", "workers") or not all(isinstance(item, str) for item in (label, why, at)):
         raise ValueError("invalid role change")
     move_id, reset = fields.get("move_id", ""), fields.get("reset", "")
     cause, window = fields.get("cause", "by hand"), fields.get("window", "unknown")
     if (not isinstance(move_id, str) or not isinstance(reset, str)
-            or cause not in ("by hand", "refusal", "auto") or window not in ("weekly", "five_hour", "unknown")):
+            or cause not in ("by hand", "refusal", "auto", "credits off") or window not in ("weekly", "five_hour", "unknown")):
         raise ValueError("invalid role change")
+    if role != "workers" and cause == "credits off":
+        raise ValueError("credits off is a workers transition cause")
     change = RoleMapChange(role, cast(str, label), cast(str, why), cast(str, at), move_id, cause, window, reset)
     if datetime.fromisoformat(change.at).tzinfo is None:
         raise ValueError("invalid role change")
@@ -399,8 +486,11 @@ def _groups_lock() -> Generator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def write_role_map(change: RoleMapChange) -> None:
+def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
     change = decode_role_map_change(json.dumps(_change_document(change)))
+    if isinstance(change, WorkersClaudeRouteChange):
+        _write_workers_claude_route(change)
+        return
     if not is_role_map_host():
         try:
             _ = ssh_role_map(("role-map-write", json.dumps(_change_document(change), sort_keys=True)))
@@ -419,6 +509,7 @@ def write_role_map(change: RoleMapChange) -> None:
                         values = worker_names.configuration(values)
                         values["workers"] = change.label
                     else:
+                        assert change.cause != "credits off"
                         selection = StoredGroupSelection(label=change.label, move_id=change.move_id,
                             cause=change.cause, window=change.window, why=change.why)
                         if change.reset:
@@ -439,10 +530,10 @@ def write_role_map(change: RoleMapChange) -> None:
                     try:
                         _atomic_write(path, json.dumps(values, sort_keys=True) + "\n")
                         history.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        descriptor = os.open(history, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+                        descriptor = os.open(history, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
                         with os.fdopen(descriptor, "a", encoding="utf-8") as output:
                             fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-                            _ = output.write(json.dumps(row, sort_keys=True) + "\n")
+                            append_journal_line(output.fileno(), json.dumps(row, sort_keys=True), valid_row=lambda _row: True)
                     except OSError:
                         if previous:
                             _atomic_write(path, previous)
@@ -465,9 +556,99 @@ def write_role_map(change: RoleMapChange) -> None:
         if change.role == "workers":
             workers = change.label
         else:
+            assert change.cause != "credits off"
             selected = StoredGroupSelection(label=change.label, move_id=change.move_id,
                 cause=change.cause, window=change.window, why=change.why)
             if change.reset:
                 selected["reset"] = change.reset
             groups[change.role] = selected
-        scope.value = RoleMap(groups, workers)
+        scope.value = RoleMap(groups, workers, scope.value.workers_claude)
+
+
+def _write_workers_claude_route(change: WorkersClaudeRouteChange) -> None:
+    """Write the route through the same authority and locks as the workers role."""
+    try:
+        if not is_role_map_host():
+            _ = ssh_role_map(("role-map-write", json.dumps(_change_document(change), sort_keys=True)))
+        else:
+            with _groups_lock(), worker_names.roles_lock():
+                path = worker_names.accounts_config_file()
+                values = worker_names.configuration(_object(path)) if path.exists() else {}
+                if isinstance(change.account, NamedWorkersClaudeAccount):
+                    values["workers_claude"] = {"label": change.account.label, "until": change.account.until.isoformat()}
+                else:
+                    _ = values.pop("workers_claude", None)
+                _atomic_write(path, json.dumps(values, sort_keys=True) + "\n")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise RoleMapWriteRefused(f"accounts: could not write Claude workers route on {ROLE_MAP_HOST}") from error
+    scope = _command_map.get()
+    if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap):
+        scope.value = replace(scope.value, workers_claude=change.account)
+
+
+def append_journal_line(descriptor: int, document: str, *, valid_row: Callable[[object], bool]) -> None:
+    """Write a complete encoded row on an O_APPEND descriptor under its flock."""
+    flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+    _ = fcntl.fcntl(descriptor, fcntl.F_SETFL, flags | os.O_APPEND)
+    data = (document + "\n").encode("utf-8")
+    # Remove an interrupted final append before adding a new independent row.
+    size = os.lseek(descriptor, 0, os.SEEK_END)
+    if size:
+        tail = os.pread(descriptor, size, 0)
+        if not tail.endswith(b"\n"):
+            final = tail.rsplit(b"\n", 1)[-1]
+            try:
+                if not valid_row(cast(object, json.loads(final))):
+                    raise ValueError("invalid journal row")
+            except (ValueError, UnicodeError):
+                os.ftruncate(descriptor, size - len(final))
+            else:
+                _ = os.write(descriptor, b"\n")
+    while data:
+        count = os.write(descriptor, data)
+        if count <= 0:
+            raise OSError("journal append made no progress")
+        data = data[count:]
+
+
+@dataclass(frozen=True)
+class UnreadableAutoMoveHistory:
+    """Replay protection is unavailable, so no log entry may run this pass."""
+
+
+@dataclass(frozen=True)
+class RecordedAutoMoves:
+    entry_ids: frozenset[str]
+
+
+def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHistory:
+    """Recorded choices consume their entries even if log removal was interrupted."""
+    try:
+        text = path.read_bytes()
+        lines = text.splitlines(keepends=True)
+    except FileNotFoundError:
+        return RecordedAutoMoves(frozenset())
+    except OSError as error:
+        print(f"account moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()
+    consumed: set[str] = set()
+    try:
+        for index, line in enumerate(lines):
+            try:
+                raw = cast(object, json.loads(line))
+            except (ValueError, UnicodeError):
+                if index == len(lines) - 1 and not line.endswith(b"\n"):
+                    print(f"account moves: skipping torn final line in {path}")
+                    continue
+                raise
+            if not isinstance(raw, dict):
+                continue
+            fields = cast(dict[str, object], raw)
+            why = fields.get("why")
+            if (fields.get("cause") == "auto" and fields.get("group") in ("units", "showrunners")
+                    and isinstance(why, str) and why.startswith("auto: ")):
+                consumed.add(why.removeprefix("auto: "))
+    except ValueError as error:
+        print(f"account moves: cannot read recorded auto moves: {error}")
+        return UnreadableAutoMoveHistory()
+    return RecordedAutoMoves(frozenset(consumed))

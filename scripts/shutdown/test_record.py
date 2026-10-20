@@ -103,7 +103,6 @@ def entry(
     progress: object = None,
     *,
     number: int = 1,
-    timer_footer: record.ShowrunnerFooter | record.NoFooter | None = None,
     settle_message: record.SettleMessage | None = None,
     where: record.Where | None = None,
 ) -> LegacyEntryFixture:
@@ -113,7 +112,6 @@ def entry(
             record.TimerRestore(
                 instance=f"timer-{number}",
                 was_enabled=True,
-                footer=timer_footer or record.NoFooter(kind="no footer"),
             )
         ],
         settle_message=settle_message or record.SettleMessageNotSent(kind="not sent"),
@@ -733,6 +731,40 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertIsInstance(record.forget_session(foreign["login"], "session-9", "natedev"), record.SessionRetained)
         self.assertEqual(record.find_session(foreign["login"], "session-9"), foreign)
         self.assertFalse((self.directory / "history").exists())
+
+    def test_failed_restart_archive_checks_request_progress_and_machine_under_the_lock(self) -> None:
+        failed = record.SessionRestartFailed(kind="restart failed", at=NOW, reason="prompt unconfirmed")
+        cases: tuple[tuple[str, record.SessionProgress, str, bool], ...] = (
+            ("expected-request", failed, "natedev", True),
+            ("another-request", failed, "natedev", False),
+            ("expected-request", record.SessionNeedsManualRestart(kind="manual restart", command="resume"), "natedev", False),
+            ("expected-request", failed, "Mac", False),
+        )
+        original_replace = os.replace
+
+        def archive_locked(source: Path, target: Path) -> None:
+            with (self.directory / "lock").open("a+") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            original_replace(source, target)
+
+        for number, (request_id, progress, machine, closes) in enumerate(cases, 1):
+            with self.subTest(request=request_id, progress=progress, machine=machine):
+                saved = session_shutdown(number, progress=progress)
+                saved["request_id"], saved["machine"] = request_id, machine
+                self.assertTrue(record.create_session(saved))
+                with patch.object(os, "replace", side_effect=archive_locked):
+                    outcome = record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
+                        "natedev", "expected-request")
+                archived = self.directory / "history" / f"{NOW}-session-{number}.json"
+                if closes:
+                    self.assertIsInstance(outcome, record.SessionForgotten)
+                    self.assertEqual(json.loads(archived.read_text()), saved)
+                    self.assertIsNone(record.find_session(saved["login"], saved["session"]["session_id"]))
+                else:
+                    self.assertEqual(outcome, record.SessionRetained(saved))
+                    self.assertEqual(record.find_session(saved["login"], saved["session"]["session_id"]), saved)
+                    self.assertFalse(archived.exists())
 
     def test_forget_legacy_restore_does_not_reappear_and_preserves_siblings_and_hold(self) -> None:
         old = shutdown_record(state="restart partial",
@@ -1541,8 +1573,7 @@ class RecoverySnapshotTests(ShutdownTestCase):
         entries: list[record.SnapshotSession] = []
         for number in numbers:
             entries.append(record.SnapshotClaudeSession(agent="claude", session=session(number), workers=[],
-                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True,
-                    footer=record.ShowrunnerFooter(kind="footer", slug="show"))], last_seen=NOW, state="running", boot_id="boot-one"))
+                timers=[record.TimerRestore(instance=f"timer-{number}", was_enabled=True)], last_seen=NOW, state="running", boot_id="boot-one"))
         return record.RecoverySnapshot(machine="natedev", login="owner@example.com", label="owner",
                                        taken_at=NOW, sessions=entries, boot_id="boot-one")
 

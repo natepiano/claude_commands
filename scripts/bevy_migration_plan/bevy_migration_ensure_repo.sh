@@ -27,10 +27,6 @@ fi
 VERSION="$1"
 BEVY_REPO_DIR="${HOME}/rust/bevy-${VERSION}"
 
-# No fix pipeline registration needed: the conf is an opt-in allowlist, so a Bevy
-# clone under ~/rust/ is never evaluated unless someone explicitly adds it to
-# [projects] in fix.conf.
-
 # Clone or update repository
 if [ -d "${BEVY_REPO_DIR}/.git" ]; then
     echo "Repository already exists at ${BEVY_REPO_DIR}" >&2

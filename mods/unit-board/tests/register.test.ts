@@ -2,9 +2,9 @@ import { describe, expect, mock, test } from "claude-code/testing";
 import type { Engine, Mounted } from "claude-code/testing";
 import type { CommandRunInput, RenderSurface, TurnCompleteInput } from "claude-code";
 import { refreshIfChanged } from "../hooks/data";
-import { BOARD, CWD, DISCOVERY, drawnText, engineFiles, fixture, hostEngine, lifecycleHarness, NOW, REGISTRY, RUN, time } from "./kit";
+import { BOARD, CWD, DISCOVERY, drawnText, engineFiles, fixture, hostEngine, lifecycleHarness, NOW, REGISTRY, RUN, SESSION, time } from "./kit";
 
-const command = (args = ""): CommandRunInput => ({ command: "unit-board", args,
+const command = (args = ""): CommandRunInput => ({ command: "showrunner:unit_board", args,
   origin: { kind: "composer" }, presentation: { isFullscreen: false, columns: 170 } });
 const start = { cwd: CWD, surface: null, isInteractive: false } as const;
 const turn: TurnCompleteInput = { answer: "work finished", reason: "answer", durationMs: 100,
@@ -21,6 +21,45 @@ async function press<Surface extends RenderSurface>(ui: Mounted<Surface, "Pane">
 }
 
 describe("unit board commands and lifetime", () => {
+  test("startup registers only accounts-board", async ($, on) => {
+    mock.env(on, { HOME: "/test-home", USER_ZONE: "UTC" });
+    const registered: string[] = [];
+    on("session.start", (_$, event) => ({ cwd: event.cwd }));
+    on("ui.panes", () => ({ value: [] }));
+    on("command.register", (_$, event) => {
+      registered.push(event.name);
+      return { value: { command: event.name } };
+    });
+
+    await $.session.start(start);
+    expect(registered).toEqual(["accounts-board"]);
+  });
+
+  test("the showrunner command handles open and close without a model turn and leaves the retired command alone", async ($, on) => {
+    const fake = engineFiles(on);
+    const forwarded: string[] = [];
+    on("command.run", (_$, event) => {
+      forwarded.push(event.command);
+      return { text: "Command reached the model." };
+    });
+
+    await $.session.start(start);
+    expect(await $.command.run(command())).toEqual({ text: "Unit board opened." });
+    expect(fake.opened).toEqual(["unit-board"]);
+    expect(await $.command.run(command("close"))).toEqual({ text: "Unit board closed." });
+    expect(fake.closed).toEqual(["unit-board"]);
+    expect(forwarded).toEqual([]);
+
+    fake.clear();
+    expect(await $.command.run({ ...command(), command: "unit-board" }))
+      .toEqual({ text: "Command reached the model." });
+    expect(forwarded).toEqual(["unit-board"]);
+    expect(fake.reads).toEqual([]);
+    expect(fake.stats).toEqual([]);
+    expect(fake.processes).toEqual([]);
+    expect(fake.opened).toEqual(["unit-board"]);
+  });
+
   test("the shared stat helper refreshes only the pane whose sources changed", async () => {
     const mtimes = new Map([["/a.json", 100], ["/a-source", 101],
       ["/b.json", 100], ["/b-source", 99]]);
@@ -52,21 +91,26 @@ describe("unit board commands and lifetime", () => {
       const result = await $.command.run(command());
       expect(result.text).toBe("Unit board opened.");
       expect(fake.processes).toEqual([["/test-home/.claude/scripts/lib/py",
-        "/test-home/.claude/scripts/delegate/board_json.py", "--cwd", CWD]]);
+        "/test-home/.claude/scripts/direct/board_json.py", "--cwd", CWD, "--session", SESSION]]);
       expect(fake.opened).toEqual(["unit-board"]);
       const ui = await mount($, surface);
       let text = drawnText(await ui.drawn());
       expect(text).toContain("show");
-      expect(text).toMatch(/as of\s+18:00/);
+      expect(text).toMatch(/as of\s+14:00/);
       expect(text).toContain("alpha");
-      expect(text).toContain("18:42");
+      expect(text).toContain("run ends 14:42");
+      expect(text).toContain("ETA 14:30 · in 30m");
+      expect(text).not.toContain("first 17:15");
+      expect(text).not.toContain("moved 2×");
+      expect(text).not.toContain("+1:15 late");
+      expect(text).not.toContain("│");
+      expect(text).toContain("1 + 1 running");
+      await press(ui, "alpha");
+      text = drawnText(await ui.drawn());
+      expect(text).toContain("Finishing the retry path");
       expect(text).toContain("first 17:15");
       expect(text).toContain("moved 2×");
       expect(text).toContain("+1:15 late");
-      expect(text).toContain("1 + 1 running");
-      await press(ui, "open");
-      text = drawnText(await ui.drawn());
-      expect(text).toContain("Finishing the retry path");
       expect(text).toContain("17:15 said 16:30");
       expect(text).toContain("Check retry path");
       expect(text).toContain("Fixing the retry case");
@@ -77,16 +121,44 @@ describe("unit board commands and lifetime", () => {
       expect(fake.processes.length).toBe(1);
     });
 
-    test(`${surface}: generator focus and explicit unit both open the unit view`, async ($, on) => {
-      const fake = engineFiles(on, "alpha");
+    test(`${surface}: explicit unit selects the first production holding that key`, async ($, on) => {
+      const fake = engineFiles(on);
+      const first = fixture();
+      first.units[0]!.key = "beta";
+      first.units[0]!.summary = "Unmatched production delivery";
+      const second = fixture();
+      second.production = "second";
+      second.units[0]!.summary = "First matching production delivery";
+      const third = fixture();
+      third.production = "third";
+      third.units[0]!.summary = "Later matching production delivery";
+      fake.replaceBoards([first, second, third]);
       await $.session.start(start);
-      await $.command.run(command());
-      const ui = await mount($, surface);
-      expect(drawnText(await ui.drawn())).toContain("Finishing the retry path");
-      await $.command.run(command("close"));
       await $.command.run(command("alpha"));
-      expect(drawnText(await ui.drawn())).toContain("Finishing the retry path");
-      expect(fake.processes.length).toBe(2);
+      const ui = await mount($, surface);
+      const text = drawnText(await ui.drawn());
+      expect(text).toContain("First matching production delivery");
+      expect(text).not.toContain("Unmatched production delivery");
+      expect(text).not.toContain("Later matching production delivery");
+      await press(ui, "board");
+      const board = drawnText(await ui.drawn());
+      expect(board).toContain("show");
+      expect(board).toContain("second");
+      expect(board).toContain("third");
+    });
+
+    test(`${surface}: an unknown unit argument opens the board view`, async ($, on) => {
+      const fake = engineFiles(on);
+      const second = fixture();
+      second.production = "second";
+      fake.replaceBoards([fixture(), second]);
+      await $.command.run(command("missing-unit"));
+      const ui = await mount($, surface);
+      const text = drawnText(await ui.drawn());
+      expect(text).toContain("show");
+      expect(text).toContain("second");
+      expect(text).not.toContain("Finishing the retry path");
+      expect((await ui.findAll({ type: "Button" })).map(button => button.text)).toEqual(["alpha", "alpha"]);
     });
   }
 
@@ -119,14 +191,6 @@ describe("unit board commands and lifetime", () => {
     expect(requests).toEqual([]);
   });
 
-  test("explicit unit selects the detail view even without generator focus", async ($, on) => {
-    engineFiles(on);
-    await $.session.start(start);
-    await $.command.run(command("alpha"));
-    const ui = await mount($, "terminal");
-    expect(drawnText(await ui.drawn())).toContain("Finishing the retry path");
-  });
-
   test("command close keeps a source change quiet over the following minute", async ($, on) => {
     const fake = engineFiles(on);
     await $.session.start(start);
@@ -140,6 +204,41 @@ describe("unit board commands and lifetime", () => {
     expect(fake.reads).toEqual([]);
     expect(fake.stats).toEqual([]);
     expect(fake.processes).toEqual([]);
+  });
+
+  test("opening the board passes the current session id to the generator", async ($, on) => {
+    const fake = engineFiles(on);
+    fake.setSession("command-showrunner-id");
+
+    await $.command.run(command());
+
+    expect(fake.processes.length).toBe(1);
+    const argv = fake.processes[0]!;
+    expect(argv).toContain("--cwd");
+    expect(argv[argv.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(argv).toContain("--session");
+    expect(argv[argv.indexOf("--session") + 1]).toBe("command-showrunner-id");
+  });
+
+  test("session start reads the resumed session id and retains it for changed-source refreshes", async ($, on) => {
+    const fake = engineFiles(on);
+    await $.command.run(command());
+    fake.setSession("resumed-showrunner-id");
+    fake.clear();
+
+    await $.session.start(start);
+    fake.clear();
+    fake.setSession("later-service-id");
+    fake.mtimes.set(RUN, NOW + 1);
+    await fake.clock.advance(10_000);
+
+    expect(fake.processes.length).toBe(1);
+    const refreshed = fake.processes[0]!;
+    expect(refreshed).toContain("--cwd");
+    expect(refreshed[refreshed.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(refreshed).toContain("--session");
+    expect(refreshed[refreshed.indexOf("--session") + 1]).toBe("resumed-showrunner-id");
+    expect(fake.reads).toEqual([BOARD]);
   });
 
   test("session restart with an existing pane resumes one refresh loop", async ($, on) => {
@@ -188,9 +287,11 @@ describe("unit board commands and lifetime", () => {
     await fake.clock.advance(2 * 60_000);
     const after = drawnText(await ui.drawn());
     expect(after).not.toBe(before);
-    expect(after).toContain("14:31");
-    expect(after).toContain("18:30");
-    expect(after).toMatch(/as of\s+18:00/);
+    expect(before).toContain("ETA 14:30 · in 1m");
+    expect(after).toContain("ETA 14:30 · late 1m");
+    expect(after).toMatch(/1 late/);
+    expect(after).toMatch(/as of\s+14:00/);
+    expect(after).not.toContain("│");
     expect(fake.processes).toEqual([]);
     expect(fake.reads).toEqual([]);
     expect(fake.stats).toContain(RUN);
@@ -242,10 +343,12 @@ describe("unit board commands and lifetime", () => {
       await $.command.run(command());
       const ui = await mount($, "desktop");
       const text = drawnText(await ui.drawn());
-      if (kind === "none") expect(text).not.toContain("gated");
+      if (kind === "none") expect(text).not.toContain("waits on G3");
       else {
-        expect(text).toContain(kind === "timed" ? "gated until Wed 22 Oct 11:47" : "gated by G3");
-        expect(text).toContain("renderer review");
+        expect(text).toContain(kind === "timed"
+          ? "Phase 3 waits on G3 until 16:00: renderer review"
+          : "Phase 3 waits on G3: renderer review");
+        expect(text).not.toContain("Wed 22 Oct 11:47");
       }
       await $.command.run(command("close"));
       await ui.unmount();
@@ -258,9 +361,9 @@ describe("unit board commands and lifetime", () => {
       await $.command.run(command());
       const ui = await mount($, "terminal");
       const text = drawnText(await ui.drawn());
-      if (kind === "unknown") expect(text).not.toContain("done by");
-      else expect(text).toContain(kind === "predicted" ? "done by 19:10"
-        : kind === "finished" ? "finished 19:10" : "after G3");
+      if (kind === "unknown") expect(text).not.toMatch(/run ends|run ended/);
+      else expect(text).toContain(kind === "predicted" ? "run ends 15:10"
+        : kind === "finished" ? "run ended 15:10" : "run ends after G3");
       await $.command.run(command("close"));
       await ui.unmount();
     }
@@ -313,7 +416,7 @@ describe("unit board commands and lifetime", () => {
       expect(text).toContain("second");
       expect(text).not.toContain("Second namesake");
       const buttons = await ui.findAll({ type: "Button" });
-      expect(buttons.some(button => button.text === "open")).toBe(true);
+      expect(buttons.some(button => button.text === "alpha")).toBe(true);
     });
   }
 
@@ -376,7 +479,7 @@ describe("unit board commands and lifetime", () => {
     fake.replaceBoards([]);
     await $.command.run(command());
     const ui = await mount($, "terminal");
-    expect(drawnText(await ui.drawn())).toContain("No running productions");
+    expect(drawnText(await ui.drawn())).toContain("Run /showrunner:unit_board in a showrunner session.");
     fake.clear();
     await fake.clock.advance(10_000);
     expect(fake.processes).toEqual([]);
@@ -391,7 +494,7 @@ describe("unit board commands and lifetime", () => {
     expect(fake.processes.length).toBe(1);
   });
 
-  test("board workers are counted by role and state while the unit retains individual rows", async ($, on) => {
+  test("board workers are counted by state while the unit retains roles and individual rows", async ($, on) => {
     const fake = engineFiles(on);
     const data = fixture();
     const worker = data.units[0]!.workers[0]!;
@@ -402,12 +505,99 @@ describe("unit board commands and lifetime", () => {
     fake.replace(data);
     await $.command.run(command());
     const ui = await mount($, "terminal");
-    expect(drawnText(await ui.drawn())).toContain("1 fix running · 2 review idle · 1 fix idle");
-    await press(ui, "open");
+    const board = drawnText(await ui.drawn()).replace(/\s+/g, " ");
+    expect(board).toContain("workers 1 running · 3 idle");
+    expect(board).not.toContain("review");
+    expect(board).not.toContain("fix running");
+    await press(ui, "alpha");
     const text = drawnText(await ui.drawn());
     expect(text).toContain("Review worker two");
     expect(text).toContain("Review worker three");
     expect(text).toContain("Idle repair worker");
+    expect(text).toContain("review");
+    expect(text).toContain("fix");
   });
 
+});
+
+
+describe("accounts pane clock", () => {
+  const accountsCommand: CommandRunInput = { ...command(), command: "accounts-board" };
+
+  function accountsClockHost(on: Parameters<typeof hostEngine>[0]) {
+    const host = hostEngine(on);
+    const clock = mock.clock(on, { now: NOW });
+    mock.env(on, { HOME: "/test-home", USER_ZONE: "America/New_York" });
+    const data = { accounts: [{ label: "Fixture", tool: "claude", roles: ["workers"],
+      weekly_left_percent: 60, resets_at: "2026-10-17T03:59:55Z", credits: null,
+      use_credits: false, read_ok: true, credits_in_use: false, read_at: "2026-10-17T03:59:55Z" }], problems: [] };
+    const processes: string[][] = [];
+    const reads: string[] = [];
+    const snapshots: Record<string, unknown>[] = [];
+    let sourceMtime = NOW;
+    on("fs.stat", () => ({ value: { kind: "file", size: 0, mtimeMs: sourceMtime, isLink: false } }));
+    on("fs.exists", () => ({ value: true }));
+    on("fs.list", () => ({ value: [] }));
+    on("fs.read", (_$, event) => { reads.push(event.path); throw new Error("Accounts clock reads no fixture files"); });
+    on("process.run", (_$, event) => {
+      processes.push([...event.argv]);
+      return { value: { exitCode: 0, stdout: JSON.stringify(data), stderr: "",
+        isStdoutTruncated: false, isStderrTruncated: false } };
+    });
+    on("state.set", { plugin: "unit-board", key: "accountsPanes" }, (_$, event, next) => {
+      const state = event.value["accounts-board"];
+      if (state?.kind === "accounts") snapshots.push({ ...state });
+      return next(event);
+    });
+    return { ...host, clock, processes, reads, snapshots,
+      change: () => { sourceMtime = clock.now() + 1; } };
+  }
+
+  test("load and every unchanged ten-second tick store fresh epoch seconds without another process", async ($, on) => {
+    const fake = accountsClockHost(on);
+    await fake.clock.advance(12_345);
+    await $.command.run(accountsCommand);
+    expect(fake.snapshots.at(-1)?.now).toBe((NOW + 12_345) / 1000);
+    expect(fake.snapshots.at(-1)?.zone).toBe("America/New_York");
+    const snapshotData = fake.snapshots.at(-1)?.data;
+    expect(fake.processes.length).toBe(1);
+    for (const elapsed of [10_000, 20_000]) {
+      await fake.clock.advance(10_000);
+      expect(fake.snapshots.at(-1)?.now).toBe((NOW + 12_345 + elapsed) / 1000);
+      expect(fake.snapshots.at(-1)?.data).toEqual(snapshotData);
+      expect(fake.processes.length).toBe(1);
+      expect(fake.reads).toEqual([]);
+    }
+  });
+
+  test("a watched-source reload stamps its new reading with the current clock", async ($, on) => {
+    const fake = accountsClockHost(on);
+    await $.command.run(accountsCommand);
+    fake.change();
+    await fake.clock.advance(10_000);
+    expect(fake.processes.length).toBe(2);
+    expect(fake.snapshots.at(-1)?.now).toBe((NOW + 10_000) / 1000);
+    expect(fake.reads).toEqual([]);
+  });
+
+  for (const surface of ["terminal", "desktop"] as const) {
+    test(`${surface}: an unchanged tick across local midnight redraws resets and read age from the new now`, async ($, on) => {
+      const fake = accountsClockHost(on);
+      const midnight = Date.UTC(2026, 9, 17, 4, 0);
+      await fake.clock.advance(midnight - NOW - 5_000);
+      await $.command.run(accountsCommand);
+      const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts-board", component: "Pane", surface,
+        props: { ...props, title: "Accounts", bodyColumns: 120 } });
+      const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
+      expect(before).toContain("account role left resets credits enabled in use read");
+      expect(before).toMatch(/● Fixture workers 60% 23:59 0s\s*$/);
+      await fake.clock.advance(10_000);
+      const after = drawnText(await ui.drawn()).replace(/\s+/g, " ");
+      expect(after).toContain("account role left resets credits enabled in use read");
+      expect(after).toMatch(/● Fixture workers 60% Fri 23:59 10s\s*$/);
+      expect(fake.snapshots.at(-1)?.now).toBe((midnight + 5_000) / 1000);
+      expect(fake.processes.length).toBe(1);
+      expect(fake.reads).toEqual([]);
+    });
+  }
 });

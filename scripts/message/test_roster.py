@@ -22,12 +22,13 @@ from unittest import mock
 SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "delegate"))
+sys.path.insert(0, str(SCRIPTS / "direct"))
 
 import codex_daemon
 import process_table
 import remove_workers
 import roster
+import unit_lookup
 import unit_runs
 import herdr
 from fake_herdr import CommandResponse, herdr_listener
@@ -1108,6 +1109,23 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(helper.director, roster.NoDirector())
         self.assertTrue(roster.is_top_level(helper))
         self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
+        read = unit_lookup.every_marked_unit
+
+        def with_duplicate() -> unit_lookup.MarkedProductions:
+            found = read()
+            return unit_lookup.MarkedProductions(
+                found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
+
+        with mock.patch.object(unit_lookup, "every_marked_unit", side_effect=with_duplicate), \
+                mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
+            found = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual(found.problems, [
+            "unit hosts left out under alpha: unit-two: its mark is on herdr sessions copy and first"])
+        director = next(entry for entry in found.entries if entry.name == "director")
+        self.assertEqual(director.role, "unit director")
+        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
 
     def test_socketless_director_in_marked_pane_keeps_unit_without_worktree_match(self) -> None:
         self._write_session(

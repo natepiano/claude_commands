@@ -25,14 +25,17 @@ When the production doc names a review pool, the launcher allocates each
 lens's reviewer from the unit's own; the worker choice and role reassignment
 below do not apply.
 
-Otherwise each lens gets a different open worker. Prefer a worker that did not
-write the files it reviews. When the other workers are busy, a writer may take the
-`adversary` lens on its own work and argue against its choices. Move each worker
-under <RoleReassignment/>; if every open worker is busy, open a role-named review
-worker and keep it for reuse.
+Otherwise each lens gets a different open worker, and an idle open worker
+always takes a lens before a new one opens. Writers count: a worker that wrote
+the phase is still a reviewer. Among the idle workers, give a lens first to one
+that did not write the files it reviews. When none is left, a writer takes it;
+on the `adversary` lens it argues against its own choices. Move each worker
+under <RoleReassignment/>. Open a role-named review worker only when every open
+worker is busy, and keep it for reuse.
 
 The worker is the address and the lens is the judgment. Pass both to `review.sh`;
-artifacts remain keyed by lens even when a different slot takes it.
+findings remain keyed by lens even when a different slot takes it, and each
+seat's agent log carries its slot (`review_agent_<pass>_<lens>-<slot>.log`).
 
 The adversary's brief is to break the change, not to check it. It reports the
 concrete failing case it built, or reports plainly that it could not build one:
@@ -195,7 +198,7 @@ final diff only.
    both otherwise. When the production doc names a review pool:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --pool code \
+   bash ~/.claude/scripts/direct/review.sh --pool code \
      --lease "<slug>/<unit>/<phase>" \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
@@ -206,7 +209,7 @@ final diff only.
    Otherwise, for an open worker:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
+   bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
@@ -215,7 +218,7 @@ final diff only.
    A closure review passes no lens and keeps the unsuffixed artifacts:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
+   bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}"
@@ -225,7 +228,7 @@ final diff only.
    `review2`) and open and retain it; for example:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --slot review \
+   bash ~/.claude/scripts/direct/review.sh --slot review \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>

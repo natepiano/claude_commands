@@ -1,5 +1,5 @@
 ---
-description: Suggest and create a git worktree and branch, copy local settings into it, and offer a fix pipeline redirect.
+description: Suggest and create a git worktree and branch, and copy local settings into it.
 ---
 
 Use TodoWrite tool to create initial todos:
@@ -7,7 +7,6 @@ Use TodoWrite tool to create initial todos:
 - "Get user approval for worktree creation"
 - "Create approved worktree and branch"
 - "Allow the worktree's .envrc so direnv-gated tooling works"
-- "Offer a fix pipeline eval/fix redirect if the worktree matches a project"
 
 <ExecutionSteps>
 **EXECUTE THESE STEPS IN ORDER:**
@@ -17,7 +16,6 @@ Use TodoWrite tool to create initial todos:
 **STEP 3:** Execute <CreateWorktree/>
 **STEP 4:** Execute <CopySettingsLocal/>
 **STEP 5:** Execute <AllowDirenv/>
-**STEP 6:** Execute <OfferFixPipelineRedirect/>
 </ExecutionSteps>
 
 <SuggestWorktreeName>
@@ -94,36 +92,3 @@ environment-unavailable (yellow) rather than pass/fail.
   probe passed. If the probe still fails, surface the script's warning so the
   user knows lints in that worktree will not run yet.
 </AllowDirenv>
-
-<OfferFixPipelineRedirect>
-**Offer to point the fix pipeline's style eval/fix at this worktree.**
-
-The fix pipeline evaluates/fixes a fixed allowlist of projects (`[projects]` in
-`~/.claude/scripts/fix/fix.conf`). When a worktree is a checkout of
-one of those projects, you usually want the eval/fix work to follow the worktree
-while the project's identity/history stays put. This step offers that.
-
-**Guard — only proceed if the worktree is a sibling under `~/rust`:**
-- The worktree was created at `../[worktree-name]`. Resolve its parent.
-- If the parent is not `~/rust` (i.e. `$HOME/rust`), SKIP this step silently — fix pipeline paths are relative to `~/rust`, so a redirect would be invalid. Do not mention it.
-
-**Detect a match:**
-- Get the primary repo name: `basename "$(git rev-parse --show-toplevel)"`.
-- Run:
-  `python3 ~/.claude/scripts/make_a_worktree/retarget_fix.py detect --repo [repo-name] --worktree [worktree-name]`
-- If the JSON has `"match": false`, SKIP silently — this worktree's name is not prefixed by the repo or one of its `[projects]` member crates, so there's nothing to redirect. Do not mention it.
-
-**On a match, ask the user (do NOT auto-apply):**
-- Present the redirect concisely, e.g.:
-  > Worktree `[worktree-name]` matches fix pipeline project(s) `[redirects[].entry]`. Point style eval/fix at this worktree? The project keeps its name and history.
-- Offer keywords: **approve** / **skip**. STOP and wait.
-
-**On approve:**
-- Run (use `dangerouslyDisableSandbox: true` — the helper makes a git commit, which the sandbox blocks):
-  `python3 ~/.claude/scripts/make_a_worktree/retarget_fix.py apply --repo [repo-name] --worktree [worktree-name] --commit`
-- This writes the `[active_checkout]` redirect(s); the `[projects]` lines are untouched, so history continuity is preserved. No restart needed — the fix job reads the conf live. With `--commit` it also commits **only** `fix.conf` in the `~/.claude` repo, so the redirect needs no manual upkeep.
-- Report the `redirects` from the JSON and the `commit` result (`commit.commit` short hash if `commit.committed` is true; otherwise mention `commit.reason`).
-- Note to the user: to undo later (e.g. after merging/deleting the worktree), `/worktree_delete` reverts the redirect automatically, or run the helper's `revert --worktree [worktree-name] --commit`.
-
-**On skip:** do nothing further.
-</OfferFixPipelineRedirect>

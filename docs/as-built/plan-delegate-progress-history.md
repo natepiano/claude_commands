@@ -1,6 +1,6 @@
 # Plan-delegate progress history
 
-`scripts/delegate/progress_history.py` is the shared progress recorder for
+`scripts/direct/progress_history.py` is the shared progress recorder for
 Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
@@ -23,7 +23,7 @@ Schema version 1 records these event types:
 - `progress_reported`
 - `eta_stated`
 - `finding_opened` / `finding_batch_dispatched` / `finding_verdict` /
-  `finding_gate`, appended by `scripts/delegate/findings.py` to the same stream
+  `finding_gate`, appended by `scripts/direct/findings.py` to the same stream
 
 Every event repeats its query dimensions: run and phase identity, worktree,
 branch, working directory, plan doc, project/phase/pass timestamps, current pass
@@ -161,7 +161,7 @@ whether the calibration helped and continue tuning that original estimate.
 
 ## Findings ledger
 
-`scripts/delegate/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
+`scripts/direct/findings.py` bounds `/unit:direct`'s fix loop. It replaced a
 `FIX_PASS < 10` counter, which could not converge: the re-review after each fix
 was a fresh blind review of a now-larger diff, with no memory of what had already
 been accepted, so it always returned something.
@@ -304,13 +304,21 @@ review records its pass under the slot `pool_<reviewer>`
 `progress` writes the event and prints a short report under a line naming the
 worktree, and the branch when it differs: the phase heading, one ETA line, the
 verification block's gate notes when there is one, one `- **Agent N**` line per
-worker, the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
-`--tables` adds two tables to it: the clocks table above the phase heading, and
-the round table with its `Earlier:` line under the ETA line. `/unit:report
-tables` passes `--tables`; ordinary reports and notifier ticks do not. The
+worker, less a worker whose stretch is `done` with its window and board line both
+over 10 minutes old (`FINISHED_WORKER_SECONDS`), the stage line (`▸ **<stage label> - <activity>**`), and the wall clock.
+In the dual layout the clocks table prints above the phase heading in every
+report. `--tables` adds the round table with its `Earlier:` line under the ETA
+line. The legacy layout prints the clocks table only under `--tables`.
+`/unit:report tables` passes `--tables`; ordinary reports do
+not. The
 worktree line carries no position: how far through the plan the run is belongs
 to the clocks table's Phases column, and a plan with deferred earlier phases or
 retired ids puts the active phase at an ordinal that matches neither number.
+The Phases count adds the run's active phase when the run's own plan has no
+heading for it, so "Phase 32" never sits beside "of 31". `start-phase` refuses
+such a phase: an id other than `ad hoc` that the run's plan does not list exits
+and names the heading to add. hana cables, 2026-10-19: Phase 32's heading was
+only in a scratch clone, and the report read "19 of 31 done" beside "Phase 32".
 
 The ETA line comes from `_phase_eta_line(session_dir, phase_number)`, which
 reads only the reported phase's own row and gate from
@@ -470,9 +478,18 @@ activity's name is its `--label`, and its `Delegate` cell is empty: the unit
 director ran that window itself. Both identity columns are read per window rather
 than per run, and `start-pass` and `start-activity` re-detect the unit director
 as they open, so a unit director that changes model or effort part way through
-shows the change on the rows after it. Detection that comes back unknown leaves
-the stored identity alone, because a window that cannot answer must not erase
-the answer already recorded.
+shows the change on the rows after it. Windows are also opened from inside
+workers: a Codex worker inherits the director's `CLAUDE_CODE_SESSION_ID` but
+detects as its own `CODEX_THREAD_ID`, and a Claude worker is a Claude Code session
+of its own. So `_refresh_main_identity` replaces `main_agent` only when the
+detected session is the run's director (`unit_runs.director`, the run folder's
+`director` file, else the `run_started` event's session), else the stored
+identity's session; with neither known it takes any detection. The director is
+read from the run folder rather than from `main_agent` because until 2026-10-17
+every window rewrote it, and three live runs then carried a worker's thread there;
+the director's next window repairs such a run. Detection that comes back unknown
+leaves the stored identity alone, because a window that cannot answer must not
+erase the answer already recorded.
 
 A round's result is every finding the ledger stamped with that round: verdicts
 make it `N fixed` plus `M open` where those apply, findings opened make it
@@ -528,7 +545,7 @@ promise. With neither, or under a gate with no clear time, both read `—`.
 An active phase with no pass or activity open — reviews closed, repair writers
 not started — still gets every section. `progress` (`_print_last_recorded`)
 reads the phase's last `progress_reported` event and prints the short report
-from it, and under `--tables` the clocks table: that call's
+from it, with the clocks table: that call's
 percentages, unchanged clocks, and calibration spread, with elapsed and ETA
 measured at the event's timestamp and each arrival's day named from now. The
 `Phases` cell counts the plan as it stands. A `*Percentages and clocks as of <time>,
@@ -540,38 +557,25 @@ the round table is the phase's windows as they stand, and a phase with none yet
 draws one `no stage yet` row. In place of the stage line goes `No pass or activity
 is open.` and the warning that the records say nothing about whether a worker
 is still running. The percent options are neither required nor checked. The
-call appends no event and opens no window; like every `progress` call it
-restarts the notifier clock, and it writes state only to resolve a missing
-project clock.
+call appends no event and opens no window, and it writes state only to resolve
+a missing project clock.
 A missing phase, or a closed phase with no open activity, is refused with
 `No active phase to report`. When the last phase is closed and an activity is
 still open, `progress` prints the short report from that phase's last recorded
-values, both tables too under `--tables`, and shows the activity as the stage
-line.
+values, clocks table included, and shows the activity as the stage line. The
+round table needs `--tables`.
 
 `timeline` renders the stage table alone, for one phase or for every phase of
 the run, and needs no open window. It answers the questions asked after the
 fact — how many fix passes a phase took, how long each review ran — without
 reading the event stream by hand.
 
-The last line is the wall clock: `now <local timestamp>` and, when it can be
-resolved, `next report <time>` — the date is repeated there only when the next
-tick lands on a later day. The elapsed and unchanged columns are durations, which
-say how long but never when, and an ETA says when the work lands rather than when
-this report was made; this line is what tells a reader whether the report in
-front of them is current and how long until the next one. The next tick comes
-from the Claude unit's `unit-<run id>` notifier instance (`delegate-<run id>` for a run started before the folder rename): every `progress`
-call runs `notifier.sh restart` on it as its first act, before it reads state,
-and a rendered report names the `next_due` that restart prints. A refused call
-(no active phase, a failed percent check, a missing override reason or
-`--cap-stage`) keeps its message and exit status but still restarts the clock,
-so the next tick lands one interval after the call. With no instance, or a
-restart that fails, the recorder falls
-back to a still-future deadline in `${SESSION_DIR}/progress_timer`, then to now
-plus `PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `delegate.conf`. That key sets
-the Codex poll timeout and the default interval of a Claude unit's notifier
-instance; `/unit:report_interval` changes one run's interval. An unusable interval
-drops the clause instead of stopping the header.
+The last line is the wall clock: `now <local timestamp>`. The elapsed and
+unchanged columns are durations, which say how long but never when, and an ETA
+says when the work lands rather than when this report was made; this line is what
+tells a reader whether the report in front of them is current. Until 2026-10-19
+it also named the next scheduled report; reports now come only when asked, so the
+recorder restarts no notifier and names no next report.
 
 `aggregate` calibrates phase estimates by
 raw percentage and pass kind and emits raw/suggested/reported error plus

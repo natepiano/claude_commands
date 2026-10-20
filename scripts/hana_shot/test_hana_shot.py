@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import math
 import os
@@ -18,6 +20,7 @@ import threading
 import tomllib
 from typing import NotRequired, TypedDict, cast, override
 import unittest
+from unittest import mock
 import zlib
 
 from scripts.hana_shot import hana_shot
@@ -715,6 +718,170 @@ class FaceShotTests(HanaShotTest):
         self.assertAlmostEqual(cast(float, second["yaw"]), math.pi / 4)
         self.assertAlmostEqual(cast(float, second["pitch"]), -math.asin(1 / math.sqrt(3)))
         self.assertEqual(len(self.fake.methods("brp_extras/screenshot")), 2)
+
+
+class LaunchBuildWarningTests(unittest.TestCase):
+    root: Path = Path()
+    executable: Path = Path()
+    source: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.source = self.root / "crates" / "hana" / "main.rs"
+        self.source.parent.mkdir(parents=True)
+        _ = self.source.write_text("committed source\n")
+        _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/hana"]\n')
+        _ = (self.root / "Cargo.lock").write_text("version = 4\n")
+        self.git("init", "--quiet")
+        self.git("add", "crates/", "Cargo.toml", "Cargo.lock")
+        self.git("-c", "user.name=Hana Shot Test", "-c", "user.email=hana-shot@example.invalid", "commit", "--quiet", "-m", "fixture")
+        self.executable = self.root / "target" / "debug" / "hana"
+        self.executable.parent.mkdir(parents=True)
+        _ = self.executable.write_bytes(b"fake binary; never execute")
+        os.utime(self.executable, ns=(2_000_000_000, 2_000_000_000))
+
+    def git(self, *args: str) -> None:
+        _ = subprocess.run(
+            ["git", "-C", str(self.root), *args], stdin=subprocess.DEVNULL,
+            capture_output=True, check=True, timeout=5,
+        )
+
+    def modify_source(self, mtime_ns: int) -> None:
+        _ = self.source.write_text("uncommitted source\n")
+        os.utime(self.source, ns=(mtime_ns, mtime_ns))
+
+    def test_clean_crates_do_not_warn_about_binary(self) -> None:
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
+
+    def test_modified_source_is_included_only_when_no_newer_than_binary(self) -> None:
+        for mtime_ns, expected in (
+            (1_000_000_000, ["crates/hana/main.rs"]),
+            (2_000_000_000, ["crates/hana/main.rs"]),
+            (3_000_000_000, []),
+        ):
+            with self.subTest(mtime_ns=mtime_ns):
+                self.modify_source(mtime_ns)
+                self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), expected)
+
+    def test_untracked_source_older_than_binary_is_named_without_path_quoting(self) -> None:
+        path = self.source.with_name('new "panel"\nsource.rs')
+        _ = path.write_text("new source\n")
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [path.relative_to(self.root).as_posix()])
+
+    def test_modified_root_lockfile_older_than_binary_is_named(self) -> None:
+        path = self.root / "Cargo.lock"
+        _ = path.write_text("version = 4\n# dependency changed\n")
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), ["Cargo.lock"])
+
+    def test_modified_root_manifest_newer_than_binary_is_excluded(self) -> None:
+        path = self.root / "Cargo.toml"
+        _ = path.write_text('[workspace]\nmembers = []\n')
+        os.utime(path, ns=(3_000_000_000, 3_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
+
+    def test_manifest_outside_crates_and_repository_root_is_excluded(self) -> None:
+        path = self.root / "other" / "Cargo.toml"
+        path.parent.mkdir()
+        _ = path.write_text('[package]\nname = "unrelated"\n')
+        os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
+
+    def test_deleted_root_cargo_files_are_named_without_file_mtimes(self) -> None:
+        (self.root / "Cargo.toml").unlink()
+        (self.root / "Cargo.lock").unlink()
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), ["Cargo.lock", "Cargo.toml"])
+
+    def test_deleted_source_is_included_without_a_file_mtime(self) -> None:
+        self.source.unlink()
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), ["crates/hana/main.rs"])
+
+    def test_staged_added_source_is_included_and_other_directories_are_excluded(self) -> None:
+        added = self.source.with_name("added.rs")
+        _ = added.write_text("added source\n")
+        os.utime(added, ns=(1_000_000_000, 1_000_000_000))
+        self.git("add", str(added))
+        _ = (self.root / "outside.rs").write_text("not crate source\n")
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), ["crates/hana/added.rs"])
+
+    def test_rename_tracks_destination_and_undatable_removal(self) -> None:
+        renamed = self.source.with_name("renamed panel.rs")
+        self.git("mv", str(self.source), str(renamed))
+        os.utime(renamed, ns=(1_000_000_000, 1_000_000_000))
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [
+            "crates/hana/main.rs", "crates/hana/renamed panel.rs",
+        ])
+
+    def test_missing_binary_includes_dirty_source_newer_than_previous_build(self) -> None:
+        self.modify_source(3_000_000_000)
+        untracked = self.source.with_name("additional.rs")
+        _ = untracked.write_text("additional source\n")
+        self.executable.unlink()
+        self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [
+            "crates/hana/additional.rs", "crates/hana/main.rs",
+        ])
+
+    def test_non_git_root_does_not_block_launch_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(hana_shot.uncommitted_build_paths(Path(directory), self.executable), [])
+
+    def test_git_timeout_or_unavailable_git_does_not_block_launch_check(self) -> None:
+        for error in (subprocess.TimeoutExpired("git", 3), FileNotFoundError("git unavailable")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(subprocess, "run", side_effect=error):
+                self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
+
+    def test_missing_binary_refusal_names_edits_a_build_would_include(self) -> None:
+        self.modify_source(3_000_000_000)
+        self.executable.unlink()
+        with mock.patch.object(hana_shot, "port_answers", return_value=False), self.assertRaises(hana_shot.Refused) as refused:
+            _ = hana_shot.launch(15797, str(self.root), str(self.executable))
+        self.assertIn(f"no Hana binary at {self.executable}; build it first (cargo build -p hana)", str(refused.exception))
+        self.assertIn("uncommitted edits in crates/ or the root Cargo files will be included by a build: crates/hana/main.rs", str(refused.exception))
+
+    def test_launch_warns_before_start_and_saves_all_uncommitted_paths_with_capped_text(self) -> None:
+        paths: list[str] = []
+        for index in range(12):
+            path = self.source.with_name(f"new-{index:02}.rs")
+            _ = path.write_text("uncommitted source\n")
+            os.utime(path, ns=(1_000_000_000, 1_000_000_000))
+            paths.append(path.relative_to(self.root).as_posix())
+        diagnostics = io.StringIO()
+        process = mock.Mock(pid=12345)
+
+        def start_stub(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            self.assertEqual(command[-1], str(self.executable))
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIn("so this Hana runs that code:", diagnostics.getvalue())
+            return cast(subprocess.Popen[bytes], process)
+
+        def make_scratch(*, prefix: str) -> str:
+            self.assertEqual(prefix, "hana-shot-15797-")
+            # Git status has already run; replace only the subsequent Hana start.
+            _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=start_stub))
+            scratch = self.root / "scratch"
+            scratch.mkdir()
+            return str(scratch)
+
+        with (
+            redirect_stderr(diagnostics),
+            mock.patch.object(hana_shot, "port_answers", return_value=False),
+            mock.patch.object(hana_shot, "wait_ready"),
+            mock.patch.object(hana_shot, "launch_state_path", return_value=self.root / "launch.json"),
+            mock.patch.object(tempfile, "mkdtemp", side_effect=make_scratch),
+        ):
+            state, _ = hana_shot.launch(15797, str(self.root), str(self.executable))
+        warning = next(line for line in diagnostics.getvalue().splitlines() if line.startswith("hana_shot: warning:"))
+        self.assertIn(f"{self.executable} was built after uncommitted edits in crates/ or the root Cargo files,", warning)
+        for path in paths[:10]:
+            self.assertIn(path, warning)
+        for path in paths[10:]:
+            self.assertNotIn(path, warning)
+        self.assertTrue(warning.endswith("and 2 more"), warning)
+        self.assertEqual(state.get("uncommitted_paths"), paths)
+        saved = cast(dict[str, object], json.loads((self.root / "launch.json").read_text()))
+        self.assertEqual(saved["uncommitted_paths"], paths)
 
 
 class PortGuardTests(HanaShotTest):

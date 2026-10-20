@@ -10,7 +10,8 @@
 # the keys here; the smudge merges them back into whatever git writes. The
 # file is repo-relative and falls under .gitignore's catch-all.
 
-SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings"]'
+# extraKnownMarketplaces names folders on one machine (natedev's nate-local plugins).
+SETTINGS_LOCAL_KEYS_JSON='["model","effortLevel","modelSettings","extraKnownMarketplaces"]'
 SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
 
 # Hook groups that belong to one machine, matched by a substring of any of
@@ -19,12 +20,18 @@ SETTINGS_LOCAL_KEYS_SIDECAR="settings.local-keys.json"
 # exists nowhere else, so committed it would fail on every event on natedev.
 # The sidecar keeps these under its own `hooks` key, holding only the local
 # groups, and the merge appends them per event rather than as a whole key.
-SETTINGS_LOCAL_HOOK_PATTERNS_JSON='["/.config/iterm2/cc-status"]'
+# herdr installs its own SessionStart group with the home folder and matcher of each machine.
+SETTINGS_LOCAL_HOOK_PATTERNS_JSON='["/.config/iterm2/cc-status","/.claude/hooks/herdr-agent-state.sh"]'
+
+# enabledPlugins entries from a local marketplace (`<plugin>@<marketplace>`): the other entries
+# are shared, so these leave one by one, not as the whole key.
+SETTINGS_LOCAL_MARKETPLACES_JSON='["nate-local"]'
 
 # jq definitions every program below starts with.
 SETTINGS_LOCAL_DEFS="def local_hook: any(.hooks[]?; (.command // \"\") as \$c | ${SETTINGS_LOCAL_HOOK_PATTERNS_JSON} | any(. as \$p | \$c | contains(\$p)));
 def local_hooks: with_entries(.value |= map(select(local_hook))) | with_entries(select(.value | length > 0));
-def shared_hooks: with_entries(.value |= map(select(local_hook | not))) | with_entries(select(.value | length > 0));"
+def shared_hooks: with_entries(.value |= map(select(local_hook | not))) | with_entries(select(.value | length > 0));
+def local_plugin: .key as \$k | ${SETTINGS_LOCAL_MARKETPLACES_JSON} | any(. as \$m | \$k | endswith(\"@\" + \$m));"
 
 # jq: what the clean filter commits -- the input without its local-only keys
 # or local hook groups, its hook events sorted by name. Event order carries no
@@ -38,13 +45,19 @@ delpaths($keys | map([.]))
     (.hooks | length) as $before
     | .hooks |= (shared_hooks | to_entries | sort_by(.key) | from_entries)
     | if $before > 0 and (.hooks | length) == 0 then del(.hooks) else . end
+  else . end
+| if has("enabledPlugins") then
+    (.enabledPlugins | length) as $before
+    | .enabledPlugins |= with_entries(select(local_plugin | not))
+    | if $before > 0 and (.enabledPlugins | length) == 0 then del(.enabledPlugins) else . end
   else . end'
 
 # jq: keep only the local-only keys of an object, plus its local hook groups.
 SETTINGS_LOCAL_KEYS_PICK="$SETTINGS_LOCAL_DEFS"'
 . as $s
 | ($s | with_entries(select(.key as $k | $keys | index($k) != null)))
-+ ($s.hooks // {} | local_hooks | if length == 0 then {} else {hooks: .} end)'
++ ($s.hooks // {} | local_hooks | if length == 0 then {} else {hooks: .} end)
++ ($s.enabledPlugins // {} | with_entries(select(local_plugin)) | if length == 0 then {} else {enabledPlugins: .} end)'
 
 # jq: append the sidecar keys the input lacks, in the input's own key order,
 # then each sidecar hook group its event lacks, at the end of that event.
@@ -52,7 +65,9 @@ SETTINGS_LOCAL_KEYS_PICK="$SETTINGS_LOCAL_DEFS"'
 # rolled back by a stale snapshot, and a file with nothing missing comes out
 # byte-identical.
 SETTINGS_LOCAL_KEYS_MERGE='. as $cur | ($local[0] // {}) as $l
-| . + ($l | del(.hooks) | with_entries(.key as $k | select(($cur | has($k)) | not)))
+| . + ($l | del(.hooks, .enabledPlugins) | with_entries(.key as $k | select(($cur | has($k)) | not)))
+| reduce (($l.enabledPlugins // {}) | to_entries[]) as $p (.;
+    if (.enabledPlugins // {} | has($p.key)) then . else .enabledPlugins[$p.key] = $p.value end)
 | reduce (($l.hooks // {}) | to_entries[]) as $e (.;
     reduce $e.value[] as $g (.;
       if ((.hooks[$e.key] // []) | index([$g])) != null then .
@@ -60,7 +75,8 @@ SETTINGS_LOCAL_KEYS_MERGE='. as $cur | ($local[0] // {}) as $l
 
 # jq: how many sidecar keys and hook groups the input lacks.
 SETTINGS_LOCAL_KEYS_MISSING='. as $cur | ($local[0] // {}) as $l
-| ([$l | del(.hooks) | keys[] | . as $k | select(($cur | has($k)) | not)] | length)
+| ([$l | del(.hooks, .enabledPlugins) | keys[] | . as $k | select(($cur | has($k)) | not)] | length)
++ ([($l.enabledPlugins // {}) | keys[] as $k | select(($cur.enabledPlugins // {} | has($k)) | not)] | length)
 + ([($l.hooks // {}) | to_entries[] | .key as $k | .value[] | . as $g
     | select((($cur.hooks[$k] // []) | index([$g])) == null)] | length)'
 

@@ -26,6 +26,7 @@ Look up the project shorthand from the base files in the vault's home-base/ fold
 | brp | bevy_brp_mcp | issues - brp.base |
 | bwm | bevy_window_manager | issues - bwm.base |
 | cargo-berth | cargo-berth | issues - cargo-berth.base |
+| cargo-liner | cargo-liner | issues - cargo-liner.base |
 | cargo-mend | cargo-mend | issues - cargo-mend.base |
 | cargo-port | cargo-port | issues - cargo-port.base |
 | conduit | hana_conduit | issues - conduit.base |
@@ -121,6 +122,8 @@ If the shorthand doesn't match any of these, tell the user and stop.
    ```
 
 8. Create the file at `~/rust/hanadocs/issues/<derived-filename>.md` with the filled-in frontmatter followed by the body content. If the title was shortened in step 3, prepend the original long title as a `## ` heading before the body content.
+
+   For a proposal, then give it its P number: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/proposal_issue.py" number "<issue path>"`.
 
 9. Show the user the created file path and a summary of what was created.
 

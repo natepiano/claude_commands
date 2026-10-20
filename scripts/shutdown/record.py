@@ -22,8 +22,6 @@ from typing import Literal, NotRequired, Protocol, TypedDict, cast
 
 from session_types import Session, parse_session
 from session_types import (
-    ShowrunnerFooter as ShowrunnerFooter,
-    NoFooter as NoFooter,
     TimerRestore as TimerRestore,
     CodexSessionId as CodexSessionId,
     CodexResumePicker as CodexResumePicker,
@@ -508,6 +506,8 @@ class SessionShutdown(TypedDict):
     why: NotRequired[str]
     # Set by rename_unit while the unit is stopped: the restart note tells the session its new names.
     renamed: NotRequired[str]
+    # A move stopped the session mid-turn; its last tool call, or "" when the transcript showed none.
+    cut_off: NotRequired[str]
 
 
 class AccountHold(TypedDict):
@@ -715,23 +715,14 @@ def _conductor(value: object, place: str) -> _LegacyConductor:
     return cast(_LegacyConductor, cast(object, values))
 
 
-def _footer(value: object, place: str) -> ShowrunnerFooter | NoFooter:
-    values = _mapping(value, place)
-    kind = _kind(values, place, frozenset({"footer", "no footer"}))
-    if kind == "footer":
-        _ = _string(_required(values, "slug", place), f"{place}.slug")
-    return cast(ShowrunnerFooter | NoFooter, cast(object, values))
-
-
 def _timer(value: object, place: str) -> TimerRestore:
     values = _mapping(value, place)
     _ = _string(_required(values, "instance", place), f"{place}.instance")
     _ = _boolean(
         _required(values, "was_enabled", place), f"{place}.was_enabled"
     )
-    values["footer"] = _footer(
-        _required(values, "footer", place), f"{place}.footer"
-    )
+    # A record written while reply footers existed also has `footer`, which nothing restores now.
+    _ = values.pop("footer", None)
     return cast(TimerRestore, cast(object, values))
 
 
@@ -1159,7 +1150,7 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         if target != "~/.claude" and not (isinstance(parsed, NumberedAccountLabel) and parsed.tool == "claude"):
             raise InvalidRecord(f"{place}.target must name a numbered Claude account")
         values["target"] = canonical_label(target)
-    for field in ("source_label", "why", "renamed"):
+    for field in ("source_label", "why", "renamed", "cut_off"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     for field, allowed in (
@@ -1511,6 +1502,36 @@ def archive_session(login: str, session_id: str) -> None:
         os.replace(path, target)
 
 
+def taken_over(saved: SessionShutdown) -> bool:
+    """Whether a later request on any account holds this session, live or archived (a stop, a forget, a new move)."""
+    root = _state_root()
+    if not _record_directory(root):
+        return False
+    since = datetime.fromisoformat(saved["requested_at"])
+    session_id = saved["session"]["session_id"]
+    name = _session_filename(session_id)
+
+    def later(requested_at: str) -> bool:
+        try:
+            return datetime.fromisoformat(requested_at) > since
+        except ValueError:
+            return False
+
+    if any(item["session"]["session_id"] == session_id and later(item["requested_at"]) for item in all_session_records()):
+        return True
+    for directory in root.iterdir():
+        history = directory / "history"
+        try:
+            if _is_root_metadata(directory.name) or not _record_directory(directory) or not _record_directory(history):
+                continue
+            names = [path.name for path in history.iterdir()]
+        except (OSError, ValueError):
+            continue
+        if any(entry.endswith("-" + name) and later(entry[:-len(name) - 1]) for entry in names):
+            return True
+    return False
+
+
 def restarted_history() -> list[SessionShutdown]:
     """Read completed per-session history once, ignoring each unreadable entry.
 
@@ -1820,6 +1841,34 @@ def forget_session(login: str, session_id: str, machine: str) -> SessionForgotte
         if saved["machine"].casefold() != machine.casefold() or saved["progress"]["kind"] not in {
             "stopped", "already gone", "process identity lost", "restart failed", "manual restart",
         }:
+            return SessionRetained(saved)
+        history = directory / "history"
+        _ = _record_directory(history, create=True)
+        target = history / f"{saved['requested_at']}-{path.name}"
+        if _lstat(target) is not None:
+            raise InvalidRecord(f"{target} already exists")
+        os.replace(path, target)
+        return SessionForgotten(saved)
+
+
+def forget_failed_restart(
+    login: str, session_id: str, machine: str, expected_request_id: str,
+) -> SessionForgotten | SessionRetained | NoShutdown:
+    """Archive only the expected request's failed restart under the account lock."""
+    if _existing_account_directory(login) is None:
+        return NoShutdown()
+    _ = migrate(login)
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "sessions" / _session_filename(session_id)
+        if not _regular_record(path):
+            return NoShutdown()
+        saved = _session_shutdown(_read_json(path), str(path))
+        _check_account(login, saved["login"], path)
+        if saved["session"]["session_id"] != session_id:
+            raise InvalidRecord(f"{path} is used by a different session id")
+        if (saved["machine"].casefold() != machine.casefold()
+                or saved["request_id"] != expected_request_id
+                or saved["progress"]["kind"] != "restart failed"):
             return SessionRetained(saved)
         history = directory / "history"
         _ = _record_directory(history, create=True)

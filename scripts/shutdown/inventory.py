@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib", "hooks"):
+for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
@@ -28,7 +28,7 @@ from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
     from record import PausedSeat
-    from ..delegate.worker_state import worker_ledger
+    from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
 import herdr
@@ -91,8 +91,6 @@ from session_types import (
     WorkerSession as WorkerSession,
     TopLevelSession as TopLevelSession,
     Session as Session,
-    ShowrunnerFooter as ShowrunnerFooter,
-    NoFooter as NoFooter,
     TimerRestore as TimerRestore,
     CodexSessionId as CodexSessionId,
     CodexResumePicker as CodexResumePicker,
@@ -611,6 +609,11 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     return {"kind": "unknown"}
 
 
+# The updater's main() also refreshes the vault's agent notes, which reads every Claude login.
+# Shutdown needs only the desktops; an updater from before the flag ignores it and stays correct.
+SKIP_AGENT_NOTES = "AGENT_SESSIONS_SKIP_AGENT_NOTES"
+
+
 def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
     if sys.platform == "darwin":
         return {}
@@ -624,6 +627,7 @@ def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
                 text=True,
                 timeout=60,
                 check=False,
+                env={**os.environ, SKIP_AGENT_NOTES: "1"},
             )
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -745,6 +749,48 @@ def _checkout(cwd: str) -> CheckoutState:
         "upstream": upstream,
         "dirty": dirty,
     }
+
+
+_LAST_STEP_BYTES = 262_144
+_STEP_FIELDS = ("description", "command", "file_path", "pattern", "url", "prompt")
+_STEP_TEXT = 200
+
+
+def last_tool_call(config_dir: Path, session_id: str) -> str:
+    """Name the transcript's last tool call as `<tool>: <its first descriptive input>`, or "" when none shows."""
+    path = transcript_path(config_dir, session_id)
+    if path is None:
+        return ""
+    try:
+        with path.open("rb") as transcript:
+            size = transcript.seek(0, os.SEEK_END)
+            _ = transcript.seek(max(0, size - _LAST_STEP_BYTES))
+            lines = transcript.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            entry = cast(object, json.loads(line))
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or cast(dict[str, object], entry).get("type") != "assistant":
+            continue
+        message = cast(dict[str, object], entry).get("message")
+        content = cast(dict[str, object], message).get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in reversed(cast(list[object], content)):
+            if not isinstance(block, dict) or cast(dict[str, object], block).get("type") != "tool_use":
+                continue
+            call = cast(dict[str, object], block)
+            name = call.get("name")
+            arguments = call.get("input")
+            detail = next((value for field in _STEP_FIELDS
+                           if isinstance(arguments, dict)
+                           and isinstance(value := cast(dict[str, object], arguments).get(field), str) and value), "")
+            text = f"{name}: {detail}" if isinstance(name, str) and detail else name if isinstance(name, str) else ""
+            return " ".join(text.split())[:_STEP_TEXT]
+    return ""
 
 
 def transcript_path(config_dir: Path, session_id: str) -> Path | None:
@@ -1085,7 +1131,6 @@ def _snapshot_timers() -> _SnapshotTimers:
 
 
 def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[TimerRestore]:
-    import showrunner_footer
     try:
         pause = conversation_pause.read_record(conversation_pause.record_path(owner["session_id"]))
     except FileNotFoundError:
@@ -1094,23 +1139,10 @@ def _snapshot_timer_restores(owner: Session, timers: _SnapshotTimers) -> list[Ti
     if isinstance(pause, conversation_pause.PauseRecord):
         restore = not isinstance(pause.phase, conversation_pause.KeptOff)
         for instance in pause.instances:
-            restores[instance] = TimerRestore(instance=instance, was_enabled=restore,
-                footer=NoFooter(kind="no footer"))
-        for slug in pause.footers:
-            instance = f"showrunner-{slug}"
-            timer = restores.setdefault(instance, TimerRestore(instance=instance,
-                was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
-            if restore:
-                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+            restores[instance] = TimerRestore(instance=instance, was_enabled=restore)
     for instance in owner["timers"]:
-        timer = restores.setdefault(instance, TimerRestore(instance=instance,
-            was_enabled=timers.enabled.get(instance, False), footer=NoFooter(kind="no footer")))
-        if instance.startswith("showrunner-") and isinstance(pause, conversation_pause.NoPauseRecord):
-            slug = instance.removeprefix("showrunner-")
-            try:
-                _ = showrunner_footer.switch_path(slug).stat()
-            except FileNotFoundError:
-                timer["footer"] = ShowrunnerFooter(kind="footer", slug=slug)
+        _ = restores.setdefault(instance, TimerRestore(instance=instance,
+            was_enabled=timers.enabled.get(instance, False)))
     return list(restores.values())
 
 
@@ -1360,7 +1392,8 @@ def _snapshot_host(pid: int, session_id: str, environment: dict[str, str], hosts
 def _snapshot_units(timers: _SnapshotTimers) -> dict[str, UnitMarks]:
     every = unit_lookup.every_marked_unit()
     if every.faults:
-        raise ObservationFailure("production unit marks: " + "; ".join(f"{slug}: {detail}" for slug, detail in every.faults.items()))
+        raise ObservationFailure("production unit marks: " + "; ".join(
+            f"{slug}: {every.production_fault(slug)}" for slug in sorted(every.faults)))
     docs = {runner.slug: runner.doc for runner in timers.registrations}
     units: dict[str, UnitMarks] = {}
     for slug, marked in every.units.items():

@@ -252,7 +252,7 @@ class CiPointsTests(unittest.TestCase):
         produce = (root / "commands/showrunner/produce.md").read_text(encoding="utf-8")
         dailies = (root / "commands/showrunner/dailies.md").read_text(encoding="utf-8")
         state_list = produce.split("State:\n\n", 1)[1].split("\n\n", 1)[0]
-        self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<SCRATCH>/dailies_input_state`")
+        self.assertRegex(state_list, r"`DAILIES_STATE_DIR`\s+—\s+`<STATE_DIR>/dailies_input_state`")
         calls = cast(list[tuple[str, str]], re.findall(
             r"ci_points\.py\s+(due|watch|ci start|ci collect|notice clear|notice lift)\b([^`]*)`",
             produce, flags=re.DOTALL))
@@ -264,7 +264,7 @@ class CiPointsTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertRegex(body, r"--state-dir\s+DAILIES_STATE_DIR\b")
                 self.assertNotRegex(body, r"--state-dir\s+SCRATCH\b")
-        self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<scratchpad>/dailies_input_state\b")
+        self.assertRegex(dailies, r"dailies_input\.py[\s\S]*?--state-dir\s+<STATE_DIR>/dailies_input_state\b")
 
     def test_ci_start_passes_cancel_prior_only_when_requested(self) -> None:
         flagged = self.run_ci("ci", "start", "--state-dir", str(self.state), "--cancel-prior")
@@ -504,6 +504,41 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assert_step(lifted, "notice lift", True)
         self.assertIn(f"send alpha-unit: From the showrunner: G1 lifted — your tests pass without beta-unit phase 2 ({log}). Continue.",
                       lifted.stdout)
+
+
+    def test_mixed_handoff_history_does_not_advance_the_ci_interval(self) -> None:
+        for number in range(1, 5):
+            _ = self.merge(number)
+        for subject in (
+            "Merge alpha-unit hand-off (aaaaaaa) into production",
+            "Merge style-child hand-off (bbbbbbb) into production",
+            "Merge alpha-unit phase 4 shrink (ccccccc) into production",
+            "chore(example): rename unit alpha-unit to renamed-unit",
+        ):
+            _ = self.git("commit", "--allow-empty", "-m", subject)
+        due = self.run_ci("due", "--state-dir", str(self.state))
+        self.assert_step(due, "due", True)
+        self.assertIn("4 of 5 code merges", due.stdout)
+        self.ci_result(self.git("rev-parse", "HEAD"))
+        _ = self.start_point()
+        self.assert_step(self.collect_point(), "ci collect", True)
+        record = cast(dict[str, object], json.loads((self.state / "ci_points.json").read_text()))
+        self.assertEqual(record["count"], 4)
+
+    def test_ci_fix_commit_label_uses_last_unit_phase_when_a_handoff_is_newest(self) -> None:
+        _ = self.merge(2)
+        _ = self.git("commit", "--allow-empty", "-m", "Merge alpha-unit hand-off (aaaaaaa) into production")
+        _ = self.start_point()
+        command = (self.stub_state / "validate-calls").read_text()
+        self.assertIn("ci(example): validation fixes after alpha-unit phase 2", command)
+        self.assertNotIn("hand-off", command)
+
+    def test_notice_clear_cannot_treat_a_child_named_like_the_target_as_a_unit_phase(self) -> None:
+        _ = self.git("commit", "--allow-empty", "-m", "Merge beta-unit hand-off (bbbbbbb) into production")
+        result = self.run_ci("notice", "clear", "G1")
+        self.assert_step(result, "notice clear", False)
+        self.assertIn("beta-unit phase 2 has no code merge", result.stdout)
+        self.assertNotIn("send alpha-unit", result.stdout)
 
 
 if __name__ == "__main__":

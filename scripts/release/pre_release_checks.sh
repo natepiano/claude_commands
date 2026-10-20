@@ -54,7 +54,7 @@ done
 # fmt_cargo, run_nextest, invoke_clippy, and the SwiftPM sandbox-failure
 # detection all come from here. Sourcing it directly rather than going through
 # the `lint` CLI is the documented pattern for a caller that picks its own
-# scope — delegate/verify.sh does the same for its per-package rules.
+# scope — direct/verify.sh does the same for its per-package rules.
 # shellcheck source=/dev/null
 source "$HOME/.claude/scripts/lint/invoke.sh"
 

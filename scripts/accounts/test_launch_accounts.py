@@ -195,7 +195,7 @@ def launch():
 def launch():
     selected = accounts.role_account("unit")
     herdr.open_pane("unit", "unit", cwd, named_account_environment(selected.dir))
-    herdr.start_agent("unit", pane, kind="claude", agent_arguments=[])
+    herdr.start_agent("unit", pane, kind="claude", agent="unit", agent_arguments=[])
 '''
         problems = launch_account_violations(source, "fixture.py")
         self.assertTrue(any("selects with" in problem for problem in problems), problems)
@@ -278,7 +278,7 @@ def _resume_parts(session: Session, prompt: str):
 claude = os.environ.get("CLAUDE_BIN") or str(Path.home() / ".local/bin/claude")
 subprocess.run([claude, "agents", "--json"], capture_output=True, text=True)
 '''
-        self.assertEqual(shell_launch_account_violations(source, "delegate/implement.sh"), [])
+        self.assertEqual(shell_launch_account_violations(source, "direct/implement.sh"), [])
 
     def test_shell_launchers_do_not_pick_or_set_an_unresolved_account(self) -> None:
         for arguments in ("--print prompt", "-p prompt", "prompt", ""):

@@ -156,7 +156,8 @@ def _launch(verb: str, arguments: list[str]) -> int:
         return 1
     opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt = herdr.NoOpeningPrompt()
     if options.prompt_file:
-        opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text())
+        opening = herdr.OpeningPrompt(Path(options.prompt_file).read_text(),
+                                      herdr.SessionTranscript(config_dir, options.session_id))
     purpose: launch_permission.LaunchPurpose = (
         launch_permission.RecordedSessionRestoreLaunchPurpose(options.session_id)
         if options.restore else launch_permission.NewWorkLaunchPurpose()
@@ -196,8 +197,12 @@ def _launch(verb: str, arguments: list[str]) -> int:
         if verb == "resume":
             claude_arguments.extend(["--resume", options.session_id])
         claude_arguments.extend(["-n", name])
-        herdr.start_agent(name, pane, kind="claude", agent_arguments=claude_arguments,
-                          opening=opening, timeout_ms=90_000)
+        outcome = herdr.start_agent(name, pane, kind="claude", agent=name, agent_arguments=claude_arguments,
+                                    opening=opening, timeout_ms=90_000)
+        if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
+            reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
+            print(f"herdr_sessions: {name}: opening prompt not submitted: {reason}", file=sys.stderr)
+            return 1
     finally:
         _ = barrier.__exit__(None, None, None)
     if verb == "start" or options.attach:

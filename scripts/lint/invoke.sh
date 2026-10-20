@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # invoke.sh — sourced library holding every cargo invocation policy: canonical
-# flags, config/lint.conf gating, and macOS sandbox-failure detection. This is the single bottom layer. The lint CLI in
-# this directory is the public entry point (shell aliases, validate_ci.sh,
-# the fix pipeline and pre_release_checks.sh); delegate/verify.sh sources this
-# file directly and adds only its per-package scope rules on top. Nothing
+# flags, config/lint.conf gating, and macOS sandbox-failure detection.
+# The lint CLI in this directory serves shell aliases, validate_ci.sh and
+# pre_release_checks.sh. direct/verify.sh sources this file directly and adds
+# only its per-package scope rules on top. Nothing
 # outside this directory composes policy flags like -D warnings or the nextest
 # profile.
 #
 # Callers own scope (--workspace vs -p <pkg>, target selection); this file
 # owns how each tool always runs once scoped.
+# invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
+# judges the result. Delegate verdict keys include this policy file.
 
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 LINT_INVOKE_SOURCED=1
@@ -204,29 +206,8 @@ buildlog_finish_memory() {
 # neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
 
-# Record both streams without putting stderr into a JSON consumer's stdout.
-run_json_stdout() (
-    local log=$1 stderr_dir stderr_pid status=0
-    shift
-    : > "$log" || return $?
-    stderr_dir="$(mktemp -d)" || return $?
-    trap 'rm -rf "$stderr_dir"' EXIT
-    mkfifo "$stderr_dir/stderr" || return $?
-    # An ordinary background process can be waited for on Bash 3.2 too.
-    tee -a "$log" < "$stderr_dir/stderr" >&2 &
-    stderr_pid=$!
-    "$@" 2> "$stderr_dir/stderr" | tee -a "$log" || status=${PIPESTATUS[0]}
-    # Drain stderr before callers inspect or remove the completed step's log.
-    wait "$stderr_pid" || true
-    return "$status"
-)
-
 run_once() {
-    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
-        printf '+ %s\n' "$*" >&2
-    else
-        printf '+ %s\n' "$*"
-    fi
+    printf '+ %s\n' "$*"
     if buildlog_step_compiles "$@"; then
         build_hold_wait_local || return $?
     fi
@@ -266,6 +247,10 @@ run_once() {
         BUILDLOG_MEM_WAIT_S=$memory_wait
         build_hold_mark MemoryGateReturned "$BUILDLOG_MEM_OUTCOME"
     fi
+    if [[ -n "${LINT_NEXTEST_SHARE:-}" ]]; then
+        nextest_share_claim "$@"
+        set -- "${LINT_NEXTEST_SHARED_ARGV[@]}"
+    fi
     if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" && -n "${BUILDLOG_PEAK:-}" ]]; then
         buildlog_sample_anon "$BUILDLOG_PEAK.cgroup" "${BUILDLOG_MEM_RESERVATION%.reservation}.max" "$parent_pid" &
         sampler_pid=$!
@@ -282,9 +267,10 @@ run_once() {
     if [[ -t 1 ]]; then
         local tty_status=0
         set +e
-        buildlog_exec "$@"
+        buildlog_exec "$@" 9>&-
         tty_status=$?
         set -e
+        nextest_share_end
         buildlog_finish_memory "$tty_status" "$sampler_pid"
         buildlog_end "$tty_status" "" 1 "$@" || true
         sweep_after_step "$@" || true
@@ -295,14 +281,10 @@ run_once() {
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
     # prove a delegate is alive, so buffering a long build looks like a hang.
     set +e
-    if [[ "${LINT_JSON_STDOUT:-0}" == 1 ]]; then
-        run_json_stdout "$log" buildlog_exec "$@"
-        status=$?
-    else
-        buildlog_exec "$@" 2>&1 | tee "$log"
-        status=${PIPESTATUS[0]}
-    fi
+    buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
+    status=${PIPESTATUS[0]}
     set -e
+    nextest_share_end
     buildlog_finish_memory "$status" "$sampler_pid"
     if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
         buildlog_end "$status" "$log" 0 "$@" || true
@@ -423,29 +405,58 @@ nextest_width_arm() {
 
 # Local nextest runs share the machine's test threads: a run takes the mode's
 # width divided by the runs in flight, itself included, never below
-# nextest_budget.FLOOR (4). Each run holds an flock on its own marker through fd
-# 9 for as long as it runs, so a killed run stops counting with its shell. The
-# test processes do not inherit the fd. The trial mode stays unshared, since
-# width_trial.py names its arm by width. Any failure runs at the full width.
+# nextest_budget.FLOOR (4). A run claims its share only after the memory gate
+# admits it (run_once calls nextest_share_claim), so a run still waiting for
+# memory never counts and never narrows the runs already testing. Each run holds
+# an flock on its own marker through fd 9 for as long as it runs, so a killed run
+# stops counting with its shell. The test processes do not inherit the fd. The
+# trial mode stays unshared, since width_trial.py names its arm by width. Any
+# failure runs at the full width.
 LINT_TEST_BUDGET_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/nextest_budget.py"
 
 run_nextest_shared() {
-    local width=$1 shared="" status=0 dir name
+    local width=$1 status=0 dir name
     shift
     dir="${BUILDLOG_DIR:-$HOME/.local/state/buildlog}/admission/nextest"
     name="$$.$RANDOM$RANDOM"
-    if ! { mkdir -p "$dir" && : > "$dir/$name.new"; } 2>/dev/null; then
+    if ! mkdir -p "$dir" 2>/dev/null; then
         run cargo nextest run --test-threads "$width" "$@"
         return
     fi
+    # The block puts fd 9 back as it was, so the marker nextest_share_claim
+    # opens on it closes when the run ends.
     {
-        shared="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "$dir" "$name" "$width" 9 2>/dev/null)" \
-            || shared=""
-        [[ "$shared" =~ ^[1-9][0-9]*$ ]] || shared=$width
-        run cargo nextest run --test-threads "$shared" "$@" 9>&- || status=$?
-    } 9>>"$dir/$name.new"
+        LINT_NEXTEST_SHARE="$dir/$name" run cargo nextest run --test-threads "$width" "$@" || status=$?
+    } 9>&-
     rm -f "$dir/$name.run" "$dir/$name.new"
     return "$status"
+}
+
+# nextest_share_claim ARGV... (`cargo nextest run --test-threads WIDTH ...`)
+# Called by run_once once the memory gate has admitted the step. It opens the
+# run's marker on fd 9, claims a share of WIDTH, and leaves the argv to run in
+# LINT_NEXTEST_SHARED_ARGV. A narrower share is written into the step's memory
+# reservation, so its peak is recorded against the width it ran at.
+nextest_share_claim() {
+    local shared="" width=$5
+    LINT_NEXTEST_SHARED_ARGV=("$@")
+    [[ "${4:-}" == --test-threads && "$width" =~ ^[1-9][0-9]*$ ]] || return 0
+    { exec 9>>"$LINT_NEXTEST_SHARE.new"; } 2>/dev/null || return 0
+    shared="$(buildlog_memory_python "$LINT_TEST_BUDGET_SCRIPT" claim "${LINT_NEXTEST_SHARE%/*}" \
+        "${LINT_NEXTEST_SHARE##*/}" "$width" 9 2>/dev/null)" || shared=""
+    [[ "$shared" =~ ^[1-9][0-9]*$ && "$shared" != "$width" ]] || return 0
+    LINT_NEXTEST_SHARED_ARGV=("${@:1:4}" "$shared" "${@:6}")
+    printf 'nextest: %s of %s test threads, shared with the runs in flight\n' "$shared" "$width"
+    if [[ -n "${BUILDLOG_MEM_RESERVATION:-}" ]]; then
+        buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" width "$BUILDLOG_MEM_RESERVATION" "$shared" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+# The test run is over: drop the share before the build log write and the sweep
+# start in the background, so neither keeps the marker locked.
+nextest_share_end() {
+    [[ -z "${LINT_NEXTEST_SHARE:-}" ]] || exec 9>&-
 }
 
 run_nextest() {
@@ -539,11 +550,9 @@ invoke_clippy() {
         ${clippy_args[@]+"${clippy_args[@]}"}
 }
 
-# Replay the judging diagnostics as JSON; only apply_mul_add.py selects fixes.
-invoke_clippy_mul_add_json() {
-    lint_config_enabled clippy || return 0
-    local LINT_JSON_STDOUT=1
-    invoke_clippy "$@" --message-format=json
+# Use the same scope, lint arguments, gating, and run wrapper as judgment.
+invoke_clippy_fix() {
+    invoke_clippy --fix --allow-dirty --allow-staged --allow-no-vcs "$@"
 }
 
 invoke_mend() {
@@ -553,9 +562,8 @@ invoke_mend() {
     fi
     # RUSTC_WRAPPER cleared: a compiler cache replays cached output instead of
     # running rustc, which suppresses the diagnostics mend analyzes
-    # Scope comes from the caller (the lint CLI resolves it, or a caller like
-    # the fix pipeline passes --manifest-path). Forcing --workspace here silently
-    # overrode both: a per-project run linted the whole workspace instead.
+    # The caller sets the scope. The lint CLI resolves its scope before this
+    # call. Keep the caller's flags so targeted runs stay within that scope.
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }
 

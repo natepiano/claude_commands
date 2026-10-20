@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -9,7 +10,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast, final, override
 
@@ -69,6 +72,8 @@ class UnitRenameTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "state/sessions"),
             "SHOWRUNNER_STATE_DIR": str(self.state),
             "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
+            # No waits by default: a test that needs one sets it.
+            "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
@@ -77,6 +82,7 @@ class UnitRenameTests(unittest.TestCase):
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
+            "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "PLAN_DELEGATE_SYNC_WRITES": "0",
@@ -134,7 +140,6 @@ class UnitRenameTests(unittest.TestCase):
             name: {"type": "codex", "thread_id": f"thread-{name}", "prime_hash": "h",
                    "lease": {"unit": unit, "ordinal": 3}, "busy_pid": None, "reviews": 2}
             for name, unit in (("r1", "alpha-unit"), ("r2", "mul_add-unit"))}}))
-        self.write(self.root / "state/review-pool/demo/memory/alpha-unit.md", "alpha memory\n")
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, "\n".join(json.dumps(event) for event in (
             {"event_type": "run_started", "run_started_at": 1, "working_dir": str(old),
@@ -152,9 +157,6 @@ class UnitRenameTests(unittest.TestCase):
             self.write(self.root / f"vault/showrunners/{folder}/alpha-unit.md", "\n".join([
                 "---", "phase_table: true", f"production: {production}", "unit: alpha-unit", "---", "",
                 "# alpha-unit", ""]))
-        self.write(self.home / ".claude/scripts/fix/fix.conf", "\n".join([
-            "[projects]", "claude", "", "[active_checkout]", "claude = claude-demo-alpha",
-            "claude/sub = claude-demo-alpha/sub", "other = claude-demo-alphabet", ""]))
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +178,20 @@ class UnitRenameTests(unittest.TestCase):
                    "--scratch", str(self.root / "scratch")]
         return subprocess.run(command, cwd=self.checkout, env={**self.env, "RENAME_TEST_REFUSE": refuse},
                               capture_output=True, text=True, check=False, timeout=120)
+
+    def start_apply(self) -> subprocess.Popen[str]:
+        """apply in the background, so the test can act as the shutdown path while it waits."""
+        process = subprocess.Popen([sys.executable, str(SCRIPT), "apply", SLUG, "alpha", "gamma", "--scratch",
+                                    str(self.root / "scratch")], cwd=self.checkout, env=self.env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(process.kill)
+        return process
+
+    def wait_for(self, ready: Callable[[], bool]) -> None:
+        deadline = time.monotonic() + 60
+        while not ready():
+            self.assertLess(time.monotonic(), deadline, "timed out")
+            time.sleep(0.1)
 
     def assert_ok(self, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -201,7 +217,16 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn("'chore(demo): rename unit alpha-unit to gamma-unit'", result.stdout)
 
     def test_apply_moves_every_place(self) -> None:
+        records = self.home / ".local/state/herdr-panes"
+        for session, panes in (("agents", {"w1:p2": "alpha-unit", "w1:p3": "beta-unit"}),
+                               ("work", {"w2:p1": "alpha-unit"})):
+            self.write(records / f"{session}.json", json.dumps(
+                {pane: {"environment": {"SHOWRUNNER_UNIT_ID": unit}} for pane, unit in panes.items()}))
         self.assert_ok(self.rename("apply", "alpha-unit", "gamma-unit"))
+        # The old pane's entry would resume the old name; the relaunched unit records its new pane.
+        self.assertEqual(json.loads((records / "agents.json").read_text()),
+                         {"w1:p3": {"environment": {"SHOWRUNNER_UNIT_ID": "beta-unit"}}})
+        self.assertEqual(json.loads((records / "work.json").read_text()), {})
         new = self.rust / "claude-demo-gamma"
         self.assertFalse((self.rust / "claude-demo-alpha").exists())
         self.assertEqual(self.git("branch", "--show-current", cwd=new), "demo-gamma")
@@ -230,7 +255,6 @@ class UnitRenameTests(unittest.TestCase):
         self.assertEqual(pool["reviewers"]["r1"]["lease"], {"unit": "gamma-unit", "ordinal": 3})
         self.assertEqual(pool["reviewers"]["r1"]["thread_id"], "thread-r1")
         self.assertEqual(cast(dict[str, object], pool["reviewers"]["r2"]["lease"])["unit"], "mul_add-unit")
-        self.assertTrue((self.root / "state/review-pool/demo/memory/gamma-unit.md").exists())
         started = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
         self.assertEqual((started["working_dir"], started["branch"], started["plan_doc"]),
                          (str(new), "demo-gamma", f"{new}/docs/plans/alpha.md"))
@@ -240,12 +264,9 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn("unit: alpha-unit", (self.root / "issues/other-production.md").read_text())
         self.assertIn("unit: gamma-unit", (self.root / "vault/showrunners/demo-sr/alpha-unit.md").read_text())
         self.assertIn("unit: alpha-unit", (self.root / "vault/showrunners/other-sr/alpha-unit.md").read_text())
-        conf = (self.home / ".claude/scripts/fix/fix.conf").read_text()
-        self.assertIn("claude = claude-demo-gamma\nclaude/sub = claude-demo-gamma/sub\n"
-                      + "other = claude-demo-alphabet", conf)
         self.assertIs(self.journal()["done"], True)
 
-    def seed_record(self, progress: str = "stopped", name: str = "alpha") -> Path:
+    def seed_record(self, progress: str = "stopped", name: str = "alpha", host_session: str = "demo-alpha") -> Path:
         """A stopped unit's shutdown record, as `shutdown.py down` leaves it."""
         old = self.rust / "claude-demo-alpha"
         session: dict[str, object] = {
@@ -256,7 +277,7 @@ class UnitRenameTests(unittest.TestCase):
                          "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
             "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
             "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit", "doc": str(self.doc),
-                     "session_name": "demo-alpha", "session_host": "herdr",
+                     "session_name": host_session, "session_host": "herdr",
                      "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha.md"}}}
         saved: dict[str, object] = {
             "login": "owner@example.com", "label": "claude2", "machine": "natedev",
@@ -264,7 +285,12 @@ class UnitRenameTests(unittest.TestCase):
             "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
             "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
             "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": []}
+            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
+            "codex_seats": [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
+                             "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
+                                 "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
+                                 str(old), "/runs/r1/prompt.md", "impl", "task", "impl", "working", "0", "impl"]}]}
+        self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task you were on.\n")
         script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import record; "
                   + "assert record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
@@ -300,23 +326,93 @@ class UnitRenameTests(unittest.TestCase):
         self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha.md")
         self.assertIn(f"you are now gamma-unit, in worktree {new} on branch demo-gamma, and your plan is at "
                       + f"{new}/docs/plans/alpha.md", cast(str, saved["renamed"]))
+        # Each paused Codex seat resumes its own thread in the new worktree, and its resume prompt says so.
+        seat = cast(list[dict[str, object]], saved["codex_seats"])[0]
+        self.assertEqual(cast(list[str], seat["launcher_command"])[5], str(new))
+        self.assertEqual((self.root / "runs/r1/impl.resume-prompt.md").read_text(),
+                         "Continue the task you were on.\nWhile you were paused the showrunner renamed your unit: "
+                         + f"your worktree is now {new} on branch demo-gamma. {self.rust / 'claude-demo-alpha'} no "
+                         + f"longer exists; wherever your instructions name it, use {new}.\n")
 
-    def test_a_chosen_session_name_stays(self) -> None:
-        _ = self.seed_record(name="showrunner-fixer")
+    def test_a_session_with_its_own_name_takes_the_new_name(self) -> None:
+        _ = self.seed_record(name="builder-report")
         self.assert_refused(self.rename("apply"), "gamma-unit is not running")
-        self.assertEqual(cast(dict[str, object], self.record()["session"])["name"], "showrunner-fixer")
+        self.assertEqual(cast(dict[str, object], self.record()["session"])["name"], "gamma")
+        self.assertEqual(self.journal()["old_session"], "builder-report")
+
+    def test_the_session_name_finds_the_unit_and_only_what_differs_changes(self) -> None:
+        # The user names the unit by its session (builder-report); its id already is the new one.
+        _ = self.seed_record(name="builder-report", host_session="demo-builder-report")
+        planned = self.rename("plan", "builder-report", "alpha")
+        self.assert_ok(planned)
+        self.assertIn("Claude session builder-report -> alpha", planned.stdout)
+        self.assertIn("already matches: the id is alpha-unit", planned.stdout)
+        branches = self.git("branch", "--list")
+        doc = self.doc.read_text()
+        self.assert_refused(self.rename("apply", "builder-report", "alpha"), "alpha-unit is not running")
+        session = cast(dict[str, object], self.record()["session"])
+        self.assertEqual((session["name"], cast(dict[str, object], session["host"])["session_name"]),
+                         ("alpha", "demo-alpha"))
+        self.assertEqual((self.git("branch", "--list"), self.doc.read_text()), (branches, doc))
+        # The relaunched unit keeps its mark alpha-unit, now under the new session name.
+        _ = self.mark_live("alpha-unit", "sid-alpha")
+        self.assert_ok(self.rename("apply", "builder-report", "alpha"))
+        self.assertEqual(self.journal()["done"], True)
+
+    def test_verify_fails_while_the_old_session_name_is_live(self) -> None:
+        _ = self.seed_record(name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        _ = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        result = self.rename("apply")
+        self.assert_refused(result, "gamma-unit's session is named builder-report, not gamma")
+        self.assertIn("is still labelled builder-report", result.stderr)
+
+    def test_a_verify_that_passes_closes_the_journal(self) -> None:
+        _ = self.seed_record(name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        end = self.mark_live("gamma-unit", "sid-alpha", name="builder-report")
+        self.assert_refused(self.rename("apply"), "gamma-unit's session is named builder-report, not gamma")
+        self.assertEqual(self.journal()["done"], False)
+        end()
+        _ = self.mark_live("gamma-unit", "sid-alpha")
+        self.assert_ok(self.rename("verify"))
+        self.assertEqual(self.journal()["done"], True)
+        self.assert_ok(self.rename("plan", "gamma", "delta"))
 
     def test_apply_waits_while_the_unit_is_stopping(self) -> None:
-        _ = self.seed_record(progress="waiting")
+        log = self.seed_record(progress="waiting")
         result = self.rename("apply")
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("alpha-unit is stopping (waiting); rerun apply once it has stopped", result.stderr)
+        self.assertIn("alpha-unit is still waiting after 0 s; rerun apply once it has stopped", result.stderr)
         self.assertEqual(self.journal()["step"], 0)
+        # A stop that waits for the unit to go idle is forced at once.
+        self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
+                         [["now", "--only", "sid-alpha", "--here"]])
+
+    @unittest.skipIf(sys.platform == "darwin", "the Mac reads working directories with lsof")
+    def test_verify_fails_while_a_process_works_in_the_old_worktree(self) -> None:
+        _ = self.seed_record()
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+        _ = self.mark_live("gamma-unit", "sid-alpha")
+        old = self.rust / "claude-demo-alpha"
+        old.mkdir()
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=old)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        # The folder is gone, but the process still has it as its working directory.
+        old.rmdir()
+        result = self.rename("verify")
+        self.assert_refused(result, f"processes {child.pid} still work in {old}")
+        child.kill()
+        _ = child.wait()
+        self.assert_ok(self.rename("verify"))
 
     def test_verify_fails_on_an_unclassified_stale_reference(self) -> None:
         self.assert_ok(self.rename("apply"))
         self.write(self.root / "state/nightly-review/2026-10-16/report.md", "alpha-unit reviewed\n")
         self.write(self.root / "state/other/names.json", '{"unit": "claude-demo-alphabet"}\n')
+        self.write(self.root / "state/other/__pycache__/names.cpython-313.pyc", "alpha-unit\n")
+        self.write(self.root / "state/other/names.pyc", "alpha-unit\n")
         self.assert_ok(self.rename("verify"))
         stale = self.root / "state/other/cache.json"
         self.write(stale, '{"unit": "alpha-unit"}\n')
@@ -356,7 +452,7 @@ class UnitRenameTests(unittest.TestCase):
 
     def test_refusals(self) -> None:
         cases = [
-            (("alpha", "review-unit"), "is known to code"),
+            (("alpha", "nightly-review-unit"), "is known to code"),
             (("alpha", "mul_add"), "already in the Units table"),
             (("alpha", "bad name"), "letters, numbers"),
             (("missing", "gamma"), "expected one Units row"),
@@ -366,31 +462,101 @@ class UnitRenameTests(unittest.TestCase):
                 self.assert_refused(self.rename("apply", old, new), text)
         self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
 
-    def mark_live(self, unit: str, session_id: str) -> None:
-        """A live Claude in a herdr session marked as `unit` of this production."""
-        held = fake_showrunner.write_session(self.root / "state/sessions", unit.removesuffix("-unit"), session_id)
+    def mark_live(self, unit: str, session_id: str, name: str = "") -> Callable[[], None]:
+        """A live Claude in a herdr session marked as `unit` of this production; the result ends it.
+
+        The session and its pane label are called `name`, the unit's stem when it is empty.
+        """
+        name = name or unit.removesuffix("-unit")
+        held = fake_showrunner.write_session(self.root / "state/sessions", name, session_id)
         self.addCleanup(held.close)
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
-            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit})])
+            f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit}, label=name)])
         fake_unit_host.place_process(self.env, os.getpid(), "w1:p1")
+
+        def end() -> None:
+            held.close()
+            (self.root / "state/sessions" / f"{session_id}.sock").unlink()
+            fake_unit_host.write(self.env, [])
+        return end
+
+    def test_one_apply_stops_the_unit_waits_and_relaunches_it_with_no_rerun(self) -> None:
+        log = self.seed_record()
+        record = self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
+        stopped = cast(dict[str, object], json.loads(record.read_text()))
+        record.unlink()
+        end = self.mark_live("alpha-unit", "sid-alpha")
+        self.env.update({"RENAME_UNIT_STOP_WAIT": "60", "RENAME_UNIT_LIVE_WAIT": "60"})
+        process = self.start_apply()
+        calls: Callable[[], list[list[str]]] = lambda: ([cast(list[str], json.loads(line)) for line in
+                                                         log.read_text().splitlines()] if log.exists() else [])
+        self.wait_for(lambda: ["down", "--only", "sid-alpha", "--here"] in calls())
+        # The shutdown path ends the unit; its record reads stopping, and stopped a moment later.
+        end()
+        _ = record.write_text(json.dumps({**stopped, "progress": {"kind": "stopping", "at": "2026-10-09T21:49:30+00:00"}}))
+        time.sleep(1.5)
+        self.assertIsNone(process.poll())
+        _ = record.write_text(json.dumps(stopped))
+        self.wait_for(lambda: ["restart", "--only", "sid-alpha", "--here"] in calls())
+        # The relaunched unit comes up under its new id after the restart returns.
+        time.sleep(1.5)
+        _ = self.mark_live("gamma-unit", "sid-alpha")
+        stdout, stderr = process.communicate(timeout=120)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertIn("stop: waiting — alpha-unit is stopping", stdout)
+        self.assertIn("alpha-unit is now gamma-unit, relaunched in", stdout)
+        self.assertEqual((self.journal()["done"], self.journal()["claimed"]), (True, False))
+
+    def test_apply_waits_for_a_merge_gate_before_it_writes_the_merge_branch(self) -> None:
+        _ = self.seed_record()
+        common = subprocess.run(["git", "-C", str(self.checkout), "rev-parse", "--path-format=absolute",
+                                 "--git-common-dir"], capture_output=True, text=True, check=True).stdout.strip()
+        with (Path(common) / f"showrunner-merge-{SLUG}.lock").open("a") as gate:
+            fcntl.flock(gate, fcntl.LOCK_EX)
+            process = self.start_apply()
+            # Hold the gate until apply says it waits: a fixed sleep let a slow start under
+            # load reach the lock after it was released, so it never waited.
+            assert process.stdout is not None
+            waited = str(process.stdout.readline())  # pyright: ignore[reportAny]
+            # The gate holds the merge branch: the rename has not even checked the checkout yet.
+            self.assertIsNone(process.poll())
+            self.assertFalse((self.state / SLUG / "rename_unit.json").exists())
+            fcntl.flock(gate, fcntl.LOCK_UN)
+        stdout, stderr = process.communicate(timeout=120)
+        self.assertIn("merge lock: waiting — a merge gate or a unit rename is writing demo's merge branch",
+                      waited + stdout)
+        # The fake restart starts nothing; every step before verify ran once the gate was done.
+        self.assertIn("gamma-unit is not running", stderr)
+        self.assertEqual(self.journal()["step"], 10)
 
     def test_a_running_unit_plans_and_apply_stops_it_through_the_shutdown_path(self) -> None:
         log = self.seed_record()
         (self.home / ".local/state/shutdown/owner@example.com/sessions/sid-alpha.json").unlink()
-        self.mark_live("alpha-unit", "sid-alpha")
+        _ = self.mark_live("alpha-unit", "sid-alpha")
         planned = self.rename("plan")
         self.assert_ok(planned)
-        self.assertIn("1. stop alpha-unit through the shutdown path", planned.stdout)
+        self.assertIn("1. stop alpha-unit and its Codex seats at once through the shutdown path", planned.stdout)
         applied = self.rename("apply")
         self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
-        self.assertIn("alpha-unit is stopping; rerun apply once it has stopped", applied.stderr)
+        self.assertIn("alpha-unit is still stopping after 0 s; rerun apply once it has stopped", applied.stderr)
         self.assertEqual([json.loads(line) for line in log.read_text().splitlines()],
                          [["down", "--only", "sid-alpha", "--here"]])
         self.assertEqual(self.journal()["step"], 0)
 
     def test_a_running_new_id_is_refused(self) -> None:
-        self.mark_live("gamma-unit", "sid-gamma")
+        _ = self.mark_live("gamma-unit", "sid-gamma")
         self.assert_refused(self.rename("plan"), "gamma-unit already runs in session demo-gamma-unit")
+
+    def test_an_older_run_keeps_the_old_path_as_history(self) -> None:
+        old = self.rust / "claude-demo-alpha"
+        older = self.root / "history/runs/run-0.jsonl"
+        self.write(older, json.dumps({"event_type": "run_started", "run_started_at": 0, "working_dir": str(old)})
+                   + "\n" + json.dumps({"event_type": "run_finished"}) + "\n")
+        self.assert_ok(self.rename("apply"))
+        self.assertIn(str(old), older.read_text())
+        newest = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
+        self.assertEqual(newest["working_dir"], str(self.rust / "claude-demo-gamma"))
+        self.assert_ok(self.rename("verify"))
 
     def test_untracked_logs_in_the_checkout_do_not_block_and_stay_out_of_the_commit(self) -> None:
         for name in ("demo-log.md", "demo-log-recovered.md"):
@@ -404,18 +570,45 @@ class UnitRenameTests(unittest.TestCase):
         self.assertNotIn("demo-log", self.git("show", "--name-only", "--format=", "HEAD"))
         self.assertEqual((self.checkout / "docs/plans/demo-log.md").read_text(), "alpha-unit merged phase 2\n")
 
-    def test_refuses_an_unmerged_checkpoint(self) -> None:
+    def test_a_mid_phase_rename_keeps_the_commits_and_the_uncommitted_work(self) -> None:
+        # User, 2026-10-18: a unit is renamed at any time, not only between phases.
+        _ = self.seed_record()
         worktree = self.rust / "claude-demo-alpha"
         self.write(worktree / "work.md", "phase work\n")
         _ = self.git("add", "work.md", cwd=worktree)
         _ = self.git("commit", "-m", "checkpoint(demo-alpha): phase 1", cwd=worktree)
-        self.assert_refused(self.rename("plan"), "checkpoint not merged yet")
-
-    def test_refuses_an_open_phase(self) -> None:
+        checkpoint = self.git("rev-parse", "HEAD", cwd=worktree)
+        self.write(worktree / "work.md", "phase work\nmore, not committed\n")
+        self.write(worktree / "draft.md", "a new file\n")
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, run.read_text() + json.dumps(
             {"event_type": "phase_started", "phase_instance_id": "p2", "phase_id": "2"}) + "\n")
-        self.assert_refused(self.rename("plan"), "is in phase 2")
+
+        self.assert_refused(self.rename("apply"), "gamma-unit is not running")
+
+        new = self.rust / "claude-demo-gamma"
+        self.assertEqual((new / "work.md").read_text(), "phase work\nmore, not committed\n")
+        self.assertEqual((new / "draft.md").read_text(), "a new file\n")
+        # The branch kept its tip: no merge went into work in progress.
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), checkpoint)
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/demo-gamma").split()[0], checkpoint)
+        self.assertEqual(self.git("ls-remote", "--heads", "origin", "demo-alpha"), "")
+        self.assertEqual(self.journal()["kept"], "phase 2 is open")
+        self.assertIn("| gamma-unit | docs/plans/alpha.md |", self.doc.read_text())
+        started = cast(dict[str, object], json.loads(run.read_text().splitlines()[0]))
+        self.assertEqual(started["working_dir"], str(new))
+        self.assertIn("Your work was in progress (phase 2 is open), so your branch kept its commits and took no "
+                      + "merge: the rename commit comes with your next merge of demo.", cast(str, self.record()["renamed"]))
+
+    def test_uncommitted_work_between_phases_also_keeps_the_tip(self) -> None:
+        worktree = self.rust / "claude-demo-alpha"
+        tip = self.git("rev-parse", "HEAD", cwd=worktree)
+        self.write(worktree / "draft.md", "a new file\n")
+        self.assert_ok(self.rename("apply"))
+        new = self.rust / "claude-demo-gamma"
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), tip)
+        self.assertEqual((new / "draft.md").read_text(), "a new file\n")
+        self.assertEqual(self.journal()["kept"], "the worktree has uncommitted work")
 
     def test_refuses_an_unfinished_production_rename(self) -> None:
         self.write(self.state / SLUG / "rename.json", '{"done": false}\n')

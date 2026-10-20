@@ -24,6 +24,7 @@ for dependency in ("message", "production", "herdr", "lib"):
 import sessions
 import herdr
 import relaunch
+import unit_lookup
 from inventory import Inventory, Session, terminal_kind, live_supervisor, codex_seats
 from record import (
     CLAIM_STALE_SECONDS,
@@ -41,7 +42,7 @@ from record import (
 class ShutdownReadiness(Protocol):
     def stoppable_status(self, status: str) -> bool: ...
 
-    def blocker(self, session: Session) -> ReadinessCheck: ...
+    def blocker(self, session: Session, *, moving: bool = False) -> ReadinessCheck: ...
 
 
 settle = cast(ShutdownReadiness, cast(object, import_module("settle")))
@@ -146,10 +147,6 @@ def run_systemctl(arguments: list[str]) -> int | None:
     return _run(["systemctl", *arguments])
 
 
-def run_launchctl(arguments: list[str]) -> int | None:
-    return _run(["launchctl", *arguments])
-
-
 def _run(command: list[str]) -> int | None:
     try:
         completed = subprocess.run(
@@ -172,6 +169,11 @@ def _fresh_inventory(login: str, only: frozenset[str]) -> Inventory:
     from inventory import inventory
 
     return inventory(login, only=only, refresh_desktops=False)
+
+
+def _same_process(stored: Session) -> bool:
+    """Whether the recorded process still runs with its recorded start."""
+    return bool(stored["proc_start"]) and sessions.process_start(stored["pid"]) == stored["proc_start"]
 
 
 def fresh_session(stored: Session, report: Inventory) -> FreshSession:
@@ -364,9 +366,10 @@ def _stop_codex_servers(
 def _stop_unit_session(
     session: Session, clock: Clock, claim: StopClaim
 ) -> list[SessionStopIssue]:
-    if session["kind"] != "unit" or session["host"]["kind"] != "unit":
+    host = session["host"]
+    if session["kind"] != "unit" or host["kind"] != "unit":
         return []
-    name = session["host"]["session_name"]
+    name = host["session_name"]
     issue: SessionStopIssue = {
         "kind": "unit session left running",
         "at": _timestamp(clock),
@@ -375,6 +378,19 @@ def _stop_unit_session(
         "cause": "stop not confirmed",
     }
     claim.check()
+    if name == herdr.shared_session():
+        # The shared session holds every production: close only the tab of the pane that carries this unit's marks.
+        client = herdr.Herdr(name)
+        try:
+            marked = unit_lookup.marked_unit(host["production"], host["unit"])
+            if marked is not None and marked.place.session == name:
+                client.close_tab_of(marked.place.pane)
+            left = marked is not None and any(pane["pane_id"] == marked.place.pane for pane in client.panes())
+        except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
+            left = True
+        finally:
+            claim.check()
+        return [issue] if left else []
     try:
         herdr.stop_session(name)
     except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
@@ -560,7 +576,7 @@ def _stop_owner(
             _owner_identity_lost_issues(stored, clock),
         )
         return
-    if match["kind"] == "session account unreadable":
+    if match["kind"] == "session account unreadable" and not (force_now and _same_process(stored)):
         _ = _set_stop_outcome(
             claim, "stop failed", clock,
             [{"kind": "account unreadable", "at": _timestamp(clock)}],
@@ -588,13 +604,14 @@ def _stop_owner(
         )
         return
 
-    current = match["session"]
+    # A forced stop of a session whose account cannot be read goes by its process identity alone.
+    current, workers = (match["session"], match["workers"]) if match["kind"] == "matching session" else (stored, [])
     if not force_now and prior["kind"] != "reaping" and (
         (prior["kind"] not in {"ready", "held by usage limit", "stopping", "stop failed"}
          and not (prior["kind"] == "waiting" and idle_reason != "not an idle stop"))
         or not settle.stoppable_status(current["status"])
-        or any(worker["status"] != "idle" for worker in match["workers"])
-        or settle.blocker(current)["kind"] != "clear"
+        or any(worker["status"] != "idle" for worker in workers)
+        or settle.blocker(current, moving=bool(entry.get("target")))["kind"] != "clear"
     ):
         issue = NotReadyToStop(
             kind="not ready to stop", at=_timestamp(clock),
@@ -674,7 +691,7 @@ def _stop_owner(
                 _owner_identity_lost_issues(stored, clock),
             )
             return
-        if second["kind"] == "session account unreadable":
+        if second["kind"] == "session account unreadable" and not (force_now and _same_process(stored)):
             _ = _set_stop_outcome(
                 claim, "stop failed", clock,
                 [{"kind": "account unreadable", "at": _timestamp(clock)}],
@@ -750,6 +767,7 @@ def stop_session(
     record: SessionShutdown,
     *,
     idle_reason: IdleStopReason = "not an idle stop",
+    forced: bool = False,
     kill: KillProcess = os.kill,
     is_alive: LivenessCheck = process_is_alive,
     session_record_exists: SessionRecordPresence = session_record_exists,
@@ -802,7 +820,7 @@ def stop_session(
             return update_session(current["login"], current["session"]["session_id"], restore_progress)
         _stop_owner(
             owned, current, prior=prior, idle_reason=idle_reason,
-            force_now=current["force"] == "now",
+            force_now=forced or current["force"] == "now",
             kill=kill, is_alive=is_alive,
             session_record_exists=session_record_exists,
             fresh_inventory=fresh_inventory, clock=clock,

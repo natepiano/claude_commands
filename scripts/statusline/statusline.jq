@@ -8,17 +8,28 @@
 # one process.
 #
 # Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "<ids>"
-#                --arg showrunner "<session JSON>" --slurpfile labels <by-label.json>
-#                --rawfile colors <statusline.conf> -f statusline.jq
-# Input:      the status line JSON on stdin; labels, showrunner, showrunners and
+#                --arg showrunner "<session JSON>" --arg own "<session JSON>" --arg counts "<id> <row> lines"
+#                --slurpfile labels <by-label.json> --rawfile colors <statusline.conf> -f statusline.jq
+# Input:      the status line JSON on stdin; labels, showrunner, own, showrunners, counts and
 #             colors are optional; /dev/null stands in for missing input files.
 #             Empty or damaged showrunner text leaves the unit director unnamed.
-# Output:     Line 1: "<role> | <account> | <dirname> | <tokens with thousands separators> | <model [effort]>"
-#             A unit director's role reads "unit director for <showrunner name>"
-#             when the live showrunner record has a name.
-#             Line 2, when present: "5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
+#             $own is this session's record; its name is used only when its sessionId
+#             is this session's.
+# Output:     Line 1: "<role> | <path>", the path with "~" for the home folder (user, 2026-10-19).
+#             A showrunner reads "<session> showrunner", a unit director "<session> unit for
+#             <showrunner name>"; the session name comes only from this session's record, and
+#             " for <name>" only when the live showrunner record has a name.
+#             Line 2: "<account> | <model [effort]> | <tokens with thousands separators> |
+#             5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
+#             each piece only when present, the 5-hour piece only when under 10% is left,
 #             each " until ..." only when its window carries a reset time.
-#             ANSI colors wrap the role, account, tokens and percentages only.
+#             Line 3, when present: this session's "For you: …" counts row, from
+#             the "<session id> <row>" lines in $counts that statusline.sh reads
+#             from each showrunner's counts cache, with each count in bold. Each
+#             part ("2 changes") takes its type's counts.<type> color, matched by
+#             its word, so the user learns each type by its color (user, 2026-10-20).
+#             ANSI colors wrap the role (with the session name before it), account, tokens,
+#             percentages and the counts row's parts only.
 
 def trim: gsub("^\\s+|\\s+$"; "");
 
@@ -135,34 +146,61 @@ def usage($config; $label; $window; $fmt):
 | ($ARGS.named.showrunner // "" | try fromjson catch null
    | if type == "object" then .name else null end
    | if type == "string" and . != "" then . else null end) as $showrunner_name
+| (.session_id // "") as $session_id
+| ($ARGS.named.own // "" | try fromjson catch null
+   | if type == "object" and $session_id != "" and .sessionId == $session_id then .name else null end
+   | if type == "string" and . != "" then . else null end) as $session_name
 | ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
-# Trailing slashes stripped first, so "/etc/nixos/" gives "nixos" and not "".
-# "/" survives that to become "", and falls back to the path itself.
-| (($d | sub("/+$"; "") | split("/") | last) // "") as $raw
-| (if $raw == "" then $d else $raw end) as $base
+# Trailing slashes stripped first, so "/etc/nixos/" gives "/etc/nixos"; "/" stays "/".
+| ($d | sub("(?<=.)/+$"; "")) as $full
+| ($ENV.HOME // "" | sub("/+$"; "")) as $home
+| (if $home == "" then $full
+   elif $full == $home then "~"
+   elif ($full | startswith($home + "/")) then "~" + $full[($home | length):]
+   else $full end) as $path
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
      (role as $role
+      | (if $role == "unit director" then "unit" else $role end)
       | (if $role == "unit director" and ($showrunner_name | type) == "string"
             and $showrunner_name != ""
-         then $role + " for " + $showrunner_name else $role end)
+         then . + " for " + $showrunner_name else . end)
+      | if $session_name != null and ($role == "showrunner" or $role == "unit director")
+        then $session_name + " " + . else . end
+      # The session name takes the role's color.
       | color($colors; "role." + ($role | gsub(" "; "-")))),
+     $path
+   ] | join(" | ")) as $first_line
+| ([
      # A label is a note name; an address never reaches the line.
      (if $account == "" or ($account | contains("@")) then empty
       elif ($account | test("^claude [0-9]+$")) then $account | sub(" "; "")
       else $account end | . as $label | color($colors; "account." + $label)),
-     $base,
+     ($m | select(. != "")),
+     # Tokens show once the response carries a count.
      (.context_window as $context
-      | (($context.total_input_tokens // 0) | commas)
+      | select(($context.total_input_tokens? | type) == "number")
+      | ($context.total_input_tokens | commas)
       | if ($context.context_window_size | type) == "number" and $context.context_window_size > 0
            and ($context.total_input_tokens | type) == "number"
         then level_color($colors; "tokens"; $context.total_input_tokens * 100 / $context.context_window_size)
         else . end),
-     $m
-   ] | join(" | ")) as $first_line
-| ([
-     usage($colors; "5-hour"; window("five_hour"; .rate_limits.five_hour?); "%H:%M"),
+     # The 5-hour window shows only when under 10% of it is left (user, 2026-10-18).
+     (window("five_hour"; .rate_limits.five_hour?) as $five_hour
+      | select((remaining($five_hour) // 100) < 10)
+      | usage($colors; "5-hour"; $five_hour; "%H:%M")),
      usage($colors; "weekly"; window("weekly"; .rate_limits.seven_day?); "%a %H:%M")
    ] | join(" | ")) as $second_line
-| $first_line + (if $second_line == "" then "" else "\n" + $second_line end)
+| ((.session_id // "") as $id
+   | [$ARGS.named.counts // "" | split("\n")[]
+      | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
+      # The key is the plural word: counts.questions, counts.efficiency and so on.
+      | gsub("(?<count>[0-9]+)(?: (?<word>question|change|efficiency|proposal|project)(?<s>s?))?";
+             . as $part | "\u001b[1m\($part.count)\u001b[22m"
+             | if $part.word == null then .
+               else (. + " " + $part.word + $part.s)
+                 | color($colors; "counts." + $part.word + (if $part.word == "efficiency" then "" else "s" end))
+               end)]
+   | join("\n")) as $counts_row
+| [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")
