@@ -9,6 +9,9 @@ end lasts until `off`; --until (natedev local time, America/New_York) or --for (
 the end. If the end passes without the timer (natedev was off), the next push or silence.py call
 ends silence as `off` does.
 
+auto_silence.py turns silence on with the auto marker when the user is idle, and ends only that
+silence when they come back; `on` replaces the marker, so a silence set by hand stays until `off`.
+
 natedev holds the state: on the Mac every subcommand, and pushover.py's check, runs there over
 ssh. NOTIFY_STATE_DIR, when set, names this host's state directory and keeps everything here.
 """
@@ -40,6 +43,7 @@ SILENCE = Path.home() / ".claude/scripts/notify/silence.py"
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/silence.py"'
 SSH = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "natedev"]
 UNTIL_OFF = "until off"
+UNTIL_BACK = "until you are back"
 SPAN_UNITS = {"d": 86400, "day": 86400, "days": 86400, "h": 3600, "hour": 3600, "hours": 3600,
               "m": 60, "min": 60, "minute": 60, "minutes": 60, "s": 1, "sec": 1, "second": 1, "seconds": 1}
 SPAN_PART = re.compile(r"\s*(\d+)\s*([a-z]+)")
@@ -53,6 +57,7 @@ class SilenceRecord(TypedDict):
     since: str
     until: str | None
     timer: str | None
+    auto: bool
 
 
 class KeptPush(TypedDict):
@@ -108,7 +113,12 @@ def read_state() -> SilenceRecord | None:
     since, until, timer = record.get("since"), record.get("until"), record.get("timer")
     if not isinstance(since, str) or not isinstance(until, str | None) or not isinstance(timer, str | None):
         return None
-    return {"since": since, "until": until, "timer": timer}
+    return {"since": since, "until": until, "timer": timer, "auto": record.get("auto") is True}
+
+
+def write_state(record: SilenceRecord) -> None:
+    """The caller holds the lock."""
+    _ = state_file().write_text(json.dumps(record), encoding="utf-8")
 
 
 def read_kept() -> list[KeptPush]:
@@ -146,6 +156,8 @@ def shown(moment: datetime) -> str:
 
 
 def ends(record: SilenceRecord) -> str:
+    if record["auto"]:
+        return UNTIL_BACK
     return f"until {shown(datetime.fromisoformat(record['until']))}" if record["until"] else UNTIL_OFF
 
 
@@ -212,8 +224,8 @@ def on(until: datetime | None, runner: Run) -> int:
     with locked():
         old = read_state()
         record: SilenceRecord = {"since": old["since"] if old else datetime.now(user_zone()).isoformat(),
-                                 "until": until.isoformat() if until else None, "timer": unit}
-        _ = state_file().write_text(json.dumps(record), encoding="utf-8")
+                                 "until": until.isoformat() if until else None, "timer": unit, "auto": False}
+        write_state(record)
     stop_timer(old["timer"] if old else None, runner)
     print(f"silence on from {shown(datetime.fromisoformat(record['since']))} {ends(record)}")
     return 0
@@ -228,11 +240,14 @@ def post_kept(push: KeptPush) -> int:
     return cast(PushChannel, cast(object, importlib.import_module("pushover"))).post_kept(push)
 
 
-def claim(*, past_end_only: bool) -> tuple[SilenceRecord | None, list[KeptPush]] | None:
-    """End silence and take the kept pushes, under the lock: two callers never take the same push."""
+def claim(when: Callable[[SilenceRecord], bool] | None = None) -> tuple[SilenceRecord | None, list[KeptPush]] | None:
+    """End silence and take the kept pushes, under the lock: two callers never take the same push.
+
+    With `when`, only a silence it accepts ends; otherwise nothing changes and the result is None.
+    """
     with locked():
         record = read_state()
-        if past_end_only and (record is None or not past_end(record)):
+        if when is not None and (record is None or not when(record)):
             return None
         kept = read_kept()
         state_file().unlink(missing_ok=True)
@@ -250,13 +265,13 @@ def release(record: SilenceRecord | None, kept: list[KeptPush], runner: Run, del
 
 
 def off(runner: Run, deliver: Deliver | None = None) -> int:
-    record, kept = cast(tuple[SilenceRecord | None, list[KeptPush]], claim(past_end_only=False))
+    record, kept = cast(tuple[SilenceRecord | None, list[KeptPush]], claim())
     return release(record, kept, runner, deliver or post_kept, "silence off")
 
 
 def end_if_past(runner: Run | None = None, deliver: Deliver | None = None) -> int:
     """End a silence whose end passed without its timer firing, as `off` does."""
-    claimed = claim(past_end_only=True)
+    claimed = claim(past_end)
     if claimed is None:
         return 0
     return release(*claimed, runner or run, deliver or post_kept, "silence ended at its end time")
