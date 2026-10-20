@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+from importlib import import_module
 import json
 import math
 import os
@@ -32,10 +33,17 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone  # noqa: E402
+
+
+# These readers retain their names for callers that already use them.
+__all__ = [
+    "_arg", "_duration", "_emit", "_events", "_integer", "_meta", "_number",
+    "_require_rows", "_since_epoch", "_skills", "_status_filter", "_string", "_warn",
+]
 
 
 SPINE_VERSION = 1
@@ -1084,11 +1092,20 @@ def _cmd_summary(args: argparse.Namespace) -> None:
             weight = f"{_count(len(heavy), 'phase', 'phases')} ({heavy_share:.0f}%)"
             print(f"{weight} with >={FIX_PASS_THRESHOLD} fix passes {held}")
         print("\nNext:")
-        print("  history.py phases --sort fix_passes        the phases holding the tail")
+        print("  history.py rounds                         phases ranked by repair rounds")
         print("  history.py stages --stage review --group agent   cost per agent")
         print("  history.py compare --on <date>             did a change help")
     _warn(tally)
     _require_rows(table, "summary")
+
+
+class RoundReporter(Protocol):
+    def run(self, args: argparse.Namespace) -> None: ...
+
+
+def _cmd_rounds(args: argparse.Namespace) -> None:
+    rounds = cast(RoundReporter, cast(object, import_module("scripts.history.rounds")))
+    rounds.run(args)
 
 
 def main() -> None:
@@ -1143,6 +1160,14 @@ def main() -> None:
     status(phases)
     _ = phases.add_argument("--sort", default="total", choices=["fix_passes", "total"])
     phases.set_defaults(handler=_cmd_phases)
+
+    rounds = subparsers.add_parser("rounds", help="repair rounds and causes per phase instance")
+    shared(rounds, filters=False)
+    status(rounds)
+    _ = rounds.add_argument("--until", default="", help="upper bound; same forms as --since")
+    _ = rounds.add_argument("--top", type=int, default=25, help="maximum rows (default: 25)")
+    _ = rounds.add_argument("--plan", default="", help="plan basename substring")
+    rounds.set_defaults(handler=_cmd_rounds)
 
     compare = subparsers.add_parser("compare", help="before and after one change")
     _ = compare.add_argument("--on", default="", help="the date the change landed")
