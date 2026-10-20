@@ -1495,6 +1495,7 @@ never take a second ticket while one is open.
 | 3 | `waiting for sync` or `waiting for structure: <crates>`; report the printed line once to the showrunner and end the turn with `— blocked: waiting on the showrunner: sync`. Refill on its sync message or any `ticket <id> merged; refill.`. |
 | 4 | `waiting for board`; report `board unavailable: <reason>` once and end the turn with `— blocked: waiting on the showrunner: board`. Refill on the next sync or showrunner message. |
 | 5 | `waiting for merge: <id>`; report once and end the turn with `— blocked: waiting on the showrunner: ticket <id> merge`. Refill on `ticket <id> merged; refill.` |
+| 6 | `merge the style branch first: <n> cells judged at <unit tip> wait for <style branch>`; each cell was judged at a commit in the unit tip with the inputs the tip has, and the pushed style merge branch changes those inputs. In the unit worktree, run the standing style unit merge (`~/.claude/docs/production_format.md` <ProductionUnit/> item 5): `git -C <unit-worktree> fetch origin <style merge branch> && git -C <unit-worktree> merge --ff-only origin/<style merge branch>`, then refill at once. If the fast-forward is refused or leaves HEAD unchanged, do not refill: report it once to the showrunner and end the turn with `— blocked: waiting on the showrunner: style merge`. |
 | Other nonzero | Report the error and retain the ticket; repair it before refill. |
 
 A standing plan never closes its run: skip FinalGate, RunAsBuilt, the final

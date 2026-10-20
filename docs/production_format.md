@@ -129,7 +129,7 @@ The production doc sits beside the source plan as `<source-stem>-production.md`.
 - **Improvement queue:** <path to the improvement ledger>; optional; open lines
   still to decide or hand out show as `N projects` in the `For you:` line
 - **Efficiency ledger:** <path to a nightly-review style ledger>; optional; its
-  proposed and deferred lines show as `N efficiency proposals` in the `For you:`
+  proposed and deferred lines show as `N efficiency` in the `For you:`
   line on the status line and in the dailies footer
 
 The showrunner's session name is not in the doc: a name can change, so it is

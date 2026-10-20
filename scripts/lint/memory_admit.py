@@ -153,6 +153,12 @@ def test_threads(argv: list[str]) -> int | None:
 
 def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
                   test_threads: int | None = None) -> ExpectedPeak:
+    """The p90 process-memory peak of a step over HISTORY_DAYS.
+
+    The gate pools every test width: one width's history is thin and rebuild-heavy, and the
+    claim of a width comes only after admission. `test_threads` narrows the measured history to
+    one width, for width_trial.py's report.
+    """
     cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
     before = store.utc_iso(now.timestamp())
     measured: list[int] = []
@@ -162,7 +168,7 @@ def expected_peak(repo: str, step: str, host: str, now: datetime, root: Path,
                 try:
                     item = cast(dict[str, object], json.loads(line))
                     if ((item.get("host"), item.get("repo"), item.get("step")) == (host, repo, step)
-                            and item.get("test_threads") == test_threads
+                            and (test_threads is None or item.get("test_threads") == test_threads)
                             and cutoff <= str(item.get("ended_at", "")) < before):
                         peak = item.get("anon_peak_bytes")
                         if isinstance(peak, int) and peak > 0:
@@ -266,7 +272,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], force: bool = 
         repo, worktree = git_identity(argv, os.getcwd())
         step = parse.step_name(argv) if argv else "build"
         host = store.host_name()
-        peak = expected_peak(repo, step, host, now, root, width) if repo else ExpectedPeak(FALLBACK, "fallback", 0)
+        peak = expected_peak(repo, step, host, now, root) if repo else ExpectedPeak(FALLBACK, "fallback", 0)
         profile = StepProfile(repo, step, worktree, peak)
     repo, step, worktree, peak = profile.repo, profile.step, profile.worktree, profile.peak
     if not argv and not (root / "admission").exists():
@@ -323,6 +329,19 @@ def release(path: Path, status: int, root: Path | None = None) -> None:
             Path(row["sidecar"]).unlink(missing_ok=True)
 
 
+def set_width(path: Path, width: int, root: Path | None = None) -> None:
+    """Record the test width a reserved step runs at, claimed after its admission."""
+    root = root if root is not None else store.root()
+    with (admission_dir(root) / "lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            row = cast(Reservation, json.loads(path.read_text()))
+        except (OSError, ValueError, TypeError):
+            return
+        row["test_threads"] = width
+        _ = path.write_text(json.dumps(row, separators=(",", ":")))
+
+
 def clean_field(value: str) -> str:
     return value.replace("|", " ").replace("\n", " ")
 
@@ -331,6 +350,9 @@ def main() -> None:
     action = sys.argv[1]
     if action == "release":
         release(Path(sys.argv[2]), int(sys.argv[3]))
+        return
+    if action == "width":
+        set_width(Path(sys.argv[2]), int(sys.argv[3]))
         return
     _, _, meminfo, pid, sidecar, forced, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
     profile = None

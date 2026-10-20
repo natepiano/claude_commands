@@ -378,6 +378,8 @@ class UnitRenameTests(unittest.TestCase):
         self.assert_ok(self.rename("apply"))
         self.write(self.root / "state/nightly-review/2026-10-16/report.md", "alpha-unit reviewed\n")
         self.write(self.root / "state/other/names.json", '{"unit": "claude-demo-alphabet"}\n')
+        self.write(self.root / "state/other/__pycache__/names.cpython-313.pyc", "alpha-unit\n")
+        self.write(self.root / "state/other/names.pyc", "alpha-unit\n")
         self.assert_ok(self.rename("verify"))
         stale = self.root / "state/other/cache.json"
         self.write(stale, '{"unit": "alpha-unit"}\n')

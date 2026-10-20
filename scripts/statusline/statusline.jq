@@ -25,9 +25,11 @@
 #             each " until ..." only when its window carries a reset time.
 #             Line 3, when present: this session's "For you: …" counts row, from
 #             the "<session id> <row>" lines in $counts that statusline.sh reads
-#             from each showrunner's counts cache, with each count in bold.
-#             ANSI colors wrap the role (with the session name before it), account, tokens
-#             and percentages only.
+#             from each showrunner's counts cache, with each count in bold. Each
+#             part ("2 changes") takes its type's counts.<type> color, matched by
+#             its word, so the user learns each type by its color (user, 2026-10-20).
+#             ANSI colors wrap the role (with the session name before it), account, tokens,
+#             percentages and the counts row's parts only.
 
 def trim: gsub("^\\s+|\\s+$"; "");
 
@@ -193,6 +195,12 @@ def usage($config; $label; $window; $fmt):
 | ((.session_id // "") as $id
    | [$ARGS.named.counts // "" | split("\n")[]
       | select($id != "" and startswith($id + " ")) | .[($id | length) + 1:]
-      | gsub("(?<count>[0-9]+)"; "\u001b[1m\(.count)\u001b[22m")]
+      # The key is the plural word: counts.questions, counts.efficiency and so on.
+      | gsub("(?<count>[0-9]+)(?: (?<word>question|change|efficiency|proposal|project)(?<s>s?))?";
+             . as $part | "\u001b[1m\($part.count)\u001b[22m"
+             | if $part.word == null then .
+               else (. + " " + $part.word + $part.s)
+                 | color($colors; "counts." + $part.word + (if $part.word == "efficiency" then "" else "s" end))
+               end)]
    | join("\n")) as $counts_row
 | [$first_line, $second_line, $counts_row] | map(select(. != "")) | join("\n")

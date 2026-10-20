@@ -98,13 +98,34 @@ Refill only the unit worktree's own plan copy:
 `next-phase` returns 0 after writing a phase, resuming an assigned ticket, or
 reporting `repair first`; 3 means `waiting for sync`, or
 `waiting for structure: <crates>` when every pending family cell in those
-in-scope crates is blocked by a structure cell on its file or crate, until the
+in-scope crates is blocked by a structure cell, until the
 modules unit's structure tickets merge
 (an unclassified catalog also says `pull nate_style`); 4 means
 `board unavailable: <reason>`; 5 means
-`waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation
+`waiting for merge: <ticket> checkpointed at <commit7>`; 6 means
+`merge the style branch first: <n> cells judged at <unit tip7> wait for <style branch>`.
+On 6, run the standing style unit merge in the unit worktree
+(`git -C <unit-worktree> fetch origin <style merge branch> && git -C <unit-worktree> merge --ff-only origin/<style merge branch>`),
+then refill. If the fast-forward is refused or leaves HEAD unchanged, do not
+refill: report it to the showrunner.
+Unknown reservation
 availability stops selection without recording work. `queue` is a read-only
 preview and also returns 4 when the board is unavailable.
+A file cell waits only for open or stale structure cells at its own file; a crate cell waits for every one in its crate.
+
+Refill leaves out two kinds of stale cell. The first is a held cell whose site
+did not change since its held judgment, when at least one of its findings is
+not waived, built or withdrawn, and each such finding is filed on an open
+proposal. The second is a cell of the unit's family (or a structure cell, for
+the modules unit) in its pilot scope whose newest judgment (current rule text,
+newest declared scope) is at a commit in the unit tip and in the style branch,
+and saw the inputs that the unit tip has: a ticket at that tip records the same
+verdict again. Ranking and structure blocking still count such a cell. When no
+work is left, refill returns 6 and records no sync wait only when a style
+branch is stored, the unit tip is in the pushed style tip
+(`origin/<style branch>` when origin exists, else the local branch), and that
+tip changes the inputs of at least one such cell. Otherwise it returns 3,
+`waiting for sync`: the next sync or style merge changes the cell.
 
 The ticket stores its rule text. Workers read the pinned files under the unit
 worktree's `docs/style-production/rules/`, including after an interruption;
@@ -196,6 +217,10 @@ inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 text and inputs still match.
 Tickets pin their rule text: `record --ticket <id>` uses that pin, and a supplied
 `--rule-blob` must match it. A changed rule leaves an old ticket's judgment stale.
+The phase of a proposal ticket lists the exact cells to record, one
+``- `<rule>` · `<file>` `` line each. A tier B rule has a cell only at a ticket file
+with one of its listed sites at the synced tip, because `record` refuses it at
+other files. A `#uncovered` component has a cell at every ticket file.
 
 A partial B rule has listed file cells and `<rule id>#uncovered` C cells for
 every included Rust file in reach. Both components must be current to finish
@@ -425,21 +450,86 @@ The dry run prints the same lines and writes nothing. A decision that it cannot
 close or refresh gets a `skipped <issue>: <reason>` line, the other decisions
 go on, and `withdraw` exits 1 as `file` does.
 
+Before that, filing reads the declaration of each unfiled and filed finding of
+a `.rs` file. The declaration is the item that holds the finding's line at the
+commit it was judged at, or at its last follow: its keyword, its name and the
+impl or trait it is in. The step reads only a finding whose commit is in the
+synced commit. When that file at the synced commit no longer declares the
+item, the step searches every Rust file. One other file: the finding follows it
+to the line with the same text in the item, else the item's first line, and
+keeps its id. Two or more files, or a filed finding's file in another crate:
+the finding stays as it is for a person to waive or fix in the code. No file:
+
+- A filed rename is built when its own file, or the one file that gained it,
+  now declares its after name with the same keyword and owner, and its decision
+  is approved. A built rename follows to its new declaration, also in its own
+  file. Two or more such files, or one in another crate, leave the finding as a
+  move does. A rename in a decision that is not approved waits for the answer,
+  with no line. The step reads the answer again when it writes.
+- Another filed finding whose file is still there stays filed for a person. A
+  person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
+  puts the item back in the code.
+- An unfiled finding, or a filed finding whose file is gone, is withdrawn, with
+  no decision when it was unfiled.
+
+A finding that an open ticket builds is kept. When the synced commit moves
+after the step reads the declarations, it writes nothing and exits 1; run it
+again. The step prints
+`follow <finding> <rule> <path>:<line> -> <path>:<line>: <keyword> <name>`,
+`built <finding> <rule> <path>:<line>: <keyword> <name> renamed to <new name> in <path>:<line>`,
+`withdraw … declaration gone at <commit>`, `left … declared in <files>`,
+`left … declared in another crate: <file>`, `left … declaration gone; waive it or
+declare it again`, `kept …: open ticket <ticket> builds it`, a `close` line per
+decision and
+`totals: follow <n>, built <n>, withdraw <n>, left <n>, kept <n>, close <n>`. A
+decision that it changes refreshes its sites, and one with no finding left
+closes. A decision whose last finding the step built closes at the next refill
+or `complete`, with `built in synced commit <commit>`. Each run refreshes
+every open decision that holds a followed finding, so a rerun completes a run
+that stopped before its refresh.
+`style_proposals.py follow --repo <style checkout> --proposals <folder>
+[--dry-run]` runs this step alone; it exits 1 when it leaves a finding or skips a
+decision. `held list` shows `followed from <path>:<line> at <commit>` for a
+followed finding, and `--json` adds `followed_from`, `followed_at` and
+`declaration_gone_at`.
+
 One style decision covers one rule and crate under one rule blob. An answer
-also covers later findings under that rule text. A new rule blob needs a new
+also covers later findings under that rule text: a declined decision waives
+them with its stored words, and `file` prints
+`waived <n> findings in <decision>: declined: <words>`. A new rule blob needs a new
 answer. Each decision shows counts and up to three examples from different
 files. The ledger holds its full site list. Show decisions only when the user
 asks through `/showrunner:proposals` or `/adhoc_review`.
 
 Approve with `proposal_issue.py approve <issue> --showrunner <parent>
 --unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
+Approval sets the decision's stage active (in progress), so it leaves the
+footer's proposal count.
 Refill builds approved findings in small tickets before coverage work.
 Each ticket permits its own approved findings and proven rename references.
+Only a rename whose `before` and `after` are one `<parent>::<name>` pair proves
+reference edits. A rename with no such pair (a bare name, a field or prose)
+approves no reference edit, and the ticket's other pairs stay approved. A
+ticket with a type or restructure finding approves no reference edit.
+The ticket's phase names each approved pair. It tells the worker to apply any
+other rename only in its own file, and to hold it when other files use its old
+name.
 Other findings stay held. Package checks still run. The parent schedules
 changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
-Refill waives a finding whose file is not in the synced commit, and prints the
-file and the commit. When no finding of the decision is left to build, refill
-closes it. Refill does not assign a queued proposal ticket that was
+Refill first runs the declaration step once, on the findings of all approved
+decisions, so a finding tickets at the file its declaration moved to. A finding
+that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
+`waiting <decision>: <finding> declared in another crate: <file>` or
+`waiting <decision>: <finding> declaration gone`, and stays out of the ticket. A
+decision whose last finding the step built closes. A decision whose answer
+changes during the refill gets `waiting <decision>: no longer approved`. A decision
+that the step skips gets `waiting <decision>: skipped by the declaration step`,
+and refill writes none of its findings. For a finding
+that the step cannot read, refill waives it when its file is not in the synced
+commit, and prints the file and the commit. It also waives a finding whose one-line site text left its
+file and moved into exactly one file that gained the line since the finding was
+judged, and prints both files and the commit. When no finding of the decision
+is left to build, refill closes it. Refill does not assign a queued proposal ticket that was
 made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
 then run migrate.
 
@@ -460,8 +550,35 @@ refill skips it until a person marks it built:
 `not built <finding id>: <kind> has no applied check; mark it built with style_ledger.py held built --repo <checkout> --id <finding id> after checking`.
 `held built` refuses a finding with no merged build ticket, and a rename that is
 not applied at that ticket's checkpoint.
+When a plain merge, not a ticket, put the change in the code, run
+`style_ledger.py held built --repo <checkout> --id <finding id> [--id <finding id> ...] --commit <merge> [--by <who>]`.
+The id can be a unique prefix. The merge must be the synced tip or an ancestor
+of it. Each finding must be filed, and no open ticket may build it. The applied
+check runs at the merge. A rename that is not applied is refused. A finding with
+no check (a rename the check cannot prove, a type or restructure finding) needs
+`--by`, and the row records the person as reopen does. A proven rename clears
+that record. It prints `built <finding id> at <merge>` for each finding, with
+`, read by <who>` when a person read it. A refusal writes nothing for any id.
+Without `--commit`, `held built` takes one `--id` and refuses `--by`.
 A rename also has no check when its file declares neither name under one
 parent, or when more than one item in the file has the parent's name.
+
+To undo a waive, run
+`style_proposals.py unwaive --repo <checkout> --proposals <folder> --id <finding id> [--id <finding id> ...] --by <who>`.
+The id can be a unique prefix. Each finding goes back to unfiled, with no
+decision and no build ticket, so the next `file` puts it in a decision again.
+It prints `unwaived <finding id> by <who>` for each finding. The row records the
+person in its `unwaived_by` column; `held list` shows `unwaived by <who>` after
+the state (`unwaived_by` with `--json`). The record stays after every later
+change, a new waive included, so a later `file` never erases it. A second
+unwaive records the newer person. When a decline set the cell's newest
+judgment to `waived`, unwaive sets it back to `held`.
+Unwaive refuses an id that names no finding or more than one, a finding that is
+not waived, a finding judged under an older rule text (`file` skips it), a
+finding that an open ticket judged or builds, and a blank `--by`. It also
+refuses a finding whose decision is declined, because the next `file` waives it
+again: answer the decline again first. It strips `--by`. A refusal writes
+nothing for any id.
 
 A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
 where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
@@ -490,12 +607,56 @@ A decision opens again with its approval. The findings of an old issue move to
 the decision for their rule, crate and rule blob, as migrate moves them; a new
 decision takes the old issue's approval. Reopen prints
 `filed again <finding id> in <decision>: <before> -> <after> not applied in <path>`
-for each finding, or `nothing to reopen: every built finding is applied`.
+for each finding it files again. For each built rename with no check it prints
+`cannot check <finding id> in <path>: <before> -> <after>; pass --finding <finding id> or --applied <finding id>`
+and exits 1. With none of these lines it prints `nothing to reopen: every built finding is applied`,
+or `nothing to reopen: every checked finding is applied; restructure not checked <count>`
+when the issue holds a built restructure (or type) finding. The check never judges
+one, so reopen prints no other line for it; `--all` counts them in its totals.
+A person who reads the code gives the verdict with `--by <who>`:
+`--finding <finding id>` when the change is not in the code, `--applied <finding id>`
+when it is. Repeat either option for more findings; the id can be a unique prefix.
+Reopen files each `--finding` finding again with no check, in the same run as the
+findings the check finds not applied, and prints
+`filed again <finding id> in <decision>: <before> -> <after> in <path> by <who>: a person read the code`.
+Each `--applied` finding stays built, and reopen prints
+`applied <finding id> in <issue>: <before> -> <after> in <path> by <who>: a person read the code`.
+The held finding records the person in its `person_read_by` column; the state
+shows the verdict. `style_ledger.py held list` shows
+`filed again by <who>: a person read the code` for a filed row and
+`applied, read by <who>: a person read the code` for a built row (the `reading`
+field with `--json`). The record stays after later changes of the finding, except
+a new build: when a ticket merge or `held built` marks the finding built again,
+the record is cleared, because the person read the old build. A built
+finding that a person read is not checked again: reopen does not file it again and
+prints no `cannot check` line for it. `--finding` and `--applied` need `--by` and
+`--issue`; they are refused with `--all`, and `--by` alone is refused. Reopen strips
+`--by` before it stores it.
 The dry run prints the same lines and writes nothing. Reopen refuses an issue
 that is not approved, an issue that an open ticket builds, an issue with a
-merged ticket whose checkpoint the synced tip does not hold yet (sync first), and
-an old issue that migrate would refuse or whose decision is declined or has no
-answer. A refusal writes nothing.
+merged ticket whose checkpoint the synced tip does not hold yet (sync first), an
+old issue that migrate would refuse or whose decision is declined or has no
+answer, a blank `--finding` or `--applied`, one that is not one built finding of
+the issue, one finding named by both, and an `--applied` rename that the check
+finds not applied (the old name is still declared):
+`<issue>: finding <finding id>: the check finds the rename not applied; use --finding`.
+A refusal writes nothing.
+`style_proposals.py reopen --repo <style checkout> --all [--parent <slug>] [--dry-run]`
+runs reopen on every approved decision and old issue that holds a built finding.
+An old issue takes the parent that its own `Parent:` line names. Only an old
+issue with no `Parent:` line takes `--parent`, and with no `--parent` it prints
+`skipped <issue>: no Parent line; pass --parent`. A decision that a finding moves
+into keeps its own parent; only a new decision takes the old issue's parent. Each
+issue with a built finding that the run leaves out or reopen refuses prints
+`skipped <issue>: <reason>`, and the others go on. The reasons include
+`missing file`, `not approved` and `closed without answer`. It prints the
+`cannot check` line for each built rename with no check. The run ends with
+`totals: reopen <issues>, filed again <findings>, cannot check <findings>, restructure not checked <findings>, skipped <issues>`
+and exits 1 when it skipped an issue or cannot check a rename. The restructure
+count never sets the exit code.
+`style_ledger.py held add` on a built finding that no person read and whose rename is not at the synced tip
+prints `built, but not in the code at <tip>: run style_proposals.py reopen --all (issue <issue>)`
+to stderr and changes nothing.
 
 After each merge and at startup, run `style_proposals.py complete --repo
 <style checkout>`. It closes only approved decisions, and only when all their
@@ -520,6 +681,24 @@ nothing left to build also opens again with its approval for a later finding. Mi
 issue with an unfinished build ticket unchanged, and it can resume after a crash.
 Migration does not change an off-rule issue that a style unit filed through
 `/issue`; it lists the issue as `skipped: off-rule <path>` and counts it in its totals.
+
+A bare duplicate is a filed or built rename finding whose `before` has no `::`,
+and whose `before` and `after` are the last `::` segments of a qualified rename
+finding with the same rule and file (a `#uncovered` component counts as its
+rule). The qualified finding is filed or built, and its `before` and `after` are
+one approved `<parent>::<name>` pair: the same parent with a changed last name.
+Migrate and reopen never move a bare duplicate into a decision that holds, or
+receives in the same run, its qualified finding. They withdraw it into that
+decision and print `drop <finding id> in <decision>: duplicate of <finding id>`.
+The row records the finding it duplicates. `style_proposals.py drop-duplicates
+--repo <style checkout> [--dry-run]` drops each bare duplicate of every open
+decision and regenerates the decision's body with its own `Parent:` line. A
+decision whose duplicate an open ticket builds, or that has no generated body,
+prints `skipped <issue>: <reason>` and is not written. The run ends with
+`totals: drop <findings>, skipped <decisions>` and exits 1 when it skipped a
+decision. The dry run prints the same lines and writes nothing. `style_ledger.py
+held list` shows `duplicate of <finding id>` or `judgment <row> exception` after
+the state of a withdrawn row; `--json` gives `duplicate_of` and `withdrawn_by`.
 
 ## Lifetime
 

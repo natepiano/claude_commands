@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 FENCE = "---"
+# The tag every proposal issue carries.
+PROPOSAL_TAG = "proposal"
 FIELD = re.compile(r"^(?P<key>[A-Za-z_][\w-]*):\s*(?P<value>.*)$")
 ITEM = re.compile(r"^\s+-\s*(?P<value>.*)$")
 WIKI_LINK = re.compile(r"^\[\[(?P<target>[^\]|]*)(?:\|(?P<alias>[^\]]*))?\]\]$")

@@ -2,10 +2,10 @@
 
 The status line and the dailies report's own footer show it; no reply carries it (user,
 2026-10-18). Changes are the rows still to review on the list the doc's Change review line names,
-proposals the open proposal issues in its Proposals folder that are its own (see
-proposals_folder), efficiency proposals the proposed or deferred lines in its Efficiency
-ledger, and projects the improvement-queue lines still to decide or hand out, for a doc
-with an Improvement queue line.
+proposals the open proposal issues in its Proposals folder that are its own and that the user has
+not approved (see proposals_folder and proposal_issue.proposal_progress), efficiency proposals
+the proposed or deferred lines in its Efficiency ledger, and projects the improvement-queue
+lines still to decide or hand out, for a doc with an Improvement queue line.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import change_review
+import proposal_issue
 import proposals_folder
 from production_units import Refusal, production_field
 
@@ -47,7 +48,8 @@ def changes(doc: Path) -> int:
 
 
 def proposals(doc: Path) -> int:
-    return len(proposals_folder.open_proposals(doc))
+    return sum(isinstance(proposal_issue.proposal_progress(issue), proposal_issue.AwaitingApproval)
+               for issue in proposals_folder.open_proposals(doc))
 
 
 def open_project(line: str) -> bool:
@@ -145,14 +147,15 @@ def plural(count: int, word: str) -> str:
 
 
 def counts_line(counts: FooterCounts) -> str | None:
-    """`For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question`.
+    """`For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects`.
 
-    Zero counts are left out; None when all are zero.
+    Questions come first because they need the user most (user, 2026-10-20). "efficiency" has
+    no plural. Zero counts are left out; None when all are zero.
     """
     parts = [text for count, text in (
-        (counts.changes, f"{plural(counts.changes, 'change')} to review"),
+        (counts.questions, plural(counts.questions, "question")),
+        (counts.changes, plural(counts.changes, "change")),
+        (counts.efficiency, f"{counts.efficiency} efficiency"),
         (counts.proposals, plural(counts.proposals, "proposal")),
-        (counts.efficiency, plural(counts.efficiency, "efficiency proposal")),
-        (counts.projects, plural(counts.projects, "project")),
-        (counts.questions, plural(counts.questions, "question"))) if count]
+        (counts.projects, plural(counts.projects, "project"))) if count]
     return COUNTS_HEAD + ", ".join(parts) if parts else None
