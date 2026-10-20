@@ -11,12 +11,13 @@ import threading
 import unittest
 from collections.abc import Sequence
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
 import silence
+from user_zone import user_zone
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
                           "message": "No action needed.\nThe build passed.", "detail": ""}
@@ -77,7 +78,7 @@ class SilenceTests(unittest.TestCase):
         _ = self.main("on", "--until", f"{end:%Y-%m-%d %H:%M}")
         timer = self.commands[0]
         self.assertEqual(timer[:3], ["systemd-run", "--user", "--collect"])
-        self.assertIn(f"--on-calendar={end:%Y-%m-%d} 07:00:00", timer)
+        self.assertIn(f"--on-calendar={end.replace(tzinfo=user_zone()).astimezone(timezone.utc):%Y-%m-%d %H:%M:%S} UTC", timer)
         self.assertEqual(timer[-2:], [str(silence.SILENCE), "off"])
         unit = timer[3].removeprefix("--unit=")
         self.assertTrue(unit.startswith("silence-off-"))
