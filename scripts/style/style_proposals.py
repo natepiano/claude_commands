@@ -27,7 +27,7 @@ import coverage_report
 import rules
 import style_ledger
 import style_rules
-from approved_renames import RenameNotApplied
+from approved_renames import NoAppliedCheck, RenameNotApplied
 from add_style import StandingStyleProduction, standing_style_production
 from issues import Issue, frontmatter, open_issues, plain
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
@@ -663,7 +663,8 @@ class ResumeMigration:
 @dataclass(frozen=True)
 class FileBuiltAgain:
     """Reopen takes the built findings that are not in the code, and the findings still filed to the issue."""
-    finding_ids: frozenset[str]
+    # Each built finding that reopen files again, with why.
+    refilings: Mapping[str, style_ledger.PersonReading]
 
 
 MoveScope = ResumeMigration | FileBuiltAgain
@@ -675,8 +676,8 @@ class MovePlan:
     sources: tuple[LegacyIssue, ...]
     moves: tuple[DecisionMove, ...]
     closes: tuple[OldIssueClose, ...]
-    # Built findings that are not in the code. The move files them again before it moves them.
-    refile: frozenset[str]
+    # Built findings that are not in the code, with why. The move files them again before it moves them.
+    refile: Mapping[str, style_ledger.PersonReading]
     # Each old issue that keeps its findings, with the reason.
     refusals: tuple[str, ...]
     # The decision of each finding that the move takes from an old issue.
@@ -692,7 +693,7 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
                          if ticket["state"] not in style_ledger.FINAL_TICKET_STATES)
     holding = {Path(ticket["proposal"]): ticket for ticket in open_tickets}
     open_ids = {ticket["id"] for ticket in open_tickets}
-    refile = scope.finding_ids if isinstance(scope, FileBuiltAgain) else frozenset[str]()
+    refile: Mapping[str, style_ledger.PersonReading] = scope.refilings if isinstance(scope, FileBuiltAgain) else {}
     directories = workspace_directories(ledger)
     lines: list[str] = []
     refusals: list[str] = []
@@ -791,7 +792,7 @@ def run_moves(ledger: style_ledger.Ledger, proposals: Path, parent: str, plan: M
                 apply_answer(ledger, move.issue, move.join, move.pending)
     if not dry_run:
         if plan.refile:
-            ledger.return_to_filed(sorted(plan.refile))
+            ledger.return_to_filed(plan.refile)
         for source in plan.sources:
             if source.owned:
                 ledger.move_issue_findings(source.issue.path, {
@@ -818,15 +819,67 @@ def migrate(ledger: style_ledger.Ledger, proposals: Path, parent: str, *, dry_ru
     print(f"totals: create {created}, move {moved}, close {len(plan.closes)}, off-rule {len(off_rule)}")
 
 
-def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, dry_run: bool = False) -> None:
+@dataclass(frozen=True)
+class CheckOnly:
+    """Reopen files again only the built findings that the applied check finds not in the code."""
+
+
+@dataclass(frozen=True)
+class PersonRead:
+    """A person read the code of the named built findings in place of the applied check.
+
+    Reopen files each not_applied finding again and keeps each applied finding built. Each name is a finding id
+    or a unique prefix of one.
+    """
+    by: str
+    not_applied: tuple[str, ...]
+    applied: tuple[str, ...]
+
+
+ReopenReading = CheckOnly | PersonRead
+CHECK_ONLY = CheckOnly()
+
+
+@dataclass(frozen=True)
+class PersonVerdicts:
+    """The built findings of one issue that a person read, by verdict, each with the person's reading."""
+    not_applied: Mapping[str, style_ledger.ReadByPerson]
+    applied: Mapping[str, style_ledger.ReadByPerson]
+
+
+@dataclass(frozen=True)
+class Reopening:
+    """What reopen does to one issue."""
+    filed_again: tuple[style_ledger.HeldFinding, ...]
+    # The built findings that a person found applied in this run.
+    applied: tuple[style_ledger.HeldFinding, ...]
+    # The built renames that the applied check cannot judge and no person read. A person reads each one.
+    unchecked_renames: tuple[style_ledger.HeldFinding, ...]
+    # The built findings that are not renames, which the applied check never judges.
+    unjudged_restructures: tuple[style_ledger.HeldFinding, ...]
+
+
+@dataclass(frozen=True)
+class ReopenSweep:
+    """What reopen --all leaves to a person: the issues it skipped and the count of built findings it cannot check."""
+    skipped: tuple[Path, ...]
+    unchecked_renames: int
+
+
+def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, reading: ReopenReading = CHECK_ONLY,
+           dry_run: bool = False) -> tuple[style_ledger.HeldFinding, ...]:
     """Set each built rename of the issue that is not in the synced code back to filed, in an approved decision.
 
-    Every refusal comes before the first write.
+    Every refusal comes before the first write. Returns the built renames that the applied check cannot judge.
     """
-    if not file_unapplied_again(ledger, issue, parent, dry_run=dry_run):
-        print("nothing to reopen: every built finding is applied")
-    elif not dry_run:
+    result = file_unapplied_again(ledger, issue, parent, reading, dry_run=dry_run)
+    if not result.filed_again and not result.applied and not result.unchecked_renames:
+        # The check never judges a restructure, so it cannot say that one is applied.
+        print(f"nothing to reopen: every checked finding is applied; restructure not checked {len(result.unjudged_restructures)}"
+              if result.unjudged_restructures else "nothing to reopen: every built finding is applied")
+    elif result.filed_again and not dry_run:
         renumber()
+    return result.unchecked_renames
 
 
 def old_issue_parent(issue: Path, given: str) -> str:
@@ -839,16 +892,18 @@ def old_issue_parent(issue: Path, given: str) -> str:
     return given
 
 
-def reopen_all(ledger: style_ledger.Ledger, given_parent: str, *, dry_run: bool = False) -> tuple[Path, ...]:
+def reopen_all(ledger: style_ledger.Ledger, given_parent: str, *, dry_run: bool = False) -> ReopenSweep:
     """Reopen each approved decision and old issue that holds a built finding, then print the totals.
 
     An old issue takes the parent its Parent line names, else given_parent. Each issue that the sweep
-    leaves out or reopen refuses prints a skip line and the others go on; returns those issues.
+    leaves out or reopen refuses prints a skip line and the others go on.
     """
     built = {finding.state.proposal for finding in ledger.held_findings(style_ledger.HeldFindingsInState("built"))
              if isinstance(finding.state, style_ledger.Built)}
     reopened = 0
     filed_again = 0
+    unchecked_renames = 0
+    unjudged_restructures = 0
     skipped: list[Path] = []
     for issue in sorted(built):
         try:
@@ -861,23 +916,56 @@ def reopen_all(ledger: style_ledger.Ledger, given_parent: str, *, dry_run: bool 
                                                and source.value("status") == "closed" else "not approved")
             # A decision moves no finding, so it needs no parent.
             parent = "" if is_decision(source) else old_issue_parent(issue, given_parent)
-            unbuilt = file_unapplied_again(ledger, issue, parent, dry_run=dry_run)
+            result = file_unapplied_again(ledger, issue, parent, CHECK_ONLY, dry_run=dry_run)
         except style_ledger.LedgerError as error:
             skipped.append(issue)
             print(skip_line(issue, error))
             continue
-        reopened += bool(unbuilt)
-        filed_again += len(unbuilt)
+        reopened += bool(result.filed_again)
+        filed_again += len(result.filed_again)
+        unchecked_renames += len(result.unchecked_renames)
+        unjudged_restructures += len(result.unjudged_restructures)
     if reopened and not dry_run:
         renumber()
-    print(f"totals: reopen {reopened}, filed again {filed_again}, skipped {len(skipped)}")
-    return tuple(skipped)
+    print(f"totals: reopen {reopened}, filed again {filed_again}, cannot check {unchecked_renames}, "
+          + f"restructure not checked {unjudged_restructures}, skipped {len(skipped)}")
+    return ReopenSweep(tuple(skipped), unchecked_renames)
 
 
-def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, *,
-                         dry_run: bool) -> tuple[style_ledger.HeldFinding, ...]:
-    """File each built rename of the issue that is not in the synced code again, print a line for each and return them.
+def named_built_finding(issue: Path, findings: tuple[style_ledger.HeldFinding, ...], option: str,
+                        name: str) -> style_ledger.HeldFinding:
+    """The one built finding of the issue that name names; refuses a name that is not one."""
+    matches = [finding for finding in findings if finding.finding_id.startswith(name)]
+    if not matches:
+        raise style_ledger.LedgerError(f"{issue}: no finding {name} in this issue")
+    if len(matches) > 1:
+        raise style_ledger.LedgerError(f"{issue}: {option} {name} matches {len(matches)} findings")
+    finding, = matches
+    if not isinstance(finding.state, style_ledger.Built):
+        raise style_ledger.LedgerError(
+            f"{issue}: finding {finding.finding_id} is {style_ledger.held_state_name(finding.state)}, not built")
+    return finding
 
+
+def person_verdicts(issue: Path, findings: tuple[style_ledger.HeldFinding, ...], reading: ReopenReading) -> PersonVerdicts:
+    """The built findings of the issue that the person read, by verdict; refuses a name that is not one, or both."""
+    if isinstance(reading, CheckOnly):
+        return PersonVerdicts({}, {})
+    reader = style_ledger.ReadByPerson(reading.by)
+    not_applied = {named_built_finding(issue, findings, "--finding", name).finding_id: reader for name in reading.not_applied}
+    applied = {named_built_finding(issue, findings, "--applied", name).finding_id: reader for name in reading.applied}
+    both = sorted(not_applied.keys() & applied.keys())
+    if both:
+        raise style_ledger.LedgerError(f"{issue}: finding {both[0]} is both --finding and --applied")
+    return PersonVerdicts(not_applied, applied)
+
+
+def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, reading: ReopenReading, *,
+                         dry_run: bool) -> Reopening:
+    """File each built rename of the issue that is not in the synced code again, and each one a person found not applied.
+
+    Record each built finding that a person found applied. Print a line for each finding filed again, for each
+    finding a person found applied and for each built rename that the applied check cannot judge.
     Every refusal comes before the first write.
     """
     building = [ticket["id"] for ticket in ledger.proposal_tickets()
@@ -894,21 +982,64 @@ def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, 
     if not isinstance(decision_answer(source), ApprovedDecision):
         raise style_ledger.LedgerError(f"{issue}: not approved")
     decision = is_decision(source)
-    # A run that stopped before the move leaves an old issue's findings filed to it.
-    unbuilt = tuple(finding for finding in issue_findings(ledger, issue)
-                    if (isinstance(finding.state, style_ledger.Built)
-                        or not decision and isinstance(finding.state, style_ledger.Filed))
-                    and isinstance(ledger.applied_check(finding, commit), RenameNotApplied))
-    if not unbuilt:
-        return ()
-    built = frozenset(finding.finding_id for finding in unbuilt if isinstance(finding.state, style_ledger.Built))
+    findings = issue_findings(ledger, issue)
+    verdicts = person_verdicts(issue, findings, reading)
+    unbuilt: list[style_ledger.HeldFinding] = []
+    applied: list[style_ledger.HeldFinding] = []
+    unchecked_renames: list[style_ledger.HeldFinding] = []
+    unjudged_restructures: list[style_ledger.HeldFinding] = []
+    for finding in findings:
+        # A person's verdict comes before the check, so the check does not run for it.
+        if finding.finding_id in verdicts.not_applied:
+            unbuilt.append(finding)
+            continue
+        if finding.finding_id in verdicts.applied:
+            # The check is certain when the old name is still declared, so it refuses a verdict of applied.
+            if isinstance(ledger.applied_check(finding, commit), RenameNotApplied):
+                raise style_ledger.LedgerError(
+                    f"{issue}: finding {finding.finding_id}: the check finds the rename not applied; use --finding")
+            applied.append(finding)
+            continue
+        # A run that stopped before the move leaves an old issue's findings filed to it.
+        if not (isinstance(finding.state, style_ledger.Built)
+                or not decision and isinstance(finding.state, style_ledger.Filed)):
+            continue
+        # A person who read the code of a built finding settled it, so the check does not judge it again.
+        if isinstance(finding.state, style_ledger.Built) and isinstance(finding.reading, style_ledger.ReadByPerson):
+            continue
+        check = ledger.applied_check(finding, commit)
+        if isinstance(check, RenameNotApplied):
+            unbuilt.append(finding)
+        elif isinstance(check, NoAppliedCheck) and isinstance(finding.state, style_ledger.Built):
+            (unchecked_renames if finding.kind == "rename" else unjudged_restructures).append(finding)
+    if unbuilt:
+        file_again(ledger, source, parent, tuple(unbuilt), verdicts.not_applied, dry_run=dry_run)
+    if applied and not dry_run:
+        ledger.record_person_applied(verdicts.applied)
+    for finding in applied:
+        print(f"applied {finding.finding_id} in {issue}: {finding.before} -> {finding.after} in {finding.path} "
+              + f"by {verdicts.applied[finding.finding_id].by}: a person read the code")
+    for finding in unchecked_renames:
+        print(f"cannot check {finding.finding_id} in {finding.path}: {finding.before} -> {finding.after}; "
+              + f"pass --finding {finding.finding_id} or --applied {finding.finding_id}")
+    return Reopening(tuple(unbuilt), tuple(applied), tuple(unchecked_renames), tuple(unjudged_restructures))
+
+
+def file_again(ledger: style_ledger.Ledger, source: Issue, parent: str, unbuilt: tuple[style_ledger.HeldFinding, ...],
+               readings: Mapping[str, style_ledger.ReadByPerson], *, dry_run: bool) -> None:
+    """File the findings again in an approved decision and print a line for each; refusals come before the first write."""
+    issue = source.path
+    decision = is_decision(source)
+    built: dict[str, style_ledger.PersonReading] = {
+        finding.finding_id: readings.get(finding.finding_id, style_ledger.NotReadByPerson())
+        for finding in unbuilt if isinstance(finding.state, style_ledger.Built)}
     if decision:
         decisions = {finding.finding_id: issue for finding in unbuilt}
         if not dry_run:
             # Open the decision first: a stop before the findings are filed again leaves it built, so complete closes it.
             if source.value("status") != "open":
                 proposal_command("reopen", str(issue))
-            ledger.return_to_filed(sorted(built))
+            ledger.return_to_filed(built)
     else:
         listed = set(source.fields.get("style_findings", []))
         missing = sorted(finding.finding_id for finding in unbuilt if finding.finding_id not in listed)
@@ -931,9 +1062,10 @@ def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, 
         with redirect_stdout(sys.stderr):
             run_moves(ledger, issue.parent, parent, plan, lambda _: None, dry_run=dry_run)
     for finding in unbuilt:
+        cause = (f"in {finding.path} by {readings[finding.finding_id].by}: a person read the code"
+                 if finding.finding_id in readings else f"not applied in {finding.path}")
         print(f"filed again {finding.finding_id} in {decisions[finding.finding_id]}: "
-              + f"{finding.before} -> {finding.after} not applied in {finding.path}")
-    return unbuilt
+              + f"{finding.before} -> {finding.after} {cause}")
 
 
 PARENT_LINE = re.compile(r"^Parent: (.+)$", re.MULTILINE)
@@ -1058,6 +1190,10 @@ def main(argv: list[str]) -> int:
     _ = targets.add_argument("--all", action="store_true")
     _ = reopening.add_argument("--parent", default="")
     _ = reopening.add_argument("--dry-run", action="store_true")
+    # A person who read the code files these built findings again, or keeps them built, without the applied check.
+    _ = reopening.add_argument("--finding", action="append", default=[])
+    _ = reopening.add_argument("--applied", action="append", default=[])
+    _ = reopening.add_argument("--by", default="")
     withdrawing = sub.add_parser("withdraw")
     _ = withdrawing.add_argument("--proposals", type=Path, required=True)
     _ = withdrawing.add_argument("--dry-run", action="store_true")
@@ -1075,6 +1211,13 @@ def main(argv: list[str]) -> int:
     args = cast(ProposalArguments, parser.parse_args(argv))
     if args.command == "reopen" and not args.all and not args.parent:
         parser.error("reopen --issue requires --parent")
+    read = args.command == "reopen" and bool(args.finding or args.applied)
+    if read and args.all:
+        parser.error("reopen --finding and --applied require --issue, not --all")
+    if args.command == "reopen" and read != bool(args.by.strip()):
+        parser.error("reopen --finding and --applied require --by, and --by requires one of them")
+    if read and any(not name.strip() for name in (*args.finding, *args.applied)):
+        parser.error("reopen --finding and --applied require a finding id")
     try:
         source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen", "withdraw") and args.dry_run
                   else style_ledger.open_ledger(args.repo))
@@ -1105,12 +1248,20 @@ def main(argv: list[str]) -> int:
                     print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
                     return 1
             elif args.command == "reopen" and args.all:
-                skipped = reopen_all(ledger, args.parent, dry_run=args.dry_run)
-                if skipped:
-                    print(f"style_proposals: skipped {len(skipped)} issues", file=sys.stderr)
+                sweep = reopen_all(ledger, args.parent, dry_run=args.dry_run)
+                if sweep.skipped:
+                    print(f"style_proposals: skipped {len(sweep.skipped)} issues", file=sys.stderr)
+                if sweep.unchecked_renames:
+                    print(f"style_proposals: cannot check {sweep.unchecked_renames} built findings", file=sys.stderr)
+                if sweep.skipped or sweep.unchecked_renames:
                     return 1
             elif args.command == "reopen":
-                reopen(ledger, args.issue.expanduser().resolve(), args.parent, dry_run=args.dry_run)
+                reading = PersonRead(args.by.strip(), tuple(args.finding), tuple(args.applied)) if read else CHECK_ONLY
+                unchecked_renames = reopen(ledger, args.issue.expanduser().resolve(), args.parent, reading=reading,
+                                           dry_run=args.dry_run)
+                if unchecked_renames:
+                    print(f"style_proposals: cannot check {len(unchecked_renames)} built findings", file=sys.stderr)
+                    return 1
             else:
                 complete(ledger)
         return 0
@@ -1132,6 +1283,9 @@ class ProposalArguments(argparse.Namespace):
     idea: str = ""
     dry_run: bool = False
     all: bool = False
+    finding: list[str] = []
+    applied: list[str] = []
+    by: str = ""
 
 
 if __name__ == "__main__":

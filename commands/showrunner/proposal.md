@@ -84,7 +84,8 @@ again with its approval for a later finding, as a decision closed as built does.
 A finding is built only when its change is in the code. Repair a decision
 or an old issue that closed too early with `style_proposals.py reopen --repo
 <style checkout> --issue <issue> --parent <slug>`; add `--dry-run` to see the
-lines first.
+lines first. It exits 1 when a built rename has no check; read the code and
+pass `--finding <id>` (not applied) or `--applied <id>`, with `--by <who>`.
 Filing withdraws a filed finding that an `exception` under its rule's newer
 text supersedes, and closes a decision left with no filed finding. Run that step
 alone with `style_proposals.py withdraw --repo <style checkout> --proposals
