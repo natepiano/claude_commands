@@ -499,13 +499,19 @@ that is not approved, an issue that an open ticket builds, an issue with a
 merged ticket whose checkpoint the synced tip does not hold yet (sync first), and
 an old issue that migrate would refuse or whose decision is declined or has no
 answer. A refusal writes nothing.
-`style_proposals.py reopen --repo <style checkout> --all [--dry-run]` runs reopen
-on every approved decision that holds a built finding. A refused decision prints
-`skipped <decision>: <reason>` and the others go on; the run ends with
-`totals: reopen <decisions>, filed again <findings>, skipped <decisions>` and exits 1
+`style_proposals.py reopen --repo <style checkout> --all [--parent <slug>] [--dry-run]`
+runs reopen on every approved decision and old issue that holds a built finding.
+An old issue takes the parent that its own `Parent:` line names. Only an old
+issue with no `Parent:` line takes `--parent`, and with no `--parent` it prints
+`skipped <issue>: no Parent line; pass --parent`. A decision that a finding moves
+into keeps its own parent; only a new decision takes the old issue's parent. Each
+issue with a built finding that the run leaves out or reopen refuses prints
+`skipped <issue>: <reason>`, and the others go on. The reasons include
+`missing file`, `not approved` and `closed without answer`. The run ends with
+`totals: reopen <issues>, filed again <findings>, skipped <issues>` and exits 1
 when it skipped one.
 `style_ledger.py held add` on a built finding whose rename is not at the synced tip
-prints `built, but not in the code at <tip>: run style_proposals.py reopen --all (decision <decision>)`
+prints `built, but not in the code at <tip>: run style_proposals.py reopen --all (issue <issue>)`
 to stderr and changes nothing.
 
 After each merge and at startup, run `style_proposals.py complete --repo

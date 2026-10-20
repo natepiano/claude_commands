@@ -372,7 +372,10 @@ def join_action(issue: Path) -> JoinAction:
     closed = fields.get("status") == ["closed"]
     if closed and not fields.get("reason", [""])[0].startswith(FINISHED_REASONS) and not fields.get("as_built"):
         raise style_ledger.LedgerError("closed decision is not built")
-    require_generated_body(issue)
+    try:
+        require_generated_body(issue)
+    except Refusal as error:
+        raise style_ledger.LedgerError(str(error)) from error
     return ReopenBuiltDecision() if closed else JoinOpenDecision()
 
 
@@ -766,9 +769,14 @@ def run_moves(ledger: style_ledger.Ledger, proposals: Path, parent: str, plan: M
 
     A built decision opens before any finding moves into it, so a stop never leaves a pending finding in a closed decision.
     """
+    writer = decision_writer(ledger, proposals, parent)
+    # A decision that this run creates names the run's parent. A refresh keeps the parent that any other decision
+    # names, read here before the first write.
+    created = {move.issue for move in plan.moves if isinstance(move.join, NewDecision)}
+    refreshers = {issue: writer if issue in created else replace(writer, parent=decision_parent(issue))
+                  for issue in sorted(set(plan.decisions.values()))}
     for line in plan.issue_lines:
         say(line)
-    writer = decision_writer(ledger, proposals, parent)
     for move in plan.moves:
         if isinstance(move.join, NewDecision):
             say(f"create {move.issue}")
@@ -791,8 +799,8 @@ def run_moves(ledger: style_ledger.Ledger, proposals: Path, parent: str, plan: M
         for move in plan.moves:
             if isinstance(move.join, WaiveWithAnswer):
                 apply_answer(ledger, move.issue, move.join, move.pending)
-        for issue in sorted(set(plan.decisions.values())):
-            writer.refresh(Issue(issue, frontmatter(issue)))
+        for issue, refresher in refreshers.items():
+            refresher.refresh(Issue(issue, frontmatter(issue)))
     for close in plan.closes:
         say(f"close {close.issue}: {close.reason}")
         if not dry_run:
@@ -821,23 +829,39 @@ def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, dry_run: bo
         renumber()
 
 
-def reopen_all(ledger: style_ledger.Ledger, *, dry_run: bool = False) -> tuple[Path, ...]:
-    """Reopen each approved decision that holds a built finding, then print the totals.
+def old_issue_parent(issue: Path, given: str) -> str:
+    """The parent that the old issue's Parent line names, else the given parent."""
+    match = PARENT_LINE.search(issue.read_text())
+    if match is not None:
+        return match[1]
+    if not given:
+        raise style_ledger.LedgerError("no Parent line; pass --parent")
+    return given
 
-    A decision that reopen refuses prints a skip line and the others go on; returns those decisions.
+
+def reopen_all(ledger: style_ledger.Ledger, given_parent: str, *, dry_run: bool = False) -> tuple[Path, ...]:
+    """Reopen each approved decision and old issue that holds a built finding, then print the totals.
+
+    An old issue takes the parent its Parent line names, else given_parent. Each issue that the sweep
+    leaves out or reopen refuses prints a skip line and the others go on; returns those issues.
     """
     built = {finding.state.proposal for finding in ledger.held_findings(style_ledger.HeldFindingsInState("built"))
              if isinstance(finding.state, style_ledger.Built)}
     reopened = 0
     filed_again = 0
     skipped: list[Path] = []
-    for issue in sorted(path for path in built if path.is_file()):
-        source = Issue(issue, frontmatter(issue))
-        if not is_decision(source) or not isinstance(decision_answer(source), ApprovedDecision):
-            continue
+    for issue in sorted(built):
         try:
+            if not issue.is_file():
+                raise style_ledger.LedgerError("missing file")
+            source = Issue(issue, frontmatter(issue))
+            answer = decision_answer(source)
+            if not isinstance(answer, ApprovedDecision):
+                raise style_ledger.LedgerError("closed without answer" if isinstance(answer, UnansweredDecision)
+                                               and source.value("status") == "closed" else "not approved")
             # A decision moves no finding, so it needs no parent.
-            unbuilt = file_unapplied_again(ledger, issue, "", dry_run=dry_run)
+            parent = "" if is_decision(source) else old_issue_parent(issue, given_parent)
+            unbuilt = file_unapplied_again(ledger, issue, parent, dry_run=dry_run)
         except style_ledger.LedgerError as error:
             skipped.append(issue)
             print(skip_line(issue, error))
@@ -1081,9 +1105,9 @@ def main(argv: list[str]) -> int:
                     print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
                     return 1
             elif args.command == "reopen" and args.all:
-                skipped = reopen_all(ledger, dry_run=args.dry_run)
+                skipped = reopen_all(ledger, args.parent, dry_run=args.dry_run)
                 if skipped:
-                    print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
+                    print(f"style_proposals: skipped {len(skipped)} issues", file=sys.stderr)
                     return 1
             elif args.command == "reopen":
                 reopen(ledger, args.issue.expanduser().resolve(), args.parent, dry_run=args.dry_run)

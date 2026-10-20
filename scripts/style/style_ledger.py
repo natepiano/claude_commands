@@ -2524,7 +2524,7 @@ def main() -> None:
                         else:
                             if isinstance(check, RenameNotApplied):
                                 print(f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all "
-                                      + f"(decision {finding.state.proposal})", file=sys.stderr)
+                                      + f"(issue {finding.state.proposal})", file=sys.stderr)
                 elif args.action == "file":
                     ledger.file_held(args.id, Path(args.proposal))
                 elif args.action == "waive":
