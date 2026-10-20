@@ -30,9 +30,9 @@ from production_units import Refusal
 from issues import Issue
 from proposals_folder import open_proposals
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
-from scripts.delegate import plan_history
+from scripts.direct import plan_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import unit_runs

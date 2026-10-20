@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_reservation  # noqa: E402
 import unit_runs  # noqa: E402
 

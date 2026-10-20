@@ -12,7 +12,7 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.delegate.local_release_wait import IntervalReleasePolling, local_release_waiter
+from scripts.direct.local_release_wait import IntervalReleasePolling, local_release_waiter
 
 
 def wait_until(ready: Callable[[], bool], directory: Path, timeout: float = 300,

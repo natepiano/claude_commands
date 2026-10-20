@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import add_unit  # noqa: E402
 import berth_board  # noqa: E402
 import production_units  # noqa: E402
@@ -67,7 +67,7 @@ else:
 SCRIPTS = Path(__file__).resolve().parent.parent
 SHUTDOWN = SCRIPTS / "shutdown" / "shutdown.py"
 MESH = SCRIPTS / "agents" / "codex_mesh.py"
-POOL = SCRIPTS / "delegate" / "review_pool.py"
+POOL = SCRIPTS / "direct" / "review_pool.py"
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 WAIT_MINUTES = 20.0

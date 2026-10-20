@@ -55,7 +55,7 @@ The problem it solves is the number of manual steps a showrunner has to carry. E
 - `<ShrinkCommit/>` (`commands/unit/checkpoint.md`) stages only the plan doc and an approved next-items file, refuses any other staged path, commits `shrink(<plan-slug>): phase N — <title>`, runs `<PushCheckpoint/>` and owns no reservation.
 - The shrink notice is `From <unit>: phase <N> shrink <hash> — plan doc only.` or `… — plan doc and <next-items path>.`
 - A failed shrink blocks only `<ShrinkCommit/>`; the next `<CheckpointCommit/>` refuses while an earlier `done` phase still has a Work Order.
-- **Closing work in the recorder** (`scripts/delegate/progress_history.py`). `start-activity` succeeds whenever the run is active and a phase has been started in it, still active or already closed by `finish-phase`, so work after step 5 with no next phase started (the last phase's `shrink` activity) keeps its row. On a closed phase `activity_started` and `activity_finished` carry that phase's `phase_instance_id`, and the phase's status, `finished_at` and elapsed time stay as `finish-phase` left them; `finish-activity` records status, result and elapsed seconds as it does inside a phase. `start-activity` exits 1 with `Start a phase before starting an activity` when the run has no phase, and with `Cannot start an activity: the run is finished` after `finish-run`.
+- **Closing work in the recorder** (`scripts/direct/progress_history.py`). `start-activity` succeeds whenever the run is active and a phase has been started in it, still active or already closed by `finish-phase`, so work after step 5 with no next phase started (the last phase's `shrink` activity) keeps its row. On a closed phase `activity_started` and `activity_finished` carry that phase's `phase_instance_id`, and the phase's status, `finished_at` and elapsed time stay as `finish-phase` left them; `finish-activity` records status, result and elapsed seconds as it does inside a phase. `start-activity` exits 1 with `Start a phase before starting an activity` when the run has no phase, and with `Cannot start an activity: the run is finished` after `finish-run`.
 - **An activity left open.** `start-phase` and `finish-run` close an activity still open, inside a phase or on a closed one, as `interrupted`. A repeated `finish-phase` does nothing: `_finish_phase` returns before any cleanup when the phase in state is not active, so an activity opened after the phase closed keeps running.
 
 ### Checkpoint merge: `merge_checkpoint.py`
@@ -269,7 +269,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - Recorder: `_event` stamps the phase in state on every event, active or closed; nothing else carries an activity's phase. When the last phase is closed but an activity is open, `progress` prints the short report from that phase's last recorded values, clocks table included, and shows the activity as the stage line. The round table needs `--tables`. `No active phase to report: …` remains for a missing or closed phase with no open activity.
 
-- The recorder other units run is the main checkout's copy under `~/.claude/scripts/delegate/`; a change in a worktree reaches them, and their `review-trial` line, only when promoted.
+- The recorder other units run is the main checkout's copy under `~/.claude/scripts/direct/`; a change in a worktree reaches them, and their `review-trial` line, only when promoted.
 
 - `showrunners.py` is mode 0644: call it through `scripts/lib/py`.
 

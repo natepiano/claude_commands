@@ -172,7 +172,7 @@ an opening parenthesis, as in `(retired by the user 2026-10-07, worktree removed
 The status script, the dailies, the waits and the stall watch then skip it. The word
 anywhere else in the cell changes nothing. With a **Review pool** line, the
 showrunner first runs
-`~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py retire --production <slug> --unit <unit>`,
+`~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py retire --production <slug> --unit <unit>`,
 which ends the unit's reviewers and prints their names. One still reviewing is
 named on stderr and left in place; run `retire` again once its review ends. A
 unit's plan run ending retires nothing, because the unit's next plan keeps
@@ -257,7 +257,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
    Before sending a checkpoint notice, record its next-phase ETA:
-   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
    `<HH:MM>` means today in the user's zone; an ETA on a later day takes
    `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed.
 

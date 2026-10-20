@@ -12,7 +12,7 @@ from unittest.mock import patch
 from pathlib import Path
 from typing import cast, override
 from collections.abc import Callable
-from scripts.delegate import findings
+from scripts.direct import findings
 
 
 SCRIPT = Path(__file__).with_name("findings.py")

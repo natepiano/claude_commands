@@ -22,7 +22,7 @@ An account-wide request holds the account against new launches and scheduled wor
 | `scripts/shutdown/stop.py` | `fresh_session`, `StopClaim`, `IdleStopReason`, `stop_session`, owner cleanup, `_save_codex_seats` and `_stop_codex_servers`. |
 | `scripts/shutdown/restart.py` | `relaunch_session`, confirmation, Remote Control wait, `up`, `restart`, result transport, `account_move_note` and the resume-workers message (`_send_worker_resume`, `_resume_worker_command`). |
 | `scripts/agents/codex_mesh.py` | Codex seat roster: `stop --pause`, `reopen`, `FOLLOWABLE_STATES` (`docs/as-built/long-lived-workers.md`). |
-| `scripts/delegate/implement.sh`, `review.sh` | The `--to` launchers a resume command runs. |
+| `scripts/direct/implement.sh`, `review.sh` | The `--to` launchers a resume command runs. |
 | `scripts/shutdown/remote_control.py` | Detached, identity-checked Remote Control repair and its launch helper. |
 | `scripts/lib/relaunch.py` | Terminal window supervisor, `RelaunchRequest`, hold and request writers. |
 | `scripts/lib/detached.py` | Mac starts of the conductor and the Remote Control fixer, with readiness. |

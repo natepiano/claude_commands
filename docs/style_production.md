@@ -248,7 +248,7 @@ On a sync message, run `style_ledger.py tip seen --repo <checkout> --tip <tip>`;
 
 1. Merge the new tip into the style merge branch and run its Merge tests.
 2. Run `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py lint --repo <checkout> --checkout <style checkout> --tip <branch-point tip>`.
-   This uses `bash ~/.claude/scripts/delegate/verify.sh lint --workspace --no-cache --check`
+   This uses `bash ~/.claude/scripts/direct/verify.sh lint --workspace --no-cache --check`
    at the exact requested commit in a disposable checkout, with workspace mend,
    rustfmt and clippy (`--all-targets --all-features`, workspace lint config).
    Nothing rewrites the tree: mend runs in report mode and rustfmt with `--check`.

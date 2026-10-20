@@ -64,7 +64,7 @@ A step records its width through its argv: `invoke.sh` puts `--test-threads N` b
 - P pairs each attempt of a call with its own anon peak by end time when the counts match; a retried call missing a peak gives no P for any of its attempts.
 - The header carries the script's own sha256 (first 12 hex) and the window in the user's zone (`user_zone()`).
 
-### CI-scope lint (`scripts/delegate/verify.sh`, `lint` arm)
+### CI-scope lint (`scripts/direct/verify.sh`, `lint` arm)
 
 Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed members, taplo, clippy, rustdoc on changed members.
 

@@ -24,7 +24,7 @@ from typing import TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.delegate import phase_reservation  # noqa: E402
+from scripts.direct import phase_reservation  # noqa: E402
 
 # A path's HEAD, index and worktree entries, each `<mode> <sha1>`, or empty where it has none.
 Entries = tuple[str, str, str]

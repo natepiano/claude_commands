@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, overrid
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
-for _directory in (SCRIPTS / "production", SCRIPTS / "delegate", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
+for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "shutdown", SCRIPTS / "herdr", SCRIPTS / "whoami", SCRIPTS / "message", SCRIPTS / "lib"):
     if str(_directory) not in sys.path:
         sys.path.insert(0, str(_directory))
 

@@ -22,7 +22,7 @@ from unittest import mock
 SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(SCRIPTS / "production"))
-sys.path.insert(0, str(SCRIPTS / "delegate"))
+sys.path.insert(0, str(SCRIPTS / "direct"))
 
 import codex_daemon
 import process_table

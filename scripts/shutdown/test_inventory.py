@@ -78,8 +78,8 @@ class InventoryTests(ShutdownTestCase):
     def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
         run = self.root / "paused run"
         run.mkdir()
-        command = ["bash", "/config/scripts/delegate/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
-        outer = ["bash", "/config/scripts/delegate/implement.sh", "outer arguments"]
+        command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
+        outer = ["bash", "/config/scripts/direct/implement.sh", "outer arguments"]
         self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
         self.herdr_process(811, 812, command, {})
         self.herdr_process(812, 1, outer, {})

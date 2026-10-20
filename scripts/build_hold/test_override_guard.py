@@ -24,7 +24,7 @@ CHECKOUT_SCRIPT = SCRIPT_DIRECTORY / "build_hold.py"
 SHELL_GUARD = SCRIPT_DIRECTORY / "override_guard.sh"
 BASH = "/bin/bash"
 PYTHON_RELATIVE = "build_hold/build_hold.py"
-SHELL_RELATIVE = "delegate/verify.sh"
+SHELL_RELATIVE = "direct/verify.sh"
 EXPECTED_VARIABLES = (
     "BUILD_HOLD_DIR",
     "BUILD_HOLD_RELEASE_DIR",
@@ -437,7 +437,7 @@ class GuardCallSiteTests(unittest.TestCase):
     def test_every_guarded_file_calls_the_guard(self) -> None:
         scripts = SCRIPT_DIRECTORY.parent
         for relative, first_read in (
-            ("delegate/verify.sh", ("HOME=", "$HOME")),
+            ("direct/verify.sh", ("HOME=", "$HOME")),
             ("lint/memory_gate.sh", ("BUILD_TARGETS_SCRIPT",)),
         ):
             with self.subTest(file=relative):

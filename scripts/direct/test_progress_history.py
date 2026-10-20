@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.delegate import phase_table, plan_history, progress_history
-from scripts.delegate.recorder_fixture import invoke_recorder
+from scripts.direct import phase_table, plan_history, progress_history
+from scripts.direct.recorder_fixture import invoke_recorder
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -130,8 +130,8 @@ class ProgressHistoryTests(unittest.TestCase):
         program = r'''import fcntl, hashlib, json, os, signal, sys
 from pathlib import Path
 from unittest.mock import patch
-from scripts.delegate.recorder_fixture import invoke_recorder
-from scripts.delegate import progress_history
+from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct import progress_history
 from scripts.lib import user_zone
 
 root, working = map(Path, sys.argv[1:])
@@ -285,12 +285,12 @@ print('two homes isolated; recorder lock retained; caller restored')
         stderr = io.StringIO()
         if isinstance(refresh_result, BaseException):
             run_patch = patch(
-                "scripts.delegate.progress_history.subprocess.run",
+                "scripts.direct.progress_history.subprocess.run",
                 side_effect=refresh_result,
             )
         else:
             run_patch = patch(
-                "scripts.delegate.progress_history.subprocess.run",
+                "scripts.direct.progress_history.subprocess.run",
                 return_value=refresh_result,
             )
         with (
@@ -5186,7 +5186,7 @@ print('two homes isolated; recorder lock retained; caller restored')
     def test_plan_without_production_marker_starts_no_phase_table_process(self) -> None:
         session_dir = self.start_run("refresh-not-a-production", 60_000)
 
-        with patch("scripts.delegate.progress_history.subprocess.run") as run:
+        with patch("scripts.direct.progress_history.subprocess.run") as run:
             refresh_phase_table(session_dir)
 
         run.assert_not_called()
@@ -5207,7 +5207,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                     "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
                 },
             ),
-            patch("scripts.delegate.progress_history.subprocess.run") as run,
+            patch("scripts.direct.progress_history.subprocess.run") as run,
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):

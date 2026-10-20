@@ -198,7 +198,7 @@ final diff only.
    both otherwise. When the production doc names a review pool:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --pool code \
+   bash ~/.claude/scripts/direct/review.sh --pool code \
      --lease "<slug>/<unit>/<phase>" \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
@@ -209,7 +209,7 @@ final diff only.
    Otherwise, for an open worker:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
+   bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
@@ -218,7 +218,7 @@ final diff only.
    A closure review passes no lens and keeps the unsuffixed artifacts:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --to "<full-worker-name>" \
+   bash ~/.claude/scripts/direct/review.sh --to "<full-worker-name>" \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}"
@@ -228,7 +228,7 @@ final diff only.
    `review2`) and open and retain it; for example:
 
    ```sh
-   bash ~/.claude/scripts/delegate/review.sh --slot review \
+   bash ~/.claude/scripts/direct/review.sh --slot review \
      --phase "<phase id>" "${SESSION_DIR}" "${WORKING_DIR}" \
      "${PHASE_DIR}/review_prompt_${REVIEW_PASS}_<lens>.md" review \
      "<responsibility>" "<activity>" "${REVIEW_PASS}" <lens>
