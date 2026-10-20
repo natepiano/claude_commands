@@ -697,7 +697,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Gotchas:**
 - `held built --commit` takes the code repo's merge, and that merge must be an ancestor of the ledger's synced tip and not older than each finding's judged commit; a merge on the style branch that the last sync did not take is refused until the next sync.
 
-### Phase 25 — refill never reissues a ticket that cannot change a cell  · status: todo
+### Phase 25 — refill never reissues a ticket that cannot change a cell  · status: done
 
 **Depends on:** Phase 24
 
@@ -705,13 +705,19 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Goal:** refill stops issuing a ticket at a base where the cell was already judged; the director is told to merge the style branch first; the held-cell skip ignores findings in a final state.
 
-**Spec (ruled by the showrunner, (w)):** production case: cargo-liner values tickets 124/125, cell `crates/cargo-port/src/lint/trigger.rs` × `derive-test-values-from-production-constants.md#uncovered` (crate scope), judged at the values branch tip 2181135d after style/main moved on (same crate) — stale is correct; the ticket base (`ticket_base`, style_ledger.py:1280, the unit branch tip) cannot change it.
+**Spec:** ruled by the showrunner, (w). production case: cargo-liner values tickets 124/125, cell `crates/cargo-port/src/lint/trigger.rs` × `derive-test-values-from-production-constants.md#uncovered` (crate scope), judged at the values branch tip 2181135d after style/main moved on (same crate) — stale is correct; the ticket base (`ticket_base`, style_ledger.py:1280, the unit branch tip) cannot change it.
 (a) `_refill_cells` / `candidate_tickets` (style_plan.py ~1013, ~1559) take the unit branch; leave out a stale cell whose newest judgment (current blob, newest declared scope) matches the inputs at the unit branch tip, through a ledger helper that reuses `_judgment_inputs_match`.
 (b) When that leaves no candidate and a cell was left out for this reason, `next_phase` returns a new outcome "merge the style branch first" with its own exit code and line (not waiting-for-sync); `commands/unit/direct.md` <StandingPlanRefill/> table and `docs/style_production.md` get the row: merge the style branch, then refill.
 (c) The held-cell skip (style_plan.py ~1024) ignores waived, built and withdrawn findings; it needs at least one remaining finding and every remaining finding filed on an open proposal.
 Do not take the fingerprint at the ticket base (it would mark current a cell whose inputs changed).
 
-**Files:** `scripts/style/style_plan.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_plan*.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`, `commands/unit/direct.md`
+**Files:**
+- `scripts/style/style_plan.py`
+- `scripts/style/style_ledger.py`
+- `scripts/style/test_style_plan.py`
+- `scripts/style/test_style_ledger.py`
+- `docs/style_production.md`
+- `commands/unit/direct.md`
 
 **Workers:** 1 writer.
 
@@ -727,10 +733,13 @@ Do not take the fingerprint at the ticket base (it would mark current a cell who
 
 **Goal:** a person can undo a waive: the finding goes back to unfiled and the row says who did it.
 
-**Spec (ruled by the showrunner, (x)):** production case: cargo-liner findings e905399a, 3e86fba4, a5e2b756, 07a1d8b6 and 821e2bc9 were waived and must be held again; no command moves a waived finding back.
+**Spec:** ruled by the showrunner, (x). production case: cargo-liner findings e905399a, 3e86fba4, a5e2b756, 07a1d8b6 and 821e2bc9 were waived and must be held again; no command moves a waived finding back.
 `style_ledger.py held unwaive --id <id>... --by <who>` moves each named waived finding to unfiled. Unique prefixes as other held commands take. Refused before the first write: an id that is not a waived finding, a blank `--by`, a finding an open ticket holds. The row records who unwaived it (the existing `person_read_by` shape or a new column through the next migration, whichever fits the schema code). The ticket gate does not write the ledger. Update the held-commands section of `docs/style_production.md`.
 
-**Files:** `scripts/style/style_ledger.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+**Files:**
+- `scripts/style/style_ledger.py`
+- `scripts/style/test_style_ledger.py`
+- `docs/style_production.md`
 
 **Workers:** 1 writer.
 

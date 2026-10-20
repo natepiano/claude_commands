@@ -185,6 +185,42 @@ class WaitingForBranchPointSync:
 
 
 @dataclass(frozen=True)
+class MergeStyleBranchFirst:
+    """No ticket is left, and a judgment in the unit tip saw the inputs of each of these cells that the tip has.
+
+    The pushed style tip holds the unit tip and changes those inputs, so a fast-forward to it lets refill issue them.
+    """
+
+    cell_count: int
+    unit_tip: str
+    style_branch: str
+
+
+@dataclass(frozen=True)
+class UnitBranchTip:
+    """The commit where the unit's next ticket starts."""
+
+    commit: str
+
+
+@dataclass(frozen=True)
+class NoUnitBranch:
+    """The unit has no branch yet, so no cell was judged at its tip."""
+
+
+UnitBase = UnitBranchTip | NoUnitBranch
+
+
+def unit_base(repo: Path, branch: str) -> UnitBase:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         f"refs/heads/{branch.removeprefix('refs/heads/')}^{{commit}}"],
+        capture_output=True, text=True, check=False,
+    )
+    return UnitBranchTip(result.stdout.strip()) if result.returncode == 0 else NoUnitBranch()
+
+
+@dataclass(frozen=True)
 class TicketSelection:
     kind: style_ledger.TicketKind
     family: rules.Family
@@ -205,7 +241,8 @@ class BusyFiles:
         return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
 
 
-NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure | WaitingForBranchPointSync | berth_board.BoardUnavailable
+NextPhase = (PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure
+             | WaitingForBranchPointSync | MergeStyleBranchFirst | berth_board.BoardUnavailable)
 
 
 def style_document(repo: Path) -> Path:
@@ -1015,12 +1052,30 @@ def _is_when_to_split_rule(rule_id: str) -> bool:
     return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "when-to-split-a-module.md"
 
 
-def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
-    """Leave unchanged held sites with open proposals out of coverage work."""
+@dataclass(frozen=True)
+class RefillCells:
+    """The cells one refill weighs.
+
+    Ranking and structure blocking read every cell in cells. No ticket takes a cell in judged_at_base: it is one of
+    the unit's own stale cells in its pilot scope, and a ticket at the unit tip cannot change it.
+    """
+
+    cells: tuple[style_ledger.Cell, ...]
+    judged_at_base: frozenset[style_ledger.Cell]
+
+
+def _unit_tickets(family: rules.Family, cell: style_ledger.Cell) -> bool:
+    return cell.family == family or (family == "modules" and cell.tier == "D")
+
+
+def _refill_cells(ledger: style_ledger.Ledger, base: UnitBase, family: rules.Family, scope: PilotScope) -> RefillCells:
+    """Leave out unchanged held sites with open proposals, and find the unit's cells a ticket at its tip cannot change."""
     held = ledger.latest_held_judgments()
     findings: dict[tuple[str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
     for finding in ledger.held_findings(style_ledger.AllHeldFindings()):
-        findings[(finding.rule, finding.path)].append(finding)
+        # A waived, built or withdrawn finding needs no more work at its site.
+        if not isinstance(finding.state, style_ledger.Waived | style_ledger.Built | style_ledger.Withdrawn):
+            findings[(finding.rule, finding.path)].append(finding)
     tip = synced_tip(ledger)
     result: list[style_ledger.Cell] = []
     for cell in ledger.cells():
@@ -1038,18 +1093,27 @@ def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
                     if previous == current:
                         continue
         result.append(cell)
-    return tuple(result)
+    own = (cell for cell in result if _unit_tickets(family, cell) and crate_in_scope(scope, cell.crate))
+    judged = ledger.judged_at_base(own, base.commit) if isinstance(base, UnitBranchTip) else ()
+    return RefillCells(tuple(result), frozenset(judged))
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES,
-                      *, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
+                      *, base: UnitBase, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
+    return _tickets_from(repo, ledger, busy, family, scope, family_scopes, _refill_cells(ledger, base, family, scope),
+                         first_files)
+
+
+def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, family: rules.Family, scope: PilotScope,
+                  family_scopes: Mapping[rules.Family, PilotScope], refill: RefillCells,
+                  first_files: frozenset[str]) -> tuple[TicketSelection, ...]:
     pending: list[style_ledger.Cell] = []
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
     structure_crates: set[str] = set()
-    for cell in _refill_cells(ledger):
+    for cell in refill.cells:
         stale[cell.crate] += cell.state == "stale"
         if cell.state in ("open", "stale"):
             pending.append(cell)
@@ -1072,8 +1136,9 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
         if structure:
             if family == "modules":
                 manifest = str(PurePosixPath(crate) / "Cargo.toml")
-                manifest_cells = tuple(cell for cell in structure if cell.path == crate)
-                file_cells = tuple(cell for cell in structure if cell.path != crate and not busy.contains(cell.path))
+                ticketed = tuple(cell for cell in structure if cell not in refill.judged_at_base)
+                manifest_cells = tuple(cell for cell in ticketed if cell.path == crate)
+                file_cells = tuple(cell for cell in ticketed if cell.path != crate and not busy.contains(cell.path))
                 available = {cell.path for cell in file_cells}
                 if manifest_cells and not busy.contains(manifest):
                     available.add(manifest)
@@ -1090,6 +1155,7 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                                                   cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
                 continue
         own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family
+                    and cell not in refill.judged_at_base
                     and not busy.contains(cell.path) and not blocked_by_structure(cell, structure))
         for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
             files = {cell.path for cell in own if cell.rule == rule_id}
@@ -1460,7 +1526,7 @@ def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
     definitions: Mapping[str, rules.Rule],
-) -> PhaseWritten | NoAvailableWork | WaitingForStructure:
+) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst:
     queued: list[style_ledger.TicketRecord] = []
     for ticket in ledger.queued_tickets(unit):
         if ticket["kind"] == "proposal" and not ticket["finding_ids"]:
@@ -1555,11 +1621,16 @@ def _select_phase(
         style_proposals.renumber()
     if isinstance(decision_phase, PhaseWritten):
         return decision_phase
-    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo),
-                                   first_files=first_files)
+    base = unit_base(repo, branch)
+    refill = _refill_cells(ledger, base, family, scope)
+    candidates = _tickets_from(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo), refill, first_files)
     if not candidates:
+        if isinstance(base, UnitBranchTip) and refill.judged_at_base:
+            merge = ledger.style_merge_changes(refill.judged_at_base, base.commit)
+            if isinstance(merge, style_ledger.StyleMergeChanges):
+                return MergeStyleBranchFirst(len(merge.cells), base.commit, merge.style_branch)
         if family != "modules":
-            pending = tuple(cell for cell in _refill_cells(ledger)
+            pending = tuple(cell for cell in refill.cells
                             if cell.state in ("open", "stale") and crate_in_scope(scope, cell.crate))
             structure = tuple(cell for cell in pending if cell.tier == "D")
             own = tuple(cell for cell in pending if cell.family == family)
@@ -1633,7 +1704,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         busy = busy_files(repo, doc, ledger, unit, board)
         selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
                                  definitions)
-        if isinstance(selected, PhaseWritten):
+        # A unit told to merge the style branch acts at once, so it records no sync wait.
+        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
             ledger.clear_sync_wait(unit)
             return selected
         ledger.wait_for_sync(unit)
@@ -1643,7 +1715,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         busy = busy_files(repo, doc, ledger, unit, board)
         selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
                                  definitions)
-        if isinstance(selected, PhaseWritten):
+        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
             ledger.clear_sync_wait(unit)
             return selected
         if isinstance(selected, WaitingForStructure):
@@ -1678,13 +1750,15 @@ def main(argv: list[str]) -> int:
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
                 settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
+                branches = {row.unit: row.branch for row in unit_worktrees(doc)}
                 for family in FAMILIES:
                     unit = family + "-unit"
                     if args.unit and args.unit != unit:
                         continue
                     first_files = settings[family].first_files if family in settings else _NO_FIRST_FILES
-                    for ticket in candidate_tickets(args.repo, ledger, busy, family,
-                                                    scopes.get(family, _ALL_CRATES), scopes, first_files=first_files):
+                    base = unit_base(args.repo, branches[unit]) if unit in branches else NoUnitBranch()
+                    for ticket in candidate_tickets(args.repo, ledger, busy, family, scopes.get(family, _ALL_CRATES),
+                                                    scopes, base=base, first_files=first_files):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)
@@ -1714,6 +1788,10 @@ def main(argv: list[str]) -> int:
             case WaitingForBranchPointSync(branch_point, branch_tip, tip):
                 print(f"waiting for sync: {branch_point} {branch_tip[:7]} is not in the synced tip {tip[:7]}")
                 return 3
+            case MergeStyleBranchFirst(cell_count, unit_tip, style_branch):
+                print(f"merge the style branch first: {cell_count} cell{'' if cell_count == 1 else 's'} judged at {unit_tip[:7]} "
+                      + f"wait for {style_branch.removeprefix('refs/heads/')}")
+                return 6
         return 0
     except (OSError, ValueError, Refusal, sqlite3.Error) as error:
         print(f"style_plan: {error}", file=sys.stderr)

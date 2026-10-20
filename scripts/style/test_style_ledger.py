@@ -2242,7 +2242,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(checkpoint, "main")
         self.assertEqual(self.states(rule)[path], "current")
         tickets = style_plan.candidate_tickets(
-            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "names")
+            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "names",
+            base=style_plan.NoUnitBranch())
         self.assertFalse(any(path in ticket.files for ticket in tickets))
         with closing(sqlite3.connect(ledger.database)) as connection:
             rows = cast(list[tuple[str, str]], connection.execute(
@@ -2402,7 +2403,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(checkpoint, "main")
         self.assertEqual(self.states(rule)[path], "stale")
         tickets = style_plan.candidate_tickets(
-            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "names")
+            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "names",
+            base=style_plan.NoUnitBranch())
         self.assertTrue(any(path in ticket.files for ticket in tickets))
 
     def test_checkpoint_does_not_restamp_a_path_changed_on_a_merged_outside_branch(self) -> None:
@@ -2446,7 +2448,8 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.states(names)[path], "current")
         self.assertEqual(self.states(forbidden)[path], "stale")
         tickets = style_plan.candidate_tickets(
-            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "values")
+            self.repo, ledger, style_plan.BusyFiles(berth_board.Board(()), frozenset()), "values",
+            base=style_plan.NoUnitBranch())
         self.assertTrue(any(path in ticket.files and forbidden in ticket.rules for ticket in tickets))
 
     def test_structure_checkpoint_requires_every_rule_and_accepts_any_verdict_at_head(self) -> None:

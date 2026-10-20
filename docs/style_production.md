@@ -102,10 +102,30 @@ in-scope crates is blocked by a structure cell, until the
 modules unit's structure tickets merge
 (an unclassified catalog also says `pull nate_style`); 4 means
 `board unavailable: <reason>`; 5 means
-`waiting for merge: <ticket> checkpointed at <commit7>`. Unknown reservation
+`waiting for merge: <ticket> checkpointed at <commit7>`; 6 means
+`merge the style branch first: <n> cells judged at <unit tip7> wait for <style branch>`.
+On 6, run the standing style unit merge in the unit worktree
+(`git -C <unit-worktree> fetch origin <style merge branch> && git -C <unit-worktree> merge --ff-only origin/<style merge branch>`),
+then refill. If the fast-forward is refused or leaves HEAD unchanged, do not
+refill: report it to the showrunner.
+Unknown reservation
 availability stops selection without recording work. `queue` is a read-only
 preview and also returns 4 when the board is unavailable.
 A file cell waits only for open or stale structure cells at its own file; a crate cell waits for every one in its crate.
+
+Refill leaves out two kinds of stale cell. The first is a held cell whose site
+did not change since its held judgment, when at least one of its findings is
+not waived, built or withdrawn, and each such finding is filed on an open
+proposal. The second is a cell of the unit's family (or a structure cell, for
+the modules unit) in its pilot scope whose newest judgment (current rule text,
+newest declared scope) is at a commit in the unit tip and in the style branch,
+and saw the inputs that the unit tip has: a ticket at that tip records the same
+verdict again. Ranking and structure blocking still count such a cell. When no
+work is left, refill returns 6 and records no sync wait only when a style
+branch is stored, the unit tip is in the pushed style tip
+(`origin/<style branch>` when origin exists, else the local branch), and that
+tip changes the inputs of at least one such cell. Otherwise it returns 3,
+`waiting for sync`: the next sync or style merge changes the cell.
 
 The ticket stores its rule text. Workers read the pinned files under the unit
 worktree's `docs/style-production/rules/`, including after an interruption;
