@@ -26,7 +26,7 @@ Run these steps in order for each completed loop or verbose phase:
    `phase_table.py parallel` line happen here.
 2. **Code ready notice.** Before sending <ProductionUnit/> item 3's checkpoint
    notice, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.
    `<HH:MM>` means today in the user's zone; an ETA on a later day takes
    `<YYYY-MM-DDTHH:MM>`. State the time the recorder printed. Its hash is
    mergeable now;

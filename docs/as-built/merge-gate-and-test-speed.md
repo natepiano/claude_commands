@@ -29,12 +29,12 @@
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <dir> -p <module>`, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
 - All jobs share one `TMPDIR` under `/dev/shm/merge-gate-*`. Each job's output goes to a log file there, read and deleted when the job ends.
 - Exit 5 with `Ran 0 tests` and `NO TESTS RAN` counts as a pass: Python 3.13's exit for a helper module with no tests.
-- The basedpyright job (`types`) is queued first, on `type_dirs`. It passes on exit 0 or 3 (pyrightconfig names a `.venv` no checkout has) with the line `0 errors, 0 warnings, 0 notes`.
+- The basedpyright job (`types`) is queued first, on `type_dirs` (default `scripts`, the full tree, also for a docs-only checkpoint). It runs with `--pythonpath` set to a type-check-only venv, `typecheck-venv` in the state dir. The venv holds the pinned `TYPECHECK_REQUIREMENTS` (pillow, and fake-bpy-module dated 2026-08-22), so `bpy` and `PIL` resolve. The gate builds it with uv under a lock when it is absent or its pins changed. If the build fails, the types job is red with `type-check venv missing: <cause>; build it with: <command>`, and basedpyright does not run. The job passes on exit 0 or 3 (pyrightconfig still names a `.venv` no checkout has) with the line `0 errors, 0 warnings, 0 notes`. No `.venv` is made in the repo.
 - `MERGE_GATE_PYTHON` and `MERGE_GATE_BASEDPYRIGHT` override the interpreter and the type checker; tests use these.
 - **Ordering cache.** `${MERGE_GATE_STATE_DIR:-~/.local/state/merge-gate}/module_seconds.json` maps `suite/module.py` to the last run's seconds. Modules with no recorded time start first, then the rest longest first. The cache is rewritten atomically after every run, red ones included.
-- **Admission** (`SampledRSSAdmission`). Every 0.25 s or more the runner sums resident plus swapped memory (`stat` RSS and `status` VmSwap) from `/proc` over its own process tree (every job) and over each job's tree separately. `headroom` starts at 96 MiB (2 × `MODULE_MEMORY_MIB` 48) and then holds the largest job tree seen. A running job reserves `max(0, headroom − its measured RSS)`, so a small startup sample never releases its reservation. A new job is admitted when `latest aggregate + sum of reservations + headroom ≤ cap`. With nothing running, one job is always admitted. A sampled peak above the cap makes the run red (`GateRun.memory_within_cap`).
+- **Admission** (`SampledRSSAdmission`). Every 0.25 s or more the runner sums resident plus swapped memory (`stat` RSS and `status` VmSwap) from `/proc` over its own process tree (every job) and over each job's tree separately. `headroom` starts at 96 MiB (2 × `MODULE_MEMORY_MIB` 48) and then holds the largest module tree seen. A running module reserves `max(0, headroom − its measured RSS)`. The types job is one large job, not a module: it reserves its last sampled peak for the same type dirs × 1.2 (`types_peak_mib.json` in the state dir), or 3072 MiB when none is recorded, and its samples never raise `headroom`. The full tree peaked at 2.64 GiB in 77 s and `scripts/production` at 0.79 GiB (2026-10-19). Before this, the type job started at 96 MiB, grew past the cap, and then made `headroom` 2.6 GiB, so the run went one module at a time, so a small startup sample never releases its reservation. A new job is admitted when `latest aggregate + sum of reservations + headroom ≤ cap`. With nothing running, one job is always admitted. A sampled peak above the cap makes the run red (`GateRun.memory_within_cap`).
 - **Cleanup.** When a job's leader exits, the runner SIGKILLs the job's whole process group, which catches leaked children. On any exit it kills and reaps every running group before the tmpfs dir is removed. It never kills a process outside its own groups.
-- **Report.** For each suite, `OK` or `RED` and its wall time; each red module's exit code and full output; then the basedpyright verdict and output, total time, sampled peak GiB against the cap, the largest module's peak and name, and one-minute load at start, maximum and end. `GateRun.passed` is true when all jobs exited 0 and memory stayed within the cap.
+- **Report.** For each suite, `OK` or `RED` and its wall time; each red module's exit code and full output; then the basedpyright verdict and output; then one `Slow module: <suite>/<module> <s> s, median of the last <n> runs <s> s (3x or more)` line for each module that took at least `SLOW_MODULE_FACTOR` (3) times the median of its last `MODULE_HISTORY_RUNS` (5) times and at least `SLOW_MODULE_FLOOR_S` (60 s) more. The times are in `module_history.json` in the state dir. A module with no history uses its `module_seconds.json` time. A regression is named on about three runs in a row, then becomes the normal. The line does not make the run red; total time, sampled peak GiB against the cap, the largest module's peak and name, and one-minute load at start, maximum and end. `GateRun.passed` is true when all jobs exited 0 and memory stayed within the cap.
 
 **`--tests-only`** runs `run_suites` on `--repo` with no git operation and no basedpyright (it passes no type dirs). It exits 0 on green, 1 on red.
 
@@ -59,7 +59,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 **Session host fakes.** Production, message and shutdown tests reach herdr only through `scripts/herdr/fake_herdr.py` (`HERDR_BIN`) and `scripts/production/fake_unit_host.py`, which publishes marked unit panes, their pane reads and a fake `/proc` (see [herdr-adoption.md](herdr-adoption.md), Test doubles). Most production suites use them, `test_waiting.py` and `test_dailies_input.py` among them. The `ci_points` fake `gh` is a shell + jq stub (`GH_STUB` in `test_ci_points.py`).
 
-**`scripts/delegate/recorder_fixture.py`**
+**`scripts/direct/recorder_fixture.py`**
 - `invoke_recorder(arguments, environment, cwd, *, check=False) -> CompletedProcess[str]` runs the real `progress_history.main()` through `invoke_cli`, with the recorder lock and real child integrations.
   - It patches `DEFAULT_CONFIG_PATH`, `DEFAULT_AGENTS_CONFIG_PATH` and `user_zone.CONF` from the fixture HOME.
   - It clears `_config_digest`'s cache before and after the call.
@@ -68,11 +68,11 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 - `communicate_launcher(process, timeout=300) -> tuple[str, str]`: on timeout it SIGKILLs and reaps the launcher's process group, then re-raises.
 - In `test_progress_history.py`, `run_command`, `run_failing_command` and `run_unowned_command` go through `invoke_recorder`.
 
-**`scripts/delegate/local_release_wait.py`**
+**`scripts/direct/local_release_wait.py`**
 - `local_release_waiter(holders, release) -> LocalReleaseEvents | IntervalReleasePolling`. `LocalReleaseEvents` watches the directories and their existing parents through inotify via ctypes, re-arms replaced directories, and treats queue overflow as a change. `IntervalReleasePolling` sleeps the caller's interval; it is used where libc has no inotify (macOS) or the call returns ENOSYS/ENOTSUP.
-- `wait_for_local_release(seconds, call_id)` arms the watch, then reads target and admission state, and returns on release, admission or deadline. `verify.sh` calls it as a script (`VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path). `build_targets.py` imports it as `scripts.delegate.local_release_wait`, with the repo root on `sys.path`.
+- `wait_for_local_release(seconds, call_id)` arms the watch, then reads target and admission state, and returns on release, admission or deadline. `verify.sh` calls it as a script (`VERIFY_LOCAL_RELEASE_WAIT_SCRIPT` overrides the path). `build_targets.py` imports it as `scripts.direct.local_release_wait`, with the repo root on `sys.path`.
 
-**`scripts/delegate/wait_for_test_state.py`**
+**`scripts/direct/wait_for_test_state.py`**
 - `wait_until(ready, directory, timeout=300, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
 
@@ -84,18 +84,18 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
-| `PLAN_DELEGATE_EARLY_POLL_SECS` | `scripts/delegate/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `PLAN_DELEGATE_WORKER_POLL_SECS` | `scripts/delegate/implement.sh` (worker and turn probes) | `1` (s) | `0.01` |
-| `PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS` | `scripts/delegate/implement.sh` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
-| `PLAN_DELEGATE_TOKEN_CLOCK_FILE` | `scripts/delegate/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
+| `PLAN_DELEGATE_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
+| `PLAN_DELEGATE_WORKER_POLL_SECS` | `scripts/direct/implement.sh` (worker and turn probes) | `1` (s) | `0.01` |
+| `PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS` | `scripts/direct/implement.sh` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
+| `PLAN_DELEGATE_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
 | `PLAN_DELEGATE_SYNC_WRITES` | `progress_history.py`, `findings.py`, `review_pool.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
 | `RESIDENT_POLL_SECS`, `REAP_WAIT_SECS`, `REAP_POLL_SECS` | `scripts/agents/codex_mesh.py` | `1.0`, `5.0`, `0.2` | patched as module attributes |
-| `PLAN_DELEGATE_ACTIVE_DIR` | `end_session.sh`, `unit_notifier.sh`, `unit_status.sh`, `hooks/delegate_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory and pins it for `unit_notifier.sh` | `/tmp/claude/delegate/active` | a temp dir |
+| `PLAN_DELEGATE_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/delegate_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
 | `PLAN_DELEGATE_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
-| `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright` | scratch dir and stubs |
+| `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
 `PLAN_DELEGATE_ACTIVE_DIR` is on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when it, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
 
@@ -153,7 +153,7 @@ The largest module peaks near 0.5 GiB. The gate's wall time is its slowest modul
 - **Inherited SIGINT.** A suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores. `SUITE_BOOTSTRAP` resets dispositions for gate jobs; a signal test still restores `SIG_DFL` itself.
 
 - **Admission is not an OS limit.** It works on samples, so a module can grow past the cap between two samples. A job whose own sample is over the cap is killed at once (its group gets SIGKILL), its result starts `killed: sampled memory <X> GiB is over the <cap> GiB cap`, and the run is red. Before 2026-10-18 an overrun only turned the run red at the end: a shutdown module looping on a failed fake grew to 28 GiB in 56 minutes (10 GiB of it resident, the rest in swap) and filled natedev's swap.
-- **Module time limit.** A module still running `DEFAULT_MODULE_TIME_LIMIT_S` (1800 s, `--module-time-limit-s`) after it starts is killed the same way; its result starts `killed: still running after 1800 s, the module time limit`, and the run is red. A hung module would otherwise hold every gate behind it. The limit is about 4.6 times the slowest measured module: delegate/test_verify_mac_offload.py took 387 s at load 152 (2026-10-18).
+- **Module time limit.** A module still running `DEFAULT_MODULE_TIME_LIMIT_S` (1800 s, `--module-time-limit-s`) after it starts is killed the same way; its result starts `killed: still running after 1800 s, the module time limit`, and the run is red. A hung module would otherwise hold every gate behind it. The limit is about 4.6 times the slowest measured module: direct/test_verify_mac_offload.py took 387 s at load 152 (2026-10-18).
 
 - **macOS has no inotify.** `local_release_wait` and `wait_until` fall back to interval polling there.
 

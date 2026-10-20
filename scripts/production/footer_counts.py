@@ -2,8 +2,9 @@
 
 The status line and the dailies report's own footer show it; no reply carries it (user,
 2026-10-18). Changes are the rows still to review on the list the doc's Change review line names,
-proposals the open proposal issues in its Proposals folder that are its own (see
-proposals_folder), and projects the improvement-queue
+proposals the open proposal issues in its Proposals folder that are its own and that the user has
+not approved (see proposals_folder and proposal_issue.proposal_progress), efficiency proposals
+the proposed or deferred lines in its Efficiency ledger, and projects the improvement-queue
 lines still to decide or hand out, for a doc with an Improvement queue line.
 """
 from __future__ import annotations
@@ -13,13 +14,16 @@ from pathlib import Path
 from typing import NamedTuple
 
 import change_review
+import proposal_issue
 import proposals_folder
 from production_units import Refusal, production_field
 
 IMPROVEMENT_QUEUE_FIELD = "Improvement queue"
+EFFICIENCY_LEDGER_FIELD = "Efficiency ledger"
 COUNTS_HEAD = "For you: "
 # A ledger line: `- <date> <title> (<file>) — <status>`.
 LEDGER_STATUS = re.compile(r"^- \d{4}-\d\d-\d\d .* — (?P<status>.*)$")
+EFFICIENCY_LINE = re.compile(r"^- \d{4}-\d\d-\d\d .*? — (?P<status>.*)$")
 SETTLED = re.compile(r"\b(assigned|applied|built|declined)\b", re.IGNORECASE)
 
 
@@ -28,6 +32,7 @@ class FooterCounts(NamedTuple):
     proposals: int = 0
     projects: int = 0
     questions: int = 0
+    efficiency: int = 0
 
 
 def total(each: list[FooterCounts]) -> FooterCounts:
@@ -43,7 +48,8 @@ def changes(doc: Path) -> int:
 
 
 def proposals(doc: Path) -> int:
-    return len(proposals_folder.open_proposals(doc))
+    return sum(isinstance(proposal_issue.proposal_progress(issue), proposal_issue.AwaitingApproval)
+               for issue in proposals_folder.open_proposals(doc))
 
 
 def open_project(line: str) -> bool:
@@ -55,12 +61,39 @@ def open_project(line: str) -> bool:
     return status.startswith("proposed") or (status.startswith("accepted") and SETTLED.search(status) is None)
 
 
-def ledger(doc: Path) -> Path | None:
-    """The ledger the doc's Improvement queue line names, or None when it names none."""
+def open_efficiency(line: str) -> bool:
+    """A dated efficiency ledger line whose first status is proposed or deferred."""
+    match = EFFICIENCY_LINE.match(line)
+    return match is not None and match.group("status").strip().startswith(("proposed", "deferred"))
+
+
+def _field_path(doc: Path, field: str) -> Path | None:
     try:
-        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), IMPROVEMENT_QUEUE_FIELD)).expanduser()
+        return Path(production_field(doc.read_text(encoding="utf-8").splitlines(), field)).expanduser()
     except Refusal:
         return None
+
+
+def ledger(doc: Path) -> Path | None:
+    """The ledger the doc's Improvement queue line names, or None when it names none."""
+    return _field_path(doc, IMPROVEMENT_QUEUE_FIELD)
+
+
+def efficiency_ledger(doc: Path) -> Path | None:
+    """The ledger the doc's Efficiency ledger line names, or None when it names none."""
+    return _field_path(doc, EFFICIENCY_LEDGER_FIELD)
+
+
+def efficiency(doc: Path) -> int:
+    """Proposed and deferred efficiency proposals in the doc's ledger."""
+    try:
+        path = efficiency_ledger(doc)
+        if path is None:
+            return 0
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return 0
+    return sum(open_efficiency(line) for line in lines)
 
 
 def projects(doc: Path) -> int:
@@ -77,7 +110,7 @@ def projects(doc: Path) -> int:
 def read_counts(doc: Path, *, questions: int = 0) -> FooterCounts:
     """Each count for one production doc; a source that cannot be read counts nothing."""
     try:
-        return FooterCounts(changes(doc), proposals(doc), projects(doc), questions)
+        return FooterCounts(changes(doc), proposals(doc), projects(doc), questions, efficiency(doc))
     except OSError:
         return FooterCounts(questions=questions)
 
@@ -95,9 +128,11 @@ def sources(doc: Path) -> list[Path]:
     folder = proposals_folder.issues_folder(doc)
     try:
         queue = ledger(doc)
+        efficiency_queue = efficiency_ledger(doc)
     except OSError:
         queue = None
-    found = [doc, *(path for path in (listed, folder, queue) if path is not None)]
+        efficiency_queue = None
+    found = [doc, *(path for path in (listed, folder, queue, efficiency_queue) if path is not None)]
     # A unit added below changes which proposals are this production's.
     found.extend(proposals_folder.owner_docs(doc)[1:])
     try:
@@ -112,10 +147,15 @@ def plural(count: int, word: str) -> str:
 
 
 def counts_line(counts: FooterCounts) -> str | None:
-    """`For you: 2 changes to review, 1 proposal, 3 projects, 1 question`, zero counts left out; None when all are zero."""
+    """`For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects`.
+
+    Questions come first because they need the user most (user, 2026-10-20). "efficiency" has
+    no plural. Zero counts are left out; None when all are zero.
+    """
     parts = [text for count, text in (
-        (counts.changes, f"{plural(counts.changes, 'change')} to review"),
+        (counts.questions, plural(counts.questions, "question")),
+        (counts.changes, plural(counts.changes, "change")),
+        (counts.efficiency, f"{counts.efficiency} efficiency"),
         (counts.proposals, plural(counts.proposals, "proposal")),
-        (counts.projects, plural(counts.projects, "project")),
-        (counts.questions, plural(counts.questions, "question"))) if count]
+        (counts.projects, plural(counts.projects, "project"))) if count]
     return COUNTS_HEAD + ", ".join(parts) if parts else None

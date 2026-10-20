@@ -91,8 +91,11 @@ Loop/verbose only:
    ten-second deadline: invoke no retry.
 6. **Standing plans:** rerun the ticket's
    `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket <id>`
-   before staging. Exit 1 (a review or error) retains the reservation and
-   returns to repair. On exit 0, stage only this phase's code paths from
+   before staging. Exit 1 is a review: it retains the reservation and returns
+   to repair. Exit 2 means the gate could not run (`error: <reason>`, such as a
+   locked ledger): retain the reservation, do not repair, and rerun the gate.
+   If the same error comes back, stop and report it.
+   On exit 0, stage only this phase's code paths from
    `git status --porcelain`, handling renamed paths as pairs; never name the
    plan doc, `docs/style-production/` or pinned rule files in `git add`.
    Commit exactly the gated tree once using the message below, then capture
@@ -113,6 +116,10 @@ Loop/verbose only:
    --repo . --id <ticket> --commit <captured HEAD>` then
    `style_ledger.py ticket merge --repo . --id <ticket>` through
    `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py`.
+   For each `has no applied check` line that merge prints, check the change in
+   the code and run the printed `held built` command when the change is there.
+   A finding whose change is not there waits for a person, who makes the change
+   and runs that command, or waives the finding with `style_ledger.py held waive`.
    From `Active`, atomically replace the durable record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that same captured
    full id as `checkpoint_commit`, and read it back. This is the one case where
@@ -131,13 +138,18 @@ Loop/verbose only:
 
    <what the phase built>
 
-   Change-Review: <what you see change> | <how to check it>
+   Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>
    Claude-Session: <session url>
    ```
 
    Every `checkpoint(...)` commit that changes more than Markdown carries
-   `Change-Review: <what you see change> | <how to check it>`, one line per
-   visible change, or `Change-Review: none — <why nothing visible changes>`.
+   `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
+   `Change-Review: none — <why nothing visible changes>`. Write each line for a
+   person with no context. "Where" names the machine (natedev or the Mac) and
+   the session (a terminal, a showrunner session, a unit session, any Claude
+   session). Example:
+   `Change-Review: The unit board shows each unit's phase | In a showrunner session on natedev, type /showrunner:unit_board | Each row has a Phase column`.
+   A line without all three parts is refused.
    A change the user can check outside the app counts as visible too: a
    table's columns, a status line, a command's output.
    A hook refuses the commit without it and the merge refuses the checkpoint;
@@ -234,8 +246,8 @@ Loop/verbose only:
    `Checkpoint <short hash> — phase N: <title>.` with its push note, if any.
    This report follows successful release when the phase was active.
 9. In a production unit, run
-   `python3 ~/.claude/scripts/delegate/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
-   and `python3 ~/.claude/scripts/delegate/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
+   `python3 ~/.claude/scripts/direct/progress_history.py review-trial --session-dir "${SESSION_DIR}"`
+   and `python3 ~/.claude/scripts/direct/phase_table.py parallel --session-dir "${SESSION_DIR}"`,
    and keep both lines for <ProductionUnit/> item 3's checkpoint notice.
 </CheckpointCommit>
 

@@ -14,7 +14,7 @@ export type PaneState<Production> =
 
 export type AccountsPaneState<Status> =
   | { kind: 'loading' }
-  | { kind: 'accounts'; data: Status; zone: string }
+  | { kind: 'accounts'; data: Status; zone: string; now: number }
   | { kind: 'failed'; reason: string };
 
 /** The engine contract keeps snapshots opaque; hooks bind Production to BoardData. */

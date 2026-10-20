@@ -78,8 +78,8 @@ class InventoryTests(ShutdownTestCase):
     def test_codex_seats_records_nearest_launcher_argv_and_excludes_ended_and_other_runs(self) -> None:
         run = self.root / "paused run"
         run.mkdir()
-        command = ["bash", "/config/scripts/delegate/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
-        outer = ["bash", "/config/scripts/delegate/implement.sh", "outer arguments"]
+        command = ["bash", "/config/scripts/direct/review.sh", "--phase", "1", str(run), "/checkout with spaces", "/old/prompt.md", "review-task", "review instructions", "review task", "1", "api"]
+        outer = ["bash", "/config/scripts/direct/implement.sh", "outer arguments"]
         self.herdr_process(810, 811, ["python3", "codex_mesh.py", "follow"], {})
         self.herdr_process(811, 812, command, {})
         self.herdr_process(812, 1, outer, {})
@@ -316,6 +316,15 @@ class InventoryTests(ShutdownTestCase):
             desktops = inventory._snapshot_desktops(refresh=False)  # pyright: ignore[reportPrivateUsage]
         updater.assert_not_called()
         self.assertEqual(desktops[DESKTOP_ID], "Writing")
+
+    def test_desktop_snapshot_update_skips_the_agent_notes_refresh(self) -> None:
+        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            _ = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
+        updater.assert_called_once()
+        environment = cast("dict[str, str]", updater.call_args.kwargs["env"])
+        self.assertEqual(environment[inventory.SKIP_AGENT_NOTES], "1")
+        self.assertEqual(environment["PATH"], os.environ["PATH"])
 
     def test_nested_shutdown_inventory_reads_existing_snapshot_without_updating_notes(self) -> None:
         with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),

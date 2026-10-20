@@ -10,10 +10,10 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Self, cast, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.accounts import accounts, role_map
 from scripts.agents import codex_mesh
@@ -60,6 +60,89 @@ class RoleMapTests(unittest.TestCase):
         with redirect_stdout(output), redirect_stderr(error):
             code = accounts.main(list(arguments))
         return code, output.getvalue(), error.getvalue()
+
+    def test_named_workers_route_reaches_a_mac_launch_and_its_offline_cache(self) -> None:
+        self.seed(self.home, groups={"showrunners": "claude1"})
+        self.seed(self.server_home, groups={"showrunners": "claude2"})
+        self.assertEqual(accounts.setup("claude3"), [])
+        directory = accounts.account_dir("claude3")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "claude3@example.invalid"}}))
+        # A Mac write goes through the real CLI on a fake authority.
+        with (patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.home)),
+              patch.object(role_map, "ssh_role_map", side_effect=self.remote),
+              patch.object(accounts, "datetime", RoleMapReadTime)):
+            role_map.write_role_map(role_map.WorkersClaudeRouteChange(
+                role_map.NamedWorkersClaudeAccount("claude3", RoleMapReadTime.now(timezone.utc) + timedelta(days=2)), "queued workers route",
+                RoleMapReadTime.now(timezone.utc).isoformat()))
+            with patch.object(role_map, "ssh_role_map", side_effect=self.remote) as fetch:
+                selected = accounts.account_for_unscoped_launch(
+                    {"CLAUDE_CONFIG_DIR": str(self.home / ".claude99")}, workers=True)
+            fetch.assert_called_once_with(("role-map-read",))
+            self.assertEqual(selected, accounts.NamedAccount("claude3", directory))
+            with (patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture offline")),
+                  redirect_stderr(io.StringIO()) as errors):
+                cached = accounts.account_for_unscoped_launch({}, workers=True)
+            self.assertEqual(cached, selected)
+            self.assertIn("natedev unreachable", errors.getvalue())
+            role_map.write_role_map(role_map.WorkersClaudeRouteChange(
+                role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "Codex recovered",
+                RoleMapReadTime.now(timezone.utc).isoformat()))
+            self.assertIsInstance(role_map.read_role_map().workers_claude, role_map.DefaultWorkersClaudeAccount)
+        server_config = self.server_home / ".claude/config/accounts.json"
+        self.assertNotIn("workers_claude", cast(dict[str, object], json.loads(server_config.read_text())))
+
+    def test_workers_launch_refuses_an_unreadable_map_without_a_cache(self) -> None:
+        self.seed(self.home, groups={})
+        self.assertEqual(accounts.setup("claude1"), [])
+        directory = accounts.account_dir("claude1")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "claude1@example.invalid"}}))
+        caller = {"CLAUDE_CONFIG_DIR": str(directory)}
+        with (patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.home)),
+              patch.object(role_map, "ssh_role_map", side_effect=OSError("fixture offline"))):
+            with self.assertRaisesRegex(accounts.AccountsError, "no usable map"):
+                _ = accounts.account_for_unscoped_launch(caller, workers=True)
+        # An old map with no route field still uses the caller's account.
+        with (patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.home)),
+              patch.object(role_map, "ssh_role_map", return_value='{"groups": {}, "workers": "codex1"}')):
+            self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
+                             accounts.NamedAccount("claude1", directory))
+        configuration = accounts.accounts_config_file()
+        _ = configuration.write_text(json.dumps({"workers": "codex1", "workers_claude": {
+            "label": "codex3", "until": "2026-10-20T00:00:00+00:00"}}))
+        with (patch.object(role_map, "is_role_map_host", return_value=True),
+              self.assertRaisesRegex(accounts.AccountsError, "no usable map")):
+            _ = accounts.account_for_unscoped_launch(caller, workers=True)
+
+    def test_workers_route_uses_the_default_account_at_its_end_time(self) -> None:
+        self.seed(self.home, groups={})
+        for label in ("claude1", "claude3"):
+            self.assertEqual(accounts.setup(label), [])
+            _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": f"{label}@example.invalid"}}))
+        until = RoleMapReadTime.now(timezone.utc)
+        wire = json.dumps({"groups": {}, "workers": "codex1", "workers_claude": {
+            "label": "claude3", "until": until.isoformat()}})
+        caller = {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude1"))}
+        with patch.object(role_map, "ssh_role_map", return_value=wire):
+            for now, label in ((until - timedelta(seconds=1), "claude3"),
+                               (until, "claude1"), (until + timedelta(seconds=1), "claude1")):
+                with self.subTest(now=now), patch.object(accounts, "datetime", wraps=datetime, now=Mock(return_value=now)):
+                    self.assertEqual(accounts.account_for_unscoped_launch(caller, workers=True),
+                                     accounts.NamedAccount(label, accounts.account_dir(label)))
+
+    def test_workers_route_without_an_end_time_uses_the_default_account(self) -> None:
+        self.seed(self.home, groups={})
+        self.assertEqual(accounts.setup("claude1"), [])
+        directory = accounts.account_dir("claude1")
+        _ = (directory / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "claude1@example.invalid"}}))
+        for route in ("claude3", {"label": "claude3"}):
+            with self.subTest(route=route), patch.object(role_map, "ssh_role_map", return_value=json.dumps({
+                    "groups": {}, "workers": "codex1", "workers_claude": route})):
+                self.assertEqual(accounts.account_for_unscoped_launch(
+                    {"CLAUDE_CONFIG_DIR": str(directory)}, workers=True), accounts.NamedAccount("claude1", directory))
 
     def test_remote_command_refusal_retains_the_last_nonempty_stderr_line(self) -> None:
         message = "next: units has 1 entries; position 3 is out of range"

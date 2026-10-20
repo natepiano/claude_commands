@@ -22,11 +22,11 @@ The code that assigns a role records it when it assigns it, in an append-only `<
 
 | Writer | Role written |
 | --- | --- |
-| `scripts/delegate/prepare_session.sh` | `director`, under `CLAUDE_CODE_SESSION_ID` |
+| `scripts/direct/prepare_session.sh` | `director`, under `CLAUDE_CODE_SESSION_ID` |
 | `scripts/production/update_registration.py register` | `showrunner`, at every showrunner start and resume |
 | `scripts/agents/agent_bg.sh` | `worker`, under the 8-hex id |
 | `scripts/agents/codex_mesh.py` | the worker's role and `--lens` on a new thread and on a follow-up claim; the previous role again when a claim is released |
-| `scripts/delegate/review.sh` | passes `--lens` to `codex_mesh.py` |
+| `scripts/direct/review.sh` | passes `--lens` to `codex_mesh.py` |
 | `scripts/hooks/session-start-agents-log.py` | `subagent` for a payload with a non-empty `agent_id`, else `interactive` for `session_id`, through `register_default` |
 
 The hook is registered twice in `settings.json`, with the command `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/session-start-agents-log.py"`: in the `hooks.SessionStart` entry with no `matcher` (startup, resume, clear, compact) and in a `hooks.SubagentStart` entry with no `matcher`. `SubagentStart` delivers the parent `session_id` and the `agent_id` before the subagent's first request; `SessionStart` does not fire for a subagent. The lens lives only in `agents.jsonl`, never in `mesh_roster.json`.
@@ -241,7 +241,7 @@ The roster carries each worker's role and the context size that decides when a l
 | `scripts/whoami/worker_usage.py` | Codex before/after worker readout over the store |
 | `scripts/lib/user_zone.py`, `config/user_zone.conf` | The zone report bounds and times are read in |
 | `scripts/agents/codex_mesh.py` | Worker role and lens recording; roster revision and guarded writes |
-| `scripts/delegate/prepare_session.sh`, `scripts/agents/agent_bg.sh`, `scripts/production/update_registration.py`, `scripts/delegate/review.sh` | Role writers |
+| `scripts/direct/prepare_session.sh`, `scripts/agents/agent_bg.sh`, `scripts/production/update_registration.py`, `scripts/direct/review.sh` | Role writers |
 | `/etc/nixos/modules/linux/usage-collect.nix` | Hourly timer |
 | `scripts/usage/test_*.py`, `scripts/whoami/test_worker_usage.py`, `scripts/usage/fixtures/` | Tests over invented logs; expected reports compared whole |
 

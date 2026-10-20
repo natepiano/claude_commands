@@ -17,6 +17,7 @@ from collections.abc import Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from enum import Enum
+from itertools import accumulate
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import cast
@@ -26,13 +27,17 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
+from approved_renames import (RUST_KEYWORDS, AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
+                              MissingFile, RenameNotApplied, UncertainScan, applied_check,
+                              approved_rename, declaration_sites, enclosing, file_rename, inline_modules, item_starts)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
 import style_ledger
 import style_footprint
 import style_proposals
-from issues import frontmatter
+from issues import Issue, frontmatter
 from production_units import Refusal, production_field
+from proposal_issue import ApprovedDecision, decision_answer
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 
 FAMILIES: tuple[rules.Family, ...] = ("modules", "names", "values", "types")
@@ -180,6 +185,42 @@ class WaitingForBranchPointSync:
 
 
 @dataclass(frozen=True)
+class MergeStyleBranchFirst:
+    """No ticket is left, and a judgment in the unit tip saw the inputs of each of these cells that the tip has.
+
+    The pushed style tip holds the unit tip and changes those inputs, so a fast-forward to it lets refill issue them.
+    """
+
+    cell_count: int
+    unit_tip: str
+    style_branch: str
+
+
+@dataclass(frozen=True)
+class UnitBranchTip:
+    """The commit where the unit's next ticket starts."""
+
+    commit: str
+
+
+@dataclass(frozen=True)
+class NoUnitBranch:
+    """The unit has no branch yet, so no cell was judged at its tip."""
+
+
+UnitBase = UnitBranchTip | NoUnitBranch
+
+
+def unit_base(repo: Path, branch: str) -> UnitBase:
+    result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+         f"refs/heads/{branch.removeprefix('refs/heads/')}^{{commit}}"],
+        capture_output=True, text=True, check=False,
+    )
+    return UnitBranchTip(result.stdout.strip()) if result.returncode == 0 else NoUnitBranch()
+
+
+@dataclass(frozen=True)
 class TicketSelection:
     kind: style_ledger.TicketKind
     family: rules.Family
@@ -200,7 +241,8 @@ class BusyFiles:
         return path in self.paths or any(reservation.blocks(path) for reservation in self.board.reservations())
 
 
-NextPhase = PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure | WaitingForBranchPointSync | berth_board.BoardUnavailable
+NextPhase = (PhaseWritten | Resumed | RepairFirst | WaitingForMerge | WaitingForSync | WaitingForStructure
+             | WaitingForBranchPointSync | MergeStyleBranchFirst | berth_board.BoardUnavailable)
 
 
 def style_document(repo: Path) -> Path:
@@ -217,23 +259,19 @@ def busy_files(repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, bo
     return BusyFiles(board, busy)
 
 
-@dataclass(frozen=True)
-class ApprovedRename:
-    parent: str
-    old: str
-    new: str
-
-
 def approved_rename_pairs(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[ApprovedRename, ...]:
     pairs: list[ApprovedRename] = []
     for finding in findings:
-        before, after = finding.before.split("::"), finding.after.split("::")
-        if (finding.kind != "rename" or len(before) < 2 or len(before) != len(after)
-                or before[:-1] != after[:-1] or before[-1] == after[-1]
-                or not style_footprint.IDENTIFIER.fullmatch(before[-1])
-                or not style_footprint.IDENTIFIER.fullmatch(after[-1])):
+        # A file rename's edits in other files are judged by approved_module_file.
+        if isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename):
+            continue
+        pair = approved_rename(finding.kind, finding.before, finding.after)
+        if isinstance(pair, ApprovedRename):
+            pairs.append(pair)
+        elif finding.kind != "rename":
+            # A type or restructure finding can change code that no pair proves, so no reference edit is approved.
             return ()
-        pairs.append(ApprovedRename(before[-2], before[-1], after[-1]))
+        # A rename with no qualified pair (a bare name, a field or prose) approves no reference edit of its own.
     return tuple(pairs)
 
 
@@ -292,27 +330,6 @@ def approved_reference_qualifier(
     return parent != "Self" and parent == pair.parent
 
 
-def approved_declaration_sites(words: tuple[str, ...], pair: ApprovedRename) -> frozenset[int]:
-    sites = {index for body in style_footprint.enum_bodies(words) if body.name == pair.parent
-             for index in body.variants if words[index] == pair.old}
-    bodies = list(style_footprint.impl_bodies(words, pair.parent))
-    for index, word in enumerate(words[:-2]):
-        if word in {"mod", "trait"} and words[index + 1] == pair.parent:
-            start = next((i for i in range(index + 2, len(words)) if words[i] in {"{", ";"}), len(words))
-            if start < len(words) and words[start] == "{":
-                bodies.append((start, style_footprint.closing(words, start)))
-    for start, end in bodies:
-        cursor = start + 1
-        while cursor < end:
-            if words[cursor] in {"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"}:
-                if cursor + 1 < end and words[cursor + 1] == pair.old:
-                    sites.add(cursor + 1)
-            if words[cursor] in {"{", "(", "["}:
-                cursor = style_footprint.closing(words, cursor)
-            cursor += 1
-    return frozenset(sites)
-
-
 def unique_rename_mentions(
     repo: Path, pairs: tuple[ApprovedRename, ...], finding_files: set[str],
 ) -> frozenset[ApprovedRename]:
@@ -337,7 +354,8 @@ def unique_rename_mentions(
         words = tuple(token.value for token in source)
         use_parents = use_reference_parents(words)
         for pair in tuple(unique):
-            declarations = approved_declaration_sites(words, pair) if path in finding_files else frozenset[int]()
+            found = declaration_sites(words, path, pair, pair.old) if path in finding_files else UncertainScan()
+            declarations = found.sites if isinstance(found, Declarations) else frozenset[int]()
             for index, token in enumerate(source):
                 if token.kind != "identifier" or token.value != pair.old:
                     continue
@@ -415,7 +433,463 @@ def approved_reference_file(
     return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
 
 
+def rename_pair_text(pair: ApprovedRename) -> str:
+    parent = "::".join((*pair.qualifier, pair.parent))
+    return f"`{parent}::{pair.old}` -> `{parent}::{pair.new}`"
+
+
+def approved_file_renames(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[FileRename, ...]:
+    return tuple(moved for finding in findings
+                 if isinstance(moved := file_rename(finding.kind, finding.path, finding.after), FileRename))
+
+
+@dataclass(frozen=True)
+class NoCrateRoot:
+    """No folder above the renamed file holds a `lib.rs` or `main.rs`."""
+
+
+@dataclass(frozen=True)
+class Library:
+    """The library target of the renamed file's crate, by the name that paths in other crates start with."""
+
+    name: str
+
+
+@dataclass(frozen=True)
+class NoLibrary:
+    """The renamed file's crate has no library target the gate can name, so no path outside the crate names its modules."""
+
+
+@dataclass(frozen=True)
+class OutsideCrate:
+    """The file is not a module file of the renamed file's crate, so its `crate`, `self` and `super` paths do not resolve."""
+
+
+CrateModule = tuple[str, ...] | OutsideCrate
+
+
+@dataclass(frozen=True)
+class UnresolvedPath:
+    """The path does not start at `crate`, `self` or `super`, or its file is outside the crate, so it names no known module."""
+
+
+@dataclass(frozen=True)
+class UseTrees:
+    """The path before each segment and glob of the file's `use` items, and the `use` keyword of each segment and alias."""
+
+    prefixes: Mapping[int, tuple[str, ...]]
+    keywords: Mapping[int, int]
+
+
+@dataclass(frozen=True)
+class ModuleBinding:
+    """An item, import or alias that binds the renamed module's name in one inline module scope of a file."""
+
+    scope: tuple[InlineModule, ...]
+    renamed: bool
+
+
+@dataclass(frozen=True)
+class GlobImport:
+    """A `*` import in one inline module scope, and the module path it imports from."""
+
+    scope: tuple[InlineModule, ...]
+    source: tuple[str, ...] | UnresolvedPath
+
+
+# The anchors that start a path the gate resolves from the file's own module.
+PATH_ANCHORS = frozenset({"crate", "self", "super"})
+# The item keywords whose name is in the type namespace, where a module name lives.
+TYPE_ITEM_KEYWORDS = frozenset({"mod", "struct", "enum", "union", "trait", "type"})
+# The words after a `use` leaf.
+USE_LEAF_ENDS = frozenset({";", ",", "}", "as"})
+
+
+def crate_root(repo: Path, moved: FileRename) -> PurePosixPath | NoCrateRoot:
+    """The nearest folder above the renamed file that holds a crate root file."""
+    for folder in PurePosixPath(moved.old).parents:
+        if any((repo / folder / name).is_file() for name in ("lib.rs", "main.rs")):
+            return folder
+    return NoCrateRoot()
+
+
+def crate_library(repo: Path, root: PurePosixPath) -> Library | NoLibrary:
+    """The library of the crate whose root files are in root: its `[lib]` name, else its package name in snake case."""
+    manifest = repo / root.parent / "Cargo.toml"
+    if not (repo / root / "lib.rs").is_file() or not manifest.is_file():
+        return NoLibrary()
+    try:
+        data: dict[str, object] = tomllib.loads(manifest.read_text())
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return NoLibrary()
+    for table in (data.get("lib"), data.get("package")):
+        if isinstance(table, dict) and isinstance(name := cast(dict[str, object], table).get("name"), str):
+            return Library(name.replace("-", "_"))
+    return NoLibrary()
+
+
+def crate_module(path: str, root: PurePosixPath) -> CrateModule:
+    """The module path of a Rust file under the crate root folder: `()` for the crate root file."""
+    file = PurePosixPath(path)
+    if file.suffix != ".rs" or not file.is_relative_to(root):
+        return OutsideCrate()
+    folders = file.relative_to(root).parent.parts
+    if folders[:1] == ("bin",):
+        # Each file in `bin` is the root of a crate of its own.
+        return OutsideCrate()
+    if not folders and file.stem in {"lib", "main"}:
+        return ()
+    return folders if file.stem == "mod" else (*folders, file.stem)
+
+
+def resolved_module(prefix: tuple[str, ...], module: CrateModule) -> tuple[str, ...] | UnresolvedPath:
+    """The module that a path starting at `crate`, `self` or `super` names from module."""
+    if isinstance(module, OutsideCrate) or not prefix or prefix[0] not in PATH_ANCHORS:
+        return UnresolvedPath()
+    rest = prefix[1:]
+    base = () if prefix[0] == "crate" else module
+    if prefix[0] == "super":
+        rest = prefix
+        while rest and rest[0] == "super":
+            if not base:
+                return UnresolvedPath()
+            base, rest = base[:-1], rest[1:]
+    return UnresolvedPath() if PATH_ANCHORS & set(rest) else base + rest
+
+
+def use_trees(words: tuple[str, ...], starts: frozenset[int]) -> UseTrees:
+    prefixes: dict[int, tuple[str, ...]] = {}
+    keywords: dict[int, int] = {}
+    for keyword, word in enumerate(words):
+        if word != "use" or keyword not in starts:
+            continue
+        groups: list[tuple[str, ...]] = [()]
+        path: list[str] = []
+        cursor = keyword + 1
+        while cursor < len(words) and words[cursor] != ";":
+            part = words[cursor]
+            if part == "{":
+                groups.append(groups[-1] + tuple(path))
+                path = []
+            elif part in {"}", ","}:
+                if part == "}" and len(groups) > 1:
+                    _ = groups.pop()
+                path = []
+            elif part == "as":
+                cursor += 1
+                keywords[cursor] = keyword
+            elif part != "::":
+                prefixes[cursor] = groups[-1] + tuple(path)
+                keywords[cursor] = keyword
+                path.append(part)
+            cursor += 1
+    return UseTrees(prefixes, keywords)
+
+
+@dataclass(frozen=True)
+class RenamedModuleScan:
+    """One Rust file read at HEAD, and the module file rename whose references the scan finds in it."""
+
+    words: tuple[str, ...]
+    module: CrateModule
+    parent: tuple[str, ...]
+    stem: str
+    library: Library | NoLibrary
+
+    def sites(self) -> frozenset[int]:
+        """The words that name the renamed module: its `mod` line and the path segments that name it.
+
+        A word is a site only when the scan is certain; the gate keeps every other word unchanged.
+        """
+        words, stem = self.words, self.stem
+        starts = item_starts(words)
+        modules = inline_modules(words, starts)
+        trees = use_trees(words, starts)
+        depths = (0, *accumulate((word == "{") - (word == "}") for word in words))
+        bindings: list[ModuleBinding] = []
+        globs: list[GlobImport] = []
+        block_bindings = False
+        for index, word in enumerate(words[:-1]):
+            if index == 0 or word not in {"*", stem}:
+                continue
+            # A binding is in the scope of its `use` keyword, or of the keyword just before its name.
+            anchor = trees.keywords.get(index, index - 1)
+            scope = enclosing(modules, anchor)
+            if word == "*":
+                if index in trees.prefixes:
+                    globs.append(GlobImport(scope, resolved_module(trees.prefixes[index], self.scope_module(scope))))
+                continue
+            renamed = self.mod_line(index, starts, modules)
+            if index in trees.prefixes and words[index + 1] in {";", ",", "}"}:
+                renamed = self.names_parent(trees.prefixes[index], self.scope_module(scope))
+            elif not (renamed or words[index - 1] == "as"
+                      or (words[index - 1] in TYPE_ITEM_KEYWORDS and index - 1 in starts)
+                      or words[index - 2:index] == ("extern", "crate")):
+                continue
+            if depths[anchor] == len(scope):
+                bindings.append(ModuleBinding(scope, renamed))
+            else:
+                block_bindings = True
+        found: set[int] = set()
+        for index, word in enumerate(words[:-1]):
+            if index == 0 or word != stem or words[index - 1] == "." or words[index + 1:index + 3] == ("::", "<"):
+                continue
+            scope = enclosing(modules, index)
+            if self.mod_line(index, starts, modules):
+                found.add(index)
+            elif index in trees.prefixes and (trees.prefixes[index] or words[index - 1] == "::"):
+                if (words[index + 1] == "::" or words[index + 1] in USE_LEAF_ENDS) and self.names_parent(
+                        trees.prefixes[index], self.scope_module(enclosing(modules, trees.keywords[index]))):
+                    found.add(index)
+            elif words[index + 1] == "::":
+                prefix = self.qualifier(index)
+                if ((prefix and self.names_parent(prefix, self.scope_module(scope)))
+                        or (not prefix and words[index - 1] != "::" and not block_bindings
+                            and self.bound_in(scope, tuple(bindings), tuple(globs)))):
+                    found.add(index)
+        return frozenset(found)
+
+    def scope_module(self, scope: tuple[InlineModule, ...]) -> CrateModule:
+        if isinstance(self.module, OutsideCrate):
+            return self.module
+        return self.module + tuple(module.name for module in scope)
+
+    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> bool:
+        """Whether the word at index is the name in the renamed module's `mod <name>;` line."""
+        return (self.words[index - 1:index] == ("mod",) and index - 1 in starts
+                and self.words[index + 1:index + 2] == (";",)
+                and self.scope_module(enclosing(modules, index)) == self.parent)
+
+    def names_parent(self, prefix: tuple[str, ...], module: CrateModule) -> bool:
+        """Whether a path prefix read in module names the renamed module's parent.
+
+        A plain prefix such as `ledger` names it from a child of module inside the crate, and from the library's name in
+        a file outside the crate.
+        """
+        if prefix and prefix[0] in PATH_ANCHORS:
+            return resolved_module(prefix, module) == self.parent
+        if not prefix or PATH_ANCHORS & set(prefix):
+            return False
+        if isinstance(module, OutsideCrate):
+            return isinstance(self.library, Library) and prefix == (self.library.name, *self.parent)
+        return module + prefix == self.parent
+
+    def qualifier(self, index: int) -> tuple[str, ...]:
+        """The path segments joined by `::` before the word at index."""
+        segments: list[str] = []
+        while index >= 2 and self.words[index - 1] == "::" and style_footprint.IDENTIFIER.fullmatch(self.words[index - 2]):
+            segments.insert(0, self.words[index - 2])
+            index -= 2
+        return () if index >= 1 and self.words[index - 1] == "::" else tuple(segments)
+
+    def bound_in(self, scope: tuple[InlineModule, ...], bindings: tuple[ModuleBinding, ...],
+                 globs: tuple[GlobImport, ...]) -> bool:
+        """Whether the stem names the renamed module in scope: every binding there does, or with none, a glob brings it.
+
+        A glob from an outer inline module scope of the file brings what that scope binds.
+        """
+        bound = tuple(binding.renamed for binding in bindings if binding.scope == scope)
+        if bound:
+            return all(bound)
+        for glob in globs:
+            if glob.scope != scope:
+                continue
+            if glob.source == self.parent or any(
+                    glob.source == self.scope_module(scope[:depth]) and self.bound_in(scope[:depth], bindings, globs)
+                    for depth in range(len(scope))):
+                return True
+        return False
+
+
+def without_trailing_commas(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The words without a comma that ends a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
+
+    A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
+    does not change the code, so a reformat that adds or drops one leaves the code the same. Any other paren list can be
+    a tuple, where `(x,)` and `(x)` differ, so its comma stays.
+    """
+    droppable: list[bool] = []
+    dropped: set[int] = set()
+    for index, word in enumerate(words):
+        if word in {"(", "[", "{"}:
+            lead = words[index - 1] if index else ""
+            droppable.append(word != "(" or lead in {">", ")", "]"} or (
+                style_footprint.IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS))
+        elif word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",):
+            dropped.add(index - 1)
+    return tuple(word for index, word in enumerate(words) if index not in dropped)
+
+
+def sorted_use_groups(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The words of a `use` item with the entries of each brace group in sorted order."""
+    result: list[str] = []
+    cursor = 0
+    while cursor < len(words):
+        if words[cursor] != "{":
+            result.append(words[cursor])
+            cursor += 1
+            continue
+        end = style_footprint.closing(words, cursor)
+        entries: list[tuple[str, ...]] = []
+        start = inner = cursor + 1
+        while inner < end:
+            if words[inner] == "{":
+                inner = style_footprint.closing(words, inner)
+            elif words[inner] == ",":
+                entries.append(sorted_use_groups(words[start:inner]))
+                start = inner + 1
+            inner += 1
+        entries.append(sorted_use_groups(words[start:end]))
+        result.append("{")
+        for position, entry in enumerate(sorted(entry for entry in entries if entry)):
+            result.extend((",", *entry) if position else entry)
+        result.append("}")
+        cursor = end + 1
+    return tuple(result)
+
+
+def module_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
+    """The first and last word of each `use` item and `mod <name>;` item, attributes and visibility included, in order.
+
+    An item with a `macro_use` attribute is left out: its place decides where its macros can be used.
+    """
+    starts = item_starts(words)
+    attributes = {end: start for start, end in style_footprint.attribute_spans(words)}
+    visibilities = {style_footprint.closing(words, index + 1) + 1: index for index, word in enumerate(words[:-1])
+                    if word == "pub" and words[index + 1] == "("}
+    items: list[tuple[int, int]] = []
+    for keyword, word in enumerate(words):
+        if keyword not in starts:
+            continue
+        if word == "use":
+            end = next((index for index in range(keyword, len(words)) if words[index] == ";"), len(words))
+        elif word == "mod" and words[keyword + 2:keyword + 3] == (";",):
+            end = keyword + 2
+        else:
+            continue
+        start = visibilities.get(keyword, keyword - 1 if words[keyword - 1:keyword] == ("pub",) else keyword)
+        while start in attributes:
+            start = attributes[start]
+        if end < len(words) and "macro_use" not in words[start:keyword]:
+            items.append((start, end))
+    return tuple(items)
+
+
+def module_runs(words: tuple[str, ...]) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """The runs of adjacent module items, each item by its first and last word, in order."""
+    runs: list[list[tuple[int, int]]] = []
+    for start, end in module_items(words):
+        if runs and runs[-1][-1][1] + 1 == start:
+            runs[-1].append((start, end))
+        else:
+            runs.append([(start, end)])
+    return tuple(tuple(run) for run in runs)
+
+
+def canonical_order(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The words with trailing commas dropped, use group entries sorted and each run of adjacent module items sorted.
+
+    None of these changes the code, and rustfmt makes them when a rename changes a name's sort order or line length.
+    """
+    words = without_trailing_commas(words)
+    result: list[str] = []
+    cursor = 0
+    for run in module_runs(words):
+        result.extend(words[cursor:run[0][0]])
+        result.extend(word for item in sorted(sorted_use_groups(words[start:end + 1]) for start, end in run)
+                      for word in item)
+        cursor = run[-1][1] + 1
+    result.extend(words[cursor:])
+    return tuple(result)
+
+
+def comment_lines(text: str, spans: tuple[style_footprint.TokenSpan, ...]) -> tuple[str | tuple[str, ...], ...]:
+    """The stripped lines of the comments between the code tokens, in order.
+
+    The lines from the start of a run of module items to its last word are one sorted entry: canonical_order sorts the
+    run's items, and their comments move with them.
+    """
+    ends = (0, *(span.end for span in spans))
+    starts = (*(span.start for span in spans), len(text))
+    gaps = tuple(tuple(line.strip() for line in text[end:start].splitlines() if line.strip())
+                 for end, start in zip(ends, starts, strict=True))
+    entries: list[str | tuple[str, ...]] = []
+    cursor = 0
+    for run in module_runs(tuple(span.token.value for span in spans)):
+        first, last = run[0][0], run[-1][1]
+        entries.extend(line for gap in gaps[cursor:first] for line in gap)
+        entries.append(tuple(sorted(line for gap in gaps[first:last + 1] for line in gap)))
+        cursor = last + 1
+    entries.extend(line for gap in gaps[cursor:] for line in gap)
+    return tuple(entries)
+
+
+def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
+    """Whether a Rust file outside the findings changes only the `mod` lines and module paths of approved file renames,
+    and the qualified references of approved renames.
+
+    The file's HEAD words with each module site renamed, then each qualified reference, must equal its worktree words in
+    canonical order, and no comment changes. A qualified reference reads its parent from the HEAD words.
+    """
+    target = repo / path
+    if not moves or target.suffix != ".rs" or target.is_symlink() or not target.is_file():
+        return False
+    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
+    if result.returncode:
+        return False
+    try:
+        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return False
+    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
+    if len(old) != len(style_footprint.tokens(before)) or len(new) != len(style_footprint.tokens(after)):
+        return False
+    words = tuple(span.token.value for span in old)
+    renamed = list(words)
+    for moved in moves:
+        root = crate_root(repo, moved)
+        if isinstance(root, NoCrateRoot):
+            return False
+        module = crate_module(moved.old, root)
+        if isinstance(module, OutsideCrate):
+            return False
+        scan = RenamedModuleScan(words, crate_module(path, root), module[:-1], moved.old_stem, crate_library(repo, root))
+        for index in scan.sites():
+            renamed[index] = moved.new_stem
+    if tuple(renamed) == words:
+        return False
+    use_parents = use_reference_parents(words)
+    for index, word in enumerate(words):
+        for pair in pairs:
+            if word == pair.old and approved_reference_qualifier(words, index, use_parents, pair):
+                renamed[index] = pair.new
+    return (canonical_order(tuple(renamed)) == canonical_order(tuple(span.token.value for span in new))
+            and comment_lines(before, old) == comment_lines(after, new))
+
+
+def outside_refusal(path: str, moves: tuple[FileRename, ...]) -> str:
+    """Why the gate refuses a changed file outside the findings: a person moves a renamed module's folder of children."""
+    for moved in moves:
+        for folder in moved.module_folders:
+            if path.startswith(folder + "/"):
+                return f"{path} (in {folder}/, the folder of a renamed module: a person moves it)"
+    return f"{path} (change is not an approved rename reference)"
+
+
+def worktree_file(repo: Path, path: str) -> bytes | Folder | MissingFile:
+    target = repo / path
+    if target.is_dir():
+        return Folder()
+    return target.read_bytes() if target.is_file() else MissingFile()
+
+
+def worktree_check(repo: Path, finding: style_ledger.HeldFinding) -> AppliedCheck:
+    """Whether the finding's change is in the worktree."""
+    return applied_check(finding.kind, finding.before, finding.after, finding.path, lambda path: worktree_file(repo, path))
+
+
 def gate(repo: Path, ticket_id: str) -> int:
+    """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
         with style_ledger.open_ledger(repo) as ledger:
             origin = ledger.ticket_origin(ticket_id)
@@ -428,34 +902,51 @@ def gate(repo: Path, ticket_id: str) -> int:
                 base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
-                return 0 if result.returncode == 0 else 1
+                return result.returncode if result.returncode in (0, 2) else 1
             fields = frontmatter(origin.issue)
-            findings = style_proposals.issue_findings(ledger, origin.issue)
-            if (fields.get("status") != ["open"] or fields.get("unit") != [origin.unit] or not fields.get("plan")
-                    or set(fields.get("style_findings", [])) != set(origin.finding_ids)
+            decision = Issue(origin.issue, fields)
+            answer = decision_answer(decision)
+            if not origin.finding_ids:
+                raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
+            by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
+            if any(identity not in by_id for identity in origin.finding_ids):
+                raise style_ledger.LedgerError("proposal ticket findings changed")
+            findings = tuple(by_id[identity] for identity in origin.finding_ids)
+            if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
+                    or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
                     or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
-                           for finding in findings)):
+                           or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
                 raise style_ledger.LedgerError("proposal approval or filed findings changed")
-            allowed = {finding.path for finding in findings}
+            moves = approved_file_renames(findings)
+            allowed = {finding.path for finding in findings} | {moved.new for moved in moves}
             outside = changed_files(repo) - allowed
             if outside:
                 pairs = approved_rename_pairs(findings)
                 unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
                 modified = modified_reference_files(repo)
                 refused = [path for path in sorted(outside)
-                           if path not in modified or not approved_reference_file(repo, path, pairs, unique)]
+                           if path not in modified or not (approved_reference_file(repo, path, pairs, unique)
+                                                           or approved_module_file(repo, path, moves, pairs))]
                 if refused:
                     raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
-                        f"{path} (change is not an approved rename reference)" for path in refused))
+                        outside_refusal(path, moves) for path in refused))
+            unapplied = tuple(finding for finding in findings if isinstance(worktree_check(repo, finding), RenameNotApplied))
+            if unapplied:
+                for finding in unapplied:
+                    print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
+                return 1
             print("approved proposal")
             return 0
-    except (OSError, ValueError, sqlite3.Error) as error:
+    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+        print(f"error: {error}")
+        return 2
+    except ValueError as error:
         print(f"review: {error}")
         return 1
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         rows = cast(list[tuple[str]], connection.execute("SELECT tip FROM sync WHERE id=1").fetchall())
     if not rows:
         raise style_ledger.LedgerError("no synced tip; run set-tip first")
@@ -463,7 +954,7 @@ def synced_tip(ledger: style_ledger.Ledger) -> str:
 
 
 def synced_style_branch(ledger: style_ledger.Ledger) -> str:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         rows = cast(list[tuple[str]], connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
     return rows[0][0] if rows else ""
 
@@ -478,20 +969,20 @@ def coverage_footprint_base(repo: Path, ledger: style_ledger.Ledger, recorded_ba
     if resolved.returncode == 1:
         return recorded_base
     if resolved.returncode:
-        raise style_ledger.LedgerError(resolved.stderr.strip() or "git rev-parse failed")
+        raise style_ledger.CheckCouldNotRun(resolved.stderr.strip() or "git rev-parse failed")
     merged = subprocess.run(["git", "-C", str(repo), "merge-base", "HEAD", resolved.stdout.strip()],
                             capture_output=True, text=True, check=False)
     if merged.returncode == 1:
         return recorded_base
     if merged.returncode:
-        raise style_ledger.LedgerError(merged.stderr.strip() or "git merge-base failed")
+        raise style_ledger.CheckCouldNotRun(merged.stderr.strip() or "git merge-base failed")
     base = merged.stdout.strip()
     ancestry = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", recorded_base, base],
                               capture_output=True, text=True, check=False)
     if ancestry.returncode == 1:
         return recorded_base
     if ancestry.returncode:
-        raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
+        raise style_ledger.CheckCouldNotRun(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
     return base
 
 
@@ -548,7 +1039,8 @@ def balanced_slices(groups: tuple[tuple[str, ...], ...], lengths: dict[str, int]
 
 
 def blocked_by_structure(cell: style_ledger.Cell, structure: tuple[style_ledger.Cell, ...]) -> bool:
-    return any(blocker.crate == cell.crate and blocker.path in (cell.crate, cell.path)
+    """A file cell waits for the structure cells at its own file; a crate cell waits for every one in its crate."""
+    return any(blocker.crate == cell.crate and cell.path in (cell.crate, blocker.path)
                for blocker in structure)
 
 
@@ -560,12 +1052,30 @@ def _is_when_to_split_rule(rule_id: str) -> bool:
     return PurePosixPath(rule_id.removesuffix("#uncovered")).name == "when-to-split-a-module.md"
 
 
-def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
-    """Leave unchanged held sites with open proposals out of coverage work."""
+@dataclass(frozen=True)
+class RefillCells:
+    """The cells one refill weighs.
+
+    Ranking and structure blocking read every cell in cells. No ticket takes a cell in judged_at_base: it is one of
+    the unit's own stale cells in its pilot scope, and a ticket at the unit tip cannot change it.
+    """
+
+    cells: tuple[style_ledger.Cell, ...]
+    judged_at_base: frozenset[style_ledger.Cell]
+
+
+def _unit_tickets(family: rules.Family, cell: style_ledger.Cell) -> bool:
+    return cell.family == family or (family == "modules" and cell.tier == "D")
+
+
+def _refill_cells(ledger: style_ledger.Ledger, base: UnitBase, family: rules.Family, scope: PilotScope) -> RefillCells:
+    """Leave out unchanged held sites with open proposals, and find the unit's cells a ticket at its tip cannot change."""
     held = ledger.latest_held_judgments()
     findings: dict[tuple[str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
     for finding in ledger.held_findings(style_ledger.AllHeldFindings()):
-        findings[(finding.rule, finding.path)].append(finding)
+        # A waived, built or withdrawn finding needs no more work at its site.
+        if not isinstance(finding.state, style_ledger.Waived | style_ledger.Built | style_ledger.Withdrawn):
+            findings[(finding.rule, finding.path)].append(finding)
     tip = synced_tip(ledger)
     result: list[style_ledger.Cell] = []
     for cell in ledger.cells():
@@ -583,18 +1093,27 @@ def _refill_cells(ledger: style_ledger.Ledger) -> tuple[style_ledger.Cell, ...]:
                     if previous == current:
                         continue
         result.append(cell)
-    return tuple(result)
+    own = (cell for cell in result if _unit_tickets(family, cell) and crate_in_scope(scope, cell.crate))
+    judged = ledger.judged_at_base(own, base.commit) if isinstance(base, UnitBranchTip) else ()
+    return RefillCells(tuple(result), frozenset(judged))
 
 
 def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES,
-                      *, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
+                      *, base: UnitBase, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
+    return _tickets_from(repo, ledger, busy, family, scope, family_scopes, _refill_cells(ledger, base, family, scope),
+                         first_files)
+
+
+def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, family: rules.Family, scope: PilotScope,
+                  family_scopes: Mapping[rules.Family, PilotScope], refill: RefillCells,
+                  first_files: frozenset[str]) -> tuple[TicketSelection, ...]:
     pending: list[style_ledger.Cell] = []
     stale: dict[str, int] = defaultdict(int)
     blocked: dict[str, int] = defaultdict(int)
     structure_crates: set[str] = set()
-    for cell in _refill_cells(ledger):
+    for cell in refill.cells:
         stale[cell.crate] += cell.state == "stale"
         if cell.state in ("open", "stale"):
             pending.append(cell)
@@ -617,8 +1136,9 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
         if structure:
             if family == "modules":
                 manifest = str(PurePosixPath(crate) / "Cargo.toml")
-                manifest_cells = tuple(cell for cell in structure if cell.path == crate)
-                file_cells = tuple(cell for cell in structure if cell.path != crate and not busy.contains(cell.path))
+                ticketed = tuple(cell for cell in structure if cell not in refill.judged_at_base)
+                manifest_cells = tuple(cell for cell in ticketed if cell.path == crate)
+                file_cells = tuple(cell for cell in ticketed if cell.path != crate and not busy.contains(cell.path))
                 available = {cell.path for cell in file_cells}
                 if manifest_cells and not busy.contains(manifest):
                     available.add(manifest)
@@ -635,6 +1155,7 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                                                   cells=tuple(sorted((cell.rule, cell.path) for cell in batch_cells))))
                 continue
         own = tuple(cell for cell in pending if cell.crate == crate and cell.family == family
+                    and cell not in refill.judged_at_base
                     and not busy.contains(cell.path) and not blocked_by_structure(cell, structure))
         for rule_id in sorted({cell.rule for cell in own if cell.tier == "B"}):
             files = {cell.path for cell in own if cell.rule == rule_id}
@@ -751,7 +1272,8 @@ def _is_two_judge_ticket(ticket: style_ledger.TicketRecord,
 def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
                context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
                file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
-               crate_targets: CrateTargets = CrateTargets.LIBRARY) -> str:
+               crate_targets: CrateTargets = CrateTargets.LIBRARY,
+               proposal_cells: tuple[style_ledger.ProposalCell, ...] = ()) -> str:
     ticket_id = ticket["id"]
     number = ticket_id.rsplit("-", 1)[1]
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -775,6 +1297,16 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                   + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
                      for finding in held_findings]) if per_file_structure and held_findings else []
     approved = ticket["kind"] == "proposal"
+    # The gate takes reference edits in other files only for these pairs, so the text names them.
+    pairs = approved_rename_pairs(held_findings)
+    own_file_renames = any(finding.kind == "rename" and not isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)
+                           and approved_rename(finding.kind, finding.before, finding.after) not in pairs
+                           for finding in held_findings)
+    # A proposal ticket names its exact cells, because the ledger refuses a tier B cell at a file with no listed site.
+    record_lines = ([f"Record exactly these cells, each with `style_ledger.py record --ticket {ticket_id} --rule <rule> --path <file>`; "
+                     + "the ledger takes its pinned rule blob:"] + [f"- `{cell.rule}` · `{cell.path}`" for cell in proposal_cells]
+                    if proposal_cells else ["Record no cell: the ledger takes no cell of this ticket."]) if approved else [
+        f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob."]
     files: list[str] = []
     for path in ticket["files"]:
         line = f"- `{path}`"
@@ -875,23 +1407,31 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
         (("Apply the approved findings. "
-          + ("For a rename, find every use through the compiler, not a text search, and update each one "
-             + "in other files. Also update every comment and Markdown doc in the repo that means the "
+          + ("For each of these renames, find every use through the compiler, not a text search, and update each one "
+             + "in other files: " + ", ".join(rename_pair_text(pair) for pair in dict.fromkeys(pairs)) + ". "
+             + "Also update every comment and Markdown doc in the repo that means the "
              + "renamed item, and leave mentions of other items with the same name. "
              + "Change nothing else in those files. "
-             if approved_rename_pairs(held_findings) else "")
+             if pairs else "")
+          + ("Apply any other rename only in its own file; when other files use its old name, hold it. "
+             if own_file_renames else "")
+          + ("For a file rename, rename the file, then update its `mod` line and each path that names the module "
+             + "in other files; change nothing else in those files, comments included. "
+             if approved_file_renames(held_findings) else "")
           + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
-        f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
-        "Add `--input-scope file` only to a crate or module cell of a Rust source file.",
-        "Use it only for a `clean` or `exception` verdict based on that file alone.",
-        "Without this flag, changes to any file in the crate or module scope can make the verdict stale.",
+        "Hold a finding only when the cited rule's text requires the change.",
+        f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
+        *record_lines,
+        "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
+        "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
+        "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
-        "`bash ~/.claude/scripts/delegate/verify.sh check <package>`",
-        "`bash ~/.claude/scripts/delegate/verify.sh test <package>`",
-        "`bash ~/.claude/scripts/delegate/verify.sh lint <package>`",
+        "`bash ~/.claude/scripts/direct/verify.sh check <package>`",
+        "`bash ~/.claude/scripts/direct/verify.sh test <package>`",
+        "`bash ~/.claude/scripts/direct/verify.sh lint <package>`",
         f"`~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py gate --repo . --ticket {ticket_id}`",
         "Every ticket cell has a recorded verdict.", "",
     ])
@@ -930,11 +1470,14 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
                      for path in ticket["files"]} if ticket["kind"] == "read" else {})
     held = (tuple(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())
                   if finding.path in ticket["files"] and finding.rule in ticket["rules"]
-                  and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built)))
+                  and not isinstance(finding.state, (style_ledger.Waived, style_ledger.Built, style_ledger.Withdrawn)))
             if ticket["kind"] == "structure" and ticket["cells"] else ())
     if ticket["kind"] == "proposal":
-        held = style_proposals.issue_findings(ledger, Path(ticket["proposal"]))
-    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets)
+        identities = set(ticket["finding_ids"])
+        held = tuple(finding for finding in ledger.proposal_findings(Path(ticket["proposal"]))
+                     if finding.finding_id in identities)
+    cells = ledger.proposal_cells(ticket["id"]) if ticket["kind"] == "proposal" else ()
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells)
     for pinned in texts:
         path = plan.parent.parent / "rules" / (pinned.blob + ".md")
         if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
@@ -956,7 +1499,7 @@ PHASE = re.compile(r"(?ms)^### Phase \d+ — (?P<id>[^\s]+)[^\n]*(?:\n|\Z).*?(?=
 
 
 def discard_finished(ledger: style_ledger.Ledger, text: str) -> tuple[str, tuple[str, ...]]:
-    with closing(sqlite3.connect(ledger.database)) as connection:
+    with closing(sqlite3.connect(ledger.database, timeout=style_ledger.BUSY_TIMEOUT_SECONDS)) as connection:
         states = dict(cast(list[tuple[str, str]], connection.execute("SELECT id,state FROM tickets").fetchall()))
     changes: list[str] = []
     def keep(match: re.Match[str]) -> str:
@@ -974,11 +1517,28 @@ class NoAvailableWork:
     pass
 
 
+def made_before_decisions(ticket_id: str) -> str:
+    """Why a proposal ticket with no finding ids cannot build, and what to do."""
+    return f"{ticket_id}: made before decisions; drop it with style_ledger.py ticket drop, then run migrate"
+
+
+def _unbuilt_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
+    """The decision's filed findings that no build ticket holds."""
+    return tuple(finding for finding in ledger.proposal_findings(issue)
+                 if isinstance(finding.state, style_ledger.Filed) and isinstance(finding.build_ticket, style_ledger.NoBuildTicket))
+
+
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
-) -> PhaseWritten | NoAvailableWork | WaitingForStructure:
-    queued = ledger.queued_tickets(unit)
+    definitions: Mapping[str, rules.Rule],
+) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst:
+    queued: list[style_ledger.TicketRecord] = []
+    for ticket in ledger.queued_tickets(unit):
+        if ticket["kind"] == "proposal" and not ticket["finding_ids"]:
+            print("waiting " + made_before_decisions(ticket["id"]))
+        else:
+            queued.append(ticket)
     for index, ticket in enumerate(queued):
         in_scope = crate_in_scope(scope, ticket["crate"])
         if index == 0 and in_scope and not any(busy.contains(path) for path in ticket["files"]):
@@ -1000,33 +1560,116 @@ def _select_phase(
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
     except Refusal:
-        issue = style_proposals.NoApprovedProposal()
+        decisions: tuple[Issue, ...] = ()
     else:
         if not folder.is_absolute():
             folder = doc.parent.parent / folder
-        issue = style_proposals.approved_issue(folder, unit, ledger)
-    if not isinstance(issue, style_proposals.NoApprovedProposal):
-        findings = style_proposals.issue_findings(ledger, issue.path)
-        if any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != issue.path for finding in findings):
-            raise style_ledger.LedgerError(f"{issue.path}: every approved finding must be filed")
-        if any(not crate_in_scope(scope, style_proposals.crate_for(ledger, finding.path)) for finding in findings):
+        decisions = style_proposals.approved_decisions(folder, unit)
+    directories = style_proposals.workspace_directories(ledger) if decisions else ()
+    tip = synced_tip(ledger)
+    decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
+    closed = False
+    sites = style_proposals.MovedSites(ledger, tip)
+    unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions if issue.value("style_rule") in definitions}
+    # The declaration step runs once for the proposals folder that holds every decision, before the loop, so a finding
+    # whose declaration moved tickets at its new file, a rename whose new name is declared is built, and one whose
+    # declaration is gone waits for a person or is withdrawn with its file. Each refresh keeps the parent its decision
+    # names, and the step renumbers after its own closes.
+    follow = (style_proposals.run_follow(style_proposals.decision_writer(ledger, next(iter(unbuilt)).parent, ""),
+                                         (finding for findings in unbuilt.values() for finding in findings), dry_run=False)
+              if any(unbuilt.values()) else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
+    outcomes = {outcome.finding.finding_id: outcome for outcome in follow.reading.outcomes}
+    for issue in decisions:
+        rule = issue.value("style_rule")
+        definition = definitions.get(rule)
+        if definition is None:
+            print(f"waiting {issue.path}: rule {rule} not in the catalog")
+            continue
+        findings = unbuilt[issue.path]
+        if not findings or issue.path in follow.closes:
+            continue
+        # The step wrote none of a skipped decision's findings, so the gone-file and moved-site waives must not write them either.
+        if issue.path in follow.skipped:
+            print(f"waiting {issue.path}: skipped by the declaration step")
+            continue
+        own = tuple(outcomes[finding.finding_id] for finding in findings)
+        # The answer changed after this refill read the decision as approved, so it waits for the next refill.
+        if any(isinstance(outcome, style_ledger.RenameAwaitingApproval) for outcome in own):
+            print(f"waiting {issue.path}: no longer approved")
+            continue
+        left: dict[str, style_ledger.DeclarationLeft] = {
+            outcome.finding.finding_id: outcome for outcome in own if isinstance(outcome, style_ledger.DeclarationLeft)}
+        for finding_id, outcome in left.items():
+            match outcome:
+                case style_ledger.DeclaredInSeveralFiles():
+                    where = f"declared in {len(outcome.paths)} files"
+                case style_ledger.DeclaredInAnotherCrate():
+                    where = f"declared in another crate: {outcome.path}"
+                case style_ledger.DeclarationGoneFromFile():
+                    where = "declaration gone"
+            print(f"waiting {issue.path}: {finding_id} {where}")
+        read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
+        withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
+        built = any(isinstance(outcome, style_ledger.DeclarationRenamed) for outcome in own)
+        findings = tuple(finding for finding in _unbuilt_findings(ledger, issue.path) if finding.finding_id not in left)
+        # The gone-file and moved-site waives read only the findings whose declaration the step could not read.
+        unread_findings = tuple(finding for finding in findings if finding.finding_id not in read)
+        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in unread_findings})))
+        moved = sites.destinations(tuple(finding for finding in unread_findings if finding.path in present))
+        by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
+        gone: dict[str, list[str]] = defaultdict(list)
+        for finding in findings:
+            if finding.finding_id not in read and finding.path not in present:
+                gone[f"{finding.path} is not in synced commit {tip}"].append(finding.finding_id)
+            elif finding.finding_id in moved:
+                gone[f"{finding.path} site moved to {moved[finding.finding_id]} in synced commit {tip}"].append(finding.finding_id)
+            else:
+                by_file[finding.path].append(finding)
+        # A finding in a removed file, or whose site a merge moved to another file, can never build at its
+        # site, so it is waived and the decision can close.
+        for words, finding_ids in sorted(gone.items()):
+            _ = ledger.decline_findings(finding_ids, words)
+            print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
+        if (gone or withdrew or built) and style_proposals.close_finished_decision(ledger, issue.path):
+            closed = True
+            continue
+        outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}
+        if outside:
             print(f"waiting {issue.path}: outside pilot scope")
-        elif any(busy.contains(finding.path) for finding in findings):
+        held = {path for path in by_file if path not in outside and busy.contains(path)}
+        if held:
             print(f"waiting {issue.path}: files busy")
-        else:
-            ticket_id = ledger.next_ticket_id(unit)
-            ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(ledger, findings[0].path),
-                              sorted({finding.path for finding in findings}), sorted({finding.rule for finding in findings}),
-                              proposal=str(issue.path))
-            ledger.ticket_assign(ticket_id, branch)
-            style_proposals.proposal_command("start", str(issue.path))
-            write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-            return PhaseWritten(ticket_id)
-    candidates = candidate_tickets(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo),
-                                   first_files=first_files)
+        available = tuple(sorted(set(by_file) - outside - held))
+        if not available:
+            continue
+        limits = (_STRUCTURE_LIMITS if any(style_proposals.proposal_kind(finding, definition) == "restructure"
+                                           for finding in findings) else _READ_LIMITS)
+        files = read_slices(repo, tip, available, limits)[0]
+        selected_findings = tuple(finding for path in files for finding in by_file[path])
+        ticket_id = ledger.next_ticket_id(unit)
+        ledger.ticket_add(ticket_id, unit, "proposal", family, style_proposals.crate_for(directories, files[0]),
+                          list(files), sorted({finding.rule for finding in selected_findings}),
+                          proposal=str(issue.path), finding_ids=tuple(finding.finding_id for finding in selected_findings))
+        ledger.ticket_assign(ticket_id, branch)
+        style_proposals.proposal_command("start", str(issue.path))
+        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+        decision_phase = PhaseWritten(ticket_id)
+        break
+    # As complete does, one renumber follows every decision this refill closed.
+    if closed:
+        style_proposals.renumber()
+    if isinstance(decision_phase, PhaseWritten):
+        return decision_phase
+    base = unit_base(repo, branch)
+    refill = _refill_cells(ledger, base, family, scope)
+    candidates = _tickets_from(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo), refill, first_files)
     if not candidates:
+        if isinstance(base, UnitBranchTip) and refill.judged_at_base:
+            merge = ledger.style_merge_changes(refill.judged_at_base, base.commit)
+            if isinstance(merge, style_ledger.StyleMergeChanges):
+                return MergeStyleBranchFirst(len(merge.cells), base.commit, merge.style_branch)
         if family != "modules":
-            pending = tuple(cell for cell in _refill_cells(ledger)
+            pending = tuple(cell for cell in refill.cells
                             if cell.state in ("open", "stale") and crate_in_scope(scope, cell.crate))
             structure = tuple(cell for cell in pending if cell.tier == "D")
             own = tuple(cell for cell in pending if cell.family == family)
@@ -1095,9 +1738,13 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         board = berth_board.read_board(repo)
         if isinstance(board, berth_board.BoardUnavailable):
             return board
+        # One catalog read serves both refill passes.
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files)
-        if isinstance(selected, PhaseWritten):
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                 definitions)
+        # A unit told to merge the style branch acts at once, so it records no sync wait.
+        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
             ledger.clear_sync_wait(unit)
             return selected
         ledger.wait_for_sync(unit)
@@ -1105,8 +1752,9 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
         if isinstance(board, berth_board.BoardUnavailable):
             return board
         busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files)
-        if isinstance(selected, PhaseWritten):
+        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                 definitions)
+        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
             ledger.clear_sync_wait(unit)
             return selected
         if isinstance(selected, WaitingForStructure):
@@ -1141,13 +1789,15 @@ def main(argv: list[str]) -> int:
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
                 settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
+                branches = {row.unit: row.branch for row in unit_worktrees(doc)}
                 for family in FAMILIES:
                     unit = family + "-unit"
                     if args.unit and args.unit != unit:
                         continue
                     first_files = settings[family].first_files if family in settings else _NO_FIRST_FILES
-                    for ticket in candidate_tickets(args.repo, ledger, busy, family,
-                                                    scopes.get(family, _ALL_CRATES), scopes, first_files=first_files):
+                    base = unit_base(args.repo, branches[unit]) if unit in branches else NoUnitBranch()
+                    for ticket in candidate_tickets(args.repo, ledger, busy, family, scopes.get(family, _ALL_CRATES),
+                                                    scopes, base=base, first_files=first_files):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
             return 0
         result = next_phase(args.unit, args.plan, args.repo)
@@ -1177,6 +1827,10 @@ def main(argv: list[str]) -> int:
             case WaitingForBranchPointSync(branch_point, branch_tip, tip):
                 print(f"waiting for sync: {branch_point} {branch_tip[:7]} is not in the synced tip {tip[:7]}")
                 return 3
+            case MergeStyleBranchFirst(cell_count, unit_tip, style_branch):
+                print(f"merge the style branch first: {cell_count} cell{'' if cell_count == 1 else 's'} judged at {unit_tip[:7]} "
+                      + f"wait for {style_branch.removeprefix('refs/heads/')}")
+                return 6
         return 0
     except (OSError, ValueError, Refusal, sqlite3.Error) as error:
         print(f"style_plan: {error}", file=sys.stderr)

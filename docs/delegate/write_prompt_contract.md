@@ -40,7 +40,7 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    it unless told not to.
 3. Narration: when the activity changes — a new piece of work, or a run
    started — run
-   `bash ~/.claude/scripts/delegate/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
+   `bash ~/.claude/scripts/direct/board.sh post <concrete SESSION_DIR> <slot> status "<activity>"`.
    Use short present-tense text and never read the heartbeat file. Post
    nothing while the activity stays the same. Every prompt to a Codex worker
    carries this section verbatim, after section 2:
@@ -67,7 +67,7 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    and ends its turn until the task notification arrives. Role
    changes: **before the first tool call in a new role** — taking a slice of
    the test work, standing down — run
-   `bash ~/.claude/scripts/delegate/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
+   `bash ~/.claude/scripts/direct/board.sh role <concrete SESSION_DIR> <slot> <impl|fix|test|review> "<why>"`,
    written out with the real path and this slot's name. A `status` sentence
    saying the same thing does not count: the table reads the `role=` field,
    and a move that is not posted is a row the run never shows.
@@ -207,7 +207,7 @@ assignment. Completion ends the turns, not their Codex threads.
 
 <CoordinationBoard>
 The team coordinates through `${SESSION_DIR}/board.log`, written only with
-`bash ~/.claude/scripts/delegate/board.sh`.
+`bash ~/.claude/scripts/direct/board.sh`.
 
 **Why a file even when messages work.** Every member is reachable by name on
 both paths — see <PhaseMesh/> — but the board is the durable broadcast record
@@ -254,7 +254,7 @@ mid-run, without waiting for a phase to end.
 - **Addresses** are `<project>-<slot>`, the project being the working tree's
   directory name: `hana_catalyst-impl`, `-test`; a repair worker is `-fix`. The
   slot, never the role: a `test` worker writing code is still `-test`. Get each
-  name from `bash ~/.claude/scripts/delegate/worker_name.sh "${WORKING_DIR}"
+  name from `bash ~/.claude/scripts/direct/worker_name.sh "${WORKING_DIR}"
   <slot> <kind>`, the launcher's own rule; never compose one. A member is told
   its peer's name in its prompt, and every `register` line on the board repeats
   the names in its `mesh=` field, so a member that missed the launch can still

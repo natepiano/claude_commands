@@ -18,7 +18,9 @@ For a seat it runs `cargo-berth check <paths> --json` from the repository root o
 phase, as that phase's berth session `<director session id>.phase-<phase>`, so two open phases
 hold separate reservations. A path a sibling phase already holds is allowed and records nothing:
 the engine leaves the session unmapped and names the sibling's reservation. A clear answer allows the edit and, when it carries the acquired reservation,
-writes `Active` into that phase's state file. An unenrolled repository is allowed. Every other
+writes `Active` into that phase's state file. An unenrolled repository is allowed, and so is a
+ledger the engine cannot read (`ledger_unreadable`, as in a scratch clone with no ledger): the
+engine's own edit hook lets those edits through, because ledger loss fails open. Every other
 answer, a missing engine or a timeout refuses the edit with the engine's reason: an unchecked
 edit can collide with a foreign reservation, where a refused one only costs the seat a retry.
 
@@ -33,7 +35,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_reservation  # noqa: E402
 import unit_runs  # noqa: E402
 
@@ -99,7 +101,7 @@ def decide(raw: str) -> int:
     for phase, phase_scopes in groups:
         berth_session = phase_reservation.phase_session_id(session_id, phase.phase) if phase else session_id
         answer = phase_reservation.check(root, phase_scopes, berth_session)
-        if answer.status == phase_reservation.UNCONFIGURED:
+        if answer.status in phase_reservation.FAILS_OPEN:
             return 0
         if answer.status != phase_reservation.CLEAR:
             return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")

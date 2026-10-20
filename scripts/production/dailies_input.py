@@ -558,7 +558,7 @@ def unit_phase_state(value: object, where: str, zone: ZoneInfo) -> UnitPhaseStat
 
 def phase_table_path() -> Path:
     configured = os.environ.get("DAILIES_PHASE_TABLE")
-    return Path(configured) if configured else Path(__file__).resolve().parent.parent / "delegate/phase_table.py"
+    return Path(configured) if configured else Path(__file__).resolve().parent.parent / "direct/phase_table.py"
 
 
 def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:

@@ -23,7 +23,7 @@ Then it stops everything the unit owns. It finds each thing by its own record, n
 pattern, and prints one line for each thing it stops and for each thing it leaves running, with
 the reason:
 
-1. Each Claude session that works in the worktree, the unit director and its Claude seats, stops
+1. Each Claude session that works in the worktree, the unit director and its Claude seats, and the director of each of the worktree's runs wherever it works, stops
    through `shutdown.py down`: it pauses and stops at its ready mark. Its restore is then forgotten,
    so no restart brings it back.
 2. Each run of the worktree with an app-server stops it and ends its Codex seats.
@@ -32,8 +32,11 @@ the reason:
    of each Mac claim on the worktree stops.
 5. Each process still working inside the worktree, a build or a test, gets SIGTERM.
 
-When nothing is left running, the Units row's Plan cell gets `(retired <date>, worktree removed)`,
-committed on the merge branch (the next merge push takes it out). Then the worktree, the local
+When nothing is left running, the Units row's Plan cell gets
+`(retired <date>, worktree removed, session <id>)`, committed on the merge branch (the next merge
+push takes it out). The session is the unit director's last one: the live session that carries the
+unit's mark, else the newest interactive transcript under the worktree. `/showrunner:resume_unit`
+resumes it. Then the worktree, the local
 branch and the origin branch are removed. When something still runs, nothing is marked or removed:
 the output says what, and a rerun resumes.
 

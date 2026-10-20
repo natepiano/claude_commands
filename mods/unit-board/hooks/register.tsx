@@ -125,7 +125,7 @@ const readAccounts = async ($: EngineInterface, opened: Map<string, OpenAccounts
   const isOpen = () => opened.get(ACCOUNTS) === active;
   try {
     const data = await loadAccounts(accountsCalls($), isOpen, paths => { if (isOpen()) active.paths = paths; });
-    await putAccounts($, { kind: 'accounts', data, zone: active.zone }, isOpen);
+    await putAccounts($, { kind: 'accounts', data, zone: active.zone, now: await $.clock.now() / 1000 }, isOpen);
   } catch {
     // Never include process output or a login in an error or command result.
     await putAccounts($, { kind: 'failed', reason: 'Stored accounts status could not be read.' }, isOpen);
@@ -137,9 +137,14 @@ const tickAccounts = async ($: EngineInterface, opened: Map<string, OpenAccounts
   const isOpen = () => opened.get(ACCOUNTS) === active;
   active.busy = true;
   try {
-    await refreshIfChanged({ stat: path => $.fs.stat(path) }, active.paths,
+    const regenerated = await refreshIfChanged({ stat: path => $.fs.stat(path) }, active.paths,
       () => loadAccounts(accountsCalls($), isOpen, paths => { if (isOpen()) active.paths = paths; }),
-      data => putAccounts($, { kind: 'accounts', data, zone: active.zone }, isOpen), isOpen);
+      async data => putAccounts($, { kind: 'accounts', data, zone: active.zone, now: await $.clock.now() / 1000 }, isOpen), isOpen);
+    if (regenerated || !isOpen()) return;
+    const state = (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined;
+    if (state?.kind === 'accounts') {
+      await putAccounts($, { ...state, now: await $.clock.now() / 1000 }, isOpen);
+    }
   } catch {
     await putAccounts($, { kind: 'failed', reason: 'Stored accounts status could not be read.' }, isOpen);
   } finally { active.busy = false; }
@@ -259,15 +264,15 @@ export const register: Register = on => {
     const state = (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined;
     const elements = $.ui.resolve(e);
     const { Text } = elements;
-    if (!state || state.kind === 'loading') return <Text color="subtle">Loading accounts…</Text>;
+    if (!state || state.kind === 'loading') return <Text color="inactive">Loading accounts…</Text>;
     if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
-    return AccountsView(elements, state.data, state.zone);
+    return AccountsView(elements, e.props.bodyColumns, state.data, state.zone, state.now);
   });
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const state = await readPane($, PANE);
     const elements = $.ui.resolve(e);
     const { Text } = elements;
-    if (!state || state.kind === 'loading') return <Text color="subtle">Loading unit board…</Text>;
+    if (!state || state.kind === 'loading') return <Text color="inactive">Loading unit board…</Text>;
     if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
     if (state.kind === 'unit') {
       const data = state.data.boards.find(board => board.production === state.production);

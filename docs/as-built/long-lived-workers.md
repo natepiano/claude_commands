@@ -55,11 +55,11 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 
 ### Launchers
 
-**`scripts/delegate/implement.sh [--to <worker>] <session_dir> [working_dir] [prompt_file] [task] [role_description] <pass_kind> [pass_activity] [fix_pass] <team_role> [mesh_prefix]`**
+**`scripts/direct/implement.sh [--to <worker>] <session_dir> [working_dir] [prompt_file] [task] [role_description] <pass_kind> [pass_activity] [fix_pass] <team_role> [mesh_prefix]`**
 
 - Without `--to`, it opens a new worker named by `worker_name.sh`. After the turn it writes the worker's identity file.
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
-  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`.
+  1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, model, worker_id}`. `model` is the model configured for the task and `worker_id` is the thread id. A mismatch fails with `has no matching durable worker identity`. A missing file with a roster thread for the name is not a mismatch: the claim writes the identity from the roster and continues. That resumes a reopened seat, and a fix worker of a run from before 2026-10-17, whose record the impl worker's replaced. A worker recorded under another slot is still refused.
   2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
   3. If the roster's `context_tokens` is an integer greater than `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On any other failure it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
@@ -68,7 +68,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 - It reads the threshold from `config/delegate.conf` (`PLAN_DELEGATE_CONFIG` can override the path). A missing, non-numeric or non-positive value exits 2 with an error naming the key.
 - A worker assigned a different role keeps its slot as the 9th argument and changes only the task and pass-kind words.
 
-**`scripts/delegate/review.sh [--to <worker> | --slot <new-slot> | --pool code|ui --lease <slug>/<unit>/<phase>] <session_dir> [working_dir] [prompt_file] [task] [role_description] [pass_activity] [pass_index] [lens] [early_ready_file]`**
+**`scripts/direct/review.sh [--to <worker> | --slot <new-slot> | --pool code|ui --lease <slug>/<unit>/<phase>] <session_dir> [working_dir] [prompt_file] [task] [role_description] [pass_activity] [pass_index] [lens] [early_ready_file]`**
 
 `lens` must be one of `adversary`, `contract`, `craft` or `ux`. Lens `ux` is the design check: it records no review pass, since the unit director's `UX review` activity carries that time. Findings and status are keyed by pass and lens, never by worker: `review_findings_<N>[_<lens>].txt`, `review_status[_<lens>]`. The agent log adds the seat, `review_agent_<N>[_<lens>]-<slot>.log` for a worker and `-pool` for a pool reviewer, so a second seat on the same pass cannot truncate the first one's log.
 
@@ -103,12 +103,12 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 - Every prompt carries the Three Gods sentence written out in full: opening, later-phase, repair, review and follow-up prompts alike. It also carries the Type Design Contract, verbatim for a new worker or as the allowed pointer for a follow-up. Compaction can erase earlier prompt text, which is why each prompt repeats them.
 - A new worker opens only when no open worker can take the work: the assignment needs more workers, every open worker is busy, or a reusable thread is gone. A replacement under the same name starts fresh and gets an opening prompt.
 
-`scripts/delegate/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` number after `impl` and `test`, in the order workers first appear: a `- **Agent N**` line in every report, and a round-table column under `progress --tables`. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
+`scripts/direct/progress_history.py` gives each extra worker (`review2`, `fix2`, …) its own `Agent N` number after `impl` and `test`, in the order workers first appear: a `- **Agent N**` line in every report, and a round-table column under `progress --tables`. A worker appears when it records a pass or receives a board handoff. The original `review` worker keeps its earlier rule: it shows only while a displayed stage assigns it.
 
 ### Cleanup
 
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. That removes Claude workers only and leaves Codex threads open. After a successful Claude session listing, and only under the real delegate root, it runs `codex_mesh.py sweep --stop` (best-effort). A sweep failure prints one line and worker cleanup continues.
-- **Run end.** `scripts/delegate/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. It is a plain scan: reading the director of all 224 live folders took about 25 ms (2026-10-17). The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
+- **Run end.** `scripts/direct/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. It is a plain scan: reading the director of all 224 live folders took about 25 ms (2026-10-17). The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
   1. one `remove_workers.py` call with a `--session-dir` per held run
   2. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
   3. one `sweep --root <root of the first held run> --stop`
@@ -160,12 +160,12 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 | File | Role |
 | --- | --- |
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
-| `scripts/delegate/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
-| `scripts/delegate/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
-| `scripts/delegate/end_session.sh` | Ends the workers of every run the director holds (`stop`) and sweeps |
-| `scripts/delegate/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
+| `scripts/direct/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
+| `scripts/direct/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
+| `scripts/direct/end_session.sh` | Ends the workers of every run the director holds (`stop`) and sweeps |
+| `scripts/direct/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
 | `scripts/lib/unit_runs.py` | `held`: every run folder a director holds |
-| `scripts/delegate/progress_history.py` | Agent columns for extra workers |
+| `scripts/direct/progress_history.py` | Agent columns for extra workers |
 | `scripts/whoami/worker_usage.py` | Before/after usage report over the usage store |
 | `scripts/usage/weights.py` | Dated per-model weights the report applies |
 | `scripts/usage/rollouts.py` | `is_edit`, used by the collector |

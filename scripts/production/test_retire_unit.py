@@ -17,19 +17,25 @@ from typing import TYPE_CHECKING, final, override
 from unittest import mock
 
 import retire_unit
+import unit_lookup
 import unit_move
+from herdr import HerdrPlace
 from add_unit import Production, read_production
 
 if TYPE_CHECKING:
+    from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
     from scripts.shutdown import record as shutdown_record
     from scripts.shutdown.record import SessionShutdown
 else:
     # retire_unit puts the message and shutdown folders on the path.
     import record as shutdown_record
+    import sessions
     from sessions import SessionRecord
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
+# The fixture replaces the lookup; a test of the lookup itself puts it back.
+CLAUDE_SESSIONS = retire_unit.claude_sessions
 SEAT = "22222222-2222-2222-2222-222222222222"
 
 
@@ -57,6 +63,8 @@ class RetireUnitTests(unittest.TestCase):
     calls: list[list[str]] = []
     claude: list[SessionRecord] = []
     pool_lines: str = ""
+    marked: unit_lookup.MarkedUnit | None = None
+    config: Path = Path()
 
     @override
     def setUp(self) -> None:
@@ -108,7 +116,7 @@ class RetireUnitTests(unittest.TestCase):
         def production_of(_slug: str) -> Production:
             return production
 
-        def claude_sessions(_worktree: Path) -> tuple[SessionRecord, ...]:
+        def claude_sessions(_worktree: Path, _ids: frozenset[str]) -> tuple[SessionRecord, ...]:
             return tuple(self.claude)
 
         def nothing_inside(_worktree: Path) -> list[int]:
@@ -129,6 +137,15 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", nothing_inside))
         _ = self.enterContext(mock.patch.object(retire_unit, "reservations", no_reservations))
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", no_records))
+        self.marked = unit_lookup.MarkedUnit(
+            "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
+
+        def marked_unit(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
+            return self.marked
+
+        self.config = self.root / "config"
+        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", marked_unit))
+        _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: [self.config]))
 
     def fake_run(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         """Git runs for real; every other command is recorded and answered."""
@@ -205,6 +222,16 @@ class RetireUnitTests(unittest.TestCase):
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(self.doc.read_text(encoding="utf-8"), before)
 
+    def test_a_run_director_working_outside_the_worktree_is_still_stopped(self) -> None:
+        director = session(DIRECTOR, "alpha", 4101)
+        elsewhere = session("33333333-3333-3333-3333-333333333333", "elsewhere", 4103)
+        with (mock.patch.object(retire_unit, "claude_sessions", CLAUDE_SESSIONS),
+              mock.patch.object(sessions, "live_sessions", return_value=[director, elsewhere])):
+            code, output = self.retire("--dry-run")
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"would stop: Claude session alpha ({DIRECTOR}, pid 4101), through shutdown down", output.splitlines())
+        self.assertNotIn("elsewhere", output)
+
     def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
         code, output = self.retire()
 
@@ -220,12 +247,28 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("stopped: reviewer code-1", output)
         self.assertIn("alpha-unit retired", output)
         row = next(line for line in self.doc.read_text(encoding="utf-8").splitlines() if line.startswith("| alpha-unit"))
-        self.assertRegex(row, r"^\| alpha-unit \| \(retired \d{4}-\d{2}-\d{2}, worktree removed\) docs/plans/alpha\.md \|")
+        self.assertRegex(row, r"^\| alpha-unit \| \(retired \d{4}-\d{2}-\d{2}, worktree removed, session "
+                         + DIRECTOR + r"\) docs/plans/alpha\.md \|")
         self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): retire alpha-unit")
         self.assertEqual(git(self.checkout, "status", "--porcelain", "--untracked-files=no"), "")
         self.assertFalse(self.worktree.exists())
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
         self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+
+    def test_a_stopped_director_is_found_by_its_newest_interactive_transcript(self) -> None:
+        self.marked = None
+        folder = self.config / "projects" / unit_move.project_folder(str(self.worktree))
+        folder.mkdir(parents=True)
+        for name, entrypoint, mtime in (("older", "cli", 100), (DIRECTOR, "cli", 200), (SEAT, "sdk-cli", 300)):
+            transcript = folder / f"{name}.jsonl"
+            _ = transcript.write_text('{"type": "summary"}\n' + json.dumps({"entrypoint": entrypoint}) + "\n",
+                                      encoding="utf-8")
+            os.utime(transcript, (mtime, mtime))
+
+        code, output = self.retire()
+
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"worktree removed, session {DIRECTOR}) docs/plans/alpha.md", self.doc.read_text(encoding="utf-8"))
 
     def test_a_reviewer_still_reviewing_keeps_the_unit_from_retiring(self) -> None:
         self.pool_lines = "code-1\tcode\talpha-unit:1\tbusy\t3\n"

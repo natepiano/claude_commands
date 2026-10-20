@@ -24,7 +24,9 @@ ENTRIES = (
     PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
         ActionTemplate("answer the open form"),
         "Reason: {operation} is blocked because {session}'s claude session is showing a form and it can't proceed.\n\n"
-        + "Or stop it instead, and the {operation} goes on without it. In a terminal on {machine}: {command}",
+        + "Answer the form (recommended): the session pauses, and the {operation} goes on.\n\n"
+        + "Stop the session: it ends, its uncommitted work stays, and the {operation} goes on without it. "
+        + "In a terminal on {machine}, run:\n\n{command}",
         (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
             "operation": "restart",
             "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),),
@@ -69,12 +71,12 @@ ENTRIES = (
         (PushExample("typical", {"machine": "natedev", "session": "Owner"}),
          PushExample("long_session", {"machine": "Mac", "session": "build-followups-message-clarity-unit-director-session-12"}))),
     PushText("quota.claude_next_move", "quota_alert", "note", "Claude work on {account} may stop",
-        ActionTemplate("In the natedev session, type /next_moves and the move you want, for example: when units reach 1% switch to claude2."),
+        ActionTemplate("In the natedev session, type /account_moves and the move you want, for example: when units reach 1% switch to claude2."),
         "{account} has {remaining} of its weekly usage left, and no move is set up for the units or showrunners on it. When it runs out, they move to a Claude account with room, or stop if none has any.",
         (PushExample("uncovered_low", {"account": "claude3", "remaining": "2%"}),
          PushExample("uncovered_empty", {"account": "claude4", "remaining": "0%"}))),
     PushText("quota.codex_next_move", "quota_alert", "note", "{account} Codex workers will {outcome_title}",
-        ActionTemplate("Optional: to move them at 1% instead, type in the natedev session: /next_moves when workers reach 1% switch to {fallback}"),
+        ActionTemplate("Optional: to move them at 1% instead, type in the natedev session: /account_moves when workers reach 1% switch to {fallback}"),
         "{account} has {remaining} of its weekly usage left{outcome_body} Nothing is needed.",
         (PushExample("credits_on", {"account": "codex2", "remaining": "2%", "fallback": "codex1",
                                    "outcome_title": "use paid credits",

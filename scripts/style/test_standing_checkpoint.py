@@ -157,7 +157,8 @@ class StandingCheckpointTests(unittest.TestCase):
                 finding = ledger.hold(self.rule, path, 2, "1", "type", "1", "2", rule_blob, "outside")
                 ledger.file_held(finding.finding_id, issue)
         _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
-                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_findings: [{finding.finding_id}]\n---\n')
+                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {self.rule}\nstyle_crate: alpha\n'
+                             + f'style_rule_blob: {rule_blob}\nstyle_count: 1\n---\n')
         _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {issue.parent}\n\n## Units"))
         result = self.refill()
         self.assertEqual(result.returncode, 0, result.stderr)

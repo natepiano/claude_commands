@@ -2119,7 +2119,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual((code, error.getvalue()), (0, ""))
         self.assertIn("units: would select claude3", output.getvalue())
         self.assertIn(f"{off['name']}: {off['session_id']}", output.getvalue())
-        self.assertIn("reap and restart now", output.getvalue())
+        self.assertIn("will stop and move now", output.getvalue())
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
@@ -2434,12 +2434,18 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(command[command.index("--to") + 1], "claude2")
 
     def test_status_without_group_file_does_not_infer_live_members_accounts(self) -> None:
-        """F004: read-only status reports missing configuration despite live members."""
+        """Status reports missing group accounts even when their sessions are live."""
         _ = self.owner("unit-one", host="unit")
         _ = self.owner("runner", host="herdr", label="claude3")
         before = self.snapshot()
-        self.assertIn("units: not configured", accounts.status_report())
-        self.assertIn("showrunners: not configured", accounts.status_report())
+        output = accounts.status_report()
+        for group in ("units", "showrunners"):
+            self.assertEqual(output.splitlines().count(
+                f"accounts: {group} has no account; run accounts.py move {group} <claudeN>"), 1)
+        rows = [line for line in output.splitlines() if line.startswith("|")][2:]
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row.split("|")[3].strip(), "")
         self.assertEqual(self.snapshot(), before)
 
     def test_refused_unconfigured_groups_report_setup_and_move_no_members(self) -> None:

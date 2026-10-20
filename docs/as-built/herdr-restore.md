@@ -30,13 +30,12 @@ The settings.json entry, one more SessionStart item:
 
 ## Pane restore (checkpoint 2)
 
-- Each entry also holds `flags_read` (false when the hook found no Claude argv, as on the Mac
-  without `/proc`) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
+- Each entry also holds `flags_read` (false when the hook found no Claude argv) and `ended`. `scripts/hooks/session-end-pane-record.py` sets `ended` at
   SessionEnd for any reason but `other`: `/exit` and logout mark it, a signal at a reboot or a
   crash does not. An end only marks the entry of the same conversation.
 - `pane_record.py seed [--session NAME]` writes the entries of the Claudes running now: the argv
-  and cwd from herdr's `pane process-info`, the environment from `/proc/<pid>/environ`, and the
-  conversation id from `<config>/sessions/<pid>.json`. Linux only. It needs no
+  and cwd from herdr's `pane process-info`, the environment of the process, and the
+  conversation id from `<config>/sessions/<pid>.json`. It needs no
   `report-agent-session`: a restore takes the id from the entry and checks herdr's
   `agent_session` only when the pane has one.
 - `scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]` (the shared session by
@@ -81,39 +80,52 @@ Steps on natedev, in order, after promotion:
 1. herdr `~/.config/herdr/config.toml`: add `[session]` with `resume_agents_on_restore = false`,
    then `herdr --session agents server reload-config`.
 2. `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_record.py seed` once.
-3. The nixos units (`modules/linux/agent-sessions.nix` or a new `herdr.nix`) below, then rebuild.
-   The shared server running now is the transient unit `herdr-agents.service` that
-   `systemd-run` made, the same name. Not tested: how the rebuild treats a unit file under the name
-   of an active transient unit. After the rebuild, check `systemctl --user status
-   herdr-agents.service` and that only one `herdr --session agents server` runs. The boot unit
-   takes over at the next reboot.
+3. The nixos units below, added to `modules/linux/herdr.nix`, then
+   rebuild. The shared server running now is the transient unit `herdr-agents.service` that
+   `systemd-run` made, the same name, and the transient file wins while it runs. Not tested: how
+   the rebuild treats a unit file under the name of an active transient unit. After the rebuild,
+   check `systemctl --user status herdr-agents.service` and that only one
+   `herdr --session agents server` runs. The boot unit takes over at the next reboot. Linger is
+   off, so both units start at login. Both take the user manager's PATH, as the transient unit
+   does now.
 
 ```nix
-systemd.user.services.herdr-agents = {
-  description = "The shared herdr session, from login";
-  wantedBy = [ "default.target" ];
-  serviceConfig = {
-    Environment = "PATH=/etc/profiles/per-user/${username}/bin:/run/current-system/sw/bin";
-    ExecStart = "/etc/profiles/per-user/${username}/bin/herdr --session agents server";
-    # The restore takes minutes; its own unit keeps it out of this unit's start time.
-    ExecStartPost = "/run/current-system/sw/bin/systemctl --user start --no-block herdr-agents-restore.service";
-    Restart = "on-failure";
-    RestartSec = 5;
+{ inputs, pkgs, ... }:
+{
+  # environment.systemPackages as now.
+
+  systemd.user.services.herdr-agents = {
+    description = "The shared herdr session, from login";
+    wantedBy = [ "default.target" ];
+    serviceConfig = {
+      ExecStart = "/run/current-system/sw/bin/herdr --session agents server";
+      # The restore takes minutes; its own unit keeps it out of this unit's start time.
+      ExecStartPost = "/run/current-system/sw/bin/systemctl --user start --no-block herdr-agents-restore.service";
+      Restart = "on-failure";
+      RestartSec = 5;
+    };
   };
-};
-systemd.user.services.herdr-agents-restore = {
-  description = "Resume each herdr pane's Claude on its own account";
-  after = [ "herdr-agents.service" ];
-  serviceConfig = {
-    Type = "oneshot";
-    Environment = "PATH=/etc/profiles/per-user/${username}/bin:/run/current-system/sw/bin";
-    ExecStart = "%h/.claude/scripts/lib/py %h/.claude/scripts/shutdown/pane_restore.py";
+  systemd.user.services.herdr-agents-restore = {
+    description = "Resume each herdr pane's Claude on its own account";
+    after = [ "herdr-agents.service" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = "%h/.claude/scripts/lib/py %h/.claude/scripts/shutdown/pane_restore.py";
+      # Up to 90 s per pane; the 90 s default start timeout would kill it.
+      TimeoutStartSec = "1h";
+    };
   };
-};
+}
 ```
+
+- The Mac has no `/proc`. There `pane_record` reads a parent with `ps -o ppid= -p <pid>`, and the
+  arguments and environment from the kernel's KERN_PROCARGS2 record (`account.kern_procargs2`,
+  split by `account.procargs2_parts`). On both machines an environment keeps only
+  `CLAUDE_CONFIG_DIR` and the names the entry keeps; every other value, a token included, is
+  dropped as it is read. The Mac hides the environment of a system binary such as `/bin/zsh`,
+  never of Claude.
 
 ## Still to come
 
-- The Mac: a launchd agent, the Mac desktop rule for herdr, and the flags read with
-  `ps -o ppid=,args= -p <pid>` (herdr review, 2026-10-19).
+- The Mac: a launchd agent and the Mac desktop rule for herdr.
 - Last: retire `agent-sessions-snapshot.timer` after one real reboot restores every pane.

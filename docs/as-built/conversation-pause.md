@@ -82,7 +82,7 @@ For five minutes after automatic return, a late yes reports that updates already
 
 ### Closing progress
 
-`scripts/delegate/progress_history.py` represents the report target as:
+`scripts/direct/progress_history.py` represents the report target as:
 
 ```python
 ReportedPassWindow | ReportedActivityWindow | NoReportedWindow

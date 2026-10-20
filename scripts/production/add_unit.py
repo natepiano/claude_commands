@@ -240,14 +240,6 @@ class NoMarkedUnit:
     """No session carries the requested unit's marks."""
 
 
-def is_review_unit(unit: str, lines: list[str]) -> bool:
-    """Whether `unit` is the review unit of the production doc whose lines these are.
-
-    The review unit runs `/review:direct` and is idle by design between reviews.
-    """
-    return unit == "review-unit" and any(line.startswith("- **Review pool:** ") for line in lines)
-
-
 def read_production(path: Path) -> Production:
     """Read the production fields shared with merge_checkpoint.py."""
     try:
@@ -390,6 +382,8 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
     # A restore creates no worktree or branch, so the naming pattern behind `request.worktree` and
     # `request.branch` neither reserves them against other rows nor has to match the unit's own row.
     restoring = isinstance(request.launch_kind, UnitRestoreLaunch)
+    # A resumed session also runs in its row's worktree, whatever the naming rule now gives.
+    row_names_place = restoring or isinstance(request.session, ResumedSession)
     matching: list[ExistingUnitRow] = []
     for cells in unit_table(lines):
         fields = {heading: cell_value(cell) for heading, cell in cells.items()}
@@ -407,7 +401,7 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
     if not matching:
         return NoUnitRow()
     existing = matching[0]
-    pattern_cells = () if restoring else (("Worktree", existing.worktree, str(request.worktree)),
+    pattern_cells = () if row_names_place else (("Worktree", existing.worktree, str(request.worktree)),
                                           ("Branch", existing.branch, request.branch))
     for cell, actual, expected in (("Plan", existing.plan, request.plan_cell), *pattern_cells):
         if actual != expected:
@@ -509,6 +503,10 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         if isinstance(existing, NoUnitRow):
             raise Refusal(f"unit {request.unit} has no Units row; a restore never adds one")
         # Its row, not the naming pattern, names a restored unit's worktree and branch.
+        request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
+    elif isinstance(request.session, ResumedSession) and isinstance(existing, ExistingUnitRow):
+        if request.session.cwd != Path(existing.worktree).expanduser().resolve():
+            raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
         production=request.production,
@@ -664,7 +662,6 @@ def prompt_for(request: UnitLaunch) -> str:
             prompt += " " + request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
         return prompt
     plan = request.plan_path.as_posix()
-    review_unit = is_review_unit(request.identity.unit, production.doc.read_text(encoding="utf-8").splitlines())
     if isinstance(request.session, ResumedSession):
         plan = str(request.worktree / request.plan_path)
         identity = (f"You are now {request.identity.unit} in production {production.slug} (doc {doc}), under "
@@ -674,12 +671,8 @@ def prompt_for(request: UnitLaunch) -> str:
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             note = request.launch_kind.note.read_text(encoding="utf-8").rstrip("\n")
             return f"{identity} {note}"
-        if review_unit:
-            return f"{identity} Run /review:direct {doc}."
         return f"{identity} Run /unit:direct {plan}."
     if isinstance(request.plan, PlanGiven):
-        if review_unit:
-            return f"/review:direct {doc}"
         return f"/unit:direct {plan}"
     return (f"You are {request.identity.unit} in production {production.slug} (doc {doc}), under "
             f"{showrunner}. Work only in your worktree {request.worktree}, "
@@ -693,7 +686,7 @@ def host_session_name(request: UnitLaunch) -> str:
     """The destination name, limited to characters supported by named herdr sessions.
 
     A new launch's name leads with the production slug, since every production may have a unit of
-    the same name (each has a review-unit). A restore keeps the name its session was recorded under
+    the same name (each had a review-unit). A restore keeps the name its session was recorded under
     when that name leads with the slug; a record from before the slug led, such as `review`, would
     take another production's live session of that name, so it gets the new launch's name instead.
     """

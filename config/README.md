@@ -38,7 +38,7 @@ next run, so a change is immediate:
 
 - `/unit:style_review` — the phase's main review or a run by hand
 - `scripts/lint/invoke.sh` — the lint CLI and
-  `scripts/delegate/verify.sh`'s `lint` and `fmt` arms
+  `scripts/direct/verify.sh`'s `lint` and `fmt` arms
 
 Deliberately not gated: `verify.sh check`/`test`/`example`, the workspace check
 and test inside `verify.sh final`, `pre_release_checks.sh`, and
@@ -83,23 +83,12 @@ hard ceiling (5). The rest bound the other patterns worth reporting:
 agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
-`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout and the
-default interval of a Claude unit's notifier instance. It is read by
-`scripts/delegate/unit_notifier.sh` and by the main agent per
-`<ProgressContract/>` in `commands/unit/direct.md`, not by `findings.py`.
-Claude units do not launch `progress_timer.sh`. A missing or non-numeric value
-makes the notifier use 900 seconds; Codex requires a positive integer. It is
-3600, one hour (user, 2026-10-10). After changing it,
-`unit_notifier.sh --all` retimes every unit run's instance to the new value,
-or to `--all <minutes>`, and leaves each one on or off.
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
+`<CodexDispatchWait/>` in `commands/unit/direct.md`; Codex requires a positive
+integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
+someone asks (2026-10-19): no notifier instance or timer sends them.
 
-`PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`, or no line, gives a new Claude
-unit run no notifier instance, so `/unit:report` runs only when someone asks
-for it; `/unit:report on` makes the instance then. `scheduled` makes it at
-every run's start. A resumed run that already has an instance keeps it, on or
-off. It is `on-demand` (user, 2026-10-13: no timer unless asked).
-
-`scripts/delegate/findings.py` reads the file at startup, so an edit applies to
+`scripts/direct/findings.py` reads the file at startup, so an edit applies to
 the next `findings.py gate` with nothing to restart. The file is authoritative:
 no limit has a compiled default, so a missing key, a non-numeric value, or a
 value below its minimum makes `findings.py` list every problem it found and
@@ -149,7 +138,9 @@ roster.
 ## statusline.conf
 
 Colors for each role and account in the status line, plus usage-level colors
-and thresholds for context tokens used and quota percentages left.
+and thresholds for context tokens used and quota percentages left. `counts.<type>`
+colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,
+`proposals` and `projects`.
 `scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;
 an edit applies on the next refresh. A missing or bad entry leaves that piece
 uncolored. Colors use ANSI names (`cyan`, `bright-magenta`, and so on) or the

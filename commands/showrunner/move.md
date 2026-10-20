@@ -19,7 +19,7 @@ When it finishes, print its output exactly as it comes, with nothing added.
   moves every live member not already on it, across all productions; for
   `showrunners`, this one included. A showrunner with no session under the id
   its timer names is left where it is and named.
-- `--dry-run`: for a group, show each off-target name/id, source account and `move when idle` or `reap and restart now` with its reason; change nothing. In this terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id|name> <target> --dry-run` previews one ad hoc session.
+- `--dry-run`: for a group, show each off-target name/id, source account and `will move once idle` or `will stop and move now` with its reason; change nothing. In this terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move <session-id|name> <target> --dry-run` previews one ad hoc session.
 - `--why <text>`: the reason each session reads when it is back.
 
 A fresh target at zero usage with no credits refuses before writes and gives the picker command. A missing or stale target reading is named and permits the move. Idle members stop with no pause; busy members get `Pause for move: …` and stop after marking ready, or once idle after the pause. A transcript refusal or fresh exhausted source reading reaps and restarts immediately. Supervised windows, including sessions started by numbered account aliases, retain their window and scroll history.

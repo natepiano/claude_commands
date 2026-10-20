@@ -26,15 +26,15 @@ SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
-                 colors: Path | str = "", showrunners: str = "", showrunner: str = "",
-                 **marks: str) -> list[str]:
+                 colors: Path | str = "", showrunners: str = "", showrunner: str = "", own: str = "",
+                 counts: str = "", **marks: str) -> list[str]:
     """Run statusline.jq once over every input and return its output lines.
 
     `colors` is a file path or temporary config text; empty text omits the argument.
     """
     stdin = "\n".join(json.dumps(each) for each in inputs)
     stored = [] if labels is None else ["--slurpfile", "labels", str(labels)]
-    parent = ["--arg", "showrunner", showrunner]
+    parent = ["--arg", "showrunner", showrunner, "--arg", "own", own, "--arg", "counts", counts]
     with tempfile.TemporaryDirectory() as directory:
         configured: list[str] = []
         if colors:
@@ -69,7 +69,7 @@ class ColorTests(unittest.TestCase):
     def test_direct_jq_reads_the_showrunner_record_text_and_colors_the_entire_role(self) -> None:
         record = ShowrunnerRecord(sessionId="parent-id", name="live production")
         line = status_lines({}, showrunner=json.dumps(record), colors=SHIPPED_COLORS, SHOWRUNNER_UNIT="show")[0]
-        self.assertEqual(line.split(" | ")[0], "\x1b[94munit director for live production\x1b[0m")
+        self.assertEqual(line.split(" | ")[0], "\x1b[94munit for live production\x1b[0m")
 
     def test_direct_jq_with_invalid_or_non_object_showrunner_text_keeps_both_lines(self) -> None:
         payload = {**limits({"used_percentage": 38}, {"used_percentage": 60}),
@@ -78,14 +78,31 @@ class ColorTests(unittest.TestCase):
             with self.subTest(record=record):
                 self.assertEqual(status_lines(payload, showrunner=record, colors=SHIPPED_COLORS,
                                               SHOWRUNNER_UNIT="show"), [
-                    "\x1b[94munit director\x1b[0m | project | 0 | Opus",
-                    "\x1b[36mclaude1\x1b[0m | weekly \x1b[92m40% left\x1b[0m",
+                    "\x1b[94munit\x1b[0m | /tmp/project",
+                    "\x1b[38;5;137mclaude1\x1b[0m | Opus | weekly \x1b[92m40% left\x1b[0m",
                 ])
+
+    def test_the_user_s_examples_render_the_role_with_its_path_then_the_account_model_tokens_and_weekly(self) -> None:
+        home = os.environ["HOME"]
+        payload = {**limits({"used_percentage": 20}, {"used_percentage": 9}), "session_id": "sid",
+                   "model": {"display_name": "Opus 5.5"}, "effort": {"level": "high"},
+                   "context_window": ContextWindow(total_input_tokens=103_438, context_window_size=250_000)}
+        own = json.dumps({"sessionId": "sid", "name": "natedev"})
+        for cwd, path in (("/etc/nixos/", "/etc/nixos"), (f"{home}/rust/hana_catalyst", "~/rust/hana_catalyst"),
+                          (home, "~"), (f"{home}x/elsewhere", f"{home}x/elsewhere"), ("/", "/")):
+            with self.subTest(cwd=cwd):
+                self.assertEqual(status_lines({**payload, "workspace": {"current_dir": cwd}}, showrunners="sid", own=own), [
+                    f"natedev showrunner | {path}", "claude1 | Opus 5.5 high | 103,438 | weekly 91% left"])
+        record = ShowrunnerRecord(sessionId="parent-id", name="hana")
+        unit = json.dumps({"sessionId": "sid", "name": "cables"})
+        lines = status_lines({**payload, "workspace": {"current_dir": f"{home}/rust/hana_catalyst_cables"}},
+                             showrunner=json.dumps(record), own=unit, SHOWRUNNER_UNIT="hana")
+        self.assertEqual(lines[0], "cables unit for hana | ~/rust/hana_catalyst_cables")
 
     def test_shipped_role_colors_and_unassigned(self) -> None:
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("\x1b[95mshowrunner\x1b[0m", "session-id", {}),
-            ("\x1b[94munit director\x1b[0m", "", {"SHOWRUNNER_UNIT": "unit"}),
+            ("\x1b[94munit\x1b[0m", "", {"SHOWRUNNER_UNIT": "unit"}),
             ("\x1b[96mworker\x1b[0m", "", {"PLAN_DELEGATE_TEAM_ROLE": "impl", "SHOWRUNNER_UNIT": "unit"}),
             ("\x1b[38;5;141munassigned\x1b[0m", "", {}),
         )
@@ -99,7 +116,7 @@ class ColorTests(unittest.TestCase):
 
     def test_shipped_account_colors_and_unknown_label(self) -> None:
         for account, expected in (
-            ("claude1", "\x1b[36mclaude1\x1b[0m"), ("claude2", "\x1b[35mclaude2\x1b[0m"),
+            ("claude1", "\x1b[38;5;137mclaude1\x1b[0m"), ("claude2", "\x1b[35mclaude2\x1b[0m"),
             ("claude3", "\x1b[34mclaude3\x1b[0m"), ("claude4", "\x1b[38;5;208mclaude4\x1b[0m"),
             ("claude99", "claude99"),
         ):
@@ -140,7 +157,7 @@ class ColorTests(unittest.TestCase):
                              (89_000, 93), (89_999, 93), (90_000, 91)):
             with self.subTest(tokens=tokens):
                 payload = ContextInput(context_window=ContextWindow(total_input_tokens=tokens, context_window_size=100_000))
-                field = status_lines(payload, colors=SHIPPED_COLORS)[0].split(" | ")[2]
+                field = status_lines(payload, colors=SHIPPED_COLORS)[1].split(" | ")[1]
                 self.assertEqual(field, f"\x1b[{code}m{tokens:,}\x1b[0m")
 
     def test_tokens_without_a_positive_window_size_are_uncolored(self) -> None:
@@ -148,7 +165,7 @@ class ColorTests(unittest.TestCase):
                        ContextWindow(total_input_tokens=90_000, context_window_size=0),
                        ContextWindow(total_input_tokens=90_000, context_window_size=-1)):
             with self.subTest(window=window):
-                self.assertEqual(status_lines(ContextInput(context_window=window), colors=SHIPPED_COLORS)[0].split(" | ")[2], "90,000")
+                self.assertEqual(status_lines(ContextInput(context_window=window), colors=SHIPPED_COLORS)[1].split(" | ")[1], "90,000")
 
     def test_each_usage_window_colors_the_integer_left_at_both_thresholds(self) -> None:
         for name, index in (("5-hour", 1), ("weekly", -1)):
@@ -175,13 +192,11 @@ class ColorTests(unittest.TestCase):
                 with self.subTest(family=family, threshold=threshold):
                     config = SHIPPED_COLORS.read_text(encoding="utf-8") + f"\n{family}.{threshold}=not-a-number\n"
                     lines = status_lines({**payload, **usage}, colors=config)
-                    account = "\x1b[36mclaude1\x1b[0m"
+                    account = "\x1b[38;5;137mclaude1\x1b[0m"
                     if family == "tokens":
-                        self.assertEqual(lines[0].split(" | ")[2], "90,000")
-                        self.assertEqual(lines[1], f"{account} | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[93m10% left\x1b[0m")
+                        self.assertEqual(lines[1], f"{account} | 90,000 | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[93m10% left\x1b[0m")
                     else:
-                        self.assertEqual(lines[1], f"{account} | 5-hour 5% left | weekly 10% left")
-                        self.assertEqual(lines[0].split(" | ")[2], "\x1b[91m90,000\x1b[0m")
+                        self.assertEqual(lines[1], f"{account} | \x1b[91m90,000\x1b[0m | 5-hour 5% left | weekly 10% left")
 
     def test_colors_wrap_only_the_fields_and_preserve_both_plain_lines(self) -> None:
         reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
@@ -193,9 +208,24 @@ class ColorTests(unittest.TestCase):
         colored = status_lines(payload, showrunners="sid", colors=SHIPPED_COLORS)
         self.assertEqual([ANSI.sub("", line) for line in colored], plain)
         self.assertEqual(colored, [
-            "\x1b[95mshowrunner\x1b[0m | project | \x1b[93m80,000\x1b[0m | Opus high",
-            "\x1b[36mclaude1\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
+            "\x1b[95mshowrunner\x1b[0m | /tmp/project",
+            "\x1b[38;5;137mclaude1\x1b[0m | Opus high | \x1b[93m80,000\x1b[0m | 5-hour \x1b[93m9% left\x1b[0m until 07:00 EST | weekly \x1b[91m5% left\x1b[0m until Thu 07:00 EST",
         ])
+
+    def test_the_counts_row_colors_each_part_by_its_type_and_keeps_the_number_bold(self) -> None:
+        row = "sid For you: 1 question, 2 changes, 130 efficiency, 2 proposals, 3 projects"
+        line = status_lines({"session_id": "sid"}, colors=SHIPPED_COLORS, counts=row)[-1]
+        self.assertEqual(line, "For you: \x1b[91m\x1b[1m1\x1b[22m question\x1b[0m, "
+                         + "\x1b[96m\x1b[1m2\x1b[22m changes\x1b[0m, "
+                         + "\x1b[92m\x1b[1m130\x1b[22m efficiency\x1b[0m, "
+                         + "\x1b[38;5;141m\x1b[1m2\x1b[22m proposals\x1b[0m, "
+                         + "\x1b[38;5;208m\x1b[1m3\x1b[22m projects\x1b[0m")
+
+    def test_a_counts_type_without_a_color_key_keeps_only_its_bold_number(self) -> None:
+        row = "sid For you: 2 questions, 1 change, 1 project"
+        line = status_lines({"session_id": "sid"}, colors="counts.questions=bright-red\n", counts=row)[-1]
+        self.assertEqual(line, "For you: \x1b[91m\x1b[1m2\x1b[22m questions\x1b[0m, "
+                         + "\x1b[1m1\x1b[22m change, \x1b[1m1\x1b[22m project")
 
 
 def limits(five_hour: dict[str, float | None], seven_day: dict[str, float | None]) -> dict[str, object]:
@@ -383,7 +413,7 @@ class RoleTests(unittest.TestCase):
                 for name in ("initial production", "renamed production"):
                     self.showrunner_record(os.getpid(), name)
                     role = self.command_lines({}, shell=shell, SHOWRUNNER_UNIT="show")[0].split(" | ")[0]
-                    self.assertEqual(role, f"\x1b[94munit director for {name}\x1b[0m")
+                    self.assertEqual(role, f"\x1b[94munit for {name}\x1b[0m")
 
     def test_a_named_session_leads_the_first_line_with_its_own_name(self) -> None:
         self.timer("showrunner-show", "session:parent-id")
@@ -394,10 +424,10 @@ class RoleTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 role = self.command_lines({"session_id": "own-id"}, shell=shell, SHOWRUNNER_UNIT="show")[0]
                 # The name takes the role's color: one color span holds both.
-                self.assertEqual(role.split(" | ")[0], "\x1b[94mherdr-trust - unit director for natedev\x1b[0m")
+                self.assertEqual(role.split(" | ")[0], "\x1b[94mherdr-trust unit for natedev\x1b[0m")
                 # A record whose session id is another session's names nobody.
                 other = self.command_lines({"session_id": "other-id"}, shell=shell, SHOWRUNNER_UNIT="show")[0]
-                self.assertEqual(ANSI.sub("", other).split(" | ")[0], "unit director for natedev")
+                self.assertEqual(ANSI.sub("", other).split(" | ")[0], "unit for natedev")
         self.timer("showrunner-own", "session:own-id")
         for shell in SHELLS:
             with self.subTest(shell=shell, role="showrunner"):
@@ -414,8 +444,8 @@ class RoleTests(unittest.TestCase):
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 self.assertEqual(self.command_lines(payload, shell=shell, SHOWRUNNER_UNIT="show"), [
-                    "\x1b[94munit director\x1b[0m | project | 0 | Opus",
-                    "weekly \x1b[92m40% left\x1b[0m",
+                    "\x1b[94munit\x1b[0m | /tmp/project",
+                    "Opus | weekly \x1b[92m40% left\x1b[0m",
                 ])
 
     def test_unit_director_without_a_notifier_conf_keeps_the_plain_role_name(self) -> None:
@@ -423,7 +453,7 @@ class RoleTests(unittest.TestCase):
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 role = self.command_lines({}, shell=shell, SHOWRUNNER_UNIT="show")[0].split(" | ")[0]
-                self.assertEqual(role, "\x1b[94munit director\x1b[0m")
+                self.assertEqual(role, "\x1b[94munit\x1b[0m")
 
     def test_unit_director_with_no_matching_record_or_an_empty_sessions_directory_still_renders(self) -> None:
         self.timer("showrunner-show", "session:parent-id")
@@ -435,7 +465,7 @@ class RoleTests(unittest.TestCase):
             for shell in SHELLS:
                 with self.subTest(state=state, shell=shell):
                     role = self.command_lines({}, shell=shell, SHOWRUNNER_UNIT="show")[0].split(" | ")[0]
-                    self.assertEqual(role, "\x1b[94munit director\x1b[0m")
+                    self.assertEqual(role, "\x1b[94munit\x1b[0m")
 
     def test_unit_director_ignores_a_showrunner_record_after_its_process_has_exited(self) -> None:
         self.timer("showrunner-show", "session:parent-id")
@@ -445,7 +475,7 @@ class RoleTests(unittest.TestCase):
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 role = self.command_lines({}, shell=shell, SHOWRUNNER_UNIT="show")[0].split(" | ")[0]
-                self.assertEqual(role, "\x1b[94munit director\x1b[0m")
+                self.assertEqual(role, "\x1b[94munit\x1b[0m")
 
     def test_unit_director_with_an_empty_or_missing_showrunner_name_keeps_the_plain_role_name(self) -> None:
         self.timer("showrunner-show", "session:parent-id")
@@ -454,7 +484,7 @@ class RoleTests(unittest.TestCase):
             for shell in SHELLS:
                 with self.subTest(name=name, shell=shell):
                     role = self.command_lines({}, shell=shell, SHOWRUNNER_UNIT="show")[0].split(" | ")[0]
-                    self.assertEqual(role, "\x1b[94munit director\x1b[0m")
+                    self.assertEqual(role, "\x1b[94munit\x1b[0m")
 
     def test_worker_with_a_matching_showrunner_record_keeps_the_worker_role(self) -> None:
         self.timer("showrunner-show", "session:parent-id")
@@ -480,7 +510,7 @@ class RoleTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 role = self.command_lines({}, shell=shell, SHOWRUNNER_UNIT="show",
                                           CLAUDE_CONFIG_DIR=str(self.home / ".claude4"))[0].split(" | ")[0]
-                self.assertEqual(role, "\x1b[94munit director for cross-account production\x1b[0m")
+                self.assertEqual(role, "\x1b[94munit for cross-account production\x1b[0m")
 
     @unittest.skipUnless(shutil.which("zsh"), "zsh is not installed")
     def test_zsh_settings_command_renders_both_lines_without_any_notifier_directory(self) -> None:
@@ -492,8 +522,8 @@ class RoleTests(unittest.TestCase):
         lines = self.command_lines(payload, shell="zsh")
 
         self.assertEqual(lines, [
-            "\x1b[38;5;141munassigned\x1b[0m | project | 0 | Opus",
-            "weekly \x1b[92m40% left\x1b[0m",
+            "\x1b[38;5;141munassigned\x1b[0m | /tmp/project",
+            "Opus | weekly \x1b[92m40% left\x1b[0m",
         ])
         self.assertFalse((self.home / ".local/state/notifier").exists())
 
@@ -506,8 +536,8 @@ class RoleTests(unittest.TestCase):
                    "model": {"display_name": "Opus"},
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
         self.assertEqual(self.command_lines(payload, CLAUDE_CONFIG_DIR=str(config), SHOWRUNNER_UNIT="unit"), [
-            "\x1b[94munit director\x1b[0m | project | \x1b[91m90,000\x1b[0m | Opus",
-            "\x1b[38;5;208mclaude4\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
+            "\x1b[94munit\x1b[0m | /tmp/project",
+            "\x1b[38;5;208mclaude4\x1b[0m | Opus | \x1b[91m90,000\x1b[0m | 5-hour \x1b[91m5% left\x1b[0m | weekly \x1b[92m11% left\x1b[0m",
         ])
 
     def test_settings_command_with_a_missing_config_keeps_plain_text(self) -> None:
@@ -519,8 +549,8 @@ class RoleTests(unittest.TestCase):
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
         self.assertEqual(self.command_lines(payload, command=command, PLAN_DELEGATE_TEAM_ROLE="impl"), [
-            f"worker | {self.home.name} | 90,000 | ",
-            "5-hour 5% left | weekly 10% left",
+            "worker | ~",
+            "90,000 | 5-hour 5% left | weekly 10% left",
         ])
 
     def role(self, session_id: str = "aaaa-1111", **marks: str) -> str:
@@ -557,7 +587,7 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(self.role(NOTIFIER_STATE_DIR=str(moved)), "showrunner")
 
     def test_a_unit_mark_is_a_unit_director(self) -> None:
-        self.assertEqual(self.role(SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID="trunk-unit"), "unit director")
+        self.assertEqual(self.role(SHOWRUNNER_UNIT="show", SHOWRUNNER_UNIT_ID="trunk-unit"), "unit")
 
     def test_an_empty_unit_mark_is_unassigned(self) -> None:
         self.assertEqual(self.role(SHOWRUNNER_UNIT=""), "unassigned")
@@ -627,17 +657,37 @@ class CountsRowTests(unittest.TestCase):
             with self.subTest(shell=shell):
                 lines = self.lines(shell=shell)
                 self.assertTrue(lines[0].startswith("showrunner | "), lines)
-                self.assertEqual(lines[-1], "For you: 1 project, 1 question")
-                self.assertNotIn("For you: 1 project, 1 question", self.lines("bbbb-2222", shell=shell))
+                self.assertEqual(lines[-1], "For you: 1 question, 1 project")
+                self.assertNotIn("For you: 1 question, 1 project", self.lines("bbbb-2222", shell=shell))
 
-    def test_each_count_in_the_row_is_bold(self) -> None:
+    def test_each_count_in_the_row_is_bold_inside_its_shipped_color(self) -> None:
         _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
         self.questions(*(OutstandingItem(since="2026-10-16T19:00", text=f"Q{n}") for n in range(12)))
         env = {"PATH": os.environ["PATH"], "HOME": str(self.home)}
         result = subprocess.run(["/bin/sh", "-c", COMMAND], input=json.dumps({"session_id": "aaaa-1111"}),
                                 capture_output=True, text=True, check=True, env=env, cwd=self.home)
         self.assertEqual(result.stdout.splitlines()[-1],
-                         "For you: \x1b[1m1\x1b[22m project, \x1b[1m12\x1b[22m questions")
+                         "For you: \x1b[91m\x1b[1m12\x1b[22m questions\x1b[0m, "
+                         + "\x1b[38;5;208m\x1b[1m1\x1b[22m project\x1b[0m")
+
+    def test_the_row_counts_efficiency_and_refreshes_when_the_ledger_changes(self) -> None:
+        ledger = self.home / "efficiency.md"
+        doc = self.home / "docs/plans/show-production.md"
+        _ = doc.write_text(doc.read_text(encoding="utf-8") + f"- **Efficiency ledger:** {ledger}\n",
+                           encoding="utf-8")
+        _ = self.ledger.write_text("- 2026-10-19 Project (project.md) — proposed\n", encoding="utf-8")
+        self.questions({"since": "2026-10-19T04:00", "text": "Review the study"})
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                _ = ledger.write_text("- 2026-10-19 config: First — proposed\n"
+                                      + "- 2026-10-19 messages: Second — deferred\n"
+                                      + "- 2026-10-19 rust: Done — accepted, applied\n", encoding="utf-8")
+                self.assertEqual(self.lines(shell=shell)[-1],
+                                 "For you: 1 question, 2 efficiency, 1 project")
+                _ = ledger.write_text("- 2026-10-19 config: First — accepted, applied\n"
+                                      + "- 2026-10-19 messages: Second — deferred\n", encoding="utf-8")
+                self.assertEqual(self.lines(shell=shell)[-1],
+                                 "For you: 1 question, 1 efficiency, 1 project")
 
     def test_nothing_counted_shows_no_row(self) -> None:
         self.assertEqual(len(self.lines()), 1)
@@ -655,7 +705,7 @@ class CountsRowTests(unittest.TestCase):
                 self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 questions")
                 # The ledger did not exist, so its folder stands in until it appears.
                 _ = self.ledger.write_text("- 2026-10-16 Idea (idea.md) — proposed\n", encoding="utf-8")
-                self.assertEqual(self.lines(shell=shell)[-1], "For you: 1 project, 2 questions")
+                self.assertEqual(self.lines(shell=shell)[-1], "For you: 2 questions, 1 project")
                 self.ledger.unlink()
                 self.questions({"since": "2026-10-16T19:00", "text": "A"})
 

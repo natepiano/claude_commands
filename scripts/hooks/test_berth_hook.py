@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "delegate"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
@@ -237,6 +237,14 @@ class BerthHookTests(unittest.TestCase):
 
     def test_an_unenrolled_repository_is_allowed_silently(self) -> None:
         self.answer(envelope("unconfigured", "this repository has no cargo-berth configuration"))
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state(), AWAITING)
+
+    def test_an_unreadable_ledger_allows_the_edit_as_the_engine_does(self) -> None:
+        # A scratch clone carries the berth configuration but no ledger (hana, 2026-10-20).
+        self.answer(envelope("ledger_unreadable", "cargo-berth could not establish edit safety; "
+                             + "editing is allowed because ledger loss fails open."))
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(self.state(), AWAITING)

@@ -166,7 +166,7 @@ class MergeCheckpointTests(unittest.TestCase):
                      "style_sync.py", "style_ledger.py"):
             self.executable(self.bin / name, STUB)
         home = self.root / "home"
-        for relative, name in ((".claude/scripts/delegate", "verify.sh"),
+        for relative, name in ((".claude/scripts/direct", "verify.sh"),
                                (".claude/scripts/validate_and_push", "validate_and_push.sh"),
                                (".claude/scripts/production", "review_regime.py")):
             directory = home / relative
@@ -559,13 +559,13 @@ class MergeCheckpointTests(unittest.TestCase):
                               + "| --- | --- | --- | --- | --- |\n| C7 | old | 2026-10-14 | yes | - |\n", encoding="utf-8")
         self.production_doc(change_review=review)
         sha = self.dated_checkpoint("checkpoint(alpha): grid fades\n\n"
-                                    + "Change-Review: The grid fades gently | Look across the floor\n"
+                                    + "Change-Review: The grid fades gently | Run `hana` in a natedev terminal | The grid lines fade out farther away\n"
                                     + "Change-Review: none — the merge script")
         result = self.run_checkpoint(sha)
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         merged = self.git("rev-parse", "--short=8", "HEAD")
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Look across the floor \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
@@ -690,6 +690,18 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(passed.process.returncode, 0, passed.process.stderr + passed.process.stdout)
         self.assertEqual(len(self.events("verify.sh")), 4)
         self.assertIn("flake", self.log.read_text().lower())
+
+    def test_a_docs_path_under_a_workspace_root_runs_no_package_test(self) -> None:
+        self.write(self.unit, "crates/alpha/Cargo.toml", '[workspace]\nmembers = ["crates/*"]\n')
+        self.write(self.unit, "crates/alpha/docs/as-built/pane.md", "# Pane\n")
+        _ = self.git("add", "crates/alpha", cwd=self.unit)
+        _ = self.git("commit", "-m", "docs only", cwd=self.unit)
+        sha = self.git("rev-parse", "HEAD", cwd=self.unit)
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        _ = (self.state / "fail-always-test").touch()
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertEqual(self.events("verify.sh"), [])
 
     def test_two_backticked_known_flakes_each_count_green_alone(self) -> None:
         for package in ("crate-a", "crate-b"):

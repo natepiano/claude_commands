@@ -49,7 +49,7 @@ def _plan(workers_block: str) -> str:
         **Files:**
         - `src/replay.rs` — the replay loop
         @@WORKERS@@
-        **Acceptance gate:** `bash ~/.claude/scripts/delegate/verify.sh test demo`
+        **Acceptance gate:** `bash ~/.claude/scripts/direct/verify.sh test demo`
         """
     )
     return template.replace("@@WORKERS@@", workers_block)

@@ -16,9 +16,11 @@ from typing import NamedTuple
 # Under the state root: logs, reports and archives that keep a unit's old names as history.
 STATE_HISTORY = (
     "shutdown/", "nightly-review/", "message/log.jsonl", "message/relay/", "message/keys.json",
-    "message/queue/", "notify/", "accounts/moves.jsonl", "showrunner/outstanding/", "plan-delegate/runs/",
-    "plan-delegate/review_turns/", "model-study/", "claude-model-study/", "screenshot-analysis/",
-    "plan-backlog/", "usage-model/",
+    "message/queue/", "message/postmaster/replies/", "notify/", "accounts/moves.jsonl", "showrunner/outstanding/",
+    "plan-delegate/runs/", "plan-delegate/review_turns/", "model-study/", "claude-model-study/",
+    "screenshot-analysis/", "plan-backlog/", "usage-model/", "style-backups/",
+    # Build logs, hook trial records, the feature log, review prompts, verify events and shell history.
+    "buildlog/", "mul-add-hook/", "fn-length-hook/", "claude/feature-log/", "review-pool/", "verify/", "zsh/",
     # Rebuilt from its sources on the next board refresh.
     "unit-board/",
 )
@@ -29,7 +31,7 @@ PRODUCTION_HISTORY = ("log-backups/", "dailies_last.json", "rename_unit.json", "
 CONFIG_HISTORY = (
     "projects/", "file-history/", "history.jsonl", "todos/", "shell-snapshots/", "debug/", "plans/",
     "paste-cache/", "sessions/", "statsig/", "backups/", ".claude.json", ".git/", ".claude/worktrees/",
-    "data/review_regime.jsonl", "teams/",
+    "data/review_regime.jsonl", "data/review_regime_marks_", "teams/", "jobs/", "feedback/", "state/berth-fix/",
 )
 
 
@@ -79,7 +81,8 @@ def _hits(values: tuple[str, ...], paths: list[Path], *, ignored: bool) -> list[
     if not existing:
         return []
     flags = ["-uuu"] if ignored else ["--hidden"]
-    result = subprocess.run(["rg", "-l", "-F", *flags, *(argument for value in values for argument in ("-e", value)),
+    # Bytecode caches are rebuilt from their sources, so they are never a live place.
+    result = subprocess.run(["rg", "-l", "-F", *flags, "--glob", "!__pycache__/", "--glob", "!*.pyc", *(argument for value in values for argument in ("-e", value)),
                              "--", *existing], capture_output=True, text=True, check=False)
     # rg exits 1 when nothing matches, 2 when some file could not be read.
     if result.returncode not in (0, 1, 2):
