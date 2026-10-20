@@ -12,7 +12,9 @@ export interface AccountDisplay {
   weekly: AccountReading<number>;
   resets: AccountReading<string>;
   credits: CreditBalance;
-  onCredits: boolean;
+  useCredits: boolean;
+  readOk: boolean;
+  creditsInUse: boolean;
   read: AccountReading<string>;
 }
 
@@ -31,7 +33,8 @@ export function accountDisplay(account: StoredAccount): AccountDisplay {
     weekly: reading(account.weekly_left_percent), resets: reading(account.resets_at),
     credits: account.credits === null ? { kind: 'unavailable' }
       : account.credits === 'unlimited' ? { kind: 'unlimited' } : { kind: 'finite', amount: account.credits },
-    onCredits: account.use_credits, read: reading(account.read_at),
+    useCredits: account.use_credits, readOk: account.read_ok === true,
+    creditsInUse: account.credits_in_use === true, read: reading(account.read_at),
   };
 }
 
@@ -58,7 +61,18 @@ function dateText(value: AccountReading<string>, zone: string, now: number): str
   return days === 0 ? clock : `${new Intl.DateTimeFormat('en-US', { timeZone: zone, weekday: 'short' }).format(date)} ${clock}`;
 }
 
-type AccountColumn = 'dot' | 'label' | 'roles' | 'left' | 'resets' | 'credits' | 'read';
+function readAge(value: AccountReading<string>, now: number): string {
+  if (value.kind === 'unavailable') return '';
+  const readAt = new Date(value.value).getTime() / 1000;
+  if (!Number.isFinite(readAt)) return '';
+  const age = Math.max(0, now - readAt);
+  if (age < 60) return `${Math.floor(age)}s`;
+  if (age < 3600) return `${Math.floor(age / 60)}m`;
+  if (age < 86400) return `${Math.floor(age / 3600)}h`;
+  return `${Math.floor(age / 86400)}d`;
+}
+
+type AccountColumn = 'dot' | 'label' | 'roles' | 'left' | 'resets' | 'credits' | 'enabled' | 'inUse' | 'read';
 interface AccountRow {
   cells: Record<AccountColumn, BoardLine>;
   facts: BoardLine[];
@@ -72,22 +86,24 @@ interface TableColumn {
 
 function accountRow(account: AccountDisplay, zone: string, now: number): AccountRow {
   const tone = leftTone(account.weekly);
-  const dot = account.weekly.kind === 'unavailable' ? 'inactive' : tone === 'default' ? 'success' : tone;
+  const dot = account.readOk ? 'success' : 'error';
   const left = account.weekly.kind === 'available' ? `${Math.round(account.weekly.value)}%` : '—';
   const reset = dateText(account.resets, zone, now);
-  const read = dateText(account.read, zone, now);
+  const read = readAge(account.read, now);
   const balance = account.credits.kind === 'unavailable' ? '' : account.credits.kind === 'unlimited'
     ? 'unlimited' : new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(account.credits.amount);
   const credits = [span(balance)];
-  if (balance && account.onCredits) credits.push(span(' in use', 'warning'));
-  const facts = [[span(account.weekly.kind === 'available' ? `${left} left` : 'no reading', tone)]];
+  const facts = [[span(`${left} left`, tone)]];
   if (reset) facts.push([span('resets', 'inactive'), span(` ${reset}`)]);
   if (balance) facts.push([span('credits', 'inactive'), span(' '), ...credits]);
-  if (read) facts.push([span('read', 'inactive'), span(` ${read}`)]);
+  if (account.useCredits) facts.push([span('enabled')]);
+  if (account.creditsInUse) facts.push([span('in use', 'warning')]);
+  if (read) facts.push([span('read', 'inactive'), span(` ${read} ago`)]);
   return { cells: {
     dot: [span('●', dot)], label: [span(account.label, 'default', 'bold')],
     roles: [span(account.roles.join(', '))], left: [span(left, tone)],
-    resets: [span(reset)], credits, read: [span(read)],
+    resets: [span(reset)], credits, enabled: [span(account.useCredits ? 'yes' : '')],
+    inUse: [span(account.creditsInUse ? 'yes' : '', 'warning')], read: [span(read)],
   }, facts };
 }
 
@@ -123,15 +139,17 @@ function wrapFacts(facts: BoardLine[], width: number): BoardLine[] {
   return lines;
 }
 
-function tableColumns(accounts: AccountRow[], showCredits: boolean): TableColumn[] {
+function tableColumns(accounts: AccountRow[]): TableColumn[] {
   const columns: TableColumn[] = [
     { key: 'dot', heading: '', align: 'left', width: 0 },
-    { key: 'label', heading: 'Label', align: 'left', width: 0 },
-    { key: 'roles', heading: 'Roles', align: 'left', width: 0 },
-    { key: 'left', heading: 'Left', align: 'right', width: 0 },
-    { key: 'resets', heading: 'Resets', align: 'right', width: 0 },
-    ...(showCredits ? [{ key: 'credits', heading: 'Credits', align: 'left', width: 0 } as const] : []),
-    { key: 'read', heading: 'Read', align: 'right', width: 0 },
+    { key: 'label', heading: 'account', align: 'left', width: 0 },
+    { key: 'roles', heading: 'role', align: 'left', width: 0 },
+    { key: 'left', heading: 'left', align: 'right', width: 0 },
+    { key: 'resets', heading: 'resets', align: 'right', width: 0 },
+    { key: 'credits', heading: 'credits', align: 'right', width: 0 },
+    { key: 'enabled', heading: 'enabled', align: 'left', width: 0 },
+    { key: 'inUse', heading: 'in use', align: 'left', width: 0 },
+    { key: 'read', heading: 'read', align: 'right', width: 0 },
   ];
   return columns.map(column => ({ ...column, width: accounts.reduce(
     (width, row) => Math.max(width, lineWidth(row.cells[column.key])), cellWidth(column.heading)) }));
@@ -158,9 +176,9 @@ function tableLine(columns: TableColumn[], cells: Record<AccountColumn, BoardLin
   return line;
 }
 
-function accountLines(accounts: AccountRow[], width: number, showCredits: boolean): BoardLine[] {
+function accountLines(accounts: AccountRow[], width: number): BoardLine[] {
   if (!accounts.length) return [];
-  const columns = tableColumns(accounts, showCredits);
+  const columns = tableColumns(accounts);
   const header = Object.fromEntries(columns.map(column =>
     [column.key, [span(column.heading, 'default', 'bold')]])) as Record<AccountColumn, BoardLine>;
   const tableWidth = (columns: TableColumn[], indent = 0) =>
@@ -187,7 +205,7 @@ export function AccountsView(elements: PaneElements, columns: number, status: St
   const accounts = status.accounts.map(accountDisplay)
     .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: 'base' }))
     .map(account => accountRow(account, zone, now));
-  const rows = accountLines(accounts, width, status.accounts.some(account => account.credits !== null));
+  const rows = accountLines(accounts, width);
   const drawLine = (parts: BoardLine) => <Box flexDirection="row" flexShrink={0}>
     {(parts.some(part => part.text) ? parts.filter(part => part.text) : [span('')]).map(part => part.tone === 'default'
       ? <Text bold={part.kind === 'bold'}>{part.text}</Text>
