@@ -74,6 +74,7 @@ For active process redesigns, as we are currently undergoing with promotions and
   3. **Unit and session names.** For every production doc that `showrunners.py list` prints: each **Units** row name that does not follow `<area>-unit`, and each showrunner slug or unit name that two productions both use.
   4. **Wrong-party asks.** In the message log for the window: messages from a unit director to the user, and from a unit director to another production's showrunner, by sender. Where the log does not tell a role, print `not recorded` and name the source that would.
   - The script reads natedev's records. A table whose source the Mac also keeps says `natedev only`.
+- Wording fix, approved by the showrunner 2026-10-20 as not a redesign: `docs/production_format.md` **Words** ("reports on a schedule") and the `description` line of `commands/showrunner/produce.md` ("report each unit's ETA on a schedule") say the showrunner reports when asked, to match the rule the user set (updates on demand, user 2026-10-13). The Friction list records the conflict as found.
 - The design doc `docs/plans/sdlc-roles-design.md`, sections:
   - **Duty matrix.** One row per duty (for example: merge a checkpoint, push, promote to main, settle a design, write a Work Order, dispatch a worker, run a gate, ask the user, relay the user's words, report an ETA, give dailies, retire a unit, move an account, rename a unit, place a build hold). Columns: the role that does it, every other role a file also gives it to, and each source as `file` and tag or section. Mark each row `one owner`, `duplicate` (two files give it to one role in different words), `conflict` (two files give it to different roles, or say different things), or `no owner`. Roles come from hierarchies-unit's **Map**, by its row names; the designer and reviewer roles come from guilds-unit's plan, marked planned.
   - **Term table.** Each term in `role_terms.toml`, its definition in one line, its other names and the files that use each, and the term the doc recommends. The table includes documents (Work Order, as-built, add-on, proposal, change, dailies), steps (checkpoint, shrink, phase review, landing call) and records, not only roles.
@@ -86,10 +87,11 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/production/test_roles_audit.py` — new
 - `scripts/production/role_terms.toml` — new
 - `docs/plans/sdlc-roles-design.md` — new
+- `docs/production_format.md`, `commands/showrunner/produce.md` — the wording fix only (hub files this unit owns)
 
 **Workers:** `2 writers` — the script and the design doc are disjoint.
 - `impl` — `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py`, `scripts/production/role_terms.toml`
-- `test` — opens as impl — the design doc's Duty matrix, Term table, Friction and Questions sections; it sends `impl` each term and other name it finds for `role_terms.toml`, and fills Baseline from `impl`'s output when the script runs
+- `test` — opens as impl — the wording fix; the design doc's Duty matrix, Term table, Friction and Questions sections; it sends `impl` each term and other name it finds for `role_terms.toml`, and fills Baseline from `impl`'s output when the script runs
 
 **Constraints from prior phases:** none.
 
