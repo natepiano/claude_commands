@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-import production_tree
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import production_tree  # noqa: E402
 import showrunners
 import unit_lookup
 from herdr import HerdrPlace
@@ -54,6 +55,8 @@ class ProductionTreeTests(unittest.TestCase):
             _ = (notifier / f"showrunner-{slug}" / "conf").write_text(f"TARGET=session:{session_id}\nEVERY=30\n")
         (state / "child").mkdir(parents=True)
         _ = (state / "child" / "parent").write_text("main\n")
+        _ = cast(object, self.enterContext(mock.patch.dict(
+            os.environ, {"ASTRA_ROLES_STATE": str(self.root / "astra-roles")})))
         for patch in (
             mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier),
             mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
@@ -85,6 +88,96 @@ class ProductionTreeTests(unittest.TestCase):
         with mock.patch.object(production_tree, "running_sessions", return_value=[record(session_id) for session_id in running]), \
                 mock.patch.object(unit_lookup, "every_marked_unit", return_value=marked):
             return production_tree.tree()
+
+    def astra_role(self, role: str, thread: str, manager: str, session_dir: str = "", worker: str = "") -> None:
+        roles = self.root / "astra-roles"
+        roles.mkdir(exist_ok=True)
+        _ = (roles / f"{thread}.json").write_text(json.dumps({
+            "role": role, "thread_id": thread, "codex_home": str(self.root / "codex-home"),
+            "manager": manager, "held_at": "2026-10-20T20:00:00+00:00",
+            "session_dir": session_dir or None, "worker": worker or None,
+            "pid": None if worker else os.getpid(),
+        }))
+
+    def test_astra_designer_and_reviewer_edges_carry_their_account_and_live_state(self) -> None:
+        run = self.run_folder("unit", DIRECTOR, {
+            "project-design": {"thread_id": "thread-design", "role": "impl", "status": "idle"},
+        })
+        self.astra_role("designer", "thread-design", DIRECTOR, str(run), "project-design")
+        self.astra_role("reviewer", "thread-reviewer", RUNNER)
+        edges = self.tree({RUNNER, DIRECTOR}, {"main": {"one": unit(DIRECTOR, "one")}})
+        self.assertCountEqual(edges, [
+            {"manager": RUNNER, "member": DIRECTOR, "role": "unit"},
+            {"manager": DIRECTOR, "member": "thread-design", "role": "astra-designer",
+             "codex_home": str(self.root / "codex-home"), "state": "idle"},
+            {"manager": RUNNER, "member": "thread-reviewer", "role": "astra-reviewer",
+             "codex_home": str(self.root / "codex-home"), "state": "busy"},
+        ])
+
+    def test_an_astra_thread_has_one_edge_and_other_mesh_workers_keep_their_edges(self) -> None:
+        run = self.run_folder("unit", DIRECTOR, {
+            "project-impl": {"thread_id": "thread-design", "role": "impl", "status": "running"},
+            "project-test": {"thread_id": "thread-test", "role": "test", "status": "running"},
+        })
+        self.astra_role("designer", "thread-design", DIRECTOR, str(run), "project-impl")
+        self.assertEqual(production_tree.worker_edges({DIRECTOR}), [
+            {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
+        ])
+        self.assertCountEqual(self.tree({DIRECTOR}, {}), [
+            {"manager": DIRECTOR, "member": "thread-design", "role": "astra-designer",
+             "codex_home": str(self.root / "codex-home"), "state": "busy"},
+            {"manager": DIRECTOR, "member": "thread-test", "role": "test"},
+        ])
+
+    def test_a_local_astra_thread_keeps_its_manager_on_another_machine(self) -> None:
+        self.astra_role("reviewer", "thread-remote-manager", ORPHAN)
+        self.assertEqual(self.tree(set(), {}), [
+            {"manager": ORPHAN, "member": "thread-remote-manager", "role": "astra-reviewer",
+             "codex_home": str(self.root / "codex-home"), "state": "busy"},
+        ])
+
+    def test_an_unreadable_astra_record_keeps_other_astra_and_claude_edges(self) -> None:
+        self.astra_role("reviewer", "thread-readable", RUNNER)
+        broken = self.root / "astra-roles" / "thread-broken.json"
+        _ = broken.write_text("{not json")
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            edges = self.tree({RUNNER, CHILD_RUNNER}, {})
+        self.assertCountEqual(edges, [
+            {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
+            {"manager": RUNNER, "member": "thread-readable", "role": "astra-reviewer",
+             "codex_home": str(self.root / "codex-home"), "state": "busy"},
+        ])
+        self.assertIn("thread-broken", errors.getvalue())
+
+    def test_malformed_astra_records_keep_other_edges_and_json_output(self) -> None:
+        self.astra_role("reviewer", "thread-readable", RUNNER)
+        valid = cast(dict[str, object], json.loads(
+            (self.root / "astra-roles" / "thread-readable.json").read_text()))
+        for shape in ("missing-lifetime", "extra-state", "wrong-pid"):
+            thread = f"thread-{shape}"
+            record = {**valid, "thread_id": thread}
+            if shape == "missing-lifetime":
+                del record["session_dir"]
+                del record["worker"]
+            elif shape == "extra-state":
+                record["state"] = "busy"
+            else:
+                record["pid"] = True
+            _ = (self.root / "astra-roles" / f"{thread}.json").write_text(json.dumps(record))
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            edges = self.tree({RUNNER, CHILD_RUNNER}, {})
+        self.assertCountEqual(edges, [
+            {"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"},
+            {"manager": RUNNER, "member": "thread-readable", "role": "astra-reviewer",
+             "codex_home": str(self.root / "codex-home"), "state": "busy"},
+        ])
+        self.assertEqual(len(errors.getvalue().splitlines()), 3)
+        for shape in ("missing-lifetime", "extra-state", "wrong-pid"):
+            self.assertIn(f"thread-{shape}.json", errors.getvalue())
+        with mock.patch.object(production_tree, "tree", return_value=edges), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(production_tree.main(["--json"]), 0)
+        self.assertEqual(cast(object, json.loads(output.getvalue())), {"schema": 1, "edges": edges})
 
     def test_every_kind_of_edge_between_running_sessions(self) -> None:
         _ = self.run_folder("unit", DIRECTOR, {

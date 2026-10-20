@@ -1,0 +1,228 @@
+"""Astra role records from local mesh and process fixtures, without a live Codex."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import cast, override
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.astra import astra_roles  # noqa: E402
+
+SCRIPT = Path(__file__).with_name("astra_roles.py")
+
+
+class AstraRolesTests(unittest.TestCase):
+    root: Path = Path()
+    state: Path = Path()
+    mesh_run: Path = Path()
+    home: Path = Path()
+    environment: dict[str, str] = {}
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.state, self.mesh_run, self.home = (self.root / name for name in ("roles", "mesh", "codex-home"))
+        self.mesh_run.mkdir()
+        self.home.mkdir()
+        self.environment = {**os.environ, "ASTRA_ROLES_STATE": str(self.state), "HOME": str(self.root)}
+        _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
+        self.roster("running")
+        _ = (self.mesh_run / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.home)}))
+
+    def roster(self, status: str, thread: str = "thread-designer") -> None:
+        _ = (self.mesh_run / "mesh_roster.json").write_text(json.dumps({
+            "project-design": {"thread_id": thread, "status": status, "role": "impl"},
+        }))
+
+    def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment,
+                              capture_output=True, text=True, check=False, timeout=5)
+
+    def hold_mesh(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return self.command("hold", "designer", "--session-dir", str(self.mesh_run),
+                            "--worker", "project-design", *arguments)
+
+    def records(self) -> list[dict[str, object]]:
+        shown = self.command("list", "--json")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        return cast(list[dict[str, object]], json.loads(shown.stdout))
+
+    def test_mesh_hold_reads_the_thread_and_account_and_defaults_to_the_calling_manager(self) -> None:
+        self.environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"
+        held = self.hold_mesh()
+        self.assertEqual(held.returncode, 0, held.stderr)
+        path = self.state / "thread-designer.json"
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual({key: value for key, value in record.items() if key != "held_at"}, {
+            "role": "designer", "thread_id": "thread-designer", "codex_home": str(self.home),
+            "manager": "sid-director", "session_dir": str(self.mesh_run), "worker": "project-design", "pid": None,
+        })
+        self.assertEqual(datetime.fromisoformat(str(record["held_at"])).utcoffset(), timedelta(0))
+        self.assertEqual([entry.name for entry in self.state.iterdir()], [path.name])
+
+    def test_a_missing_worker_or_thread_is_refused_without_a_record(self) -> None:
+        for roster in ({}, {"project-design": {"status": "running"}},
+                       {"project-design": {"thread_id": "", "status": "running"}}):
+            with self.subTest(roster=roster):
+                _ = (self.mesh_run / "mesh_roster.json").write_text(json.dumps(roster))
+                result = self.hold_mesh("--manager", "sid-director")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+                self.assertIn("project-design", result.stderr)
+                self.assertFalse(list(self.state.glob("*.json")))
+
+    def test_an_empty_manager_is_refused_without_a_record(self) -> None:
+        self.environment["CLAUDE_CODE_SESSION_ID"] = ""
+        result = self.hold_mesh()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(len(result.stderr.strip().splitlines()), 1)
+        self.assertIn("Claude session id", result.stderr)
+        self.assertFalse(list(self.state.glob("*.json")))
+
+    def test_an_explicit_manager_overrides_the_calling_session(self) -> None:
+        self.environment["CLAUDE_CODE_SESSION_ID"] = "sid-caller"
+        result = self.hold_mesh("--manager", "sid-director")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.records()[0]["manager"], "sid-director")
+
+    def test_live_mesh_state_tracks_busy_and_idle_statuses(self) -> None:
+        self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+        for status, state in (("running", "busy"), ("waiting_capacity", "busy"), ("idle", "idle"), ("done", "idle")):
+            with self.subTest(status=status):
+                self.roster(status)
+                records = self.records()
+                self.assertEqual(len(records), 1)
+                self.assertEqual((records[0]["thread_id"], records[0]["state"]), ("thread-designer", state))
+
+    def test_ended_and_failed_workers_remove_their_records(self) -> None:
+        for status in ("ended", "failed"):
+            with self.subTest(status=status):
+                self.roster("running")
+                self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+                self.roster(status)
+                self.assertEqual(self.records(), [])
+                self.assertFalse((self.state / "thread-designer.json").exists())
+
+    def test_malformed_records_are_reported_once_and_keep_valid_roles(self) -> None:
+        self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+        valid = cast(dict[str, object], json.loads((self.state / "thread-designer.json").read_text()))
+        malformed: list[dict[str, object]] = []
+        for key in valid:
+            missing = dict(valid)
+            del missing[key]
+            malformed.append(missing)
+            malformed.append({**valid, key: []})
+        malformed.append({**valid, "state": "busy"})
+        paths: list[Path] = []
+        for number, record in enumerate(malformed):
+            thread = f"thread-broken-{number}"
+            if "thread_id" in record and isinstance(record["thread_id"], str):
+                record["thread_id"] = thread
+            path = self.state / f"{thread}.json"
+            _ = path.write_text(json.dumps(record))
+            paths.append(path)
+        shown = self.command("list", "--json")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        records = cast(list[dict[str, object]], json.loads(shown.stdout))
+        self.assertEqual([entry["thread_id"] for entry in records], ["thread-designer"])
+        lines = shown.stderr.splitlines()
+        self.assertEqual(len(lines), len(paths))
+        for path in paths:
+            self.assertEqual(sum(str(path) in line for line in lines), 1)
+            self.assertTrue(path.exists())
+
+    def test_live_roles_name_the_mesh_worker_and_exec_process_lifetimes(self) -> None:
+        self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+        self.assertEqual(self.command("hold", "reviewer", "--thread", "thread-process", "--codex-home",
+                                      str(self.home), "--pid", str(os.getpid()), "--manager", "sid-runner").returncode, 0)
+        with mock.patch.dict(os.environ, self.environment):
+            roles = astra_roles.live_roles()
+        self.assertEqual([role["lifetime"] for role in roles], [
+            astra_roles.MeshWorker(str(self.mesh_run), "project-design"), astra_roles.ExecProcess(os.getpid()),
+        ])
+        for role in roles:
+            self.assertTrue({"session_dir", "worker", "pid"}.isdisjoint(role))
+
+    def test_a_missing_run_or_worker_removes_the_hold_silently(self) -> None:
+        for missing in ("run", "worker"):
+            with self.subTest(missing=missing):
+                self.mesh_run.mkdir(exist_ok=True)
+                self.roster("running")
+                _ = (self.mesh_run / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.home)}))
+                self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+                if missing == "run":
+                    for path in self.mesh_run.iterdir():
+                        path.unlink()
+                    self.mesh_run.rmdir()
+                else:
+                    _ = (self.mesh_run / "mesh_roster.json").write_text("{}")
+                shown = self.command("list", "--json")
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertEqual(shown.stderr, "")
+                self.assertEqual(cast(object, json.loads(shown.stdout)), [])
+                self.assertFalse((self.state / "thread-designer.json").exists())
+
+    def test_an_unreadable_roster_keeps_the_hold_and_reports_its_file(self) -> None:
+        self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+        for text in ("{not json", "[]"):
+            with self.subTest(text=text):
+                _ = (self.mesh_run / "mesh_roster.json").write_text(text)
+                shown = self.command("list", "--json")
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertEqual(cast(object, json.loads(shown.stdout)), [])
+                self.assertEqual(len(shown.stderr.splitlines()), 1)
+                self.assertIn("thread-designer.json", shown.stderr)
+                self.assertTrue((self.state / "thread-designer.json").exists())
+        roster = self.mesh_run / "mesh_roster.json"
+        roster.unlink()
+        roster.mkdir()
+        shown = self.command("list", "--json")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(cast(object, json.loads(shown.stdout)), [])
+        self.assertEqual(len(shown.stderr.splitlines()), 1)
+        self.assertIn("thread-designer.json", shown.stderr)
+        self.assertTrue((self.state / "thread-designer.json").exists())
+
+    def test_a_starting_mesh_worker_is_busy(self) -> None:
+        self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+        self.roster("starting")
+        self.assertEqual(self.records()[0]["state"], "busy")
+
+    def test_a_process_role_is_busy_until_its_pid_exits_then_its_record_is_removed(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"], stdin=subprocess.PIPE)
+        try:
+            held = self.command("hold", "reviewer", "--thread", "thread-reviewer", "--codex-home", str(self.home),
+                                "--pid", str(process.pid), "--manager", "sid-showrunner")
+            self.assertEqual(held.returncode, 0, held.stderr)
+            records = self.records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual({key: value for key, value in records[0].items() if key != "held_at"}, {
+                "role": "reviewer", "thread_id": "thread-reviewer", "codex_home": str(self.home),
+                "manager": "sid-showrunner", "session_dir": None, "worker": None,
+                "pid": process.pid, "state": "busy",
+            })
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+            _ = process.wait(timeout=5)
+        self.assertEqual(self.records(), [])
+        self.assertFalse((self.state / "thread-reviewer.json").exists())
+
+    def test_release_removes_a_record_and_is_safe_to_repeat(self) -> None:
+        self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)
+        for _attempt in range(2):
+            result = self.command("release", "thread-designer")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((self.state / "thread-designer.json").exists())
+        self.assertEqual(self.records(), [])
+
+
+if __name__ == "__main__":
+    _ = unittest.main()
