@@ -1,5 +1,5 @@
 ---
-description: Add a change for the user to check to the top-level showrunner's change review list, walk the list when the user asks for "change review", and record their verdicts.
+description: Add a change for the user to check to the top-level showrunner's change review list, show the next change when the user asks for one, and record their verdicts.
 ---
 
 # Change review
@@ -78,15 +78,15 @@ The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
 
-Only when the user asks for "change review". Run `show <production>`. It
-prints each row to review: its id and change, how to check it, and when it
-merged, or `nothing to review`. Walk the rows one at a time, in order. For each,
-say what changed, how to try it and what the user sees, then wait for the user's
-verdict in their reply. Never use a form; ask in one plain-text line.
+Only when the user asks for "change review" or "the next change"
+(`/next change`). Run `show <production>`. It prints the first row to review:
+its id and change, how to check it, when it merged, and how many rows wait
+after it; or `nothing to review`. Say what changed, how to try it and what the
+user sees, even if already shown, then wait for the user's verdict in their
+reply. Never use a form; ask in one plain-text line.
 
-A request for "the next change" means the user is returning to the terminal:
-show the current unconfirmed row in full, even if already shown. Never show a
-later row until the current one has a verdict (user, 2026-10-16).
+Show one row per request. After its verdict, stop: never show the next row
+until the user asks for it (user, 2026-10-20).
 
 ## verdict
 

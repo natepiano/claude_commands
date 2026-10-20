@@ -24,7 +24,7 @@ unit's checkpoint without one, then adds one row per visible line under the list
 the next C number, the push date and the merged hash, the How to check cell `<how to try it> You
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
-its id, Merged cell and position; `show` prints the rows still to review; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
+its id, Merged cell and position; `show` prints the first row still to review and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
 date. Every write holds a lock on the list's directory, and the first write to a missing list
 creates it from the skeleton. Every write sets the frontmatter's date_modified and adds the
 writing production's doc to its productions. A list in a git work tree is committed alone after
@@ -621,8 +621,10 @@ def _run(options: CommandLine) -> int:
             row, item = _row_option(options), _visible(options)
             print(edit_row(_list(options), row, item, today(), production_doc(options.production)))
         case "show":
+            # One row only: the user asks for the next one when they want it (user, 2026-10-20).
             waiting = pending(_list(options))
-            print("\n\n".join(describe(row) for row in waiting) if waiting else "nothing to review")
+            print(describe(waiting[0]) + (f"\n\n{len(waiting) - 1} more to review" if len(waiting) > 1 else "")
+                  if waiting else "nothing to review")
         case "verdict":
             row = _row_option(options)
             verdict = _words("verdict", options.verdict)
