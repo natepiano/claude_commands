@@ -90,8 +90,9 @@ Filing withdraws a filed finding that an `exception` under its rule's newer
 text supersedes, and closes a decision left with no filed finding. Run that step
 alone with `style_proposals.py withdraw --repo <style checkout> --proposals
 <folder>`; add `--dry-run` to see the lines first.
-Filing first moves a finding to the one file that now declares its item, or,
-when no file does, withdraws an unfiled one and leaves a filed one for a person; run that step alone with `style_proposals.py
+Filing first moves a finding to the one file that now declares its item, marks a
+filed rename built when its new name is declared, leaves a filed finding whose
+item is gone from its file, and withdraws the rest; run that step alone with `style_proposals.py
 follow --repo <style checkout> --proposals <folder>`, and add `--dry-run` to see
 the lines first.
 Drop the bare duplicates of qualified renames from every open decision with
