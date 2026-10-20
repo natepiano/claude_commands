@@ -654,22 +654,16 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - A built finding whose decision file is missing was skipped without a line; phase 22 prints `skipped <issue>: missing file`.
 
 ### Phase 22 — reopen --all covers old-form issues  · status: done
-**Depends on:** Phase 21
 
-#### Work Order
+#### As-built
 
-**Goal:** `reopen --all` also checks approved old-form style issues (not decisions) that hold built findings, and prints a skip line for every issue it leaves out, so it never skips without a word.
+- `reopen --all [--parent <slug>]` takes every issue that holds a built finding: approved decisions and approved old-form issues. An old issue moves under the parent its own `Parent:` line names (`old_issue_parent`); `--parent` is used only for an old issue with no such line, else it is skipped with `no Parent line; pass --parent`.
+- Each issue with a built finding that the run leaves out prints `skipped <issue>: <reason>` (`missing file`, `not approved`, `closed without answer`, or the reopen refusal) and counts in `skipped`; stderr says `skipped N issues`.
+- `run_moves` refreshes a decision it did not create with that decision's own parent, read before the first write, as withdraw does. `join_action` turns a missing generated body into a `LedgerError`, so it is refused before any write and the dry run matches the real run.
+- The `held add` hint says `(issue <path>)`.
 
-**Spec:**
-- Old-form approved issues with built findings join the sweep. Find each issue parent by itself (from the issue or the ledger); take an optional `--parent` only if it cannot. Ruled by natedev, 2026-10-20.
-- Every issue with built findings that the sweep leaves out (missing file, not approved, closed without answer, no parent found) prints one skip line and counts in `skipped`.
-- Test: a dry run over an old-form issue with a false built row reports it (not totals 0).
+**Files:**
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
 
-**Files:** `scripts/style/style_proposals.py`, `scripts/style/test_style_proposals.py`, `docs/style_production.md`
-
-**Workers:** 1 writer — nothing splits.
-- `impl` — all of the above
-
-**Constraints from prior phases:** Phase 21: `reopen_all`, `file_unapplied_again`, `Built(proposal)`.
-
-**Acceptance gate:** the tests above; `scripts/style` green; basedpyright clean; merge gate `--tests-only` green.
+**Gotchas:**
+- The issue's `showrunner` field is a session name, not a parent slug; the body's `Parent:` line is the source.
