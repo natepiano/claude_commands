@@ -1039,7 +1039,7 @@ class TerminalAccountSelection:
 
 
 def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
-    """Terminal restarts cover records and holds; other verbs cover configured logins."""
+    """Terminal restarts cover records and holds; other verbs cover configured logins, and `now` also record logins."""
     selected: dict[str, Account] = {}
     unavailable: list[str] = []
     if options.command == "restart":
@@ -1072,6 +1072,10 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
             login = note.get("login")
             if note.tool == "claude" and login:
                 selected[login.casefold()] = Account("claude", login, note.label)
+        if options.command == "now":
+            # A paused stop may sit on an account that is no longer configured here.
+            for saved in all_session_records():
+                _ = selected.setdefault(saved["login"].casefold(), Account("claude", saved["login"], saved["label"]))
         if options.command == "status":
             for snapshot in recovery_store.all_snapshots():
                 if snapshot["sessions"]:
@@ -1181,8 +1185,8 @@ def _dispatch(options: CommandLine) -> int:
         except (InvalidRecord, InvalidInventory, OSError, ValueError) as error:
             print(f"shutdown: {error}", file=sys.stderr)
             return 1
-    if (options.command in {"down", "restart", "status"} and options.account is None
-            and not os.environ.get("CLAUDE_CODE_SESSION_ID")):
+    if ((options.command in {"down", "restart", "status"} or (options.command == "now" and options.only is not None))
+            and options.account is None and not os.environ.get("CLAUDE_CODE_SESSION_ID")):
         return _all_accounts(options)
 
     if options.command == "remote-control":
