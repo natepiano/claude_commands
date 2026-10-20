@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
+description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA when asked.
 ---
 
 # Produce

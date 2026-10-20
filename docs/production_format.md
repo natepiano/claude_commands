@@ -28,7 +28,7 @@ must not drift from it:
   plans and splits them into a production doc and unit plans.
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
-  and reports on a schedule. It writes no implementation code.
+  and reports when asked. It writes no implementation code.
 - **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.

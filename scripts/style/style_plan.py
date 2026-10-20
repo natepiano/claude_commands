@@ -20,7 +20,7 @@ from enum import Enum
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import cast
+from typing import assert_never, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
@@ -1607,6 +1607,10 @@ def _select_phase(
                     where = f"declared in another crate: {outcome.path}"
                 case style_ledger.DeclarationGoneFromFile():
                     where = "declaration gone"
+                case style_ledger.TraitIdentityUncertain():
+                    where = "trait identity uncertain"
+                case _:
+                    assert_never(outcome)
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)

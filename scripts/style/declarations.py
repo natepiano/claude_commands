@@ -48,6 +48,31 @@ def declaration_line(declaration: Declaration) -> str:
 
 
 @dataclass(frozen=True)
+class ImplementedTrait:
+    """The readable path of the trait whose impl directly owns the item."""
+
+    path: tuple[str, ...]
+    arguments: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.path:
+            raise ValueError("an implemented trait needs a nonempty path")
+
+
+@dataclass(frozen=True)
+class NoImplementedTrait:
+    """The item is not directly owned by a trait implementation."""
+
+
+@dataclass(frozen=True)
+class UnreadableImplementedTrait:
+    """A trait impl owns the item, but its trait path cannot be read safely."""
+
+
+TraitMembership = ImplementedTrait | NoImplementedTrait | UnreadableImplementedTrait
+
+
+@dataclass(frozen=True)
 class DeclaredItem:
     """One named item and its lines: its keyword, its first owned attribute (else its keyword) and its end."""
 
@@ -55,6 +80,7 @@ class DeclaredItem:
     keyword_line: int
     first_line: int
     last_line: int
+    implemented_trait: TraitMembership = NoImplementedTrait()
 
 
 @dataclass(frozen=True)
@@ -103,10 +129,51 @@ def _span(words: tuple[str, ...], keyword: int) -> _Span:
     return _Span(keyword, len(words) - 1, _NoBody())
 
 
-def _impl_name(words: tuple[str, ...], span: _Span) -> str:
-    """The last segment of the impl's type: the path after a `for` outside angle brackets, else the whole header.
+@dataclass(frozen=True)
+class _UnreadableImplOwner:
+    """The implementing type is not a readable path; its direct members are left out."""
 
-    It is '' when the type is not a plain path.
+
+@dataclass(frozen=True)
+class _ImplHeader:
+    """The implementing type's name and the trait relationship read from one header."""
+
+    owner: ImplOrTraitItem | _UnreadableImplOwner
+    implemented_trait: TraitMembership
+
+
+def _implemented_trait(words: tuple[str, ...]) -> ImplementedTrait | UnreadableImplementedTrait:
+    """Read a trait path and its complete argument list without dropping trailing words."""
+    path = type_path(words)
+    if not path:
+        return UnreadableImplementedTrait()
+    start = len(path) * 2 - 1
+    if start == len(words):
+        return ImplementedTrait(path)
+    if words[start] != "<" or words[-1] != ">":
+        return UnreadableImplementedTrait()
+    depth = 0
+    brackets: list[str] = []
+    for index in range(start, len(words)):
+        word = words[index]
+        if word in ("(", "[", "{"):
+            brackets.append(word)
+        elif word in (")", "]", "}"):
+            if not brackets or brackets.pop() != {")": "(", "]": "[", "}": "{"}[word]:
+                return UnreadableImplementedTrait()
+        elif not brackets:
+            depth += (word == "<") - (word == ">")
+            if depth <= 0 and index != len(words) - 1:
+                return UnreadableImplementedTrait()
+    if depth or brackets or len(words[start:]) <= 2:
+        return UnreadableImplementedTrait()
+    return ImplementedTrait(path, words[start:])
+
+
+def _impl_header(words: tuple[str, ...], span: _Span) -> _ImplHeader:
+    """Split at `for` outside generic arguments, excluding the `for` of a higher-ranked bound.
+
+    An unreadable implementing type still leaves out its direct members.
     """
     header = words[span.keyword + 1:span.body.open if isinstance(span.body, _Body) else span.end]
     depth, begin = 0, 0
@@ -123,7 +190,11 @@ def _impl_name(words: tuple[str, ...], span: _Span) -> str:
             separator = index
             break
     path = type_path(header[separator + 1:] if separator >= 0 else header[begin:])
-    return path[-1] if path else ""
+    trait_words = header[begin:separator] if separator >= 0 else ()
+    trait: TraitMembership = NoImplementedTrait()
+    if separator >= 0:
+        trait = _implemented_trait(trait_words)
+    return _ImplHeader(ImplOrTraitItem(path[-1]) if path else _UnreadableImplOwner(), trait)
 
 
 @dataclass(frozen=True)
@@ -168,13 +239,23 @@ def read_declarations(text: str) -> DeclaredFile:
     spans = {index: _span(words, index) for index, word in enumerate(words)
              if index in starts and (word in ITEM_KEYWORDS or word in {"impl", "use"})}
     # The bodies that own their items directly: each impl's type name and each trait's name.
-    owning: list[tuple[_Body, str]] = []
+    owning: list[tuple[_Body, ImplOrTraitItem | _UnreadableImplOwner, TraitMembership]] = []
     for index, span in spans.items():
         if isinstance(span.body, _Body) and words[index] == "impl":
-            owning.append((span.body, _impl_name(words, span)))
+            header = _impl_header(words, span)
+            owning.append((span.body, header.owner, header.implemented_trait))
         elif isinstance(span.body, _Body) and words[index] == "trait" and index + 1 < len(words):
-            owning.append((span.body, words[index + 1]))
-    item_bodies = [span.body for index, span in spans.items() if isinstance(span.body, _Body) and words[index] in ITEM_KEYWORDS]
+            owning.append((span.body, ImplOrTraitItem(words[index + 1]), NoImplementedTrait()))
+    # A member must sit directly in its impl's braces, including when other blocks hold nested items.
+    enclosing: dict[int, int] = {}
+    braces: list[int] = []
+    for index, word in enumerate(words):
+        if index in spans and braces:
+            enclosing[index] = braces[-1]
+        if word == "{":
+            braces.append(index)
+        elif word == "}" and braces:
+            _ = braces.pop()
     item_spans: list[_Span] = []
     items: list[DeclaredItem] = []
     others: list[_Span] = []
@@ -188,18 +269,18 @@ def read_declarations(text: str) -> DeclaredFile:
         # `const fn` is a function, and `const _` names no item.
         if name in {"", "_", "fn"} or not style_footprint.IDENTIFIER.fullmatch(name):
             continue
-        closest = max((body for body in (*(body for body, _ in owning), *item_bodies) if body.open < index < body.close),
-                      key=lambda body: body.open, default=_NoBody())
         owner: Owner = ModuleItem()
-        for body, owner_name in owning:
-            if body == closest:
-                if not owner_name:
+        trait: TraitMembership = NoImplementedTrait()
+        for body, member_owner, membership in owning:
+            if body.open == enclosing.get(index):
+                if isinstance(member_owner, _UnreadableImplOwner):
                     break
-                owner = ImplOrTraitItem(owner_name)
+                owner = member_owner
+                trait = membership
         else:
             item_spans.append(span)
             items.append(DeclaredItem(Declaration(keyword, name, owner), lines[index],
-                                      lines[first_attribute.get(index, index)], lines[span.end]))
+                                      lines[first_attribute.get(index, index)], lines[span.end], trait))
     return DeclaredFile(tuple(items), tuple(text.splitlines()), tuple(item_spans), tuple(others), lines)
 
 
