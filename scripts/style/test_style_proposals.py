@@ -2822,6 +2822,48 @@ class StyleProposalsTests(unittest.TestCase):
             style_ledger.main()
         return output.getvalue()
 
+    def test_follow_of_a_trait_method_prints_the_same_action_in_dry_run_and_keeps_its_decision(self) -> None:
+        with self.ledger() as ledger:
+            source = "pub trait Trait {\n    fn old(&self) -> u32;\n}\npub struct Type;\nimpl Trait for Type {\n    fn old(&self) -> u32 {\n        7\n    }\n}\n"
+            path = "alpha/src/a.rs"
+            _ = self.commit_tip(ledger, {path: source})
+            finding, = self.judge(ledger, ((path, 7, "7"),), kind="restructure")
+            issue, = self.file(ledger)
+            built, = self.judge(ledger, ((path, 2, "fn old(&self) -> u32;"),), before="Trait::old", after="Trait::new")
+            self.assertEqual(self.file(ledger), (issue,))
+            self.approve(issue)
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (built.finding_id,))
+            tip = self.commit_tip(ledger, {path: "// relocated\n" + source.replace("fn old", "fn new")})
+            before = self.written(ledger)
+            expected = (0, f"follow {finding.finding_id} {self.rename} {path}:7 -> {path}:8: fn Type::new\n"
+                        + "totals: follow 1, built 0, withdraw 0, left 0, kept 0, close 0\n")
+            self.assertEqual(self.follow("--dry-run"), expected)
+            self.assertEqual(self.written(ledger), before)
+            self.assertEqual(self.follow(), expected)
+            followed = next(row for row in ledger.proposal_findings(issue) if row.finding_id == finding.finding_id)
+            self.assertEqual((followed.line, followed.state, followed.follow),
+                             (8, style_ledger.Filed(issue), style_ledger.FollowedDeclaration(path, 7, tip)))
+            self.assertIn(f"followed from {path}:7 at {tip[:7]}", self.held_list())
+            self.assertEqual(self.follow(), (0, "totals: follow 0, built 0, withdraw 0, left 0, kept 0, close 0\n"))
+
+    def test_uncertain_trait_identity_prints_a_kept_line_without_withdrawing_or_closing(self) -> None:
+        with self.ledger() as ledger:
+            path = "alpha/src/a.rs"
+            source = "impl Trait for Type {\n    fn method() { 7 }\n}\n"
+            _ = self.commit_tip(ledger, {path: source})
+            finding, = self.judge(ledger, ((path, 2, "7"),), kind="restructure")
+            issue, = self.file(ledger)
+            _ = self.commit_tip(ledger, {path: source.replace("impl Trait", "impl external::Trait")})
+            before = self.written(ledger)
+            expected = (1, f"left {finding.finding_id} {self.rename} {path}:2: fn Type::method trait identity uncertain\n"
+                        + "totals: follow 0, built 0, withdraw 0, left 1, kept 0, close 0\n")
+            self.assertEqual(self.follow("--dry-run"), expected)
+            self.assertEqual(self.written(ledger), before)
+            self.assertEqual(self.follow(), expected)
+            self.assertEqual(self.written(ledger), before)
+            self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+
     def moved_parent(self, ledger: style_ledger.Ledger) -> tuple[style_ledger.HeldFinding, Path, str]:
         """A filed rename of the field Parent::old in a.rs, then a commit that moves struct Parent to b.rs."""
         _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT})
