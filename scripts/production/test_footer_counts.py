@@ -177,16 +177,20 @@ class FooterCountsTests(unittest.TestCase):
 
     def test_the_line_names_each_count_once_and_leaves_out_zeros(self) -> None:
         self.assertEqual(footer_counts.counts_line(FooterCounts(2, 1, 3, 1)),
-                         "For you: 2 changes to review, 1 proposal, 3 projects, 1 question")
+                         "For you: 1 question, 2 changes, 1 proposal, 3 projects")
         self.assertEqual(footer_counts.counts_line(FooterCounts(changes=1, questions=2)),
-                         "For you: 1 change to review, 2 questions")
+                         "For you: 2 questions, 1 change")
         self.assertIsNone(footer_counts.counts_line(FooterCounts()))
 
-    def test_efficiency_proposals_follow_proposals_and_use_their_own_plural(self) -> None:
-        self.assertEqual(footer_counts.counts_line(FooterCounts(1, 2, 3, 1, 130)),
-                         "For you: 1 change to review, 2 proposals, 130 efficiency proposals, 3 projects, 1 question")
-        self.assertEqual(footer_counts.counts_line(FooterCounts(efficiency=1)),
-                         "For you: 1 efficiency proposal")
+    def test_the_line_orders_questions_changes_efficiency_proposals_then_projects(self) -> None:
+        self.assertEqual(footer_counts.counts_line(FooterCounts(changes=2, proposals=4, projects=3, questions=5,
+                                                                efficiency=130)),
+                         "For you: 5 questions, 2 changes, 130 efficiency, 4 proposals, 3 projects")
+
+    def test_each_count_of_one_takes_the_singular_and_efficiency_has_no_plural(self) -> None:
+        self.assertEqual(footer_counts.counts_line(FooterCounts(1, 1, 1, 1, 1)),
+                         "For you: 1 question, 1 change, 1 efficiency, 1 proposal, 1 project")
+        self.assertEqual(footer_counts.counts_line(FooterCounts(efficiency=2)), "For you: 2 efficiency")
 
     def test_counts_add_across_productions(self) -> None:
         self.assertEqual(footer_counts.total([FooterCounts(1, 0, 2, 0, 4), FooterCounts(0, 3, 1, 0, 7)]),
