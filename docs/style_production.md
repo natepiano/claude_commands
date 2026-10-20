@@ -457,13 +457,14 @@ impl or trait it is in. The step reads only a finding whose commit is in the
 synced commit. When that file at the synced commit no longer declares the
 item, the step searches every Rust file. One other file: the finding follows it
 to the line with the same text in the item, else the item's first line, and
-keeps its id. No file: the finding is withdrawn,
-with no decision when it was unfiled. Two or more files, or a filed finding's
-file in another crate: the finding stays as it is for a person to waive or fix
-in the code. A finding that an open ticket builds is kept. The step prints
+keeps its id. No file: an unfiled finding is withdrawn with no decision; a
+filed finding is approved work, so it stays as it is for a person to waive or
+build again. Two or more files, or a filed finding's file in another crate: the
+finding stays as it is for a person to waive or fix in the code. A finding that an open ticket builds is kept. The step prints
 `follow <finding> <rule> <path>:<line> -> <path>:<line>: <keyword> <name>`,
 `withdraw … declaration gone at <commit>`, `left … declared in <files>` or
-`left … declared in another crate: <file>`, `kept …: open ticket <ticket> builds
+`left … declared in another crate: <file>`, `left … declaration gone; waive it
+or build it again`, `kept …: open ticket <ticket> builds
 it`, a `close` line per decision and a `totals` line. A decision that it changes
 refreshes its sites, and one with no finding left closes. Each run refreshes
 every open decision that holds a followed finding, so a rerun completes a run

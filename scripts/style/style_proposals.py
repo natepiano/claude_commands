@@ -1312,13 +1312,16 @@ class FollowRun:
 
 def follow_totals(run: FollowRun) -> str:
     return (f"totals: follow {run.count(style_ledger.DeclarationMoved)}, withdraw {run.count(style_ledger.DeclarationRemoved)}, "
-            + f"left {run.count(style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate)}, "
+            + f"left {run.count(*LEFT)}, "
             + f"kept {run.count(style_ledger.KeptForOpenBuild)}, close {len(run.closes)}")
 
 
+# The outcomes that leave a finding for a person.
+LEFT = (style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate, style_ledger.FiledDeclarationGone)
+
 # The outcomes that print a line: each one changes the finding, or names why the step leaves it.
 DeclarationChange = (style_ledger.DeclarationMoved | style_ledger.DeclarationRemoved | style_ledger.DeclaredInSeveralFiles
-                     | style_ledger.DeclaredInAnotherCrate | style_ledger.KeptForOpenBuild)
+                     | style_ledger.DeclaredInAnotherCrate | style_ledger.FiledDeclarationGone | style_ledger.KeptForOpenBuild)
 
 
 def follow_line(outcome: DeclarationChange, tip: str) -> str:
@@ -1335,6 +1338,8 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
             return f"left {site}: {declaration_line(outcome.declaration)} declared in {', '.join(outcome.paths)}"
         case style_ledger.DeclaredInAnotherCrate():
             return f"left {site}: {declaration_line(outcome.declaration)} declared in another crate: {outcome.path}"
+        case style_ledger.FiledDeclarationGone():
+            return f"left {site}: {declaration_line(outcome.declaration)} declaration gone; waive it or build it again"
         case style_ledger.KeptForOpenBuild():
             return f"kept {site}: open ticket {outcome.ticket} builds it"
 
@@ -1514,7 +1519,7 @@ def main(argv: list[str]) -> int:
                 writer = decision_writer(ledger, args.proposals.expanduser().resolve(), "")
                 follow = run_follow(writer, unfiled_and_filed(ledger), dry_run=args.dry_run)
                 print(follow_totals(follow))
-                left = follow.count(style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate)
+                left = follow.count(*LEFT)
                 if follow.skipped:
                     print(f"style_proposals: skipped {len(follow.skipped)} decisions", file=sys.stderr)
                 if left:

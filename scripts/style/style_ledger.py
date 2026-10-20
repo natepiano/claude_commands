@@ -566,6 +566,15 @@ class DeclaredInAnotherCrate:
 
 
 @dataclass(frozen=True)
+class FiledDeclarationGone:
+    """No file declares the subject of a filed finding at the synced tip. Its decision is approved work, so the
+    finding stays as it is: a person waives it or builds it again."""
+
+    finding: HeldFinding
+    declaration: Declaration
+
+
+@dataclass(frozen=True)
 class KeptForOpenBuild:
     """A finding the step would follow or withdraw, kept because a ticket that is not final builds it."""
 
@@ -574,7 +583,7 @@ class KeptForOpenBuild:
 
 
 DeclarationOutcome = (DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved
-                      | DeclaredInSeveralFiles | DeclaredInAnotherCrate | KeptForOpenBuild)
+                      | DeclaredInSeveralFiles | DeclaredInAnotherCrate | FiledDeclarationGone | KeptForOpenBuild)
 
 
 @dataclass(frozen=True)
@@ -2143,6 +2152,8 @@ class Ledger:
             ticket = self._ticket(finding.build_ticket.ticket)
             if ticket["state"] not in FINAL_TICKET_STATES:
                 return KeptForOpenBuild(finding, ticket["id"])
+        if isinstance(outcome, DeclarationRemoved) and isinstance(finding.state, Filed):
+            return FiledDeclarationGone(finding, declaration)
         return outcome
 
     def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip) -> DeclarationReading:

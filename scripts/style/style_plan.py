@@ -1592,12 +1592,16 @@ def _select_phase(
             print(f"waiting {issue.path}: skipped by the declaration step")
             continue
         own = tuple(outcomes[finding.finding_id] for finding in findings)
-        left: dict[str, style_ledger.DeclaredInSeveralFiles | style_ledger.DeclaredInAnotherCrate] = {
-            outcome.finding.finding_id: outcome for outcome in own
-            if isinstance(outcome, (style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate))}
+        left: dict[str, style_ledger.DeclaredInSeveralFiles | style_ledger.DeclaredInAnotherCrate | style_ledger.FiledDeclarationGone] = {
+            outcome.finding.finding_id: outcome for outcome in own if isinstance(outcome, style_proposals.LEFT)}
         for finding_id, outcome in left.items():
-            where = (f"declared in {len(outcome.paths)} files" if isinstance(outcome, style_ledger.DeclaredInSeveralFiles)
-                     else f"declared in another crate: {outcome.path}")
+            match outcome:
+                case style_ledger.DeclaredInSeveralFiles():
+                    where = f"declared in {len(outcome.paths)} files"
+                case style_ledger.DeclaredInAnotherCrate():
+                    where = f"declared in another crate: {outcome.path}"
+                case style_ledger.FiledDeclarationGone():
+                    where = "declaration gone"
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)

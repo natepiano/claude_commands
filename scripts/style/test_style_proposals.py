@@ -2475,7 +2475,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(ledger.proposal_findings(issue), (followed,))
             self.assertEqual(followed.finding_id, finding.finding_id)
 
-    def test_follow_withdraws_findings_whose_declaration_is_gone_and_closes_their_decision(self) -> None:
+    def test_a_filed_finding_whose_declaration_is_gone_is_left_for_a_person_and_its_decision_stays_open(self) -> None:
         info = "pub struct CratesIoInfo {\n    pub version: String,\n    pub downloads: u64,\n}\n"
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/ci_cache.rs": info})
@@ -2483,19 +2483,17 @@ class StyleProposalsTests(unittest.TestCase):
                                            ("alpha/src/ci_cache.rs", 3, "pub downloads: u64,")),
                                   kind="restructure", before="one struct", after="two structs")
             issue = self.approved_decision(ledger, *findings)
-            tip = self.commit_tip(ledger, {"alpha/src/ci_cache.rs": "pub fn cache() {}\n",
-                                           "alpha/src/release.rs": "pub struct CratesIoRelease {\n    pub version: String,\n}\n"})
+            states = {finding.state for finding in ledger.proposal_findings(issue)}
+            _ = self.commit_tip(ledger, {"alpha/src/ci_cache.rs": "pub fn cache() {}\n",
+                                         "alpha/src/release.rs": "pub struct CratesIoRelease {\n    pub version: String,\n}\n"})
             code, output = self.follow()
-            self.assertEqual(code, 0)
+            self.assertEqual(code, 1)
             for finding in findings:
-                self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/ci_cache.rs:{finding.line}: "
-                              + f"struct CratesIoInfo declaration gone at {tip[:7]}\n", output)
-            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)},
-                             {style_ledger.Withdrawn(issue, style_ledger.DeclarationGone(tip))})
-            reason = "nothing left to build: withdrawn: " + ", ".join(
-                f"{finding_id} (declaration gone at {tip[:7]})" for finding_id in sorted(finding.finding_id for finding in findings))
-            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], [reason]))
-            self.assertIn(f"close {issue}: {reason}\ntotals: follow 0, withdraw 2, left 0, kept 0, close 1\n", output)
+                self.assertIn(f"left {finding.finding_id} {self.rename} alpha/src/ci_cache.rs:{finding.line}: "
+                              + "struct CratesIoInfo declaration gone; waive it or build it again\n", output)
+            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)}, states)
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            self.assertTrue(output.endswith("totals: follow 0, withdraw 0, left 2, kept 0, close 0\n"))
 
     def test_an_unfiled_finding_whose_declaration_is_gone_is_withdrawn_with_no_decision_and_never_filed(self) -> None:
         with self.ledger() as ledger:
