@@ -2,7 +2,7 @@ import { describe, expect, mock, test } from 'claude-code/testing';
 import type { Engine } from 'claude-code/testing';
 import type { CommandRunInput, EngineInterface, On, TurnCompleteInput } from 'claude-code';
 import { register } from '../hooks/register';
-import { accountDisplay, accountsTable } from '../hooks/accounts';
+import { accountDisplay } from '../hooks/accounts';
 import { cellWidth } from '../hooks/geometry';
 import type { StoredAccountsStatus } from '../types/accounts';
 import { BOARD, CWD, DISCOVERY, drawnText, fixture, hostEngine, NOW, REGISTRY, RUN } from './kit';
@@ -34,15 +34,98 @@ function statusFixture(): StoredAccountsStatus {
       resets_at: null, credits: null, use_credits: false, read_at: null },
   ], problems: ['Stored reading unavailable for one account.'] };
 }
-const HEADINGS = ['Label', 'Roles', 'Left', 'Resets', 'Credits', 'Read'];
 const OLD_HEADINGS = ['Login', 'Weekly left', 'Weekly resets', 'On credits', 'Credits left'];
-function compactFixture(): StoredAccountsStatus {
-  const data = statusFixture();
-  data.accounts[0] = { ...data.accounts[0]!,
-    weekly_left_percent: 9.4, resets_at: '2026-10-18T14:00:00Z', read_at: '2026-10-18T14:00:00Z' };
-  data.accounts[1] = { ...data.accounts[1]!, weekly_left_percent: 25.6 };
-  return data;
+/** Four Claude and three Codex accounts; deliberately unsorted and mixed case. */
+function readableFixture(): StoredAccountsStatus {
+  return { accounts: [
+    { label: 'Gamma', tool: 'claude', roles: ['workers'], weekly_left_percent: 74,
+      resets_at: '2026-10-24T18:00:00Z', credits: null, use_credits: false,
+      read_at: '2026-10-16T17:55:00Z' },
+    { label: 'beta', tool: 'codex', roles: ['workers'], weekly_left_percent: 20.2,
+      resets_at: '2026-10-17T18:00:00Z', credits: 42, use_credits: false,
+      read_at: '2026-10-16T17:58:00Z' },
+    { label: 'Echo', tool: 'claude', roles: ['showrunners', 'unit directors'], weekly_left_percent: null,
+      resets_at: null, credits: null, use_credits: false, read_at: null },
+    { label: 'aLpha', tool: 'claude', roles: ['showrunners', 'unit directors'], weekly_left_percent: 60.4,
+      resets_at: '2026-10-16T18:00:00Z', credits: 'unlimited', use_credits: true,
+      read_at: '2026-10-16T17:59:00Z' },
+    { label: 'Foxtrot', tool: 'codex', roles: ['spare'], weekly_left_percent: 90,
+      resets_at: '2026-10-22T18:00:00Z', credits: null, use_credits: false,
+      read_at: '2026-10-16T17:56:00Z' },
+    { label: 'Charlie', tool: 'claude', roles: ['workers'], weekly_left_percent: 8.4,
+      resets_at: '2026-10-18T18:00:00Z', credits: null, use_credits: false,
+      read_at: '2026-10-16T17:57:00Z' },
+    { label: 'Delta', tool: 'codex', roles: ['spare'], weekly_left_percent: 25,
+      resets_at: '2026-10-23T18:00:00Z', credits: null, use_credits: false,
+      read_at: '2026-10-16T17:54:00Z' },
+  ], problems: [
+    'Stored weekly reading is unavailable for the spare account; keep its previous assignment until another reading arrives.',
+    'The role cache has an old showrunner assignment that needs refreshing before the next production starts.',
+  ] };
 }
+const ACCOUNT_LINES = [
+  ['● aLpha  showrunners, unit directors', '60% left · resets 14:00 · credits unlimited in use · read 13:59'],
+  ['● beta  workers', '20% left · resets Sat 14:00 · credits 42 · read 13:58'],
+  ['● Charlie  workers', '8% left · resets Sun 14:00 · read 13:57'],
+  ['● Delta  spare', '25% left · resets 23 Oct · read 13:54'],
+  ['● Echo  showrunners, unit directors', 'no reading'],
+  ['● Foxtrot  spare', '90% left · resets Thu 14:00 · read 13:56'],
+  ['● Gamma  workers', '74% left · resets 24 Oct · read 13:55'],
+] as const;
+
+// Literal expectations from the repair spec: seven-cell labels, 27-cell roles,
+// and a ten-cell reading column in the one-line form. No renderer helpers here.
+const REPAIR_TWO_LINE_ACCOUNTS = [
+  '● aLpha    showrunners, unit directors  60% left',
+  '  resets 14:00 · credits unlimited in use · read 13:59',
+  '● beta     workers                      20% left',
+  '  resets Sat 14:00 · credits 42 · read 13:58',
+  '● Charlie  workers                      8% left',
+  '  resets Sun 14:00 · read 13:57',
+  '● Delta    spare                        25% left',
+  '  resets 23 Oct · read 13:54',
+  '● Echo     showrunners, unit directors  no reading',
+  '● Foxtrot  spare                        90% left',
+  '  resets Thu 14:00 · read 13:56',
+  '● Gamma    workers                      74% left',
+  '  resets 24 Oct · read 13:55',
+];
+const REPAIR_DRAWN_LINES: Record<number, readonly string[]> = {
+  50: [
+    REPAIR_TWO_LINE_ACCOUNTS[0]!,
+    '  resets 14:00 · credits unlimited in use',
+    '  read 13:59',
+    ...REPAIR_TWO_LINE_ACCOUNTS.slice(2),
+    '', 'Problems',
+    '• Stored weekly reading is unavailable for the',
+    '  spare account; keep its previous assignment',
+    '  until another reading arrives.',
+    '• The role cache has an old showrunner assignment',
+    '  that needs refreshing before the next',
+    '  production starts.',
+  ],
+  85: [
+    ...REPAIR_TWO_LINE_ACCOUNTS,
+    '', 'Problems',
+    '• Stored weekly reading is unavailable for the spare account; keep its previous',
+    '  assignment until another reading arrives.',
+    '• The role cache has an old showrunner assignment that needs refreshing before the',
+    '  next production starts.',
+  ],
+  110: [
+    '● aLpha    showrunners, unit directors  60% left   · resets 14:00 · credits unlimited in use · read 13:59',
+    '● beta     workers                      20% left   · resets Sat 14:00 · credits 42 · read 13:58',
+    '● Charlie  workers                      8% left    · resets Sun 14:00 · read 13:57',
+    '● Delta    spare                        25% left   · resets 23 Oct · read 13:54',
+    '● Echo     showrunners, unit directors  no reading',
+    '● Foxtrot  spare                        90% left   · resets Thu 14:00 · read 13:56',
+    '● Gamma    workers                      74% left   · resets 24 Oct · read 13:55',
+    '', 'Problems',
+    '• Stored weekly reading is unavailable for the spare account; keep its previous assignment until another',
+    '  reading arrives.',
+    '• The role cache has an old showrunner assignment that needs refreshing before the next production starts.',
+  ],
+};
 
 /** Extra fields can still arrive from an older status producer. */
 function legacyLoginFixture() {
@@ -58,31 +141,52 @@ function children(value: unknown): unknown[] {
   const found = element(value).children;
   return Array.isArray(found) ? found : found === undefined ? [] : [found];
 }
-/** Preserve cell padding and adjacent spans so width checks measure drawn rows. */
+/** Keep adjacent spans, indentation and blank rows so width checks measure actual drawn lines. */
 function rowLines(value: unknown): string[] {
-  if (typeof value === 'string' || typeof value === 'number') return [String(value)];
+  if (typeof value === 'string' || typeof value === 'number') return String(value).split('\n');
+  if (Array.isArray(value)) return value.flatMap(rowLines);
   const node = element(value);
-  const parts = children(value).flatMap(rowLines);
-  if (node.type === 'Text') return [parts.join('')];
-  if (node.type !== 'Box') return parts;
   const props = element(node.props);
+  const parts = children(value).map(rowLines).filter(lines => lines.length);
+  if (node.type === 'Text') return [parts.flat().join('')];
+  if (node.type !== 'Box') return parts.flat();
   const top = Number(props.marginTop ?? props.marginY ?? props.margin ?? 0)
     + Number(props.paddingTop ?? props.paddingY ?? props.padding ?? 0);
-  const lines = props.flexDirection === 'column' ? parts
-    : parts.length ? [parts.join(' '.repeat(Number(props.columnGap ?? props.gap ?? 0)))] : [];
-  return [...Array.from({ length: top }, () => ''), ...lines];
+  const bottom = Number(props.marginBottom ?? props.marginY ?? props.margin ?? 0)
+    + Number(props.paddingBottom ?? props.paddingY ?? props.padding ?? 0);
+  const lines = props.flexDirection === 'column'
+    ? parts.flatMap((rows, index) => [...Array<string>(index ? Number(props.rowGap ?? props.gap ?? 0) : 0).fill(''), ...rows])
+    : parts.length ? [parts.flat().join(' '.repeat(Number(props.columnGap ?? props.gap ?? 0)))] : [];
+  const indent = ' '.repeat(Number(props.paddingLeft ?? props.paddingX ?? props.padding ?? 0));
+  return [...Array<string>(top).fill(''), ...lines.map(line => indent + line), ...Array<string>(bottom).fill('')];
 }
-function textNodes(value: unknown): Record<string, unknown>[] {
-  const node = element(value);
-  return [...(node.type === 'Text' ? [node] : []), ...children(value).flatMap(textNodes)];
+function elements(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) return value.flatMap(elements);
+  if (typeof value !== 'object' || value === null) return [];
+  return [element(value), ...children(value).flatMap(elements)];
 }
-function accountRow(tree: unknown, label: string): unknown {
-  if (children(tree).some(child => drawnText(child).trim() === label)) return tree;
-  for (const child of children(tree)) {
-    const found = accountRow(child, label);
-    if (found) return found;
-  }
-  return undefined;
+/** Follow inherited styles so an outer dim/color cannot hide a wrongly styled fact. */
+function styledText(value: unknown, color = 'default', bold = false): { text: string; color: string; bold: boolean }[] {
+  if (typeof value === 'string' || typeof value === 'number') return [{ text: String(value), color, bold }];
+  if (Array.isArray(value)) return value.flatMap(child => styledText(child, color, bold));
+  const props = element(element(value).props);
+  return children(value).flatMap(child => styledText(child,
+    typeof props.color === 'string' ? props.color : color,
+    typeof props.bold === 'boolean' ? props.bold : bold));
+}
+function textInColor(tree: unknown, color: string): string {
+  return styledText(tree).filter(span => span.color === color).map(span => span.text).join('');
+}
+function accountLines(tree: unknown, label: string): string[] {
+  const lines = rowLines(tree);
+  const first = lines.findIndex(line => line.startsWith(`● ${label}`));
+  if (first < 0) return [];
+  const rest = lines.slice(first + 1);
+  const next = rest.findIndex(line => line.startsWith('● ') || line === '' || line === 'Problems');
+  return [lines[first]!, ...rest.slice(0, next < 0 ? rest.length : next)];
+}
+function normalized(lines: readonly string[]): string {
+  return lines.join(' ').replace(/\s+/g, ' ').trim();
 }
 function accountsHost(on: On, missing: readonly string[] = [], environment: Record<string, string> = { USER_ZONE: 'UTC' }) {
   const host = hostEngine(on);
@@ -192,57 +296,231 @@ async function mount($: Engine, surface: 'terminal' | 'desktop' = 'terminal') {
 function hasSensitivePath(paths: readonly string[]) {
   return paths.some(path => /(?:\.claude\.json|auth\.json|id_token)/.test(path));
 }
-function accountRowText(tree: unknown, label: string): string {
-  if (!tree || typeof tree !== 'object') return '';
-  if (Array.isArray(tree)) {
-    for (const child of tree) { const found = accountRowText(child, label); if (found) return found; }
-    return '';
+describe('accounts paired lines', () => {
+  for (const surface of ['terminal', 'desktop'] as const) {
+    for (const columns of [40, 60, 85, 120]) {
+      test(`${surface}: seven accounts retain every fact within ${columns} cells`, async ($, on) => {
+        const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
+        const data = readableFixture();
+        const before = JSON.stringify(data);
+        fake.replace(data);
+        await $.session.start(start);
+        await $.command.run(command());
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+          props: { ...props, bodyColumns: columns } });
+        const tree = await ui.drawn();
+        const lines = rowLines(tree);
+        expect(lines[0]).toContain('● aLpha');
+        expect(lines.filter(line => line.startsWith('● ')).map(line => line.split('  ')[0]))
+          .toEqual(ACCOUNT_LINES.map(([left]) => left.split('  ')[0]));
+        for (const line of lines) {
+          expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+          expect(line).not.toContain('…');
+          expect(line).not.toContain('—');
+        }
+        for (const [left, right] of ACCOUNT_LINES) {
+          const label = left.slice(2).split('  ')[0]!;
+          const rows = accountLines(tree, label);
+          // A wrapped separator is intentionally dropped by the repair spec.
+          expect(normalized(rows).replace(/ · /g, ' ')).toBe(normalized([left, right]).replace(/ · /g, ' '));
+          if (columns === 120) {
+            expect(rows).toHaveLength(1);
+            expect(rows[0]?.startsWith('● ' + label)).toBe(true);
+          }
+          if (columns === 40) {
+            expect(rows[0]).toBe(left);
+            expect(rows[1]?.startsWith('  ' + right.split(' · ')[0])).toBe(true);
+            expect(rows.slice(1).every(line => line.startsWith('  '))).toBe(true);
+          }
+          const labelSpans = styledText(tree).filter(span => span.text.includes(label));
+          expect(labelSpans.length).toBeGreaterThan(0);
+          expect(labelSpans.every(span => span.bold && span.color === 'default')).toBe(true);
+        }
+        for (const node of elements(tree)) {
+          const attributes = element(node.props);
+          expect(attributes.color === 'subtle').toBe(false);
+          expect(attributes.dimColor === true).toBe(false);
+          expect(attributes.wrap === 'truncate-end').toBe(false);
+        }
+        const problemHeading = lines.indexOf('Problems');
+        expect(problemHeading).toBeGreaterThan(0);
+        expect(lines[problemHeading - 1]).toBe('');
+        expect(styledText(tree).some(span => span.text === 'Problems' && span.bold)).toBe(true);
+        const problemRows = lines.slice(problemHeading + 1);
+        expect(problemRows.filter(line => line.startsWith('• ')).length).toBe(data.problems.length);
+        expect(normalized(problemRows)).toBe(normalized(data.problems.map(problem => '• ' + problem)));
+        for (const line of problemRows.filter(line => line.trim())) {
+          expect(line.startsWith('• ') || line.startsWith('  ')).toBe(true);
+        }
+        const styled = styledText(tree);
+        const headingSpan = styled.findIndex(span => span.text === 'Problems');
+        expect(headingSpan).toBeGreaterThanOrEqual(0);
+        expect(styled.slice(headingSpan + 1).filter(span => span.text.trim()).every(span => span.color === 'warning')).toBe(true);
+        expect(JSON.stringify(data)).toBe(before);
+      });
+    }
   }
-  const node = tree as Record<string, unknown>;
-  const children = node.children;
-  if (Array.isArray(children) && children.some(child => drawnText(child).trim() === label)) return drawnText(tree);
-  return accountRowText(children, label);
-}
 
-describe('compact accounts table', () => {
-  test('a CJK label reserves terminal columns and drawn rows fit the stated width', async ($, on) => {
+  for (const surface of ['terminal', 'desktop'] as const) {
+    for (const columns of [50, 85, 110]) {
+      test(`${surface}: repair layout draws exact aligned fact lines at ${columns} cells`, async ($, on) => {
+        const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
+        fake.replace(readableFixture());
+        await $.command.run(command());
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+          props: { ...props, bodyColumns: columns } });
+        const tree = await ui.drawn();
+        const lines = rowLines(tree);
+        expect(lines).toEqual(REPAIR_DRAWN_LINES[columns]!);
+        const readingColumns = ACCOUNT_LINES.map(([left, right]) => {
+          const label = left.slice(2).split('  ')[0]!;
+          const heading = accountLines(tree, label)[0]!;
+          const reading = right.split(' · ')[0]!;
+          expect(heading).toContain(reading);
+          return cellWidth(heading.slice(0, heading.indexOf(reading)));
+        });
+        expect(readingColumns).toEqual([40, 40, 40, 40, 40, 40, 40]);
+        for (const line of lines) {
+          expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+          expect(/(?:\b(?:resets|credits|read|in)| ·)\s*$/.test(line)).toBe(false);
+          expect(/^\s*(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) )?\d{1,2}:\d{2}\b/.test(line)).toBe(false);
+        }
+      });
+    }
+    for (const columns of [30, 40]) {
+      test(`${surface}: repair fallback at ${columns} cells preserves complete facts on indented lines`, async ($, on) => {
+        const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
+        fake.replace(readableFixture());
+        await $.command.run(command());
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
+          props: { ...props, bodyColumns: columns } });
+        const tree = await ui.drawn();
+        const lines = rowLines(tree);
+        for (const [left, right] of ACCOUNT_LINES) {
+          const label = left.slice(2).split('  ')[0]!;
+          const rows = accountLines(tree, label);
+          // Reconstruct the facts without silently losing separators at line breaks.
+          const firstFact = rows.findIndex(line => line.startsWith('  ' + right.split(' · ')[0]));
+          expect(firstFact).toBeGreaterThan(0);
+          expect(normalized(rows.slice(0, firstFact))).toBe(normalized([left]));
+          const facts = rows.slice(firstFact).flatMap(line => line.trim().split(' · '));
+          expect(facts).toEqual(right.split(' · '));
+          expect(rows.slice(1).every(line => line.startsWith('  '))).toBe(true);
+        }
+        for (const line of lines) {
+          expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+          expect(line).not.toContain('…');
+          expect(/(?:\b(?:resets|credits|read|in)| ·)\s*$/.test(line)).toBe(false);
+          expect(/^\s*(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) )?\d{1,2}:\d{2}\b/.test(line)).toBe(false);
+        }
+      });
+    }
+  }
+
+  test('wide labels use terminal cells and preserve all their characters when wrapping', async ($, on) => {
     const fake = accountsHost(on);
-    const account = { ...compactFixture().accounts[0]!, label: '用户名用户名用户',
-      roles: ['unit directors', 'showrunners'],
-      credits: 'unlimited' as const, use_credits: true };
-    fake.replace({ accounts: [account], problems: [] });
-    const table = accountsTable([accountDisplay(account)], 'UTC');
-    const widths = table.headings.map((heading, index) => Math.max(cellWidth(heading),
-      ...table.rows.map(row => cellWidth(row[index]!))));
-    expect(table.width).toBe(widths.reduce((sum, width) => sum + width, 0) + 10);
-    await $.session.start(start);
+    const label = '用户名'.repeat(8) + ' e\u0301😀';
+    const data = statusFixture();
+    data.accounts = [{ ...data.accounts[0]!, label }];
+    data.problems = [];
+    fake.replace(data);
     await $.command.run(command());
-    for (const surface of ['terminal', 'desktop'] as const) {
-      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
-        props: { ...props, bodyColumns: table.width } });
-      const rows = rowLines(await ui.drawn()).filter(line => line.startsWith(account.label));
-      expect(rows.length).toBe(1);
-      const expected = table.rows[0]!.map((cell, index) => index === 5 ? cell
-        : cell + ' '.repeat(widths[index]! - cellWidth(cell))).join('  ');
-      for (const row of rows) {
-        expect(row).toBe(expected);
-        expect(cellWidth(row)).toBeLessThanOrEqual(table.width);
-      }
+    const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface: 'terminal',
+      props: { ...props, bodyColumns: 40 } });
+    const lines = rowLines(await ui.drawn());
+    for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(40);
+    expect(lines.join('').replace(/\s/g, '')).toContain(label.replace(/\s/g, ''));
+    expect(lines.join('')).not.toContain('…');
+  });
+
+  test('dots and weekly values use thresholds, while labels, roles and time values keep the default tone', async ($, on) => {
+    const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
+    const data = readableFixture();
+    data.problems = [];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    const tree = await ui.drawn();
+    expect(textInColor(tree, 'error').replace(/\s/g, '')).toBe('●8%left');
+    expect(textInColor(tree, 'warning').replace(/\s/g, '')).toBe('inuse●20%left');
+    expect(textInColor(tree, 'success').replace(/\s/g, '')).toBe('●●●●');
+    const inactive = textInColor(tree, 'inactive');
+    expect(inactive).toContain('●');
+    expect(inactive.replace(/resets|credits|read| · |●|\s/g, '')).toBe('');
+    const ordinary = textInColor(tree, 'default');
+    for (const fact of ['60% left', '25% left', '90% left', '74% left', 'no reading',
+      'showrunners, unit directors', 'workers', 'spare', 'unlimited', '42', '14:00', '13:59', '24 Oct']) {
+      expect(ordinary).toContain(fact);
     }
   });
 
-  test('six short headings and compact cells preserve the stored readings', () => {
-    const data = compactFixture();
-    const before = JSON.stringify(data);
-    const table = accountsTable(data.accounts.map(accountDisplay), 'UTC');
-    expect(table.headings).toEqual(HEADINGS);
-    expect(table.rows[0]).toEqual(['Low', 'unit directors, showrunners',
-      '9%', 'Oct 18 14:00', '42 in use', 'Oct 18 14:00']);
-    expect(table.rows[1]?.[2]).toBe('26%');
-    expect(table.rows[1]?.[4]).toBe('unlimited');
-    expect(JSON.stringify(data)).toBe(before);
-    for (const heading of OLD_HEADINGS) expect(table.headings.includes(heading)).toBe(false);
+  test('the exact ten and twenty-five percent boundaries choose warning and success', async ($, on) => {
+    const fake = accountsHost(on);
+    const data = statusFixture();
+    data.accounts = [9, 10, 24, 25].map(value => ({ ...data.accounts[0]!, label: `Level ${value}`,
+      weekly_left_percent: value, credits: null, use_credits: false }));
+    data.problems = [];
+    fake.replace(data);
+    await $.command.run(command());
+    const tree = await (await mount($)).drawn();
+    expect(textInColor(tree, 'error').replace(/\s/g, '')).toBe('●9%left');
+    expect(textInColor(tree, 'warning').replace(/\s/g, '')).toBe('●10%left●24%left');
+    expect(textInColor(tree, 'success').trim()).toBe('●');
+    expect(textInColor(tree, 'default')).toContain('25% left');
   });
+
+  for (const [at, expected] of [
+    ['2026-10-17T02:00:00Z', '22:00'], // Same New York day, different UTC day.
+    ['2026-10-10T18:00:00Z', 'Sat 14:00'],
+    ['2026-10-22T18:00:00Z', 'Thu 14:00'],
+    ['2026-10-09T18:00:00Z', '9 Oct'],
+    ['2026-10-24T18:00:00Z', '24 Oct'],
+  ] as const) {
+    test(`short reset and read times in the resolved zone render ${at} as ${expected}`, async ($, on) => {
+      const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
+      const account = { ...statusFixture().accounts[0]!, resets_at: at, read_at: at };
+      fake.replace({ accounts: [account], problems: [] });
+      await $.command.run(command());
+      const text = normalized(rowLines(await (await mount($)).drawn()));
+      expect(text).toContain(`resets ${expected}`);
+      expect(text).toContain(`read ${expected}`);
+    });
+  }
+
+  test('missing or invalid optional facts disappear, and real zero readings and credits remain', async ($, on) => {
+    const fake = accountsHost(on);
+    const account = statusFixture().accounts[2]!;
+    fake.replace({ accounts: [account,
+      { ...account, label: 'Invalid', resets_at: 'not-a-date', read_at: 'not-a-date', use_credits: true },
+      { ...account, label: 'Zero', weekly_left_percent: 0, credits: 0 }], problems: [] });
+    await $.command.run(command());
+    const tree = await (await mount($)).drawn();
+    expect(normalized(accountLines(tree, 'Unknown'))).toBe('● Unknown no reading');
+    expect(normalized(accountLines(tree, 'Invalid'))).toBe('● Invalid no reading');
+    expect(normalized(accountLines(tree, 'Zero'))).toBe('● Zero 0% left · credits 0');
+    const text = rowLines(tree).join(' ');
+    for (const missing of ['—', 'resets', 'read ', 'in use', 'null', 'undefined', 'Problems']) {
+      expect(text).not.toContain(missing);
+    }
+  });
+
+  for (const [missing, expected] of [
+    ['reset', '9% left · credits 42 in use · read 17:59'],
+    ['credit', '9% left · resets Sun 18:00 · read 17:59'],
+    ['read', '9% left · resets Sun 18:00 · credits 42 in use'],
+  ] as const) {
+    test(`a missing ${missing} omits only that optional part`, async ($, on) => {
+      const fake = accountsHost(on);
+      const account = { ...statusFixture().accounts[0]!,
+        ...(missing === 'reset' ? { resets_at: null } : {}),
+        ...(missing === 'credit' ? { credits: null } : {}),
+        ...(missing === 'read' ? { read_at: null } : {}) };
+      fake.replace({ accounts: [account], problems: [] });
+      await $.command.run(command());
+      const text = normalized(rowLines(await (await mount($)).drawn()));
+      expect(text).toBe(`● Low unit directors, showrunners ${expected}`);
+    });
+  }
 
   test('the display projection drops a legacy login address', () => {
     const account = legacyLoginFixture().accounts[0]!;
@@ -250,102 +528,11 @@ describe('compact accounts table', () => {
     expect('login' in display).toBe(false);
     expect(JSON.stringify(display).includes(account.login)).toBe(false);
   });
-
-  test('each missing reading and invalid date uses an em dash while real zero stays zero', () => {
-    const data = compactFixture();
-    const missing = data.accounts[2]!;
-    const invalid = { ...missing, label: 'Invalid', resets_at: 'not-a-date', read_at: 'not-a-date',
-      use_credits: true };
-    const zero = { ...data.accounts[0]!, label: 'Zero', weekly_left_percent: 0, credits: 0,
-      use_credits: false };
-    const table = accountsTable([missing, invalid, zero].map(accountDisplay), 'UTC');
-    for (const row of table.rows.slice(0, 2)) {
-      expect([row[2], row[3], row[4], row[5]]).toEqual(['—', '—', '—', '—']);
-      expect(row.join(' ').includes('unavailable')).toBe(false);
-      expect(row.join(' ').includes('0%')).toBe(false);
-    }
-    expect(table.rows[2]?.[2]).toBe('0%');
-    expect(table.rows[2]?.[4]).toBe('0');
-  });
-
-  test('short dates honor the resolved zone and unlimited credits show when they are in use', () => {
-    const account = { ...compactFixture().accounts[0]!, credits: 'unlimited' as const, use_credits: true };
-    const table = accountsTable([accountDisplay(account)], 'America/New_York');
-    expect(table.rows[0]?.[3]).toBe('Oct 18 10:00');
-    expect(table.rows[0]?.[5]).toBe('Oct 18 10:00');
-    expect(table.rows[0]?.[4]).toBe('unlimited in use');
-  });
-
-  test('width reserves six columns and exactly five two-space gaps within 90 columns', () => {
-    const data = compactFixture();
-    data.accounts[1]!.use_credits = true;
-    const table = accountsTable(data.accounts.map(accountDisplay), 'UTC');
-    const widths = table.headings.map((heading, index) => Math.max(cellWidth(heading),
-      ...table.rows.map(row => cellWidth(row[index]!))));
-    expect(table.width).toBe(widths.reduce((sum, width) => sum + width, 0) + 10);
-    expect(table.width).toBeLessThanOrEqual(90);
-    for (const row of [table.headings, ...table.rows]) {
-      expect(row.length).toBe(6);
-      for (const cell of row) expect(cell).toBe(cell.trim());
-    }
-  });
 });
 
 describe('accounts pane', () => {
   for (const surface of ['terminal', 'desktop'] as const) {
-    test(`${surface}: the stated table width draws whole unpadded rows with normal text colors`, async ($, on) => {
-      const fake = accountsHost(on);
-      const data = compactFixture();
-      data.accounts[1]!.use_credits = true;
-      fake.replace(data);
-      const table = accountsTable(data.accounts.map(accountDisplay), 'UTC');
-      await $.session.start(start);
-      await $.command.run(command());
-      const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface,
-        props: { ...props, bodyColumns: table.width } });
-      const tree = await ui.drawn();
-      const lines = rowLines(tree);
-      const header = lines.find(line => line.trimStart().startsWith('Label'));
-      expect(lines[0]).toBe(header);
-      expect(lines.some(line => /^\s*units:/i.test(line))).toBe(false);
-      expect(header?.trim().split(/\s{2,}/)).toEqual(HEADINGS);
-      expect(header!.length).toBeLessThanOrEqual(table.width);
-      expect(header!.endsWith(' ')).toBe(false);
-      const widths = table.headings.map((heading, index) => Math.max(heading.length,
-        ...table.rows.map(row => row[index]!.length)));
-      for (const [index, account] of data.accounts.entries()) {
-        const line = lines.find(line => line.trimStart().startsWith(account.label));
-        expect(typeof line).toBe('string');
-        expect(line!.length).toBeLessThanOrEqual(table.width);
-        expect(line!.endsWith(' ')).toBe(false);
-        expect(line).toBe(table.rows[index]!.map((cell, column) => column === 5
-          ? cell : cell.padEnd(widths[column]!)).join('  '));
-        const row = accountRow(tree, account.label);
-        expect(row !== undefined).toBe(true);
-        const cells = textNodes(row);
-        expect(cells.length).toBeGreaterThan(0);
-        for (const cell of cells) {
-          const text = rowLines(cell).join('');
-          const color = element(cell.props).color;
-          expect(color === 'subtle').toBe(false);
-          expect(color ?? 'default').toBe(text.trim() === '9%' ? 'error' : 'default');
-        }
-        // The final Read cell must be on this same line, including for missing dates.
-        expect(line!.trimEnd().endsWith(account.read_at ? 'Oct 18 14:00' : '—')).toBe(true);
-      }
-      const bold = textNodes(tree).filter(cell => /^Label\b/.test(rowLines(cell).join('').trimStart()));
-      expect(bold.length).toBeGreaterThan(0);
-      for (const cell of bold) expect(element(cell.props).bold).toBe(true);
-      const problems = await ui.findAll({ type: 'Text', text: 'Stored reading unavailable for one account.' });
-      expect(problems.length).toBeGreaterThan(0);
-      expect(problems.every(cell => cell.props.color === 'warning')).toBe(true);
-      expect(lines.indexOf('Stored reading unavailable for one account.')).toBeGreaterThan(
-        lines.findIndex(line => line.startsWith('Unknown')));
-    });
-  }
-
-  for (const surface of ['terminal', 'desktop'] as const) {
-    test(`${surface}: stored status opens a private table with roles and problems`, async ($, on) => {
+    test(`${surface}: stored status opens private account lines with roles and problems`, async ($, on) => {
       const fake = accountsHost(on);
       await $.session.start(start);
       const result = await $.command.run(command());
@@ -355,7 +542,7 @@ describe('accounts pane', () => {
       expect(fake.opened).toEqual(['accounts-board']);
       const ui = await mount($, surface);
       const text = drawnText(await ui.drawn());
-      for (const word of [...HEADINGS, 'Low', 'Watch', 'Unknown', 'showrunners', 'workers',
+      for (const word of ['●', '% left', 'Problems', 'Low', 'Watch', 'Unknown', 'showrunners', 'workers',
         'Stored reading unavailable for one account.', 'unlimited', '42']) {
         expect(text.toLowerCase().includes(word.toLowerCase())).toBe(true);
       }
@@ -433,7 +620,7 @@ describe('accounts pane', () => {
   });
 
   for (const role of ['units', 'unit directors']) {
-    test(`${role} assignments stay in the table with its headings first`, async ($, on) => {
+    test(`${role} assignments stay beside their account labels`, async ($, on) => {
       const fake = accountsHost(on);
       const data = statusFixture();
       data.accounts[0]!.roles = [role];
@@ -444,10 +631,10 @@ describe('accounts pane', () => {
       const ui = await mount($);
       const tree = await ui.drawn();
       const lines = rowLines(tree);
-      expect(lines[0]?.trim().split(/\s{2,}/)).toEqual(HEADINGS);
+      expect(lines[0]).toContain('● Low');
       expect(lines.some(line => /^\s*units:/i.test(line))).toBe(false);
-      expect(accountRowText(tree, 'Low').includes(role)).toBe(true);
-      expect(accountRowText(tree, 'Watch').includes('showrunners')).toBe(true);
+      expect(normalized(accountLines(tree, 'Low')).includes(role)).toBe(true);
+      expect(normalized(accountLines(tree, 'Watch')).includes('showrunners')).toBe(true);
     });
   }
 
@@ -531,40 +718,8 @@ describe('accounts pane', () => {
     fake.change(`${HOME}/.local/state/accounts/roles.jsonl`);
     await fake.clock.advance(60_000);
     expect(fake.accountRuns()).toEqual([]);
-    expect(fake.stateWrites).toEqual([]);
+    expect(fake.stateWrites.every(kind => kind === 'accounts')).toBe(true);
     expect(fake.fs.includes(`${HOME}/.local/state/accounts`)).toBe(false);
-  });
-
-  test('nullable readings draw four em dashes instead of unavailable or zero', async ($, on) => {
-    const fake = accountsHost(on);
-    await $.session.start(start);
-    await $.command.run(command());
-    const ui = await mount($);
-    const row = accountRowText(await ui.drawn(), 'Unknown');
-    expect(row.includes('Unknown')).toBe(true);
-    expect(row.match(/—/g)?.length).toBe(4);
-    expect(row.includes('unavailable')).toBe(false);
-    expect(row.includes('0%')).toBe(false);
-    expect(row.includes('null') || row.includes('undefined')).toBe(false);
-    expect(fake.accountRuns()).toEqual([ARGV]);
-  });
-
-  test('weekly thresholds use error below ten and warning below twenty-five only', async ($, on) => {
-    const fake = accountsHost(on);
-    const data = statusFixture();
-    data.accounts = [9, 10, 24, 25].map(value => ({ ...data.accounts[0]!,
-      label: `Level ${value}`, weekly_left_percent: value }));
-    fake.replace(data);
-    await $.session.start(start);
-    await $.command.run(command());
-    const ui = await mount($);
-    for (const [value, tone] of [[9, 'error'], [10, 'warning'], [24, 'warning']] as const) {
-      const cells = await ui.findAll({ type: 'Text', text: new RegExp(`^${value}(?:\\.0)?\\s*%$`) });
-      expect(cells.some(cell => cell.props.color === tone)).toBe(true);
-    }
-    const healthy = await ui.findAll({ type: 'Text', text: /^25(?:\.0)?\s*%$/ });
-    expect(healthy.length).toBeGreaterThan(0);
-    expect(healthy.some(cell => cell.props.color === 'warning' || cell.props.color === 'error')).toBe(false);
   });
 
   for (const source of INPUTS) {
@@ -673,7 +828,7 @@ describe('accounts pane', () => {
       await fake.clock.advance(10_000);
       const text = drawnText(await ui.drawn());
       expect(fake.accountStateKind()).toBe('accounts');
-      expect(text.includes('Left')).toBe(true);
+      expect(text.includes('% left')).toBe(true);
       for (const heading of OLD_HEADINGS) expect(text.includes(heading)).toBe(false);
       expect(fake.accountRuns().every(argv => JSON.stringify(argv) === JSON.stringify(ARGV))).toBe(true);
     });

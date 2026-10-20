@@ -519,3 +519,85 @@ describe("unit board commands and lifetime", () => {
   });
 
 });
+
+
+describe("accounts pane clock", () => {
+  const accountsCommand: CommandRunInput = { ...command(), command: "accounts-board" };
+
+  function accountsClockHost(on: Parameters<typeof hostEngine>[0]) {
+    const host = hostEngine(on);
+    const clock = mock.clock(on, { now: NOW });
+    mock.env(on, { HOME: "/test-home", USER_ZONE: "America/New_York" });
+    const data = { accounts: [{ label: "Fixture", tool: "claude", roles: ["workers"],
+      weekly_left_percent: 60, resets_at: "2026-10-17T03:59:55Z", credits: null,
+      use_credits: false, read_at: "2026-10-17T03:59:55Z" }], problems: [] };
+    const processes: string[][] = [];
+    const reads: string[] = [];
+    const snapshots: Record<string, unknown>[] = [];
+    let sourceMtime = NOW;
+    on("fs.stat", () => ({ value: { kind: "file", size: 0, mtimeMs: sourceMtime, isLink: false } }));
+    on("fs.exists", () => ({ value: true }));
+    on("fs.list", () => ({ value: [] }));
+    on("fs.read", (_$, event) => { reads.push(event.path); throw new Error("Accounts clock reads no fixture files"); });
+    on("process.run", (_$, event) => {
+      processes.push([...event.argv]);
+      return { value: { exitCode: 0, stdout: JSON.stringify(data), stderr: "",
+        isStdoutTruncated: false, isStderrTruncated: false } };
+    });
+    on("state.set", { plugin: "unit-board", key: "accountsPanes" }, (_$, event, next) => {
+      const state = event.value["accounts-board"];
+      if (state?.kind === "accounts") snapshots.push({ ...state });
+      return next(event);
+    });
+    return { ...host, clock, processes, reads, snapshots,
+      change: () => { sourceMtime = clock.now() + 1; } };
+  }
+
+  test("load and every unchanged ten-second tick store fresh epoch seconds without another process", async ($, on) => {
+    const fake = accountsClockHost(on);
+    await fake.clock.advance(12_345);
+    await $.command.run(accountsCommand);
+    expect(fake.snapshots.at(-1)?.now).toBe((NOW + 12_345) / 1000);
+    expect(fake.snapshots.at(-1)?.zone).toBe("America/New_York");
+    const snapshotData = fake.snapshots.at(-1)?.data;
+    expect(fake.processes.length).toBe(1);
+    for (const elapsed of [10_000, 20_000]) {
+      await fake.clock.advance(10_000);
+      expect(fake.snapshots.at(-1)?.now).toBe((NOW + 12_345 + elapsed) / 1000);
+      expect(fake.snapshots.at(-1)?.data).toEqual(snapshotData);
+      expect(fake.processes.length).toBe(1);
+      expect(fake.reads).toEqual([]);
+    }
+  });
+
+  test("a watched-source reload stamps its new reading with the current clock", async ($, on) => {
+    const fake = accountsClockHost(on);
+    await $.command.run(accountsCommand);
+    fake.change();
+    await fake.clock.advance(10_000);
+    expect(fake.processes.length).toBe(2);
+    expect(fake.snapshots.at(-1)?.now).toBe((NOW + 10_000) / 1000);
+    expect(fake.reads).toEqual([]);
+  });
+
+  for (const surface of ["terminal", "desktop"] as const) {
+    test(`${surface}: an unchanged tick across local midnight redraws short times from the new now`, async ($, on) => {
+      const fake = accountsClockHost(on);
+      const midnight = Date.UTC(2026, 9, 17, 4, 0);
+      await fake.clock.advance(midnight - NOW - 5_000);
+      await $.command.run(accountsCommand);
+      const ui = await $.ui.mount({ plugin: "unit-board", requestId: "accounts-board", component: "Pane", surface,
+        props: { ...props, title: "Accounts", bodyColumns: 120 } });
+      const before = drawnText(await ui.drawn()).replace(/\s+/g, " ");
+      expect(before).toContain("resets 23:59");
+      expect(before).toContain("read 23:59");
+      await fake.clock.advance(10_000);
+      const after = drawnText(await ui.drawn()).replace(/\s+/g, " ");
+      expect(after).toContain("resets Fri 23:59");
+      expect(after).toContain("read Fri 23:59");
+      expect(fake.snapshots.at(-1)?.now).toBe((midnight + 5_000) / 1000);
+      expect(fake.processes.length).toBe(1);
+      expect(fake.reads).toEqual([]);
+    });
+  }
+});
