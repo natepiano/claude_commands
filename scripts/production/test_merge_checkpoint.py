@@ -691,6 +691,18 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(len(self.events("verify.sh")), 4)
         self.assertIn("flake", self.log.read_text().lower())
 
+    def test_a_docs_path_under_a_workspace_root_runs_no_package_test(self) -> None:
+        self.write(self.unit, "crates/alpha/Cargo.toml", '[workspace]\nmembers = ["crates/*"]\n')
+        self.write(self.unit, "crates/alpha/docs/as-built/pane.md", "# Pane\n")
+        _ = self.git("add", "crates/alpha", cwd=self.unit)
+        _ = self.git("commit", "-m", "docs only", cwd=self.unit)
+        sha = self.git("rev-parse", "HEAD", cwd=self.unit)
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        _ = (self.state / "fail-always-test").touch()
+        result = self.run_checkpoint(sha)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertEqual(self.events("verify.sh"), [])
+
     def test_two_backticked_known_flakes_each_count_green_alone(self) -> None:
         for package in ("crate-a", "crate-b"):
             self.write(self.unit, f"crates/alpha/{package}/Cargo.toml",
