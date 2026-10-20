@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Set a hanadocs issue's proposal fields: approve, start, close or stars.
 
-Edits one issue file's frontmatter in place and reads nothing else. Every verb also sets
+Each verb edits one issue file's frontmatter in place and reads nothing else, but number and create
+read the folder for the highest P number, and move-approved reads the folder and edits each open
+approved proposal in it. Every verb also sets
 date_modified to today in the user's zone, written "[[YYYY-MM-DD]]" as the vault writes dates.
 Each verb holds an exclusive lock on the issue for its whole read, change and write. The lock
 file is in the user's runtime folder, never in the issue folder.
@@ -13,6 +15,7 @@ Usage:
   proposal_issue.py rules <issue> --rules URLS
   proposal_issue.py stars <issue> --goal G --alignment A --impact I --urgency U --effort E
   proposal_issue.py number <issue>...
+  proposal_issue.py move-approved <issues folder> [--dry-run]
 
 `number` gives each proposal without one the next `proposal_id`, P1 up, as change rows are C1 up;
 `create` numbers a new decision the same way.
@@ -27,7 +30,7 @@ import os
 import re
 import sys
 import tempfile
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -36,7 +39,7 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone  # noqa: E402
-from issues import Issue, frontmatter
+from issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
 
 FENCE = "---"
 # Values the vault writes bare; every other value is written double-quoted.
@@ -246,10 +249,13 @@ def edit(path: Path, fields: dict[str, str], today: date) -> list[str]:
 
 
 def reopen(path: Path, today: date) -> list[str]:
-    """Remove the close fields and set status open. The answer stays."""
+    """Remove the close fields and set status open. The answer stays, and an approved one is in progress."""
     with _issue_lock(path):
+        reopened = {"status": "open"}
+        if isinstance(decision_answer(Issue(path, frontmatter(path))), ApprovedDecision):
+            reopened["stage"] = IN_PROGRESS_STAGE
         text, removed = remove_fields(_read(path), CLOSE_FIELDS, path)
-        text, changed = set_fields(text, {"status": "open"}, path)
+        text, changed = set_fields(text, reopened, path)
         if not removed and not changed:
             return []
         text, dates = set_fields(text, {"date_modified": _vault_date(today)}, path)
@@ -264,9 +270,10 @@ def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
             "showrunner": cast(str, args.showrunner),
             "unit": cast(str, args.unit),
             "plan": cast(str, args.plan),
+            "stage": IN_PROGRESS_STAGE,
         }
     if verb == "start":
-        return {"stage": "active"}
+        return {"stage": IN_PROGRESS_STAGE}
     if verb == "close":
         detail = {"as_built": cast(str, args.as_built)} if cast(str | None, args.as_built) else {"reason": cast(str, args.reason)}
         return {**detail, "status": "closed", "date_closed": _vault_date(today)}
@@ -311,6 +318,90 @@ def decision_answer(issue: Issue) -> UnansweredDecision | ApprovedDecision | Dec
     if issue.value("unit") and issue.value("plan"):
         return ApprovedDecision(issue.value("unit"), issue.value("plan"))
     return UnansweredDecision()
+
+
+IN_PROGRESS_STAGE = "active"
+
+
+@dataclass(frozen=True)
+class AwaitingApproval:
+    """An open proposal the user has not approved: no approval is recorded and its stage is not active."""
+
+
+@dataclass(frozen=True)
+class InProgress:
+    """An open proposal approved for implementation, or started, and not yet built."""
+
+
+ProposalProgress = AwaitingApproval | InProgress
+
+
+def proposal_progress(issue: Issue) -> ProposalProgress:
+    """In progress when the approval is recorded, or when no answer is recorded and the stage is active."""
+    match decision_answer(issue):
+        case ApprovedDecision():
+            return InProgress()
+        case UnansweredDecision() if issue.value("stage") == IN_PROGRESS_STAGE:
+            return InProgress()
+        case _:
+            return AwaitingApproval()
+
+
+def _approved_at_backlog(issue: Issue) -> bool:
+    """An open proposal whose approval is recorded and whose stage is still the one it was filed at."""
+    return (issue.value("status") == "open" and PROPOSAL_TAG in issue.fields.get("tags", [])
+            and isinstance(decision_answer(issue), ApprovedDecision) and issue.value("stage") == "backlog")
+
+
+@dataclass(frozen=True)
+class Moved:
+    """The issue's stage is now active, or would be on a dry run."""
+    path: Path
+
+
+@dataclass(frozen=True)
+class LeftAlone:
+    """Another writer changed the issue after the folder read, and it no longer qualifies."""
+    path: Path
+
+
+@dataclass(frozen=True)
+class MoveRefused:
+    """The issue file cannot be edited. The run goes on with the other issues."""
+    path: Path
+    reason: str
+
+
+MoveOutcome = Moved | LeftAlone | MoveRefused
+
+
+def _move_one(path: Path, today: date, *, dry_run: bool) -> MoveOutcome:
+    """Set stage active on the issue when it still qualifies under the lock.
+
+    A dry run makes the same change, so it refuses the same files, and does not write it.
+    """
+    with _issue_lock(path):
+        if not _approved_at_backlog(Issue(path, frontmatter(path))):
+            return LeftAlone(path)
+        try:
+            text, _ = set_fields(_read(path), {"stage": IN_PROGRESS_STAGE, "date_modified": _vault_date(today)}, path)
+            if not dry_run:
+                _write(path, text)
+        except (ValueError, OSError, UnicodeError) as error:
+            return MoveRefused(path, str(error))
+        return Moved(path)
+
+
+def move_approved(folder: Path, today: date, *, dry_run: bool) -> Iterator[MoveOutcome]:
+    """Move each open proposal in the folder whose approval is recorded and whose stage is backlog to stage active.
+
+    Gives each outcome as it is written, or as it would be on a dry run. A second run moves none.
+    """
+    if not folder.is_dir():
+        raise Refusal(f"{folder} is not a folder")
+    for issue in open_issues(folder, PROPOSAL_TAG):
+        if _approved_at_backlog(issue):
+            yield _move_one(issue.path, today, dry_run=dry_run)
 
 
 def _generated_span(text: str, path: Path) -> tuple[int, int]:
@@ -393,8 +484,11 @@ def _create_numbered(path: Path, template: Path, project: str, short: str, propo
     if rule_urls:
         lists["style_rules"] = sorted(set(rule_urls))
     text, _ = set_list_fields(text, lists, path)
-    text, _ = set_fields(text, {"status": "open", "stage": "backlog", **inherited, **keys, "style_count": str(count),
-                                NUMBER_FIELD: f"P{_highest_number(path.parent) + 1}"}, path)
+    # An inherited approval starts in progress, by the rule decision_answer reads.
+    approved = isinstance(decision_answer(Issue(path, {key: [value] for key, value in inherited.items()})), ApprovedDecision)
+    stage = {"stage": IN_PROGRESS_STAGE} if approved else {}
+    text, _ = set_fields(text, {"status": "open", "stage": "backlog", **inherited, **stage, **keys,
+                                "style_count": str(count), NUMBER_FIELD: f"P{_highest_number(path.parent) + 1}"}, path)
     text = text.rstrip() + f"\n\nProposed ranking: {proposed_ranking}\n\n" + decision_body(body)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=".decision-", delete=False) as stream:
@@ -420,10 +514,31 @@ def _initial_fields(raw: str) -> dict[str, str]:
     return fields
 
 
+def _main_move_approved(folder: Path, today: date, *, dry_run: bool) -> int:
+    moved = 0
+    refused = False
+    try:
+        for outcome in move_approved(folder, today, dry_run=dry_run):
+            match outcome:
+                case Moved(path=path):
+                    moved += 1
+                    print(f"move-approved {path.name}: stage {IN_PROGRESS_STAGE}", flush=True)
+                case MoveRefused(path=path, reason=reason):
+                    refused = True
+                    print(f"move-approved {path.name}: refused {reason}", flush=True)
+                case LeftAlone():
+                    pass
+    except (ValueError, OSError, UnicodeError) as error:
+        print(f"proposal_issue: {error}", file=sys.stderr)
+        return 2
+    print(f"move-approved: {moved} moved")
+    return 2 if refused else 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
-    approve = verbs.add_parser("approve", help="record the user's approval; stage stays backlog")
+    approve = verbs.add_parser("approve", help="record the user's approval; stage active (in progress)")
     _ = approve.add_argument("--showrunner", required=True, help="the showrunner's session name")
     _ = approve.add_argument("--unit", required=True, help="the unit, as in the production's Units table")
     _ = approve.add_argument("--plan", required=True, help="'<plan path> Phase N–M'")
@@ -444,6 +559,9 @@ def main(argv: list[str]) -> int:
     _ = creation.add_argument("--body-file", type=Path, required=True)
     _ = creation.add_argument("--template", type=Path, default=Path.home() / "rust/hanadocs/.claude/templates/issue.yaml")
     reopening = verbs.add_parser("reopen", help="reopen a built decision, keeping its answer")
+    moving = verbs.add_parser("move-approved", help="move each open approved proposal at backlog to stage active")
+    _ = moving.add_argument("folder", type=Path)
+    _ = moving.add_argument("--dry-run", action="store_true", help="print the moves and write nothing")
     answer = verbs.add_parser("decline-answer", help="store a decision's declined answer")
     _ = answer.add_argument("--words", required=True)
     linking = verbs.add_parser("rules", help="set the rule links")
@@ -466,6 +584,8 @@ def main(argv: list[str]) -> int:
             print(f"proposal_issue: {error}", file=sys.stderr)
             return 2
         return 0
+    if verb == "move-approved":
+        return _main_move_approved(cast(Path, args.folder).expanduser(), today, dry_run=cast(bool, args.dry_run))
     # A plan's Issues line writes `~/rust/hanadocs/issues/<name>.md`, quoted since names hold spaces.
     path = cast(Path, args.issue).expanduser()
     try:

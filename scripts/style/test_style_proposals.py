@@ -28,9 +28,10 @@ import style_proposals
 import add_style
 import approved_renames
 import style_rules
+import footer_counts
 import proposal_issue
 import proposals_table
-from issues import frontmatter, open_issues
+from issues import Issue, frontmatter, open_issues
 
 # Each crate declares the new name of the fixture rename, so a merge finds it applied, and still declares
 # Size and Rate, so the renames of those variants are not applied.
@@ -705,6 +706,63 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["unit"]), (["open"], ["names-unit"]))
             self.assertEqual(ledger.proposal_findings(issue)[-1].state, style_ledger.Filed(issue))
             self.assertEqual(ledger.proposal_findings(issue)[-1].finding_id, later.finding_id)
+
+    def progress(self, issue: Path) -> tuple[list[str], proposal_issue.ProposalProgress]:
+        """The issue's stage, and the progress the footer and the table read from it."""
+        return frontmatter(issue)["stage"], proposal_issue.proposal_progress(Issue(issue, frontmatter(issue)))
+
+    def test_approving_a_style_decision_moves_it_to_in_progress(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue, = self.file(ledger)
+            self.assertEqual(self.progress(issue), (["backlog"], proposal_issue.AwaitingApproval()))
+            self.issue_command("approve", str(issue), "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
+            self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
+
+    def test_an_approved_style_decision_leaves_the_footer_count(self) -> None:
+        # A doc named for the style production, so the decisions it files are its own.
+        doc = self.root / f"{style_proposals.style_slug(self.repo)}.md"
+        _ = doc.write_text(f"# Style\n\n- **Proposals:** {self.proposals}\n", encoding="utf-8")
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue, = self.file(ledger)
+            self.assertEqual(footer_counts.proposals(doc), 1)
+            self.issue_command("approve", str(issue), "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
+            self.assertEqual(footer_counts.proposals(doc), 0)
+
+    def test_a_decision_migrate_creates_from_an_approved_old_issue_starts_in_progress(self) -> None:
+        with self.ledger() as ledger:
+            old = self.legacy_issue(ledger, "old", self.hold(ledger))
+            self.assertEqual(frontmatter(old)["stage"], ["backlog"])
+            with redirect_stdout(io.StringIO()):
+                style_proposals.migrate(ledger, self.proposals, "parent")
+            decision = next(path for path in self.proposals.glob("*.md") if "style_rule" in frontmatter(path))
+            self.assertEqual(self.progress(decision), (["active"], proposal_issue.InProgress()))
+
+    def test_a_built_decision_a_later_finding_reopens_is_in_progress(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            issue = self.approved_decision(ledger, finding)
+            _ = self.merge_ticket(ledger, "names-unit-1", issue, finding)
+            with redirect_stdout(io.StringIO()):
+                style_proposals.complete(ledger)
+            # Before approve set the stage, a built decision closed at stage backlog.
+            _ = proposal_issue.edit(issue, {"stage": "backlog"}, date(2026, 10, 19))
+            self.assertEqual(frontmatter(issue)["status"], ["closed"])
+            _ = self.hold(ledger, line=2)
+            self.assertEqual(self.file(ledger), (issue,))
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
+
+    def test_complete_closes_an_in_progress_decision(self) -> None:
+        with self.ledger() as ledger:
+            first, second = self.hold(ledger), self.hold(ledger, line=2)
+            issue = self.approved_decision(ledger, first, second)
+            self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
+            _ = self.merge_ticket(ledger, "names-unit-1", issue, first, second)
+            with redirect_stdout(io.StringIO()):
+                style_proposals.complete(ledger)
+            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["stage"]), (["closed"], ["active"]))
 
     def approved_decision(self, ledger: style_ledger.Ledger, *findings: style_ledger.HeldFinding) -> Path:
         issue, = self.file(ledger)

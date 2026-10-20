@@ -503,6 +503,8 @@ asks through `/showrunner:proposals` or `/adhoc_review`.
 
 Approve with `proposal_issue.py approve <issue> --showrunner <parent>
 --unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
+Approval sets the decision's stage active (in progress), so it leaves the
+footer's proposal count.
 Refill builds approved findings in small tickets before coverage work.
 Each ticket permits its own approved findings and proven rename references.
 Only a rename whose `before` and `after` are one `<parent>::<name>` pair proves

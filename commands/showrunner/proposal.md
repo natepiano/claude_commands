@@ -22,12 +22,14 @@ in the vault's `archive/` beside it is taken. Name a proposal to the user by
 its number and title, such as `P12 selection widgets toggle`. On a
 missing file or one without frontmatter it exits 2: report the line.
 
-| State | `status` / `stage` | Set |
+| State | `status` / `stage` | Set by |
 | --- | --- | --- |
-| written | open / backlog | `proposed_by` |
-| approved, not started | open / backlog | `showrunner`, `unit`, `plan` |
-| being built | open / active | |
-| built | closed | `as_built` |
+| waiting for approval | open / backlog | filing (`proposed_by`) |
+| in progress | open / active | `approve` (`showrunner`, `unit`, `plan`), or `start` for a plan issue that has no approval |
+| built | closed | `close` (`as_built` or `reason`) |
+
+The footer's proposal count and the table's `waiting for your review` rows are
+the waiting proposals only; approval moves a proposal to in progress.
 
 ## File
 
@@ -69,6 +71,9 @@ copy and no phase numbers:
 … proposal_issue.py approve <issue> --showrunner "<name>" --unit <unit> --plan "<unit plan copy>"
 ```
 
+Proposals approved before 2026-10-20 move with `proposal_issue.py
+move-approved <issues folder>` (`--dry-run` first); a second run moves none.
+
 Refill builds its approved findings in small tickets. The decision stays open
 until every finding is built or waived. Decline only through:
 
@@ -80,8 +85,9 @@ For other proposals, send the approved issue to the unit that builds it.
 The unit adds phases that cite it and puts it on the plan's `> **Issues:**`
 line. Record that plan and its phases with the same `approve` command.
 `--showrunner` is the session name from `showrunners.py name <slug>`;
-`--unit` is the full name in the production's Units table. The stage stays
-backlog until work starts. Other declined proposals close through `/close_issue`.
+`--unit` is the full name in the production's Units table. Approve sets the
+stage active: the proposal is in progress and leaves the waiting count. Other
+declined proposals close through `/close_issue`.
 
 ## Start and close
 
