@@ -11,6 +11,34 @@
       "time": "2026-10-14T04:25:55.369515-04:00"
     }
   },
+  "nate.adhoc": {
+    "long_sender": {
+      "objections": [
+        {
+          "quote": "cargo-liner-style renames",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "both units run under their new names",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:23:00.784022-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "natedev the /nate skill is ready",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:22:51.437039-04:00"
+    }
+  },
   "nixos.disk_low": {
     "no_free_space": {
       "reviewer": "opus",

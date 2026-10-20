@@ -484,8 +484,8 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float) -> list[str]:
     return [f"{describe_session(item)}: still stopping after {wait_minutes:g} minutes" for item in still]
 
 
-def terminate(pids: list[int], what: dict[int, str]) -> list[str]:
-    """SIGTERM each pid; one alive after TERM_WAIT_SECONDS comes back as still running."""
+def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
+    """SIGTERM each pid; one alive after `wait` seconds (TERM_WAIT_SECONDS) comes back as still running."""
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -493,7 +493,7 @@ def terminate(pids: list[int], what: dict[int, str]) -> list[str]:
             continue
         except PermissionError as error:
             what[pid] += f": {error}"
-    deadline = time.monotonic() + TERM_WAIT_SECONDS
+    deadline = time.monotonic() + (TERM_WAIT_SECONDS if wait is None else wait)
     while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(0.2)
     left: list[str] = []

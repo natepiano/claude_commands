@@ -82,6 +82,9 @@ STOP_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_STOP_WAIT") or 3600)
 LIVE_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_LIVE_WAIT") or 180)
 # A stop request that has written no shutdown record by then has failed.
 RECORD_WAIT_SECONDS = 120.0
+# A run supervisor passes SIGTERM to its command and exits when that ends: a lint seen
+# 2026-10-20 took longer than retire_unit's 10 s.
+RUN_STOP_WAIT_SECONDS = 120.0
 POLL_SECONDS = 1.0
 
 
@@ -226,7 +229,10 @@ def _session_name(slug: str, unit: str) -> str:
 
 
 def _check_stopped(rename: UnitRename) -> None:
-    """The unit runs no Claude under either id, and nothing works inside its worktree."""
+    """The unit runs no Claude under either id, and nothing works inside its worktree.
+
+    Its runs' leftovers are ended here too: a rename resumed past its stop step never ran that
+    step's `_stop_runs`, such as one stopped before the stop ended runs."""
     try:
         marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
@@ -237,6 +243,7 @@ def _check_stopped(rename: UnitRename) -> None:
             raise RenameRefused(f"{unit} has a live Claude; stop it first")
         if found and isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {found.claude.reason}")
+    _stop_runs(rename)
     pids = unit_move.processes_inside(rename.worktree())
     if pids:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
@@ -510,7 +517,7 @@ def _stop_runs(rename: UnitRename) -> None:
     worktree = rename.worktree()
     inside = unit_move.processes_inside(worktree) if unit_move.exists(worktree) else []
     runs = retire_unit.run_processes(worktree, inside) if inside else {}
-    left = retire_unit.terminate(sorted(runs), runs)
+    left = retire_unit.terminate(sorted(runs), runs, RUN_STOP_WAIT_SECONDS)
     if left:
         raise RenameRefused("; ".join(left) + "; rerun apply once they stop")
 

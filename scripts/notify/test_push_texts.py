@@ -9,6 +9,7 @@ import unittest
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest import mock
 
@@ -143,6 +144,20 @@ class PushTextTests(unittest.TestCase):
         self.assertEqual(push_texts.render_entry(entry, values).session, SessionLine("Owner"))
         entry = replace(entry, examples=(PushExample("typical", values),))
         self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, session=SessionTemplate("{session:s}"))))
+
+    def test_nate_adhoc_renders_without_a_header_line(self) -> None:
+        push = push_texts.render("nate.adhoc", sender="natedev", title="the /nate skill is ready", description="It is ready now.")
+        self.assertEqual(push.title, "natedev the /nate skill is ready")
+        self.assertEqual(push.message, "It is ready now.\n\nadhoc")
+
+    def test_header_is_fingerprinted_and_cannot_hide_an_action_or_session(self) -> None:
+        entry = replace(self.entry(), action=push_texts.NoActionNeeded())
+        self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, header=False)))
+        for hidden in (self.entry(), replace(entry, session=SessionTemplate("{version}"))):
+            module = SimpleNamespace(ENTRIES=(replace(hidden, header=False),))
+            with (self.subTest(hidden=hidden), mock.patch.object(importlib, "import_module", return_value=module),
+                  self.assertRaises(ValueError)):
+                _ = push_texts.catalog()
 
     def test_holdout_begins_with_the_users_four_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout")
