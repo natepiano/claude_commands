@@ -49,6 +49,9 @@ class PushText:
     body: str
     examples: tuple[PushExample, ...]
     session: SessionTemplate | NoSessionLine = NO_SESSION_LINE
+    # False: the phone shows the title and body exactly as rendered, with no
+    # "No action needed." line. Only an entry with no action and no session can opt out.
+    header: bool = True
 
 
 @dataclass(frozen=True)
@@ -61,10 +64,11 @@ class RenderedPush:
     body: str
     values: dict[str, str]
     session: NotificationSession = NO_SESSION_LINE
+    header: bool = True
 
     @property
     def message(self) -> str:
-        return first_line(self.action, self.session) + "\n" + self.body
+        return first_line(self.action, self.session) + "\n" + self.body if self.header else self.body
 
 
 def catalog() -> tuple[PushText, ...]:
@@ -75,6 +79,8 @@ def catalog() -> tuple[PushText, ...]:
     for entry in entries:
         if not entry.examples or len({example.name for example in entry.examples}) != len(entry.examples):
             raise ValueError(f"{entry.id}: examples need distinct names and must not be empty")
+        if not entry.header and (isinstance(entry.action, ActionTemplate) or isinstance(entry.session, SessionTemplate)):
+            raise ValueError(f"{entry.id}: an entry without a header cannot state an action or a session")
     return entries
 
 
@@ -96,7 +102,8 @@ def render_entry(entry: PushText, values: dict[str, str]) -> RenderedPush:
     action = ActionRequired(entry.action.text.format(**values)) if isinstance(entry.action, ActionTemplate) else NoActionRequired()
     return RenderedPush(entry.id, entry.sender.format(**values), entry.need,
                         entry.title.format(**values), action, entry.body.format(**values), dict(values),
-                        SessionLine(entry.session.text.format(**values)) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE)
+                        SessionLine(entry.session.text.format(**values)) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE,
+                        entry.header)
 
 
 def render(id: str, **values: str) -> RenderedPush:
@@ -134,12 +141,27 @@ class FilledExampleRecord(TypedDict):
 
 class FingerprintRecord(TypedDict):
     session: NotRequired[str]
+    header: NotRequired[bool]
     sender: str
     need: Need
     title: str
     action: dict[str, str | bool]
     body: str
     examples: list[FilledExampleRecord]
+
+
+def user_specified(text_id: str) -> bool:
+    """Whether the user specified this text: its values are written per send, so a failed review is
+    about one send's words, not the template, and no template fix is due."""
+    try:
+        approvals = cast(object, json.loads(REVIEWED_FILE.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return False
+    entry = cast(dict[str, object], approvals).get(text_id) if isinstance(approvals, dict) else None
+    if not isinstance(entry, dict) or not entry:
+        return False
+    return all(isinstance(approval, dict) and str(cast(dict[str, object], approval).get("reviewer", "")).startswith("user-spec:")
+               for approval in cast(dict[str, object], entry).values())
 
 
 def fingerprint(entry: PushText) -> str:
@@ -157,4 +179,6 @@ def fingerprint(entry: PushText) -> str:
              "body": entry.body, "examples": examples}
     if isinstance(entry.session, SessionTemplate):
         value["session"] = entry.session.text
+    if not entry.header:
+        value["header"] = False
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

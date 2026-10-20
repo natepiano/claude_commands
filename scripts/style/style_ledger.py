@@ -30,7 +30,7 @@ import style_footprint
 import style_rules
 from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
-from declarations import Declaration, DeclaredFile, DeclaredItem, moved_site_line, read_declarations
+from declarations import Declaration, DeclaredFile, DeclaredItem, ImplOrTraitItem, moved_site_line, read_declarations
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
 CellState = Literal["current", "stale", "open", "awaiting merge"]
@@ -212,6 +212,13 @@ class ExceptionVerdict:
 
 
 @dataclass(frozen=True)
+class JudgedAgain:
+    """A judgment under the rule's newer text judged the unfiled finding's cell again; that judgment now decides the cell."""
+
+    judgment_id: int
+
+
+@dataclass(frozen=True)
 class DuplicateOf:
     """The finding is a bare rename that a qualified rename finding of the same rule and file already holds.
 
@@ -228,13 +235,15 @@ class DeclarationGone:
     commit: str
 
 
-WithdrawnBy = ExceptionVerdict | DuplicateOf | DeclarationGone
+WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone
 
 
 def withdrawn_line(by: WithdrawnBy) -> str:
     match by:
         case ExceptionVerdict():
             return f"judgment {by.judgment_id} exception"
+        case JudgedAgain():
+            return f"judged again in judgment {by.judgment_id}"
         case DuplicateOf():
             return f"duplicate of {by.finding_id}"
         case DeclarationGone():
@@ -485,17 +494,19 @@ class BareDuplicate:
 
 
 @dataclass(frozen=True)
-class SupersedingException:
-    """The judgment with the verdict exception under the rule's current text that is newest at a finding's cell, also newer than its own."""
+class SupersedingJudgment:
+    """The newest judgment at a finding's cell under the rule's current text, also newer than its own: an exception
+    for a filed finding, any verdict for an unfiled one."""
 
     judgment_id: int
+    verdict: Verdict
     rule_blob: str
 
 
 @dataclass(frozen=True)
 class WithdrawnFinding:
     finding: HeldFinding
-    verdict: SupersedingException
+    verdict: SupersedingJudgment
 
 
 @dataclass(frozen=True)
@@ -503,13 +514,13 @@ class KeptForBuild:
     """A finding the newer verdict would withdraw, kept because a ticket that is not final builds it."""
 
     finding: HeldFinding
-    verdict: SupersedingException
+    verdict: SupersedingJudgment
     ticket: str
 
 
 @dataclass(frozen=True)
 class Withdrawal:
-    """The filed findings that an exception under their rule's newer text withdraws, and those an open build keeps."""
+    """The findings that a newer judgment under their rule's current text withdraws, and those an open build keeps."""
 
     withdrawn: tuple[WithdrawnFinding, ...]
     kept: tuple[KeptForBuild, ...]
@@ -532,7 +543,8 @@ class DeclarationInPlace:
 
 @dataclass(frozen=True)
 class DeclarationMoved:
-    """One other file declares the finding's subject at the synced tip; the finding follows it to path and line."""
+    """One other file declares the finding's subject at the synced tip, or a built rename of an approved decision renamed
+    the subject or its impl or trait and one file gained the new declaration; the finding follows it to path and line."""
 
     finding: HeldFinding
     declaration: Declaration
@@ -569,7 +581,8 @@ class DeclaredInAnotherCrate:
 @dataclass(frozen=True)
 class DeclarationRenamed:
     """A filed rename finding whose own change is in the code. Its declaration is gone, and its after name is declared
-    with the same keyword and owner, in its file or in the one file that gained it. The finding is built there."""
+    with the same keyword and owner, or the owner's name after the built renames, in its file or in the one file that
+    gained it. The finding is built there."""
 
     finding: HeldFinding
     declaration: Declaration
@@ -599,6 +612,120 @@ class DeclarationGoneFromFile:
 class NoRenamedSite:
     """The finding is not a filed rename of its own declaration, no file gained its after name with the same keyword
     and owner, or the applied check finds the rename not applied there."""
+
+
+@dataclass(frozen=True)
+class UnqualifiedName:
+    """A rename's before is one name, or a type finding's item head: it can name any item of that name."""
+
+
+@dataclass(frozen=True)
+class ModuleQualified:
+    """A rename's before is a path whose last qualifier is a module (it does not start upper case): it names a module
+    item of a file of that module."""
+
+    module: str
+
+
+@dataclass(frozen=True)
+class SelfQualified:
+    """A rename's before is a `Self::` path: its owner must be read at the built finding's line."""
+
+
+@dataclass(frozen=True)
+class TypeQualified:
+    """A rename's before is a path whose last qualifier is a type or trait: it names an item of that impl or trait, or a
+    variant of that enum."""
+
+    type_name: str
+
+
+RenameScope = UnqualifiedName | ModuleQualified | SelfQualified | TypeQualified
+
+
+@dataclass(frozen=True)
+class ItemRename:
+    """The old and new name of one item, as a built rename or type finding gives them, and the items its old name can
+    name."""
+
+    old: str
+    new: str
+    scope: RenameScope
+
+
+@dataclass(frozen=True)
+class NoItemRename:
+    """The finding does not rename one item: its before and after are not one name pair, its qualifier is not one name,
+    or a type finding changes more than one name."""
+
+
+@dataclass(frozen=True)
+class BuiltRename:
+    """The item rename of one built finding, with the finding's path and decision."""
+
+    rename: ItemRename
+    path: str
+    proposal: Path
+
+
+@dataclass(frozen=True)
+class RenamedByBuilds:
+    """The finding's declaration with the new names that built renames of approved decisions gave its item, the impl
+    or trait that holds it, or both."""
+
+    declaration: Declaration
+
+
+@dataclass(frozen=True)
+class NoBuiltRename:
+    """No built rename of an approved decision gives the finding's item or its impl or trait a new name."""
+
+
+BuiltRenaming = RenamedByBuilds | NoBuiltRename
+
+
+def _module_name(path: str) -> str:
+    """The file's module: crate for src/lib.rs and src/main.rs, its directory for mod.rs or other lib.rs and main.rs,
+    else its stem."""
+    file = PurePosixPath(path)
+    if file.parent.name == "src" and file.stem in ("lib", "main"):
+        return "crate"
+    return file.parent.name if file.stem in ("mod", "lib", "main") else file.stem
+
+
+# A type finding's item head: its keyword, its name and the rest of the item.
+_ITEM_HEAD = re.compile(rf"(fn|struct|enum|union|trait|type|const|static|mod)\s+({style_footprint.IDENTIFIER.pattern})(.*)", re.DOTALL)
+
+
+def _item_rename(kind: str, before: str, after: str) -> ItemRename | NoItemRename:
+    """The item rename a finding names.
+
+    A rename gives the last path segment of before and of after; a note after `;` in after is not part of the name.
+    The segment before the old name sets the scope: none, `Self`, a type or trait (upper case) or a module. A type
+    finding gives the item name when only that name changes.
+    A field form such as `Owner.field` gives none.
+    """
+    if kind == "rename":
+        *qualifier, old = before.strip().split("::")
+        new = after.split(";", 1)[0].strip().split("::")[-1]
+        if old == new or not style_footprint.IDENTIFIER.fullmatch(old) or not style_footprint.IDENTIFIER.fullmatch(new):
+            return NoItemRename()
+        if not qualifier:
+            return ItemRename(old, new, UnqualifiedName())
+        if not style_footprint.IDENTIFIER.fullmatch(qualifier[-1]):
+            return NoItemRename()
+        if qualifier[-1] == "Self":
+            return ItemRename(old, new, SelfQualified())
+        if qualifier[-1].removeprefix("r#")[0].isupper():
+            return ItemRename(old, new, TypeQualified(qualifier[-1]))
+        return ItemRename(old, new, ModuleQualified(qualifier[-1].removeprefix("r#")))
+    if kind == "type":
+        old_head = _ITEM_HEAD.fullmatch(before.strip())
+        new_head = _ITEM_HEAD.fullmatch(after.strip())
+        if (old_head and new_head and old_head[1] == new_head[1] and old_head[3] == new_head[3]
+                and old_head[2] != new_head[2]):
+            return ItemRename(old_head[2], new_head[2], UnqualifiedName())
+    return NoItemRename()
 
 
 @dataclass(frozen=True)
@@ -1790,7 +1917,8 @@ class Ledger:
                 state = Built(Path(row[11]))
             case "withdrawn":
                 state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
-                                  DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20] else ExceptionVerdict(row[13]))
+                                  DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20]
+                                  else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
             case "unfiled":
                 state = Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
@@ -2037,12 +2165,16 @@ class Ledger:
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
 
     def _changed_rule_findings(self, definitions: Mapping[str, Rule]) -> tuple[tuple[HeldFinding, Rule], ...]:
-        """Each filed finding whose rule's current text is not the text it was judged under, with that rule.
+        """Each unfiled or filed finding whose rule's current text is not the text it was judged under, with that rule.
 
-        Filing skips an unfiled finding by the same lookup.
+        An unfiled finding that an open ticket holds is not read. Filing skips an unfiled one that this step leaves.
         """
+        waiting = {finding.finding_id for finding in self.held_findings(UnfiledFindingsFromOpenTickets())}
         changed: list[tuple[HeldFinding, Rule]] = []
-        for finding in self.held_findings(HeldFindingsInState("filed")):
+        for finding in (*self.held_findings(HeldFindingsInState("unfiled")),
+                        *self.held_findings(HeldFindingsInState("filed"))):
+            if finding.finding_id in waiting:
+                continue
             definition = definitions.get(finding.rule.removesuffix("#uncovered"))
             if definition is not None and definition.blob != finding.rule_blob:
                 changed.append((finding, definition))
@@ -2052,16 +2184,22 @@ class Ledger:
         withdrawn: list[WithdrawnFinding] = []
         kept: list[KeptForBuild] = []
         for finding, definition in self._changed_rule_findings(definitions):
-            # The verdict must also be newer than the finding's own judgment, so an old exception under a text
-            # that the rule returned to never withdraws a finding judged after it.
-            rows = cast(list[tuple[int, Verdict, str]], self._connection.execute(
-                "SELECT id,verdict,rule_blob FROM judgments WHERE rule=? AND path=? AND rule_blob IN (?,?) "
-                + "ORDER BY recorded_at DESC,id DESC LIMIT 1",
-                (finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
+            # followed_at holds a commit. updated_at uses the same UTC clock and format as recorded_at.
+            # After a follow, require a verdict after that row update. This can keep a finding judged before
+            # its move, or before a later row edit; keeping it is safer than closing its decision too soon.
+            rows = cast(list[tuple[int, Verdict, str, str, str, str, str]], self._connection.execute(
+                "SELECT j.id,j.verdict,j.rule_blob,j.recorded_at,h.created_at,h.followed_at,h.updated_at FROM judgments j "
+                + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.rule_blob IN (?,?) "
+                + "ORDER BY j.recorded_at DESC,j.id DESC LIMIT 1",
+                (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
             ).fetchall())
-            if not rows or rows[0][1:] != ("exception", definition.blob):
+            withdraws = (rows and rows[0][2] == definition.blob
+                         and (isinstance(finding.state, Unfiled) or rows[0][1] == "exception")
+                         and rows[0][4] < rows[0][3]
+                         and (not rows[0][5] or rows[0][6] < rows[0][3]))
+            if not withdraws:
                 continue
-            verdict = SupersedingException(rows[0][0], definition.blob)
+            verdict = SupersedingJudgment(rows[0][0], rows[0][1], definition.blob)
             if isinstance(finding.build_ticket, BuildTicket):
                 ticket = self._ticket(finding.build_ticket.ticket)
                 if ticket["state"] not in FINAL_TICKET_STATES:
@@ -2073,7 +2211,7 @@ class Ledger:
     def superseded_findings(self, definitions: Mapping[str, Rule]) -> Withdrawal:
         """What withdraw_superseded withdraws and keeps; it writes nothing.
 
-        definitions maps each rule id to its current catalog rule. The synced tip loads only when a filed
+        definitions maps each rule id to its current catalog rule. The synced tip loads only when an unfiled or filed
         finding's rule text changed.
         """
         if not self._changed_rule_findings(definitions):
@@ -2081,7 +2219,11 @@ class Ledger:
         return self._superseded(definitions, self._synced_tip())
 
     def withdraw_superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
-        """Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text.
+        """Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text,
+        and each unfiled finding whose cell's newest judgment is under that text.
+
+        That judgment must come after the finding was created. For a followed finding it must also come after
+        its last row update, which is no earlier than its last follow. Judgments at other cells do not affect this check.
 
         A finding that a ticket which is not final builds stays filed and is returned as kept. The plan comes
         before the write lock; if the rows it read change before the lock, the withdrawal starts again.
@@ -2143,7 +2285,7 @@ class Ledger:
         return self._declared_files[key]
 
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
-                             approved: Callable[[Path], bool]) -> DeclarationOutcome:
+                             approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...]) -> DeclarationOutcome:
         if not isinstance(finding.state, (Unfiled, Filed)) or PurePosixPath(finding.path).suffix != ".rs":
             return DeclarationNotRead(finding)
         if isinstance(finding.state, Unfiled):
@@ -2196,17 +2338,24 @@ class Ledger:
             path, item = next(iter(found.items()))
             return DeclarationMoved(finding, declaration, path,
                                     moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
-        renamed = self._renamed_site(finding, read, old_file, old, tip, rust_files, changed, approved)
+        after_builds = self._built_renaming(finding, read, declaration, tip, approved, renames)
+        renamed = self._renamed_site(finding, read, old_file, old, after_builds, tip, rust_files, changed, approved)
         if not isinstance(renamed, NoRenamedSite):
             return renamed
+        if isinstance(after_builds, RenamedByBuilds):
+            followed = self._followed_rename(finding, read, old_file, old, after_builds, tip, rust_files, changed)
+            if not isinstance(followed, NoRenamedSite):
+                return followed
         if isinstance(finding.state, Filed) and finding.path in tip.blobs:
             return DeclarationGoneFromFile(finding, declaration)
         return DeclarationRemoved(finding, declaration)
 
-    def _renamed_site(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem, tip: RepositoryTip,
-                      rust_files: frozenset[str], changed: frozenset[str], approved: Callable[[Path], bool],
+    def _renamed_site(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
+                      after_builds: BuiltRenaming, tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],
+                      approved: Callable[[Path], bool],
                       ) -> DeclarationRenamed | RenameAwaitingApproval | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite:
-        """Where a filed rename's after name is declared at the tip with the keyword and owner of its gone declaration.
+        """Where a filed rename's after name is declared at the tip with the keyword and owner of its gone declaration,
+        else with the owner that the built renames gave it.
 
         A file counts only when it gained that declaration since the read commit; this holds for the finding's own
         file too, which is checked first. Several files or a file in another crate leave the finding, as a move does.
@@ -2222,20 +2371,13 @@ class Ledger:
                 or new_name == old_name or not style_footprint.IDENTIFIER.fullmatch(new_name)):
             return NoRenamedSite()
         renamed = Declaration(declaration.keyword, new_name, declaration.owner)
-
-        def gained(path: str) -> tuple[DeclaredItem, ...]:
-            """The items of path that declare the new name at the tip; none when path declared it at the read commit."""
-            if any(item.declaration == renamed for item in self._declared_file(read, path).declared_items):
-                return ()
-            return tuple(item for item in self._declared_file(tip.commit, path).declared_items if item.declaration == renamed)
-
-        found: dict[str, DeclaredItem] = {}
-        if own := gained(finding.path):
-            found[finding.path] = own[0]
-        else:
-            for path in self._files_naming(tip.commit, new_name):
-                if path != finding.path and path in rust_files and path in changed and (items := gained(path)):
-                    found[path] = items[0]
+        found = self._gaining_files(finding, read, renamed, tip, rust_files, changed)
+        # The owner's own name comes first: a built rename of another type of that name, or one that a later commit put
+        # back, gives the owner a new name that the code does not use.
+        if (not found and isinstance(after_builds, RenamedByBuilds)
+                and after_builds.declaration.owner != declaration.owner):
+            renamed = Declaration(declaration.keyword, new_name, after_builds.declaration.owner)
+            found = self._gaining_files(finding, read, renamed, tip, rust_files, changed)
         if len(found) > 1:
             return DeclaredInSeveralFiles(finding, renamed, tuple(sorted(found)))
         if not found:
@@ -2251,10 +2393,128 @@ class Ledger:
         return DeclarationRenamed(finding, declaration, renamed, path,
                                   moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
 
+    def _built_renaming(self, finding: HeldFinding, read: str, declaration: Declaration, tip: RepositoryTip,
+                        approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...]) -> BuiltRenaming:
+        """The new names that the built renames of approved decisions in the finding's crate gave its item and the impl
+        or trait that holds it.
+
+        Each name follows its renames one after another, and stops at a name with two new names or at a name it had
+        before. A name keeps its old name when the finding's own rename names it. A rename names the item only when its
+        scope holds the item: a module path names a module item in a file of that module, and a type path names an
+        item of that type's impl or trait under any name the renames gave the type. A built `Self` path has the type
+        of its own impl or trait.
+        """
+        own = _item_rename(finding.kind, finding.before, finding.after)
+        crate = tip.crate(finding.path)
+        module = _module_name(finding.path)
+        # The built finding can sit at a call site in any file of the crate; the gaining-file search still guards it.
+        in_crate = tuple(built_rename for built_rename in renames if tip.crate(built_rename.path) == crate)
+
+        def renamed(name: str, holds_item: Callable[[RenameScope], bool]) -> tuple[str, ...]:
+            """name, then each new name the renames gave it in turn, up to a name with two new names or a name the chain
+            already holds; name alone when the finding's own rename names it."""
+            names = (name,)
+            if isinstance(own, ItemRename) and own.old == name:
+                return names
+            while new := {built_rename.rename.new for built_rename in in_crate if built_rename.rename.old == names[-1]
+                          and holds_item(built_rename.rename.scope) and approved(built_rename.proposal)}:
+                if len(new) > 1 or not new.isdisjoint(names):
+                    return names
+                names = (*names, *new)
+            return names
+
+        def module_item(scope: RenameScope) -> bool:
+            return isinstance(scope, UnqualifiedName) or (isinstance(scope, ModuleQualified) and scope.module == module)
+
+        owner = declaration.owner
+        if not isinstance(owner, ImplOrTraitItem):
+            names = renamed(declaration.name, module_item)
+            if len(names) == 1:
+                return NoBuiltRename()
+            return RenamedByBuilds(Declaration(declaration.keyword, names[-1], owner))
+        # The impl's type or the trait is a module item. A trait impl's owner is its type, so a trait path does not
+        # reach the items of a trait impl.
+        def owner_item(scope: RenameScope) -> bool:
+            if module_item(scope):
+                return True
+            if not isinstance(scope, ModuleQualified):
+                return False
+            return any(tip.crate(path) == crate and _module_name(path) == scope.module
+                       and any(item.declaration.name == owner.name
+                               and item.declaration.keyword in ("struct", "enum", "union", "trait", "type")
+                               and not isinstance(item.declaration.owner, ImplOrTraitItem)
+                               for item in self._declared_file(read, path).declared_items)
+                       for path in self._files_naming(read, owner.name))
+
+        owners = renamed(owner.name, owner_item)
+
+        def impl_or_trait_item(scope: RenameScope) -> bool:
+            return (isinstance(scope, UnqualifiedName)
+                    or (isinstance(scope, TypeQualified) and scope.type_name in owners))
+
+        names = renamed(declaration.name, impl_or_trait_item)
+        if len(names) == 1 and len(owners) == 1:
+            return NoBuiltRename()
+        return RenamedByBuilds(Declaration(declaration.keyword, names[-1], ImplOrTraitItem(owners[-1])))
+
+    def _followed_rename(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
+                         after_builds: RenamedByBuilds, tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],
+                         ) -> DeclarationMoved | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite:
+        """Where the finding's item is declared at the tip under the new names that the built renames gave it.
+
+        Several gaining files or a filed finding's file in another crate leave the finding, as a move does.
+        """
+        renamed = after_builds.declaration
+        found = self._gaining_files(finding, read, renamed, tip, rust_files, changed)
+        if len(found) > 1:
+            return DeclaredInSeveralFiles(finding, renamed, tuple(sorted(found)))
+        if not found:
+            return NoRenamedSite()
+        path, item = next(iter(found.items()))
+        if isinstance(finding.state, Filed) and tip.crate(path) != tip.crate(finding.path):
+            return DeclaredInAnotherCrate(finding, renamed, path)
+        return DeclarationMoved(finding, renamed, path,
+                                moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
+
+    def _gaining_files(self, finding: HeldFinding, read: str, renamed: Declaration, tip: RepositoryTip,
+                       rust_files: frozenset[str], changed: frozenset[str]) -> dict[str, DeclaredItem]:
+        """The files that gained renamed since the read commit, with its item there.
+
+        The finding's own file is checked first; when it gained renamed, it is the only file.
+        """
+
+        def gained(path: str) -> tuple[DeclaredItem, ...]:
+            """The items of path that declare renamed at the tip; none when path declared it at the read commit."""
+            if any(item.declaration == renamed for item in self._declared_file(read, path).declared_items):
+                return ()
+            return tuple(item for item in self._declared_file(tip.commit, path).declared_items if item.declaration == renamed)
+
+        if own := gained(finding.path):
+            return {finding.path: own[0]}
+        found: dict[str, DeclaredItem] = {}
+        for path in self._files_naming(tip.commit, renamed.name):
+            if path != finding.path and path in rust_files and path in changed and (items := gained(path)):
+                found[path] = items[0]
+        return found
+
     def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
                              approved: Callable[[Path], bool]) -> DeclarationReading:
         rust_files = frozenset(tip.rust_files)
-        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved)
+        built_renames: list[BuiltRename] = []
+        for finding in self.held_findings(HeldFindingsInState("built")):
+            rename = _item_rename(finding.kind, finding.before, finding.after)
+            if isinstance(finding.state, Built) and isinstance(rename, ItemRename):
+                if isinstance(rename.scope, SelfQualified):
+                    read = JudgedCommit(finding.follow.commit) if isinstance(finding.follow, FollowedDeclaration) else self.judged_commit(finding)
+                    if isinstance(read, NoJudgedCommit):
+                        continue
+                    item = self._declared_file(read.commit, finding.path).declaration_at(finding.line)
+                    if not isinstance(item, DeclaredItem) or not isinstance(item.declaration.owner, ImplOrTraitItem):
+                        continue
+                    rename = ItemRename(rename.old, rename.new, TypeQualified(item.declaration.owner.name))
+                built_renames.append(BuiltRename(rename, finding.path, finding.state.proposal))
+        renames = tuple(built_renames)
+        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames)
                                                     for finding_id in finding_ids))
 
     def declaration_reading(self, finding_ids: Iterable[str], approved: Callable[[Path], bool]) -> DeclarationReading:
@@ -2265,9 +2525,9 @@ class Ledger:
         return self._declaration_reading(tuple(finding_ids), self._synced_tip(), approved)
 
     def follow_declarations(self, finding_ids: Iterable[str], at: str, approved: Callable[[Path], bool]) -> DeclarationReading:
-        """Move each finding whose declaration moved to one other file there, build each filed rename whose new name
-        is declared and whose decision is approved, and withdraw each finding whose declaration is gone when it is
-        unfiled or its file is gone.
+        """Move each finding whose declaration moved to one other file, or whose item a built rename renamed, there,
+        build each filed rename whose new name is declared and whose decision is approved, and withdraw each finding
+        whose declaration is gone when it is unfiled or its file is gone.
 
         at is the synced tip of the caller's reading; when the synced tip is no longer at, the step refuses. A filed
         finding whose item is gone from its file stays filed. approved tells whether the user approved the decision
@@ -3158,9 +3418,9 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
     if isinstance(finding.state, (Filed, Built, Withdrawn)):
         result["proposal"] = str(finding.state.proposal) if isinstance(finding.state.proposal, Path) else ""
     if isinstance(finding.state, Withdrawn):
-        # One of the two is set, as in the ledger row: the exception judgment, or the qualified finding duplicated.
+        # The judgment row is set for either verdict withdrawal.
         by = finding.state.by
-        result["withdrawn_by"] = by.judgment_id if isinstance(by, ExceptionVerdict) else 0
+        result["withdrawn_by"] = by.judgment_id if isinstance(by, (ExceptionVerdict, JudgedAgain)) else 0
         result["duplicate_of"] = by.finding_id if isinstance(by, DuplicateOf) else ""
     result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
     result["unwaived_by"] = finding.waive_undo.by if isinstance(finding.waive_undo, WaiveUndoneBy) else ""

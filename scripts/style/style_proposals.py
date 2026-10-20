@@ -72,6 +72,12 @@ def issue_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledg
                  if not isinstance(finding.state, style_ledger.Withdrawn))
 
 
+def left_to_build(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[style_ledger.HeldFinding, ...]:
+    """The findings that are not built or waived. issue_findings already leaves out the withdrawn ones."""
+    return tuple(finding for finding in findings
+                 if not isinstance(finding.state, (style_ledger.Built, style_ledger.Waived)))
+
+
 def bare_duplicates(candidates: tuple[style_ledger.HeldFinding, ...],
                     holders: tuple[style_ledger.HeldFinding, ...]) -> dict[str, str]:
     """The qualified finding in holders that each bare duplicate in candidates duplicates, by finding id.
@@ -362,7 +368,8 @@ def find_decision(proposals: Path, key: DecisionKey) -> Path:
     return issue
 
 
-# The close reasons of a decision with no finding left to build.
+# The close reasons that complete and the withdrawal write. A closed decision with no answer takes a later
+# finding only under one of them.
 BUILT_REASON = "built in "
 NOTHING_LEFT_REASON = "nothing left to build: "
 FINISHED_REASONS = (BUILT_REASON, NOTHING_LEFT_REASON)
@@ -382,7 +389,10 @@ class WaiveWithAnswer:
 
 @dataclass(frozen=True)
 class ReopenBuiltDecision:
-    """The decision is closed as finished. A finding that joins it reopens it with its approval."""
+    """The decision is closed and nothing is left to build in it: each finding is built, waived or withdrawn.
+
+    A finding that joins it opens it again with its answer.
+    """
 
 
 @dataclass(frozen=True)
@@ -393,15 +403,21 @@ class JoinOpenDecision:
 JoinAction = WaiveWithAnswer | ReopenBuiltDecision | JoinOpenDecision
 
 
-def join_action(issue: Path) -> JoinAction:
-    """What the decision's answer does to findings that join it. Refuse a decision they cannot join."""
+def join_action(ledger: style_ledger.Ledger, issue: Path) -> JoinAction:
+    """What the decision's answer does to findings that join it.
+
+    Refuse a closed decision with a filed finding, or one with no answer that a person closed.
+    """
     fields = frontmatter(issue)
     answer = decision_answer(Issue(issue, fields))
     if isinstance(answer, DeclinedDecision):
         return WaiveWithAnswer(answer.words)
     closed = fields.get("status") == ["closed"]
-    if closed and not fields.get("reason", [""])[0].startswith(FINISHED_REASONS) and not fields.get("as_built"):
-        raise style_ledger.LedgerError("closed decision is not built")
+    if closed:
+        if not isinstance(answer, ApprovedDecision) and not fields.get("reason", [""])[0].startswith(FINISHED_REASONS):
+            raise style_ledger.LedgerError(f"{issue}: closed decision has no approval")
+        if left_to_build(issue_findings(ledger, issue)):
+            raise style_ledger.LedgerError(f"{issue}: closed decision has unbuilt findings")
     try:
         require_generated_body(issue)
     except Refusal as error:
@@ -427,7 +443,7 @@ def file_decision(writer: DecisionWriter, key: DecisionKey, items: tuple[style_l
     issue = find_decision(writer.proposals, key)
     if not issue.exists():
         issue = writer.create(key, items, {})
-    action = join_action(issue)
+    action = join_action(writer.ledger, issue)
     apply_answer(writer.ledger, issue, action, tuple(finding.finding_id for finding in items))
     if not isinstance(action, WaiveWithAnswer):
         for finding in items:
@@ -585,7 +601,7 @@ def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
             or not isinstance(decision_answer(decision), ApprovedDecision)):
         return False
     findings = issue_findings(ledger, issue)
-    if not findings or not all(isinstance(item.state, (style_ledger.Built, style_ledger.Waived)) for item in findings):
+    if not findings or left_to_build(findings):
         return False
     tickets = sorted(ticket["id"] for ticket in ledger.proposal_tickets()
                      if ticket["state"] == "merged" and Path(ticket["proposal"]) == issue)
@@ -802,7 +818,7 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
         join: NewDecision | JoinAction
         if issue.exists():
             # The answer is read also when every finding is a duplicate, so its refusal comes before any write.
-            join = join_action(issue)
+            join = join_action(ledger, issue)
             if not findings:
                 continue
         else:
@@ -1260,13 +1276,14 @@ def drop_duplicates(ledger: style_ledger.Ledger, *, dry_run: bool) -> tuple[Path
     return tuple(skipped)
 
 
-def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingException) -> str:
+def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingJudgment) -> str:
     return (f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}: "
-            + f"judgment {verdict.judgment_id} exception under {verdict.rule_blob[:8]}")
+            + f"judgment {verdict.judgment_id} {verdict.verdict} under {verdict.rule_blob[:8]}")
 
 
 def run_withdrawal(writer: DecisionWriter, *, dry_run: bool) -> tuple[Path, ...]:
-    """Withdraw each filed finding that an exception under its rule's newer text supersedes, then close or refresh its decision.
+    """Withdraw each filed finding that an exception under its rule's newer text supersedes, and each unfiled
+    finding whose cell that text judged again, then close or refresh the decisions of the filed ones.
 
     Print one line per withdrawn and kept finding and per closed decision, then the totals. A dry run prints the
     same lines and writes nothing. A refresh keeps the parent that the decision names. A decision that cannot

@@ -114,8 +114,8 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 - Failed or Withheld:
   - When the priority is 2 or the push has a `--text-id`, it is still sent. A registry push sends its own registered text, not the rewrite. The log detail is `sent despite failed review: <rules>`, and a template-fix request is launched.
   - Otherwise nothing is posted. The command prints `pushover: not sent: <why>` and exits 6.
-- `Rewritten` sends the rewrite and prints `pushover: sent as rewritten:`, followed by the title, the header line(s) and the body.
-- `deliver(draft, keys_file, post, *, detail)` posts a draft that has already been reviewed. `trimmed_body()` is the only body trim. Keys are read from `~/.config/pushover/env` and are never printed. `post: Post` is injectable, so tests never reach Pushover.
+- `Rewritten` sends the rewrite and prints `pushover: sent as rewritten:`, followed by the title, the header line(s) and the body. A registry push is the exception: it always sends its rendered text. The review is only a logged check, with detail `registered text sent as rendered, rewrite not applied` (2026-10-20: a rewrite of `nate.adhoc` removed the sender from the title).
+- `deliver(draft, keys_file, post, *, detail, header)` posts a draft that has already been reviewed. `trimmed_body()` is the only body trim. Keys are read from `~/.config/pushover/env` and are never printed. `post: Post` is injectable, so tests never reach Pushover.
 
 | pushover exit | Meaning |
 | --- | --- |
@@ -184,7 +184,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 ### Script push texts
 
 - `scripts/notify/push_texts.py`:
-  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], session: SessionTemplate | NoSessionLine)` and `PushExample(name, values)`.
+  - `PushText(id, sender, need, title, action: ActionTemplate | NoActionNeeded, body, examples: tuple[PushExample, ...], session: SessionTemplate | NoSessionLine, header: bool = True)` and `PushExample(name, values)`. With `header=False` the phone shows only the title and the body, with no `No action needed.` line. `catalog()` refuses `header=False` on an entry that has an action or a session. `nate.adhoc` uses it, and `fingerprint` includes it only when it is False.
   - `render(id, **values)` and `render_entry(entry, values) -> RenderedPush`. An unknown id, a missing value or an extra value raises `ValueError`.
   - `user_send_argv(rendered, *, sender, machine, priority, timeout)` builds the `send.py --to user --from … --need … --text-id … --value …` argv. User-send wrappers take a rendered push, never a string.
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.

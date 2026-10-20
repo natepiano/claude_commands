@@ -425,7 +425,8 @@ File held changes with `style_proposals.py file --repo <style checkout>
 `**Proposals:**` line and the parent from `showrunners.py parent <style slug>`.
 Run filing after each checkpoint with held cells and each no-change notice
 with held findings. Findings held by assigned or checkpointed tickets wait.
-Findings judged under an older rule text stay unfiled.
+Findings judged under an older rule text stay unfiled until a judgment under
+the current text judges their cell again; then filing withdraws them.
 A `skipped <issue>: <reason>` line means that filing cannot write that
 decision. When filing new findings, those findings stay unfiled. When
 refreshing an open decision, its findings stay filed and the file stays as it
@@ -433,18 +434,24 @@ was. The other decisions still file. When it skips one or more decisions,
 `file` exits 1. Fix the named decision file as the reason tells, then run
 `file` again. A `skipped <finding>: rule changed since judged` line names one
 finding, not a decision, and does not change the exit status.
+Its cell has no judgment under the current text yet: a refill judges the stale cell,
+and the next `file` withdraws the finding.
 
 Filing first withdraws each filed finding whose site has an `exception` as the
 newest judgment under its rule's current text, when the finding was judged
 under an older text. `withdrawn` is its own state, not `waived`, and the
 finding records that judgment's row. A finding that an open ticket builds is
-kept. The judgment must also be newer than the finding's own judgment. A
-decision whose findings are all withdrawn closes with a reason that names them
+kept. The judgment must also be newer than the finding's own judgment.
+An unfiled finding judged under an older text is withdrawn when the newest
+judgment at its site uses the current text. Any verdict withdraws it, and the
+finding records that row. It has no decision, so no decision changes.
+An unfiled finding of an open ticket waits for that ticket. A decision whose
+findings are all withdrawn closes with a reason that names them
 and the judgment rows. A decision that keeps other findings shows only those,
 and `complete` closes it when they are built or waived.
 `style_proposals.py withdraw --repo <style checkout> --proposals <folder>
 [--dry-run]` runs this step alone. It prints
-`withdraw <finding> <rule> <path>:<line>: judgment <row> exception under <blob>`,
+`withdraw <finding> <rule> <path>:<line>: judgment <row> <verdict> under <blob>`,
 a `kept` line with the ticket, a `close` line per decision and a `totals` line.
 The dry run prints the same lines and writes nothing. A decision that it cannot
 close or refresh gets a `skipped <issue>: <reason>` line, the other decisions
@@ -466,6 +473,20 @@ the finding stays as it is for a person to waive or fix in the code. No file:
   file. Two or more such files, or one in another crate, leave the finding as a
   move does. A rename in a decision that is not approved waits for the answer,
   with no line. The step reads the answer again when it writes.
+- A finding whose item, or the impl or trait that holds it, has a new name from
+  built rename or type findings of approved decisions in the same crate follows
+  the item to its newest name, in its own file or in the one file that gained
+  it, and keeps its id. The renames apply one after another; a name with two
+  new names, or a rename back to an earlier name, stops the chain. A rename
+  qualified by a module names only the items of that module's files and the
+  impl items of a type declared there; `crate::` names the crate root. A rename
+  qualified by a type names only the impl or trait items of that type under any
+  of its names, and a `Self` path names the type of its own impl or trait. A
+  trait path does not reach the items of the trait's impls, and a `self::` or
+  `super::` path names no item. Two or more gaining files, or a filed finding's
+  file in another crate, leave the finding as a move does. A finding whose own
+  rename names its item keeps the rule above; a filed rename whose impl type a
+  built rename renamed is built at the renamed type.
 - Another filed finding whose file is still there stays filed for a person. A
   person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
   puts the item back in the code.
@@ -496,8 +517,17 @@ followed finding, and `--json` adds `followed_from`, `followed_at` and
 One style decision covers one rule and crate under one rule blob. An answer
 also covers later findings under that rule text: a declined decision waives
 them with its stored words, and `file` prints
-`waived <n> findings in <decision>: declined: <words>`. A new rule blob needs a new
-answer. Each decision shows counts and up to three examples from different
+`waived <n> findings in <decision>: declined: <words>`. An approved decision
+that is closed opens again with its approval for a later finding when each of
+its findings is built, waived or withdrawn. The ledger decides this, not the
+close reason, so a decision closed by hand opens again too. A closed decision
+with a filed finding refuses it: `file` prints
+`skipped <decision>: closed decision has unbuilt findings` and exits 1. Open
+that decision with `proposal_issue.py reopen <decision>` and file again. A
+closed decision with no answer takes a later finding only when its close
+reason starts with `built in ` or `nothing left to build: `; else `file` prints
+`skipped <decision>: closed decision has no approval`. A new rule blob needs a
+new answer. Each decision shows counts and up to three examples from different
 files. The ledger holds its full site list. Show decisions only when the user
 asks through `/showrunner:proposals` or `/adhoc_review`.
 
@@ -676,8 +706,9 @@ through `/new_style`, or drops the idea with `style_proposals.py drop-candidate
 --parent <slug> --dry-run` before migrating old style issues. Migration moves
 only the findings filed to each old issue. A moved finding takes the answer of
 its decision: a declined decision waives it with the stored words, and a
-decision closed as built opens again with its approval. A decision closed with
-nothing left to build also opens again with its approval for a later finding. Migration leaves an
+closed decision opens again by the rule for a later finding that `file` files
+(above). A closed decision that refuses the finding stops the migration before
+any write, with `style_proposals: <decision>: <reason>`. Migration leaves an
 issue with an unfinished build ticket unchanged, and it can resume after a crash.
 Migration does not change an off-rule issue that a style unit filed through
 `/issue`; it lists the issue as `skipped: off-rule <path>` and counts it in its totals.
@@ -697,8 +728,8 @@ decision whose duplicate an open ticket builds, or that has no generated body,
 prints `skipped <issue>: <reason>` and is not written. The run ends with
 `totals: drop <findings>, skipped <decisions>` and exits 1 when it skipped a
 decision. The dry run prints the same lines and writes nothing. `style_ledger.py
-held list` shows `duplicate of <finding id>` or `judgment <row> exception` after
-the state of a withdrawn row; `--json` gives `duplicate_of` and `withdrawn_by`.
+held list` shows `duplicate of <finding id>`, `judgment <row> exception` or
+`judged again in judgment <row>` after the state of a withdrawn row; `--json` gives `duplicate_of` and `withdrawn_by`.
 
 ## Lifetime
 
