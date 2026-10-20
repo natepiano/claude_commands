@@ -81,7 +81,8 @@ def _hits(values: tuple[str, ...], paths: list[Path], *, ignored: bool) -> list[
     if not existing:
         return []
     flags = ["-uuu"] if ignored else ["--hidden"]
-    result = subprocess.run(["rg", "-l", "-F", *flags, *(argument for value in values for argument in ("-e", value)),
+    # Bytecode caches are rebuilt from their sources, so they are never a live place.
+    result = subprocess.run(["rg", "-l", "-F", *flags, "--glob", "!__pycache__/", "--glob", "!*.pyc", *(argument for value in values for argument in ("-e", value)),
                              "--", *existing], capture_output=True, text=True, check=False)
     # rg exits 1 when nothing matches, 2 when some file could not be read.
     if result.returncode not in (0, 1, 2):
