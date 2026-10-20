@@ -14,11 +14,15 @@ Usage:
   proposal_issue.py close <issue> --as-built PATH
   proposal_issue.py rules <issue> --rules URLS
   proposal_issue.py stars <issue> --goal G --alignment A --impact I --urgency U --effort E
+  proposal_issue.py urgency <issue> --level user|blocks|soon|normal|later [--due ISO]
+  proposal_issue.py mark-important <issue>
   proposal_issue.py number <issue>...
   proposal_issue.py move-approved <issues folder> [--dry-run]
 
 `number` gives each proposal without one the next `proposal_id`, P1 up, as change rows are C1 up;
-`create` numbers a new decision the same way.
+`create` numbers a new decision the same way. `urgency` sets where the proposal goes among the ones
+waiting for the user (urgency.py): `review_urgency`, with `review_due` for soon; normal removes them.
+`mark-important` marks a proposal the user called important (`review_urgency: user`, `review_marked`).
 """
 from __future__ import annotations
 
@@ -38,6 +42,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
 
@@ -261,6 +266,22 @@ def reopen(path: Path, today: date) -> list[str]:
         text, dates = set_fields(text, {"date_modified": _vault_date(today)}, path)
         _write(path, text)
         return [*removed, *changed, *dates]
+
+
+REVIEW_FIELDS = ("review_urgency", "review_due", "review_marked")
+
+
+def set_urgency(path: Path, level: urgency.Urgency, today: date) -> list[str]:
+    """Store the proposal's level for the user's review; normal stores nothing."""
+    with _issue_lock(path):
+        original = _read(path)
+        text, removed = remove_fields(original, REVIEW_FIELDS, path)
+        text, changed = set_fields(text, urgency.fields(level, "review_"), path)
+        if text == original:
+            return []
+        text, dates = set_fields(text, {"date_modified": _vault_date(today)}, path)
+        _write(path, text)
+        return [*dict.fromkeys([*removed, *changed]), *dates]
 
 
 def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
@@ -566,13 +587,17 @@ def main(argv: list[str]) -> int:
     _ = answer.add_argument("--words", required=True)
     linking = verbs.add_parser("rules", help="set the rule links")
     _ = linking.add_argument("--rules", required=True)
+    ranking = verbs.add_parser("urgency", help="set where it goes among the proposals waiting for the user")
+    _ = ranking.add_argument("--level", required=True, choices=urgency.LEVELS)
+    _ = ranking.add_argument("--due", default="", help="ISO date or time; only with soon")
+    important = verbs.add_parser("mark-important", help="the user called it important: it goes first")
     stars = verbs.add_parser("stars", help="set the five ranking values")
     numbering = verbs.add_parser("number", help="give each proposal without one its P number")
     _ = numbering.add_argument("issues", type=Path, nargs="+")
     _ = stars.add_argument("--goal", required=True, help="e.g. '1 - Ship Hana'")
     for name in ("alignment", "impact", "urgency", "effort"):
         _ = stars.add_argument(f"--{name}", required=True, help="1 to 5")
-    for verb in (approve, verbs.choices["start"], close, stars, linking, reopening, answer):
+    for verb in (approve, verbs.choices["start"], close, stars, linking, reopening, answer, ranking, important):
         _ = verb.add_argument("issue", type=Path)
     args = parser.parse_args(argv)
     verb = cast(str, args.verb)
@@ -603,6 +628,11 @@ def main(argv: list[str]) -> int:
             changed = reopen(path, today)
         elif verb == "decline-answer":
             changed = edit(path, {"style_answer": "declined", "style_answer_words": cast(str, args.words)}, today)
+        elif verb in ("urgency", "mark-important"):
+            now = datetime.now(user_zone()).replace(tzinfo=None)
+            level = (urgency.mark(now) if verb == "mark-important" or cast(str, args.level) == urgency.USER
+                     else urgency.read(cast(str, args.level), cast(str, args.due)))
+            changed = set_urgency(path, level, today)
         elif verb == "rules":
             changed = edit_rules(path, [url for url in cast(str, args.rules).split(",") if url], today)
         else:

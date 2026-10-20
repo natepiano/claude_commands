@@ -59,6 +59,20 @@ class ProposalIssueTests(unittest.TestCase):
         self.runtime = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
 
+    def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
+        code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
+        self.assertEqual((code, out), (0, f"urgency {self.issue.name}: set review_urgency, review_due, date_modified\n"))
+        self.assertIn('review_urgency: "soon"\nreview_due: "2026-10-22"\n', self.issue.read_text())
+        self.assertEqual(self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")[1],
+                         f"urgency {self.issue.name}: unchanged\n")
+        self.assertEqual(self.run_cli("urgency", str(self.issue), "--level", "blocks", "--due", "2026-10-22")[0], 2)
+        self.assertEqual(self.run_cli("mark-important", str(self.issue))[0], 0)
+        text = self.issue.read_text()
+        self.assertIn('review_urgency: "user"\nreview_marked: "', text)
+        self.assertNotIn("review_due", text)
+        _ = self.run_cli("urgency", str(self.issue), "--level", "normal")
+        self.assertNotIn("review_", self.issue.read_text())
+
     def run_cli(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

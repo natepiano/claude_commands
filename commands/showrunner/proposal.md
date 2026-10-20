@@ -62,6 +62,11 @@ all five and delete the `Proposed ranking:` line:
 
 Never ask star by star, and never through a form.
 
+A proposal that blocks work, or matters by a date, takes a level for the
+user's review order: `proposal_issue.py urgency <issue> --level blocks` (or
+`soon --due <ISO>`, `later`). When the user calls one important, run
+`proposal_issue.py mark-important <issue>`.
+
 ## Approve
 
 For a style decision, record the user's approval with its unit's own plan
