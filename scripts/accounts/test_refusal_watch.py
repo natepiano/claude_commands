@@ -2119,7 +2119,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual((code, error.getvalue()), (0, ""))
         self.assertIn("units: would select claude3", output.getvalue())
         self.assertIn(f"{off['name']}: {off['session_id']}", output.getvalue())
-        self.assertIn("reap and restart now", output.getvalue())
+        self.assertIn("will stop and move now", output.getvalue())
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())

@@ -3045,10 +3045,10 @@ def move_preview_line(member: ListedSession, now: datetime) -> str:
     state = reader.prompt_state(reader.PromptSubject(member.session_id, member.login, member.config_dir), now)
     source = session_account_label(member)
     if state.because in {"refused in its transcript", "account out of usage"}:
-        plan = f"reap and restart now ({source} out of usage: {cast(MemberNeedingReap, state).detail})"
+        plan = f"will stop and move now ({source} out of usage: {cast(MemberNeedingReap, state).detail})"
     else:
         reason = "has room" if state.because == "room" else state.because
-        plan = f"move when idle ({source} {reason})"
+        plan = f"will move once idle ({source} {reason})"
     return f"{member.name}: {member.session_id} · {plan}"
 
 
@@ -3848,7 +3848,7 @@ def render_status_json(reading: StatusReading) -> str:
             use_credits=row.use_credits,
             read_at=None if isinstance(row.read_at, StatusUnavailable) else row.read_at.astimezone(timezone.utc).isoformat())
         accounts.append(item)
-    return json.dumps(StatusDocument(accounts=accounts, problems=list(reading.notes)))
+    return json.dumps(StatusDocument(accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
 def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:

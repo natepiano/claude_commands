@@ -91,13 +91,13 @@ export function healthTone(unit: BoardUnit, now: number): Tone {
 }
 
 /** Styling stays attached to text even when a fact wraps onto another row. */
-interface BoardSpan { text: string; tone: Tone; kind: 'fact' | 'name' | 'bold' }
-type BoardLine = BoardSpan[];
+export interface BoardSpan { text: string; tone: Tone; kind: 'fact' | 'name' | 'bold' }
+export type BoardLine = BoardSpan[];
 interface UnitBlock { unit: BoardUnit; lines: BoardLine[]; workers: BoardLine[] }
-const span = (text: string, tone: Tone = 'default', kind: BoardSpan['kind'] = 'fact'): BoardSpan => ({ text, tone, kind });
+export const span = (text: string, tone: Tone = 'default', kind: BoardSpan['kind'] = 'fact'): BoardSpan => ({ text, tone, kind });
 const lineText = (parts: BoardLine) => parts.map(part => part.text).join('');
 
-function wrapLine(parts: BoardLine, width: number, indent = 0): BoardLine[] {
+export function wrapLine(parts: BoardLine, width: number, indent = 0): BoardLine[] {
   indent = Math.max(0, Math.min(width - 1, indent));
   const text = lineText(parts);
   const room = Math.max(1, width - indent);
@@ -121,14 +121,14 @@ function wrapLine(parts: BoardLine, width: number, indent = 0): BoardLine[] {
 }
 
 /** A right-hand fact moves intact to its next row before either side wraps. */
-function pairedLines(left: BoardLine, right: BoardLine, width: number, indent = 2): BoardLine[] {
-  if (!lineText(left)) return wrapLine(right, width, indent);
+export function pairedLines(left: BoardLine, right: BoardLine, width: number, indent = 2, rightIndent = indent): BoardLine[] {
+  if (!lineText(left)) return wrapLine(right, width, rightIndent);
   if (!lineText(right)) return wrapLine(left, width, indent);
   const spacing = width - indent - cellWidth(lineText(left)) - cellWidth(lineText(right));
   if (spacing >= 2) {
     return wrapLine([...left, span(' '.repeat(spacing)), ...right], width, indent);
   }
-  return [...wrapLine(left, width, indent), ...wrapLine(right, width, indent)];
+  return [...wrapLine(left, width, indent), ...wrapLine(right, width, rightIndent)];
 }
 
 function unitBlock(unit: BoardUnit, data: BoardData, now: number, width: number): UnitBlock {

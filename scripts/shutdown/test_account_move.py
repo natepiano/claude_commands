@@ -811,10 +811,10 @@ class AccountMoveTests(ShutdownTestCase):
         listing.assert_called()
         self.assertIn("sr-one", output)
         self.assertIn("first showrunner:", output)
-        self.assertIn("move when idle (claude1 has room)", output)
+        self.assertIn("will move once idle (claude1 has room)", output)
         self.assertIn("sr-two", output)
         self.assertIn("second showrunner:", output)
-        self.assertIn("reap and restart now (claude1 out of usage: weekly limit, resets Thu 9:00 AM)", output)
+        self.assertIn("will stop and move now (claude1 out of usage: weekly limit, resets Thu 9:00 AM)", output)
         subjects = [cast(settle.PromptSubject, call.args[0]) for call in prompt.call_args_list]
         self.assertEqual([subject.session_id for subject in subjects], ["sr-one", "sr-two"])
         self.assertTrue(all(subject.login == report["login"] for subject in subjects))
@@ -927,7 +927,7 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual((result, error.getvalue()), (0, ""))
         self.assertIn("kept name:", output.getvalue())
         self.assertIn("move-id", output.getvalue())
-        self.assertIn("move when idle", output.getvalue())
+        self.assertIn("will move once idle", output.getvalue())
         self.assertEqual(self.disk_state(), before)
         process.assert_not_called()
 
