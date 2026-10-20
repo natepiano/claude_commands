@@ -627,25 +627,39 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - A restructure split command: style decisions replace it.
 
 ### Phase 20 — Values work starts per file  · status: done
-**Depends on:** Phase 19
+
+#### As-built
+
+- `blocked_by_structure` (`scripts/style/style_plan.py`): a cell at a file waits only for open or stale tier-D cells at its own path; a crate-level cell (path == crate) waits for every one in its crate. Busy files still block. `waiting for structure` names only crates where every own cell is still blocked.
+- Move-in: a file whose content changes goes stale through its file-scope fingerprint (no new code). Refill's waive loop also waives a filed finding with no build ticket whose one-line text left its file and went into exactly one file that gained the line since the finding was judged, with reason `<file> site moved to <file> in synced commit <tip>`. `style_proposals.MovedSites` (one per refill; one `git diff` per judged commit), `Ledger.judged_commit -> JudgedCommit | NoJudgedCommit` (judging ticket's checkpoint, else base), `unit_files.file_text` (bytes decoded with `errors="replace"`).
+
+**Files:**
+- `scripts/style/style_plan.py`, `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/unit_files.py`, `scripts/style/test_style_plan.py`, `docs/style_production.md`
+
+**Gotchas:**
+- A finding text that is a description, not a source line, never matches a destination, so it stays filed.
+- Only approved decisions of the refilling unit are checked; unapproved decisions wait for approval.
+
+### Phase 21 — Reopen every false built rename  · status: done
+**Depends on:** Phase 20
 
 #### Work Order
 
-**Goal:** a non-structure cell at a file waits only for open or stale structure cells at that file, so values-unit follows modules-unit file by file instead of idling until a whole crate's structure is judged.
+**Goal:** built rename findings whose rename is not in the synced code, left from merges before the applied check, go back to filed across every approved decision in one command, and a re-add of such a row says so.
 
 **Spec:**
-- `blocked_by_structure` (`scripts/style/style_plan.py`): a cell at a file path waits only for open or stale tier-D cells at its own path; a crate-level cell (path == crate) still waits for every open or stale tier-D cell in the crate; busy files on the board still block. `waiting for structure` names only crates where every own cell is still blocked. Ruled by the showrunner (natedev, 2026-10-19).
-- Move-in case: a structure merge that moves code into file X from file Y (X keeps its path) turns X's other-family cells stale so they are judged again, and waives Y's filed findings whose site is gone from Y (as for a removed file), never one whose text stays in Y or one an open ticket builds. What already holds gets a proving test; what is missing is added.
-- One line in `docs/style_production.md` where it describes the structure wait.
+- `style_proposals.py reopen --all [--dry-run]` (beside `--issue`, mutually exclusive): runs the per-decision `reopen` (style_proposals.py:813) over every approved decision that has built rename findings, with the same refusals for each (an open ticket builds it, a merged ticket is not synced). A refused decision is skipped with one line and the run goes on, exit 1 when any was skipped; a totals line at the end. Ruled by the showrunner (natedev, 2026-10-19).
+- `style_ledger.py held add`: when it returns an existing built row whose applied check is `RenameNotApplied` at the synced tip, it prints `built, but not in the code at <tip7>: run style_proposals.py reopen --issue <decision>` and changes no state. A re-add never reopens a row by itself.
+- One doc line each in `docs/style_production.md` beside `reopen`.
 
 **Files:**
-- `scripts/style/style_plan.py`, `scripts/style/style_ledger.py` (only if the move-in case needs it), `scripts/style/test_style_plan*.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
 
-**Workers:** 1 writer — one function, its callers and their tests; nothing splits.
+**Workers:** 1 writer — one flag, one print and their tests; nothing splits.
 - `impl` — all of the above
 
-**Constraints from prior phases:** Phase 19: ledger writers follow the lock rule (`retry_on_change`); held state `withdrawn` exists; refill waives a finding whose file is gone.
+**Constraints from prior phases:** Phase 19: `applied_check` gives `AppliedInCode | RenameNotApplied | NoAppliedCheck`; ledger writers follow the lock rule (`retry_on_change`); `reopen --issue --parent [--dry-run]` exists.
 
 **Acceptance gate:**
-- Tests: a values cell at a judged file gets a ticket while the crate-level and another file's structure cells are open; a file with its own open structure cell still waits; a crate-level values cell still waits; the move-in case end to end.
-- `scripts/style` tests green, `basedpyright scripts/style scripts/production` 0 errors and 0 warnings, merge gate `--tests-only` green.
+- Tests: `--all` reopens false built renames in two decisions and leaves applied ones built; a refused decision is skipped with its line while the others reopen, exit 1; `--dry-run` writes nothing and prints the same lines; `held add` on a false built row prints the hint and changes nothing; on an applied built row prints nothing new.
+- `scripts/style` tests green, basedpyright 0 errors and 0 warnings, merge gate `--tests-only` green.

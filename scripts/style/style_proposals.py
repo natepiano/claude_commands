@@ -815,6 +815,47 @@ def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, dry_run: bo
 
     Every refusal comes before the first write.
     """
+    if not file_unapplied_again(ledger, issue, parent, dry_run=dry_run):
+        print("nothing to reopen: every built finding is applied")
+    elif not dry_run:
+        renumber()
+
+
+def reopen_all(ledger: style_ledger.Ledger, *, dry_run: bool = False) -> tuple[Path, ...]:
+    """Reopen each approved decision that holds a built finding, then print the totals.
+
+    A decision that reopen refuses prints a skip line and the others go on; returns those decisions.
+    """
+    built = {finding.state.proposal for finding in ledger.held_findings(style_ledger.HeldFindingsInState("built"))
+             if isinstance(finding.state, style_ledger.Built)}
+    reopened = 0
+    filed_again = 0
+    skipped: list[Path] = []
+    for issue in sorted(path for path in built if path.is_file()):
+        source = Issue(issue, frontmatter(issue))
+        if not is_decision(source) or not isinstance(decision_answer(source), ApprovedDecision):
+            continue
+        try:
+            # A decision moves no finding, so it needs no parent.
+            unbuilt = file_unapplied_again(ledger, issue, "", dry_run=dry_run)
+        except style_ledger.LedgerError as error:
+            skipped.append(issue)
+            print(skip_line(issue, error))
+            continue
+        reopened += bool(unbuilt)
+        filed_again += len(unbuilt)
+    if reopened and not dry_run:
+        renumber()
+    print(f"totals: reopen {reopened}, filed again {filed_again}, skipped {len(skipped)}")
+    return tuple(skipped)
+
+
+def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, *,
+                         dry_run: bool) -> tuple[style_ledger.HeldFinding, ...]:
+    """File each built rename of the issue that is not in the synced code again, print a line for each and return them.
+
+    Every refusal comes before the first write.
+    """
     building = [ticket["id"] for ticket in ledger.proposal_tickets()
                 if Path(ticket["proposal"]) == issue and ticket["state"] not in style_ledger.FINAL_TICKET_STATES]
     if building:
@@ -835,8 +876,7 @@ def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, dry_run: bo
                         or not decision and isinstance(finding.state, style_ledger.Filed))
                     and isinstance(ledger.applied_check(finding, commit), RenameNotApplied))
     if not unbuilt:
-        print("nothing to reopen: every built finding is applied")
-        return
+        return ()
     built = frozenset(finding.finding_id for finding in unbuilt if isinstance(finding.state, style_ledger.Built))
     if decision:
         decisions = {finding.finding_id: issue for finding in unbuilt}
@@ -869,8 +909,7 @@ def reopen(ledger: style_ledger.Ledger, issue: Path, parent: str, *, dry_run: bo
     for finding in unbuilt:
         print(f"filed again {finding.finding_id} in {decisions[finding.finding_id]}: "
               + f"{finding.before} -> {finding.after} not applied in {finding.path}")
-    if not dry_run:
-        renumber()
+    return unbuilt
 
 
 PARENT_LINE = re.compile(r"^Parent: (.+)$", re.MULTILINE)
@@ -990,8 +1029,10 @@ def main(argv: list[str]) -> int:
     showing = sub.add_parser("sites")
     _ = showing.add_argument("--issue", type=Path, required=True)
     reopening = sub.add_parser("reopen")
-    _ = reopening.add_argument("--issue", type=Path, required=True)
-    _ = reopening.add_argument("--parent", required=True)
+    targets = reopening.add_mutually_exclusive_group(required=True)
+    _ = targets.add_argument("--issue", type=Path)
+    _ = targets.add_argument("--all", action="store_true")
+    _ = reopening.add_argument("--parent", default="")
     _ = reopening.add_argument("--dry-run", action="store_true")
     withdrawing = sub.add_parser("withdraw")
     _ = withdrawing.add_argument("--proposals", type=Path, required=True)
@@ -1008,6 +1049,8 @@ def main(argv: list[str]) -> int:
     for command in sub.choices.values():
         _ = command.add_argument("--repo", type=Path, default=Path.cwd())
     args = cast(ProposalArguments, parser.parse_args(argv))
+    if args.command == "reopen" and not args.all and not args.parent:
+        parser.error("reopen --issue requires --parent")
     try:
         source = (style_ledger.preview_ledger(args.repo) if args.command in ("migrate", "reopen", "withdraw") and args.dry_run
                   else style_ledger.open_ledger(args.repo))
@@ -1037,6 +1080,11 @@ def main(argv: list[str]) -> int:
                 if skipped:
                     print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
                     return 1
+            elif args.command == "reopen" and args.all:
+                skipped = reopen_all(ledger, dry_run=args.dry_run)
+                if skipped:
+                    print(f"style_proposals: skipped {len(skipped)} decisions", file=sys.stderr)
+                    return 1
             elif args.command == "reopen":
                 reopen(ledger, args.issue.expanduser().resolve(), args.parent, dry_run=args.dry_run)
             else:
@@ -1059,6 +1107,7 @@ class ProposalArguments(argparse.Namespace):
     words: str = ""
     idea: str = ""
     dry_run: bool = False
+    all: bool = False
 
 
 if __name__ == "__main__":

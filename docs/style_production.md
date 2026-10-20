@@ -499,6 +499,14 @@ that is not approved, an issue that an open ticket builds, an issue with a
 merged ticket whose checkpoint the synced tip does not hold yet (sync first), and
 an old issue that migrate would refuse or whose decision is declined or has no
 answer. A refusal writes nothing.
+`style_proposals.py reopen --repo <style checkout> --all [--dry-run]` runs reopen
+on every approved decision that holds a built finding. A refused decision prints
+`skipped <decision>: <reason>` and the others go on; the run ends with
+`totals: reopen <decisions>, filed again <findings>, skipped <decisions>` and exits 1
+when it skipped one.
+`style_ledger.py held add` on a built finding whose rename is not at the synced tip
+prints `built, but not in the code at <tip>: run style_proposals.py reopen --all (decision <decision>)`
+to stderr and changes nothing.
 
 After each merge and at startup, run `style_proposals.py complete --repo
 <style checkout>`. It closes only approved decisions, and only when all their

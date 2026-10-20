@@ -901,6 +901,63 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(self.reopen_output(ledger, issue), "nothing to reopen: every built finding is applied\n")
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
 
+    def built_decision(self, ledger: style_ledger.Ledger,
+                       crate: str) -> tuple[Path, style_ledger.HeldFinding, style_ledger.HeldFinding]:
+        """An approved decision in crate whose 2 renames a merge marked built before the check; only the first is in the code."""
+        applied = self.hold(ledger, crate=crate)
+        missing = self.hold(ledger, crate=crate, line=2, before="Kind::Size", after="Kind::Length")
+        issue = self.approved_decision(ledger, applied, missing)
+        self.built_before_the_check(ledger, applied, missing)
+        return issue, applied, missing
+
+    def reopen_all(self, *arguments: str) -> tuple[int, list[str], str]:
+        """The exit code, stdout lines and stderr of reopen --all."""
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            result = style_proposals.main(["reopen", "--repo", str(self.repo), "--all", *arguments])
+        return result, output.getvalue().splitlines(), errors.getvalue()
+
+    def filed_again_line(self, issue: Path, finding: style_ledger.HeldFinding) -> str:
+        return f"filed again {finding.finding_id} in {issue}: Kind::Size -> Kind::Length not applied in {finding.path}"
+
+    def test_reopen_all_files_again_the_unapplied_renames_of_every_approved_decision(self) -> None:
+        with self.ledger() as ledger:
+            # Decisions run in path order, and the alpha decision's name sorts first.
+            decisions = (self.built_decision(ledger, "alpha"), self.built_decision(ledger, "beta"))
+        self.assertEqual(self.reopen_all(), (0, [*(self.filed_again_line(issue, missing) for issue, _, missing in decisions),
+                                                 "totals: reopen 2, filed again 2, skipped 0"], ""))
+        with self.ledger() as ledger:
+            for issue, applied, missing in decisions:
+                self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
+                                 {applied.finding_id: style_ledger.Built(issue), missing.finding_id: style_ledger.Filed(issue)})
+
+    def test_reopen_all_skips_a_refused_decision_and_reopens_the_others(self) -> None:
+        with self.ledger() as ledger:
+            reopened, _, missing = self.built_decision(ledger, "alpha")
+            refused, _, kept = self.built_decision(ledger, "beta")
+            later = self.hold(ledger, crate="beta", line=3, before="Kind::Rate", after="Kind::Speed")
+            self.assertEqual(self.file(ledger), (refused,))
+            ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "beta", [later.path], [self.rename],
+                              proposal=str(refused), finding_ids=(later.finding_id,))
+        # Decisions run in path order, and the alpha decision's name sorts first.
+        self.assertEqual(self.reopen_all(), (1, [self.filed_again_line(reopened, missing),
+                                                 f"skipped {refused}: open ticket names-unit-1 builds it",
+                                                 "totals: reopen 1, filed again 1, skipped 1"],
+                                             "style_proposals: skipped 1 decisions\n"))
+        with self.ledger() as ledger:
+            states = {finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+        self.assertEqual((states[missing.finding_id], states[kept.finding_id]),
+                         (style_ledger.Filed(reopened), style_ledger.Built(refused)))
+
+    def test_reopen_all_dry_run_prints_the_lines_of_the_run_and_writes_nothing(self) -> None:
+        with self.ledger() as ledger:
+            for crate in ("alpha", "beta"):
+                _ = self.built_decision(ledger, crate)
+            before = self.written(ledger)
+        preview = self.reopen_all("--dry-run")
+        with self.ledger() as ledger:
+            self.assertEqual(self.written(ledger), before)
+        self.assertEqual(self.reopen_all(), preview)
+
     def test_sites_and_candidates_list_the_ledger_records_without_filing_candidates(self) -> None:
         with self.ledger() as ledger:
             finding = self.hold(ledger)
@@ -1821,7 +1878,7 @@ class StyleProposalsTests(unittest.TestCase):
             row = self.newer_verdict(ledger, self.newer_rule_text(), "exception", withdrawn.path)
             self.assertIn("totals: withdraw 1, kept 0, close 0", self.withdraw(ledger))
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
-                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, row), built.finding_id: style_ledger.Built()})
+                             {withdrawn.finding_id: style_ledger.Withdrawn(issue, row), built.finding_id: style_ledger.Built(issue)})
             self.assertEqual(frontmatter(issue)["status"], ["open"])
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
