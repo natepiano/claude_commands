@@ -75,48 +75,59 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** `--until` on `runs` (it ignored the flag); marking a record `mixed` because two merge rounds name different merges (merge texts vary).
 
 ### Phase 2 — Why the phases with the most rounds needed them  · status: done
-**Depends on:** Phase 1
+
+#### As-built
+
+- `docs/plans/sdlc-fix-rounds-study.md` gives, for the 15 phases with the most repair rounds, why each round ran. Its head notes the `history.py rounds --since 60d --status all --format json` command, its date and its summary lines.
+- Each phase section gives plan, phase title, rounds, findings and fix time, then one line per round: its cause from the round classifier, its root cause, and its evidence.
+- Root causes are `spec-gap`, `target-moved`, `out-of-scope`, `fix-failed`, `fix-regressed`, `serial-check`, `mechanical` and `record`.
+- The 15 ranked records hold 255 rounds and 975,069 agent-seconds of fix time, as counted by the batch join of this phase. The study also splits 3 `mixed` records by hand into their phases.
+- A rule check gives, per phase, the rounds past the hard landing and whether their findings were the kind item 7 lets stay. Totals tables give rounds and fix time by root cause over the 15 phases, and by classifier cause over the full 60 days.
+- A separate section covers the cargo-liner `/astra_review` design-doc rounds (8, 6, 5 findings; `fix-regressed` / `target-moved`). It stays out of the run-record totals.
+- `LIVE_WORDS` in `scripts/history/rounds.py` includes "ux review". No other classifier change.
+
+**Files:**
+- `docs/plans/sdlc-fix-rounds-study.md` — method, 15 phase sections, 3 `mixed` splits, rule check, totals, Astra reference.
+- `scripts/history/rounds.py`, `scripts/history/test_rounds.py` — `LIVE_WORDS` gains "ux review", with a test.
+
+**Binds later work:** `rounds.py` joins ledger batches by `fix_pass` number alone. When numbers restart inside one instance (8f4c2e88/38, 7b115092/137), later rounds get the findings of an earlier batch. The batch join fix corrects this, and the study's counts change with it. The proposals cite the study's root totals and wait on that fix.
+
+**Gotchas:** Root labels are hand assessments. A row that only verifies is `record`. `serial-check` needs a trace of one defect per check; no normal record shows that pattern.
+
+**Ruled out:** a wider `mechanical` root, and `serial-check` for batched checks — both blur the defined roots.
+
+### Phase 3 — Each repair round joins only its own ledger batch  · status: todo
+**Depends on:** Phase 2
 
 #### Work Order
 
-**Goal:** `docs/plans/sdlc-fix-rounds-study.md` gives, for each of the 15 phases with the most repair rounds, why each round ran, and what share of all rounds each cause holds.
+**Goal:** `load_phases` and `phase_rounds` give each repair round only the ledger batch it repaired, also when fix-pass numbers repeat inside one phase instance.
 
 **Spec:**
-- Take the top 15 non-`mixed` records from `history.py rounds --since 60d --status all --format json`, and the top 3 `mixed` records split by hand into the phases they hold. Note the command, its date and its summary lines at the head of the study.
-- For each phase, a short section: plan, phase title, rounds, findings, fix time; then one line per round: its cause from Phase 1, and its **root cause**, one of:
-  - `spec-gap` — the Work Order did not say what the fix had to meet (no target size, no visible goal, no test named);
-  - `target-moved` — the user or the showrunner changed the goal after the phase started;
-  - `out-of-scope` — a defect that was there before the phase or lives in another unit (item 7 says route it, not fix it);
-  - `fix-failed` — the same finding was open after the round before it;
-  - `fix-regressed` — the round repaired a defect the round before it caused;
-  - `serial-check` — a live check sent one defect, it was fixed, then the next was found (item 7 "one batch per check");
-  - `mechanical` — lint, test update or merge work that follows from a change and needs no judgment;
-  - `record` — not a repair: phase records not started or finished at the boundary.
-  Each line names its evidence: the pass activity, finding ids and titles, the plan's Work Order at the phase start (`git log -p -- <plan>`), the production log line, or the attempts log.
-- **Rule check:** for each phase, the rounds past the hard landing (`past_landing`) and whether the findings they repaired were the kind item 7 lets stay (regression the phase caused, broke what worked, fails a test or gate). This tells "the rule does not stop it" from "the rule was not followed".
-- **Totals table:** root causes by rounds and by fix time, over the 15 phases, most first. Then the same table for causes from Phase 1 over the full 60-day window, for scale.
-- **Reference case outside the run records** (the sdlc showrunner, 2026-10-20): experiments-unit (cargo-liner) ran 3 `/astra_review` rounds on a design doc, with 8, 6 and 5 findings, all fixed. The rounds did not converge, because each fix added a mechanism that the next round found gaps in (the doc grew from 568 to 696 lines). Notes: `~/rust/hanadocs/showrunners/cargo-liner/experiments/astra-design-notes.md`, sections (b) and (d). Give it its own short section with root causes (`fix-regressed` / `target-moved` on a design, not on code), and keep it out of the run-record totals.
-- Tune Phase 1's word lists in `scripts/history/rounds.py` where the hand reading shows a wrong cause, with a test per change in `test_rounds.py`.
-- No proposals in this phase. The study states facts and evidence only.
+- Today `_rounds` in `scripts/history/rounds.py` joins a fix-worker group to every `finding_batch_dispatched` event whose `round` equals one of the group's `fix_pass` numbers. When fix-pass numbers restart inside one phase instance, a later group takes an earlier batch's findings and cause, and a repeated ledger round number is hidden. Evidence: run `8f4c2e88-92c3-44c4-ac27-36ab13c68327`, phase 38: the ledger sent batch 1 (F001–F006) and batch 2 (F007–F009) once each, but rounds 10, 22, 38, 39 and 40 also claim them and read as `review-ux`. Also seen in run `7b115092`, phase 137, where batch 3 has no matching worker after its dispatch.
+- Join each batch dispatch to at most one group: the group holding the first fix pass, in start order, that starts at or after the dispatch time and carries its number. A pass inside an already open group counts, so a batch sent during a group joins that group (22 recorded batches do this, for example `fcc29db9` phase 7 batch 2). Each dispatch is used once. A dispatch that no pass takes stays a ledger-only round, as today. A group with no batch keeps the word-list causes.
+- Keep the public API: `load_phases(events) -> list[PhaseRounds]`, `phase_rounds(events) -> list[Round]`, and every `Round` / `PhaseRounds` field. phases-unit's `phase_process.py baseline` imports them.
+- Add tests in `scripts/history/test_rounds.py`: restarted fix-pass numbers give the later group no covered findings and a word-list cause; a batch dispatched after an earlier group with the same number joins the later group; a repeated ledger round number with no group stays a ledger-only round; a batch sent while a group is open joins that group. Check causes, covered findings and counts through `phase_rounds`, `load_phases` and a synthetic `history.py rounds --format json` report.
+- Re-run `python3 scripts/history/history.py rounds --since 60d --status all --format json --top 40`. In `docs/plans/sdlc-fix-rounds-study.md`, correct each Phase 1 cause, covered-finding list and count that the fix changes, and the full-window Phase 1 cause table, with the new capture date. The study keeps its 15 ranked records as a fixed cohort; where the fix adds or removes a round in one of them, renumber its rows, assign the new row a root with evidence, and recompute the rule check, totals and the Phase 4 constraints copied from them. Hand root labels change only where a row's evidence changes. Tell phases-unit which causes and counts changed.
 
 **Files:**
-- `docs/plans/sdlc-fix-rounds-study.md` — new: method, 15 phase sections, rule check, totals.
-- `scripts/history/rounds.py`, `scripts/history/test_rounds.py` — word list tuning only.
+- `scripts/history/rounds.py` — `_rounds` batch join.
+- `scripts/history/test_rounds.py` — join tests.
+- `docs/plans/sdlc-fix-rounds-study.md` — Phase 1 causes and the full-window table.
 
-**Workers:** `2 writers`
-- `impl` — `docs/plans/sdlc-fix-rounds-study.md`; phases 1–8 of the ranked list, the rule check and the totals; hub: `docs/plans/sdlc-fix-rounds-study.md` (the second writer sends its sections to `impl` to place).
-- `test` — opens as `impl`: phases 9–15 and the 3 `mixed` records, sent to `impl` as finished sections; owns `scripts/history/rounds.py` and `scripts/history/test_rounds.py` for word list tuning.
+**Workers:** `1 writer + 1 tester`
+- `impl` — `scripts/history/rounds.py`, then `docs/plans/sdlc-fix-rounds-study.md`; hub: `scripts/history/rounds.py`.
+- `test` — `scripts/history/test_rounds.py`.
 
 **Constraints from prior phases:**
-- From Phase 1: `scripts/history/rounds.py` is an API that phases-unit's `phase_process.py baseline` imports. Word list tuning changes only the constants `GATE_WORDS`, `MERGE_WORDS`, `LIVE_WORDS` (each a tuple of lower-case words or phrases matched against the pass activity); never the signatures of `load_phases(events) -> list[PhaseRounds]` and `phase_rounds(events) -> list[Round]`, and never a `PhaseRounds` or `Round` field.
-- From Phase 1: a record is `mixed` when a pass activity names another phase number, its passes span more than 72 h, or its merge rounds are more than 24 h apart (`MERGE_SEPARATION_SECONDS`). A pass with no finish never extends a round.
-- From Phase 1: the 60-day baseline on 2026-10-20 was 1,863 phases; median 0 rounds; 221 phases with 3 or more rounds hold 79% of fix time; rounds by cause review-ux 18.9%, review-code 61.6%, gate 7.3%, merge 1.9%, live 0.2%, other 10.1%; 44 `mixed` records. The top two records, `189487ea` phase 6 (56 rounds) and `03f9b80e` phase 20 (42 rounds), are both `mixed`. `live` at 0.2% shows `LIVE_WORDS` barely match: check it first in the hand reading.
-- From Phase 1: the merge gate runs the `history` suite (`scripts/production/merge_gate.py` `TEST_SUITES`), so a `rounds.py` change must keep `python3 -m unittest discover -s scripts/history -p 'test_*.py'` green.
+- From Phase 1: `rounds.py` is an importable API that phases-unit imports; `run()` alone prints. A round's `fix_seconds` is summed worker time; a ledger-only round adds no time; `finished_at` 0.0 means open.
+- From Phase 1: the merge gate runs the `history` suite, so `python3 -m unittest discover -s scripts/history -p 'test_*.py'` must stay green.
+- From Phase 2: the study's 15 normal records hold 255 rounds and 975,069 agent-seconds; roots: fix-failed 91, spec-gap 44, mechanical 38, record 34, fix-regressed 29, out-of-scope 12, target-moved 7, serial-check 0. `LIVE_WORDS` now holds `"ux review"`.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` green and `basedpyright scripts/history` `0 errors, 0 warnings` when `rounds.py` changed. Every round line in the study names its evidence; every phase section's rounds match `history.py rounds` for that record; the totals table sums to the rounds counted.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` green; `basedpyright scripts/history` `0 errors, 0 warnings`; phase 38 of run 8f4c2e88 gives batch 1 and batch 2 to one round each; the study's cause columns match the new report.
 
-### Phase 3 — Proposals to the user that cut rounds and keep the work  · status: todo
-**Depends on:** Phase 2
+### Phase 4 — Proposals to the user that cut rounds and keep the work  · status: todo
+**Depends on:** Phase 2, Phase 3
 
 #### Work Order
 
@@ -129,32 +140,38 @@ For active process redesigns, as we are currently undergoing with promotions and
   - **Rounds saved:** applied by hand to the 15 studied phases: rounds that would not have run, and fix time that would not have been spent. Count only rounds the change removes for certain; a round it might remove counts as zero.
   - **Work kept:** where each finding the change stops repairing goes (follow-up phase, owning unit, routed to the showrunner), and what tells us it got done.
   - **Risk:** what a defect could reach the user or a merge because of it.
-  - **Measure:** the `history.py rounds` and `review_regime.py report` numbers Phase 5 compares, with the target for each.
+  - **Measure:** the `history.py rounds` and `review_regime.py report` numbers Phase 6 compares, with the target for each.
   - **Answers:** the buildable answers (adopt, adopt with a named change, do not adopt) and the one recommended.
 - File each proposal as a hanadocs issue through `/issue` with tag `proposal`, `proposed_by: fix-rounds-unit`, and its five ranking values on a `Proposed ranking:` line (<ProductionUnit/> item 17).
-- Send the proposals to the showrunner as one message: per proposal, the question, the answers and the recommendation, its issue path, and the study path. Name it as a process change for the user (production rule). Then write the user's answers into Phase 4's Spec when they arrive.
-- A proposal that only changes this unit's own tooling (`scripts/history/`) is not a process change: build it in Phase 4 without a question, and state it in one line.
+- Send the proposals to the showrunner as one message: per proposal, the question, the answers and the recommendation, its issue path, and the study path. Name it as a process change for the user (production rule). Then write the user's answers into Phase 5's Spec when they arrive.
+- A proposal that only changes this unit's own tooling (`scripts/history/`) is not a process change: build it in Phase 5 without a question, and state it in one line.
 
+- A change that only corrects the record (a `record` row, a cause label) gets no work-saving credit unless the work itself goes away; both windows of Phase 6 use the same corrected measurement.
+- Each proposal states, beside its round target, the work-kept margins Phase 6 judges it by, the sample it needs, and that missing follow-up or review evidence makes the result inconclusive, not a pass.
 **Files:**
 - `docs/plans/sdlc-fix-rounds-study.md` — `## Proposals`.
 
-**Workers:** `1 writer + 1 tester`
+**Workers:** `2 writers`
 - `impl` — `docs/plans/sdlc-fix-rounds-study.md`: the proposals.
 - `test` — opens as `impl`, writes nothing: recounts each proposal's **Rounds saved** from the study's round lines and sends `impl` each count that differs, with the round lines it read.
 
-**Constraints from prior phases:** set at Phase 2's checkpoint.
+**Constraints from prior phases:**
+- From Phase 2: `docs/plans/sdlc-fix-rounds-study.md` holds the evidence: 15 non-mixed records, 255 rounds, 975,069 agent-seconds (270.85 h). Roots by rounds (share of fix time): fix-failed 91 (48.6%), spec-gap 44 (19.6%), mechanical 38 (10.6%), record 34 (5.5%), fix-regressed 29 (8.0%), out-of-scope 12 (6.8%), target-moved 7 (1.0%), serial-check 0. Its `## Totals` and `## Rule check` sections are the base each proposal cites.
+- From Phase 2: no normal record shows the one-defect-per-check pattern; the study treats that as a limit of the evidence, not proof. `fix-failed` counts interrupted continuations and failed gate batches as well as rejected patches. Spec-gap rows name a missing target or test case in the start Work Order; they are inferences, not proof that the test would have stopped the repair.
+- From Phase 2: the three largest mixed records (189487ea/6, 03f9b80e/20 and 8f4c2e88/38) are outside the totals; the Astra reference case is outside them too.
+- From Phase 3: proposal measures use the `history.py rounds` numbers after Phase 3's batch-join fix, not the earlier Phase 1 cause shares.
 
 **Acceptance gate:** every proposal has all six parts; each **Rounds saved** matches the recount; the message to the showrunner is sent, and the turn ends `— decision:` on the user's answers.
 
-### Phase 4 — Apply the changes the user approved  · status: todo
-**Depends on:** Phase 3
+### Phase 5 — Apply the changes the user approved  · status: todo
+**Depends on:** Phase 4
 
 #### Work Order
 
 **Pending decision: which proposals the user adopts, and in what form**
 
 Actual problem:
-Phase 3 sends the proposals to the user through the showrunner. This phase builds only what the user adopts, and the files it edits follow from those answers.
+Phase 4 sends the proposals to the user through the showrunner. This phase builds only what the user adopts, and the files it edits follow from those answers.
 
 What exists now:
 - The repair rules in `docs/production_format.md` item 7, `commands/unit/direct.md` <FindingsLedger/> and <FixDispatch/>, and the limits in `config/delegate.conf`.
@@ -165,44 +182,48 @@ What should change:
 Recommendation:
 Write the user's answers into this Spec, Files and Acceptance gate when they arrive, then dispatch.
 
-**Goal:** the adopted changes are in the files `/unit:direct` runs from, merged to main, and the date they took effect is recorded for Phase 5.
+**Goal:** the adopted changes are in the files `/unit:direct` runs from, merged to main, and the date they took effect is recorded for Phase 6.
 
 **Spec:**
 - One edit per adopted proposal, in the words the user approved.
 - Edits to `commands/unit/direct.md` (owner phases-unit) and `docs/production_format.md` (owner roles-unit) go through cargo-berth's normal flow; the checkpoint notice names each as `also touches <path> (owner <unit>), tested against <owner tip>`, and names the build-followups owner too.
 - Tooling proposals in `scripts/history/` need no question.
-- Add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <checkpoint hash> on main, <date>`. Phase 5 compares from that date.
+- Add a line to the head of `docs/plans/sdlc-fix-rounds-study.md`: `Changes took effect: <checkpoint hash> on main, <date>`. Phase 6 compares from that date.
 
+- When the user adopts no process change, record `No process change adopted` at the head of the study with the date, mark this phase and Phase 6 done with that reason, and build only the tooling-only items Phase 4 named.
 **Files:** set by the decision.
 
 **Workers:** set by the decision.
 
-**Constraints from prior phases:** set at Phase 3's checkpoint.
+**Constraints from prior phases:** set at Phase 4's checkpoint.
 
 **Acceptance gate:** set by the decision; at least the merge gate green and `basedpyright scripts/direct scripts/production scripts/history` `0 errors, 0 warnings`.
 
-### Phase 5 — Did the changes cut rounds and keep the work  · status: todo
-**Depends on:** Phase 4
-**Blocked by:** 30 phases with at least one repair round recorded after the date Phase 4 records, counted by `history.py rounds --since <date> --status all`.
+### Phase 6 — Did the changes cut rounds and keep the work  · status: todo
+**Depends on:** Phase 5
+**Blocked by:** 30 phases with at least one repair round recorded after the date Phase 5 records, counted by `history.py rounds --since <date> --status all`.
 
 #### Work Order
 
 **Goal:** `docs/plans/sdlc-fix-rounds-study.md` ends with a before-and-after table per adopted change, a verdict on each, and any revert sent to the user as a question.
 
 **Spec:**
-- Before window: the 30 days before the Phase 4 date. After window: from that date to the run.
+- Before window: the 30 days before the Phase 5 date. After window: from that date to the run.
 - **Fewer rounds:** from `history.py rounds`: median rounds per phase, share of phases with ≥3 rounds, share of fix time those hold, rounds past the hard landing, and rounds by root cause class for the causes each change targets.
 - **Work kept:** follow-up phases written after a landing and how many reached `done` (plan docs under each production's units); merge design-check defects per phase and holds per phase from `review_regime.py report` on rows in each window; findings routed to other units and whether their phases ran.
-- A change passes when its round measure meets the target Phase 3 set and no work-kept measure is worse by more than its stated margin. A change that fails goes to the user as a question through the showrunner: keep, change, or revert, with the numbers and the one recommended.
+- A change passes when its round measure meets the target Phase 4 set and no work-kept measure is worse by more than its stated margin. A change that fails goes to the user as a question through the showrunner: keep, change, or revert, with the numbers and the one recommended.
 - State the sample sizes beside every number; a window under 20 phases is reported, not judged.
 
+- Root counts use the Phase 2 study method by hand, one evidence line per round, with the second writer recounting each window on its own; `history.py rounds` gives only the Phase 1 causes.
+- Review rows come from `review_regime.py`'s shared row reader with both window bounds applied in the study's extraction, not from `report`'s fixed regimes; state the boundary field, the excluded rows and each window's sample size.
+- The readiness count takes phases from `history.py rounds --since <date> --status all --format json --top 100000` with at least one round, a `check` of `ok`, and a start on or after the date; open and mixed phases are listed apart and not judged.
 **Files:**
 - `docs/plans/sdlc-fix-rounds-study.md` — `## Effect`.
 
-**Workers:** `1 writer + 1 tester`
+**Workers:** `2 writers`
 - `impl` — `docs/plans/sdlc-fix-rounds-study.md`: the effect tables and verdicts.
 - `test` — opens as `impl`, writes nothing: reruns each command the tables cite and sends `impl` each number that differs.
 
-**Constraints from prior phases:** set at Phase 4's checkpoint.
+**Constraints from prior phases:** set at Phase 5's checkpoint.
 
 **Acceptance gate:** every number in `## Effect` names the command that produced it and matches a rerun; each adopted change has a verdict; each failed change's question is sent to the showrunner.
