@@ -57,6 +57,10 @@ class JsonRow(TypedDict):
     rounds: int | str
     check: str
     past_landing: int | str
+    round_details: list[rounds.Round]
+    causes: dict[str, int]
+    findings: int
+    fix_seconds: float
 
 
 class JsonReport(TypedDict):
@@ -124,8 +128,92 @@ def load_one(events: list[dict[str, object]]) -> rounds.PhaseRounds:
     return phases[0]
 
 
+def restarted_batch_events() -> list[dict[str, object]]:
+    """Two repaired batches, an unledgered repair, and a final dispatch without workers."""
+    events = phase_events() + ledger_events(finding="CODE")
+    events += pass_events(BASE + 10, BASE + 20, name="original")
+    events += pass_events(BASE + 40, BASE + 50, name="restart", activity="Repair failing tests")
+    events += ledger_events(at=BASE + 60, finding="UX", lens="ux")
+    events += pass_events(BASE + 70, BASE + 80, name="second-batch")
+    events += ledger_events(at=BASE + 90, finding="UNSTARTED")
+    return events
+
+
 @final
 class RepairRoundTests(unittest.TestCase):
+    def test_restarted_fix_number_does_not_inherit_an_earlier_batch(self) -> None:
+        events = ledger_events(lens="ux")
+        events += pass_events(BASE + 10, BASE + 20, name="original")
+        events += pass_events(BASE + 30, BASE + 40, name="restart", activity="Repair failing tests")
+        for records in (events, list(reversed(events))):
+            with self.subTest(reversed=records is not events):
+                built = rounds.phase_rounds(records)
+                self.assertEqual([(repair["cause"], repair["covered"]) for repair in built],
+                                 [("review-ux", ["F1"]), ("gate", [])])
+                self.assertEqual(sum(repair["fix_seconds"] for repair in built), 20)
+
+    def test_later_batch_joins_only_the_first_matching_pass_after_dispatch(self) -> None:
+        events = pass_events(BASE + 10, BASE + 20, name="before", activity="Repair merge conflict")
+        events += ledger_events(at=BASE + 25, finding="LATER")
+        events += pass_events(BASE + 30, BASE + 40, name="recipient")
+        events += pass_events(BASE + 50, BASE + 60, name="after", activity="Repair failing lint")
+        built = rounds.phase_rounds(events)
+        self.assertEqual([(repair["cause"], repair["covered"]) for repair in built],
+                         [("merge", []), ("review-code", ["LATER"]), ("gate", [])])
+
+    def test_batch_during_an_open_group_joins_its_later_matching_worker(self) -> None:
+        events = pass_events(BASE + 10, BASE + 20, name="before", number=2)
+        events += pass_events(BASE + 30, BASE + 100, name="open", number=1)
+        events += ledger_events(number=2, at=BASE + 49, finding="MID", lens="ux")
+        events += pass_events(BASE + 60, BASE + 80, name="recipient", slot="test", number=2)
+        events += pass_events(BASE + 120, BASE + 130, name="after", number=2)
+        built = rounds.phase_rounds(events)
+        self.assertEqual([(repair["cause"], repair["covered"]) for repair in built],
+                         [("other", []), ("review-ux", ["MID"]), ("other", [])])
+        self.assertEqual((built[1]["started_at"], built[1]["finished_at"],
+                          built[1]["passes"], built[1]["fix_seconds"]),
+                         (BASE + 30, BASE + 100, 2, 90))
+
+    def test_repeated_ledger_number_without_workers_keeps_each_dispatch(self) -> None:
+        events = ledger_events(finding="CODE")
+        events += ledger_events(at=BASE + 25, finding="UX", lens="ux")
+        built = rounds.phase_rounds(events)
+        self.assertEqual([(repair["cause"], repair["covered"]) for repair in built],
+                         [("review-code", ["CODE"]), ("review-ux", ["UX"])])
+        self.assertEqual([repair["started_at"] for repair in built], [BASE + 6, BASE + 26])
+        self.assertEqual([(repair["passes"], repair["fix_seconds"], repair["finished_at"])
+                          for repair in built], [(0, 0, 0), (0, 0, 0)])
+
+    def test_batch_after_the_last_matching_worker_stays_ledger_only(self) -> None:
+        events = pass_events(BASE + 10, BASE + 20, activity="Repair failing tests")
+        events += ledger_events(at=BASE + 25, finding="UNSTARTED", lens="ux")
+        built = rounds.phase_rounds(events)
+        self.assertEqual([(repair["cause"], repair["covered"], repair["fix_seconds"])
+                          for repair in built],
+                         [("gate", [], 10), ("review-ux", ["UNSTARTED"], 0)])
+
+    def test_worker_start_at_dispatch_time_is_eligible_but_wrong_number_is_not(self) -> None:
+        events = ledger_events(number=2, at=BASE + 9)
+        events += pass_events(BASE + 10, BASE + 20, name="wrong-number", number=1)
+        events += pass_events(BASE + 30, BASE + 40, name="matching", number=2)
+        built = rounds.phase_rounds(events)
+        self.assertEqual([(repair["cause"], repair["covered"]) for repair in built],
+                         [("other", []), ("review-code", ["F1"])])
+        exact = ledger_events(at=BASE + 9) + pass_events(BASE + 10, BASE + 20)
+        one, = rounds.phase_rounds(exact)
+        self.assertEqual((one["cause"], one["covered"], one["passes"]),
+                         ("review-code", ["F1"], 1))
+
+    def test_load_phases_counts_restarted_batches_without_adding_worker_time(self) -> None:
+        phase = load_one(restarted_batch_events())
+        self.assertEqual([(repair["cause"], repair["covered"]) for repair in phase["rounds"]],
+                         [("review-code", ["CODE"]), ("gate", []),
+                          ("review-ux", ["UX"]), ("review-code", ["UNSTARTED"])])
+        self.assertEqual((phase["findings"], phase["fix_seconds"], phase["past_landing"]),
+                         (3, 30, 1))
+        self.assertEqual(phase["causes"], {"review-ux": 1, "review-code": 2, "gate": 1,
+                                           "merge": 0, "live": 0, "other": 0})
+
     def test_phase_rounds_exposes_one_dispatch_with_all_concurrent_passes(self) -> None:
         events = ledger_events(number=3, lens="ux")
         events += pass_events(BASE + 10, BASE + 30, name="code", number=3)
@@ -371,6 +459,20 @@ class RepairRoundTests(unittest.TestCase):
 
 @final
 class RoundsCommandTests(unittest.TestCase):
+    def test_json_cli_reports_each_batch_once_after_fix_numbers_restart(self) -> None:
+        report = self.report(restarted_batch_events(), cli=True)
+        row, = report["rows"]
+        self.assertEqual(row["rounds"], 4)
+        self.assertEqual([(repair["round"], repair["cause"], repair["covered"])
+                          for repair in row["round_details"]],
+                         [(1, "review-code", ["CODE"]), (2, "gate", []),
+                          (3, "review-ux", ["UX"]), (4, "review-code", ["UNSTARTED"])])
+        self.assertEqual((row["findings"], row["fix_seconds"], row["past_landing"]), (3, 30, 1))
+        self.assertEqual(row["causes"], {"review-ux": 1, "review-code": 2, "gate": 1,
+                                        "merge": 0, "live": 0, "other": 0})
+        self.assertEqual(report["_meta"]["rounds"], 4)
+        self.assertEqual(report["_meta"]["causes"], row["causes"])
+
     def test_runs_rejects_until_before_reading_events(self) -> None:
         output = io.StringIO()
         with patch("sys.argv", ["history.py", "runs", "--until", "1d"]), \

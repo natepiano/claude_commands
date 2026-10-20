@@ -96,7 +96,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a wider `mechanical` root, and `serial-check` for batched checks — both blur the defined roots.
 
-### Phase 3 — Each repair round joins only its own ledger batch  · status: todo
+### Phase 3 — Each repair round joins only its own ledger batch  · status: done
 **Depends on:** Phase 2
 
 #### Work Order
@@ -156,7 +156,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `test` — opens as `impl`, writes nothing: recounts each proposal's **Rounds saved** from the study's round lines and sends `impl` each count that differs, with the round lines it read.
 
 **Constraints from prior phases:**
-- From Phase 2: `docs/plans/sdlc-fix-rounds-study.md` holds the evidence: 15 non-mixed records, 255 rounds, 975,069 agent-seconds (270.85 h). Roots by rounds (share of fix time): fix-failed 91 (48.6%), spec-gap 44 (19.6%), mechanical 38 (10.6%), record 34 (5.5%), fix-regressed 29 (8.0%), out-of-scope 12 (6.8%), target-moved 7 (1.0%), serial-check 0. Its `## Totals` and `## Rule check` sections are the base each proposal cites.
+- From Phase 2: `docs/plans/sdlc-fix-rounds-study.md` holds the evidence: 15 non-mixed records, 260 rounds, 975,069 agent-seconds (270.85 h). Roots by rounds (share of fix time): fix-failed 94 (48.5%), spec-gap 43 (19.1%), mechanical 39 (11.0%), record 35 (5.5%), fix-regressed 30 (8.1%), out-of-scope 12 (6.8%), target-moved 7 (1.0%), serial-check 0. These are the counts after the batch-join fix. Its `## Totals` and `## Rule check` sections are the base each proposal cites.
 - From Phase 2: no normal record shows the one-defect-per-check pattern; the study treats that as a limit of the evidence, not proof. `fix-failed` counts interrupted continuations and failed gate batches as well as rejected patches. Spec-gap rows name a missing target or test case in the start Work Order; they are inferences, not proof that the test would have stopped the repair.
 - From Phase 2: the three largest mixed records (189487ea/6, 03f9b80e/20 and 8f4c2e88/38) are outside the totals; the Astra reference case is outside them too.
 - From Phase 3: proposal measures use the `history.py rounds` numbers after Phase 3's batch-join fix, not the earlier Phase 1 cause shares.
