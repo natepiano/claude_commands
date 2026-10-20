@@ -74,7 +74,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** `--until` on `runs` (it ignored the flag); marking a record `mixed` because two merge rounds name different merges (merge texts vary).
 
-### Phase 2 — Why the phases with the most rounds needed them  · status: todo
+### Phase 2 — Why the phases with the most rounds needed them  · status: done
 **Depends on:** Phase 1
 
 #### Work Order

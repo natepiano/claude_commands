@@ -29,7 +29,7 @@ GATE_WORDS = ("test", "tests", "lint", "clippy", "basedpyright", "type check", "
 # Merge work includes conflict resolution and moving a change between branches.
 MERGE_WORDS = ("merge", "conflict", "port", "rebase")
 # These completed activities can cause a live repair for the next 30 minutes.
-LIVE_WORDS = ("live", "shot", "smoke")
+LIVE_WORDS = ("live", "shot", "smoke", "ux review")
 # Merge rounds more than one day apart belong to different merges.
 MERGE_SEPARATION_SECONDS = 24 * 3600
 CAUSES = ("review-ux", "review-code", "gate", "merge", "live", "other")

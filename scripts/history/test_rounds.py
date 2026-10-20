@@ -251,6 +251,16 @@ class RepairRoundTests(unittest.TestCase):
                 events += pass_events(BASE + 1_810, BASE + 1_820)
                 self.assertEqual(load_one(events)["causes"]["live"], 1)
 
+    def test_completed_ux_review_explains_the_next_unledgered_repair(self) -> None:
+        events = phase_events(phase="202")
+        checked = live_event(BASE + 10, label="UX review")
+        checked["activity_text"] = "CPU pane four states at width 19"
+        checked["activity_result"] = "2 defects"
+        events.append(checked)
+        events += pass_events(BASE + 69, BASE + 120, phase="202",
+                              activity="repairing phase 202 awaiting row")
+        self.assertEqual(load_one(events)["causes"]["live"], 1)
+
     def test_old_future_and_other_phase_checks_do_not_explain_a_round(self) -> None:
         for finished, instance in ((BASE + 9, "instance-a"), (BASE + 1_820, "instance-a"),
                                    (BASE + 1_800, "instance-b")):
