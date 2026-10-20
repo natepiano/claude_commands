@@ -847,104 +847,26 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 ### Phase 31 — a closed approved decision takes a new finding  · status: done
 
-**Depends on:** Phase 29
+#### As-built
 
-#### Work Order
-
-**Goal:** A later finding that joins a closed, approved style decision opens the decision again with its approval and is filed to it when each finding of the decision is built, waived or withdrawn. The close reason text does not decide this. A closed decision that still has a filed finding, or a closed decision with no answer and a hand-written close reason, refuses the finding with a line that names the cause.
-
-**Spec:**
-
-The showrunner ruled this current on 2026-10-20, after phase 29: it fixes a wrong result. On cargo-liner, finding 263940129a9533a0 (rule `dont-repeat-enum-domain-in-variant-names`, crate `crates/cargo-port`, blob dc6ab6df) belongs to P547 (`style dont-repeat-enum-domain-in-variant-names crates+cargo-port dc6ab6df.md`). P547 is approved. A person closed it by hand with the reason `built by names-unit phases 99, 100, 1000 and 1001; …`. `as_built` had no value. The ledger held 39 built and 6 withdrawn findings and no filed finding. `file` printed `skipped <P547>: closed decision is not built` at every run and exited 1. The showrunner since opened P547 by hand (it is now `status: open`, `stage: active`, `style_count: "40"`). The defect stays for the next hand close.
-
-Today (`scripts/style/style_proposals.py`):
-- `join_action(issue)` (:396-409) reads the frontmatter. A declined answer gives `WaiveWithAnswer`. For a closed decision it raises `LedgerError("closed decision is not built")` (:403-404) unless `reason` starts with one of `FINISHED_REASONS` (:365-368: `"built in "`, `"nothing left to build: "`) or `as_built` has a value. Then it calls `require_generated_body`, and returns `ReopenBuiltDecision()` for a closed decision, else `JoinOpenDecision()`.
-- Only `complete` (`close_finished_decision`, :574-608) and the withdrawal close (`plan_withdrawal`, :1205) write those reasons. `proposal.md` lets a person close with `close --reason <any text>`. So a hand close strands every later finding of an approved decision.
-- The two callers: `file_decision` (:425-435, `action = join_action(issue)` at :430) and `plan_moves` (:742; `join = join_action(issue)` at :805, the migrate and reopen move). `file_proposals` (:438) catches the `LedgerError` and prints `skip_line` (:482). `migrate` lets it reach `main`, which prints `style_proposals: <error>` and exits 1 (:1570-1572) before any write, because `plan_moves` runs before `run_moves`.
-
-1. **One "nothing left to build" test.** Add beside `issue_findings` (:69-72):
-   ```python
-   def left_to_build(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[style_ledger.HeldFinding, ...]:
-       """The findings that are not built or waived. issue_findings already leaves out the withdrawn ones."""
-       return tuple(finding for finding in findings
-                    if not isinstance(finding.state, (style_ledger.Built, style_ledger.Waived)))
-   ```
-   `close_finished_decision` (:587-588) uses it: `if not findings or left_to_build(findings): return False`. Its results do not change.
-
-2. **`join_action` reads the ledger.** New signature `join_action(ledger: style_ledger.Ledger, issue: Path) -> JoinAction`. Body:
-   ```python
-   fields = frontmatter(issue)
-   answer = decision_answer(Issue(issue, fields))
-   if isinstance(answer, DeclinedDecision):
-       return WaiveWithAnswer(answer.words)
-   closed = fields.get("status") == ["closed"]
-   if closed:
-       if not isinstance(answer, ApprovedDecision) and not fields.get("reason", [""])[0].startswith(FINISHED_REASONS):
-           raise style_ledger.LedgerError(f"{issue}: closed decision has no approval")
-       if left_to_build(issue_findings(ledger, issue)):
-           raise style_ledger.LedgerError(f"{issue}: closed decision has unbuilt findings")
-   try:
-       require_generated_body(issue)
-   except Refusal as error:
-       raise style_ledger.LedgerError(str(error)) from error
-   return ReopenBuiltDecision() if closed else JoinOpenDecision()
-   ```
-   - An approved closed decision takes the finding whatever its reason says, when the ledger has nothing left to build in it.
-   - The reason test stays only for a closed decision with no answer. The withdrawal close (:1205) closes an unanswered decision with `nothing left to build: withdrawn: …`. A later finding under the same rule, crate and blob has the same decision file, so without the reason test that finding could never be filed. An unanswered decision closed by hand with another reason is a person's close, so it refuses.
-   - The ledger test applies to every closed decision. A withdrawal close holds only withdrawn findings, so it passes.
-   - The `as_built` test goes (author's call): an approved decision with `as_built` passes the ledger test; an unanswered one with only `as_built` now refuses with `no approval`. No style path writes that state.
-   - The answer test comes first, so an unanswered decision with a filed finding names the missing approval.
-   - The error starts with `{issue}: `. `skip_line` (:482-483) removes that prefix, so `file` prints `skipped <decision>: closed decision has unbuilt findings` or `skipped <decision>: closed decision has no approval`. `migrate` prints `style_proposals: <decision>: closed decision has …` and exits 1 with no write.
-   - `require_generated_body` stays after these tests (phase 24: refused before any write; the dry run matches the real run).
-   - The refusal for a decision that is not finished stays a refusal, not a reopen. A decision with a filed finding was closed too early by hand; the person opens it with `proposal_issue.py reopen <decision>` (which keeps the approval and sets `stage: active` since phase 29), and the next `file` joins it as an open decision.
-
-3. **Callers.** `file_decision` (:430): `action = join_action(writer.ledger, issue)`. `plan_moves` (:805): `join = join_action(ledger, issue)`. Neither caller changes otherwise. `apply_answer` (:412-422) already runs `proposal_command("reopen", …)` for `ReopenBuiltDecision`, and `file_proposals` already refreshes every open decision after the moves (:470-479), so the count, examples and ranking of the reopened decision update in the same run.
-
-4. **Docstrings and comment.**
-   - :365 comment: `# The close reasons that complete and the withdrawal write. A closed decision with no answer takes a later finding only under one of them.`
-   - `ReopenBuiltDecision` (:384-386): `"""The decision is closed and nothing is left to build in it: each finding is built, waived or withdrawn. A finding that joins it opens it again with its answer."""`
-   - `join_action` (:397): `"""What the decision's answer does to findings that join it. Refuse a closed decision with a filed finding, or one with no answer that a person closed."""`
-
-5. **Docs.** Phase 29 edits both files and lands first; keep its edits. Phase 30 item 7 edits other sentences of both files; keep them too.
-   - `commands/showrunner/proposal.md` :97-98: replace the sentence "A decision closed with nothing left to build opens again with its approval for a later finding, as a decision closed as built does." with:
-     "A later finding opens a closed, approved decision again with its approval when each of its findings is built, waived or withdrawn, whatever its close reason says. `file` skips a closed decision that still has a filed finding (`closed decision has unbuilt findings`): open it with `proposal_issue.py reopen <issue>`, then file again. A closed decision with no answer takes a later finding only when its close reason starts with `built in ` or `nothing left to build: ` (else `closed decision has no approval`)."
-   - `docs/style_production.md` :499: after the sentence that ends "`waived <n> findings in <decision>: declined: <words>`." and before "A new rule blob needs a new answer.", add:
-     "An approved decision that is closed opens again with its approval for a later finding when each of its findings is built, waived or withdrawn. The ledger decides this, not the close reason, so a decision closed by hand opens again too. A closed decision with a filed finding refuses it: `file` prints `skipped <decision>: closed decision has unbuilt findings` and exits 1. Open that decision with `proposal_issue.py reopen <decision>` and file again. A closed decision with no answer takes a later finding only when its close reason starts with `built in ` or `nothing left to build: `; else `file` prints `skipped <decision>: closed decision has no approval`."
-   - `docs/style_production.md` :678-680: replace "a decision closed as built opens again with its approval. A decision closed with nothing left to build also opens again with its approval for a later finding." with:
-     "a closed decision opens again by the rule for a later finding that `file` files (above). A closed decision that refuses the finding stops the migration before any write, with `style_proposals: <decision>: <reason>`."
+- `join_action(ledger: style_ledger.Ledger, issue: Path) -> JoinAction` returns `ReopenBuiltDecision` for a closed approved decision with nothing left to build, whatever its close reason. Filing or migration reopens it with its approval, makes it active and files the later finding to it; filing refreshes its counts, examples and ranking in the same run.
+- `left_to_build(findings: tuple[style_ledger.HeldFinding, ...]) -> tuple[style_ledger.HeldFinding, ...]` keeps every state except `Built` and `Waived`. Its callers pass `issue_findings`, which excludes withdrawn findings. `join_action` and `close_finished_decision` share this test.
+- A closed decision with no answer reopens only when its reason starts with `built in ` or `nothing left to build: ` and nothing remains to build; it keeps no answer and stays in backlog. `as_built` alone does not qualify it. A declined decision returns `WaiveWithAnswer` before the closed-decision checks; an open decision returns `JoinOpenDecision` after body validation.
+- Closed-decision validation checks for a missing approval before unbuilt findings, then calls `require_generated_body`. Refusals are `closed decision has no approval` or `closed decision has unbuilt findings`; `file` prints `skipped <decision>: <reason>` and exits 1, while migration prints `style_proposals: <decision>: <reason>` and exits 1 before any write.
 
 **Files:**
-- `scripts/style/style_proposals.py` — `left_to_build`, `join_action(ledger, issue)`, its two callers, `close_finished_decision`, the :365 comment and two docstrings
-- `scripts/style/test_style_proposals.py` — the seven tests below
-- `docs/style_production.md` — the two edits of item 5
-- `commands/showrunner/proposal.md` — the :97-98 sentence of item 5
+- `scripts/style/style_proposals.py` — shared unfinished-findings test, ledger-aware join action and its filing, migration and completion callers
+- `scripts/style/test_style_proposals.py` — seven cases covering hand-closed approved decisions, built/waived findings, filing and migration refusals, and unanswered withdrawal closes
+- `docs/style_production.md` — reopening rules, refusal lines and migration behavior
+- `commands/showrunner/proposal.md` — closing, later findings and recovery from an early close
 
-**Workers:** `1 writer + 1 tester`. The change is one function, its helper and two call lines in one module, so the code does not split. The Spec gives exact lines and states, so the tests go to the tester.
-- `impl` — `scripts/style/style_proposals.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`; hub: `scripts/style/style_proposals.py` (it holds `join_action` and `left_to_build`, which the tests call through `file_proposals`, `migrate` and `main`).
-- `test` — `scripts/style/test_style_proposals.py`, from the Spec alone. Use `issue_command` (:142), `hold` (:150), `file` (:161), `legacy_issue` (:332), `migration_lines` (:401), `progress` (:710), `approved_decision` (:767), `built_before_the_check` (:804), `written` (:810), `newer_rule_text` (:2117), `newer_verdict` (:2122), `withdraw` (:2129), and the `main(["file", …])` pattern of `test_one_bad_decision_is_skipped_while_other_decisions_file` (:1380; hold inside `with self.ledger()`, call `main` after the block). Close by hand with `self.issue_command("close", str(issue), "--reason", "<text>")`. Each test name states the behavior:
-  1. `test_a_later_finding_reopens_an_approved_decision_closed_by_hand_with_every_finding_built`: `first = hold`; `approved_decision(ledger, first)`; `built_before_the_check(ledger, first)`; close with reason `built by names-unit phases 99 and 100`; `later = hold(line=2)`. `main(["file", …])` exits 0 and prints `filed {issue}`. The issue has `status: open`, `stage: active`, `unit: names-unit`, no `reason`, `style_count: "2"`, and `later` is `Filed(issue)`.
-  2. `test_a_later_finding_reopens_an_approved_decision_closed_by_hand_with_its_findings_built_or_waived`: two findings; the first built (`built_before_the_check`), the second waived (`ledger.decline_findings((second.finding_id,), "No")`); close with reason `done by hand`; a later finding at line 3 files to the decision, which is open and approved.
-  3. `test_migration_moves_findings_into_an_approved_decision_closed_by_hand_and_reopens_it`: the decision of test 1 closed by hand; `later = hold(line=2)` in `legacy_issue(ledger, "old", later)`. `migration_lines(ledger, dry_run=False)` holds `reopen {decision}`; the decision is open with `stage: active`; `later` is `Filed(decision)`; the old issue is closed.
-  4. `test_a_closed_approved_decision_with_a_filed_finding_refuses_a_later_finding`: two findings, only the first built; close with reason `built in names-unit-1` (a reason that `join_action` took before this phase). `main(["file", …])` exits 1; stdout holds `skipped {issue}: closed decision has unbuilt findings`; stderr is `style_proposals: skipped 1 decisions\n`; the issue bytes do not change; the later finding stays `Unfiled()`.
-  5. `test_a_closed_unanswered_decision_with_a_hand_reason_refuses_a_later_finding`: file one finding, no approval; close with reason `closed by hand`; a later finding gives exit 1 and `skipped {issue}: closed decision has no approval`; the issue bytes do not change.
-  6. `test_a_closed_unanswered_decision_whose_findings_were_withdrawn_reopens_with_no_answer_for_a_later_finding` (pins a limit; passes before and after): hold and file one finding; keep the rule text; `newer_verdict(ledger, newer_rule_text(), "exception")`; `withdraw(ledger)` closes the decision with a `nothing left to build: withdrawn: …` reason; write the kept rule text back to `self.catalog / "names.md"` so the live blob is the decision's blob again; `later = hold(line=2)`; `file(ledger) == (issue,)`; the issue is open, has no `unit`, keeps `stage: backlog`, and `later` is `Filed(issue)`.
-  7. `test_migration_refuses_a_closed_approved_decision_with_a_filed_finding_before_any_write`: the decision of test 4; `later` in `legacy_issue(ledger, "old", later)`; `written(ledger)` before; `main(["migrate", "--repo", …, "--proposals", …, "--parent", "parent"])` exits 1 with stderr `style_proposals: {decision}: closed decision has unbuilt findings\n`; `written(ledger)` after is the same.
+**Binds later work:** `file_decision` and `plan_moves` pass the ledger to `join_action`; completion uses the same `left_to_build` rule. A closed decision's frontmatter alone cannot establish that its findings are resolved.
 
-**Constraints from prior phases:**
-- Phase 29 lands first in the same worktree. `proposal_issue.reopen` (`scripts/production/proposal_issue.py:251-263`) removes `CLOSE_FIELDS` (`as_built`, `reason`, `date_closed`, :54) and sets `stage: active` for an `ApprovedDecision`, so `ReopenBuiltDecision` opens an approved decision in progress with no change to `proposal_issue.py`. Phase 29 edits the `proposal.md` state table, its Approve section and :75-76, `docs/style_production.md:485-486`, and adds tests and the helpers `progress` (:710), `approved_decision` (:767) and `merge_ticket` (:774) to `test_style_proposals.py`. Keep all of these.
-- Phase 30 runs in the same worktree in `scripts/style/style_ledger.py` and `test_style_ledger.py`. This phase writes neither. Phase 30's item 7 edits the declaration step bullets of `docs/style_production.md` and the "Filing first moves a finding …" sentence of `proposal.md` (:107-108); this phase edits other sentences only.
-- Phase 31 starts after phase 30's checkpoint, so its gate runs `scripts.style.test_style_ledger` against phase 30's committed state. Its checkpoint stages only its own four files.
-- `join_action` turns a missing generated body into a `LedgerError`, so `plan_moves` refuses before any write and the dry run matches the real run (phase 24).
-- Every `proposal_issue` write goes through `proposal_command`; the tests stub it in-process with `issue_command` (:142-148), so the reopen's stage and removed close fields show in the test issue files.
-- `close_finished_decision` writes `built in <tickets>`, `built in synced commit <c>`, `nothing left to build: <files> not in synced commit <c>` or `nothing left to build: every finding is waived` (phase 28). Those reasons and their order do not change.
-- The `UPDATE` in `unwaive_held` (`style_ledger.py`) clears `proposal`, so `issue_findings` holds no `Unfiled` finding in practice; `left_to_build` still counts every state other than `Built` and `Waived` as left.
-- `style_ledger.py` cannot import `style_proposals`; nothing here needs it.
+**Gotchas:**
+- Join errors start with `<decision>: `; `skip_line` strips that prefix for filing, while migration retains it. Generated-body validation follows the state checks, and migration refuses before writes in both dry and real runs.
+- A decision closed with a filed finding needs `proposal_issue.py reopen <decision>` before filing again; reopening preserves approval and sets an approved decision active.
 
-**Acceptance gate:** from the worktree root `<W>`:
-- Tests 1-5 and 7 each fail without this phase (1-3: today the hand reason gives `closed decision is not built`; 4 and 7: today `built in ` reopens the decision; 5: today the line reads `closed decision is not built`). Test 6 pins the kept reason test and passes before and after. All 7 are present and pass.
-- `env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_proposals scripts.style.test_style_plan scripts.style.test_style_ledger` is green.
-- `basedpyright scripts/style` reports `0 errors, 0 warnings`.
-- Observable behavior: none live. P547, the case that showed the defect, is already open by hand (`stage: active`, `style_count: "40"`), so the unit tests are the proof.
+**Ruled out:** automatically reopening a closed decision that still has a filed finding; it remains a refusal.
 
 ### Phase 32 — an old-text finding is withdrawn once judged again  · status: todo
 
