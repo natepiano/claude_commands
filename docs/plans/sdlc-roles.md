@@ -80,7 +80,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:** The tool follows Python output references in lexical scope only. It does not follow helper call arguments into parameters; the report header says so. It does not count shell `cat >&2 <<EOF` stderr heredocs. The term `change` also means menu actions in some files; `other_meaning_files` excludes those files.
 
-### Phase 2 — The design doc recommends who owns each duty and what each thing is called, split into steps  · status: todo
+### Phase 2 — The design doc recommends who owns each duty and what each thing is called, split into steps  · status: done
 **Depends on:** Phase 1
 
 #### Work Order

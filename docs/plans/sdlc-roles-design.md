@@ -1,8 +1,8 @@
 # Duties and names in the development process
 
-> **Status: DESIGN — phase 1 map and baseline.** Recommendations await the user's answer. The two approved reporting wording fixes are the only live contract changes in this phase.
+> **Status: DESIGN — phase 2 proposals.** Questions Q1–Q8 remain open. This phase changes no live duty or name. Phase 1 made only the two approved reporting wording fixes.
 
-Scope: `docs/plans/sdlc-roles.md`, Decisions and Phase 1. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
+Scope: `docs/plans/sdlc-roles.md`, Decisions and Phases 1–2. Duties and names belong here. Structure belongs to hierarchies-unit; designer and reviewer contracts belong to guilds-unit; phase steps and the document pipeline belong to phases-unit; repair rules belong to fix-rounds-unit. This document refers to their work and does not replace it.
 
 ## Sources
 
@@ -15,7 +15,7 @@ Paths without a prefix are relative to this checkout. These short references kee
 | UD | `commands/unit/direct.md` |
 | Format | `docs/delegate_plan_format.md` |
 | Decisions | `~/.claude/docs/decision_criteria.md` |
-| Hierarchy | `/home/natepiano/worktrees/claude-build-followups-hierarchies/docs/plans/build-followups-hierarchies-design.md`, Map → Roles |
+| Hierarchy | `d0b07aec:docs/plans/build-followups-hierarchies-design.md` in `/home/natepiano/worktrees/claude-build-followups-hierarchies`, Map → Roles |
 | SDLC | `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/sdlc-production.md` |
 | Guilds | `/home/natepiano/worktrees/claude-build-followups-sdlc-guilds/docs/plans/sdlc-guilds.md` |
 | Phases | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases/docs/plans/sdlc-phases.md` |
@@ -23,7 +23,7 @@ Paths without a prefix are relative to this checkout. These short references kee
 | nixos memory | `~/.claude/projects/-etc-nixos/memory/` |
 | hana memory | `~/.claude/projects/-home-natepiano-rust-hana/memory/` |
 
-Read on 2026-10-20 on natedev. The requested `git show HEAD:docs/plans/build-followups-hierarchies-design.md` failed because the file was not in HEAD. The Hierarchy reference is its on-disk draft, read without changes. The role names below use its row names. The Map stays in that document.
+Read on 2026-10-20 on natedev. Phase 1 used the on-disk Hierarchy draft because the file was absent from HEAD. Phase 2 uses the committed Map at `d0b07aec`, also merged to main through `83a0ad28`. Its role rows supply the names below; the Map stays in that document. Planned per-design roles D51–D52 come from Guilds, not from the Map.
 
 Repair source check, 2026-10-20: Guilds HEAD is `95eb9cda042cead9f09dcdab29025f314f22d83f` (`plan(sdlc-guilds): phase 2 runs beside phase 1 (showrunner approval)`). Its committed Phase 2 Spec and Roles text match the working plan read here. That plan defines the planned per-design roles in D51–D52; it leaves their full contracts and names to guilds-unit and the user.
 
@@ -49,16 +49,16 @@ Repair source check, 2026-10-20: Guilds HEAD is `95eb9cda042cead9f09dcdab29025f3
 | D14 | Run the main phase review, including style | Unit director | Codex worker and Pooled reviewer supply separate read-only reviews; a standalone style review stays with its invoking session | duplicate | `docs/delegate/dual_review.md`, `<DualReview>` item 4; `docs/delegate/phase_checks.md`, `<PhaseChecks>`; `commands/unit/style_review.md`, opening and `<StyleReview>` |
 | D15 | Review code in a production with a review pool | Pooled reviewer | Codex worker is the explicit fallback if the pool cannot prime | duplicate | PF, Words → Reviewer and `<ProductionUnit>` item 16; UD, `<LongLivedWorkers>` |
 | D16 | Hold and supply the standing review prompt | Review template | None; pool scripts allocate leases and never lease the template | one owner | PF, Words → Template, Review pool and Lease |
-| D17 | Bring a user-only decision or action to the user | Top-level showrunner | Child showrunner sends an item through its parent and keeps its own item; Unit director supplies the need | duplicate | SR, opening, `<Throughout>` → Nested showrunners, What reaches the user and Open questions; hana memory `unit-asks-go-through-the-showrunner.md`, body and How to apply; PF, `<ProductionUnit>` item 2 |
+| D17 | Bring a user-only decision or action to the user | Top-level showrunner | Child showrunner asks in its own reply, keeps its own open item and also sends the item directly to its root; a question between productions goes to its parent; Unit director supplies the need to its showrunner | duplicate | SR, opening, `<Throughout>` → Nested showrunners, What reaches the user and Open questions; Hierarchy at `d0b07aec`, Map → Roles → Child showrunner and Channels → Open question; hana memory `unit-asks-go-through-the-showrunner.md`, body and How to apply; PF, `<ProductionUnit>` item 2 |
 | D18 | Relay the user's words to a unit | Top-level showrunner | Child showrunner relays to its own units; Unit director alone relays user words to its workers | duplicate | SR, `<Throughout>` → The user's words for a unit director and Nested showrunners; `docs/delegate/write_prompt_contract.md`, `<WritePromptContract>` item 4 and `<PhaseMesh>` |
 | D19 | Measure and record a unit phase ETA | Unit director | Top-level showrunner requests a missing ETA and reports the result | duplicate | PF, `<ProductionUnit>` items 3 and 11; `commands/unit/eta.md`, Steps and Answer; SR, `<Throughout>` → Unmeasured ETAs |
-| D20 | Give production dailies; choose the default report schedule | Top-level showrunner | Child showrunner reports its own production; Producer writes a conflicting default | conflict | PF, Production Context → Updates; SR, `<StartUpdates>` says both 15 minutes when absent and on demand when absent; `commands/producer/to_production.md`, `<WriteProductionDoc>` → Updates still says every 15 minutes |
+| D20 | Give production dailies; choose the default report schedule | Top-level showrunner | Child showrunner reports its own production; Producer writes a conflicting default | conflict | PF, Production Context → Updates; SR, `<StartUpdates>` `:393–394` says 15 minutes when absent; `commands/producer/to_production.md:118` still says every 15 minutes; PF `:100–103` and SR `:412–418` already give the on-demand behavior |
 | D21 | Retire a unit and its resources | Top-level showrunner | Child showrunner for its own unit; ending a director run does not retire the unit | duplicate | PF, Units → To retire a unit; `commands/showrunner/retire_unit.md`, opening and numbered resource list |
 | D22 | Move a unit director to an account after checking active worker runs | Top-level showrunner | Child showrunner can invoke the move; natedev holds the role map for both machines | conflict | SR, `<PauseForMove>`; `commands/showrunner/move.md`, opening and idle/busy move rules; `commands/showrunner/accounts.md`, natedev role-map rule; config memory `ask-director-before-moving-unit.md`, body requires an answer before moving even an idle director |
-| D23 | Rename a unit; decide when it can stop | Top-level showrunner | Executive producer approves the name change during this redesign; a Unit director cannot rename itself | conflict | PF, Units → To rename a unit says between phases; `commands/showrunner/rename_unit.md`, opening and step 1 allow mid-phase and immediate stop; `commands/unit/rename.md`, opening forwards to the showrunner; SDLC, Production rules |
+| D23 | Rename a unit; decide when it can stop | Top-level showrunner | Executive producer approves the name change during this redesign; a Unit director cannot rename itself | conflict | PF, Units → To rename a unit says between phases; `docs/as-built/unit-rename.md:53` records the user's any-time rule (2026-10-18); `scripts/production/rename_unit.py:77` records stop-at-once (2026-10-20); `commands/showrunner/rename_unit.md`, step 1 implements it; `commands/unit/rename.md` forwards to the showrunner |
 | D24 | Place and release a timing build hold | Top-level showrunner | Unit director requests the hold and release; Codex worker and Small-fix helper never place it | duplicate | `commands/build/hold.md`, steps 1 and 4; hana memory `build-holds.md`, Frame-time asks build stop before timing and Seats never place build holds; SR, `<Throughout>` → The showrunner decides |
 | D25 | Send an actionable phone push for a unit blocked on the user | Top-level showrunner | Child showrunner for its production; a machine session pushes only its own blocks | one owner | SR, `<Notify>` → Units tell you, and you push; SR, `<Dependencies>` rule 6 |
-| D26 | Call an early landing; apply the automatic hard landing | Top-level showrunner for the early call | Unit director applies the hard landing from the third repair round without a call | duplicate | SR, `<LandingCall>`; PF, `<ProductionUnit>` item 7; fix-rounds-unit owns changes to these repair rules |
+| D26 | Call an early landing; apply the automatic hard landing | Top-level showrunner for the early landing call; Unit director when another unit waits on the phase | Unit director also applies the landing rule after the second repair round and the hard landing from the third repair round without a call | duplicate | SR, `<LandingCall>`; PF, `<ProductionUnit>` item 7; fix-rounds-unit source check, 2026-10-20; fix-rounds-unit owns changes to these repair rules |
 | D27 | Review remaining Work Orders, then shrink the completed phase | Unit director | Codex worker supplies an architect review only when a listed trigger fires | duplicate | UD, `<RunPhaseReview>`; `docs/delegate/run_phase_review.md`, `<RunPhaseReview>` and `<RunPhaseShrink>`; `docs/delegate/phase_end.md`, `<PhaseEnd>` items 3 and 7 |
 | D28 | Close the run with as-built documentation | Unit director | None; its scope choice is not a product scope change | duplicate | SR, `<Throughout>` → As-built close-out; UD, `<RunAsBuilt>`; `docs/delegate/final_gate_commit.md`, `<RunAsBuilt>`; `commands/plan/to_as_built.md`, Purpose |
 | D29 | Write a small unowned fix in the showrunner checkout | Small-fix helper | Top-level showrunner dispatches, commits, pushes and promotes; existing unit work stays with its unit | one owner | nixos memory `small-fixes-by-subagent-in-main.md`, body and How to apply; PF, Words → Showrunner writes no implementation code |
@@ -85,6 +85,9 @@ Repair source check, 2026-10-20: Guilds HEAD is `95eb9cda042cead9f09dcdab29025f3
 | D50 | Start the repository's standing style production | Top-level showrunner | Child showrunner can be its parent under the current contract; structure changes go to hierarchies-unit and the user | one owner | `commands/showrunner/add_style.md`, opening; SDLC, Production rules and Scope of each unit |
 | D51 | Write and revise a design in the same Codex thread; answer each review finding with a change or a reason to disagree | Astra designer, planned per-design role (`astra-designer`) | Unit director or showrunner holds and briefs the role; the holder passes reviews and judges the result, rather than writing the design; Chief designer, planned is the separate guild head in D30 | one owner | Guilds, Source → 2026-10-20 16:19 EDT; Phase 2 → Spec first bullet and Roles (working-plan lines 137 and 140; committed version above) |
 | D52 | Review a design and return findings for the designer to answer | Astra reviewer, planned per-design role (`astra-reviewer`) | Unit director or showrunner holds the role and passes its review to the designer; the unit director rules on disagreements in the Phase 2 design; Chief reviewer, planned is the separate guild head in D31; Pooled reviewer in D15 reviews code under the pool contract | one owner | Guilds, Source → 2026-10-20 16:19 EDT (optional separate reviewer, at most one per design); Phase 2 → Spec first bullet, Roles and Workers (working-plan lines 137, 140 and 152; committed version above) |
+| D53 | A fix that fails twice: find the cause, record it in the attempts log, then dispatch one pass with a new approach | Unit director | Codex worker carries out the new pass; no third pass repeats the failed approach | one owner | PF, `<ProductionUnit>` item 7 → A fix that fails twice; fix-rounds-unit source check, 2026-10-20 |
+| D54 | One batch per check: check every changed view after a fix and send all findings to the next round together | Unit director | Codex worker receives the full batch for its file set; the design checker supplies its findings | duplicate | PF, `<ProductionUnit>` item 7 → One batch per check; UD, `<UXReview>` and `<FixDispatch>`; fix-rounds-unit source check, 2026-10-20 |
+| D55 | Own change only: send a defect from before the phase to the showrunner for routing | Unit director | Top-level showrunner, or Child showrunner for its production, routes the defect to the owning unit; the phase does not take it into its repair round | one owner | PF, `<ProductionUnit>` item 7 → Its own change only; fix-rounds-unit source check, 2026-10-20 |
 
 Two helpers select recipients, not the actor's role: `commands/showrunner/announce.md` sends the user's words to showrunners, and `commands/unit/announce.md` sends them to unit directors. Their bodies require the invoking session to pass the user's words unchanged. Neither helper gives a worker or director new decision authority. `commands/unit/delegate.md` forwards to `/unit:direct`; `commands/unit/ci.md`, `<PeriodicCI>`, explicitly skips production units because D06 belongs to the showrunner.
 
@@ -106,9 +109,9 @@ The machine-readable inventory is `scripts/production/role_terms.toml`. The tabl
 | review pool | record | Reusable reviewers allocated by script; PF, Words | — | review pool |
 | reviewer | role | Read-only Codex thread in the pool; PF, Words | pooled reviewer: Hierarchy, Map → Roles; Astra reviewer is a distinct planned role: Guilds, Phase 2 → Roles | pooled reviewer in shared prose; ask about the distinct design role |
 | template | record | Thread with standing review instructions; never leased; PF, Words | review template: Hierarchy, Map → Roles | review template in shared prose |
-| lease | record | A reviewer's assignment to a unit phase; PF, Words | — | review lease in shared prose |
+| lease | record | Lasting reviewer assignment to one unit, distinct from ownership of one active review; `scripts/direct/review_pool.py:32`, `UnitLease`, and `:676`, `command_end_lease` (no-op). PF, Words still describes a phase lease and needs correction against this code. | review lease is a proposed qualifier, not a phase lifecycle | review lease in shared prose (proposed); define its lasting unit lifetime |
 | merge branch | record | Branch that receives unit checkpoints; PF, Words | trunk: PF, Words, retained as cargo-berth's term; SR, `<Dependencies>` also records a former unit named trunk | merge branch, or the actual branch name where needed |
-| gate | step | Dependency that blocks a phase until another checkpoint merges; PF, Words | verification gate is a different use: UD, `<FinalGate>`; checks: `docs/delegate/phase_checks.md`, `<PhaseChecks>` | dependency gate for coordination; verification gate for checks; ask before changing |
+| gate | step | Dependency that blocks a phase until another checkpoint merges; PF, Words | Verification check: UD, `<FinalGate>` and `docs/delegate/phase_checks.md`, `<PhaseChecks>`; required user interaction: UD, `<TurnEndGate>` (`:200`), including authorization and phase approval | dependency gate, verification gate and user gate for the distinct meanings; ask before changing; keep `gate:` status syntax |
 | parent showrunner | role | Showrunner that receives another production's reports; PF, Words | parent: SR, `<Throughout>` → Nested showrunners | parent showrunner when the hierarchy is relevant |
 | child showrunner | role | Showrunner with its own production that reports to a parent; PF, Words | lower showrunner: `commands/showrunner/add_showrunner.md`, opening | child showrunner |
 | root showrunner | role | Top of an attached production tree; PF, Words | root: SR, `<Throughout>` → Nested showrunners; top-level showrunner: Hierarchy, Map → Roles | root showrunner for a tree; top-level showrunner for a peer without a parent |
@@ -133,7 +136,7 @@ The machine-readable inventory is `scripts/production/role_terms.toml`. The tabl
 | ETA | record | Measured expected finish time with its basis; `commands/unit/eta.md`, Steps and Answer | phase ETA: same file; next-phase ETA: PF, `<ProductionUnit>` item 3, has a different target | ETA with the unit, target and time zone |
 | /unit:direct | step | Command that runs a unit plan and dispatches workers; UD, opening | /unit:delegate: `commands/unit/delegate.md`, description and `commands/showrunner/promote_showrunner.md`, Checks | /unit:direct; keep compatibility paths separate |
 
-The examples above describe meanings; some related names identify distinct stages or roles and are not counted as aliases. The index below lists every matching file for each other name in the term inventory, using the audit's path and string filters. The Baseline gives the complete live file set and file counts. Guild-head names and per-design role IDs are planned names, not approved replacements.
+The examples above describe meanings; some related names identify distinct stages or roles and are not counted as aliases. The index below lists every matching file for each other name in the term inventory, using the audit's path and string filters. The index was checked against `phases/2/measure_facts.md`, Other names, from the checker run on 2026-10-20. Combined counts include Python and shell lower bounds; they are observed matches, not eligible rename totals. The Baseline gives the complete live file set and file counts. Guild-head names and per-design role IDs are planned names, not approved replacements.
 
 <details>
 <summary>Other-name file index (n=546 live files; paths and script strings use the audit filters)</summary>
@@ -178,7 +181,6 @@ The examples above describe meanings; some related names identify distinct stage
 | reservation | phase reservation | 15 | 3 | `commands/unit/direct.md`; `docs/delegate/final_gate_commit.md`; `scripts/direct/phase_reservation.py` |
 | reservation | delegated phase reservation | 0 | 0 | none |
 | ETA | phase ETA | 8 | 4 | `commands/showrunner/dailies.md`; `commands/showrunner/produce.md`; `commands/unit/eta.md`; `commands/unit/eta_breakdown.md` |
-
 </details>
 
 ## Baseline
@@ -532,7 +534,7 @@ Each line is `measured` for a directly checked source or script result, or `repo
 - F01 — measured: PF, Words and SR, description said reports come on a schedule, while PF, Production Context → Updates and SR, `<StartUpdates>` default to on demand; Phase 1 fixes only those two sentences, as approved in `docs/plans/sdlc-roles.md`, Phase 1 → Wording fix.
 - F02 — measured: D20 remains open because `commands/producer/to_production.md`, `<WriteProductionDoc>` → Updates writes every 15 minutes, and SR, `<StartUpdates>` opens with 15 minutes when absent but later says on demand when absent; PF and SDLC, Production Context → Updates say on demand; these lines are outside the approved wording fix.
 - F03 — measured: D22 has two restart checks: `commands/showrunner/move.md`, idle/busy move rules let an idle member stop without a pause, while config memory `ask-director-before-moving-unit.md`, body requires the director's answer because idle does not prove no worker run.
-- F04 — measured: D23 has two rename timings: PF, Units → To rename a unit says between phases; `commands/showrunner/rename_unit.md`, opening and step 1 allow an immediate mid-phase stop.
+- F04 — measured: PF, Units → To rename a unit says between phases, contrary to the user's any-time rule in `docs/as-built/unit-rename.md:53` (2026-10-18) and stop-at-once rule at `scripts/production/rename_unit.py:77` (2026-10-20). Correcting PF preserves current behavior; requiring a phase boundary would change policy.
 - F05 — measured: D32 has no final shared-tip owner or distribution contract; Guilds, Phase 2 → Guilds requires that design, and SDLC, Scope of each unit assigns its design to guilds-unit.
 - F06 — reported: routine peer relays and unit updates repeatedly reached the user; nixos memory `relay-directly-not-via-user.md`, recurrence notes through 2026-10-16; SR, `<Throughout>` → What reaches the user now limits those messages.
 - F07 — reported: a unit asked the user for `github-warmup` instead of sending the need to its showrunner; hana memory `unit-asks-go-through-the-showrunner.md`, Why, 2026-10-18; this is the prior event behind D17.
@@ -542,7 +544,7 @@ Each line is `measured` for a directly checked source or script result, or `repo
 - F11 — reported: bare phase numbers did not identify another unit's work to the user; config memory `name-work-not-phase-numbers.md`, Why, user 2026-10-06; `commands/showrunner/dailies.md`, work-naming rules require the change in words.
 - F12 — reported: a small fix took about 25 minutes through a unit and repeated merge checks; nixos memory `small-fixes-by-subagent-in-main.md`, Why, user 2026-10-08; its file-count limit and checkout interpretation are the memory author's interpretation, not a user-set threshold.
 - F13 — measured: `docs/delegate_plan_format.md`, introduction calls the unit director an orchestrator; UD, opening uses delegate for the writer and `<WorkerRuns>` uses seat; PF, Words calls that writer Worker. These names do not identify one role consistently.
-- F14 — measured: PF, Words → Gate means a dependency between units; UD, `<FinalGate>` and `docs/delegate/phase_checks.md`, `<PhaseChecks>` use gate or checks for verification. One word has two current uses.
+- F14 — measured: PF, Words → Gate means a dependency between units; UD, `<FinalGate>` and `docs/delegate/phase_checks.md`, `<PhaseChecks>` use gate or checks for verification. UD, `<TurnEndGate>` also uses gate for a required user interaction. These are distinct meanings.
 - F15 — measured: Guilds, Phase 2 → Names requires the two uses of `astra-designer` and `astra-reviewer` to be named apart; SDLC, Guild heads uses those IDs for top-level heads, while Guilds, Phase 1 uses them for held per-design threads. cargo-liner owns the final head-name choice with the user.
 - F16 — measured: `commands/unit/add_ons.md`, `<ConsiderNextItems>` calls follow-up candidates proposals, while `commands/showrunner/proposal.md`, File requires a proposal issue; `commands/change_review.md`, add tracks an implemented change separately. Add-on, proposal and change identify different stages but overlap in prose.
 - F17 — measured: `commands/unit/delegate.md`, description keeps the old `/unit:delegate` command; `commands/showrunner/promote_showrunner.md`, step 1 still uses it. `docs/delegate/` paths and state keys are compatibility names, not proof of a live role called delegate.
@@ -554,7 +556,7 @@ These are proposed questions for the showrunner to present. They do not ask for 
 
 Q1. For D32, should each guild head own its guild's shared tips and distribution, or should the sdlc showrunner own both; recommend each guild head, with the final route designed by guilds-unit?
 
-Q2. Should `gate` name only a dependency between units, with `verification gate` for a check, or should both keep `gate`; recommend the two distinct terms (F14)?
+Q2. Should shared prose use `dependency gate` for an inter-unit wait, `verification gate` for a check, and `user gate` for a required authorization or phase approval, or keep `gate` with local definitions; recommend the scoped terms (F14; UD, `<TurnEndGate>`)? Keep the `gate:` status syntax unless a separate compatibility change is approved.
 
 Q3. Should `reviewer` alone mean a pooled code reviewer (D15), with `Astra reviewer` for the planned per-design reviewer (D52), or should both keep the same name; recommend explicit `pooled reviewer` and `Astra reviewer` in shared prose, with guilds-unit defining the full design-review contract (PF, Words → Reviewer; Guilds, Phase 2 → Roles)?
 
@@ -568,6 +570,357 @@ Q7. Should `worker` name a unit-dispatched thread and `small-fix helper` name a 
 
 Q8. Should `as-built record` name the phase facts and `as-built doc` name the feature overview, or should both use `as-built` alone; recommend the two explicit names (F18)?
 
+Q9. Should a showrunner keep renaming an approved unit at any time, stopping it and its workers at once, or wait for a phase boundary; recommend the current any-time rule? Waiting may reduce interrupted work but delays an authorized rename and changes the user's rule. This new policy alternative has not been answered.
+
+## Candidates
+
+These are alternatives for the user, not new instructions. Q1–Q8 went to the showrunner on 2026-10-20 at 17:50 EDT. No answer has arrived. Each candidate needs approval before it changes a live duty, name or process. A Q reference below marks an additional open dependency, not an assumed answer.
+
+All alternatives keep sdlc, the chief designer and the chief reviewer as top-level peers. None adds a parent, promotes a session or changes a reporting edge. A proposed edge change goes to hierarchies-unit through the showrunner. Guilds-unit designs guild contracts; cargo-liner settles head names with the user. Phases-unit owns phase steps and the document pipeline. Fix-rounds-unit owns repair rules, including D26 and D53–D55. A role's shorter name does not change its authority.
+
+The three gods apply after correctness: Simple, Fast, Beautiful. The specific user rule for this redesign requires questions for duty and name changes. DecisionEconomy still lets the director package approved work, choose ordinary implementation details and record those calls without another user question. These proposals add no report timer, peer relay through the user, or measurement traffic.
+
+### Where duties are written
+
+- **P-A — Owner commands.** State each duty once in its owner's command and tag. Other commands and PF link to that tag. PF Words gives a short role description and links to its duties; it does not repeat the operating rules. A shared repair rule stays in the file fix-rounds-unit chooses; the director command links to it. Keep each current owner in the duplicate rows listed below. Ask separately before resolving a conflict or assigning D32. This keeps a worker's operating rule near the command it follows.
+- **P-B — Central duty register.** Put the full duty text, owner and stable duty ID in PF. Commands link to the register instead of restating it. Keep the same owners and the same unresolved choices as P-A. This gives a reader one duty table, but a command needs another document to explain its work. It also makes PF a shared edit point for unrelated duties.
+
+Both candidates cover the duplicate rows D01–D06, D08–D15, D17–D19, D21, D24, D26–D28, D33–D34, D37–D40, D42, D48 and D54. They do not transfer work between those roles. The command source in each row is P-A's proposed home; PF is P-B's home. For D01 and D09, Decisions and the user's production rule remain the authority: link to them instead of rewriting the user's policy. For D26 and D54, submit the proposed links to fix-rounds-unit and phases-unit. For D15, guilds-unit must confirm the distinction from D52. D20, D22, D23 and D32 use the ownership alternatives below.
+
+### Who owns the conflicting or ownerless work
+
+| Candidate | Proposed owner and behavior | Alternative and open decision |
+| --- | --- | --- |
+| O20-A | Top-level showrunner owns runtime report policy. Producer writes `on demand` as the default. Only a user request starts a timer. Correct SR `:393–394` and `commands/producer/to_production.md:118` against PF `:100–103`; keep SR `:412–418`'s timer setup/stop behavior. | Preferred for D20. The user approves the source correction; it does not authorize a schedule. |
+| O20-B | Producer owns a required Updates declaration when it creates a production. Showrunner reads that declaration and reports on demand if it is missing. It starts a timer only after a user request. | Same user rule; more required authoring. D20 remains split between setup and runtime roles, with their separate actions stated. |
+| O22-A | Top-level showrunner executes an authorized account move after the Unit director confirms that no worker run is in progress. natedev keeps the shared role-account map. | Preferred for D22; align move instructions with the director-readiness rule. No new permission question for an already authorized move. |
+| O22-B | Unit director confirms that no worker run is in progress and invokes the approved move helper for its own run. The showrunner supplies the queued destination; natedev still owns the shared map. | Transfers execution to the director. Needs an explicit user answer and a checked resume path. It does not grant a director power to choose an account outside the authorized queue. |
+| O23-A | Top-level showrunner executes the approved rename at any time, mid-phase too, stopping the unit and its Codex workers at once. Correct PF's between-phases wording to match the user rule and helper. | Recommended for D23. Preserve the executor, thread identity and any-time behavior. Approval of a particular new name stays separate. |
+| O23-B | Top-level showrunner executes the approved rename only after a phase boundary. The director reports that boundary. | Q9 policy-change alternative, not a source correction. It may reduce interrupted work; it costs a delay and reverses the current any-time rule unless the user changes that rule. Out under the current rule. |
+| O32-A | Each guild head owns its guild's shared tips and distribution. Members send observations to the head under the route guilds-unit defines. | Preferred for D32; depends on Q1 and guilds-unit's contract. The heads remain top-level peers. |
+| O32-B | sdlc supplies a shared-document editor for both guilds. Each head approves and distributes its own guild's advice. | Q1 alternative: sdlc owns editing, not authority over a head. Guilds-unit must define the edit and distribution duties separately. |
+
+O20–O23 are new source-resolution proposals; no Q1–Q8 answer silently approves them. O32 describes planned work. Neither alternative claims the heads are running. Q9 is the explicit question for O23-B; O23-A preserves the current rule. The new repair rows already have owners, so they need no new assignment proposal. P-A or P-B may remove repeated duty wording; changes to their rules go to fix-rounds-unit.
+
+### How names keep one meaning
+
+- **T-A — Term data is the definition source.** Add a short definition and a stable term ID to `role_terms.toml`. Point `defined_in` at that entry; keep original sources in a separate provenance field. Propose `roles_audit.py render-terms --root .` to render PF Words between fixed markers in stable term-ID order, with fixed newlines and no timestamps. Propose `roles_audit.py check-terms-view --root .` to compare that output without writing and fail on a stale view. Run the comparison in a fixture-backed test discovered by `merge_gate --tests-only`. These commands are new code, not available commands today. Replace competing definitions with links to the rendered table. The same source defines roles, documents, steps and records. A term ID names its meaning; it is not a session name or a transport key. Owner commands still state duties under P-A. Do not remove a second meaning merely to make a count smaller: Q2 and Q5 must first settle the distinct gate and Astra meanings.
+- **T-B — PF is the definition source.** Expand PF Words to cover all term kinds. Propose deterministic `roles_audit.py compile-terms --root .` to generate `role_terms.toml` from that section and `roles_audit.py check-terms-data --root .` to reject a stale generated copy in the same test lane. These are new commands; both T choices pay for a generator, validation and a stale-copy test. Commands link to PF for a definition and keep their operating instructions. This is a near-tie with T-A: readable prose is the source, with a Markdown parser instead of TOML parsing and view rendering.
+- **N-A — Use scoped names.** Adopt the proposed meanings in the table below, after the relevant answer. Retire an old name only in uses that mean the same thing. Keep identifiers, paths, recorded history and other meanings explicitly separate. Read each match before changing it. Each new name states the role, stage or record it means, as required by the Type Design Contract.
+- **N-B — Keep declared synonyms.** Keep the present allowed aliases. Use full role or record names at a shared-file boundary and link to the term definition. Qualify `gate`, `reviewer`, `proposal` and `as-built` where they have distinct meanings. This avoids broad replacements, but leaves more names for a reader to learn. It depends on the same open Q answers where a meaning changes.
+- **R-seat — Retire worker `seat`.** Use `worker`; use `Codex worker` only when the agent family matters. Replace `Codex seat` before the shorter phrase so it does not become an accidental name. Keep transport addresses, state keys, file paths and slot identities. Depends on Q7. N-B keeps these prose aliases instead.
+- **R-trunk — Retire role prose `trunk`.** Use `merge branch` for the role of the branch, and the actual branch name for a specific ref. Keep cargo-berth's own term and historical unit names when those are the intended meanings. Those are explicit exceptions, not a global substitution. Needs a new user answer; N-B retains the alias.
+- **R-command — Retire `/unit:delegate`.** Change command examples and live callers to `/unit:direct`. Only after a compatibility review, remove the forwarding command and update command discovery. Keep `docs/delegate/` paths and script/config identifiers. Needs a separate user answer on removal of the callable alias; Q7 alone is insufficient. N-B keeps the forwarding command and documents its preferred spelling.
+- **G-A — Check approved retired uses.** Add a source-only, plural-aware `roles_audit.py check`, called by a test in `scripts/production/test_roles_audit.py` that `merge_gate --tests-only` discovers. Each unit's own gate then fails before the showrunner's merge. Per-file kept-use contexts are new code: today's `without_paths` masks kept strings globally. New entries must name a file, exact context and reason; fixtures must reject a leaked exception in another file or changed context. The check reports each offending path and line and returns failure. It reads no message log and sends nothing. Fixtures cover singulars, plurals, paths, protocol fields, history, unrelated meanings and kept-context drift. Ship it with the first approved retirement. Time the source-only check and review its false failures before the user question goes out; full-baseline time is not its cost.
+- **G-B — Report and review only.** Keep the baseline command and have the checkpoint review compare it with the approved target. Add no merge-gate failure. This has less code and no new gate time, but a retired name can return between reviews. It is the enforcement runner-up.
+
+T-A and T-B need a user answer on the definition home. Neither starts a new documentation hierarchy. P, T, N and G are independent choices. Scoped names can use either definition source and either check policy; owner commands can link to either definition home. Mixed choices are valid. N-A and N-B cover every other name in the term table, including an allowed name with no current hit. The choices below are proposed meanings, not replacements already made.
+
+| Defined term and other names | N-A treatment; N-B alternative where it differs | Approval dependency |
+| --- | --- | --- |
+| executive producer: user | Use executive producer when naming the process role. Keep user for the person and for product users. Do not retire user globally. | New role-label approval |
+| showrunner and unit director: orchestrator | Name the actual role in production/phase instructions. For a standalone command, say invoking session without assigning a new role. N-B keeps the broad coordinator word. | Q6; phases-unit for phase text |
+| worker: seat, Codex seat, delegate, Codex worker | R-seat changes only the seat names. Review delegate separately from command names and paths. Keep Codex as a family qualifier, not a second duty. N-B retains the aliases. | Q7; R-command is separate |
+| reviewer: pooled reviewer | Use pooled reviewer for D15 and Astra reviewer for D52 in shared prose. They remain different roles. | Q3; guilds-unit |
+| gate: dependency, verification and required user interaction | Use dependency gate, verification gate and user gate in shared prose; N-B keeps gate with a local definition. Preserve the `gate:` status syntax. | Q2; separate compatibility answer for syntax |
+| template: review template; lease: review lease | Use the qualified names in shared prose. They are records with different lifetimes: a template is never leased; the current lease assigns a reviewer to a unit for good, while an active review has separate ownership. Correct PF's phase-only description before choosing a name. N-B keeps the shorter local names with a definition link. | New name approval |
+| merge branch: trunk | Apply R-trunk; keep actual refs and cargo-berth terminology. | New name approval |
+| parent showrunner: parent; child showrunner: lower showrunner | Use full role names when reporting an existing edge. Parent of a file or process keeps its own meaning. N-B keeps the short edge labels. | New name approval; any edge change goes to hierarchies-unit |
+| root showrunner: root, top-level showrunner | Root names the head of an attached tree. Top-level showrunner names a peer without a parent. Do not merge those meanings or replace filesystem root. | New meaning approval; hierarchies-unit |
+| production doc: production document | Use production doc for that file. N-B permits the longer spelling. | New name approval |
+| unit plan: delegate-ready plan | Use unit plan for a production unit, and phased plan for the general format. Do not rename a standalone plan to a unit plan. | New name approval; phases-unit |
+| as-built: as-built overview, as-built doc | Use as-built doc for the feature overview and as-built record for phase facts. N-B permits the short name only when the scope is explicit. | Q8; phases-unit |
+| add-on: next item; proposal: candidate, add proposal | Add-on is unfiled follow-up work; proposal is a filed issue; candidate is still a general option in unrelated work. Next item may describe queue order without naming a new record. | Q4; phases-unit for document stages |
+| change: change-review row | Change names the implemented result; change-review row names its record. Keep menu action change as a different verb. | Q4 for stage distinction; new record-label approval |
+| dailies: scheduled update | Dailies names the report. Scheduled names a user-requested trigger, not the default. N-B keeps the phrase only with that trigger stated. | O20; new name approval |
+| checkpoint: code commit, code ready notice, code checkpoint | Name checkpoint commit and checkpoint notice separately where both matter. Code checkpoint may qualify the checkpoint before shrink. N-B keeps the existing labels with links. | New name approval; phases-unit owns steps |
+| phase review: plan review | Use phase review for the review of remaining Work Orders. Keep a general plan review distinct when no phase is involved. | New name approval; phases-unit |
+| /unit:direct: /unit:delegate | Approve the current-reference migration on its own. Keep the callable alias and historical recognition unless removal is separately approved. | Caller approval, then a separate command-compatibility answer |
+| astra-designer: chief designer; astra-reviewer: chief reviewer | Keep per-design roles distinct from the top-level guild heads. Use the temporary head IDs until cargo-liner settles names with the user. No global replacement of either ID. | Q5; Q3 for reviewer distinction; guilds-unit and cargo-liner |
+| small-fix helper: subagent, helper | Use small-fix helper only for D29. A research helper or library helper keeps its own meaning. N-B keeps general agent-family names in local context. | Q7 |
+| pending decision: Pending decision block | Pending decision names the unresolved choice; block describes its document form. N-B permits both with that distinction. | New record-label approval; phases-unit |
+| finding: issue | Use finding for a confirmed review defect. Keep issue for a filed backlog item, and issue as a verb. No global issue replacement. | New record-label approval |
+| reservation: phase reservation, delegated phase reservation | Use phase reservation for durable phase authorization. Keep a worker's narrower file claim distinct. N-B keeps the longer qualifier. | New record-label approval; phases-unit |
+| ETA: phase ETA | Keep ETA qualified by its target, unit and time zone. Phase ETA is a useful qualifier, not a retired name. | No retirement proposed; approval only if the definition changes |
+
+Work Order, production, producer, unit, review pool, gate, shrink and landing call have no other-name entry in the inventory. Those entries propose no alias retirement by themselves. Gate's distinct meanings still need Q2: N-A proposes dependency gate, verification gate and user gate in shared prose; N-B permits gate with an explicit local meaning. Keep `gate:` protocol syntax under either answer. Landing call and hard landing remain different actions. No naming candidate changes the repair thresholds.
+
+## Comparison
+
+The Phase 1 measures are in the Baseline section; the phase 2 checker re-ran them on 2026-10-20 and they agree. Step 1 adds a read-only plural-aware classification dated 2026-10-20. It does not overwrite the singular-only Baseline. Python and shell counts, including combined totals, are lower bounds: helper arguments and stderr cat heredocs are not fully counted. A lexical hit is not a defect.
+
+The ranking is G-A with N-A first for drift prevention; G-B with N-B is the enforcement runner-up. P-A versus P-B and T-A versus T-B are near-ties on reading. The judge dated 2026-10-20 found `seat` grew from n=4 lines at retirement commit `4ddd7b52` (2026-10-14) to n=27 at the reviewed HEAD, using `git grep -ciw seat`. That line count has a different file set and unit from Names hits. It supports drift as the gain; it does not measure reading or prove G-B would fail its new baseline comparison.
+
+Every candidate is scored on Names, Definitions, unit/session names, sent contacts and duty sources below. `Unchanged` means no direct target. No candidate changes a production or session identity, so all leave the checker's n=2 nonconforming and n=2 shared-name findings in n=5 production docs unchanged. None claims a contact saving: historical roles and request intent are absent from the message log. Its checked window is [2026-10-06T17:54:18.659760-04:00, 2026-10-20T17:54:18.659760-04:00), America/New_York, n=10352 records and n=10144 natedev sent contacts. The measure sends no traffic.
+
+Rule scores are conditional on approval. The columns name each rule without codes. Unit boundaries mean hierarchies-unit owns structure, guilds-unit owns guild contracts, phases-unit owns phase steps and the document pipeline, fix-rounds-unit owns repair rules, and cargo-liner settles guild-head names with the user. A candidate that breaks a current user rule is out. Decision economy permits ordinary implementation and packaging choices; it does not override the explicit duty/name questions. Meaning and language require semantic names under the Type Design Contract and short active sentences under Simplified Technical English.
+
+| Candidate and rank | Names | Definitions | Unit/session names | Sent contacts | Duty sources | Benefit, cost and limit under Simple, Fast, Beautiful | User approval | Flat peers | Decision economy | Unit boundaries | Meaning and language |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| P-A; slight preference, reading tie | Unchanged | Unchanged alone | Unchanged | No size known | Each listed duplicate except D16 becomes one operating statement plus links; needs a source measure | Keeps rules nearby; costs link maintenance; reading gain unmeasured | Kept; source moves need approval | Kept | Kept; package approved moves | Kept; owners supply shared edits | Kept; scoped duty IDs |
+| P-B; near-tie | Unchanged | Unchanged alone | Unchanged | No size known | Same duplicate target as P-A | One register; shared edit point and command lookup; reading equal until measured | Kept; source moves need approval | Kept | Kept | Kept | Kept; owner per action |
+| O20-A; recommended | Unchanged | Unchanged | Unchanged | No size known | Close D20 after all source clauses agree | Keeps runtime owner; correct stale defaults; baseline cannot yet count duty clauses | Kept; new answer | Kept | Kept; no routine timer question | Kept | Kept; report differs from trigger |
+| O20-B; alternative | Unchanged | Unchanged | Unchanged | No size known | Measure all source clauses for those two scoped duties | Explicit producer setup and runtime owner; extra authoring; same on-demand default | Kept; new answer | Kept | Kept | Kept | Kept; setup differs from runtime |
+| O22-A; recommended | Unchanged | Unchanged | Unchanged | No size known | Close D22 with director readiness and showrunner execution | Preserves executor; requires readiness contact; resume proof still needed | Kept; new answer | Kept | Kept; queued destination stays authorized | Kept; natedev owns shared map | Kept; readiness is a state |
+| O22-B; alternative | Unchanged | Unchanged | Unchanged | No size known | Close D22 by approved execution transfer | Local readiness; helper/resume changes; no measured saving | Kept; transfer needs answer | Kept | Kept | Kept; no new reporting edge | Kept; executor differs from chooser |
+| O23-A; recommended | Unchanged | Unchanged | Unchanged | No size known | Close D23 by correcting PF to the current any-time rule | Preserves user behavior and showrunner executor; interrupted work resumes on its thread | Kept; source correction needs answer | Kept | Kept; no new timing permission | Kept | Kept; approved name is an input |
+| O23-B; out under current rule | Unchanged | Unchanged | Unchanged | No size known | Would impose a boundary instead of correcting PF | May reduce interruptions; delays rename; changes explicit user policy | Needs Q9 policy change | Kept | Kept only after new policy answer | Kept | Kept; timing policy stated |
+| O32-A; recommended after guild contract | Unchanged | Unchanged | Unchanged | No size known | D32 gains each head's maintain/distribute contract | Head owns advice; external contract missing; not build-ready | Kept; Q1 | Kept; heads are peers | Kept | Kept; guilds-unit defines contract | Kept; head differs from member |
+| O32-B; alternative | Unchanged | Unchanged | Unchanged | No size known | D32 splits editing, approval and distribution | Shared editor; extra hand-off; sdlc gains no authority over heads | Kept; Q1 | Kept | Kept | Kept; guilds-unit decides contract | Kept; editor differs from head |
+| T-A; near-tie, slight preference | Unchanged alone | One authority per approved meaning; fix false worker finding separately | Unchanged | Unchanged | Owner choices unchanged | Existing TOML source; new renderer and stale-view test; no measured reading gain | Kept; home and meaning answers | Kept | Kept; rendering details delegated | Kept | Kept; meaning IDs and provenance |
+| T-B; near-tie | Unchanged alone | Same authority target as T-A | Unchanged | Unchanged | Owner choices unchanged | Human definition source; new parser and stale-data test; equal generated-copy duty | Kept; same answers | Kept | Kept | Kept | Kept; generated data is a view |
+| N-A; recommended for drift | Down only for classified meanings; include source spelling and plurals | Split approved meanings; no false-finding credit | Unchanged | No size known | Owners unchanged | Clear meanings; classification work; mixed P/T/G choices valid | Kept; each named question | Kept | Kept | Kept | Kept; semantic role and lifecycle names |
+| N-B; runner-up | Aliases remain allowed; no quota | May split meanings with local qualifiers | Unchanged | No size known | Owners unchanged | Less rewrite work; more allowed spellings; reading equal until measured | Kept; meaning changes still questions | Kept | Kept | Kept | Kept; local meanings explicit |
+| R-seat; first rename, conditional on cost check | Step 1: n=66 eligible of n=84 singular/plural hits in n=19 live files; n=18 kept; script share lower bound | Unchanged | Unchanged | No size known | Worker duties unchanged | Narrow classified meaning plus reusable check; checker and gate work included; timing prerequisite remains | Kept; Q7 and retirement policy | Kept | Kept; identities stay | Kept; phases-unit supplies director text | Kept; worker is a role |
+| R-trunk; later classification | Observed n=26 in n=8 prose files; eligible subset unknown | Unchanged | Unchanged | No size known | Merge owner unchanged | Role/ref distinction; cargo and history review; not build-ready | Kept; new answer | Kept | Kept | Kept | Kept; role differs from ref |
+| R-command; caller phase only | Step 3: n=3 eligible of n=9 in n=6 live files; n=6 kept; script share lower bound | Unchanged | Unchanged | No size known | Director duties unchanged | Corrects stale statements; keeps history parsing and forwarding; removal is separate later work | Kept; caller approval, then separate removal answer | Kept | Kept | Kept; phases-unit owns director contract | Kept; command differs from actor |
+| G-A; recommended for drift | Holds the approved target; no reduction alone | Unchanged | Unchanged | Unchanged | Unchanged | Unit gate catches re-adds. Full baseline took 13–31 s under load 154–269 on 32 cores (judge, 2026-10-20); source-only scan 10.5–10.8 s at load 50–54 (2026-10-20); false failures are replayed first in the build phase | Kept; new check policy answer | Kept | Kept; approved rule runs automatically | Kept | Kept; per-file kept contexts are new code |
+| G-B; runner-up | Review compares baseline; no automatic rejection | Unchanged | Unchanged | Unchanged | Unchanged | Less code and no added check; drift can escape review; historical drift did not test this comparison | Kept; review policy answer | Kept | Kept | Kept | Kept; no inferred retirement |
+
+The Phase 1 Names file set is n=546 files, with n=2771 other-name hits of n=11308 pair hits (24.5%), a lower bound including scripts. This is neither a defect rate nor a target denominator. Orchestrator's n=18 hits in n=6 prose files are shared between the showrunner and director pairs; do not add them as independent source savings. The old Definitions set is n=36 terms: worker, gate and each Astra ID have n=2 files, and helper has n=0. Worker is a false duplicate: the roster passage is a selection rule. Removing that finding changes classification, not source duplication. Gate and the Astra IDs need meaning splits before an authority count is meaningful. Preserve the old report beside any new authority report.
+
+Before a build, repeat each classification on unchanged sources. Keep the old lexical result beside the plural-aware and scoped results. Freeze kept contexts before edits; do not turn a failed rename into a passing check by adding an exception later. Source-only scan measured 2026-10-20 18:40 EDT: `read_live_files` plus `measure_names` over the n=546 live files and all n=36 terms took 10.5–10.8 s at host load 50–54 on 32 cores; file reading and string extraction took 7.6–7.7 s of that, and a one-term check still pays it. The false-failure replay over the retired-use history is the first task of Step 1's build phase, before any rename; if it reverses the case for G-A, that phase stops and asks again. The first-place ranking includes new matcher, kept-context and gate work.
+
+## Recommendation
+
+Choose N-A with G-A for drift; use P-A and T-A as slight preferences, with O20-A, O22-A, O23-A and O32-A subject to their answers.
+P-A versus P-B and T-A versus T-B are near-ties on reading; mixed choices are valid.
+Keep the showrunner's current any-time, stop-at-once rename behavior and correct PF, rather than add a phase boundary.
+Start with singular and plural worker-role prose, its pinned tests and a source-only check in each unit's tests-only gate.
+Keep identities, protocol fields, historical records and quoted command output in memory explicit; the measured source-only scan time goes with the policy question.
+Keep guild heads as peers; their contracts and final names stay with their assigned owners.
+The runner-up is P-B, T-B, N-B and G-B with the same owner choices: less enforcement; equal reading.
+No candidate claims fewer wrong-party asks from records that lack historical roles and intent.
+An adversarial review with a neutral judge and an Astra review, both dated 2026-10-20, led to the drift ranking, plural scope, pinned tests, stale-view checks and preservation of any-time renames.
+
+## Steps
+
+Only the numbered steps below have a selected term, exact source set, classified before count and acceptance target. They are proposed Work Orders, not approval to build. Each requires its named user answer and the source owner hand-offs. The director may package already approved work without another question. Later work below is not a numbered build step: it must first acquire its missing source classification, contract or duty measure. That separation avoids copying a programme into one phase.
+
+### 1. Retire singular and plural worker-seat prose with its check
+
+**Needs the user and dependencies:** Q7, R-seat and G-A approval. Keep worker duties and any-time rename behavior. The question carries the measured source-only scan time (Comparison). The build phase first replays a plural-aware prototype over the commits after the retirement (`4ddd7b52..HEAD`, n=21 commits that add the word) and counts real flags against false failures and run time; if that reverses the case for G-A, the phase stops before any rename and asks again. The implementation estimate covers matcher, context data, fixtures and gate test.
+
+**Change files — live prose:** `commands/showrunner/rename_unit.md`; `commands/showrunner/retire_unit.md`; `commands/unit/direct.md`; `docs/production_format.md`; `docs/as-built/agent-registry.md`; `docs/as-built/long-lived-workers.md`; `docs/as-built/shutdown-and-restart.md`; `docs/as-built/unit-rename.md`; `docs/delegate/dual_review.md`. Phases-unit supplies the director edit; hub edits use the owning unit's normal flow. Change worker-role labels, not runtime behavior. Treat `Codex seats` and `Codex seat` before the shorter words.
+
+**Change files — scripts:** `scripts/agents/codex_mesh.py`; `scripts/agents/mesh_runs.py`; `scripts/direct/implement.sh`; `scripts/direct/phase_reservation.py`; `scripts/production/rename_unit.py`; `scripts/production/retire_unit.py`; `scripts/shutdown/restart.py`; `scripts/direct/board.sh`; `scripts/direct/review.sh`; `scripts/hooks/pre-tool-use-berth.py`. Change worker-role comments, docstrings, help, printed labels and messages, including `restart.py:1975`, `mesh_runs.py:272–275` and the rename/retire descriptions. The last three files contain role prose missed by string extraction; their edits earn no extra count credit. Keep identifiers, API fields, flags, transport addresses, filenames, placeholders documenting those contracts and historical identities.
+
+**Change files — measure and gate:** `scripts/production/role_terms.toml`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`. Add explicit inflected forms for the worker aliases to the data and use those forms in both Names and `check`; do not apply an English plural rule to every command or term. Add per-file kept contexts with reasons, instead of extending today's global masking. In `test_roles_audit.py`, add fixture tests for singular/plural matches, overlap, protocol/history contexts, a context copied into another file, changed kept text and a returning retired use. Add a source-only repository check test in this same discovered test file, so existing `merge_gate --tests-only` runs it in the unit and at merge. No new merge-gate dispatch code is needed. It reads repository sources, not home-state records. Tests that prove behavior must still fail on an eligible re-add.
+
+**Change files — assertions of changed output:** `scripts/shutdown/test_restart.py:435`, `scripts/production/test_rename_unit.py:553`, `scripts/agents/test_mesh_runs.py:183`, and `scripts/production/test_retire_unit.py:214`. Update their role-label expectations with the source output. Keep checks for thread identity, launcher arguments, worker names, refusal behavior and dry-run side effects. The expanded search found the retire dry-run assertion in addition to the first review's pinned tests. Checked `scripts/agents/test_codex_mesh.py` reopen assertions and `scripts/direct/test_implement_launcher.py` claim refusal assertions retain their existing expectations: those strings do not change. Test files stay outside the Names denominator because `read_live_files` skips `test_` scripts.
+
+**Reviewed and kept live files:** `docs/as-built/message-clarity.md:269` is a retirement record preserved at commit `291e1da55`, dated 2026-10-16 by blame; keep its old word as history, not an allowed role label. `docs/as-built/usage-ledger.md:46` and `scripts/usage/collect.py:532–534` document or implement the old `seats` data value migration; keep those exact values. These files belong to the measured source set and are reviewed in this phase, not deferred to a later rename. Raw source matches in `scripts/accounts/worker_names.py`, `scripts/agents/agent_bg.sh`, `scripts/buildlog/index.py`, `scripts/direct/worker_state.py`, `scripts/feature_log/inventory.py`, `scripts/shutdown/inventory.py`, `scripts/shutdown/record.py` and `scripts/shutdown/stop.py` are identifiers, stored keys or migration values, not worker-role prose. Keep them. This classification covers every worker-role singular/plural use found by the read-only search over the audit's scanned folders, plus uncounted source prose above; it makes no claim about files the scanner excludes.
+
+**Director-owned memory cleanup:** review agent-read prose under `~/.claude/projects/*/memory/` with the approved names. Correct current role explanations as director-owned cleanup, outside this worker's repository Work Order. Keep dated history, identities and quoted command output as recorded. Memory folders are not in the audit's Names set and earn no count credit. Do not send a question to the user for routine memory maintenance under an already approved naming policy.
+
+**Read-only classification, 2026-10-20:** the following table uses the current audit file filters, extraction and global kept-path masking, then applies `(?<![\w-])seats?(?![\w-])` case-insensitively. It adds only the explicit plural form to today's singular matcher. Each cell is eligible / kept. Every occurrence not listed in the kept contexts below is eligible role prose. Script and combined counts remain lower bounds. Source-only comments/docstrings excluded by the extractor receive no numeric credit.
+
+| Measured live file | Singular eligible / kept (n) | Plural eligible / kept (n) |
+| --- | --- | --- |
+| `commands/showrunner/rename_unit.md` | 5 / 0 | 2 / 0 |
+| `commands/showrunner/retire_unit.md` | 0 / 0 | 2 / 0 |
+| `commands/unit/direct.md` | 8 / 0 | 0 / 0 |
+| `docs/as-built/agent-registry.md` | 1 / 0 | 1 / 0 |
+| `docs/as-built/long-lived-workers.md` | 5 / 0 | 0 / 0 |
+| `docs/as-built/message-clarity.md` | 0 / 0 | 0 / 1 |
+| `docs/as-built/shutdown-and-restart.md` | 20 / 11 | 7 / 3 |
+| `docs/as-built/unit-rename.md` | 1 / 0 | 1 / 0 |
+| `docs/as-built/usage-ledger.md` | 0 / 0 | 0 / 1 |
+| `docs/delegate/dual_review.md` | 1 / 0 | 0 / 0 |
+| `docs/production_format.md` | 0 / 0 | 1 / 0 |
+| Prose subtotal, n=11 files | 41 / 11 | 14 / 5 |
+| `scripts/agents/codex_mesh.py` | 2 / 0 | 0 / 0 |
+| `scripts/agents/mesh_runs.py` | 1 / 0 | 0 / 0 |
+| `scripts/direct/implement.sh` | 1 / 0 | 0 / 0 |
+| `scripts/direct/phase_reservation.py` | 0 / 0 | 1 / 0 |
+| `scripts/production/rename_unit.py` | 1 / 0 | 2 / 0 |
+| `scripts/production/retire_unit.py` | 0 / 0 | 2 / 0 |
+| `scripts/shutdown/restart.py` | 1 / 0 | 0 / 0 |
+| `scripts/usage/collect.py` | 0 / 0 | 0 / 2 |
+| Script subtotal, n=8 files | 6 / 0 | 5 / 2 |
+| Total, n=19 measured live files | 47 / 11 | 19 / 7 |
+
+**Kept contexts:**
+
+- Stored field: `docs/as-built/shutdown-and-restart.md:116`, literal `seat` (n=1 singular).
+- Command/output placeholders: that file `:120`, `--to <seat>`, `reopened <seat>`, printed `--to <seat>` and `codex_mesh: <seat>: <reason>` (n=4 singular); `:143`, `<seat> (<role>, was working|idle): <command>` (n=1 singular). These document protocol arguments; ordinary role prose and the newly changed live message quotation change together.
+- Filename placeholders: that file `:116`, `<run_dir>/<seat>.resume-prompt.md`, and `:122`, `<seat>.account-move.json` (n=2 singular). Today's masking leaves those placeholders partly visible; keep that fact in the lexical report.
+- Dated probe history: that file `:290`, the 2026-10-16 run narrative (n=3 singular, n=3 plural). Keep its recorded wording and worker identity. Unlike the prior classification, this classification retains the full dated record, not just its identity.
+- Retirement history: `docs/as-built/message-clarity.md:269` at `291e1da55`, dated 2026-10-16 (n=1 plural).
+- Legacy data value: `docs/as-built/usage-ledger.md:46` (n=1 plural) and `scripts/usage/collect.py:532–534` SQL migration values (n=2 plural). They remain inputs the migration must recognize, not names for current workers.
+
+**Before and target:** singular n=58 reconciles with the checker's n=58 exactly; plural adds n=26, giving n=84 in n=19 live files. Eligible n=66 comprises prose n=55 and script n=11; kept n=18 comprises prose n=16 and script n=2. Singular eligible is n=47 and plural eligible n=19. With the same extraction the lexical result should become singular n=11 plus plural n=7, total n=18, while scoped eligible uses become zero. Phase 4's half-size test uses n=66 as the expected reduction. Re-run this classification before the build Work Order; source drift requires a new frozen classification. Do not claim adding plural detection or retaining more history as a rename saving. Keep the singular-only before/after report as well as the expanded report. `Codex seat` and `Codex seats` overlap these matches and earn no extra credit. Definitions, production names and sent contacts have no target here.
+
+**Why first:** this narrow role meaning has a classified plural-aware pool and a documented drift event after retirement. G-A adds matcher, context data, fixture and integration work, but later approved retirements reuse it. The judge supports drift prevention, not a measured work rate. The ranking remains conditional on the false-failure replay at the start of the build phase; a prose count alone does not rank implementation effort. This keeps the first phase measurable without pretending the other broad aliases are classified defects.
+
+**Undo:** revert role prose and pinned expectations with the inflection/retirement entries and check test. Preserve identities and migration inputs. Keep the before records. No live session, transport key, file path or thread moves during this rename or its undo.
+
+### 2. Name the coordinator by its actual role
+
+**Needs the user and dependencies:** Q6 and approval of N-A for orchestrator; Step 1's context check is available. Phases-unit supplies its command and document-pipeline edits. No role authority changes.
+
+**Change files:** `commands/plan/phase_review.md`, `commands/plan/shrink.md`, `commands/plan/to_as_built.md`, `commands/plan/to_phased_plan.md`, `commands/team_review.md`, `docs/delegate_plan_format.md`, `scripts/production/role_terms.toml`, `scripts/production/test_roles_audit.py`. Use the actual showrunner or unit director in production instructions; use invoking session for standalone execution. The policy fixture covers this term and does not alter protocol names. The source search found no pinned output test for these prose files.
+
+**Before and acceptance:** the checker facts give orchestrator n=18 in n=6 prose files for each role pair. All broad coordinator references in that set become the scoped role or invoking session. Target no eligible orchestrator use; each pair falls by its observed n=18. These are the same source occurrences, not independent savings. Freeze a new before classification if history or source drift adds a retained use. Other measures have no target.
+
+**Undo:** restore that source set and its retirement entry together; preserve Step 1's independently approved worker policy.
+
+### 3. Correct current command references and keep compatibility
+
+**Needs the user and dependencies:** approve the R-command current-reference migration only. Q7 does not authorize alias removal. Step 1 supplies the scoped check. The forwarding command, historical command recognition and thread records remain valid. Removal is later work requiring a separate answer.
+
+**Change files:** `CLAUDE.md:7`, `commands/showrunner/promote_showrunner.md:36`, `scripts/production/promote_showrunner.py:100`, `scripts/production/test_promote_showrunner.py:210`, `scripts/production/role_terms.toml`, `scripts/production/test_roles_audit.py`. Correct CLAUDE.md's wrong statement: `/unit:direct` imports decision criteria at `commands/unit/direct.md:673`; the alias merely forwards. Correct the current command name in the promotion instruction/refusal and its expected text, retaining the active-run refusal and identity/argument checks. No alias is deleted.
+
+**Reviewed and kept files:** `docs/as-built/agent-registry.md:315,432` documents forwarding and discovery behavior; `docs/as-built/director-model-study.md:27,108` describes old transcript recognition and historical study results; `scripts/model_study/turns.py:17` must recognize historical `/unit:delegate` records. `commands/unit/delegate.md` stays as the forwarding control file. Checked `scripts/model_study/test_turns.py:257,269,479` and `scripts/model_study/test_rerun.py:182,274` fixtures retain old transcript inputs; do not convert historical recognition tests to current callers.
+
+**Before and acceptance, read-only classification 2026-10-20:** the checker's alias pool has n=9 hits in n=6 live files. The current-reference uses above give n=3 eligible (prose n=2, script n=1); kept n=6 (prose n=5, script n=1). The kept prose consists of agent-registry n=3 and director-model-study n=2; the kept script match is historical command recognition. Target no eligible old current reference and lexical n=6 kept in the unchanged measured set. Script/combined counts are lower bounds. Test files are change/check files outside that denominator. Prove the live-run refusal still fires, forwarding preserves arguments, and old and new transcript commands remain recognized. Definitions, session names and sent contacts have no target.
+
+**Undo:** restore these current-reference statements, refusal expectation and scoped policy together. The forwarding command and history parser never need removal or restoration in this phase.
+
+## Later work
+
+This list replaces the former repeated-duty and per-term programmes, including former Steps 9–11. None is a build Work Order. Before promoting one item to a numbered step, select exactly one duty or term, paste all its exact change and kept files, name dependencies, freeze a before classification and state an acceptance target and undo. No measured live file for that selected rename may wait for another slice. Test expectations of changed strings belong in its change set even though test files earn no Names credit. An item with an unknown eligible size or a missing external contract stays here.
+
+### Merge-branch prose (former Step 4)
+
+R-trunk needs a new user name answer and a classification of trunk n=26 in n=8 prose files from the checker facts: `commands/berth_fix.md`, `commands/plan/to_as_built.md`, `commands/showrunner/dailies.md`, `commands/showrunner/produce.md`, `docs/as-built/director-model-study-results.md`, `docs/as-built/director-model-study.md`, `docs/as-built/review-pool.md`, `docs/production_format.md`. Preserve actual refs, cargo-berth meaning and history. An eligible count is not yet recorded, so this is not phase-ready. Its later target is zero eligible retired role use; undo restores only role prose and its policy, never branch refs.
+
+### Definition authority and worker classification (former Step 5)
+
+T-A or T-B needs its own user answer and the deterministic generator/stale-copy test named in Candidates. Handle one approved meaning in each later build phase. Proposed control files are `scripts/production/role_terms.toml`, `scripts/production/roles_audit.py`, `scripts/production/test_roles_audit.py` and `docs/production_format.md`; select the term's source files before dispatch.
+
+The worker finding is a false duplicate, not a removal target. `docs/as-built/session-roster.md:60` specifies process checks, status conversion, cwd choice and director links. Keep all that implementation rule; add a link to the general worker definition. Correct Definitions classification with fixtures that distinguish role selection from a competing definition, retaining the old result beside the corrected one. The observed worker n=2-file finding in the n=36-term set must disappear for the correct reason; it earns no reduction in actual repeated duties or definitions. The helper still has n=0 defining files, but Q7 must settle its scope before adding one. These are separate term/classification tasks, not one combined definition move. Undo restores authority links and schema with the affected term; never deletes the roster selection rule.
+
+### Reporting default and duty-source measurement (former Step 6)
+
+O20-A is recommended; O20-B is the setup/runtime alternative. Ask the user about the source resolution and P-A before changing it. The checked sources are `docs/production_format.md:100–103` (on demand when absent), `commands/showrunner/produce.md:393–394` (15 minutes when absent), `commands/showrunner/produce.md:412–418` (timer creation/stop, already agrees), and `commands/producer/to_production.md:118` (every 15 minutes, contrary to PF). Correct the producer line and SR's introductory absent-default clause against PF. Keep SR's actual setup/stop behavior; it is in the checked acceptance set, not a policy conflict to remove.
+
+Before dispatch, add a typed duty-source measure proposal using `scripts/production/role_terms.toml`, `scripts/production/roles_audit.py` and `scripts/production/test_roles_audit.py`, recording every cited clause, owner and reference. The current baseline does not count D20's source clauses. Print that new before set before fixing a numeric target. The later acceptance set must cover every source clause for agreement with the approved runtime owner and on-demand default, with no clause dropped. A matrix relabel is not a measure. Undo restores the source clauses and registry together and starts no timer.
+
+### Account-move readiness (former Step 7)
+
+O22-A keeps the showrunner executor after the director confirms no worker run is active. O22-B transfers execution and needs its own answer. Checked change candidates are `commands/showrunner/produce.md`, `commands/showrunner/move.md` and `commands/showrunner/accounts.md`; the read-only source is `~/.claude/projects/-home-natepiano--claude/memory/ask-director-before-moving-unit.md`. Keep natedev's shared role map. This item depends on the duty-source measure, its exact before clause count and a separate O22 answer. Target agreement across D22's cited clauses, plus functional pause/resume proof; no measured contact saving is claimed. Undo restores the instructions and registry, not a live account move.
+
+### Any-time unit rename (former Step 8)
+
+Recommend O23-A: keep the showrunner executor and the current any-time, stop-at-once rule. `docs/as-built/unit-rename.md:53` records the user's 2026-10-18 rule; `scripts/production/rename_unit.py:77` records immediate stopping (2026-10-20). The source correction is PF's between-phases phrase, not the helper. Checked files are `docs/production_format.md:158–161`, `commands/showrunner/rename_unit.md:8,22–30`, `commands/unit/rename.md`, the as-built and the helper. Only PF timing text and the later duty registry need change for O23-A; keep other behavior and test assertions. This needs the source-resolution answer and the duty measure's full before set; no numeric clause size has been measured. Target all D23 clauses agreeing with the existing any-time behavior. A specific name approval is separate. O23-B is a Q9 policy proposal: waiting may reduce interruption, but delays the rename and reverses current permission. It is out without a new answer. Undo restores only the PF/source-registry correction, never renames a live unit.
+
+### One selected duplicate duty at a time (former Step 9)
+
+P-A and P-B cover D01–D06, D08–D15, D17–D19, D21, D24, D26–D28, D33–D34, D37–D40, D42, D48 and D54. Select one row and its exact cited files from the Duty matrix, not this whole programme, after the source-policy answer. D16 already has one owner and earns no duplicate-removal target; its source remains available for other rows. A later Work Order must state the before operating-statement count, the one chosen authority and valid linked references. A genuinely different scoped action stays separate rather than being deleted. D01/D09 link to the user's authority; D15 needs guilds-unit's role check; D26/D54 go through fix-rounds-unit and phases-unit. D53/D55 keep their current rules. This item cannot use an unmeasured aggregate count as acceptance. Undo restores only the selected row's statements and links.
+
+### Guild meanings and tips (former Step 10)
+
+Q1, Q3 and Q5 remain open. O32-A is recommended, subject to guilds-unit's actual contract; O32-B is the editor alternative. Sources are `/home/natepiano/worktrees/claude-build-followups-sdlc-guilds/docs/plans/sdlc-guilds.md` and `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/sdlc-production.md`. Each Astra ID has n=2 definition sources in the checked n=36-term set, but head and per-design meanings must be approved separately before a target can be stated. cargo-liner settles head names. The shared-tips contract file has not been returned: no build phase for D32 can be written without its exact file, owner and distribution clauses. Keep this external dependency here, not inside a nominally ready step. Undo of a later approved meaning/contract change must be coordinated with those owners and must not rename a running head.
+
+### Alias removal, meanings and remaining source pools (former Step 11)
+
+Removing `/unit:delegate` is distinct from Step 3's current-reference migration. It needs a compatibility answer, discovery checks, exact removal/control files and a before measure before it can become a Work Order. Keeping forwarding is a buildable answer. Preserve historical transcript recognition under either answer.
+
+Q2 covers dependency, verification and required user-interaction meanings of gate. Checked defining files are `docs/production_format.md` and `commands/unit/direct.md`; the latter's `<TurnEndGate>` meaning is not a verification check. Keep `gate:` status syntax unless compatibility is separately approved. Q4 covers filed proposal, unfiled add-on and implemented change using `commands/unit/add_ons.md`, `commands/showrunner/proposal.md` and `commands/change_review.md`. Q8 covers phase as-built record and feature as-built doc; phases-unit owns the pipeline. Each later term phase must classify its complete source-spelling set, not infer a file list from its proposed target spelling.
+
+That rule includes defined names: template, lease and reviewer are current source spellings, even though review template and review lease have no observed alias hits. The following source pools were re-counted read-only on 2026-10-20 with the current audit filters and exact singular matcher. They are search sets, not approved replacement lists or eligible counts. Python/shell and combined counts are lower bounds. Before a Work Order, inspect every meaning, include plural forms, classify protocol/history and pin changed output tests. Add the chosen definition source and control files only after the authority policy is approved. Broad templates unrelated to review, machine keys, active-review ownership and other reviewer roles must not be renamed together.
+
+
+<details>
+<summary>template source spelling: n=84 hits in n=23 live files</summary>
+
+| Source file | Hits (n) |
+| --- | --- |
+| `commands/bevy_migration_plan.md` | 2 |
+| `commands/issue.md` | 3 |
+| `commands/nate.md` | 6 |
+| `commands/plan/phase_review.md` | 1 |
+| `commands/showrunner/dailies.md` | 2 |
+| `commands/unit/direct.md` | 2 |
+| `docs/as-built/feature-log.md` | 1 |
+| `docs/as-built/long-lived-workers.md` | 3 |
+| `docs/as-built/message-clarity.md` | 7 |
+| `docs/as-built/nextest-width-and-lint-scope.md` | 1 |
+| `docs/as-built/review-pool-probes.md` | 9 |
+| `docs/as-built/review-pool.md` | 22 |
+| `docs/delegate_footprint_review.md` | 2 |
+| `docs/production_format.md` | 2 |
+| `docs/style_production.md` | 1 |
+| `docs/user_facing_explanation.md` | 2 |
+| `scripts/agents/codex_mesh.py` | 2 |
+| `scripts/direct/review_pool.py` | 4 |
+| `scripts/make_a_worktree/copy_settings_local.sh` | 2 |
+| `scripts/message/send.py` | 4 |
+| `scripts/new_rust_project/rust_generate.sh` | 3 |
+| `scripts/notify/pushover.py` | 2 |
+| `scripts/production/dailies_render.py` | 1 |
+
+</details>
+
+<details>
+<summary>lease source spelling: n=25 hits in n=6 live files</summary>
+
+| Source file | Hits (n) |
+| --- | --- |
+| `docs/as-built/review-pool-probes.md` | 1 |
+| `docs/as-built/review-pool.md` | 17 |
+| `docs/as-built/showrunner-automation.md` | 3 |
+| `docs/production_format.md` | 1 |
+| `scripts/direct/review_pool.py` | 1 |
+| `scripts/direct/review_pool_report.py` | 2 |
+
+</details>
+
+<details>
+<summary>reviewer source spelling: n=252 hits in n=40 live files</summary>
+
+| Source file | Hits (n) |
+| --- | --- |
+| `commands/api_review.md` | 6 |
+| `commands/astra_review.md` | 1 |
+| `commands/commit_prep.md` | 1 |
+| `commands/module_review.md` | 8 |
+| `commands/plan/phase_review.md` | 2 |
+| `commands/plan/shrink.md` | 1 |
+| `commands/prioritize.md` | 1 |
+| `commands/showrunner/produce.md` | 1 |
+| `commands/showrunner/retire_unit.md` | 1 |
+| `commands/unit/direct.md` | 23 |
+| `commands/unit/report.md` | 3 |
+| `docs/as-built/agent-registry.md` | 6 |
+| `docs/as-built/herdr-trial.md` | 1 |
+| `docs/as-built/long-lived-workers.md` | 14 |
+| `docs/as-built/message-clarity.md` | 21 |
+| `docs/as-built/plan-delegate-progress-history.md` | 3 |
+| `docs/as-built/review-pool.md` | 85 |
+| `docs/as-built/review-regime-trial.md` | 11 |
+| `docs/as-built/session-roster.md` | 7 |
+| `docs/as-built/showrunner-automation.md` | 3 |
+| `docs/as-built/unit-rename.md` | 1 |
+| `docs/as-built/usage-ledger.md` | 1 |
+| `docs/decision_criteria.md` | 2 |
+| `docs/delegate/dual_review.md` | 14 |
+| `docs/delegate/launch_implementation.md` | 1 |
+| `docs/delegate/phase_end.md` | 1 |
+| `docs/delegate/write_prompt_contract.md` | 2 |
+| `docs/delegate_footprint_review.md` | 3 |
+| `docs/delegate_plan_format.md` | 1 |
+| `docs/production_format.md` | 6 |
+| `docs/quota_alerts.md` | 1 |
+| `docs/user_facing_explanation.md` | 1 |
+| `scripts/agents/codex_mesh.py` | 3 |
+| `scripts/direct/progress_history.py` | 3 |
+| `scripts/direct/review_pool.py` | 1 |
+| `scripts/message/roster.py` | 2 |
+| `scripts/notify/review.py` | 3 |
+| `scripts/production/rename_unit.py` | 1 |
+| `scripts/production/retire_unit.py` | 3 |
+| `scripts/production/review_regime.py` | 3 |
+
+</details>
+
+For lease, first correct PF's phase-only definition against `scripts/direct/review_pool.py:32,676`: the unit assignment lasts, while claiming/releasing an active review changes process ownership. Keep the `--lease` API and no-op compatibility entry unless an independent compatibility answer changes them. For reviewer, classify pool, per-design Astra, blind, one-turn and other review roles before Q3 or Q5 selects a name. For template, classify review instructions apart from message, project and output templates. A proposed target with no hit is not a source inventory.
+
+All other aliases and related terms stay proposed under the N-A treatment table, with their Other-name file index as one input, not a sufficient source set. Add defined-name and plural matches whenever those spellings would change. Include zero-hit policy entries only with a measured definition task or keep them unbuilt. Every later rename needs a frozen eligible size, kept contexts and an undo of that term's prose/policy together. Meaning IDs and inventory versions must stay beside before/after Definitions; adding a meaning or changing a parser is not source cleanup by itself. No aggregate promise of fewer production names or contacts is made.
+
+After each approved numbered phase, run `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline`. Record its term-set version, file set, count and window beside the before result. Keep any contact comparison on one fixed window. Run the new source-only check through the unit's tests-only gate after its policy is approved. A step is complete only when its stated measure moves and the functional checks pass. Source-only tests must not read real home-state records or send messages.
+
 ## Next steps
 
-Phase 2 of `docs/plans/sdlc-roles.md` compares candidates for duty definitions, ownership and names and states which baseline measure each step must move. No candidate is approved by this map. Later phases change one approved step and rerun the measure; a step is complete only when its before and after counts show the intended change. The approved wording fix above does not retire any alias or change any role.
+The adversarial judge and Astra review dated 2026-10-20 are folded into Candidates, Comparison, Recommendation and Steps. The director checked these repairs, recorded the source-only scan time, and sends the showrunner the Recommendation and Step 1 as a question with buildable answers and the recommended answer. The false-failure replay runs first in Step 1's build phase. Use only a numbered phase-ready step for a build Work Order; promote later work only after its exact files, dependencies and before/target are complete. No open question or later candidate is approved by accepting another step.
