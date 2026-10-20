@@ -731,3 +731,83 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:**
 - The command in `style_ledger.py` without the decline check: a declined decision waived an unwaived finding again at the next `file`, with no message.
+
+### Phase 27 — a held finding follows its declaration  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** an unfiled or filed held finding always names a file that declares its subject at the synced tip. When the declaration moved to one other file, the finding follows it. When no file declares it, the finding is withdrawn. When several files declare it, a line names them for a person.
+
+**Spec:** production cases, both from one cause: the finding's declaration is no longer at its recorded path. (1) A module split moved a declaration to another file. The finding kept its old path, so the applied check, the proposal ticket's files and the gate's allowed files read the wrong file. Refill also waives such a site (phase 20). (2) In cargo-liner, restructure findings fff079fb7af8cf21 and 72fc92aca6fc9706 (filed, decision 8f8dec15) name `struct CratesIoInfo` at `crates/cargo-port/src/scan/ci_cache.rs:229`. An approved phase removed that type and added `CratesIoRelease` in another file. No held action retires them. The new type is judged on its own cell.
+
+A finding records its declaration only as `path:line` at the commit it was judged at. `before`, `after` and `text` are prose for type and restructure findings. So the step reads the declaration from the code, not from the finding's words.
+
+- **Read the declaration.** New module `scripts/style/declarations.py` (reuses `approved_renames.item_starts`, `inline_modules`, `body_start`, `type_path` and `style_footprint.tokenized_text`, `closing`, `attribute_owners`):
+  - `Declaration(keyword, name, owner)`. `keyword` is one of `approved_renames.ITEM_KEYWORDS`. `owner` is `ModuleItem()` (file top level, inline module or fn body) or `ImplOrTraitItem(name)` (directly in an impl body: the last segment of the impl's type, after `for` for a trait impl; directly in a trait body: the trait's name). Inline module names are not part of the identity, so a split of `mod a { … }` into `a.rs` still follows.
+  - `declared_items(text) -> tuple[DeclaredItem, ...]` with each item's declaration, keyword line, first line (its first owned attribute, else its keyword) and last line (its closing brace or ending semicolon).
+  - `declaration_at(text, line) -> DeclaredItem | NoDeclarationAtLine`: the innermost item whose span holds the line. A line with no token (blank, comment, doc comment) reads as the next line that has one. An impl or `use` line, or a line in no named item, is `NoDeclarationAtLine`.
+- **Where the step reads.** The read site is `(path, line)` at the judged commit (`Ledger.judged_commit`), or at the last follow's commit for a followed finding. The step reads only `.rs` findings whose read commit is an ancestor of the synced tip. It reads none of: a non-`.rs` path, `NoJudgedCommit`, a read commit outside the synced tip, `NoDeclarationAtLine`, an unfiled finding of an assigned or checkpointed ticket. Built, waived and withdrawn findings are never read.
+- **Outcome per read finding** (Ledger, a sum type, computed with no write):
+  - in place: one `git diff --no-renames --name-only -z <read commit> <tip>` per distinct read commit (cached) does not name the path, or the file at the synced tip still declares the same `Declaration`. No line, no write.
+  - search: `git grep -l -w -F -e <name> <tip> -- '*.rs'` once per distinct name, kept to the synced tip's `rust_files` minus the finding's path. A file declares it when `declared_items` holds the same `Declaration`.
+  - one file → **follow**. The new line is the line of the new item's own span (not a nested item's) whose stripped text equals the stripped old site line, else the new item's keyword line. A filed finding whose new file is in another crate is **left** (its decision is per crate); an unfiled one follows.
+  - no file → **withdraw** with `DeclarationGone(<synced tip>)`.
+  - two or more files → **left**; nothing changes.
+  - A follow or withdraw of a finding that a ticket that is not final builds becomes **kept**; nothing changes.
+- **Ledger record.** Migration 17 (after `unwaived_by`, same `ALTER TABLE held_findings ADD COLUMN … NOT NULL DEFAULT` form): `followed_from TEXT ''`, `followed_from_line INTEGER 0`, `followed_at TEXT ''`, `declaration_gone_at TEXT ''`.
+  - `HeldFinding.follow: NotFollowed | FollowedDeclaration(from_path, from_line, commit)`. A follow sets `path`, `line` and the three columns; a second follow overwrites them, so the record is always the last move. `finding_id` does not change.
+  - `WithdrawnBy` gains `DeclarationGone(commit)`; `withdrawn_line` gives `declaration gone at <commit7>`. `_held` reads it when `declaration_gone_at` is set (after `duplicate_of`).
+  - `Withdrawn.proposal` becomes `Path | NoDecision`; `NoDecision` is an unfiled finding withdrawn before `file` put it in a decision. Its `proposal` column stays `''`.
+  - `held list` adds `followed from <path>:<line> at <commit7>` after the state; `--json` adds `followed_from` (`<path>:<line>` or `''`), `followed_at` and `declaration_gone_at`, and gives `proposal` `''` for `NoDecision`.
+  - `Ledger.hold` of a site whose rule, path, text and rule blob match a followed unfiled or filed finding returns that finding, not a new row (the new file's cell is stale and a read ticket can hold the same site again).
+- **Writes.** One `Ledger` method writes every follow and withdrawal in one `BEGIN IMMEDIATE` transaction. Under the lock it checks that the synced commit and each planned row are unchanged, else `ChangedBeforeLock`, through `retry_on_change` (the `withdraw_superseded` pattern). A git failure (`CheckCouldNotRun`) stops before any write.
+- **Decisions.** One function in `style_proposals.py`, `run_follow(writer, findings, *, dry_run)`, prints the lines, writes the ledger, then closes or refreshes each open decision that holds a followed or withdrawn finding. A decision closes when all its findings are withdrawn, through the `plan_withdrawal` close (extend it to read `DeclarationGone` rows, the reason names each row with `withdrawn_line`); otherwise it refreshes with the `Parent:` line it names. Before the first write it refuses each decision with no generated body or no `Parent:` line: it prints `skipped <issue>: <reason>` and does not write that decision's findings; the others go on.
+- **Lines.** `follow <id> <rule> <path>:<line> -> <new path>:<new line>: <keyword> <name>`; `withdraw <id> <rule> <path>:<line>: <keyword> <name> declaration gone at <tip7>`; `left <id> <rule> <path>:<line>: <keyword> <name> declared in <a>, <b>` or `… declared in another crate: <file>`; `kept <id> <rule> <path>:<line>: open ticket <ticket> builds it`; `close <decision>: <reason>`; then `totals: follow F, withdraw W, left L, kept K, close C`. An owned item prints as `<keyword> <owner>::<name>`.
+- **When it runs.** Recommended: one step at the two places that turn a path into work, and the command that runs it alone, as the withdrawal step is today.
+  - `style_proposals.py follow --repo <style checkout> --proposals <folder> [--dry-run]` runs it on every unfiled and filed finding. The dry run uses `preview_ledger`, prints the same lines and writes nothing. It exits 1 when it left a finding or skipped a decision.
+  - `file` runs it first, before the withdrawal step, so filing never puts a moved or gone site in a decision. Its `left` lines do not change `file`'s exit code; skipped decisions do, as today.
+  - Refill (`style_plan._select_phase`, the decision loop) runs it on the decision's filed findings with no build ticket before it sorts them by file. Followed findings ticket at their new path. Withdrawn and left findings are not ticketed; a left finding prints `waiting <decision>: <id> declared in <n> files`. Phase 20's two waives (`<path> is not in synced commit`, `site moved to`) apply only to findings the step could not read. Refill closes the decision when nothing is left, as it does after its waives.
+  - Not at `reopen`: it reads built findings, which this step never reads; its `cannot check` line already hands a moved built rename to a person.
+- **No person override.** A `left` finding stays as it is. A person waives it (`held waive`) or changes the code so one file declares it. No `--to` option is added until a real case needs one.
+- **Docs.** `docs/style_production.md`: a paragraph after "Filing first withdraws …" for the step, its lines, the `follow` command and dry run, and the `held list` details; change the refill paragraph ("Refill waives a finding whose file is not in the synced commit …") to say the step runs first. `commands/showrunner/proposal.md`: one sentence after the withdraw sentence naming `follow` and `--dry-run`.
+
+**Tests** (each fails without the change; no trivial tests):
+- `test_declarations.py`: a field line, a `#[derive]` line and a doc-comment line of `pub struct Parent { … }` all read `struct Parent`; a method line in `impl Display for App` reads `fn App::fmt`; a `use` line and an `impl` header line read `NoDeclarationAtLine`; `struct X` in `mod a { … }` and at a file's top level are the same declaration.
+- Moved, old file kept: a filed qualified rename `Parent::old -> Parent::new`, then a commit moves `struct Parent` to `b.rs` and sets the tip. `follow` moves the row to `b.rs` at the field's line, records `followed from a.rs:<line> at <tip7>` (`held list`, `--json`), refreshes the decision's `Site:` line, and `Ledger.applied_check` then returns `RenameNotApplied("…/b.rs")`.
+- Moved, old file deleted: refill on an approved decision tickets the finding at the new file; it is not waived.
+- A second `follow` after a follow prints no line (it reads at the follow's commit).
+- Gone (the cargo-liner shape): two restructure findings at `struct CratesIoInfo` in one approved decision; a commit removes the struct and adds `CratesIoRelease` in another file. Both are withdrawn with `declaration gone at <tip7>`, and the decision closes with `nothing left to build: withdrawn: <id> (declaration gone at <tip7>), <id> (…)`.
+- Unfiled and gone: withdrawn with `NoDecision`; the next `file` does not file it; `--json` gives `proposal: ""`.
+- Several: the struct is declared in two other files: a `left` line, the row is unchanged, `follow` exits 1, and refill leaves it out of the ticket with the `waiting` line.
+- Kept: a finding with an assigned build ticket prints `kept` and is unchanged.
+- Read commit not in the synced tip: no line, the row is unchanged.
+- Dry run: the same lines; the ledger and the decision file are unchanged.
+- A decision with no generated body: `skipped` line, its findings unchanged, another decision's finding follows, exit 1.
+- `hold` of the same rule, new path, text and blob after a follow returns the followed finding.
+- Migration 17: a version 16 ledger opens at 17 and its rows read `NotFollowed`.
+
+**Files:**
+- `scripts/style/declarations.py`
+- `scripts/style/test_declarations.py`
+- `scripts/style/style_ledger.py`
+- `scripts/style/test_style_ledger.py`
+- `scripts/style/style_proposals.py`
+- `scripts/style/test_style_proposals.py`
+- `scripts/style/style_plan.py`
+- `scripts/style/test_style_plan.py`
+- `docs/style_production.md`
+- `commands/showrunner/proposal.md`
+
+**Workers:** 1 writer.
+
+**Constraints from prior phases:** phase 20's refill waives (`MovedSites`, missing file) stay for findings the step cannot read. Phase 24's migration 15 `duplicate_of` and `WithdrawnBy`; phase 26's migration 16 `unwaived_by`, so this is migration 17. Phase 22: a refreshed decision keeps the parent its own `Parent:` line names. Phase 25's held-cell skip groups findings by `(rule, path)` and reads followed paths with no change. The ticket gate does not write the ledger.
+
+**Acceptance gate:** the follow, withdraw, left and kept cases above pass, and each refusal leaves the ledger and the decision files unchanged. From the worktree root, in the foreground, read the last line of each:
+- `~/.claude/scripts/lib/py -m unittest discover -s /home/natepiano/worktrees/claude-build-followups-style/scripts/style -p 'test_style_ledger.py'`
+- `~/.claude/scripts/lib/py -m unittest discover -s /home/natepiano/worktrees/claude-build-followups-style/scripts/style -p 'test_style_plan*.py'`
+- `~/.claude/scripts/lib/py -m unittest discover -s /home/natepiano/worktrees/claude-build-followups-style/scripts/style -p 'test_style_proposals.py'`
+- `~/.claude/scripts/lib/py -m unittest discover -s /home/natepiano/worktrees/claude-build-followups-style/scripts/style -p 'test_declarations.py'`
+- `basedpyright -p /home/natepiano/worktrees/claude-build-followups-style` on each changed `.py` file: `0 errors, 0 warnings`.
+- `merge_gate.py --tests-only` green on a frozen copy.

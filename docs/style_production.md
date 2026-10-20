@@ -450,6 +450,30 @@ The dry run prints the same lines and writes nothing. A decision that it cannot
 close or refresh gets a `skipped <issue>: <reason>` line, the other decisions
 go on, and `withdraw` exits 1 as `file` does.
 
+Before that, filing reads the declaration of each unfiled and filed finding of
+a `.rs` file. The declaration is the item that holds the finding's line at the
+commit it was judged at, or at its last follow: its keyword, its name and the
+impl or trait it is in. The step reads only a finding whose commit is in the
+synced commit. When that file at the synced commit no longer declares the
+item, the step searches every Rust file. One other file: the finding follows it
+to the line with the same text in the item, else the item's first line, and
+keeps its id. No file: the finding is withdrawn,
+with no decision when it was unfiled. Two or more files, or a filed finding's
+file in another crate: the finding stays as it is for a person to waive or fix
+in the code. A finding that an open ticket builds is kept. The step prints
+`follow <finding> <rule> <path>:<line> -> <path>:<line>: <keyword> <name>`,
+`withdraw … declaration gone at <commit>`, `left … declared in <files>` or
+`left … declared in another crate: <file>`, `kept …: open ticket <ticket> builds
+it`, a `close` line per decision and a `totals` line. A decision that it changes
+refreshes its sites, and one with no finding left closes. Each run refreshes
+every open decision that holds a followed finding, so a rerun completes a run
+that stopped before its refresh.
+`style_proposals.py follow --repo <style checkout> --proposals <folder>
+[--dry-run]` runs this step alone; it exits 1 when it leaves a finding or skips a
+decision. `held list` shows `followed from <path>:<line> at <commit>` for a
+followed finding, and `--json` adds `followed_from`, `followed_at` and
+`declaration_gone_at`.
+
 One style decision covers one rule and crate under one rule blob. An answer
 also covers later findings under that rule text: a declined decision waives
 them with its stored words, and `file` prints
@@ -471,8 +495,14 @@ other rename only in its own file, and to hold it when other files use its old
 name.
 Other findings stay held. Package checks still run. The parent schedules
 changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
-Refill waives a finding whose file is not in the synced commit, and prints the
-file and the commit. It also waives a finding whose one-line site text left its
+Refill first runs the declaration step once, on the findings of all approved
+decisions, so a finding tickets at the file its declaration moved to. A finding
+that the step leaves gets `waiting <decision>: <finding> declared in <n> files`
+or `waiting <decision>: <finding> declared in another crate: <file>`. A decision
+that the step skips gets `waiting <decision>: skipped by the declaration step`,
+and refill writes none of its findings. For a finding
+that the step cannot read, refill waives it when its file is not in the synced
+commit, and prints the file and the commit. It also waives a finding whose one-line site text left its
 file and moved into exactly one file that gained the line since the finding was
 judged, and prints both files and the commit. When no finding of the decision
 is left to build, refill closes it. Refill does not assign a queued proposal ticket that was

@@ -27,6 +27,15 @@ from approved_renames import AppliedInCode, Folder, NoAppliedCheck, RenameNotApp
 import style_plan
 import style_rules
 import berth_board
+import declarations
+
+
+PARENT_FILE = "crates/alpha/src/a.rs"
+MOVED_FILE = "crates/alpha/src/b.rs"
+TWIN_FILE = "crates/alpha/src/c.rs"
+PARENT = "pub struct Parent {\n    old: u32,\n}\n"
+# The same declaration as PARENT: an inline module is not part of it.
+TWIN = "#[cfg(test)]\nmod tests {\n    struct Parent {\n        old: u32,\n    }\n}\n"
 
 
 class StatusCell(TypedDict):
@@ -612,7 +621,8 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("INSERT INTO held_findings SELECT ?,rule,path,line,text,kind,before,after,rule_blob,ticket,"
                                    + "state,proposal,created_at,updated_at,build_ticket,moved_from,withdrawn_by,person_read_by,"
-                                   + "duplicate_of,unwaived_by FROM held_findings WHERE finding_id=?", (twin, ids[1]))
+                                   + "duplicate_of,unwaived_by,followed_from,followed_from_line,followed_at,declaration_gone_at FROM held_findings "
+                                   + "WHERE finding_id=?", (twin, ids[1]))
         before = self.held_rows(ledger.database)
         for name, error in (
             (ids[1], f"{ids[1]}: cannot unwaive a filed finding"),
@@ -747,7 +757,7 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual(finding.state, style_ledger.Filed(issue))
             self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn")), ())
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (16,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
             self.assertEqual(connection.execute("SELECT withdrawn_by FROM held_findings").fetchone(), (0,))
 
     def test_person_read_migration_fourteen_keeps_version_thirteen_findings_not_read_by_a_person(self) -> None:
@@ -768,7 +778,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.reading), (style_ledger.Built(issue), style_ledger.NotReadByPerson()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (16,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
             self.assertEqual(connection.execute("SELECT person_read_by FROM held_findings").fetchone(), ("",))
 
     def test_duplicate_migration_fifteen_keeps_version_fourteen_withdrawals_by_their_exception(self) -> None:
@@ -789,7 +799,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual(finding.state, style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (16,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
             self.assertEqual(connection.execute("SELECT withdrawn_by,duplicate_of FROM held_findings").fetchone(), (7, ""))
 
     def test_unwaive_migration_sixteen_keeps_version_fifteen_waived_findings_not_unwaived(self) -> None:
@@ -810,8 +820,138 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.waive_undo), (style_ledger.Waived(), style_ledger.NoWaiveUndo()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (16,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
             self.assertEqual(connection.execute("SELECT unwaived_by FROM held_findings").fetchone(), ("",))
+
+    def test_follow_migration_seventeen_keeps_version_sixteen_findings_not_followed(self) -> None:
+        rule = self.rule("read")
+        database = self.root / "version-sixteen.sqlite"
+        issue = self.root / "decision.md"
+        with closing(sqlite3.connect(database)) as connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number <= 16:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (16)")
+            _ = connection.execute("INSERT INTO held_findings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                                   ("legacy", rule, self.sources[0], 2, "change", "rename", "old", "new", self.blob(rule),
+                                    "read-1", "withdrawn", str(issue), "created", "updated", "", "", 7, "", "", ""))
+            connection.commit()
+        with style_ledger.Ledger(self.repo, database) as ledger:
+            finding, = ledger.proposal_findings(issue)
+            self.assertEqual((finding.state, finding.follow),
+                             (style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)), style_ledger.NotFollowed()))
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
+            self.assertEqual(connection.execute("SELECT followed_from,followed_from_line,followed_at,declaration_gone_at "
+                                                + "FROM held_findings").fetchone(), ("", 0, "", ""))
+
+    def test_hold_of_a_followed_finding_site_returns_the_followed_finding(self) -> None:
+        rule, issue, ids = self.decision_findings()
+        ledger = self.ledger()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET path=?,line=7,followed_from=?,followed_from_line=1,followed_at=? "
+                                   + "WHERE finding_id=?", (self.sources[2], self.sources[0], self.initial_tip, ids[0]))
+        count = len(ledger.held_findings(style_ledger.AllHeldFindings()))
+        held = ledger.hold(rule, self.sources[2], 8, "required change", "rename", "Outcome::Old", "Outcome::New",
+                           self.blob(rule), "read-2")
+        self.assertEqual((held.finding_id, held.state, held.line), (ids[0], style_ledger.Filed(issue), 7))
+        self.assertEqual(len(ledger.held_findings(style_ledger.AllHeldFindings())), count)
+
+    def commit_tip(self, ledger: style_ledger.Ledger, files: dict[str, str | None]) -> str:
+        """Write each file, or remove it for None, commit on main and sync the ledger there."""
+        for path, text in files.items():
+            if text is None:
+                (self.repo / path).unlink()
+            else:
+                self.write(path, text)
+        tip = self.commit("Move declarations")
+        ledger.set_tip(tip)
+        return tip
+
+    def judge_parent(self, ledger: style_ledger.Ledger, lines: tuple[tuple[int, str], ...]) -> tuple[str, tuple[str, ...]]:
+        """Filed renames of Parent::old in a.rs that a dropped read ticket judged at the head of main."""
+        rule = self.rule("names")
+        ticket = f"judge-{len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
+        ledger.ticket_add(ticket, "judge", "read", "names", "crates/alpha", [PARENT_FILE], [rule])
+        ledger.ticket_assign(ticket, "main")
+        _ = ledger.ticket_base(ticket)
+        findings = tuple(ledger.hold(rule, PARENT_FILE, line, text, "rename", "Parent::old", "Parent::new", self.blob(rule), ticket)
+                         for line, text in lines)
+        ledger.ticket_drop(ticket)
+        for finding in findings:
+            ledger.file_held(finding.finding_id, self.root / "decision.md")
+        return rule, tuple(finding.finding_id for finding in findings)
+
+    def test_hold_after_a_follow_returns_the_followed_finding_only_for_the_same_change(self) -> None:
+        ledger = self.ledger()
+        other = "pub struct Other {\n    old: u32,\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT, MOVED_FILE: other})
+        rule, (parent,) = self.judge_parent(ledger, ((2, "old: u32,"),))
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: other + "\n" + PARENT})
+        followed, = ledger.follow_declarations([parent]).outcomes
+        self.assertEqual((type(followed), ledger.held_findings(style_ledger.AllHeldFindings())[0].line), (style_ledger.DeclarationMoved, 6))
+        ledger.ticket_add("read-9", "read", "read", "names", "crates/alpha", [MOVED_FILE], [rule])
+        ledger.ticket_assign("read-9", "main")
+        # A read of b.rs holds a different change on the same text, then the followed change again.
+        held_other = ledger.hold(rule, MOVED_FILE, 2, "old: u32,", "rename", "Other::old", "Other::new", self.blob(rule), "read-9")
+        held_parent = ledger.hold(rule, MOVED_FILE, 6, "old: u32,", "rename", "Parent::old", "Parent::new", self.blob(rule), "read-9")
+        self.assertNotEqual(held_other.finding_id, parent)
+        self.assertEqual((held_other.before, held_other.line, held_other.state), ("Other::old", 2, style_ledger.Unfiled()))
+        self.assertEqual((held_parent.finding_id, held_parent.line), (parent, 6))
+        self.assertEqual(len(ledger.held_findings(style_ledger.AllHeldFindings())), 2)
+
+    def test_a_removed_declaration_whose_twin_was_already_in_another_file_is_withdrawn(self) -> None:
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT, TWIN_FILE: TWIN})
+        _, (parent,) = self.judge_parent(ledger, ((2, "old: u32,"),))
+        tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
+        removed, = ledger.follow_declarations([parent]).outcomes
+        self.assertIsInstance(removed, style_ledger.DeclarationRemoved)
+        finding, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((finding.path, finding.state),
+                         (PARENT_FILE, style_ledger.Withdrawn(self.root / "decision.md", style_ledger.DeclarationGone(tip))))
+
+    def test_a_move_to_one_file_follows_when_a_changed_third_file_already_declared_a_twin(self) -> None:
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT, TWIN_FILE: TWIN})
+        _, (parent,) = self.judge_parent(ledger, ((2, "old: u32,"),))
+        tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: PARENT, TWIN_FILE: TWIN + "fn helper() {}\n"})
+        moved, = ledger.follow_declarations([parent]).outcomes
+        self.assertIsInstance(moved, style_ledger.DeclarationMoved)
+        finding, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((finding.path, finding.line, finding.follow),
+                         (MOVED_FILE, 2, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip)))
+
+    def test_the_declaration_step_reads_each_commit_and_file_once_and_its_recheck_sees_another_writer(self) -> None:
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
+        _, (field, header) = self.judge_parent(ledger, ((2, "old: u32,"), (1, "pub struct Parent {")))
+        tip = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n", MOVED_FILE: PARENT})
+        judged = style_ledger.Ledger.judged_commit
+        written = False
+
+        def judged_with_another_writer(self_: style_ledger.Ledger, finding: style_ledger.HeldFinding) -> style_ledger.JudgedCommit | style_ledger.NoJudgedCommit:
+            nonlocal written
+            if not written:
+                written = True
+                # Another writer moves the field finding's line after the plan read its row, before the write lock.
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute("UPDATE held_findings SET line=3,text='}' WHERE finding_id=?", (field,))
+            return judged(self_, finding)
+
+        with (mock.patch.object(style_ledger, "read_declarations", wraps=declarations.read_declarations) as reads,
+              mock.patch.object(subprocess, "run", wraps=subprocess.run) as runs,
+              mock.patch.object(style_ledger.Ledger, "judged_commit", judged_with_another_writer)):
+            outcomes = ledger.follow_declarations([field, header]).outcomes
+        resolves = [call for call in runs.call_args_list if "--quiet" in cast(tuple[list[str]], call.args)[0]]
+        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved] * 2)
+        # One judged commit, and each of a.rs and b.rs at the judged commit and at the tip, across two findings and
+        # four readings: a plan, its refused recheck, a plan and its recheck.
+        self.assertEqual((len(resolves), reads.call_count), (1, 4))
+        rows = {finding.finding_id: (finding.path, finding.line, finding.follow) for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+        self.assertEqual(rows[field], (MOVED_FILE, 3, style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
+        self.assertEqual(rows[header][:2], (MOVED_FILE, 1))
 
     def test_withdraw_duplicates_is_idempotent_refuses_an_open_ticket_and_the_held_list_names_the_duplicate(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -1129,7 +1269,7 @@ class StyleLedgerTests(unittest.TestCase):
                 rows = cast(list[tuple[str, str, str]], connection.execute(
                     "SELECT path,declared_scope,verdict_detail FROM judgments ORDER BY id").fetchall())
                 version = cast(tuple[int], connection.execute("SELECT version FROM schema_version").fetchone())
-            self.assertEqual(version, (16,))
+            self.assertEqual(version, (17,))
             self.assertEqual(rows, [(path, "rule", "original detail") for path in self.sources[:2]])
             self.write(self.sources[1], "pub fn sibling_changed() {}\n")
             ledger.set_tip(self.commit("Change sibling after migration"))
@@ -1370,6 +1510,10 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN person_read_by")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN duplicate_of")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN unwaived_by")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_from")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_from_line")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_at")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN declaration_gone_at")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
             _ = connection.execute("UPDATE schema_version SET version=8")
@@ -1917,7 +2061,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(16,)])
+        self.assertEqual(versions, [(17,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -3354,7 +3498,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(16,)])
+        self.assertEqual(versions, [(17,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -3612,7 +3756,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(16,)])
+        self.assertEqual(versions, [(17,)])
 
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
@@ -3680,6 +3824,10 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN person_read_by")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN duplicate_of")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN unwaived_by")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_from")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_from_line")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN followed_at")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN declaration_gone_at")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
             _ = connection.execute("UPDATE schema_version SET version=6")

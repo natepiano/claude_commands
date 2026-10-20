@@ -29,6 +29,7 @@ import rules as rule_catalog
 import style_rules
 from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
+from declarations import Declaration, DeclaredFile, DeclaredItem, moved_site_line, read_declarations
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
 CellState = Literal["current", "stale", "open", "awaiting merge"]
@@ -219,7 +220,14 @@ class DuplicateOf:
     finding_id: str
 
 
-WithdrawnBy = ExceptionVerdict | DuplicateOf
+@dataclass(frozen=True)
+class DeclarationGone:
+    """No file at the synced commit declares the finding's subject any more."""
+
+    commit: str
+
+
+WithdrawnBy = ExceptionVerdict | DuplicateOf | DeclarationGone
 
 
 def withdrawn_line(by: WithdrawnBy) -> str:
@@ -228,13 +236,20 @@ def withdrawn_line(by: WithdrawnBy) -> str:
             return f"judgment {by.judgment_id} exception"
         case DuplicateOf():
             return f"duplicate of {by.finding_id}"
+        case DeclarationGone():
+            return f"declaration gone at {by.commit[:7]}"
+
+
+@dataclass(frozen=True)
+class NoDecision:
+    """The finding was withdrawn while unfiled, before `file` put it in a decision."""
 
 
 @dataclass(frozen=True)
 class Withdrawn:
     """The finding left its decision, for the reason in by."""
 
-    proposal: Path
+    proposal: Path | NoDecision
     by: WithdrawnBy
 
 
@@ -392,6 +407,27 @@ WaiveUndo = NoWaiveUndo | WaiveUndoneBy
 
 
 @dataclass(frozen=True)
+class NotFollowed:
+    """The finding is at the path and line it was judged at."""
+
+
+@dataclass(frozen=True)
+class FollowedDeclaration:
+    """The finding's declaration moved to another file, and the finding followed it at commit. The record is the last move."""
+
+    from_path: str
+    from_line: int
+    commit: str
+
+
+FollowState = NotFollowed | FollowedDeclaration
+
+
+def followed_line(follow: FollowedDeclaration) -> str:
+    return f"followed from {follow.from_path}:{follow.from_line} at {follow.commit[:7]}"
+
+
+@dataclass(frozen=True)
 class RuleCandidate:
     ticket: str
     unit: str
@@ -417,6 +453,7 @@ class HeldFinding:
     build_ticket: NoBuildTicket | BuildTicket
     reading: PersonReading
     waive_undo: WaiveUndo
+    follow: FollowState
 
 
 def rule_changed_since_judged(finding: HeldFinding, definitions: Mapping[str, Rule]) -> bool:
@@ -475,6 +512,77 @@ class Withdrawal:
 
     withdrawn: tuple[WithdrawnFinding, ...]
     kept: tuple[KeptForBuild, ...]
+
+
+@dataclass(frozen=True)
+class DeclarationNotRead:
+    """The step does not read the finding: not a `.rs` path, no judged commit, a read commit outside the synced
+    tip, no named item at its line, or an unfiled finding of a ticket that is still open."""
+
+    finding: HeldFinding
+
+
+@dataclass(frozen=True)
+class DeclarationInPlace:
+    """The finding's file did not change since its read commit, or still declares its subject at the synced tip."""
+
+    finding: HeldFinding
+
+
+@dataclass(frozen=True)
+class DeclarationMoved:
+    """One other file declares the finding's subject at the synced tip; the finding follows it to path and line."""
+
+    finding: HeldFinding
+    declaration: Declaration
+    path: str
+    line: int
+
+
+@dataclass(frozen=True)
+class DeclarationRemoved:
+    """No file declares the finding's subject at the synced tip; the finding is withdrawn."""
+
+    finding: HeldFinding
+    declaration: Declaration
+
+
+@dataclass(frozen=True)
+class DeclaredInSeveralFiles:
+    """Two or more other files declare the finding's subject; a person picks, and the finding stays as it is."""
+
+    finding: HeldFinding
+    declaration: Declaration
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class DeclaredInAnotherCrate:
+    """The subject of a filed finding moved to a file in another crate. Its decision is per crate, so it stays."""
+
+    finding: HeldFinding
+    declaration: Declaration
+    path: str
+
+
+@dataclass(frozen=True)
+class KeptForOpenBuild:
+    """A finding the step would follow or withdraw, kept because a ticket that is not final builds it."""
+
+    finding: HeldFinding
+    ticket: str
+
+
+DeclarationOutcome = (DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved
+                      | DeclaredInSeveralFiles | DeclaredInAnotherCrate | KeptForOpenBuild)
+
+
+@dataclass(frozen=True)
+class DeclarationReading:
+    """Where each finding's declaration is at the synced tip, one outcome per finding read, in the order given."""
+
+    tip: str
+    outcomes: tuple[DeclarationOutcome, ...]
 
 
 @dataclass(frozen=True)
@@ -687,10 +795,12 @@ class RepositoryTip:
     commit: str
     tree: str
     blobs: dict[str, str]
+    # Deepest first, so the first that holds a path is its innermost crate.
     crate_dirs: tuple[str, ...]
     rust_files: tuple[str, ...]
 
     def crate(self, path: str) -> str:
+        """The innermost crate directory that holds path, as a decision's crate is."""
         return next((directory for directory in self.crate_dirs if _under(path, directory)), ".")
 
 
@@ -938,6 +1048,14 @@ MIGRATIONS = {
     15: "ALTER TABLE held_findings ADD COLUMN duplicate_of TEXT NOT NULL DEFAULT '';",
     # The person who undid the finding's last waive; '' while none did.
     16: "ALTER TABLE held_findings ADD COLUMN unwaived_by TEXT NOT NULL DEFAULT '';",
+    # Where the finding's declaration was before its last follow, and the synced commit of that follow; '' while it
+    # never followed. The synced commit at which no file declared it any more; '' while one does.
+    17: """
+        ALTER TABLE held_findings ADD COLUMN followed_from TEXT NOT NULL DEFAULT '';
+        ALTER TABLE held_findings ADD COLUMN followed_from_line INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE held_findings ADD COLUMN followed_at TEXT NOT NULL DEFAULT '';
+        ALTER TABLE held_findings ADD COLUMN declaration_gone_at TEXT NOT NULL DEFAULT '';
+    """,
 }
 
 
@@ -950,6 +1068,13 @@ class Ledger:
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
+        # The declaration step's git reads, by commit: what each stored judged commit resolves to, the paths changed
+        # from a read commit to a tip, the `.rs` files at a tip that hold a name as a word, and a file's items at a
+        # commit. Rows are read fresh, so a recheck under the write lock sees another writer's changes.
+        self._resolved_commits: dict[str, JudgedCommit | NoJudgedCommit] = {}
+        self._changed_paths: dict[tuple[str, str], frozenset[str]] = {}
+        self._named_files: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
         try:
@@ -1587,6 +1712,15 @@ class Ledger:
         if kind not in ("rename", "type", "restructure") or line < 1:
             raise LedgerError("held finding requires a valid kind and positive line")
         finding_id = hashlib.sha256(json.dumps((rule, path, line, text, rule_blob), separators=(",", ":")).encode()).hexdigest()[:16]
+        if not self._connection.execute("SELECT 1 FROM held_findings WHERE finding_id=?", (finding_id,)).fetchone():
+            # A followed finding keeps the id of its first site. A ticket that reads its new file holds the same change
+            # again, so that change returns the followed finding, the one with the nearest line.
+            followed = cast(list[tuple[str, int]], self._connection.execute(
+                "SELECT finding_id,line FROM held_findings WHERE rule=? AND path=? AND text=? AND kind=? AND before=? AND after=? "
+                + "AND rule_blob=? AND followed_at!='' AND state IN ('unfiled','filed')", (rule, path, text, kind, before, after, rule_blob),
+            ).fetchall())
+            if followed:
+                return self._held(min(followed, key=lambda row: (abs(row[1] - line), row[0]))[0])
         now = _now()
         with self._connection:
             _ = self._connection.execute(
@@ -1596,8 +1730,9 @@ class Ledger:
         return self._held(finding_id)
 
     def _held(self, finding_id: str) -> HeldFinding:
-        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str]], self._connection.execute(
-            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by,person_read_by,duplicate_of,unwaived_by FROM held_findings WHERE finding_id=?", (finding_id,),
+        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str, str, int, str, str]], self._connection.execute(
+            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by,person_read_by,duplicate_of,unwaived_by,"
+            + "followed_from,followed_from_line,followed_at,declaration_gone_at FROM held_findings WHERE finding_id=?", (finding_id,),
         ).fetchall())
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
@@ -1611,21 +1746,26 @@ class Ledger:
             case "built":
                 state = Built(Path(row[11]))
             case "withdrawn":
-                state = Withdrawn(Path(row[11]), DuplicateOf(row[15]) if row[15] else ExceptionVerdict(row[13]))
+                state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
+                                  DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20] else ExceptionVerdict(row[13]))
             case "unfiled":
                 state = Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
-                           ReadByPerson(row[14]) if row[14] else NotReadByPerson(), WaiveUndoneBy(row[16]) if row[16] else NoWaiveUndo())
+                           ReadByPerson(row[14]) if row[14] else NotReadByPerson(), WaiveUndoneBy(row[16]) if row[16] else NoWaiveUndo(),
+                           FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed())
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
         rows = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT checkpoint,base FROM tickets WHERE id=?", (finding.ticket,),
         ).fetchall())
         for commit in (commit for commit in (rows[0] if rows else ()) if commit):
-            resolved = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
-                                      capture_output=True, text=True, check=False)
-            if not resolved.returncode:
-                return JudgedCommit(resolved.stdout.strip())
+            if commit not in self._resolved_commits:
+                resolved = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
+                                          capture_output=True, text=True, check=False)
+                self._resolved_commits[commit] = NoJudgedCommit() if resolved.returncode else JudgedCommit(resolved.stdout.strip())
+            judged = self._resolved_commits[commit]
+            if isinstance(judged, JudgedCommit):
+                return judged
         return NoJudgedCommit()
 
     def held_findings(self, selection: AllHeldFindings | HeldFindingsInState | UnfiledFindingsFromOpenTickets) -> tuple[HeldFinding, ...]:
@@ -1919,6 +2059,129 @@ class Ledger:
                 _ = self._connection.executemany(
                     "UPDATE held_findings SET state='withdrawn',withdrawn_by=?,updated_at=? WHERE finding_id=?",
                     [(item.verdict.judgment_id, now, item.finding.finding_id) for item in plan.withdrawn],
+                )
+            return plan
+
+        return retry_on_change(attempt)
+
+    def _changed_since(self, commit: str, tip: str) -> frozenset[str]:
+        key = (commit, tip)
+        if key not in self._changed_paths:
+            changed = _git(self.repo, "diff", "--no-renames", "--name-only", "-z", commit, tip)
+            self._changed_paths[key] = frozenset(path for path in changed.split("\0") if path)
+        return self._changed_paths[key]
+
+    def _files_naming(self, tip: str, name: str) -> tuple[str, ...]:
+        """The `.rs` files at tip that hold name as a whole word."""
+        key = (tip, name)
+        if key not in self._named_files:
+            result = subprocess.run(["git", "-C", str(self.repo), "grep", "-l", "-z", "-w", "-F", "-e", name, tip, "--", "*.rs"],
+                                    capture_output=True, text=True, check=False)
+            # git grep exits 1 when no file matches.
+            if result.returncode not in (0, 1):
+                raise CheckCouldNotRun(result.stderr.strip() or f"git grep {name} {tip} failed")
+            # Each match reads `<tip>:<path>`.
+            self._named_files[key] = tuple(entry.removeprefix(f"{tip}:") for entry in result.stdout.split("\0") if entry)
+        return self._named_files[key]
+
+    def _declared_file(self, commit: str, path: str) -> DeclaredFile:
+        """The items of path at commit. A path that is not a file there reads as no text, so it declares no item."""
+        key = (commit, path)
+        if key not in self._declared_files:
+            content = self._file_at(commit, path)
+            self._declared_files[key] = read_declarations(content.decode(errors="replace") if isinstance(content, bytes) else "")
+        return self._declared_files[key]
+
+    def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str]) -> DeclarationOutcome:
+        if not isinstance(finding.state, (Unfiled, Filed)) or PurePosixPath(finding.path).suffix != ".rs":
+            return DeclarationNotRead(finding)
+        if isinstance(finding.state, Unfiled):
+            judging = cast(list[tuple[TicketState]], self._connection.execute(
+                "SELECT state FROM tickets WHERE id=?", (finding.ticket,)).fetchall())
+            if judging and judging[0][0] in ("assigned", "checkpointed"):
+                return DeclarationNotRead(finding)
+        # A followed finding's path and line are at the commit of its last follow.
+        if isinstance(finding.follow, FollowedDeclaration):
+            read = finding.follow.commit
+        else:
+            judged = self.judged_commit(finding)
+            if isinstance(judged, NoJudgedCommit):
+                return DeclarationNotRead(finding)
+            read = judged.commit
+        if not self._is_ancestor(read, tip.commit):
+            return DeclarationNotRead(finding)
+        changed = self._changed_since(read, tip.commit)
+        if finding.path not in changed:
+            return DeclarationInPlace(finding)
+        old_file = self._declared_file(read, finding.path)
+        old = old_file.declaration_at(finding.line)
+        if not isinstance(old, DeclaredItem):
+            return DeclarationNotRead(finding)
+        declaration = old.declaration
+        if any(item.declaration == declaration for item in self._declared_file(tip.commit, finding.path).declared_items):
+            return DeclarationInPlace(finding)
+        # A file the declaration moved to gained it since the read commit; one that already declared it holds a
+        # different item of the same identity.
+        found: dict[str, DeclaredItem] = {}
+        for path in self._files_naming(tip.commit, declaration.name):
+            if path == finding.path or path not in rust_files or path not in changed:
+                continue
+            if any(item.declaration == declaration for item in self._declared_file(read, path).declared_items):
+                continue
+            item = next((item for item in self._declared_file(tip.commit, path).declared_items if item.declaration == declaration), None)
+            if item is not None:
+                found[path] = item
+        if len(found) > 1:
+            return DeclaredInSeveralFiles(finding, declaration, tuple(sorted(found)))
+        outcome: DeclarationMoved | DeclarationRemoved = DeclarationRemoved(finding, declaration)
+        for path, item in found.items():
+            if isinstance(finding.state, Filed) and tip.crate(path) != tip.crate(finding.path):
+                return DeclaredInAnotherCrate(finding, declaration, path)
+            outcome = DeclarationMoved(finding, declaration, path,
+                                       moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
+        if isinstance(finding.build_ticket, BuildTicket):
+            ticket = self._ticket(finding.build_ticket.ticket)
+            if ticket["state"] not in FINAL_TICKET_STATES:
+                return KeptForOpenBuild(finding, ticket["id"])
+        return outcome
+
+    def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip) -> DeclarationReading:
+        rust_files = frozenset(tip.rust_files)
+        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files)
+                                                    for finding_id in finding_ids))
+
+    def declaration_reading(self, finding_ids: Iterable[str]) -> DeclarationReading:
+        """What follow_declarations writes for the findings; it writes nothing."""
+        return self._declaration_reading(tuple(finding_ids), self._synced_tip())
+
+    def follow_declarations(self, finding_ids: Iterable[str]) -> DeclarationReading:
+        """Move each finding whose declaration moved to one other file there, and withdraw each whose declaration is gone.
+
+        The plan comes before the write lock; if the synced tip or a row it read changes before the lock, the step
+        starts again. A git failure stops before any write.
+        """
+        ids = tuple(finding_ids)
+
+        def attempt() -> DeclarationReading:
+            tip = self._synced_tip()
+            plan = self._declaration_reading(ids, tip)
+            moves = [item for item in plan.outcomes if isinstance(item, DeclarationMoved)]
+            removals = [item for item in plan.outcomes if isinstance(item, DeclarationRemoved)]
+            if not moves and not removals:
+                return plan
+            with self._connection:
+                _ = self._connection.execute("BEGIN IMMEDIATE")
+                if self.synced_commit() != tip.commit or self._declaration_reading(ids, tip) != plan:
+                    raise ChangedBeforeLock("the findings or the synced tip changed while their declarations were read; rerun")
+                now = _now()
+                _ = self._connection.executemany(
+                    "UPDATE held_findings SET path=?,line=?,followed_from=?,followed_from_line=?,followed_at=?,updated_at=? WHERE finding_id=?",
+                    [(item.path, item.line, item.finding.path, item.finding.line, tip.commit, now, item.finding.finding_id)
+                     for item in moves],
+                )
+                _ = self._connection.executemany(
+                    "UPDATE held_findings SET state='withdrawn',declaration_gone_at=?,updated_at=? WHERE finding_id=?",
+                    [(tip.commit, now, item.finding.finding_id) for item in removals],
                 )
             return plan
 
@@ -2763,7 +3026,7 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
     result["build_ticket"] = finding.build_ticket.ticket if isinstance(finding.build_ticket, BuildTicket) else ""
     result["state"] = held_state_name(finding.state)
     if isinstance(finding.state, (Filed, Built, Withdrawn)):
-        result["proposal"] = str(finding.state.proposal)
+        result["proposal"] = str(finding.state.proposal) if isinstance(finding.state.proposal, Path) else ""
     if isinstance(finding.state, Withdrawn):
         # One of the two is set, as in the ledger row: the exception judgment, or the qualified finding duplicated.
         by = finding.state.by
@@ -2771,6 +3034,11 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
         result["duplicate_of"] = by.finding_id if isinstance(by, DuplicateOf) else ""
     result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
     result["unwaived_by"] = finding.waive_undo.by if isinstance(finding.waive_undo, WaiveUndoneBy) else ""
+    follow = finding.follow
+    result["followed_from"] = f"{follow.from_path}:{follow.from_line}" if isinstance(follow, FollowedDeclaration) else ""
+    result["followed_at"] = follow.commit if isinstance(follow, FollowedDeclaration) else ""
+    result["declaration_gone_at"] = (finding.state.by.commit if isinstance(finding.state, Withdrawn)
+                                     and isinstance(finding.state.by, DeclarationGone) else "")
     return result
 
 
@@ -2999,7 +3267,8 @@ def main() -> None:
                         print(json.dumps([_held_json(finding) for finding in findings], sort_keys=True))
                     else:
                         for finding in findings:
-                            details = ([withdrawn_line(finding.state.by)] if isinstance(finding.state, Withdrawn) else []) + (
+                            details = ([followed_line(finding.follow)] if isinstance(finding.follow, FollowedDeclaration) else []) + (
+                                [withdrawn_line(finding.state.by)] if isinstance(finding.state, Withdrawn) else []) + (
                                 [reading_line(finding.state, finding.reading)] if isinstance(finding.reading, ReadByPerson) else []) + (
                                 [f"unwaived by {finding.waive_undo.by}"] if isinstance(finding.waive_undo, WaiveUndoneBy) else [])
                             print("\t".join([finding.finding_id, finding.rule, f"{finding.path}:{finding.line}",
