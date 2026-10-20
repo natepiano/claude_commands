@@ -1522,6 +1522,12 @@ def made_before_decisions(ticket_id: str) -> str:
     return f"{ticket_id}: made before decisions; drop it with style_ledger.py ticket drop, then run migrate"
 
 
+def _unbuilt_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
+    """The decision's filed findings that no build ticket holds."""
+    return tuple(finding for finding in ledger.proposal_findings(issue)
+                 if isinstance(finding.state, style_ledger.Filed) and isinstance(finding.build_ticket, style_ledger.NoBuildTicket))
+
+
 def _select_phase(
     ledger: style_ledger.Ledger, unit: str, branch: str, plan: Path, repo: Path,
     doc: Path, text: str, scope: PilotScope, busy: BusyFiles, first_files: frozenset[str],
@@ -1564,23 +1570,46 @@ def _select_phase(
     decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
     closed = False
     sites = style_proposals.MovedSites(ledger, tip)
+    unbuilt = {issue.path: _unbuilt_findings(ledger, issue.path) for issue in decisions if issue.value("style_rule") in definitions}
+    # The declaration step runs once for the proposals folder that holds every decision, before the loop, so a finding
+    # whose declaration moved tickets at its new file and one whose declaration is gone is withdrawn. Each refresh
+    # keeps the parent its decision names, and the step renumbers after its own closes.
+    follow = (style_proposals.run_follow(style_proposals.decision_writer(ledger, next(iter(unbuilt)).parent, ""),
+                                         (finding for findings in unbuilt.values() for finding in findings), dry_run=False)
+              if any(unbuilt.values()) else style_proposals.FollowRun(style_ledger.DeclarationReading(tip, ()), (), ()))
+    outcomes = {outcome.finding.finding_id: outcome for outcome in follow.reading.outcomes}
     for issue in decisions:
         rule = issue.value("style_rule")
         definition = definitions.get(rule)
         if definition is None:
             print(f"waiting {issue.path}: rule {rule} not in the catalog")
             continue
-        findings = tuple(finding for finding in ledger.proposal_findings(issue.path)
-                         if isinstance(finding.state, style_ledger.Filed)
-                         and isinstance(finding.build_ticket, style_ledger.NoBuildTicket))
-        if not findings:
+        findings = unbuilt[issue.path]
+        if not findings or issue.path in follow.closes:
             continue
-        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in findings})))
-        moved = sites.destinations(tuple(finding for finding in findings if finding.path in present))
+        # The step wrote none of a skipped decision's findings, so phase 20's waives must not write them either.
+        if issue.path in follow.skipped:
+            print(f"waiting {issue.path}: skipped by the declaration step")
+            continue
+        own = tuple(outcomes[finding.finding_id] for finding in findings)
+        left: dict[str, style_ledger.DeclaredInSeveralFiles | style_ledger.DeclaredInAnotherCrate] = {
+            outcome.finding.finding_id: outcome for outcome in own
+            if isinstance(outcome, (style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate))}
+        for finding_id, outcome in left.items():
+            where = (f"declared in {len(outcome.paths)} files" if isinstance(outcome, style_ledger.DeclaredInSeveralFiles)
+                     else f"declared in another crate: {outcome.path}")
+            print(f"waiting {issue.path}: {finding_id} {where}")
+        read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
+        withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
+        findings = tuple(finding for finding in _unbuilt_findings(ledger, issue.path) if finding.finding_id not in left)
+        # Phase 20's waives read only the findings whose declaration the step could not read.
+        unread_findings = tuple(finding for finding in findings if finding.finding_id not in read)
+        present = style_proposals.files_at(repo, tip, tuple(sorted({finding.path for finding in unread_findings})))
+        moved = sites.destinations(tuple(finding for finding in unread_findings if finding.path in present))
         by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
         gone: dict[str, list[str]] = defaultdict(list)
         for finding in findings:
-            if finding.path not in present:
+            if finding.finding_id not in read and finding.path not in present:
                 gone[f"{finding.path} is not in synced commit {tip}"].append(finding.finding_id)
             elif finding.finding_id in moved:
                 gone[f"{finding.path} site moved to {moved[finding.finding_id]} in synced commit {tip}"].append(finding.finding_id)
@@ -1591,7 +1620,7 @@ def _select_phase(
         for words, finding_ids in sorted(gone.items()):
             _ = ledger.decline_findings(finding_ids, words)
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
-        if gone and style_proposals.close_finished_decision(ledger, issue.path):
+        if (gone or withdrew) and style_proposals.close_finished_decision(ledger, issue.path):
             closed = True
             continue
         outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}

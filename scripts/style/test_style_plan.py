@@ -2626,7 +2626,8 @@ class StylePlanTests(unittest.TestCase):
     def test_a_merge_that_moves_a_site_into_a_judged_file_stales_it_and_waives_the_moved_finding(self) -> None:
         rule = self.rule("read")
         target, source = self.sources[:2]
-        moved_text, kept_text = "pub fn moved_away() -> u32 { 1 }", "pub fn stays_here() -> u32 { 2 }"
+        # Macro calls name no item, so the declaration step cannot read them and phase 20's waive applies.
+        moved_text, kept_text = "moved_away!(1);", "stays_here!(2);"
         self.write(source, f"{moved_text}\n{kept_text}\n")
         self.commit_to_every_checkout()
         self.record(rule, target, self.tip)
@@ -2675,10 +2676,89 @@ class StylePlanTests(unittest.TestCase):
     def test_a_latin_1_file_among_the_changed_files_still_takes_the_moved_site(self) -> None:
         site, other, notes = *self.sources[:2], "crates/alpha/notes.txt"
         output, state = self.refill_after_site_merge(
-            {site: "pub fn moved() {}\npub fn value() {}\n", notes: "caf\u00e9\npub fn moved() {}\n".encode("latin-1")},
-            {site: "pub fn value() {}\n", other: "pub fn moved() {}\n", notes: "caf\u00e9s\npub fn moved() {}\n".encode("latin-1")})
+            {site: "moved!();\npub fn value() {}\n", notes: "caf\u00e9\nmoved!();\n".encode("latin-1")},
+            {site: "pub fn value() {}\n", other: "moved!();\n", notes: "caf\u00e9s\nmoved!();\n".encode("latin-1")})
         self.assertIn(f"{site} site moved to {other} in synced commit {self.tip}\n", output)
         self.assertEqual(state, style_ledger.Waived())
+
+    def write_generated_body(self, issue: Path) -> None:
+        _ = issue.write_text(issue.read_text().replace("\n---\n", '\nproject: "[[sample]]"\n---\n', 1)
+                             + f"{proposal_issue.GENERATED_START}\nParent: parent\n{proposal_issue.GENERATED_END}\n")
+
+    def refill_after_declaration_move(self, after: dict[str, str | bytes], *,
+                                      generated_body: bool = True) -> tuple[Path, style_ledger.HeldFinding, str]:
+        """Files a type finding on a field of struct Parent in the first source, then removes that file, commits after
+        and refills. With a generated body the declaration step reads the finding; without one it skips the decision.
+        """
+        rule = self.rule("read")
+        site = self.sources[0]
+        self.commit_files({site: "pub struct Parent {\n    old: u32,\n}\n"})
+        issue, (finding,) = self.judged_findings(rule, ((site, 2, "old: u32,"),))
+        if generated_body:
+            self.write_generated_body(issue)
+        _ = self.git("rm", "-q", site)
+        self.commit_files(after)
+        return issue, finding, self.refill_decisions()
+
+    def refill_decisions(self) -> str:
+        """Refills with the proposal commands stubbed and a GitHub root for the rule links a decision refresh writes."""
+        with (mock.patch.object(style_proposals, "proposal_command"),
+              mock.patch.object(style_proposals, "github_rule_root", return_value=style_proposals.GitHubRuleRoot("example/nate_style", "main"))):
+            code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        return output
+
+    def test_decision_refill_tickets_a_finding_at_the_file_its_declaration_moved_to(self) -> None:
+        issue, finding, output = self.refill_after_declaration_move({"crates/alpha/src/parent.rs": "pub struct Parent {\n    old: u32,\n}\n"})
+        self.assertNotIn("waived", output)
+        followed, = self.ledger().proposal_findings(issue)
+        self.assertEqual((followed.finding_id, followed.path, followed.line, followed.state),
+                         (finding.finding_id, "crates/alpha/src/parent.rs", 2, style_ledger.Filed(issue)))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["kind"], ticket["files"], ticket["finding_ids"]),
+                         ("proposal", ["crates/alpha/src/parent.rs"], [finding.finding_id]))
+
+    def test_decision_refill_waits_on_a_decision_the_declaration_step_skipped_and_does_not_waive_its_finding(self) -> None:
+        issue, finding, output = self.refill_after_declaration_move(
+            {"crates/alpha/src/parent.rs": "pub struct Parent {\n    old: u32,\n}\n"}, generated_body=False)
+        self.assertIn(f"skipped {issue}: missing generated decision body\n", output)
+        self.assertIn(f"waiting {issue}: skipped by the declaration step\n", output)
+        self.assertNotIn("waived", output)
+        self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
+                         [(finding.path, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
+        self.assertEqual(frontmatter(issue)["status"], ["open"])
+
+    def test_decision_refill_follows_the_findings_of_every_approved_decision_before_it_tickets_one(self) -> None:
+        rule = self.rule("read")
+        first, second = self.sources[:2]
+        self.commit_files({first: "pub struct Parent {\n    old: u32,\n}\n", second: "pub struct Other {\n    old: u32,\n}\n"})
+        issue, (stays,) = self.judged_findings(rule, ((first, 2, "old: u32,"),))
+        self.write_generated_body(issue)
+        # A second approved decision, after the first in the folder, holds a finding in the second source.
+        later = issue.with_name("later.md")
+        _ = later.write_text(issue.read_text())
+        ledger = self.ledger()
+        ledger.ticket_add("modules-unit-2", "modules-unit", "read", "names", "crates/alpha", [second], [rule])
+        ledger.ticket_assign("modules-unit-2", "style/main")
+        _ = ledger.ticket_base("modules-unit-2")
+        ledger.ticket_drop("modules-unit-2")
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        moves = ledger.hold(rule, second, 2, "old: u32,", "type", "before", "after", blob, "modules-unit-2")
+        ledger.file_held(moves.finding_id, later)
+        _ = self.git("rm", "-q", second)
+        self.commit_files({"crates/alpha/src/moved.rs": "pub struct Other {\n    old: u32,\n}\n"})
+        self.assertNotIn("waived", self.refill_decisions())
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["finding_ids"], [stays.finding_id])
+        followed, = self.ledger().proposal_findings(later)
+        self.assertEqual((followed.finding_id, followed.path, followed.line), (moves.finding_id, "crates/alpha/src/moved.rs", 2))
+
+    def test_decision_refill_leaves_a_finding_declared_in_two_files_out_of_the_ticket(self) -> None:
+        parent = "pub struct Parent {\n    old: u32,\n}\n"
+        issue, finding, output = self.refill_after_declaration_move({"crates/alpha/src/one.rs": parent, "crates/alpha/src/two.rs": parent})
+        self.assertIn(f"waiting {issue}: {finding.finding_id} declared in 2 files\n", output)
+        self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
+                         [(finding.path, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
+        self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
 
     def test_decision_refill_after_a_merge_builds_only_the_unbuilt_findings(self) -> None:
         rule = self.rule("read")
