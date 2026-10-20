@@ -88,7 +88,8 @@ if name == "verify.sh":
 if (state / ("fail-" + name)).exists():
     raise SystemExit(1)
 if name == "basedpyright":
-    print("0 errors, 0 warnings, 0 notes")
+    print("0 errors, 0 warnings, 0 notes", flush=True)
+    print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
     raise SystemExit(3)
 '''
 
@@ -1615,6 +1616,27 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertFalse(history.has_code_merge("old-unit", "style hand-off"))
         self.assertEqual(history.last_handoff_for_child("old-unit"), history.entries[0])
         self.assertEqual(history.last_handoff_for_child("new-unit"), NoMerge())
+
+
+@final
+class TestPassedTests(unittest.TestCase):
+    VENV = "venv .venv subdirectory not found in venv path /checkout.\n"
+
+    def judge(self, status: int, stdout: str, stderr: str = "") -> bool:
+        result = subprocess.CompletedProcess(["basedpyright"], status, stdout, stderr)
+        return merge_checkpoint.test_passed(["/nix/bin/basedpyright", "scripts/buildlog"], result)
+
+    def test_clean_basedpyright_passes_with_trailing_venv_line_on_stderr(self) -> None:
+        self.assertTrue(self.judge(3, "0 errors, 0 warnings, 0 notes\n", self.VENV))
+
+    def test_basedpyright_with_errors_fails(self) -> None:
+        self.assertFalse(self.judge(1, "/checkout/a.py:1:1 - error: x\n2 errors, 0 warnings, 0 notes\n", self.VENV))
+        self.assertFalse(self.judge(3, "2 errors, 0 warnings, 0 notes\n", self.VENV))
+
+    def test_other_commands_pass_only_on_status_zero(self) -> None:
+        result = subprocess.CompletedProcess(["python3"], 3, "0 errors, 0 warnings, 0 notes\n", "")
+        self.assertFalse(merge_checkpoint.test_passed(["python3", "-m", "unittest"], result))
+        self.assertTrue(merge_checkpoint.test_passed(["python3"], subprocess.CompletedProcess(["python3"], 0, "", "")))
 
 
 if __name__ == "__main__":
