@@ -98,7 +98,8 @@ class StyleLedgerTests(unittest.TestCase):
                 f'[package]\nname = "{member}"\nversion = "0.1.0"\nedition = "2021"\n',
             )
         for source in self.sources:
-            self.write(source, "pub fn value() -> u32 { 1 }\n")
+            self.write(source, "pub fn value() -> u32 { 1 }\n" +
+                       ("mod a; mod b; mod c; mod other;\n" if source.endswith("src/lib.rs") else ""))
         self.write("vendor/third-party/src/lib.rs", "pub fn external() {}\n")
         self.write("crates/alpha/vendor/embedded.rs", "pub fn embedded() {}\n")
         self.write("README.md", "A sample workspace\n")
@@ -1207,6 +1208,14 @@ class StyleLedgerTests(unittest.TestCase):
     def built_finding(self, ledger: style_ledger.Ledger, path: str, before: str, after: str, *,
                       kind: style_ledger.FindingKind = "rename", line: int = 1) -> str:
         """A finding at path that its own dropped read ticket judged, filed to built.md and built."""
+        if kind == "rename" and (self.repo / path).is_file():
+            source = (self.repo / path).read_text().splitlines(keepends=True)
+            for spelling in (before, after):
+                if spelling not in source[line - 1]:
+                    source[line - 1] = source[line - 1].rstrip("\n") + f" const _: () = {{ {spelling}(); }};\n"
+            updated = "".join(source)
+            if updated != (self.repo / path).read_text():
+                _ = self.commit_tip(ledger, {path: updated})
         rule = self.rule("names")
         ticket = f"built-{len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
         ledger.ticket_add(ticket, "built", "read", "names", "/".join(path.split("/")[:2]), [path], [rule])
@@ -1596,6 +1605,9 @@ class StyleLedgerTests(unittest.TestCase):
         source = "use crate::one::nested::Trait as Alias;\nimpl Alias for Type {\n    fn old(&self) { 7 }\n}\n"
         _ = self.commit_tip(ledger, {
             PARENT_FILE: source,
+            "crates/alpha/src/lib.rs": "mod a; mod b; mod other; mod one; mod two;\n",
+            "crates/alpha/src/one.rs": "mod nested;\n",
+            "crates/alpha/src/two.rs": "mod nested;\n",
             "crates/alpha/src/one/nested.rs": "pub trait Trait { fn old() {} fn new() {} }\n",
             "crates/alpha/src/two/nested.rs": "pub use crate::other::Other as Trait;\n",
             "crates/alpha/src/other.rs": "pub trait Other { fn old() {} fn new() {} }\n",
@@ -1644,16 +1656,18 @@ class StyleLedgerTests(unittest.TestCase):
     def test_unsupported_alias_sources_keep_trait_identity_uncertain(self) -> None:
         for index, (prefix, trait) in enumerate((
             ("#[cfg(test)] use crate::b::Trait as Alias;\n", "Alias"),
-            ("fn imports() { use crate::b::Trait as Alias; }\n", "Alias"),
+            ("mod imports { use crate::b::Trait as Alias;\n", "Alias"),
             ("pub use crate::b::Trait as Alias;\n", "Alias"),
             ("use external::*;\n", "Alias"),
-            ("", "self::Alias"),
-            ("", "super::Alias"),
+            ("mod nested {\n", "self::Alias"),
+            ("mod nested {\n", "super::Alias"),
         )):
             with self.subTest(prefix=prefix, trait=trait):
                 ledger = style_ledger.Ledger(self.repo, self.root / f"aliases-{index}.db")
                 self.addCleanup(ledger.close)
                 source = prefix + f"impl {trait} for Type {{\n    fn old(&self) {{ 7 }}\n}}\n"
+                if prefix.startswith(("mod imports", "mod nested")):
+                    source += "}\n"
                 _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n"})
                 _, (finding_id,) = self.hold_parent(ledger, ((len(prefix.splitlines()) + 2, "7"),),
                                                      kind="restructure", before=prefix + trait)
@@ -1679,14 +1693,17 @@ class StyleLedgerTests(unittest.TestCase):
 
     def test_unsupported_imports_block_built_trait_declaration_fallback(self) -> None:
         for index, imported in enumerate(("#[cfg(test)] use crate::other::Other as Trait;",
-                         "fn imports() { use crate::other::Other as Trait; }",
+                         "mod imports { use crate::other::Other as Trait;",
                          "use external::*;", "pub use crate::other::Other as Trait;")):
             with self.subTest(imported=imported):
                 ledger = style_ledger.Ledger(self.repo, self.root / f"blocked-{index}.db")
                 self.addCleanup(ledger.close)
                 source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+                built_site = imported + "\npub fn caller() { Trait::old(); }\n"
+                if imported.startswith("mod imports"):
+                    built_site += "}\n"
                 _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n",
-                                           TWIN_FILE: imported + "\npub fn caller() { Trait::old(); }\n"})
+                                           TWIN_FILE: built_site})
                 _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), kind="restructure", before=imported)
                 _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new", line=2)
                 _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
@@ -1722,6 +1739,213 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertIsInstance(outcome, style_ledger.DeclarationRemoved)
         row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
         self.assertIsInstance(row.state, style_ledger.Withdrawn)
+
+    def test_a_test_module_glob_does_not_block_a_file_level_trait_impl(self) -> None:
+        for index, destination in enumerate((PARENT_FILE, MOVED_FILE)):
+            with self.subTest(destination=destination):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"module-glob-{index}.db")
+                self.addCleanup(ledger.close)
+                source = (
+                    "use crate::c::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n"
+                    "#[cfg(test)]\nmod tests { use super::*; }\n"
+                )
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub fn helper() {}\n",
+                                           TWIN_FILE: "pub trait Trait { fn method(&self); }\n"})
+                _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), kind="restructure")
+                changes: dict[str, str | None]
+                if destination == PARENT_FILE:
+                    changes = {PARENT_FILE: source + "pub fn unrelated() {}\n"}
+                else:
+                    changes = {PARENT_FILE: "pub fn unrelated() {}\n", MOVED_FILE: source}
+                tip = self.commit_tip(ledger, changes)
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                if destination == PARENT_FILE:
+                    self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                else:
+                    self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                    row, = ledger.held_findings(style_ledger.HeldFindingsInState("filed"))
+                    self.assertEqual((row.finding_id, row.path, row.line, row.state, row.follow),
+                                     (finding_id, destination, 3, style_ledger.Filed(self.root / "decision.md"),
+                                      style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
+
+    def test_a_block_import_of_the_trait_name_does_not_block_the_file_level_impl(self) -> None:
+        ledger = self.ledger()
+        source = (
+            "use other::Hittable;\nimpl Hittable<Target> for Pane {\n    fn method(&self) { 7 }\n}\n"
+            "#[cfg(test)]\nmod tests { use other::Hittable; }\n"
+        )
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((3, "7"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source + "pub fn unrelated() {}\n"})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_relative_trait_import_resolves_from_the_file_module(self) -> None:
+        cases = (
+            ("crates/alpha/src/nested/a.rs", "use super::Trait;", "crate::nested::Trait", "same file"),
+            ("crates/alpha/src/nested/a.rs", "use self::inner::Trait;", "crate::nested::a::inner::Trait", "same file"),
+            ("crates/alpha/src/nested/deeper/a.rs", "use super::super::Trait;", "crate::nested::Trait", "same file"),
+            ("crates/alpha/src/nested/mod.rs", "use self::Trait;", "crate::nested::Trait", "same file"),
+            ("crates/alpha/src/nested/a.rs", "use super::Trait;", "crate::nested::Trait", "move"),
+            ("crates/alpha/src/nested/a.rs", "use super::Trait;", "crate::different::Trait", "different trait"),
+            ("crates/alpha/src/nested/a.rs", "", "self::inner::Trait", "direct header"),
+            ("crates/alpha/src/nested/a.rs", "", "super::Trait", "direct header"),
+        )
+        for index, (path, imported, rooted, action) in enumerate(cases):
+            with self.subTest(path=path, imported=imported, action=action, rooted=rooted):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"relative-trait-{index}.db")
+                self.addCleanup(ledger.close)
+                trait = rooted if action == "direct header" else "Trait"
+                source = f"{imported}\nimpl {trait} for Type {{\n    fn method(&self) {{ 7 }}\n}}\n"
+                parents: dict[str, str | None] = {
+                    "crates/alpha/src/lib.rs": "mod nested;\n",
+                    "crates/alpha/src/nested/mod.rs": "mod a; mod b; mod deeper;\n",
+                    "crates/alpha/src/nested/deeper/mod.rs": "mod a;\n",
+                }
+                parents[path] = source
+                _ = self.commit_tip(ledger, parents)
+                _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), path=path, kind="restructure")
+                if action == "direct header":
+                    absolute = "crate::nested::a::inner::Trait" if rooted.startswith("self") else "crate::nested::Trait"
+                    after = source.replace(rooted, absolute)
+                else:
+                    after = source.replace(imported, f"use {rooted};")
+                destination = "crates/alpha/src/nested/b.rs" if action == "move" else path
+                changes: dict[str, str | None] = {destination: after}
+                if destination != path:
+                    changes[path] = "pub fn unrelated() {}\n"
+                tip = self.commit_tip(ledger, changes)
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                if action == "different trait":
+                    self.assertIsInstance(outcome, (style_ledger.TraitIdentityUncertain, style_ledger.DeclarationGoneFromFile))
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                elif action == "move":
+                    self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                    row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings())
+                               if row.finding_id == finding_id)
+                    self.assertEqual((row.path, row.line, row.state, row.follow),
+                                     (destination, 3, style_ledger.Filed(self.root / "decision.md"),
+                                      style_ledger.FollowedDeclaration(path, 3, tip)))
+                else:
+                    self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_block_and_relative_import_limits_keep_the_finding(self) -> None:
+        cases = (
+            (PARENT_FILE, "#[cfg(test)]\nmod tests {\nuse super::*;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 5),
+            (PARENT_FILE, "use crate::c::*;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            (PARENT_FILE, "#[cfg(test)] use crate::c::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            (PARENT_FILE, "use super::super::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            ("crates/alpha/examples/a.rs", "use self::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            (PARENT_FILE, "mod tests {\nuse crate::c::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 4),
+            (PARENT_FILE, "mod tests {\nimpl self::Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 3),
+            (PARENT_FILE, "fn container() {\nuse crate::c::*;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 4),
+        )
+        for index, (path, source, line) in enumerate(cases):
+            with self.subTest(path=path, source=source):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"trait-import-limit-{index}.db")
+                self.addCleanup(ledger.close)
+                _ = self.commit_tip(ledger, {path: source, TWIN_FILE: "pub trait Trait {}\n"})
+                _, (finding_id,) = self.hold_parent(ledger, ((line, "7"),), path=path, kind="restructure")
+                _ = self.commit_tip(ledger, {path: source + "pub fn unrelated() {}\n"})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_same_line_built_qualifiers_keep_enclosing_aliases_uncertain(self) -> None:
+        sites = (
+            "mod imports { use crate::other::Other as Trait; pub fn caller() { Trait::old(); } }",
+            "pub fn caller() { use crate::other::Other as Trait; Trait::old(); }",
+            "pub fn caller() { Trait::old(); } mod imports { use crate::other::Other as Trait; pub fn caller() { Trait::old(); } }",
+        )
+        for index, site in enumerate(sites):
+            with self.subTest(site=site):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"same-line-{index}.db")
+                self.addCleanup(ledger.close)
+                source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n",
+                                           TWIN_FILE: site + "\n"})
+                _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), kind="restructure")
+                _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new")
+                _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_unproved_module_layouts_keep_relative_trait_findings_unchanged(self) -> None:
+        root = "crates/alpha/src/"
+        cases: tuple[tuple[str, str, dict[str, str]], ...] = (
+            ("nested/main.rs", "crate::nested::Trait", {"lib.rs": "mod nested;", "nested/mod.rs": "pub mod main;"}),
+            ("nested/lib.rs", "crate::nested::Trait", {"lib.rs": "mod nested;", "nested/mod.rs": "pub mod lib;"}),
+            ("bin/tool.rs", "crate::bin::tool::Trait", {}),
+            ("actual.rs", "crate::actual::Trait", {"lib.rs": '#[path="actual.rs"] mod renamed;'}),
+            ("missing/a.rs", "crate::missing::a::Trait", {}),
+            ("guarded.rs", "crate::guarded::Trait", {"lib.rs": "#[cfg(test)] mod guarded;"}),
+            ("custom.rs", "crate::custom::Trait", {"lib.rs": "mod custom;"}),
+        )
+        for index, (relative, rooted, parents) in enumerate(cases):
+            with self.subTest(relative=relative):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"layout-{index}.db")
+                self.addCleanup(ledger.close)
+                source = "impl self::Trait for Type {\n    fn method(&self) { 7 }\n}\n"
+                path = root + relative
+                files: dict[str, str | None] = {root + name: text + "\n" for name, text in parents.items()}
+                files[path] = source
+                if relative == "custom.rs":
+                    files["crates/alpha/Cargo.toml"] = ('[package]\nname="alpha"\nversion="0.1.0"\n'
+                                                       '[lib]\npath="src/custom.rs"\n')
+                _ = self.commit_tip(ledger, files)
+                _, (finding_id,) = self.hold_parent(ledger, ((2, "7"),), path=path, kind="restructure")
+                _ = self.commit_tip(ledger, {path: source.replace("self::Trait", rooted)})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_nested_main_module_does_not_move_a_finding_to_its_parent_trait(self) -> None:
+        ledger = self.ledger()
+        root = "crates/alpha/src/"
+        path = root + "nested/main.rs"
+        destination = root + "destination.rs"
+        source = "impl self::Trait for Type {\n    fn method(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {root + "lib.rs": "mod nested; mod destination;\n",
+                                   root + "nested/mod.rs": "pub mod main;\n", path: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), path=path, kind="restructure")
+        _ = self.commit_tip(ledger, {path: "pub fn unrelated() {}\n",
+                                   destination: source.replace("self::Trait", "crate::nested::Trait")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_plain_main_module_chain_keeps_relative_shortcuts_identity(self) -> None:
+        ledger = self.ledger()
+        root = "crates/alpha/src/"
+        path = root + "tui/keys/output.rs"
+        destination = root + "tui/keys/other.rs"
+        source = "use super::Shortcuts;\nimpl Shortcuts for Pane {\n    fn method(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {
+            root + "lib.rs": None,
+            root + "main.rs": "mod tui;\n",
+            root + "tui/mod.rs": "mod keys;\n",
+            root + "tui/keys.rs": "mod output; mod other; pub trait Shortcuts {}\n",
+            path: source,
+            destination: "pub fn unrelated() {}\n",
+        })
+        _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), path=path, kind="restructure")
+        _ = self.commit_tip(ledger, {path: "pub fn unrelated() {}\n", destination: source.replace(
+            "super::Shortcuts", "crate::tui::keys::Shortcuts")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.line, row.state), (destination, 3, style_ledger.Filed(self.root / "decision.md")))
 
     def restructured_parent(self, ledger: style_ledger.Ledger) -> str:
         """A filed restructure finding on the field line of struct Parent in a.rs."""
