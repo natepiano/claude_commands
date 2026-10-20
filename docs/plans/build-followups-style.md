@@ -898,121 +898,35 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 ### Phase 33 — a trait-qualified rename follows to the trait's impl methods  · status: done
 
-**Depends on:** Phase 30, Phase 32. Run after Phase 32 to avoid concurrent ownership of `style_ledger.py` and its tests.
+#### As-built
 
-#### Work Order
-
-**Goal:** A finding on a method renamed by a built, approved `Trait::old` → `Trait::new` finding follows the corresponding method of each implementing type. It keeps its id and existing filed or unfiled state, and records its follow location.
-
-**Spec:**
-
-All references below are at HEAD `e7a45401`; use the named functions after intervening phases move their lines.
-
-1. **Read the implemented trait without replacing the implementing type.**
-
-   `scripts/style/declarations.py` currently represents both inherent and trait-implementation members as `ImplOrTraitItem(type_name)` (:25-31). `_impl_name` (:106-126) identifies a top-level `for`, but discards the preceding trait path; `read_declarations` (:170-202) consequently records no implemented-trait relationship.
-
-   Add immutable declaration metadata with explicit states:
-
-   - `ImplementedTrait(path: tuple[str, ...])`: the readable, nonempty trait path of the enclosing trait implementation.
-   - `NoImplementedTrait`: the item is not directly owned by a trait implementation.
-   - `UnreadableImplementedTrait`: an enclosing trait implementation exists, but its trait path cannot be read safely.
-
-   Store this metadata on `DeclaredItem` (:51-57), separately from `Declaration.owner`. Preserve `Declaration("fn", "method", ImplOrTraitItem("Type"))`, `declaration_line`, and existing output formats.
-
-   Factor the header splitting used by `_impl_name` so the same parse identifies the implementing type and implemented trait. Skip leading impl generic parameters; distinguish the trait/type separator from `for<'a>`; use `approved_renames.type_path` (:235-242) for readable paths. `approved_renames.impl_blocks` (:269-312) demonstrates this distinction, but is an applied-rename scan with additional constraints, not a replacement declaration reader.
-
-   Attach metadata only to directly owned members. A nested function inside a method must not inherit the implementation’s membership. Preserve current behavior for unreadable implementing types.
-
-2. **Match trait-qualified built renames to implementation members.**
-
-   Keep `_item_rename` (`style_ledger.py:689-717`) and the existing `RenameScope` forms. `Trait::old` remains `TypeQualified("Trait")`; the declaration reader supplies the relationship needed to interpret it.
-
-   Change `_built_renaming` (:2370-2432) to receive the original `DeclaredItem`, rather than only its `Declaration`; update its caller at :2315. In addition to the current owner-name match, permit a type-qualified member rename when its qualifier matches the member’s readable implemented trait.
-
-   Keep the destination owner as the implementing type, including any name Phase 30’s owner-rename chain gave that type. A `Trait::old` rename must not turn `ImplOrTraitItem("Type")` into `ImplOrTraitItem("Trait")`.
-
-   Preserve the existing approved-decision and same-crate filters, own-rename exclusion, chain traversal, fork stopping and cycle stopping. If an approved built rename also renamed the trait, follow its readable name history using the existing scope restrictions; do not infer a trait relationship from unrelated occurrences of its name.
-
-3. **Carry the relationship through declaration searches.**
-
-   `_declaration_outcome` currently tests in-place and moved declarations by keyword/name/owner (:2290-2304). `_gaining_files` (:2451-2472) uses that same identity and selects the first matching item. Merely adding a branch to `_built_renaming` would therefore be insufficient.
-
-   For trait-implementation members, use the recorded implemented trait when checking the old declaration and identifying a renamed destination. An inherent method or another trait’s method on the same type is not the same declaration.
-
-   Carry any renamed-trait requirement through `RenamedByBuilds`, `_followed_rename` (:2434-2449), and the relevant `_renamed_site` searches (:2327-2368). Represent unrestricted versus required trait membership with named variants, not `None`, an empty string, or a boolean.
-
-   Preserve own-file preference only among matching implementation members. Keep the existing gained-since-read check, changed-file restriction, crate checks and ambiguity handling; never resolve an ambiguous implementation match by taking the first item. Unsupported or ambiguous trait identification grants no new automatic follow.
-
-4. **Preserve collection, transitions and output.**
-
-   Keep built-rename collection in `_declaration_reading` (:2474-2492), including resolution of `SelfQualified` at the built finding’s read or follow commit. `Self::` in an inherent implementation must not become a rename across every implementation of a trait.
-
-   A dependent finding uses `DeclarationMoved` and remains filed or unfiled. A filed finding describing its own completed rename still uses `_renamed_site` and `DeclarationRenamed`, subject to its existing approval and applied checks.
-
-   Retain open-ticket protection, planning before `BEGIN IMMEDIATE`, rechecking decisions and rows under the lock, synced-tip refusal, caching and idempotence. No schema migration is needed.
-
-   Existing consumers observe the result through `follow` and `file`, using `follow_line` (`style_proposals.py:1331-1351` at HEAD), and through `held list` follow metadata. Preserve their exit-code and line contracts.
-
-5. **Document the changed limit.**
-
-   Replace the statement at `docs/style_production.md:478` that a trait path does not reach implementation items with the supported trait-qualified behavior and its conservative parsing limits. Retain the separate `self::`/`super::` limitation.
-
-   Phase 30’s successful-follow outcome already has an external surface and tests; this phase extends that outcome rather than adding another command. Unresolved paths remain subject to the existing declaration outcomes and person-facing recovery instructions.
+- `DeclaredItem.implemented_trait` separates `ImplementedTrait(path, arguments)`, `NoImplementedTrait` and `UnreadableImplementedTrait` from the declaration's owner. `_impl_header` skips impl generics and higher-ranked `for` bounds; trait arguments retain their token text, ignoring whitespace. Only direct impl members carry membership; nested functions do not inherit it. Existing declaration text and unreadable-type behavior stay intact.
+- `_built_renaming` extends approved built `Trait::old` → `Trait::new` renames to matching impl members. `RequiredTraitMembership` and `UnrestrictedTraitMembership` carry the destination requirement through in-place, moved and renamed searches. Each dependent finding uses `DeclarationMoved`, retains its id, filed or unfiled state and implementing type, and records its new path, line and follow commit. Implementing-type and trait rename chains remain separate; own-file preference applies only to matching members, and ambiguous members grant no follow.
+- `BuiltRename` stores `before_path` and `before_commit` beside its build `path` and `commit`. Trait qualifiers resolve at the built finding's own before site; the after name resolves at its build site. Existing same-crate authority, approval, own-rename exclusion, chain fork/cycle stopping, open-ticket protection, locked rechecks and idempotence remain. A filed finding's own approved, applied rename still uses `DeclarationRenamed`; no schema migration or new command is needed.
+- `TraitIdentity` distinguishes `SAME`, `DIFFERENT` and `UNCERTAIN`. `TraitIdentityUncertain(finding, declaration)` keeps the row unchanged and joins `DeclarationLeft`. `follow_line` prints `left <id> <rule> <path>:<line>: <declaration> trait identity uncertain`, including dry runs and filing; refill prints the same reason in its waiting line and makes no ticket for that finding. Tests cover parsing, independent impls, collisions, rename chains, uncertainty, output and persisted state.
 
 **Files:**
 
-- `scripts/style/declarations.py` — implemented-trait metadata and header reading.
-- `scripts/style/style_ledger.py` — trait-aware rename matching and declaration searches.
-- `scripts/style/test_declarations.py` — parser and ownership tests.
-- `scripts/style/test_style_ledger.py` — follow, isolation and transition tests.
-- `scripts/style/test_style_proposals.py` — observable dry-run and real-run behavior.
-- `docs/style_production.md` — replace the trait-path limitation.
+- `scripts/style/declarations.py` — direct-member trait metadata, generic arguments and impl-header parsing
+- `scripts/style/style_ledger.py` — trait identity, import resolution, before/build contexts and trait-aware declaration searches
+- `scripts/style/style_plan.py` — uncertainty waiting reason and exhaustive `DeclarationLeft` match
+- `scripts/style/style_proposals.py` — uncertainty left line
+- `scripts/style/test_declarations.py` — trait membership, arguments, header and nested-ownership cases
+- `scripts/style/test_style_ledger.py` — trait-follow transitions, identity isolation, aliases and bounded-cycle regression
+- `scripts/style/test_style_plan.py` — refill waits on uncertain trait identity
+- `scripts/style/test_style_proposals.py` — follow actions, preserved decisions, dry runs and uncertainty output
+- `docs/style_production.md` — supported trait-qualified follows and identity limits
 
-**Workers:** `1 writer + 1 tester`.
+**Binds later work:** An uncertain trait identity keeps the row: no follow and no withdrawal. After supported imports expand, equal paths with equal arguments prove identity; different final names or arguments prove difference. Otherwise, full rooted module paths must resolve to declared traits: different modules prove difference, while the same module proves equality only with one declaration of that trait name in the crate. Plain unconditional file imports, including `as` aliases, can prove paths; conditional or block imports, globs, re-exports and unresolved `self::`/`super::` paths block affected proofs. Built rename authority must prove the trait at its own site and commit. `style_plan`'s `DeclarationLeft` match is exhaustive through `assert_never`; every new left outcome needs a refill case.
 
-- `impl` — `declarations.py`, `style_ledger.py`, `docs/style_production.md`; hubs: `declarations.py` owns the metadata types, and `style_ledger.py` owns their matching semantics.
-- `test` — `test_declarations.py`, `test_style_ledger.py`, `test_style_proposals.py`, from the Spec. Keep all preceding phases’ tests.
+**Gotchas:**
 
-**Constraints from prior phases:**
+- Path spelling, a shared trait leaf name and omitted generic arguments cannot substitute for identity. Qualification-only edits must keep an existing method in place; `Trait<u8>` and `Trait<u16>` are distinct memberships.
+- Alias resolution precedes name comparison, and skipped imports block declaration fallback. A new left outcome also reaches refill. The old trait name belongs to the before commit, not the build commit. Uncertain rename authority holds a deleted item only when a plausible gained destination exists; an unrelated uncertain rename must not prevent ordinary deletion withdrawal.
+- An expanded alias retains every rooted module segment; equal final module names do not prove identity. Alias cycles are detected by visited `(file, binding)` pairs, with a 32-binding expansion limit returning `UnresolvedTraitPath`.
+- A child Python process does not inherit the parent's modified `sys.path`. The cycle regression passes `PYTHONPATH` from `sys.path` and uses a five-second subprocess timeout so it works under the test gate as well as direct unittest runs.
 
-- Phase 30’s `RenameScope`, `ItemRename`, `BuiltRename`, `RenamedByBuilds` and `NoBuiltRename` remain semantic states. Extend them only where the new relationship needs to travel.
-- Do not replace an implementation’s owner with its trait, or broadly change `Declaration` equality to achieve the new match.
-- Preserve Phase 31’s in-progress proposal changes and Phase 32’s withdrawal changes. Neither phase is redundant or invalidated by Phase 30.
-- Phase 32 (done, `d0a3f9ec`) renamed `SupersedingException` to `SupersedingJudgment` (it carries the verdict) and added `JudgedAgain`. `_superseded` withdraws an unfiled finding on any newer verdict at its current cell and a filed one only on an exception, and the judgment must be newer than the finding's `created_at`; for a followed finding (`followed_at` set; it holds a commit) it must also be newer than the row's `updated_at`. A follow that this phase adds writes `updated_at` in the same update, which keeps that bound correct; keep it.
-- `file` runs declaration following before withdrawal and batching. Refill runs declaration following only; preserve that ordering.
-- `style_ledger.py` must not import `style_proposals`.
-- No compiler, dependency resolution or general Rust name-resolution service is introduced. Unsupported aliases and ambiguous paths must not establish trait membership.
-- The next-items entries remain separate, unsatisfied work; none requires amendment because of Phase 30 or this phase.
-
-**Acceptance gate:**
-
-Write behavior tests first, using temporary repositories and isolated ledgers. Reuse `commit_tip` (:861), `hold_parent` (:872), `judge_parent` (:887), `follow_approved` (:896) and `built_finding` (:1192) in `test_style_ledger.py`.
-
-Required cases:
-
-1. The declaration reader distinguishes inherent members, trait-body members and trait-implementation members while preserving existing owner declarations. Include qualified trait paths, generic impl headers, higher-ranked bounds and nested functions.
-2. A filed restructure finding inside `impl Trait for Type` follows `Trait::old` → `Trait::new`, keeps its id and decision, and records the exact follow commit and line.
-3. Two implementing types follow independently, including implementations in different files of the same crate.
-4. An unfiled dependent finding follows without being withdrawn; a second run changes nothing.
-5. A matching inherent method and another trait’s same-named method neither conceal the source’s removal nor receive the destination finding. Test both source and destination collisions.
-6. A renamed implementing type, and a readable renamed trait, compose with the method rename.
-7. A destination that already existed at the read commit is not treated as newly gained. Ambiguous destinations are not selected arbitrarily.
-8. Unapproved built findings, built findings from another crate, forks, cycles and open build tickets preserve their existing protections. Losing approval before the lock prevents the write.
-9. `follow --dry-run` prints the expected `follow … fn Type::new` line and writes nothing; the real run prints that action and persists it. A rerun is idempotent.
-10. Existing filed-own-rename behavior still builds only an approved, applied rename.
-
-The new successful trait-follow tests must fail on `e7a45401` because the finding does not follow. Collision tests must exercise competing declarations, rather than merely checking an absent match.
-
-From the worktree root `<W>`:
-
-```bash
-env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_declarations
-env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_proposals scripts.style.test_style_plan scripts.style.test_style_ledger
-basedpyright scripts/style
-```
-
-Both unittest commands pass; basedpyright reports `0 errors, 0 warnings`. All verification uses temporary fixtures and touches no live repository, proposal store or ledger.
+**Ruled out:** leaf-name-only trait matching; identity fallback past unsupported imports; comparing an old trait name only at its build commit; cycle detection by expanded path alone; general Rust name resolution. Retained limit: a relative trait path `a::Trait` inside a nested module is read from the crate root.
 
 ### Phase 34 — a finding follows a rename made outside the ledger  · status: todo
 
