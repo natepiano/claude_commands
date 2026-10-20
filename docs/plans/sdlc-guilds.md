@@ -126,14 +126,14 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Acceptance gate:** both test commands (Delegation Context → Test) green; `basedpyright scripts/astra scripts/production` ends `0 errors, 0 warnings, 0 notes`; the merge gate green; live on natedev: `astra_roles.py hold designer --session-dir <experiments run> --worker cargo-liner-experiments-impl --manager <its director>` makes `production_tree.py --json` print one `astra-designer` edge with `codex_home` `/home/natepiano/.codex2` and no `impl` edge for that thread, in under 1 s; then `release`. At phase end the unit director sends the showrunner, for cargo-liner, the landed commit and the two `hold` commands the fps and experiments holders run for their live designers.
 
 ### Phase 2 — The design doc defines the designer and reviewer roles, their names and the two guilds  · status: todo
-**Depends on:** Phase 1
+**Depends on:** none
 
 #### Work Order
 
 **Goal:** `docs/plans/sdlc-guilds-design.md` defines both roles under a unit director and under a showrunner, the naming rules, and the guild mechanism, and ends with the user's questions.
 
 **Spec:**
-- The designer is one `gpt-6-astra` xhigh Codex thread: copy `~/.claude/config/agents.conf` to `$SESSION_DIR/agents_astra.conf` with `[delegate.codex] impl=gpt-6-astra:xhigh` and `fix=gpt-6-astra:xhigh`, launch with `AGENTS_CONFIG_FILE=$SESSION_DIR/agents_astra.conf`, resume each revision with `implement.sh --to <impl worker>` (as experiments-unit did). Right after launch, `astra_roles.py hold designer` for it (Phase 1). Review is `/astra_review docs/plans/sdlc-guilds-design.md <focus>`, at least 2 rounds and at most 3; the designer answers each finding in the same thread with what it changed or why it disagrees; the unit director rules on disagreements from the files cited. Copy the doc after each round to `$SESSION_DIR/design/round<N>.md`.
+- The designer is one `gpt-6-astra` xhigh Codex thread: copy `~/.claude/config/agents.conf` to `$SESSION_DIR/agents_astra.conf` with `[delegate.codex] impl=gpt-6-astra:xhigh` and `fix=gpt-6-astra:xhigh`, launch with `AGENTS_CONFIG_FILE=$SESSION_DIR/agents_astra.conf`, resume each revision with `implement.sh --to <impl worker>` (as experiments-unit did). Once Phase 1 has merged, `astra_roles.py hold designer` for it; the doc needs no Phase 1 code, so the two phases run side by side (showrunner, 2026-10-20). Review is `/astra_review docs/plans/sdlc-guilds-design.md <focus>`, at least 2 rounds and at most 3; the designer answers each finding in the same thread with what it changed or why it disagrees; the unit director rules on disagreements from the files cited. Copy the doc after each round to `$SESSION_DIR/design/round<N>.md`.
 - Sections of the design doc:
   - **Lessons.** What fps/frame-time-unit, experiments-unit and hierarchies-unit learned, each with its source file and time. At least: the berth refusal of a designer outside a phase reservation; steering new scope into a running designer turn; the review pool as the model for a lasting thread outside the run roots; that a Codex member between turns takes no peer message. Before the gate, read the experiments notes again for section (d) and the fps designer folder for its review rounds, and add what is new.
   - **Roles.** For the designer and for the reviewer: what it does and does not do; who holds it (a unit director, a showrunner, or both, as the user asked); how it opens, resumes, pauses for an account move and ends; where its thread record lives so it outlives one run; its model and effort, from `config/agents.conf` rather than hardcoded; how its output file is reserved so the berth hook lets it write; how many of each per design (the user's rule: one each); how the reviewer differs from the review pool's `code` and `ui` reviewers and from one-turn `/astra_review`.
@@ -151,7 +151,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Workers:** `1 writer` — one doc, and the user's rule allows one designer and one Astra reviewer per design, so the tester slot is not opened.
 - `impl` — `docs/plans/sdlc-guilds-design.md`, as the Astra designer above
 
-**Constraints from prior phases:** Phase 1's `astra_roles.py hold` records the designer, so cargo-handler shows it once Phase 21 lands.
+**Constraints from prior phases:** none; Phase 1's `astra_roles.py hold`, once merged, records the designer for cargo-handler.
 
 **Acceptance gate:** the doc has the eight sections; every lesson and every claim about code names its file; at least 2 review rounds ran and each is saved in `$SESSION_DIR/design/`; the adversarial findings are folded in; the merge gate green. At phase end the unit director sends the showrunner the Questions section as one message for the user, sends the Guilds section to cargo-liner (`showrunners.py address remove-running-section`), and asks the showrunner to pass the doc to hierarchies-unit and roles-unit.
 
