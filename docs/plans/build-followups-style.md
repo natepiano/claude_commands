@@ -896,7 +896,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** ticket-wide original-judgment guards; timestamp comparisons against commit-valued `followed_at`; a verdict-column migration for withdrawal reasons already distinguished by decision presence.
 
-### Phase 33 — a trait-qualified rename follows to the trait's impl methods  · status: todo
+### Phase 33 — a trait-qualified rename follows to the trait's impl methods  · status: done
 
 **Depends on:** Phase 30, Phase 32. Run after Phase 32 to avoid concurrent ownership of `style_ledger.py` and its tests.
 
