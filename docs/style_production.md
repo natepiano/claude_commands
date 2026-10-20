@@ -493,12 +493,40 @@ A decision opens again with its approval. The findings of an old issue move to
 the decision for their rule, crate and rule blob, as migrate moves them; a new
 decision takes the old issue's approval. Reopen prints
 `filed again <finding id> in <decision>: <before> -> <after> not applied in <path>`
-for each finding, or `nothing to reopen: every built finding is applied`.
+for each finding it files again. For each built rename with no check it prints
+`cannot check <finding id> in <path>: <before> -> <after>; pass --finding <finding id> or --applied <finding id>`
+and exits 1. With none of these lines it prints `nothing to reopen: every built finding is applied`,
+or `nothing to reopen: every checked finding is applied; restructure not checked <count>`
+when the issue holds a built restructure (or type) finding. The check never judges
+one, so reopen prints no other line for it; `--all` counts them in its totals.
+A person who reads the code gives the verdict with `--by <who>`:
+`--finding <finding id>` when the change is not in the code, `--applied <finding id>`
+when it is. Repeat either option for more findings; the id can be a unique prefix.
+Reopen files each `--finding` finding again with no check, in the same run as the
+findings the check finds not applied, and prints
+`filed again <finding id> in <decision>: <before> -> <after> in <path> by <who>: a person read the code`.
+Each `--applied` finding stays built, and reopen prints
+`applied <finding id> in <issue>: <before> -> <after> in <path> by <who>: a person read the code`.
+The held finding records the person in its `person_read_by` column; the state
+shows the verdict. `style_ledger.py held list` shows
+`filed again by <who>: a person read the code` for a filed row and
+`applied, read by <who>: a person read the code` for a built row (the `reading`
+field with `--json`). The record stays after later changes of the finding, except
+a new build: when a ticket merge or `held built` marks the finding built again,
+the record is cleared, because the person read the old build. A built
+finding that a person read is not checked again: reopen does not file it again and
+prints no `cannot check` line for it. `--finding` and `--applied` need `--by` and
+`--issue`; they are refused with `--all`, and `--by` alone is refused. Reopen strips
+`--by` before it stores it.
 The dry run prints the same lines and writes nothing. Reopen refuses an issue
 that is not approved, an issue that an open ticket builds, an issue with a
-merged ticket whose checkpoint the synced tip does not hold yet (sync first), and
-an old issue that migrate would refuse or whose decision is declined or has no
-answer. A refusal writes nothing.
+merged ticket whose checkpoint the synced tip does not hold yet (sync first), an
+old issue that migrate would refuse or whose decision is declined or has no
+answer, a blank `--finding` or `--applied`, one that is not one built finding of
+the issue, one finding named by both, and an `--applied` rename that the check
+finds not applied (the old name is still declared):
+`<issue>: finding <finding id>: the check finds the rename not applied; use --finding`.
+A refusal writes nothing.
 `style_proposals.py reopen --repo <style checkout> --all [--parent <slug>] [--dry-run]`
 runs reopen on every approved decision and old issue that holds a built finding.
 An old issue takes the parent that its own `Parent:` line names. Only an old
@@ -507,10 +535,12 @@ issue with no `Parent:` line takes `--parent`, and with no `--parent` it prints
 into keeps its own parent; only a new decision takes the old issue's parent. Each
 issue with a built finding that the run leaves out or reopen refuses prints
 `skipped <issue>: <reason>`, and the others go on. The reasons include
-`missing file`, `not approved` and `closed without answer`. The run ends with
-`totals: reopen <issues>, filed again <findings>, skipped <issues>` and exits 1
-when it skipped one.
-`style_ledger.py held add` on a built finding whose rename is not at the synced tip
+`missing file`, `not approved` and `closed without answer`. It prints the
+`cannot check` line for each built rename with no check. The run ends with
+`totals: reopen <issues>, filed again <findings>, cannot check <findings>, restructure not checked <findings>, skipped <issues>`
+and exits 1 when it skipped an issue or cannot check a rename. The restructure
+count never sets the exit code.
+`style_ledger.py held add` on a built finding that no person read and whose rename is not at the synced tip
 prints `built, but not in the code at <tip>: run style_proposals.py reopen --all (issue <issue>)`
 to stderr and changes nothing.
 

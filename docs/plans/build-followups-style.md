@@ -654,22 +654,39 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - A built finding whose decision file is missing was skipped without a line; phase 22 prints `skipped <issue>: missing file`.
 
 ### Phase 22 — reopen --all covers old-form issues  · status: done
-**Depends on:** Phase 21
+
+#### As-built
+
+- `reopen --all [--parent <slug>]` takes every issue that holds a built finding: approved decisions and approved old-form issues. An old issue moves under the parent its own `Parent:` line names (`old_issue_parent`); `--parent` is used only for an old issue with no such line, else it is skipped with `no Parent line; pass --parent`.
+- Each issue with a built finding that the run leaves out prints `skipped <issue>: <reason>` (`missing file`, `not approved`, `closed without answer`, or the reopen refusal) and counts in `skipped`; stderr says `skipped N issues`.
+- `run_moves` refreshes a decision it did not create with that decision's own parent, read before the first write, as withdraw does. `join_action` turns a missing generated body into a `LedgerError`, so it is refused before any write and the dry run matches the real run.
+- The `held add` hint says `(issue <path>)`.
+
+**Files:**
+- `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
+
+**Gotchas:**
+- The issue's `showrunner` field is a session name, not a parent slug; the body's `Parent:` line is the source.
+
+### Phase 23 — reopen names unchecked built findings and takes a person's override  · status: done
+**Depends on:** Phase 22
 
 #### Work Order
 
-**Goal:** `reopen --all` also checks approved old-form style issues (not decisions) that hold built findings, and prints a skip line for every issue it leaves out, so it never skips without a word.
+**Goal:** reopen never passes over a built finding without a word: each built finding the applied check cannot judge gets a line, and a person can file it again by hand with `--finding`, recorded in the ledger row.
 
 **Spec:**
-- Old-form approved issues with built findings join the sweep. Find each issue parent by itself (from the issue or the ledger); take an optional `--parent` only if it cannot. Ruled by natedev, 2026-10-20.
-- Every issue with built findings that the sweep leaves out (missing file, not approved, closed without answer, no parent found) prints one skip line and counts in `skipped`.
-- Test: a dry run over an old-form issue with a false built row reports it (not totals 0).
+- reopen (`--issue` and `--all`) prints, for each built rename whose applied check is NoAppliedCheck, `cannot check <id> in <path>: <before> -> <after>; pass --finding <id> or --applied <id>`. Totals: `cannot check K, restructure not checked R`; exit 1 when K > 0. Dry run prints the same.
+- `reopen --issue <path> --parent <slug> --finding <id> [--finding <id>...] --by <who>` files those built findings of that issue again without the applied check. Every other refusal (open ticket, unsynced merge, not approved, finding not built, finding not in the issue) and `--dry-run` stay. `--finding` needs `--by`. Ruled by natedev, 2026-10-20.
+- The ledger row records the override: who filed it again and why (a person read the code), so a later reader sees it was not the check. Schema change with migration.
+- The `cannot check` line, its count and exit 1 apply only to rename findings; restructure rows get one totals word, `restructure not checked R`, and no exit 1. `reopen --issue ... --applied <id> --by <who>` records that a person read the code and found the change in it: the row stays built, records the person, and its line stops. One column, `person_read_by`, serves `--finding` and `--applied`; the state shows the verdict. Ruled by natedev, 2026-10-20.
+- Tests: a built finding in a file with a serde derive gives the `cannot check` line in a dry run; `--finding` files it again and the row holds the override; the dry run writes nothing.
 
-**Files:** `scripts/style/style_proposals.py`, `scripts/style/test_style_proposals.py`, `docs/style_production.md`
+**Files:** `scripts/style/style_proposals.py`, `scripts/style/style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_ledger.py`, `docs/style_production.md`
 
 **Workers:** 1 writer — nothing splits.
 - `impl` — all of the above
 
-**Constraints from prior phases:** Phase 21: `reopen_all`, `file_unapplied_again`, `Built(proposal)`.
+**Constraints from prior phases:** Phase 22: `reopen_all`, `old_issue_parent`, `file_unapplied_again`, `run_moves` refreshers. Phase 21: `Built(proposal)`, `return_to_filed`.
 
 **Acceptance gate:** the tests above; `scripts/style` green; basedpyright clean; merge gate `--tests-only` green.

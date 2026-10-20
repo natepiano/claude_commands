@@ -311,6 +311,36 @@ class BuildTicket:
 
 
 @dataclass(frozen=True)
+class NotReadByPerson:
+    """No person read the code for the built finding; the applied check decides whether its change is in."""
+
+
+@dataclass(frozen=True)
+class ReadByPerson:
+    """A person read the code for the built finding in place of the applied check, and reopen keeps that verdict.
+
+    The state shows the verdict: filed again when the change is not in the code, built when it is. A new build
+    clears it, because the person read the old build.
+    """
+
+    by: str
+
+
+PersonReading = NotReadByPerson | ReadByPerson
+
+
+def reading_line(state: HeldState, reading: ReadByPerson) -> str:
+    match state:
+        case Filed():
+            verdict = "filed again by"
+        case Built():
+            verdict = "applied, read by"
+        case _:
+            verdict = "read by"
+    return f"{verdict} {reading.by}: a person read the code"
+
+
+@dataclass(frozen=True)
 class RuleCandidate:
     ticket: str
     unit: str
@@ -334,6 +364,7 @@ class HeldFinding:
     ticket: str
     state: HeldState
     build_ticket: NoBuildTicket | BuildTicket
+    reading: PersonReading
 
 
 @dataclass(frozen=True)
@@ -781,6 +812,8 @@ MIGRATIONS = {
     12: "ALTER TABLE held_findings ADD COLUMN moved_from TEXT NOT NULL DEFAULT '';",
     # The judgment whose exception under a newer rule text withdrew the finding; 0 while it is not withdrawn.
     13: "ALTER TABLE held_findings ADD COLUMN withdrawn_by INTEGER NOT NULL DEFAULT 0;",
+    # The person who read the code for the built finding in place of the applied check; '' while none did.
+    14: "ALTER TABLE held_findings ADD COLUMN person_read_by TEXT NOT NULL DEFAULT '';",
 }
 
 
@@ -1152,8 +1185,9 @@ class Ledger:
                     now = _now()
                     for finding_id, check in checks:
                         if isinstance(check, AppliedInCode):
+                            # A person's reading was of the old build, so a new build clears it.
                             _ = self._connection.execute(
-                                "UPDATE held_findings SET state='built',updated_at=? WHERE finding_id=?", (now, finding_id),
+                                "UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?", (now, finding_id),
                             )
                             continue
                         if isinstance(check, RenameNotApplied):
@@ -1438,8 +1472,8 @@ class Ledger:
         return self._held(finding_id)
 
     def _held(self, finding_id: str) -> HeldFinding:
-        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int]], self._connection.execute(
-            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by FROM held_findings WHERE finding_id=?", (finding_id,),
+        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str]], self._connection.execute(
+            "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by,person_read_by FROM held_findings WHERE finding_id=?", (finding_id,),
         ).fetchall())
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
@@ -1456,7 +1490,8 @@ class Ledger:
                 state = Withdrawn(Path(row[11]), row[13])
             case "unfiled":
                 state = Unfiled()
-        return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket())
+        return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
+                           ReadByPerson(row[14]) if row[14] else NotReadByPerson())
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
         rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -1774,20 +1809,44 @@ class Ledger:
                     return
                 if current != finding or merged_build_ticket(current) != ticket:
                     raise ChangedBeforeLock(f"{finding_id}: the finding changed while it was marked built; rerun")
-                _ = self._connection.execute("UPDATE held_findings SET state='built',updated_at=? WHERE finding_id=?", (_now(), finding_id))
+                # A person's reading was of the old build, so a new build clears it.
+                _ = self._connection.execute("UPDATE held_findings SET state='built',person_read_by='',updated_at=? WHERE finding_id=?",
+                                             (_now(), finding_id))
 
         return retry_on_change(attempt)
 
-    def return_to_filed(self, finding_ids: Iterable[str]) -> None:
-        """Set built findings whose change is not in the code back to filed, with no build ticket."""
+    def return_to_filed(self, refilings: Mapping[str, PersonReading]) -> None:
+        """Set built findings whose change is not in the code back to filed, with no build ticket.
+
+        refilings maps each finding to who found the change not in the code: the applied check, or a person.
+        A person's reading stays on the row after later changes.
+        """
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             now = _now()
-            for finding_id in finding_ids:
+            for finding_id in sorted(refilings):
                 if not isinstance(self._held(finding_id).state, Built):
                     raise LedgerError(f"{finding_id}: finding is not built")
                 _ = self._connection.execute(
                     "UPDATE held_findings SET state='filed',build_ticket='',updated_at=? WHERE finding_id=?", (now, finding_id),
+                )
+                reading = refilings[finding_id]
+                if isinstance(reading, ReadByPerson):
+                    _ = self._connection.execute(
+                        "UPDATE held_findings SET person_read_by=? WHERE finding_id=?", (reading.by, finding_id),
+                    )
+
+    def record_person_applied(self, readings: Mapping[str, ReadByPerson]) -> None:
+        """Record each person who read the code and found the change of a built finding in it; the findings stay built."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            now = _now()
+            for finding_id in sorted(readings):
+                if not isinstance(self._held(finding_id).state, Built):
+                    raise LedgerError(f"{finding_id}: finding is not built")
+                _ = self._connection.execute(
+                    "UPDATE held_findings SET person_read_by=?,updated_at=? WHERE finding_id=?",
+                    (readings[finding_id].by, now, finding_id),
                 )
 
     def waive_held(self, finding_id: str) -> None:
@@ -2329,6 +2388,7 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
         result["proposal"] = str(finding.state.proposal)
     if isinstance(finding.state, Withdrawn):
         result["withdrawn_by"] = finding.state.judgment_id
+    result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
     return result
 
 
@@ -2514,8 +2574,9 @@ def main() -> None:
                                           args.before, args.after, args.rule_blob, args.ticket)
                     print(finding.finding_id)
                     # A re-add changes no state, so a built row whose rename is not in the code waits for reopen.
-                    # The add already succeeded, so a hint that cannot be checked is left out.
-                    if isinstance(finding.state, Built):
+                    # The add already succeeded, so a hint that cannot be checked is left out. Reopen keeps a person's
+                    # reading of a built row, so the hint is left out for it too.
+                    if isinstance(finding.state, Built) and isinstance(finding.reading, NotReadByPerson):
                         try:
                             tip = ledger.synced_commit()
                             check = ledger.applied_check(finding, tip)
@@ -2537,7 +2598,9 @@ def main() -> None:
                         print(json.dumps([_held_json(finding) for finding in findings], sort_keys=True))
                     else:
                         for finding in findings:
-                            print(f"{finding.finding_id}\t{finding.rule}\t{finding.path}:{finding.line}\t{_held_json(finding)['state']}")
+                            detail = (f"\t{reading_line(finding.state, finding.reading)}"
+                                      if isinstance(finding.reading, ReadByPerson) else "")
+                            print(f"{finding.finding_id}\t{finding.rule}\t{finding.path}:{finding.line}\t{_held_json(finding)['state']}{detail}")
     except (LedgerError, rule_catalog.RuleValidationError, OSError, sqlite3.Error, ValueError) as error:
         parser.exit(2, f"style_ledger: {error}\n")
 
