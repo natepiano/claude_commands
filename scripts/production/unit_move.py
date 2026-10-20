@@ -289,7 +289,8 @@ def processes_inside(worktree: Path) -> list[int]:
         if not entry.name.isdigit():
             continue
         try:
-            cwd = os.readlink(entry / "cwd")
+            # A working directory that was removed reads "<path> (deleted)".
+            cwd = os.readlink(entry / "cwd").removesuffix(" (deleted)")
         except OSError:
             continue
         if cwd == root or cwd.startswith(f"{root}/"):
