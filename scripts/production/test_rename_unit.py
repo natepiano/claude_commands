@@ -759,7 +759,7 @@ class RunProcessTests(unittest.TestCase):
     def test_a_process_that_outlives_its_sigterm_refuses_the_rename(self) -> None:
         self.processes = {pid: item for pid, item in self.processes.items() if pid in (101, 102)}
         _ = self.enterContext(mock.patch.object(os, "kill", self.survive))
-        _ = self.enterContext(mock.patch.object(retire_unit, "TERM_WAIT_SECONDS", 0.0))
+        _ = self.enterContext(mock.patch.object(rename_unit, "RUN_STOP_WAIT_SECONDS", 0.0))
         with self.assertRaisesRegex(RenameRefused, r"of lint in run run-a: still runs after SIGTERM"):
             _ = self.stop()
 
