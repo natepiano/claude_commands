@@ -11,8 +11,12 @@ The keys are in KEYS_FILE (PUSHOVER_USER, PUSHOVER_TOKEN; 0600, filled in by the
 user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
 holds the local time, source, priority, posted title and message, and outcome.
 
+While the user's silence is on (silence.py), a push below priority 2 is kept,
+not posted: it prints "pushover: kept: silence until ..." and exits 0, and
+`silence.py off` posts it later.
+
 Messages without --action or --no-action are refused before sending. Exit 0
-sent, 1 Pushover refused it or could not be reached, 2 refused before sending,
+sent or kept, 1 Pushover refused it or could not be reached, 2 refused before sending,
 usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent after failed review. Registry and emergency pushes still send.
 """
 
@@ -32,6 +36,7 @@ from typing import NotRequired, TypedDict, cast
 
 import review
 import push_texts
+import silence
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
@@ -376,6 +381,25 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     """Post an already reviewed version, including expiry sends; do not review again."""
     source, priority, title = draft.source, draft.priority, draft.title
     message = posted_message(draft.action, draft.body, draft.session, header=header)
+    if priority != "2":
+        kept = silence.keep({"source": source, "priority": priority, "title": title,
+                             "message": message, "detail": detail},
+                            deliver=lambda push: post_kept(push, keys_file, post))
+        if isinstance(kept, silence.Kept):
+            log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
+            print(f"pushover: kept: silence {kept.until}")
+            return 0
+    return post_message(source, priority, title, message, keys_file, post, detail)
+
+
+def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+    """Post a push kept during silence, exactly as it was kept."""
+    detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
+    return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail)
+
+
+def post_message(source: str, priority: str, title: str, message: str,
+                 keys_file: Path, post: Post, detail: str) -> int:
     suffix = f", {detail}" if detail else ""
     keys = read_keys(keys_file)
     if keys is None:

@@ -1374,6 +1374,19 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(self.log()[-1]["outcome"], "replaced")
         self.assertEqual(send.pending("user"), "")
 
+    def test_a_push_kept_during_silence_reports_kept_locally_and_remotely_without_a_fallback(self) -> None:
+        self.writer_session()
+        detail = "for the user: silence until 07:00 EDT; it goes out when silence ends"
+        for extra, reply, printed in (([], 'pushover: reviewed JSON: {}\npushover: kept: silence until 07:00 EDT\n', "KEPT: " + detail),
+                                      (["--machine", "natedev"], "KEPT: " + detail + "\n", "KEPT: on natedev: " + detail)):
+            with (self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, reply, "")),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
+            self.assertEqual(output.getvalue(), printed + "\n")
+            self.assertEqual(errors.getvalue(), "")
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "kept")
+
     def test_only_a_named_session_without_from_is_answerable(self) -> None:
         self.writer_session()
         for extra, expected in (([], True), (["--from", "script"], False), (["--from", "script", "--answerable"], True)):

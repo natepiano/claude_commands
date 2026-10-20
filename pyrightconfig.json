@@ -155,7 +155,8 @@
     {
       "root": "scripts/notify",
       "extraPaths": [
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/lib"
       ]
     },
     {

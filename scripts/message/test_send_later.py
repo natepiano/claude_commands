@@ -37,6 +37,15 @@ class SendLaterTests(unittest.TestCase):
         self.assertIn("$HOME/.claude/scripts/message/send.py", command[2])
         self.assertIn("'description=it is ready'", command[2])
 
+    def test_run_silence_starts_silence_later(self) -> None:
+        silence_args = ["on", "--until", "2026-10-21 07:00"]
+        command = self.capture(["--at", "2026-10-20 22:00", "--run", "silence", "--", *silence_args], "Linux")
+        self.assertIn("--on-calendar=2026-10-20 22:00", command)
+        self.assertTrue(any(part.startswith("--unit=silence-later-") for part in command))
+        self.assertEqual(command[-len(silence_args) - 1:], [str(send_later.SCRIPTS["silence"]), *silence_args])
+        command = self.capture(["--in", "1h", "--run", "silence", "--", "on"], "Darwin")
+        self.assertIn("$HOME/.claude/scripts/notify/silence.py on", command[2])
+
     def test_no_send_arguments_refuses(self) -> None:
         with self.assertRaises(SystemExit):
             _ = send_later.main(["--in", "1h"], lambda _command: 0, "Linux")

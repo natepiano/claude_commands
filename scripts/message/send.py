@@ -52,6 +52,7 @@ message text as one JSON line in STATE/log.jsonl:
   FAILED: why    not delivered and not kept: a Codex recipient,   exit 3
                  the user, or ssh to HOST
   REPLACED: why  a newer version replaced this push; not sent     exit 0
+  KEPT: why      the user's silence is on; posted when it ends    exit 0
   REFUSED: why   rejected before delivery; not kept              exit 2
   HELD: not sent, failed review; revise and resend, no fallback     exit 4
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
@@ -109,10 +110,10 @@ PERMISSION_MODE = "auto"
 TIMEOUT = 40
 KILL_GRACE = 10
 
-Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced"]
+Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept"]
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
-EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0}
+EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0}
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
@@ -1003,6 +1004,8 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
     if code == 4:
         return Result("held", err.removesuffix("\n") or out.removesuffix("\n"))
     if code == 0:
+        kept = next((line.removeprefix("pushover: kept: ") for line in out.splitlines()
+                     if line.startswith("pushover: kept: ")), "")
         for line in out.splitlines():
             if line.startswith("pushover: reviewed JSON: "):
                 record = as_dict(loads(line.removeprefix("pushover: reviewed JSON: ")))
@@ -1010,7 +1013,10 @@ def user(message: Message, need: Need, action: UserAction, timeout: float, *, an
                     if text_id:
                         template_fix_notice(record)
                     rules = record.get("failed_rules", [])
-                    return Result("sent", "to the user, sent despite failed review: " + str(rules))
+                    if not kept:
+                        return Result("sent", "to the user, sent despite failed review: " + str(rules))
+        if kept:
+            return Result("kept", f"for the user: {kept}; it goes out when silence ends")
         before, separator, sent = out.partition("pushover: sent as rewritten:\n")
         del before
         return Result("sent", "to the user, rewritten:\n" + sent.removesuffix("\n") if separator else "to the user")
@@ -1117,7 +1123,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
                                    prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
     lines = out.removesuffix("\n").split("\n")
     headers = [(index, line.partition(": ")) for index, line in enumerate(lines)
-               if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED", "REPLACED")]
+               if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED", "REPLACED", "KEPT")]
     if not headers:
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
