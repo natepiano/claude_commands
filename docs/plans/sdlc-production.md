@@ -1,6 +1,6 @@
 # Production — sdlc
 
-> **Status: PRODUCTION — planned.** Our software development life cycle process: how we prepare design and documentation, how the design and documentation process runs, how showrunners, unit directors and workers share the work to implement it, and the names of things (the user, via the showrunner, 2026-10-20).
+> **Status: PRODUCTION — running.** Our software development life cycle process: how we prepare design and documentation, how the design and documentation process runs, how showrunners, unit directors and workers share the work to implement it, and the names of things (the user, via the showrunner, 2026-10-20).
 
 ## Production Context
 
@@ -9,7 +9,7 @@
 - **Merge branch:** `sdlc` — every unit merges here; only the showrunner pushes it
 - **Showrunner checkout:** `/home/natepiano/worktrees/claude-build-followups-sdlc` — the sdlc session's worktree, where `/showrunner:promote_showrunner` resumes it; on `sdlc` from launch
 - **Showrunner session:** sdlc
-- **Log:** `docs/plans/sdlc-log.md` — git-excluded; one line per event
+- **Log:** `docs/plans/sdlc-log.md` — untracked: never added or committed (never `git add -A` or `-a`); one line per event
 - **Updates:** on demand (user, 2026-10-13: no timer unless asked); each update reports every unit in full
 - **Merge tests:** `env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` and `basedpyright scripts/direct scripts/production` (pass is its `0 errors, 0 warnings` line), run in the showrunner checkout
 - **Push:** git
