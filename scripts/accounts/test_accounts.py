@@ -3433,7 +3433,8 @@ class AccountsTests(unittest.TestCase):
         problems = cast(list[str], json.loads(output)["problems"])
         for note in expected:
             self.assertEqual(table.splitlines().count(note), 1)
-            self.assertEqual(problems.count(note), 1)
+            self.assertEqual(problems.count(note.removeprefix("* ")), 1)
+        self.assertTrue(all(not problem.startswith("* ") for problem in problems))
         self.assertTrue(all("@" not in problem for problem in problems))
 
     def test_status_keeps_existing_folder_and_sign_in_reasons_without_duplicate_notes(self) -> None:
@@ -3485,7 +3486,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([tuple(row[field] for field in fields) for row in rows], expected)
         notes = table.split("\n\n", 1)[1].strip().splitlines()
         self.assertIn("accounts.py setup codex2", "\n".join(notes))
-        self.assertEqual(document["problems"], notes)
+        self.assertEqual(document["problems"], [note.removeprefix("* ") for note in notes])
+        self.assertTrue(any(note.startswith("* ") for note in notes))
         for row in rows:
             self.assertNotIn("login", row)
             self.assertNotIn("@", json.dumps(row))
@@ -4018,8 +4020,8 @@ class AccountsTests(unittest.TestCase):
                     code, document, error = self.run_cli("status", "--json", "--stored")
                     self.assertEqual((code, error), (0, ""))
                     problems = cast(dict[str, object], json.loads(document))["problems"]
-                    self.assertEqual([problem for problem in cast(list[str], problems)
-                                      if problem.startswith("* ")], [note])
+                    self.assertIn(note.removeprefix("* "), cast(list[str], problems))
+                    self.assertFalse(any(problem.startswith("* ") for problem in cast(list[str], problems)))
                     self.assertNotIn("refused", note)
         self.live_reads.assert_not_called()
 

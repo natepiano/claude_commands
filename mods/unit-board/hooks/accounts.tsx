@@ -58,33 +58,37 @@ function dateText(value: AccountReading<string>, zone: string, now: number): str
   return days === 0 ? clock : `${new Intl.DateTimeFormat('en-US', { timeZone: zone, weekday: 'short' }).format(date)} ${clock}`;
 }
 
+type AccountColumn = 'dot' | 'label' | 'roles' | 'left' | 'resets' | 'credits' | 'read';
 interface AccountRow {
-  label: string;
-  roles: string;
-  dot: Tone;
-  percent: BoardLine;
-  details: BoardLine[];
+  cells: Record<AccountColumn, BoardLine>;
+  facts: BoardLine[];
+}
+interface TableColumn {
+  key: AccountColumn;
+  heading: string;
+  align: 'left' | 'right';
+  width: number;
 }
 
 function accountRow(account: AccountDisplay, zone: string, now: number): AccountRow {
   const tone = leftTone(account.weekly);
   const dot = account.weekly.kind === 'unavailable' ? 'inactive' : tone === 'default' ? 'success' : tone;
-  const percent = [span(account.weekly.kind === 'available' ? `${Math.round(account.weekly.value)}% left` : 'no reading', tone)];
-  const details: BoardLine[] = [];
-  const fact = (name: string, value: string) => {
-    const parts = [span(name, 'inactive'), span(` ${value}`)];
-    details.push(parts);
-    return parts;
-  };
+  const left = account.weekly.kind === 'available' ? `${Math.round(account.weekly.value)}%` : '—';
   const reset = dateText(account.resets, zone, now);
-  if (reset) fact('resets', reset);
-  if (account.credits.kind !== 'unavailable') {
-    const credits = fact('credits', account.credits.kind === 'unlimited' ? 'unlimited' : String(account.credits.amount));
-    if (account.onCredits) credits.push(span(' in use', 'warning'));
-  }
   const read = dateText(account.read, zone, now);
-  if (read) fact('read', read);
-  return { label: account.label, roles: account.roles.join(', '), dot, percent, details };
+  const balance = account.credits.kind === 'unavailable' ? '' : account.credits.kind === 'unlimited'
+    ? 'unlimited' : new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(account.credits.amount);
+  const credits = [span(balance)];
+  if (balance && account.onCredits) credits.push(span(' in use', 'warning'));
+  const facts = [[span(account.weekly.kind === 'available' ? `${left} left` : 'no reading', tone)]];
+  if (reset) facts.push([span('resets', 'inactive'), span(` ${reset}`)]);
+  if (balance) facts.push([span('credits', 'inactive'), span(' '), ...credits]);
+  if (read) facts.push([span('read', 'inactive'), span(` ${read}`)]);
+  return { cells: {
+    dot: [span('●', dot)], label: [span(account.label, 'default', 'bold')],
+    roles: [span(account.roles.join(', '))], left: [span(left, tone)],
+    resets: [span(reset)], credits, read: [span(read)],
+  }, facts };
 }
 
 const lineWidth = (line: BoardLine) => line.reduce((width, part) => width + cellWidth(part.text), 0);
@@ -119,25 +123,61 @@ function wrapFacts(facts: BoardLine[], width: number): BoardLine[] {
   return lines;
 }
 
-function accountLines(accounts: AccountRow[], width: number): BoardLine[] {
-  const labelWidth = accounts.reduce((width, row) => Math.max(width, cellWidth(row.label)), 0);
-  const rolesWidth = accounts.reduce((width, row) => Math.max(width, cellWidth(row.roles)), 0);
-  const percentWidth = accounts.reduce((width, row) => Math.max(width, lineWidth(row.percent)), 0);
-  const headings = accounts.map(row => [span('● ', row.dot), span(row.label, 'default', 'bold'),
-    span(' '.repeat(labelWidth - cellWidth(row.label) + 2)),
-    span(row.roles + ' '.repeat(rolesWidth - cellWidth(row.roles)))]);
-  const singleLines = accounts.map((row, index) => [...headings[index]!, span('  '), ...row.percent,
-    span(' '.repeat(percentWidth - lineWidth(row.percent))),
-    ...(row.details.length ? [span(' · ', 'inactive'), ...joinFacts(row.details)] : [])]);
-  if (singleLines.every(line => lineWidth(line) <= width)) return singleLines;
+function tableColumns(accounts: AccountRow[], showCredits: boolean): TableColumn[] {
+  const columns: TableColumn[] = [
+    { key: 'dot', heading: '', align: 'left', width: 0 },
+    { key: 'label', heading: 'Label', align: 'left', width: 0 },
+    { key: 'roles', heading: 'Roles', align: 'left', width: 0 },
+    { key: 'left', heading: 'Left', align: 'right', width: 0 },
+    { key: 'resets', heading: 'Resets', align: 'right', width: 0 },
+    ...(showCredits ? [{ key: 'credits', heading: 'Credits', align: 'left', width: 0 } as const] : []),
+    { key: 'read', heading: 'Read', align: 'right', width: 0 },
+  ];
+  return columns.map(column => ({ ...column, width: accounts.reduce(
+    (width, row) => Math.max(width, lineWidth(row.cells[column.key])), cellWidth(column.heading)) }));
+}
 
-  const pairedHeadings = accounts.map((row, index) => [...headings[index]!, span('  '), ...row.percent]);
-  const aligned = pairedHeadings.every(line => lineWidth(line) <= width);
-  return accounts.flatMap((row, index) => {
-    if (aligned) return [pairedHeadings[index]!, ...wrapFacts(row.details, width)];
-    const heading = [span('● ', row.dot), span(row.label, 'default', 'bold')];
-    if (row.roles) heading.push(span(`  ${row.roles}`));
-    return [...wrapLine(heading, width), ...wrapFacts([row.percent, ...row.details], width)];
+function tableLine(columns: TableColumn[], cells: Record<AccountColumn, BoardLine>, indent = 0): BoardLine {
+  const line = [span(' '.repeat(indent)), ...columns.flatMap((column, index) => {
+    const cell = cells[column.key];
+    const padding = span(' '.repeat(column.width - lineWidth(cell)));
+    return [...(index ? [span('  ')] : []),
+      ...(column.align === 'right' ? [padding, ...cell]
+        : index === columns.length - 1 ? cell : [...cell, padding])];
+  })];
+  // Missing final cells leave no padding at the row's edge.
+  while (line.length) {
+    const last = line[line.length - 1]!;
+    const text = last.text.trimEnd();
+    if (text) {
+      line[line.length - 1] = { ...last, text };
+      break;
+    }
+    line.pop();
+  }
+  return line;
+}
+
+function accountLines(accounts: AccountRow[], width: number, showCredits: boolean): BoardLine[] {
+  if (!accounts.length) return [];
+  const columns = tableColumns(accounts, showCredits);
+  const header = Object.fromEntries(columns.map(column =>
+    [column.key, [span(column.heading, 'default', 'bold')]])) as Record<AccountColumn, BoardLine>;
+  const tableWidth = (columns: TableColumn[], indent = 0) =>
+    indent + columns.reduce((width, column) => width + column.width, 0) + (columns.length - 1) * 2;
+  if (tableWidth(columns) <= width) {
+    return [tableLine(columns, header), ...accounts.map(row => tableLine(columns, row.cells))];
+  }
+  const first = columns.slice(0, 4);
+  const second = columns.slice(4);
+  if (tableWidth(first) <= width && tableWidth(second, 2) <= width) {
+    return [tableLine(first, header), tableLine(second, header, 2),
+      ...accounts.flatMap(row => [tableLine(first, row.cells), tableLine(second, row.cells, 2)])];
+  }
+  return accounts.flatMap(row => {
+    const heading = [...row.cells.dot, span(' '), ...row.cells.label];
+    if (lineWidth(row.cells.roles)) heading.push(span('  '), ...row.cells.roles);
+    return [...wrapLine(heading, width), ...wrapFacts(row.facts, width)];
   });
 }
 
@@ -147,9 +187,9 @@ export function AccountsView(elements: PaneElements, columns: number, status: St
   const accounts = status.accounts.map(accountDisplay)
     .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: 'base' }))
     .map(account => accountRow(account, zone, now));
-  const rows = accountLines(accounts, width);
+  const rows = accountLines(accounts, width, status.accounts.some(account => account.credits !== null));
   const drawLine = (parts: BoardLine) => <Box flexDirection="row" flexShrink={0}>
-    {parts.filter(part => part.text).map(part => part.tone === 'default'
+    {(parts.some(part => part.text) ? parts.filter(part => part.text) : [span('')]).map(part => part.tone === 'default'
       ? <Text bold={part.kind === 'bold'}>{part.text}</Text>
       : <Text color={part.tone} bold={part.kind === 'bold'}>{part.text}</Text>)}
   </Box>;
