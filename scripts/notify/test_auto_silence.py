@@ -74,6 +74,18 @@ class AutoSilenceTests(unittest.TestCase):
         self.assertIn("10 min ago", self.main())
         _ = self.main("soon", code=2)
 
+    def test_on_sets_the_two_hour_default(self) -> None:
+        self.assertEqual(auto_silence.DEFAULT_IDLE, 2 * 3600)
+        self.assertEqual(self.main("on"), "auto silence after 120 min idle\n")
+        self.assertEqual(self.commands[0][2:4], ["new", "auto-silence"])
+        self.assertEqual(auto_silence.read_config()["idle_seconds"], auto_silence.DEFAULT_IDLE)
+        self.now += 119 * 60
+        _ = self.main("check")
+        self.assertEqual(self.pushes, [])
+        self.now += 60
+        _ = self.main("check")
+        self.assertEqual(self.push_values(0), ("silence.auto_on", ["minutes=120", "sender=natedev"]))
+
     def test_idle_tells_the_user_first_then_silences_once(self) -> None:
         _ = self.main("45min")
         self.now += 44 * 60

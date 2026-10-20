@@ -482,7 +482,16 @@ the finding stays as it is for a person to waive or fix in the code. No file:
   impl items of a type declared there; `crate::` names the crate root. A rename
   qualified by a type names only the impl or trait items of that type under any
   of its names, and a `Self` path names the type of its own impl or trait. A
-  trait path does not reach the items of the trait's impls, and a `self::` or
+  trait path also names direct members of its readable trait impls. The member
+  keeps its implementing type, including that type's approved new name. The
+  destination must implement the same trait with the same generic arguments.
+  Equal paths with equal arguments name the same trait. A bare name can match
+  a qualified path through one declared trait or a plain file import, including
+  an `as` alias. Conditional imports, block imports, globs, and re-exports block
+  proofs for names they can bind. Unresolved relative paths also block proofs.
+  The module path must match the trait's declared module. Built renames must name that
+  trait at their own sites. An uncertain trait identity keeps the finding
+  unchanged. Ambiguous members grant no follow. A `self::` or
   `super::` path names no item. Two or more gaining files, or a filed finding's
   file in another crate, leave the finding as a move does. A finding whose own
   rename names its item keeps the rule above; a filed rename whose impl type a

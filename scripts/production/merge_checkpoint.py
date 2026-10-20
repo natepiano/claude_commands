@@ -752,12 +752,16 @@ def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint:
 
 
 def test_passed(command: list[str], result: subprocess.CompletedProcess[str]) -> bool:
-    if result.returncode == 0:
-        return True
+    """Judge basedpyright as merge_gate.py does: status 0 or 3 and its clean summary line anywhere.
+
+    It exits 3 and prints a `.venv` warning on stderr, after the summary, because pyrightconfig
+    names a `.venv` no checkout has.
+    """
     if Path(command[0]).name != "basedpyright":
-        return False
-    lines = (result.stdout + result.stderr).strip().splitlines()
-    return bool(lines and re.fullmatch(r"0 errors, 0 warnings(?:, 0 notes)?", lines[-1].strip()))
+        return result.returncode == 0
+    output = f"{result.stdout}\n{result.stderr}"
+    clean = re.search(r"^0 errors, 0 warnings(?:, 0 notes)?\s*$", output, re.MULTILINE)
+    return result.returncode in (0, 3) and clean is not None
 
 
 def undo_failed_push(production: Production, old_origin: str) -> None:
