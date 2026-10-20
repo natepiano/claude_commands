@@ -30,7 +30,8 @@ import style_footprint
 import style_rules
 from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
-from declarations import (Declaration, DeclaredFile, DeclaredItem, ImplementedTrait, ImplOrTraitItem,
+from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
+                          ImplPosition, UnprovedImplPosition,
                           NoImplementedTrait, TraitMembership, UnreadableImplementedTrait, moved_site_line, read_declarations)
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
@@ -610,6 +611,18 @@ class UnresolvedTraitModule:
 
 
 @dataclass(frozen=True)
+class RootedFileModule:
+    """The complete module chain proved by a file's src layout."""
+
+    path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnreadableFileModule:
+    """The file has no proved module chain in its crate's src layout."""
+
+
+@dataclass(frozen=True)
 class DeclaredInAnotherCrate:
     """The subject of a filed finding moved to a file in another crate. Its decision is per crate, so it stays."""
 
@@ -712,6 +725,8 @@ class BuiltRename:
     before_path: str
     before_commit: str
     proposal: Path
+    before_position: ImplPosition
+    position: ImplPosition
 
 
 @dataclass(frozen=True)
@@ -1314,6 +1329,7 @@ class Ledger:
         self._named_files: dict[tuple[str, str], tuple[str, ...]] = {}
         self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
+        self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
         try:
@@ -2353,20 +2369,148 @@ class Ledger:
             self._declared_files[key] = read_declarations(content.decode(errors="replace") if isinstance(content, bytes) else "")
         return self._declared_files[key]
 
-    def _trait_import_path(self, commit: str, path: str, trait: tuple[str, ...]) -> ResolvedTraitPath | UnresolvedTraitPath:
-        """Expand plain file imports; skipped bindings block every declaration fallback for their names."""
+    def _crate_file_modules(self, commit: str, crate: str) -> dict[str, RootedFileModule]:
+        """Prove file modules through plain declarations, with one scan per crate and commit."""
+        key = (commit, crate)
+        if key in self._file_modules:
+            return self._file_modules[key]
+        modules: dict[str, RootedFileModule] = {}
+        self._file_modules[key] = modules
+        tip = self._tip(commit)
+        manifest = self._commit_file(commit, str(PurePosixPath(crate) / "Cargo.toml"))
+        if not isinstance(manifest, bytes):
+            return modules
+        data = _table(tomllib.loads(manifest.decode(errors="replace")))
+        bins = data.get("bin", [])
+        targets = [_table(data.get("lib"))]
+        if isinstance(bins, list):
+            targets.extend(_table(item) for item in cast(list[object], bins))
+        if any("path" in target for target in targets):
+            return modules
+        files = {path for path in tip.blobs if path.endswith(".rs") and tip.crate(path) == crate}
+        links: dict[str, tuple[str, ...]] = {}
+        for path in sorted(files):
+            content = self._commit_file(commit, path)
+            if not isinstance(content, bytes):
+                return modules
+            words = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace")))
+            attributes = style_footprint.decorated_items(words)
+            if any(words[index] == "mod" and "path" in attribute for index, attribute in attributes.items()):
+                return modules
+            depth = 0
+            names: list[str] = []
+            for index, word in enumerate(words):
+                if word == "mod" and depth == 0 and index not in attributes and index + 2 < len(words):
+                    if style_footprint.IDENTIFIER.fullmatch(words[index + 1]) and words[index + 2] == ";":
+                        names.append(words[index + 1])
+                depth += (word in ("{", "(", "[")) - (word in ("}", ")", "]"))
+            links[path] = tuple(names)
+        src = PurePosixPath(crate) / "src"
+        pending: list[tuple[str, tuple[str, ...]]] = [(str(src / name), ("crate",)) for name in ("lib.rs", "main.rs") if str(src / name) in files]
+        while pending:
+            path, chain = pending.pop()
+            if path in modules:
+                if modules[path].path != chain:
+                    modules.clear()
+                    return modules
+                continue
+            modules[path] = RootedFileModule(chain)
+            file = PurePosixPath(path)
+            is_root = file.parent == src and file.name in ("lib.rs", "main.rs")
+            directory = file.parent if is_root or file.name == "mod.rs" else file.with_suffix("")
+            for name in links[path]:
+                candidates = [str(directory / (name + ".rs")), str(directory / name / "mod.rs")]
+                children = [child for child in candidates if child in files and not PurePosixPath(child).is_relative_to(src / "bin")]
+                if len(children) == 1:
+                    pending.append((children[0], (*chain, name)))
+        return modules
+
+    def _file_module(self, commit: str, path: str) -> RootedFileModule | UnreadableFileModule:
+        """Read the same proved module chain for imports and trait declarations."""
+        crate = self._tip(commit).crate(path)
+        return self._crate_file_modules(commit, crate).get(path, UnreadableFileModule())
+
+    def _relative_trait_path(self, commit: str, path: str, trait: tuple[str, ...],
+                             position: ImplPosition) -> ResolvedTraitPath | UnresolvedTraitPath:
+        """Resolve self and super only from a file-level header's proved module chain."""
+        if trait[0] not in ("self", "super"):
+            return ResolvedTraitPath(trait)
+        if isinstance(position, BlockScopedImpl):
+            return UnresolvedTraitPath()
+        module = self._file_module(commit, path)
+        if isinstance(module, UnreadableFileModule):
+            return UnresolvedTraitPath()
+        parts = module.path
+        if trait[0] == "self":
+            return ResolvedTraitPath((*parts, *trait[1:]))
+        index = 0
+        while index < len(trait) and trait[index] == "super":
+            if len(parts) == 1:
+                return UnresolvedTraitPath()
+            parts = parts[:-1]
+            index += 1
+        return ResolvedTraitPath((*parts, *trait[index:]))
+
+    def _trait_site_position(self, commit: str, path: str, line: int, spelling: str) -> ImplPosition:
+        """Read the qualifier's scope, or the declared item's header scope when the qualifier is absent."""
+        content = self._commit_file(commit, path)
+        if not isinstance(content, bytes):
+            return UnprovedImplPosition()
+        tokenized = style_footprint.tokenized_text(content.decode(errors="replace"))
+        words = tuple(token.value for token in tokenized.tokens)
+        wanted = tuple(token.value for token in style_footprint.tokens(spelling.split(";", 1)[0]))
+        if not wanted:
+            return UnprovedImplPosition()
+        blocks: list[int] = []
+        scopes: dict[tuple[int, ...], int] = {}
+        for index, (word, number) in enumerate(zip(words, tokenized.lines, strict=True)):
+            if number == line and words[index:index + len(wanted)] == wanted:
+                scopes[tuple(blocks)] = index
+            if word == "{":
+                blocks.append(index)
+            elif word == "}" and blocks:
+                _ = blocks.pop()
+        if not scopes:
+            declared = self._declared_file(commit, path)
+            item = declared.declaration_at(line)
+            if not isinstance(item, DeclaredItem):
+                return UnprovedImplPosition()
+            # Several item boundaries on one line do not prove which item owns the site.
+            boundaries = [other for other in declared.declared_items
+                          if line in (other.first_line, other.keyword_line, other.last_line)]
+            if len(boundaries) > 1 or any(other.import_position != item.import_position for other in boundaries):
+                return UnprovedImplPosition()
+            return item.import_position
+        if len(scopes) != 1:
+            return UnprovedImplPosition()
+        scope, index = next(iter(scopes.items()))
+        return BlockScopedImpl(index) if scope else FileLevelImpl()
+
+    def _trait_import_path(self, commit: str, path: str, trait: tuple[str, ...],
+                           position: ImplPosition) -> ResolvedTraitPath | UnresolvedTraitPath:
+        """Read only imports visible at the header; enclosing block imports still block their names."""
+        if isinstance(position, UnprovedImplPosition):
+            return UnresolvedTraitPath()
         content = self._commit_file(commit, path)
         words = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace"))) if isinstance(content, bytes) else ()
-        depth = 0
-        depths: list[int] = []
-        for word in words:
-            depths.append(depth)
-            depth += (word == "{") - (word == "}")
+        blocks: list[int] = []
+        enclosing: dict[int, tuple[int, ...]] = {}
+        for index, word in enumerate(words):
+            if word == "use" or isinstance(position, BlockScopedImpl) and index == position.header_word:
+                enclosing[index] = tuple(blocks)
+            if word == "{":
+                blocks.append(index)
+            elif word == "}" and blocks:
+                _ = blocks.pop()
+        header_blocks = enclosing.get(position.header_word, ()) if isinstance(position, BlockScopedImpl) else ()
         imports: dict[str, list[tuple[str, ...]]] = {}
         blocked: set[str] = set()
         glob = False
         for item in style_footprint.use_items(words):
             use = words.index("use", item.start, item.end)
+            use_blocks = enclosing.get(use, ())
+            if use_blocks and (len(use_blocks) > len(header_blocks) or header_blocks[:len(use_blocks)] != use_blocks):
+                continue
             body = words[use + 1:item.end - 1]
             bindings: list[tuple[str, tuple[str, ...]]] = []
             if "as" in body:
@@ -2376,11 +2520,11 @@ class Ledger:
                     bindings.append((body[alias + 1], paths[0]))
             else:
                 bindings.extend((imported[-1], imported) for imported in item.paths)
-            supported = bool(bindings) and not item.attributed and not depths[use] and words[item.start] == "use"
+            supported = bool(bindings) and not item.attributed and not use_blocks and words[item.start] == "use"
             if "*" in body:
                 glob = True
             if not supported:
-                # An unread import can bind either end of the trait path, even in another block.
+                # An unread visible import can bind either end of the trait path.
                 blocked.update(name for name, _ in bindings)
                 if not bindings:
                     blocked.update(word for word in body if style_footprint.IDENTIFIER.fullmatch(word))
@@ -2390,7 +2534,11 @@ class Ledger:
         seen: set[tuple[str, str]] = set()
         # A binding must not expand twice, even when each expansion grows the path.
         while len(seen) < 32:
-            if glob or trait[0] in ("self", "super") or trait[0] in blocked or trait[-1] in blocked:
+            relative = self._relative_trait_path(commit, path, trait, position)
+            if isinstance(relative, UnresolvedTraitPath):
+                return relative
+            trait = relative.path
+            if glob or trait[0] in blocked or trait[-1] in blocked:
                 return UnresolvedTraitPath()
             candidates = imports.get(trait[0], [])
             if not candidates:
@@ -2413,14 +2561,9 @@ class Ledger:
                  and not isinstance(item.declaration.owner, ImplOrTraitItem)]
         modules: dict[str, str] = {}
         for candidate in (*homes, path):
-            file = PurePosixPath(candidate).relative_to(crate)
-            if not file.parts or file.parts[0] != "src":
-                continue
-            parts = file.parent.parts[1:]
-            if file.stem not in ("lib", "main", "mod"):
-                parts = (*parts, file.stem)
-            # Keep the whole module chain; equal leaf names do not prove equal modules.
-            modules[candidate] = "::".join(("crate", *parts))
+            module = self._file_module(commit, candidate)
+            if isinstance(module, RootedFileModule):
+                modules[candidate] = "::".join(module.path)
         if len(trait) == 1:
             local = [home for home in homes if home in modules and modules[home] == modules.get(path)]
             choices = local if local else homes
@@ -2439,8 +2582,8 @@ class Ledger:
             return TraitIdentity.UNCERTAIN
         if isinstance(left, NoImplementedTrait) or isinstance(right, NoImplementedTrait):
             return TraitIdentity.SAME if left == right else TraitIdentity.DIFFERENT
-        left_import = self._trait_import_path(left_commit, left_path, left.path)
-        right_import = self._trait_import_path(right_commit, right_path, right.path)
+        left_import = self._trait_import_path(left_commit, left_path, left.path, left.position)
+        right_import = self._trait_import_path(right_commit, right_path, right.path, right.position)
         if isinstance(left_import, UnresolvedTraitPath) or isinstance(right_import, UnresolvedTraitPath):
             return TraitIdentity.UNCERTAIN
         left_words, right_words = left_import.path, right_import.path
@@ -2460,17 +2603,20 @@ class Ledger:
     def _trait_rename_identity(self, membership: ImplementedTrait, commit: str, path: str,
                                built: BuiltRename, qualifier: tuple[str, ...]) -> TraitIdentity:
         """Prove what the qualifier names at the built finding's own site and commit."""
-        resolved = self._trait_import_path(built.before_commit, built.before_path, qualifier)
+        resolved = self._trait_import_path(built.before_commit, built.before_path, qualifier, built.before_position)
         if isinstance(resolved, UnresolvedTraitPath):
             return TraitIdentity.UNCERTAIN
         candidate = resolved.path
+        if commit == built.before_commit and path == built.before_path:
+            return self._trait_identity(membership, commit, path,
+                                        ImplementedTrait(candidate, membership.arguments, built.before_position), commit, path)
         if len(candidate) == 1:
             home = self._trait_module(built.before_commit, built.before_path, candidate)
             if isinstance(home, UnresolvedTraitModule):
                 return TraitIdentity.UNCERTAIN
             candidate = (*home.module.split("::"), candidate[-1])
         return self._trait_identity(membership, commit, path,
-                                    ImplementedTrait(candidate, membership.arguments), built.before_commit, built.before_path)
+                                    ImplementedTrait(candidate, membership.arguments, built.before_position), built.before_commit, built.before_path)
 
     def _matches_declaration(self, item: DeclaredItem, declaration: Declaration, requirement: TraitRequirement,
                              commit: str, path: str) -> TraitIdentity:
@@ -2692,7 +2838,7 @@ class Ledger:
                     return False
                 identity = self._trait_rename_identity(trait, reference.commit, reference.path, built, path)
                 if identity == TraitIdentity.UNCERTAIN and path == (trait.path[-1],) and path[-1] != trait_name:
-                    resolved = self._trait_import_path(built.before_commit, built.before_path, path)
+                    resolved = self._trait_import_path(built.before_commit, built.before_path, path, built.before_position)
                     # A proved rename grants its new name before a later build declares it. Imports still decide
                     # that name first, and another declared trait prevents this chain from proving identity.
                     declared = any(
@@ -2720,7 +2866,7 @@ class Ledger:
                     if isinstance(trait, ImplementedTrait):
                         # The before name belongs to the read commit; the new name belongs to the build commit.
                         references[built.rename.new] = RequiredTraitMembership(
-                            ImplementedTrait((*trait.path[:-1], built.rename.new), trait.arguments), built.commit, built.path)
+                            ImplementedTrait((*trait.path[:-1], built.rename.new), trait.arguments, built.position), built.commit, built.path)
                 return matches
 
             traits = renamed(trait_name, trait_item)
@@ -2810,7 +2956,11 @@ class Ledger:
                     if not isinstance(item, DeclaredItem) or not isinstance(item.declaration.owner, ImplOrTraitItem):
                         continue
                     rename = ItemRename(rename.old, rename.new, TypeQualified(item.declaration.owner.name))
-                built_renames.append(BuiltRename(rename, finding.path, read.commit, before_path, judged.commit, finding.state.proposal))
+                before_line = finding.follow.from_line if isinstance(finding.follow, FollowedDeclaration) else finding.line
+                built_renames.append(BuiltRename(
+                    rename, finding.path, read.commit, before_path, judged.commit, finding.state.proposal,
+                    self._trait_site_position(judged.commit, before_path, before_line, finding.before),
+                    self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
         renames = tuple(built_renames)
         return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames)
                                                     for finding_id in finding_ids))

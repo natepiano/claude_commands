@@ -928,9 +928,71 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** leaf-name-only trait matching; identity fallback past unsupported imports; comparing an old trait name only at its build commit; cycle detection by expanded path alone; general Rust name resolution. Retained limit: a relative trait path `a::Trait` inside a nested module is read from the crate root.
 
-### Phase 34 — a finding follows a rename made outside the ledger  · status: todo
+### Phase 34 — a test-module or relative import no longer blocks trait identity  · status: done
 
-**Depends on:** Phase 30, Phase 32, Phase 33
+**Depends on:** Phase 33
+
+#### Work Order
+
+**Goal:** A trait impl member at file level keeps its trait identity when a test module in the same file has a glob or imports the same name, and when the file imports the trait with a `self::` or `super::` path. The 22 live rows that phase 33 keeps as "trait identity uncertain" then follow, or stay in place, as they did before phase 33.
+
+**Spec:**
+
+cargo-liner-style reported the defect on 2026-10-20 after its sync to main `b45054f`: 22 left rows print `trait identity uncertain`. They are all members of file-level trait impls in cargo-handler and cargo-port. The unit director checked the cause read-only in the live repository at `b45054f`. `Ledger._trait_import_path` in `scripts/style/style_ledger.py` reads imports too strictly in three ways:
+
+- A glob anywhere in the file sets `glob` for the whole file. Eight files have only `use super::*;` inside `#[cfg(test)] mod tests` (cargo-handler `src/app.rs`, `src/census/hierarchy.rs`, `src/census/probe.rs`, `src/census/remote.rs`; cargo-port `src/project/git/checkout.rs`, `src/project/paths.rs`, `src/tui/app/phase_state.rs`, `src/tui/state/ci.rs`).
+- A block-level `use` adds its names to `blocked` for the whole file. cargo-port `src/tui/panes/cpu/pane.rs` has `use tui_pane::Hittable;` at file level and again in its test module, so `impl Hittable<HoverTarget> for CpuPane` is uncertain.
+- A file-level `use super::X;` or `use self::X;` leaves `super` or `self` as the first segment, which returns `UnresolvedTraitPath`. cargo-port `src/tui/integration/framework_keymap/output_pane.rs` has `use super::Shortcuts;` and similar imports (7 rows).
+
+The phase 33 rule stays: when identity is not proved, the finding stays as `TraitIdentityUncertain`. This phase only proves more cases. A case it cannot prove stays uncertain.
+
+1. **A block-level import binds only inside its block.** A `use` item at brace depth greater than zero, a glob included, binds names only for paths inside that same block. It neither binds nor blocks the trait path of an impl header outside that block. For an impl header inside a block (an impl in a test module, or in any inline `mod` or function body), keep today's conservative rule: every import in the blocks that enclose the header, and every glob there, blocks the proof for the names it can bind. A file-level glob still blocks every file-level name. A `#[cfg]` or other attributed import at file level still blocks its names. The impl header's position must reach the import reader. Carry it as a closed named state on the trait membership or on the identity call (for example, a file-level impl versus an impl inside a block span), never as a bool or a bare optional value. Name it to the Type Design Contract.
+2. **Resolve `self::` and `super::` from the file's module.** For a file-level import or impl header path that starts with `self` or `super`, compute the file's module chain from the crate's src layout, as `_trait_module` does now (`crate::<directories>::<file stem>`, where `lib.rs`, `main.rs` and `mod.rs` name their directory). `self` names that module. Each `super` removes one segment. A path that goes above `crate`, or a file outside `src/`, stays unresolved. The result is a rooted `crate::…` path. Then the existing alias loop, its cycle bound and the existing comparison run on it. Put the module-chain computation in one place that both `_trait_module` and the import reader use. Inside a block, `self` and `super` stay unresolved (the inline module shifts them).
+3. **Comparison is unchanged.** Equal rooted paths with equal generic arguments are the same trait. Otherwise `_trait_module` decides as now, and anything it cannot prove is uncertain. A move between two files whose imports resolve to the same rooted path (for example `use super::Shortcuts;` in `framework_keymap/output_pane.rs` and `use crate::tui::integration::framework_keymap::Shortcuts;` in a sibling file) is the same trait.
+4. **Every consumer reads the same proof.** The in-place check, `_matching_items`, the gained-file search, `_trait_rename_identity` and the locked recheck all use the improved reader. No new outcome type, command, schema change or message is needed. `TraitIdentityUncertain` prints as before.
+5. **Docs.** In `docs/style_production.md` (the trait paragraph near :488), state that a block import or glob affects only impls inside its block, and that a file-level `self::` or `super::` path resolves from the file's module. Keep the other limits. Use Simplified Technical English.
+
+**Files:**
+
+- `scripts/style/style_ledger.py` — block-scoped import reading, `self`/`super` resolution, one shared module-chain helper.
+- `scripts/style/declarations.py` — only if the impl header's block position must be read here; keep phase 33's `TraitMembership` meaning.
+- `scripts/style/test_style_ledger.py` — the tests below, in temporary repositories.
+- `docs/style_production.md` — trait identity limits.
+
+**Workers:** 1 writer + 1 tester; the code is one reader in one file, and the tests go to their own file.
+- `impl`: `scripts/style/style_ledger.py`, `scripts/style/declarations.py`, `docs/style_production.md`.
+- `test`: `scripts/style/test_style_ledger.py`, written from this Spec while the writer builds.
+
+**Constraints from prior phases:**
+
+- Phase 33 owns `TraitMembership` (`ImplementedTrait(path, arguments)`, `NoImplementedTrait`, `UnreadableImplementedTrait`), `TraitIdentity` (same, different, uncertain), `TraitIdentityUncertain(finding, declaration)` and its print text in `style_proposals.follow_line`, `run_follow` and the `style_plan` refill. Keep all of them and their tests (`test_style_ledger.py` uncertainty tests near :1491, `test_style_proposals.py` near :2850, `test_style_plan.py` near :2779) unchanged and passing.
+- Phase 33's alias reader: plain unconditional file-level `use path` and `use path as Alias`; alias cycles stop at a repeated (file, binding) or after 32 expansions. A relative `a::Trait` in a nested module resolves from the crate root (kept nit F011); this phase does not change that.
+- `BuiltRename` resolves its trait qualifier at `before_path`/`before_commit` and its new name at `path`/`commit`; keep both contexts.
+- `style_ledger.py` must not import `style_proposals`.
+
+**Acceptance gate:**
+
+Write these tests in `scripts/style/test_style_ledger.py`. Each positive test must fail before this change.
+
+1. `test_a_test_module_glob_does_not_block_a_file_level_trait_impl` — a file with `impl Trait for Type { fn method }` at file level and `#[cfg(test)] mod tests { use super::*; }` changes elsewhere. The finding stays in place (no `TraitIdentityUncertain`). A second subtest moves the method to another file of the crate with the same trait import: it follows as `DeclarationMoved`.
+2. `test_a_block_import_of_the_trait_name_does_not_block_the_file_level_impl` — the cpu pane shape: `use other::Hittable;` at file level and in the test module, `impl Hittable<Target> for Pane`. The finding stays in place.
+3. `test_a_relative_trait_import_resolves_from_the_file_module` — subtests for `use super::Trait;`, `use self::inner::Trait;`, `use super::super::Trait;` and a `mod.rs` file; a move between a file importing `super::Trait` and a sibling importing `crate::<module>::Trait` follows as the same trait. A `super` path to a different module's same-named trait is different or uncertain, never same.
+4. `test_block_and_relative_import_limits_keep_the_finding` — each keeps the row as `TraitIdentityUncertain`: an impl inside the test module with `use super::*;`; a file-level glob; a `#[cfg]` file-level import of the name; `super` above the crate root; a file outside `src/`.
+
+Run from the worktree without changing directories:
+
+```bash
+env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_declarations scripts.style.test_style_proposals scripts.style.test_style_plan scripts.style.test_style_ledger
+env -C <W> basedpyright scripts/style
+```
+
+The suites pass and basedpyright reports `0 errors, 0 warnings`.
+
+Live check (unit director, read-only): copy the live ledger with a `mode=ro` sqlite backup into a scratch directory and run the follow dry run against that copy and the live repository. None of the 22 reported rows prints `trait identity uncertain`. Each one stays in place or follows. Report any row that does otherwise, with its evidence. Edit no live repository, ledger or proposal store.
+
+### Phase 35 — a finding follows a rename made outside the ledger  · status: todo
+
+**Depends on:** Phase 30, Phase 32, Phase 33, Phase 34
 
 #### Work Order
 
@@ -940,7 +1002,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 The showrunner ruled this current on 2026-10-20, after Phase 33. A wrong follow puts a decision on code it was not made for. A missed follow only leaves the row. No manual command is added. Read the working tree after the dependencies; references below may move while Phase 32 workers edit it. The current ruling includes a rename into another file of the same crate. The separate cross-crate phase was dropped; it gives this phase no cross-crate authority.
 
-1. **Prove an outside rename in the declaration step.** Extend `Ledger._declaration_outcome` in `scripts/style/style_ledger.py` (:2292 in the researched tree). Use the finding's last follow commit, else `judged_commit`, as today. When its old declaration is gone, permit a rename without a built decision only when all these checks hold:
+1. **Prove an outside rename in the declaration step.** Extend `Ledger._declaration_outcome` in `scripts/style/style_ledger.py` (cite it by name; the declaration step starts near :2495 at checkpoint 08ea4ba0). Use the finding's last follow commit, else `judged_commit`, as today. When its old declaration is gone, permit a rename without a built decision only when all these checks hold:
    - (a) The old name is declared nowhere in the finding's crate at the synced tip. Search declarations, not name occurrences in calls, comments or strings. Read all tracked Rust files in that crate, including test items and other modules. A same-named declaration elsewhere prevents this proof; do not narrow this check to the original module or owner. The current `RepositoryTip.crate` supplies the crate boundary. A declaration in another crate does not, by itself, fail this check.
    - (b) For a rename in the same file, the line to which the source diff maps the finding's site holds a declaration with the same keyword and owner, under a different name. Keep Phase 33's implemented-trait identity as well. Establish this mapping before choosing the renamed declaration; `moved_site_line` cannot itself prove a target selected in advance. A rename into another file instead uses the gained-file proof below; a Git hunk mapping into that other file is not required.
    - (c) At least half of the old body's non-blank lines are unchanged after its old name is replaced by its new name. Count preserved lines once, in order, with their multiplicity. A repeated brace or line must not credit several old lines against one new line. The threshold is inclusive: `2 * unchanged >= old_nonblank_count`.
@@ -973,7 +1035,7 @@ The showrunner ruled this current on 2026-10-20, after Phase 33. A wrong follow 
    - Update the declaration-follow section of `docs/style_production.md` and the filing procedure in `commands/showrunner/proposal.md` with both proofs, the child rule, gained-file cardinality, refusal retention and candidate lines. Retain Phase 32's withdrawal text and Phase 33's trait support and path limits.
 
 6. **Use the verified result for all 22 live rows, not the rename descriptions.** At synced tip `19da700c6ff026c7be79b9cff9d638543a50b0dc`, this rule newly follows exactly `5855309d6998e256` and `e4c8fa3ac1ae2891`, both in `crates/cargo-handler/src/census/schedule.rs`, to lines 1427 and 1439. They remain filed to the same `style prefer-type-named-fields-and-bindings crates+cargo-handler d00b0104.md` decision. Their owner changes from `uncached_completed_rows_arrive_before_hierarchy_discovery_is_released` to `uncached_first_publication_respects_its_budget_and_holds_claude_rows`; the child names `rows` and `answers` remain. The old owner's body retains 43 of 52 non-blank lines.
-   - The other 17 original rows must not follow under this rule. In particular, `renders_primary_marker` was removed and its logic absorbed into an already-existing `worktree_entry_label`; `device_line` changed its sole body line; the CPU test retains only 3 of 8 body lines; the account names remain elsewhere in the crate; and `LocalAnswers` still exists. The research table below names each check and mapped site.
+   - The other 17 original rows must not follow under this rule. In particular, `renders_primary_marker` was removed and its logic absorbed into an already-existing `worktree_entry_label`; `device_line` changed its sole body line; the CPU test retains only 3 of 8 body lines; the account names remain elsewhere in the crate; and `LocalAnswers` still exists. The plan holds no per-row table. Before code changes, rebuild the 22-row population read-only from the live filer's `left` lines at the current synced tip, and write each row's id, expected outcome and mapped site (the two `draw` rows included) to the phase summary.
    - The three added modules rows also do not follow at this tip: `fff079fb7af8cf21` and `72fc92aca6fc9706` have one relevant gained struct, `CratesIoRelease` in `crates/cargo-port/src/project/cargo/crates_io_release.rs:4`, but only 3/7 old non-blank body lines remain. All three field lines match; all four old internal doc-comment lines changed. Do not silently ignore those lines to turn 3/7 into 3/3. `62ca205b24b40dc6` has a mapped `enum CratesIoSection` in `crates/cargo-port/src/tui/panes/pane_data/detail_data.rs:484`, which changes keyword and preserves 0/9 body lines; no gained struct passes instead. These are body/identity limits, not proof of a cross-crate move.
    - Repeat the read-only audit after Phases 32/33 and at the current synced tip before declaring the live gate met. Report any changed result by id and evidence. Do not apply a live follow as a test of this phase.
 
@@ -1000,7 +1062,9 @@ The showrunner ruled this current on 2026-10-20, after Phase 33. A wrong follow 
 **Constraints from prior phases:**
 
 - Phase 30 separates rename resolution from destination search with `_built_renaming`, `_renamed_site`, `_followed_rename` and `_gaining_files`. Its built rename pairs, scope checks, approval checks, chains, fork/cycle stops and gained-since-read checks keep their meaning. The new proof has no built pair and must not manufacture one.
-- Phase 33 keeps an impl member's owner as the implementing type and stores implemented-trait metadata separately. Preserve this distinction in source and destination matching. Its unsupported and ambiguous trait paths grant no proof. `self::`/`super::` module resolution is not added here.
+- Phase 33 keeps an impl member's owner as the implementing type and stores implemented-trait metadata separately. Preserve this distinction in source and destination matching. Its unsupported and ambiguous trait paths grant no proof. Phase 34 adds file-level `self::`/`super::` resolution and block-scoped imports to the trait import reader; reuse that reader, do not add a second one.
+- Outside-rename discovery never bypasses `TraitIdentityUncertain`: the shipped declaration flow returns it before any removal outcome (in-place check and after-builds check in `Ledger._declaration_outcome`), and it stays first. Keep the existing ledger, proposal dry/real and refill uncertainty tests (`test_style_ledger.py` near :1491, `test_style_proposals.py` near :2850, `test_style_plan.py` near :2779) unchanged and passing.
+- Candidate matching reuses the revision-aware trait proof: `_trait_requirement` and `_matches_declaration`, where `RequiredTraitMembership` carries membership, commit and path. Keep generic arguments and import resolution. When composing approved renames, keep `BuiltRename`'s before context (`before_path`, `before_commit`) and build context (`path`, `commit`) apart; raw metadata alone can reject an equal alias or resolve an old name after it is gone.
 - Phase 32's current-text judgment withdrawal remains separate and runs after declaration follow during filing. Phase 31's decision membership, unfinished-findings test and close/reopen rules remain unchanged. An outside follow is neither completion nor a new decision.
 - The showrunner requires no manual command and conservative proof. Its latest widening permits newly gained destinations inside the same crate only, and explicitly keeps rows when that search fails. The dropped cross-crate phase supplies no authority. Phase 30's `_gaining_files` requires a known target identity and gives the original file priority; the new discovery search must neither require a known after name nor reuse that priority to hide a second passing file. Keep old approved-rename callers unchanged.
 - The Type Design Contract requires closed named outcomes. Keep source mapping, proof failure and readable/unreadable body or owner states explicit; do not add an optional domain field or bool that a reader must interpret. `style_ledger.py` must not import `style_proposals`.

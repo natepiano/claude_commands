@@ -7,7 +7,7 @@ keeps its declaration.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import style_footprint
 from approved_renames import ITEM_KEYWORDS, item_starts, type_path
@@ -48,11 +48,32 @@ def declaration_line(declaration: Declaration) -> str:
 
 
 @dataclass(frozen=True)
+class FileLevelImpl:
+    """The impl header is outside every brace block."""
+
+
+@dataclass(frozen=True)
+class BlockScopedImpl:
+    """The impl header sits at this word inside one or more brace blocks."""
+
+    header_word: int
+
+
+@dataclass(frozen=True)
+class UnprovedImplPosition:
+    """The site's words do not prove one import scope."""
+
+
+ImplPosition = FileLevelImpl | BlockScopedImpl | UnprovedImplPosition
+
+
+@dataclass(frozen=True)
 class ImplementedTrait:
     """The readable path of the trait whose impl directly owns the item."""
 
     path: tuple[str, ...]
     arguments: tuple[str, ...] = ()
+    position: ImplPosition = FileLevelImpl()
 
     def __post_init__(self) -> None:
         if not self.path:
@@ -81,6 +102,8 @@ class DeclaredItem:
     first_line: int
     last_line: int
     implemented_trait: TraitMembership = NoImplementedTrait()
+    # Members use their owning header's scope; other items use their own scope.
+    import_position: ImplPosition = FileLevelImpl()
 
 
 @dataclass(frozen=True)
@@ -238,14 +261,7 @@ def read_declarations(text: str) -> DeclaredFile:
         first_attribute[keyword] = start
     spans = {index: _span(words, index) for index, word in enumerate(words)
              if index in starts and (word in ITEM_KEYWORDS or word in {"impl", "use"})}
-    # The bodies that own their items directly: each impl's type name and each trait's name.
-    owning: list[tuple[_Body, ImplOrTraitItem | _UnreadableImplOwner, TraitMembership]] = []
-    for index, span in spans.items():
-        if isinstance(span.body, _Body) and words[index] == "impl":
-            header = _impl_header(words, span)
-            owning.append((span.body, header.owner, header.implemented_trait))
-        elif isinstance(span.body, _Body) and words[index] == "trait" and index + 1 < len(words):
-            owning.append((span.body, ImplOrTraitItem(words[index + 1]), NoImplementedTrait()))
+    body_headers = {span.body.open: index for index, span in spans.items() if isinstance(span.body, _Body)}
     # A member must sit directly in its impl's braces, including when other blocks hold nested items.
     enclosing: dict[int, int] = {}
     braces: list[int] = []
@@ -256,6 +272,17 @@ def read_declarations(text: str) -> DeclaredFile:
             braces.append(index)
         elif word == "}" and braces:
             _ = braces.pop()
+    # The bodies that own their items directly: each impl's type name and each trait's name.
+    owning: list[tuple[_Body, ImplOrTraitItem | _UnreadableImplOwner, TraitMembership]] = []
+    for index, span in spans.items():
+        if isinstance(span.body, _Body) and words[index] == "impl":
+            header = _impl_header(words, span)
+            membership = header.implemented_trait
+            if isinstance(membership, ImplementedTrait) and index in enclosing:
+                membership = replace(membership, position=BlockScopedImpl(index))
+            owning.append((span.body, header.owner, membership))
+        elif isinstance(span.body, _Body) and words[index] == "trait" and index + 1 < len(words):
+            owning.append((span.body, ImplOrTraitItem(words[index + 1]), NoImplementedTrait()))
     item_spans: list[_Span] = []
     items: list[DeclaredItem] = []
     others: list[_Span] = []
@@ -278,9 +305,11 @@ def read_declarations(text: str) -> DeclaredFile:
                 owner = member_owner
                 trait = membership
         else:
+            import_header = body_headers[enclosing[index]] if isinstance(owner, ImplOrTraitItem) else index
+            position: ImplPosition = BlockScopedImpl(import_header) if import_header in enclosing else FileLevelImpl()
             item_spans.append(span)
             items.append(DeclaredItem(Declaration(keyword, name, owner), lines[index],
-                                      lines[first_attribute.get(index, index)], lines[span.end], trait))
+                                      lines[first_attribute.get(index, index)], lines[span.end], trait, position))
     return DeclaredFile(tuple(items), tuple(text.splitlines()), tuple(item_spans), tuple(others), lines)
 
 

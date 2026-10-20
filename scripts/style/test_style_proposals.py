@@ -2847,6 +2847,86 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertIn(f"followed from {path}:7 at {tip[:7]}", self.held_list())
             self.assertEqual(self.follow(), (0, "totals: follow 0, built 0, withdraw 0, left 0, kept 0, close 0\n"))
 
+    def test_a_built_trait_member_site_without_qualified_tokens_follows_from_its_header(self) -> None:
+        with self.ledger() as ledger:
+            path = "alpha/src/a.rs"
+            source = ("pub trait Trait {\n    fn old(&self);\n}\n"
+                      "pub struct Type;\nimpl Trait for Type {\n    fn old(&self) { 7 }\n}\n")
+            _ = self.commit_tip(ledger, {path: source})
+            finding, = self.judge(ledger, ((path, 6, "7"),), kind="restructure")
+            issue, = self.file(ledger)
+            built, = self.judge(ledger, ((path, 2, "fn old(&self);"),), before="Trait::old", after="Trait::new")
+            self.assertEqual(self.file(ledger), (issue,))
+            self.approve(issue)
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (built.finding_id,))
+            _ = self.commit_tip(ledger, {path: source.replace("fn old", "fn new")})
+            expected = (0, f"follow {finding.finding_id} {self.rename} {path}:6 -> {path}:6: fn Type::new\n"
+                        + "totals: follow 1, built 0, withdraw 0, left 0, kept 0, close 0\n")
+            before = self.written(ledger)
+            self.assertEqual(self.follow("--dry-run"), expected)
+            self.assertEqual(self.written(ledger), before)
+            self.assertEqual(self.follow(), expected)
+            followed = next(row for row in ledger.proposal_findings(issue) if row.finding_id == finding.finding_id)
+            self.assertEqual((followed.path, followed.line, followed.state), (path, 6, style_ledger.Filed(issue)))
+
+    def test_a_built_trait_member_site_keeps_its_inline_module_alias_uncertain(self) -> None:
+        with self.ledger() as ledger:
+            path = "alpha/src/a.rs"
+            site = "alpha/src/b.rs"
+            source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+            imported = ("pub trait Trait {}\nmod imports {\n    use crate::other::Other as Trait;\n"
+                        "    pub trait Local {\n        fn old(&self);\n    }\n}\n")
+            _ = self.commit_tip(ledger, {path: source, site: imported})
+            finding, = self.judge(ledger, ((path, 2, "7"),), kind="restructure")
+            issue, = self.file(ledger)
+            built, = self.judge(ledger, ((site, 5, "fn old(&self);"),), before="Trait::old", after="Trait::new")
+            _ = self.file(ledger)
+            self.approve(issue)
+            built_issue = next(row.state.proposal for row in ledger.held_findings(style_ledger.AllHeldFindings())
+                               if row.finding_id == built.finding_id and isinstance(row.state, style_ledger.Filed))
+            self.approve(built_issue)
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (built.finding_id,))
+            _ = self.commit_tip(ledger, {path: source.replace("fn old", "fn new")})
+            before = self.written(ledger)
+            expected = (1, f"left {finding.finding_id} {self.rename} {path}:2: fn Type::old trait identity uncertain\n"
+                        + "totals: follow 0, built 0, withdraw 0, left 1, kept 0, close 0\n")
+            self.assertEqual(self.follow("--dry-run"), expected)
+            self.assertEqual(self.written(ledger), before)
+            self.assertEqual(self.follow(), expected)
+            self.assertEqual(self.written(ledger), before)
+
+    def test_a_built_site_on_a_line_with_several_items_keeps_trait_identity_uncertain(self) -> None:
+        with self.ledger() as ledger:
+            path = "alpha/src/a.rs"
+            site = "alpha/src/b.rs"
+            source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+            imported = ("pub trait Trait {}\n"
+                        "fn outer() { use crate::other::Other as Trait; struct Inner; "
+                        "impl Trait for Inner { fn old(&self) {} fn new(&self) {} } } pub fn unrelated() {}\n")
+            _ = self.commit_tip(ledger, {path: source, site: imported,
+                                        "alpha/src/lib.rs": APPLIED + "mod a; mod b; mod other;\n",
+                                        "alpha/src/other.rs": "pub trait Other {}\n"})
+            finding, = self.judge(ledger, ((path, 2, "7"),), kind="restructure")
+            issue, = self.file(ledger)
+            built, = self.judge(ledger, ((site, 2, "fn old(&self) {}"),), before="Trait::old", after="Trait::new")
+            _ = self.file(ledger)
+            self.approve(issue)
+            built_issue = next(row.state.proposal for row in ledger.held_findings(style_ledger.AllHeldFindings())
+                               if row.finding_id == built.finding_id and isinstance(row.state, style_ledger.Filed))
+            self.approve(built_issue)
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (built.finding_id,))
+            _ = self.commit_tip(ledger, {path: source.replace("fn old", "fn new")})
+            before = self.written(ledger)
+            expected = (1, f"left {finding.finding_id} {self.rename} {path}:2: fn Type::old trait identity uncertain\n"
+                        + "totals: follow 0, built 0, withdraw 0, left 1, kept 0, close 0\n")
+            self.assertEqual(self.follow("--dry-run"), expected)
+            self.assertEqual(self.written(ledger), before)
+            self.assertEqual(self.follow(), expected)
+            self.assertEqual(self.written(ledger), before)
+
     def test_uncertain_trait_identity_prints_a_kept_line_without_withdrawing_or_closing(self) -> None:
         with self.ledger() as ledger:
             path = "alpha/src/a.rs"
