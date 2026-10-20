@@ -28,7 +28,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
@@ -162,7 +162,7 @@ def span_seconds(span: str) -> int | None:
 def timer_argv(until: datetime, unit: str) -> list[str]:
     """The systemd-run command that runs `silence.py off` once, at `until`."""
     return ["systemd-run", "--user", "--collect", f"--unit={unit}",
-            f"--on-calendar={until.astimezone():%Y-%m-%d %H:%M:%S}",
+            f"--on-calendar={until.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S} UTC",
             "--timer-property=AccuracySec=1s", str(PY), str(SILENCE), "off"]
 
 
@@ -173,7 +173,7 @@ def stop_timer(unit: str | None, runner: Run) -> None:
 
 def past_end(record: SilenceRecord) -> bool:
     until = record["until"]
-    return until is not None and datetime.fromisoformat(until) <= datetime.now().astimezone()
+    return until is not None and datetime.fromisoformat(until) <= datetime.now(user_zone())
 
 
 def keep_here(push: KeptPush, runner: Run | None = None, deliver: Deliver | None = None) -> Kept | NotSilent:
@@ -211,7 +211,7 @@ def on(until: datetime | None, runner: Run) -> int:
         return 1
     with locked():
         old = read_state()
-        record: SilenceRecord = {"since": old["since"] if old else datetime.now().astimezone().isoformat(),
+        record: SilenceRecord = {"since": old["since"] if old else datetime.now(user_zone()).isoformat(),
                                  "until": until.isoformat() if until else None, "timer": unit}
         _ = state_file().write_text(json.dumps(record), encoding="utf-8")
     stop_timer(old["timer"] if old else None, runner)
@@ -304,15 +304,15 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
         until: datetime | None = None
         if until_text:
             try:
-                until = datetime.strptime(until_text, "%Y-%m-%d %H:%M").astimezone()
+                until = datetime.strptime(until_text, "%Y-%m-%d %H:%M").replace(tzinfo=user_zone())
             except ValueError:
                 parser.error('--until takes "YYYY-MM-DD HH:MM"')
         elif span:
             seconds = span_seconds(span)
             if not seconds:
                 parser.error("--for takes a span such as 1h, 45min or 1h30min")
-            until = datetime.now().astimezone() + timedelta(seconds=seconds)
-        if until and until <= datetime.now().astimezone():
+            until = datetime.now(user_zone()) + timedelta(seconds=seconds)
+        if until and until <= datetime.now(user_zone()):
             parser.error(f"{until_text} has already passed")
         return on(until, runner)
     if command == "off":
