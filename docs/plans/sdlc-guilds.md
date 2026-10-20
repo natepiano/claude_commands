@@ -47,6 +47,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts that run the user's productions. This plan adds the designer and reviewer roles and the two guilds.
+- **Project started:** 2026-10-20T20:59:31.543+00:00
 - **Stack:** Python 3.13, standard library only; Markdown.
 - **Layout:**
   - `scripts/astra/` — `astra_review.py`, `astra_roles.py` (new), their tests
@@ -78,7 +79,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 ## Phases
 
-### Phase 1 — cargo-handler shows each Astra designer and Astra reviewer under the session that holds it  · status: todo
+### Phase 1 — cargo-handler shows each Astra designer and Astra reviewer under the session that holds it  · status: done
 **Depends on:** none
 
 #### Work Order
