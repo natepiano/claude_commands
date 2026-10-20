@@ -82,49 +82,26 @@ For active process redesigns, as we are currently undergoing with promotions and
 ### Phase 1 — cargo-handler shows each Astra designer and Astra reviewer under the session that holds it  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `production_tree.py --json` prints one `astra-designer` or `astra-reviewer` edge per Astra session while it holds the role, and `statusline.conf` carries both role colors.
-
-**Spec:**
-1. New `scripts/astra/astra_roles.py`, the record of which Claude session holds which Astra thread. State folder `~/.local/state/astra/roles/` (override `ASTRA_ROLES_STATE`), one JSON file per thread, `<thread id>.json`, written atomically (temp file and rename):
-   `{"role": "designer" | "reviewer", "thread_id": str, "codex_home": str, "manager": str, "held_at": <UTC ISO>, "session_dir": str | null, "worker": str | null, "pid": int | null}`.
-   - `hold designer|reviewer --session-dir <dir> --worker <name> [--manager <id>]` — a mesh thread: `thread_id` from `<dir>/mesh_roster.json[<name>]`, `codex_home` from `<dir>/mesh_server.json`. Exit 2 with one line when the roster has no such worker or no thread.
-   - `hold designer|reviewer --thread <id> --codex-home <dir> --pid <pid> [--manager <id>]` — a `codex exec` thread.
-   - `--manager` defaults to `$CLAUDE_CODE_SESSION_ID`; when both are empty, exit 2 with one line: the edge needs a Claude session id.
-   - `release <thread id>` removes the record; a missing record exits 0.
-   - `list [--json]` prints each live record. A record is live while its mesh worker's roster status is not `ended` or `failed`, or while its `pid` runs. `list` removes a record whose thread has ended or whose pid is gone, so a crash leaves no edge.
-   - State: `busy` while the mesh status is `running` or `waiting_capacity`, or while the `pid` runs; else `idle`.
-   - The library functions `hold`, `release` and `live_roles()` return typed results; the CLI is a thin wrapper.
-2. `scripts/astra/astra_review.py` holds the reviewer role for its own run: it starts `codex exec` with `subprocess.Popen`, reads `codex.log` until the `session id: <thread>` header line (at most 30 s; past that it goes on without an edge), then calls `astra_roles.hold("reviewer", thread, codex_home, pid=<codex pid>, manager=$CLAUDE_CODE_SESSION_ID)`, and releases in a `finally`. `codex_home` comes from `accounts.py env workers`. With no `$CLAUDE_CODE_SESSION_ID` (a Codex caller) it holds nothing. Exit codes and output stay as they are (`commands/astra_review.md`).
-3. `scripts/production/production_tree.py`:
-   - `Role` gains `astra-designer` and `astra-reviewer`. New `AstraEdge(Edge)` adds `codex_home: str` and `state: Literal["busy", "idle"]`.
-   - New `astra_edges()` builds one edge per live record from `astra_roles.live_roles()`: `manager` the record's manager, `member` its thread id, `role` `astra-<role>`. The manager may run on another machine; the member is a local thread, as with the other Codex edges.
-   - `worker_edges` leaves out a Codex worker whose thread has an Astra record, so a thread shows once, as its Astra role (experiments' `cargo-liner-experiments-impl` would otherwise print twice).
-   - `tree()` adds the Astra edges; the docstring lists the new edge and its fields.
-4. `config/statusline.conf` gains `role.astra-designer=pink` and `role.astra-reviewer=bright-green` (cargo-liner's ruling, 16:25). `config/README.md` lists both keys with the other `role.*` keys.
-5. Tests, each red before its fix:
-   - `astra_roles`: hold from a mesh fixture reads thread and home; hold refuses a missing worker and an empty manager; an ended worker and a dead pid drop out of `live_roles()` and their files go; busy and idle follow status and pid; release of a missing record exits 0.
-   - `astra_review`: with a fake `codex` that prints the header and sleeps, a record exists during the run and is gone after it, on success and on failure; with no session id, no record is made.
-   - `production_tree`: an Astra designer edge under a unit director and an Astra reviewer edge under a showrunner, with `codex_home` and `state`; a thread with an Astra record prints no worker edge; an unreadable record leaves the other edges.
+- `scripts/astra/astra_roles.py` records which Claude session holds each Astra thread: one file per thread, `~/.local/state/astra/roles/<thread id>.json` (override `ASTRA_ROLES_STATE`), written by temp file and rename. On disk `RoleRecord` has exactly `role` (`designer` | `reviewer`), `thread_id`, `codex_home`, `manager`, `held_at`, `session_dir`, `worker`, `pid`, with nulls for the other lifetime. In memory `HeldRole` / `LiveRole` (adds `state: Literal["busy", "idle"]`) carry `lifetime: MeshWorker | ExecProcess` — the nulls stay at the JSON boundary.
+- `hold(role, thread_id="", codex_home="", *, session_dir=None, worker=None, pid=None, manager=None) -> HeldRole` (raises `ValueError`; a mesh hold reads the thread from `mesh_roster.json` and `codex_home` from `mesh_server.json`; `manager` defaults to `$CLAUDE_CODE_SESSION_ID`, empty is refused), `release(thread_id) -> None`, `live_roles() -> list[LiveRole]`. CLI `hold designer|reviewer`, `release <thread id>`, `list [--json]`; a refusal exits 2 with one line.
+- `live_roles()` removes a mesh record when its run folder is gone, the roster lacks the worker, the roster thread differs, or the status is `ended`/`failed`, and an exec record when its pid is gone. `busy` is status `starting`, `running`, `waiting_capacity` or a running pid; else `idle`. A malformed record or unreadable roster is one stderr line naming the file; the record stays and every other record is returned.
+- `astra_review.py` `run_review()` holds an `ExecProcess` reviewer record for its `codex exec` when `$CLAUDE_CODE_SESSION_ID` is set, after reading `session id:` from `codex.log` (30 s limit), with `codex_home` from `accounts.py env workers`; it releases in `finally`. Exit codes and output are unchanged.
+- `production_tree.py --json` adds `AstraEdge` (`manager`, `member` = thread id, `role` `astra-designer` | `astra-reviewer`, `codex_home`, `state`) per live record and drops the Codex worker edge for that thread. `statusline.conf` has `role.astra-designer=pink`, `role.astra-reviewer=bright-green`.
 
 **Files:**
-- `scripts/astra/astra_roles.py` — new
-- `scripts/astra/astra_review.py` — holds the reviewer role during its run
-- `scripts/production/production_tree.py` — Astra edges; no double edge
-- `config/statusline.conf` — two keys
-- `config/README.md` — the two keys
-- `scripts/astra/test_astra_roles.py` — new
-- `scripts/astra/test_astra_review.py` — record during and after a run
-- `scripts/production/test_production_tree.py` — Astra edges
+- `scripts/astra/astra_roles.py` — the Astra role record, library and CLI
+- `scripts/astra/astra_review.py` — reviewer record during its `codex exec`
+- `scripts/production/production_tree.py` — Astra edges, one edge per thread
+- `config/statusline.conf`, `config/README.md` — the two role colors
+- `scripts/astra/test_astra_roles.py`, `scripts/astra/test_astra_review.py`, `scripts/production/test_production_tree.py` — their tests
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/astra/astra_roles.py`, `scripts/astra/astra_review.py`, `scripts/production/production_tree.py`, `config/statusline.conf`, `config/README.md`
-- `test` — `scripts/astra/test_astra_roles.py`, `scripts/astra/test_astra_review.py`, `scripts/production/test_production_tree.py`, written from the Spec alone
+**Binds later work:** cargo-handler reads the `AstraEdge` fields, which stay. The role launcher needs a third lifetime variant tied to its thread store, added to `RoleRecord` and to `_parse_record`'s exact key check, because a `MeshWorker` hold ends with its run folder and an `ExecProcess` hold with its pid. The record file name is the thread id, so one thread has one record; the guild view names members by that thread id.
 
-**Constraints from prior phases:** none.
+**Gotchas:** Scripts import the module as `from scripts.astra import astra_roles` after `sys.path.insert(0, <repo root>)`. A test helper named `run` hides `unittest.TestCase.run`. basedpyright exits 3 for the missing `.venv`; only its footer counts.
 
-**Acceptance gate:** both test commands (Delegation Context → Test) green; `basedpyright scripts/astra scripts/production` ends `0 errors, 0 warnings, 0 notes`; the merge gate green; live on natedev: `astra_roles.py hold designer --session-dir <experiments run> --worker cargo-liner-experiments-impl --manager <its director>` makes `production_tree.py --json` print one `astra-designer` edge with `codex_home` `/home/natepiano/.codex2` and no `impl` edge for that thread, in under 1 s; then `release`. At phase end the unit director sends the showrunner, for cargo-liner, the landed commit and the two `hold` commands the fps and experiments holders run for their live designers.
+**Ruled out:** nullable `session_dir` / `worker` / `pid` on the in-memory types — the lifetime union replaces them; keeping a mesh record whose run folder or roster worker is gone.
 
 ### Phase 2 — The design doc defines the designer and reviewer roles, their names and the two guilds  · status: todo
 **Depends on:** none
@@ -152,7 +129,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Workers:** `1 writer` — one doc, and the user's rule allows one designer and one Astra reviewer per design, so the tester slot is not opened.
 - `impl` — `docs/plans/sdlc-guilds-design.md`, as the Astra designer above
 
-**Constraints from prior phases:** none; Phase 1's `astra_roles.py hold`, once merged, records the designer for cargo-handler.
+**Constraints from prior phases:** the Astra role record is in place (commit `cf9524bb`). The unit director records the designer for cargo-handler with `python3 scripts/astra/astra_roles.py hold designer --session-dir "$SESSION_DIR" --worker <impl worker> --manager <director session id>` and removes it with `astra_roles.py release <thread id>`. A mesh hold also goes when the worker's roster status is `ended` or `failed` or the run folder is gone; `astra_review.py` holds its own `astra-reviewer` record while its `codex exec` runs. The Lessons section adds: a `MeshWorker` hold cannot outlive its run folder, so a lasting designer or reviewer needs a record tied to its lasting thread store.
 
 **Acceptance gate:** the doc has the eight sections; every lesson and every claim about code names its file; at least 2 review rounds ran and each is saved in `$SESSION_DIR/design/`; the adversarial findings are folded in; the merge gate green. At phase end the unit director sends the showrunner the Questions section as one message for the user, sends the Guilds section to cargo-liner (`showrunners.py address remove-running-section`), and asks the showrunner to pass the doc to hierarchies-unit and roles-unit.
 
@@ -176,14 +153,24 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/guilds/test_roles.py` — new
 - `scripts/astra/astra_roles.py` — records kept in step with the launcher
 - `scripts/astra/astra_review.py` — resumes a held reviewer thread
+- `scripts/astra/test_astra_roles.py` — the lasting-thread lifetime
+- `scripts/astra/test_astra_review.py` — a held reviewer thread resumed
 - `config/agents.conf` — designer and reviewer model and effort
 - `pyrightconfig.json` — one `executionEnvironments` entry for `scripts/guilds`
 
-**Workers:** `1 writer + 1 tester`
+**Workers:** `1 writer + 1 tester` — the code and its tests split cleanly; in the Astra-record work the two owner sets were independent and the test lane was real.
 - `impl` — `scripts/guilds/roles.py`, `scripts/astra/astra_roles.py`, `scripts/astra/astra_review.py`, `config/agents.conf`; hub: `pyrightconfig.json` (one entry; another unit may also add one)
-- `test` — `scripts/guilds/test_roles.py`, written from the Spec alone
+- `test` — `scripts/guilds/test_roles.py`, `scripts/astra/test_astra_roles.py`, `scripts/astra/test_astra_review.py`, written from the Spec alone
 
-**Constraints from prior phases:** Phase 1's record format and edge schema stay; cargo-handler reads them.
+**Constraints from prior phases:**
+- The Astra role record (`scripts/astra/astra_roles.py`) is one file per thread, `~/.local/state/astra/roles/<thread id>.json` (override `ASTRA_ROLES_STATE`), written by temp file and rename. On disk it is `RoleRecord`, exactly the keys `role` (`designer` | `reviewer`), `thread_id`, `codex_home`, `manager`, `held_at`, `session_dir`, `worker`, `pid`, with nulls for the other lifetime. `_parse_record` refuses a missing or extra key, a wrong type, or a `thread_id` that differs from the file name.
+- In the library a record is `HeldRole` (`live_roles()` returns `LiveRole`, which adds `state: Literal["busy", "idle"]`) with `lifetime: MeshWorker | ExecProcess`: `MeshWorker(session_dir, worker)` or `ExecProcess(pid)`, both frozen dataclasses. Functions: `hold(role, thread_id="", codex_home="", *, session_dir=None, worker=None, pid=None, manager=None) -> HeldRole` (raises `ValueError`; `manager` defaults to `$CLAUDE_CODE_SESSION_ID`), `release(thread_id) -> None` (a missing record is not an error), `live_roles() -> list[LiveRole]`. CLI: `hold designer|reviewer`, `release <thread id>`, `list [--json]`; exit 2 with one stderr line on a refusal.
+- `live_roles()` removes a `MeshWorker` record when its run folder is gone, the roster has no such worker, the roster thread differs, or the status is `ended` or `failed`; it removes an `ExecProcess` record when its pid is gone. It keeps a record whose roster is unreadable and prints one stderr line naming the file. `state` is `busy` for roster status `starting`, `running` or `waiting_capacity`, or a running pid; else `idle`.
+- A lasting designer or reviewer thread outlives its run folder, so it cannot use `MeshWorker`, and outlives one process, so it cannot use `ExecProcess`. It needs a third lifetime variant tied to the thread store, with its own on-disk keys added to `RoleRecord` and to `_parse_record`'s key check; the variant names what keeps the hold alive (type design contract).
+- `astra_review.py` `run_review()` holds an `ExecProcess` reviewer record for the life of its `codex exec` only when `$CLAUDE_CODE_SESSION_ID` is set, after it reads `session id: <thread>` from `codex.log` (at most `THREAD_HEADER_TIMEOUT` = 30 s), with `codex_home` from `accounts.py env workers`, and releases it in a `finally`. A resumed held reviewer keeps one record per thread id: the file name is the thread id.
+- `production_tree.py --json` prints one `AstraEdge` per live record (`manager`, `member` = thread id, `role` `astra-designer` | `astra-reviewer`, `codex_home`, `state`) and drops the Codex worker edge for that thread (`worker_edges(running, astra_threads)`). cargo-handler reads these fields; they stay as they are.
+- Scripts import the record module as `from scripts.astra import astra_roles` after `sys.path.insert(0, <repo root>)` (as `astra_review.py` and `production_tree.py` do).
+- Tests: never name a test helper `run` (it hides `unittest.TestCase.run`); point `ASTRA_ROLES_STATE` and `CLAUDE_CODE_SESSION_ID` at fixtures. basedpyright exits 3 for the missing `.venv`; only its footer counts.
 
 **Acceptance gate:** the scripts' tests and the merge gate green; `basedpyright` clean on every changed folder; live: a designer opened for this unit, ended run, resumed on the same thread id, and shown once in `production_tree.py --json`.
 
@@ -214,7 +201,10 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `scripts/guilds/guilds.py`, `scripts/guilds/test_guilds.py`, `docs/guilds/*.md`
 - `test` — opens as impl — `scripts/production/broadcast.py`, `scripts/production/test_broadcast.py`, `scripts/production/codex_winddown.py`
 
-**Constraints from prior phases:** Phase 3's role launcher calls join and leave.
+**Constraints from prior phases:**
+- Phase 3's role launcher calls join and leave.
+- A held designer or reviewer already shows in `production_tree.py --json` as an `astra-designer` or `astra-reviewer` edge whose `member` is its Codex thread id, with `manager`, `codex_home` and `state` (`scripts/astra/astra_roles.py` records, read by `live_roles()`). The guild view names each member by that same thread id, so cargo-handler can join the two.
+- Tests run as `python3 -m unittest scripts.production.test_<name>` from the worktree root; `scripts/production/test_production_tree.py` shows the import form that works there. Never name a test helper `run` (it hides `unittest.TestCase.run`).
 
 **Acceptance gate:** the tests and the merge gate green; `basedpyright` clean; live: a guild message reaches a held designer through its holder, and the JSON view lists it. At phase end the unit director sends cargo-liner the JSON command and its fields.
 
@@ -244,6 +234,6 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `commands/unit/direct.md`; hub: `commands/unit/direct.md` (owner phases-unit)
 - `test` — opens as impl — `commands/showrunner/produce.md`, `docs/production_format.md`, `commands/message.md`, `codex/AGENTS-messaging.md`, `commands/guild/announce.md`; hub: `commands/showrunner/produce.md`, `docs/production_format.md` (owner roles-unit)
 
-**Constraints from prior phases:** the launcher (Phase 3) and the guild commands (Phase 4) as built.
+**Constraints from prior phases:** the launcher (Phase 3) and the guild commands (Phase 4) as built. The Astra role record CLI is `python3 scripts/astra/astra_roles.py hold designer|reviewer (--session-dir <run> --worker <name> | --thread <id> --codex-home <dir> --pid <pid>) [--manager <id>]`, `release <thread id>` and `list [--json]`; a contract that names it uses these verbs. `/astra_review` holds its own `astra-reviewer` record while its `codex exec` runs; its exit codes and output did not change.
 
 **Acceptance gate:** the merge gate green; each hub file trial-merged against its owner's tip; each changed contract names the launcher and guild commands by their real verbs. At phase end the unit director sends cargo-liner the final role and guild design (production Close-out).
