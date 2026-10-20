@@ -946,3 +946,161 @@ Source: [experiments-unit design notes](/home/natepiano/rust/hanadocs/showrunner
 | 3 | 5 of 5 | fix-regressed; target-moved | The next review found conflicting missing-measurement rules, a withdrawn-result index, missing Mac path, dispatch-dependent pairing and a workload worth only 0.07 s/week. The director ruled that Mac stays in scope and that the first study needs a real recurring workload or an explicit framework-exercise claim. |
 
 All 19 findings were fixed; none was dropped. Counts fell 8 → 6 → 5, but the design did not converge: each repair added mechanisms with new gaps, and the document grew from 568 to 696 lines. The third review still had two high findings. Its final fixes had no further review because the cap was three. The notes support a design repair/target-change cycle; they do not establish a code regression rate or provide agent-time measurements comparable to the run records.
+
+## Proposals
+
+These are process-change questions for the user through the showrunner. None is adopted here. The unit director owns issue filing, ranking values, the showrunner message and the user's answers in Phase 5. Workers file nothing and send no proposal to the user or showrunner. No proposal changes only `scripts/history/`.
+
+The five eligible roots each hold at least 10% of the fixed cohort's 260 rounds. The proposals are ordered by **certain rounds saved in the studied phase**, with ties ordered by root rounds in [Totals](#totals). Proposal numbers follow this revised order. A moved repair earns round credit when the entire original interval leaves the phase under the proposed rule; its work time is **moved**, not saved. **Fix seconds saved** means time spent nowhere. No proposal below proves any such time saving. A record correction alone receives neither round nor time credit.
+
+| Proposal | Root: rounds / seconds in cohort | Certain rounds saved | Fix seconds saved | Recorded seconds moved |
+| --- | ---: | ---: | ---: | ---: |
+| P1: run command-only follow-through without a repair worker | mechanical: 39 / 107,662 | 8 | 0 | 24,033 |
+| P2: route missing acceptance criteria after landing | spec-gap: 43 / 186,473 | 5 | 0 | 1,036 |
+| P3: route repeated repairs outside the kept categories | fix-failed: 94 / 473,015 | 3 | 0 | 348 |
+| P4: verify phase and activity boundaries | record: 35 / 53,169 | 0 | 0 | 0 |
+| P5: preserve accepted behavior touched by a repair | fix-regressed: 30 / 78,532 | 0 | 0 | 0 |
+
+The counted sets do not overlap: P1 uses rank 1 R6/R12/R20/R25, rank 8 R13, rank 10 R4 and rank 13 R3/R9; P2 uses rank 3 R5/R10/R12/R16/R17; P3 uses rank 3 R6/R11/R18. Together they remove **16 original-phase rounds**, move **25,417 recorded agent-seconds**, and prove **0 seconds saved**. Recorded moved time is the work observed in these intervals, not a prediction of future follow-up cost. No other row receives credit. Each receiving Work Order named below is a proposed follow-up for the director to create, not an existing completed phase.
+
+### Evaluation shared by all five questions
+
+Phase 6 uses the 30 days before the effective main checkpoint and the period after it. Use the same corrected `history.py rounds` API in both windows, including its temporal batch join. Select phase starts, list open and mixed records separately, and compare completed non-mixed phases. Report median rounds, share with at least three rounds, that group's share of fix time, summed `past_landing`, rounds and agent-seconds per phase, and Phase 1 cause counts. Hand-label roots with evidence and an independent recount; a review/gate cause is not a root.
+
+Exposure is decided from the Work Order, finding state or handoff **before** the treated step runs, as defined in each Measure below. Keep every exposed phase in the denominator even if it then has zero repairs or zero target-root rounds. Apply the same definition to baseline records. If the necessary before-step evidence is absent, report that exclusion and treat the comparison as inconclusive. Readiness requires 30 completed non-mixed exposed phases after adoption; each window also needs at least 20 completed phases, 10 exposed phases and 12 non-excluded merge design-check rows. Report actual denominators. An insufficient sample gives observations without a pass verdict.
+
+Beside each round target, apply these **work-kept margins**: no increase in mean holds per phase or mean merge design-check defects per phase (margin 0 for each); every moved finding has a linked receiving Work Order, owner, due checkpoint and closure evidence; 100% of follow-ups due in the observation window reach done; and no known defect from a stopped repair reaches the user or merge. Set the due checkpoint at routing, before its result is known. A missing follow-up, unfinished due work, or missing closure/review evidence makes the result **inconclusive, not a pass**. Do not end the observation before later-due follow-ups have results. Routing does not waive an unmet acceptance gate: report the originating pilot or phase as incomplete until its required result is supplied.
+
+Take holds, merge defects, review minutes and UX repair minutes from the fields used by `review_regime.py report`. Bound both windows on `merged`, and report exclusions and samples; its fixed historical regimes are not these windows. Report combined parent-plus-follow-up rounds and agent-seconds, diagnosis, preparation, command execution and review cost as work-kept and cost measures. These figures do not cancel original-phase round credit. State moved seconds separately from seconds spent nowhere. When several changes are adopted together, report the combined effect and leave individual attribution inconclusive unless cases can be separated. Phase 1 cause totals provide scale; they cannot substitute for root or routing evidence.
+
+### P1. Run command-only follow-through without a repair worker — mechanical
+
+**Question:** Should the director run unchanged lint/test commands itself when the handoff has no remaining edit, instead of launching a repair worker to run them?
+
+**Change:** Add to `commands/unit/direct.md`, `<FixDispatch/>`, after its Verification contract:
+
+> Put known fixture/setup updates, lint, tests and merge follow-through in the original repair prompt. After handoff, inspect the remaining action. If it only runs unchanged commands and no edit or judgment is pending, the director runs the existing detached verification workflow; do not dispatch a repair worker. Preserve the commands, output, tree identity and review result. A failing command reopens or retains its finding and goes to the owning worker if an edit is needed. Fixture expectations, source edits and conflict choices remain owner work; a green command does not replace closure review.
+
+**Rounds saved:** **8 rounds; 0 fix seconds saved; 24,033 recorded seconds moved to director verification.** The written rule covers command-only intervals regardless of their primary root. Each row below names only command execution, with no pending edit or judgment; its activity and seconds were checked in the linked run record for that phase instance.
+
+| Rank / round | Seconds moved | Command-only evidence from the study and run record |
+| --- | ---: | --- |
+| 1 / R6 | 258 | “running final script gates” |
+| 1 / R12 | 118 | “running the three gates on the frozen script” |
+| 1 / R20 | 1,251 | “running the round 13 gates on the frozen script” |
+| 1 / R25 | 326 | “running the three gates on the frozen script” |
+| 8 / R13 | 9,609 | “rerunning lint, then the full test line” |
+| 10 / R4 | 1,986 | “running lint and the repair tests after the hover test fix” |
+| 13 / R3 | 141 | “running the chooser repair's lint and tests” |
+| 13 / R9 | 10,344 | “rerunning the device chooser gates” |
+| **Total** | **24,033** | **8 complete original-phase repair-worker intervals** |
+
+Sources: rank 1's [run record](/home/natepiano/.local/state/plan-delegate/runs/f205ddd0-5865-4dec-9b85-849e4ffa3dd8.jsonl), phase 33b; rank 8's [run record](/home/natepiano/.local/state/plan-delegate/runs/e54c80d4-ad05-4d5a-b824-67d79e7f1131.jsonl), phase 58; rank 10's [run record](/home/natepiano/.local/state/plan-delegate/runs/8777d55e-0ac2-4586-94c5-c7c309274d22.jsonl), phase 10; rank 13's [run record](/home/natepiano/.local/state/plan-delegate/runs/7b115092-80c3-42c2-9652-2ff222d2c722.jsonl), phase 137. Use each section's instance. Rank 10 R4 and rank 13 R3 keep their mechanical roots; the other six keep their record roots. The proposed executor rule removes all eight repair-worker launches while preserving their commands as director activities. This is an actual dispatch change; the boundary proposal below receives no duplicate credit. Command execution time still occurs, so none is called saved time.
+
+Rank 10 R9–R11 includes missing setup/resource and fixture edits; rank 7 R9 updates test samples. They cannot be sent to a command-only runner and receive zero credit. Rank 6 R6 (“lint”) and rank 8 R11 (“finishing lint and the full test line”) leave pending edits uncertain and also receive zero credit. Shot-only, ledger-only, unfinished or summary/edit/judgment intervals receive no credit.
+
+**Work kept:** The director owns the same eight command sets and records their output and checked tree as required Verification activities of the original repair. There is no finding moved out by those successful command-only intervals and no new follow-up order is needed for command execution. A resulting edit goes to the file owner; if it lies outside landing scope, create “Verification failure: <command and failing case>” in the owning unit with due checkpoint, failure output, test and closure review. Completion requires green results and accepted repair review, not merely a command launch.
+
+**Risk:** A director can misread a handoff and run checks while a fixture still needs changing. Running on the wrong tree can produce false confidence. Require an explicit no-edits handoff and tree identity; send every needed source/expectation decision back to its owner.
+
+**Measure:** Exposure is a phase with a repair handoff whose **written Verification list contains lint or test commands**, identified before deciding whether to launch another worker or run them directly. Include phases where the original worker already completed all commands. Target at least **10% fewer mechanical original-phase repair rounds per exposed phase**; separately report avoided command-only worker rounds, unchanged command cost, moved seconds and any seconds spent nowhere. Beside the target require the shared 0 holds/merge-defect increase, 100% due follow-up closure and no defect escape, with 30 after exposed phases and 20/10/12 per-window samples. Missing handoff, command, follow-up or review evidence is inconclusive. Use `history.py rounds` and the windowed `review_regime.py report` fields for common totals and quality.
+
+**Answers:** Adopt as a 30-exposed-phase trial (**recommended**); adopt with the named change “apply only to lint commands until test execution is audited”; do not adopt and retain repair-worker command continuations.
+
+### P2. Route missing acceptance criteria after landing — spec-gap
+
+**Question:** Should a missing acceptance criterion found after landing become a follow-up Work Order rather than another repair of the current phase, unless a kept-category failure or later explicit ruling requires it to stay?
+
+**Change:** Add to `docs/production_format.md`, item 7, and enforce in `scripts/direct/findings.py` at the finding gate and `commands/unit/direct.md`, `<FixDispatch/>`:
+
+> Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. From repair round 4 onward, do not dispatch a missing target, rule interpretation or acceptance case in this phase unless evidence establishes a phase-caused regression, broken working behavior or test/gate failure. A broad original permission to fix pilot defects does not override this check. A later explicit user or showrunner ruling may keep named work; cite it. Route every other missing criterion to a follow-up Work Order in the owning unit, with its target decision, implementation, tests and acceptance evidence. Do not dispatch a batch until every finding is either retained with evidence or assigned to that follow-up. Split mixed batches; keep their eligible defects here. Never mark an unmet pilot acceptance bar passed because its work was routed.
+>
+> Work Orders state the acceptance observation, unit or comparison, and named real-path test or live check for changed behavior. Reuse established targets. Resolve choices through the showrunner before dependent work; do not invent a number to fill the form. A later changed goal updates the order explicitly.
+
+**Rounds saved:** **5 rounds; 0 fix seconds saved; 1,036 recorded seconds moved.** The hand application uses five rank 3 spec-gap intervals, with the source-based exclusions below. The primary roots and [Rule check](#rule-check) remain the study's recorded assessments; neither alone proves that the whole interval can leave the phase. The pilot order's broad fix permission is superseded by this proposed gate. The cited pilot entries record no later user/showrunner ruling requiring these complete intervals to remain in phase 17. A target missed in a cold review is not automatically a failed test/gate; supported rows such as rank 3 R15 stay. The complete routed intervals are:
+
+| Rank / round | Seconds moved | Entire work routed and evidence | Proposed receiving Work Order in build-followups-style |
+| --- | ---: | --- | --- |
+| 3 / R5 | 166 | Fix S: accessors and one-value targets; pilot lines 545–553 add interpretations missing from the ticket. | Pilot criteria: accessors and one value per target |
+| 3 / R10 | 576 | Fix W: single-letter parameters and array elements; pilot lines 635 onward define exclusions. | Pilot criteria: parameter and collection exclusions |
+| 3 / R12 | 65 | Fix Y: a site judged under every rule it breaks; pilot lines 684 onward add the instruction. | Pilot criteria: overlapping rules |
+| 3 / R16 | 99 | Fix AC: when-to-split asked for every file; pilot lines 740 onward add an omitted step. | Pilot criteria: complete split questions |
+| 3 / R17 | 130 | Fix AD: preserve every stated comment reason; pilot lines 754 onward say neither rule nor ticket required it. | Pilot criteria: preserve comment reasons |
+| **Total** | **1,036** | **5 complete original-phase intervals** | |
+
+Rank 3 R9 and R13 receive **zero credit**, despite their outside-category designation in Rule check. The [pilot report](/home/natepiano/worktrees/claude-build-followups-style/docs/plans/build-followups-style-pilot.md:594) contradicts that designation for whole-interval routing: lines 594–597 say earlier Fix T introduced unsafe shadowing and Fix S allowed another-value lookups as accessors. R9/Fix V repairs those phase-caused defects as well as the rename-target interpretation (598–608), so retained work remains. Lines 678–681 record recall falling from 100/117 before fixes P–X to 63/117 when the expanded name-bindings paragraph diverted checks from other rules; lines 692–697 say R13/Fix Z splits the ticket to repair that loss. That broken previously working behavior also stays under the proposed exception. The 128 seconds in R9 and 381 seconds in R13 cannot certainly leave in full; any partial routing gets no whole-round credit.
+
+Rank 1 R7/R8/R15/R16/R18/R27 has explicit later showrunner target rulings and earns no routing credit. Rank 5 R1 mixes mode/switch and drag work, so its 34,645 seconds earn no credit. Rank 14 R6–R9 has uncertain eligibility and earns no credit. Other missing-test prevention remains unproven.
+
+**Work kept:** Create the five named Work Orders before closing the routing step. Each carries its pilot example/reference sites, the exact ticket decision, pinned tests, rerun recall and false-positive checks, and the original open acceptance requirement. The owning unit implements them; the showrunner settles rule changes, including the comment-reason rule still waiting for the user. Close each only with its commit, passing pinned tests, pilot rerun result and accepted review. Link that result back to the originating pilot. A routing message or renamed finding is not closure. Other discovered defects receive the same receiving-order link; retained failures keep their original checks.
+
+**Risk:** Delaying ticket corrections can leave pilot recall below its required bar. An overly narrow gate can mistake a real regression for a missing criterion. Keep failed acceptance visible, stop any release that requires the missing result, and retain every proven kept-category failure.
+
+**Measure:** Exposure is a phase whose **start Work Order changes visible layout, lifecycle/integration behavior, or pilot rule/acceptance criteria**, identified before implementation. Include it even if preparation prevents every spec-gap round. Target at least **10% fewer spec-gap original-phase rounds per exposed phase**. Report routed rounds, moved seconds, seconds spent nowhere, and follow-up totals separately. Beside the target apply the shared work-kept margins (0 holds/merge-defect increase, 100% due follow-up closure, no defect escape), samples (30 after exposed phases; 20 completed, 10 exposed and 12 reviewed rows per window), and inconclusive-on-missing-evidence rule. Use the corrected `history.py rounds` totals and the windowed `review_regime.py report` fields.
+
+**Answers:** Adopt the gate and acceptance preparation as a 30-exposed-phase trial (**recommended**); adopt with the named change “start routing at round 5 rather than round 4”; do not adopt and keep the existing landing and Work Order rules.
+
+### P3. Route repeated repairs outside the kept categories — fix-failed
+
+**Question:** Should the hard-landing gate route a repeated open finding outside its kept categories instead of treating its earlier repair as permission to keep dispatching it?
+
+**Change:** Add to `docs/production_format.md`, item 7, and enforce in `scripts/direct/findings.py` and `<FixDispatch/>`:
+
+> Count repair rounds as `history.py rounds` numbers its repair intervals, not as ledger batches. Before any round 4-or-later dispatch on a repeated finding, require evidence that it is a phase-caused regression, broken working behavior or test/gate failure. Earlier attempts and an open verdict alone are not that evidence. Broad original permission for pilot fixes does not override landing. Cite any later explicit user/showrunner ruling that keeps the named work. Route a repeated finding outside these categories to its owning unit's follow-up Work Order before another repair starts. Keep the finding open and link its checks, previous attempts, due checkpoint and final acceptance result. Split mixed batches and retain all eligible work. If eligibility is unknown, diagnose it rather than silently route or count it as a certain saving.
+>
+> For retained work after two completed failed fixes, record the failure, approaches tried, cause diagnosis and next distinguishing test before another approach. Interrupted workers and account moves remain continuations, not completed rejected patches.
+
+**Rounds saved:** **3 rounds; 0 fix seconds saved; 348 recorded seconds moved.** Rank 3 R6/R11/R18 are outside-category, whole-interval repeated ticket repairs, with no recorded later explicit ruling keeping their repair in the phase. The original broad pilot permission is superseded by this proposed gate. The evidence and receiving orders are:
+
+| Rank / round | Seconds moved | Entire work routed and evidence | Proposed receiving Work Order in build-followups-style |
+| --- | ---: | --- | --- |
+| 3 / R6 | 73 | Fix T: macros, variants and shadowing after S misses recall; pilot lines 567–574. A separate showrunner exclusion of one reference site is not a ruling to keep T's repairs here. | Pilot recall: macros, variants and shadowing |
+| 3 / R11 | 59 | Fix X: conversion-parameter instruction and pinned test after another recall miss; pilot lines 655 onward. | Pilot recall: conversion parameters |
+| 3 / R18 | 216 | Fix AE: split-alone instruction after AC bundles four defects; pilot lines 760 onward. | Pilot recall: one split per finding |
+| **Total** | **348** | **3 complete original-phase intervals** | |
+
+No other fix-failed row is counted. Rank 2 R19–R23 repairs retained regressions/test failures. Rank 11 R7–R12 has uncertain provenance and one accepted attempt rather than six rejected patches. Rank 6 R8/R11, rank 13 R12 and rank 15 R10/R11 are zero-time ledger-only continuations; this proposal does not prove that deleting those entries removes work. No round is credited merely because diagnosis might prevent it.
+
+**Work kept:** The three receiving orders retain the open recall/split cases, earlier approaches and exact pilot examples. Require the pinned ticket test, corrected ticket output, pilot rerun against its existing bar and independent acceptance review, with commits and results linked back to the phase. The original pilot remains incomplete until required results arrive. A proven regression or failed gate remains here until its check passes; a mixed batch cannot be counted as wholly removed. Diagnosis and any new eligible defect remain required work, with their costs reported.
+
+**Risk:** Routing can delay a necessary pilot repair or hide a real regression behind a scope label. Eligibility needs recorded evidence and cold review; an unmet required pilot result must still block its dependent release.
+
+**Measure:** Exposure is a phase that **enters a round-4-or-later dispatch decision with a finding still open after a preceding repair**, recorded before the gate decides retention or routing. Keep routed phases and phases with no further repair in the denominator. Target at least **10% fewer fix-failed original-phase rounds per exposed phase**. Count rejected completed fixes separately from continuations and report diagnosis, moved seconds and follow-up results. Beside the target apply the shared 0 holds/merge-defect increase, 100% due follow-up closure, no escaped defect, 30 after exposed phases and 20/10/12 per-window samples; missing eligibility, follow-up or review evidence is inconclusive. Read `history.py rounds` intervals/time and the windowed `review_regime.py report` quality fields.
+
+**Answers:** Adopt as a 30-exposed-phase trial (**recommended**); adopt with the named change “require a cold reviewer to approve every routing decision”; do not adopt and retain the present landing check and two-fix diagnosis rule.
+
+### P4. Verify phase and activity boundaries — record
+
+**Question:** Should every launch verify its Work Order's active phase and distinguish planned work or verification from repair?
+
+**Change:** Add to `commands/unit/direct.md`, `<PassOwnership/>` and the `<FixDispatch/>` pre-dispatch check:
+
+> Before each launch, check the prompt's phase against its active instance and title. Run start-phase and finish-phase at the real boundaries and keep parallel phases separately identified. Do not launch against a stale or absent instance. Classify planned implementation/deployment as implementation and command-only verification as an activity. A fix launch names its defect, failed gate or ledger batch. Correct active state only through supported recorder operations, preserving old evidence; never fabricate starts/finishes or rewrite historic records. Missing historic boundaries stay uncertain in analysis.
+
+**Rounds saved:** **0 rounds; 0 fix seconds saved; 0 seconds moved by this proposal.** No work-removing change fits the record root here: rank 4 R1–R3 remains planned rollout work, rank 1 R6/R12/R20/R25 remains required gate execution, and correcting their labels alone earns no credit here. P1 separately removes the repair-worker launches for those four rows through its executor change; it keeps their gate execution and receives the only round credit. The same applies to all 35 record rows / 53,169 seconds. The three large mixed records remain outside the cohort and add no credit.
+
+**Work kept:** Planned rollout retains its original implementation Work Order and proof; verification retains its command results; real defects retain their ledger checks. Any actual phase transfer gets a receiving Work Order, owner, due checkpoint and closure evidence before the outgoing phase closes. Recovery of missing state cannot stand for completion of deployment or checks.
+
+**Risk:** A stale-state refusal can block a valid parallel launch, while a title-only comparison can accept the wrong instance. Check instance identity, preserve separate active phases and never overwrite history during recovery.
+
+**Measure:** Exposure is a phase with an **incoming launch request for implementation, deployment, verification or repair**, recorded before the boundary check. Include phases whose first check prevents every record error. Target **100% correct phase-instance/activity association and 0 new missing-boundary record intervals; 0 credited work-saving rounds or seconds**. Use the same corrected API in both windows. Beside the accuracy target apply the shared 0 holds/merge-defect increase, 100% due follow-up closure, no defect escape, 30 after exposed phases and 20/10/12 per-window samples. Missing launch, completion or review evidence is inconclusive. Report `history.py rounds` mixed/past-landing measures and the windowed `review_regime.py report` fields without treating a relabelled count as saved repair.
+
+**Answers:** Adopt as a 30-exposed-phase accuracy trial (**recommended**); adopt with the named change “warn and repair state before the next launch rather than refuse the current launch”; do not adopt and retain the present boundary rule.
+
+### P5. Preserve accepted behavior touched by a repair — fix-regressed
+
+**Question:** Should each repair prompt carry accepted checks for behavior its edits can invalidate, and require those checks at closure as well as the new finding's check?
+
+**Change:** Add to `commands/unit/direct.md`, `<FixDispatch/>`, beside regression-test and closure requirements:
+
+> Before editing, list accepted behaviors and checks reached by the repair's planned paths, using earlier verdicts, real callers and the current suite. Carry their commands/live views into Verification beside the new regression check. Preserve assertions unless a cited approved goal change or evidence shows an expectation is wrong. Run the new and affected accepted checks on the same tree. Compare a suspected old defect against the prior accepted tree. Reopen lost accepted behavior with failing evidence. Keep cold closure review for public contracts, registration and cross-batch invariants; route unrelated old defects under item 7.
+
+**Rounds saved:** **0 rounds; 0 fix seconds saved; 0 seconds certainly moved** out of 30 fix-regressed intervals / 78,532 seconds. No safe routing change fits this root: phase-caused regressions must stay, and the rows do not prove that earlier checks would prevent a complete repair interval. Rank 1 R2 loses the Hidden-cable rule, rank 7 R8 reports five regressions from the previous repair, and rank 2 R24 reopens accepted F036/F041. They remain required repairs. Hypothetical prevention is counted as zero.
+
+**Work kept:** Reopen any newly failed accepted behavior and require both its check and the original finding's check to pass before acceptance. A proven old defect goes to “Pre-existing defect: <behavior and failing check>” in its owning unit, with due checkpoint, baseline comparison, implementation, passing result and accepted review. No cohort interval is claimed wholly moved by this proposal. The accepted-check list does not replace cold review or the full changed-view live check.
+
+**Risk:** An incomplete path list can give false confidence, a broad suite can make small repairs expensive, and stale tests can freeze an old goal. Record approved target changes and use real integration/visible checks rather than private helper tests alone.
+
+**Measure:** Exposure is a phase with a repair prompt whose **planned edited paths reach an already accepted behavior or check**, determined from callers, verdicts and tests before the patch. Include phases where those checks prevent all regressions. Target at least **10% fewer fix-regressed original-phase rounds per exposed phase**. Report regression-check and review costs, moved work and any proven seconds spent nowhere separately. Beside the target apply the shared 0 holds/merge-defect increase, 100% due follow-up closure, no escaped defect, 30 after exposed phases and 20/10/12 per-window samples. Missing accepted baseline, follow-up or review evidence is inconclusive. Hand roots determine the regression rate; corrected `history.py rounds` totals and windowed `review_regime.py report` fields give time and merge quality.
+
+**Answers:** Adopt as a 30-exposed-phase trial (**recommended**); adopt with the named change “apply accepted-check lists only to integration, lifecycle and visible-layout repairs”; do not adopt and retain the new-finding regression-test requirement alone.

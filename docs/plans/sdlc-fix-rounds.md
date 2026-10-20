@@ -119,7 +119,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** Joining by fix-pass number alone — restarted numbers give one batch to several rounds.
 
-### Phase 4 — Proposals to the user that cut rounds and keep the work  · status: todo
+### Phase 4 — Proposals to the user that cut rounds and keep the work  · status: done
 **Depends on:** Phase 2, Phase 3
 
 #### Work Order
