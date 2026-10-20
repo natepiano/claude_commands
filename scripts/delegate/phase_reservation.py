@@ -44,6 +44,10 @@ AWAITING_FIRST_TOUCH = "enrolled_awaiting_first_touch"
 ACTIVE = "active"
 CLEAR = "clear"
 UNCONFIGURED = "unconfigured"
+LEDGER_UNREADABLE = "ledger_unreadable"
+# Answers that let an edit through unchecked, as the engine's own edit hook does: an unenrolled
+# repository, and a ledger it cannot read (a scratch clone has none), since ledger loss fails open.
+FAILS_OPEN = frozenset({UNCONFIGURED, LEDGER_UNREADABLE})
 SESSION_ENVIRONMENT = "CARGO_BERTH_SESSION_ID"
 # The engine's answer when a sibling reservation of the run already holds every checked path:
 # the reservation id it returns is the sibling's, so it is never this phase's to record.
@@ -367,7 +371,8 @@ def _claim_command(args: argparse.Namespace) -> int:
         return 0
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     answer = check(root, scopes, phase_session_id(session_id, phase.phase))
-    if answer.status == UNCONFIGURED:
+    if answer.status in FAILS_OPEN:
+        print(f"phase reservation: cargo-berth check answered {answer.status}; still awaiting first touch")
         return 0
     if answer.status != CLEAR:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
