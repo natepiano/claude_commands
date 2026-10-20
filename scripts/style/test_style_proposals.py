@@ -2247,6 +2247,229 @@ class StyleProposalsTests(unittest.TestCase):
         self.assertEqual(skipped, ())
         return output.getvalue()
 
+    def test_an_unfiled_finding_that_a_newer_rule_text_judged_again_is_withdrawn_not_skipped(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            blob = self.newer_rule_text()
+            row = self.newer_verdict(ledger, blob, "held")
+            with redirect_stdout(io.StringIO()) as output:
+                _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/lib.rs:1: "
+                          + f"judgment {row} held under {blob[:8]}", output.getvalue())
+            self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
+            self.assertNotIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
+            withdrawn, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(row)))
+            self.assertEqual(self.calls, [])
+            with redirect_stdout(io.StringIO()) as repeated:
+                _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertIn("totals: withdraw 0, kept 0, close 0", repeated.getvalue())
+            self.assertNotIn(finding.finding_id, repeated.getvalue())
+
+    def test_any_newer_verdict_under_the_current_text_withdraws_an_unfiled_finding(self) -> None:
+        verdicts: tuple[style_ledger.Verdict, ...] = ("clean", "exception", "fixed", "waived")
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {f"alpha/src/{verdict}.rs": APPLIED for verdict in verdicts})
+            findings = [self.hold(ledger, file=f"{verdict}.rs") for verdict in verdicts]
+            blob = self.newer_rule_text()
+            rows = [self.newer_verdict(ledger, blob, verdict, finding.path)
+                    for verdict, finding in zip(verdicts, findings)]
+            output = self.withdraw(ledger)
+            for verdict, finding, row in zip(verdicts, findings, rows):
+                self.assertIn(f"withdraw {finding.finding_id} {self.rename} {finding.path}:1: "
+                              + f"judgment {row} {verdict} under {blob[:8]}", output)
+            self.assertIn("totals: withdraw 4, kept 0, close 0", output)
+            self.assertEqual({finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())},
+                             {finding.finding_id: style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(row))
+                              for finding, row in zip(findings, rows)})
+
+    def test_withdraw_dry_run_lists_an_unfiled_finding_judged_again_and_writes_nothing(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            blob = self.newer_rule_text()
+            row = self.newer_verdict(ledger, blob, "held")
+            before = ledger.held_findings(style_ledger.AllHeldFindings())
+            with redirect_stdout(io.StringIO()) as output:
+                skipped = style_proposals.run_withdrawal(
+                    style_proposals.decision_writer(ledger, self.proposals, "parent"), dry_run=True)
+            self.assertEqual(skipped, ())
+            self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/lib.rs:1: "
+                          + f"judgment {row} held under {blob[:8]}", output.getvalue())
+            self.assertIn("totals: withdraw 1, kept 0, close 0", output.getvalue())
+            self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings()), before)
+            unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(unchanged.state, style_ledger.Unfiled())
+            self.assertEqual(self.calls, [])
+
+    def test_an_unfiled_finding_with_no_newer_judgment_at_its_site_keeps_the_skip_line(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/other.rs": APPLIED})
+            finding = self.hold(ledger)
+            _ = self.newer_verdict(ledger, self.newer_rule_text(), "held", "alpha/src/other.rs")
+            with redirect_stdout(io.StringIO()) as output:
+                _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
+            self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+            unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(unchanged.state, style_ledger.Unfiled())
+
+    def test_an_unfiled_finding_judged_after_a_judgment_under_a_restored_rule_text_is_not_withdrawn(self) -> None:
+        with self.ledger() as ledger:
+            names = self.catalog / "names.md"
+            original = names.read_text()
+            newer = self.newer_rule_text()
+            _ = self.newer_verdict(ledger, newer, "held")
+            _ = names.write_text(original)
+            finding = self.hold(ledger)
+            self.assertEqual(self.newer_rule_text(), newer)
+            with redirect_stdout(io.StringIO()) as output:
+                _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
+            self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+            unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(unchanged.state, style_ledger.Unfiled())
+
+    def test_an_unfiled_finding_of_an_open_ticket_is_not_withdrawn(self) -> None:
+        with self.ledger() as ledger:
+            ticket = self.assign_ticket(ledger, "names-unit")
+            _ = self.hold(ledger, ticket=ticket)
+            _ = self.newer_verdict(ledger, self.newer_rule_text(), "held")
+            with redirect_stdout(io.StringIO()) as output:
+                _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertIn(f"held for open ticket {ticket}: 1 findings", output.getvalue())
+            self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+            unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(unchanged.state, style_ledger.Unfiled())
+
+    def test_an_original_text_judgment_of_another_cell_does_not_block_withdrawal(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/other.rs": APPLIED, "alpha/src/filed.rs": APPLIED})
+            names = self.catalog / "names.md"
+            original = names.read_text()
+            for verdict in ("clean", "exception"):
+                with self.subTest(verdict=verdict):
+                    _ = names.write_text(original)
+                    finding = self.hold(ledger, file="lib.rs" if verdict == "clean" else "filed.rs")
+                    proposal = self.file(ledger)[0] if verdict == "exception" else style_ledger.NoDecision()
+                    newer = self.newer_rule_text()
+                    row = self.newer_verdict(ledger, newer, verdict, finding.path)
+                    _ = names.write_text(original)
+                    ledger.record(self.rename, "alpha/src/other.rs", self.tip, finding.rule_blob, "clean",
+                                  ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
+                    self.assertEqual(self.newer_rule_text(), newer)
+                    output = self.withdraw(ledger)
+                    self.assertIn(f"withdraw {finding.finding_id}", output)
+                    withdrawn = next(item for item in ledger.held_findings(style_ledger.AllHeldFindings())
+                                     if item.finding_id == finding.finding_id)
+                    reason = style_ledger.ExceptionVerdict(row) if verdict == "exception" else style_ledger.JudgedAgain(row)
+                    self.assertEqual(withdrawn.state, style_ledger.Withdrawn(proposal, reason))
+
+    def test_an_unfiled_finding_keeps_its_newer_own_judgment_when_its_declaration_moves(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT, "alpha/src/b.rs": "fn other() {}\n"})
+            names = self.catalog / "names.md"
+            original = names.read_text()
+            newer = self.newer_rule_text()
+            _ = self.newer_verdict(ledger, newer, "clean", "alpha/src/b.rs")
+            _ = names.write_text(original)
+            finding, = self.judge(ledger, (("alpha/src/a.rs", 2, "old: u32,"),))
+            ledger.record(self.rename, finding.path, self.tip, finding.rule_blob, "held",
+                          ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
+            self.assertEqual(self.newer_rule_text(), newer)
+            _ = self.commit_tip(ledger, {"alpha/src/a.rs": "fn other() {}\n", "alpha/src/b.rs": PARENT})
+            with redirect_stdout(io.StringIO()) as output:
+                _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            moved, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual((moved.path, moved.state), ("alpha/src/b.rs", style_ledger.Unfiled()))
+            self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
+            row = self.newer_verdict(ledger, newer, "clean", moved.path)
+            self.assertIn(f"judgment {row} clean", self.withdraw(ledger))
+            withdrawn, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(row)))
+
+    def test_a_filed_finding_keeps_its_newer_own_judgment_when_its_declaration_moves(self) -> None:
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT, "alpha/src/b.rs": "fn other() {}\n"})
+            names = self.catalog / "names.md"
+            original = names.read_text()
+            newer = self.newer_rule_text()
+            _ = self.newer_verdict(ledger, newer, "exception", "alpha/src/b.rs")
+            _ = names.write_text(original)
+            finding, = self.judge(ledger, (("alpha/src/a.rs", 2, "old: u32,"),))
+            ledger.record(self.rename, finding.path, self.tip, finding.rule_blob, "held",
+                          ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
+            issue, = self.file(ledger)
+            self.assertEqual(self.newer_rule_text(), newer)
+            _ = self.commit_tip(ledger, {"alpha/src/a.rs": "fn other() {}\n", "alpha/src/b.rs": PARENT})
+            _ = self.file(ledger)
+            moved, = ledger.proposal_findings(issue)
+            self.assertEqual((moved.path, moved.state), ("alpha/src/b.rs", style_ledger.Filed(issue)))
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            row = self.newer_verdict(ledger, newer, "exception", moved.path)
+            self.assertIn(f"judgment {row} exception", self.withdraw(ledger))
+            withdrawn, = ledger.proposal_findings(issue)
+            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(row)))
+
+    def test_a_moved_finding_keeps_its_later_own_judgment_against_an_older_destination_judgment(self) -> None:
+        for verdict in ("clean", "exception"):
+            with self.subTest(verdict=verdict), self.ledger() as ledger:
+                names = self.catalog / "names.md"
+                original = names.read_text()
+                source = f"alpha/src/{verdict}_a.rs"
+                destination = f"alpha/src/{verdict}_b.rs"
+                parent = f"{verdict.title()}Parent"
+                declaration = PARENT.replace("Parent", parent)
+                _ = self.commit_tip(ledger, {source: declaration, destination: "fn other() {}\n"})
+                finding, = self.judge(ledger, ((source, 2, "old: u32,"),),
+                                      before=f"{parent}::old", after=f"{parent}::new")
+                ledger.record(self.rename, source, self.tip, finding.rule_blob, "held",
+                              ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
+                issue = self.file(ledger)[0] if verdict == "exception" else style_ledger.NoDecision()
+                newer = self.newer_rule_text()
+                _ = self.newer_verdict(ledger, newer, verdict, destination)
+                _ = names.write_text(original)
+                ledger.record(self.rename, source, self.tip, finding.rule_blob, "held",
+                              ticket=finding.ticket, worker="test", input_scope=style_ledger.DeclaredInputScope.RULE)
+                self.assertEqual(self.newer_rule_text(), newer)
+                _ = self.commit_tip(ledger, {source: "fn other() {}\n", destination: declaration})
+                with redirect_stdout(io.StringIO()) as output:
+                    _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
+                moved = next(item for item in ledger.held_findings(style_ledger.AllHeldFindings())
+                             if item.finding_id == finding.finding_id)
+                expected = style_ledger.Filed(issue) if isinstance(issue, Path) else style_ledger.Unfiled()
+                self.assertEqual((moved.path, moved.state), (destination, expected))
+                self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
+                if isinstance(issue, Path):
+                    self.assertEqual(frontmatter(issue)["status"], ["open"])
+                _ = names.write_text(original)
+
+    def test_a_moved_finding_withdraws_by_a_judgment_at_its_new_cell_after_the_move(self) -> None:
+        for verdict in ("clean", "exception"):
+            with self.subTest(verdict=verdict), self.ledger() as ledger:
+                source = f"alpha/src/{verdict}_later_a.rs"
+                destination = f"alpha/src/{verdict}_later_b.rs"
+                parent = f"{verdict.title()}Parent"
+                declaration = PARENT.replace("Parent", parent)
+                _ = self.commit_tip(ledger, {source: declaration, destination: "fn other() {}\n"})
+                finding, = self.judge(ledger, ((source, 2, "old: u32,"),),
+                                      before=f"{parent}::old", after=f"{parent}::new")
+                issue = self.file(ledger)[0] if verdict == "exception" else style_ledger.NoDecision()
+                newer = self.newer_rule_text()
+                _ = self.commit_tip(ledger, {source: "fn other() {}\n", destination: declaration})
+                _ = self.file(ledger)
+                moved = next(item for item in ledger.held_findings(style_ledger.AllHeldFindings())
+                             if item.finding_id == finding.finding_id)
+                self.assertEqual(moved.path, destination)
+                self.assertIsInstance(moved.follow, style_ledger.FollowedDeclaration)
+                row = self.newer_verdict(ledger, newer, verdict, destination)
+                self.assertIn(f"withdraw {finding.finding_id}", self.withdraw(ledger))
+                withdrawn = next(item for item in ledger.held_findings(style_ledger.AllHeldFindings())
+                                 if item.finding_id == finding.finding_id)
+                reason = style_ledger.ExceptionVerdict(row) if verdict == "exception" else style_ledger.JudgedAgain(row)
+                self.assertEqual(withdrawn.state, style_ledger.Withdrawn(issue, reason))
+                if isinstance(issue, Path):
+                    self.assertEqual(frontmatter(issue)["status"], ["closed"])
+
     def test_an_exception_under_a_newer_rule_text_withdraws_its_filed_findings_and_closes_their_decision(self) -> None:
         with self.ledger() as ledger:
             first, second = self.hold(ledger), self.hold(ledger, line=2)

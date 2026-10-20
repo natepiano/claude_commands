@@ -425,7 +425,8 @@ File held changes with `style_proposals.py file --repo <style checkout>
 `**Proposals:**` line and the parent from `showrunners.py parent <style slug>`.
 Run filing after each checkpoint with held cells and each no-change notice
 with held findings. Findings held by assigned or checkpointed tickets wait.
-Findings judged under an older rule text stay unfiled.
+Findings judged under an older rule text stay unfiled until a judgment under
+the current text judges their cell again; then filing withdraws them.
 A `skipped <issue>: <reason>` line means that filing cannot write that
 decision. When filing new findings, those findings stay unfiled. When
 refreshing an open decision, its findings stay filed and the file stays as it
@@ -433,18 +434,24 @@ was. The other decisions still file. When it skips one or more decisions,
 `file` exits 1. Fix the named decision file as the reason tells, then run
 `file` again. A `skipped <finding>: rule changed since judged` line names one
 finding, not a decision, and does not change the exit status.
+Its cell has no judgment under the current text yet: a refill judges the stale cell,
+and the next `file` withdraws the finding.
 
 Filing first withdraws each filed finding whose site has an `exception` as the
 newest judgment under its rule's current text, when the finding was judged
 under an older text. `withdrawn` is its own state, not `waived`, and the
 finding records that judgment's row. A finding that an open ticket builds is
-kept. The judgment must also be newer than the finding's own judgment. A
-decision whose findings are all withdrawn closes with a reason that names them
+kept. The judgment must also be newer than the finding's own judgment.
+An unfiled finding judged under an older text is withdrawn when the newest
+judgment at its site uses the current text. Any verdict withdraws it, and the
+finding records that row. It has no decision, so no decision changes.
+An unfiled finding of an open ticket waits for that ticket. A decision whose
+findings are all withdrawn closes with a reason that names them
 and the judgment rows. A decision that keeps other findings shows only those,
 and `complete` closes it when they are built or waived.
 `style_proposals.py withdraw --repo <style checkout> --proposals <folder>
 [--dry-run]` runs this step alone. It prints
-`withdraw <finding> <rule> <path>:<line>: judgment <row> exception under <blob>`,
+`withdraw <finding> <rule> <path>:<line>: judgment <row> <verdict> under <blob>`,
 a `kept` line with the ticket, a `close` line per decision and a `totals` line.
 The dry run prints the same lines and writes nothing. A decision that it cannot
 close or refresh gets a `skipped <issue>: <reason>` line, the other decisions
@@ -721,8 +728,8 @@ decision whose duplicate an open ticket builds, or that has no generated body,
 prints `skipped <issue>: <reason>` and is not written. The run ends with
 `totals: drop <findings>, skipped <decisions>` and exits 1 when it skipped a
 decision. The dry run prints the same lines and writes nothing. `style_ledger.py
-held list` shows `duplicate of <finding id>` or `judgment <row> exception` after
-the state of a withdrawn row; `--json` gives `duplicate_of` and `withdrawn_by`.
+held list` shows `duplicate of <finding id>`, `judgment <row> exception` or
+`judged again in judgment <row>` after the state of a withdrawn row; `--json` gives `duplicate_of` and `withdrawn_by`.
 
 ## Lifetime
 

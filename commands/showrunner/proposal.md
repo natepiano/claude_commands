@@ -107,7 +107,8 @@ or an old issue that closed too early with `style_proposals.py reopen --repo
 lines first. It exits 1 when a built rename has no check; read the code and
 pass `--finding <id>` (not applied) or `--applied <id>`, with `--by <who>`.
 Filing withdraws a filed finding that an `exception` under its rule's newer
-text supersedes, and closes a decision left with no filed finding. Run that step
+text supersedes, and an unfiled finding whose site that text judged again.
+It closes a decision left with no filed finding. Run that step
 alone with `style_proposals.py withdraw --repo <style checkout> --proposals
 <folder>`; add `--dry-run` to see the lines first.
 Filing first moves a finding to the one file that now declares its item, or to its

@@ -781,6 +781,20 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
             self.assertEqual(connection.execute("SELECT person_read_by FROM held_findings").fetchone(), ("",))
 
+    def test_an_unfiled_finding_withdrawn_by_a_newer_judgment_reads_and_lists_as_judged_again(self) -> None:
+        finding_id = self.hold_finding(self.rule("read"), 2)
+        ledger = self.ledger()
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("UPDATE held_findings SET state='withdrawn',withdrawn_by=7 WHERE finding_id=?",
+                                   (finding_id,))
+            connection.commit()
+        lines = {line.split("\t")[0]: line.split("\t")[3:] for line in self.cli("held", "list").stdout.splitlines()}
+        self.assertEqual(lines[finding_id], ["withdrawn", "judged again in judgment 7"])
+        finding, = ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn"))
+        self.assertEqual(finding.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.JudgedAgain(7)))
+        listed = cast(list[dict[str, object]], json.loads(self.cli("held", "list", "--json").stdout))
+        self.assertEqual(listed[0]["withdrawn_by"], 7)
+
     def test_duplicate_migration_fifteen_keeps_version_fourteen_withdrawals_by_their_exception(self) -> None:
         rule = self.rule("read")
         database = self.root / "version-fourteen.sqlite"
