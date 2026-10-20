@@ -15,21 +15,17 @@
     "long_sender": {
       "objections": [
         {
-          "quote": "cargo-liner-style renames are done",
+          "quote": "cargo-liner-style renames",
           "rule": "reader-starts-cold"
         },
         {
           "quote": "both units run under their new names",
           "rule": "before-and-after"
-        },
-        {
-          "quote": "cargo-liner-style renames are done",
-          "rule": "title-names-the-stake"
         }
       ],
       "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
-      "sha256": "b8b1724ecbc818daad7e7c4e0cf6595dda6bd66996a4d5ab97bcf97378abbfa7",
-      "time": "2026-10-20T14:19:09.731530-04:00"
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:23:00.784022-04:00"
     },
     "typical": {
       "objections": [
@@ -39,8 +35,8 @@
         }
       ],
       "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
-      "sha256": "b8b1724ecbc818daad7e7c4e0cf6595dda6bd66996a4d5ab97bcf97378abbfa7",
-      "time": "2026-10-20T14:18:55.912359-04:00"
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:22:51.437039-04:00"
     }
   },
   "nixos.disk_low": {

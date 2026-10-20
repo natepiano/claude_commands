@@ -199,5 +199,6 @@ ENTRIES = (
                                  + "/nate adhoc <instructions> sends you an update like this one."}),
          PushExample("long_sender", {"sender": "cargo-liner-style", "title": "renames are done",
                                      "description": "You asked to be told when the tile and handler renames finish. "
-                                     + "Both are done, and both units run under their new names."}))),
+                                     + "Both are done, and both units run under their new names."})),
+        header=False),
 )

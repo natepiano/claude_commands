@@ -441,6 +441,36 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(record.get("text_id"), "test")
         self.assertEqual(record.get("failed_rules"), ["reader-starts-cold"])
 
+    def test_registry_rewrite_is_logged_but_the_rendered_text_is_sent(self) -> None:
+        rendered = push_texts.RenderedPush("test", "script", "decision", "Choose retry", ActionRequired("Choose retry."), "The build stopped.", {})
+        rewrite = review.Draft("script", "1", "Different title", rendered.action, "Different body", False)
+        with (mock.patch.object(push_texts, "render", return_value=rendered),
+              mock.patch.object(review, "review", return_value=review.Rewritten(rewrite, ["reader-starts-cold"])),
+              redirect_stdout(io.StringIO()) as output):
+            code, form = self.run_send(["--text-id", "test"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], [rendered.title])
+        self.assertEqual(form["message"], [first_line(rendered.action) + "\n" + rendered.body])
+        self.assertNotIn("sent as rewritten", output.getvalue())
+        self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
+        self.assertEqual(cast(dict[str, object], self.reviews()[0]["sent"])["body"], rendered.body)
+
+    def test_nate_adhoc_is_sent_exactly_as_rendered_even_when_review_rewrites_it(self) -> None:
+        description = "You asked to be told when the /nate skill is ready. It is ready now."
+        values = {"sender": "natedev", "title": "the /nate skill is ready", "description": description}
+        argv = ["--text-id", "nate.adhoc", *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
+        rewrite = review.Draft("natedev", "0", "The /nate skill is ready", NoActionRequired(), "Rewritten body", False)
+        for outcome in (review.Rewritten(rewrite, ["reader-starts-cold"]), review.Failed(rewrite, ["reader-starts-cold"])):
+            with (self.subTest(outcome=type(outcome).__name__),
+                  mock.patch.object(review, "review", return_value=outcome),
+                  redirect_stdout(io.StringIO()) as output):
+                code, form = self.run_send(argv)
+            self.assertEqual(code, 0)
+            self.assertEqual(form["title"], ["natedev the /nate skill is ready"])
+            self.assertEqual(form["message"], [description + "\n\nadhoc"])
+            self.assertEqual(form["priority"], ["0"])
+            self.assertNotIn("sent as rewritten", output.getvalue())
+
     def test_cancelled_revision_drops_its_claim_without_posting_or_reporting_a_rewrite(self) -> None:
         draft = self.draft(answerable=True)
         held = review.Held(draft.source, 1000, draft, draft, ["Which build stopped?"])
