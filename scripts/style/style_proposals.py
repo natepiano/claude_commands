@@ -1276,13 +1276,14 @@ def drop_duplicates(ledger: style_ledger.Ledger, *, dry_run: bool) -> tuple[Path
     return tuple(skipped)
 
 
-def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingException) -> str:
+def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingJudgment) -> str:
     return (f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}: "
-            + f"judgment {verdict.judgment_id} exception under {verdict.rule_blob[:8]}")
+            + f"judgment {verdict.judgment_id} {verdict.verdict} under {verdict.rule_blob[:8]}")
 
 
 def run_withdrawal(writer: DecisionWriter, *, dry_run: bool) -> tuple[Path, ...]:
-    """Withdraw each filed finding that an exception under its rule's newer text supersedes, then close or refresh its decision.
+    """Withdraw each filed finding that an exception under its rule's newer text supersedes, and each unfiled
+    finding whose cell that text judged again, then close or refresh the decisions of the filed ones.
 
     Print one line per withdrawn and kept finding and per closed decision, then the totals. A dry run prints the
     same lines and writes nothing. A refresh keeps the parent that the decision names. A decision that cannot

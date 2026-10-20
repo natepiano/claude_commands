@@ -212,6 +212,13 @@ class ExceptionVerdict:
 
 
 @dataclass(frozen=True)
+class JudgedAgain:
+    """A judgment under the rule's newer text judged the unfiled finding's cell again; that judgment now decides the cell."""
+
+    judgment_id: int
+
+
+@dataclass(frozen=True)
 class DuplicateOf:
     """The finding is a bare rename that a qualified rename finding of the same rule and file already holds.
 
@@ -228,13 +235,15 @@ class DeclarationGone:
     commit: str
 
 
-WithdrawnBy = ExceptionVerdict | DuplicateOf | DeclarationGone
+WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone
 
 
 def withdrawn_line(by: WithdrawnBy) -> str:
     match by:
         case ExceptionVerdict():
             return f"judgment {by.judgment_id} exception"
+        case JudgedAgain():
+            return f"judged again in judgment {by.judgment_id}"
         case DuplicateOf():
             return f"duplicate of {by.finding_id}"
         case DeclarationGone():
@@ -485,17 +494,19 @@ class BareDuplicate:
 
 
 @dataclass(frozen=True)
-class SupersedingException:
-    """The judgment with the verdict exception under the rule's current text that is newest at a finding's cell, also newer than its own."""
+class SupersedingJudgment:
+    """The newest judgment at a finding's cell under the rule's current text, also newer than its own: an exception
+    for a filed finding, any verdict for an unfiled one."""
 
     judgment_id: int
+    verdict: Verdict
     rule_blob: str
 
 
 @dataclass(frozen=True)
 class WithdrawnFinding:
     finding: HeldFinding
-    verdict: SupersedingException
+    verdict: SupersedingJudgment
 
 
 @dataclass(frozen=True)
@@ -503,13 +514,13 @@ class KeptForBuild:
     """A finding the newer verdict would withdraw, kept because a ticket that is not final builds it."""
 
     finding: HeldFinding
-    verdict: SupersedingException
+    verdict: SupersedingJudgment
     ticket: str
 
 
 @dataclass(frozen=True)
 class Withdrawal:
-    """The filed findings that an exception under their rule's newer text withdraws, and those an open build keeps."""
+    """The findings that a newer judgment under their rule's current text withdraws, and those an open build keeps."""
 
     withdrawn: tuple[WithdrawnFinding, ...]
     kept: tuple[KeptForBuild, ...]
@@ -1906,7 +1917,8 @@ class Ledger:
                 state = Built(Path(row[11]))
             case "withdrawn":
                 state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
-                                  DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20] else ExceptionVerdict(row[13]))
+                                  DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20]
+                                  else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
             case "unfiled":
                 state = Unfiled()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
@@ -2153,12 +2165,16 @@ class Ledger:
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
 
     def _changed_rule_findings(self, definitions: Mapping[str, Rule]) -> tuple[tuple[HeldFinding, Rule], ...]:
-        """Each filed finding whose rule's current text is not the text it was judged under, with that rule.
+        """Each unfiled or filed finding whose rule's current text is not the text it was judged under, with that rule.
 
-        Filing skips an unfiled finding by the same lookup.
+        An unfiled finding that an open ticket holds is not read. Filing skips an unfiled one that this step leaves.
         """
+        waiting = {finding.finding_id for finding in self.held_findings(UnfiledFindingsFromOpenTickets())}
         changed: list[tuple[HeldFinding, Rule]] = []
-        for finding in self.held_findings(HeldFindingsInState("filed")):
+        for finding in (*self.held_findings(HeldFindingsInState("unfiled")),
+                        *self.held_findings(HeldFindingsInState("filed"))):
+            if finding.finding_id in waiting:
+                continue
             definition = definitions.get(finding.rule.removesuffix("#uncovered"))
             if definition is not None and definition.blob != finding.rule_blob:
                 changed.append((finding, definition))
@@ -2168,16 +2184,22 @@ class Ledger:
         withdrawn: list[WithdrawnFinding] = []
         kept: list[KeptForBuild] = []
         for finding, definition in self._changed_rule_findings(definitions):
-            # The verdict must also be newer than the finding's own judgment, so an old exception under a text
-            # that the rule returned to never withdraws a finding judged after it.
-            rows = cast(list[tuple[int, Verdict, str]], self._connection.execute(
-                "SELECT id,verdict,rule_blob FROM judgments WHERE rule=? AND path=? AND rule_blob IN (?,?) "
-                + "ORDER BY recorded_at DESC,id DESC LIMIT 1",
-                (finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
+            # followed_at holds a commit. updated_at uses the same UTC clock and format as recorded_at.
+            # After a follow, require a verdict after that row update. This can keep a finding judged before
+            # its move, or before a later row edit; keeping it is safer than closing its decision too soon.
+            rows = cast(list[tuple[int, Verdict, str, str, str, str, str]], self._connection.execute(
+                "SELECT j.id,j.verdict,j.rule_blob,j.recorded_at,h.created_at,h.followed_at,h.updated_at FROM judgments j "
+                + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.rule_blob IN (?,?) "
+                + "ORDER BY j.recorded_at DESC,j.id DESC LIMIT 1",
+                (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
             ).fetchall())
-            if not rows or rows[0][1:] != ("exception", definition.blob):
+            withdraws = (rows and rows[0][2] == definition.blob
+                         and (isinstance(finding.state, Unfiled) or rows[0][1] == "exception")
+                         and rows[0][4] < rows[0][3]
+                         and (not rows[0][5] or rows[0][6] < rows[0][3]))
+            if not withdraws:
                 continue
-            verdict = SupersedingException(rows[0][0], definition.blob)
+            verdict = SupersedingJudgment(rows[0][0], rows[0][1], definition.blob)
             if isinstance(finding.build_ticket, BuildTicket):
                 ticket = self._ticket(finding.build_ticket.ticket)
                 if ticket["state"] not in FINAL_TICKET_STATES:
@@ -2189,7 +2211,7 @@ class Ledger:
     def superseded_findings(self, definitions: Mapping[str, Rule]) -> Withdrawal:
         """What withdraw_superseded withdraws and keeps; it writes nothing.
 
-        definitions maps each rule id to its current catalog rule. The synced tip loads only when a filed
+        definitions maps each rule id to its current catalog rule. The synced tip loads only when an unfiled or filed
         finding's rule text changed.
         """
         if not self._changed_rule_findings(definitions):
@@ -2197,7 +2219,11 @@ class Ledger:
         return self._superseded(definitions, self._synced_tip())
 
     def withdraw_superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
-        """Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text.
+        """Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text,
+        and each unfiled finding whose cell's newest judgment is under that text.
+
+        That judgment must come after the finding was created. For a followed finding it must also come after
+        its last row update, which is no earlier than its last follow. Judgments at other cells do not affect this check.
 
         A finding that a ticket which is not final builds stays filed and is returned as kept. The plan comes
         before the write lock; if the rows it read change before the lock, the withdrawal starts again.
@@ -3392,9 +3418,9 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
     if isinstance(finding.state, (Filed, Built, Withdrawn)):
         result["proposal"] = str(finding.state.proposal) if isinstance(finding.state.proposal, Path) else ""
     if isinstance(finding.state, Withdrawn):
-        # One of the two is set, as in the ledger row: the exception judgment, or the qualified finding duplicated.
+        # The judgment row is set for either verdict withdrawal.
         by = finding.state.by
-        result["withdrawn_by"] = by.judgment_id if isinstance(by, ExceptionVerdict) else 0
+        result["withdrawn_by"] = by.judgment_id if isinstance(by, (ExceptionVerdict, JudgedAgain)) else 0
         result["duplicate_of"] = by.finding_id if isinstance(by, DuplicateOf) else ""
     result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
     result["unwaived_by"] = finding.waive_undo.by if isinstance(finding.waive_undo, WaiveUndoneBy) else ""
