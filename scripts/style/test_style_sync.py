@@ -20,7 +20,7 @@ import style_sync
 import style_ledger
 import style_rules
 import showrunners
-from scripts.delegate import test_verify_lint_scope as verify_fixture
+from scripts.direct import test_verify_lint_scope as verify_fixture
 
 
 class RecordedCall(TypedDict):

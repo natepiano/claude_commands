@@ -1606,6 +1606,24 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(send.call_count, 2)
             self.assertEqual(self.sent(send)[:2], ("runner", "Unit is back on claude3"))
 
+    def test_a_move_reported_after_a_later_stop_and_forget_does_not_say_the_unit_is_back(self) -> None:
+        saved = self.unit_for_showrunner()
+        def restarted(current: record.SessionShutdown) -> None:
+            current["progress"] = {"kind": "restarted", "at": NOW}
+            current["showrunner_told"] = settle.SHOWRUNNER_TOLD_STOPPING
+        back = record.update_session(LOGIN, "unit", restarted)
+        record.archive_session(LOGIN, "unit")
+        stop = session_shutdown(saved["session"], progress={"kind": "stopped", "at": NOW}, request_id="request-two")
+        stop["requested_at"] = (NOW_UTC + timedelta(minutes=10)).isoformat()
+        self.save(stop)
+        self.assertIsInstance(record.forget_session(LOGIN, "unit", "natedev"), record.SessionForgotten)
+        with (
+            patch.object(settle_showrunners, "current_name", return_value="runner"),
+            patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
+        ):
+            settle.tell_showrunners_outcome([back])
+        send.assert_not_called()
+
     def test_unit_showrunner_is_told_once_per_new_failure_and_a_stop_says_it_stays_stopped(self) -> None:
         saved = self.unit_for_showrunner(then="stop")
         with (
@@ -3542,7 +3560,7 @@ class SettleTests(ShutdownTestCase):
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["session"], "Display name")
         self.assertTrue(push.message.startswith("Session: Display name\nAction: "))
-        self.assertIn("in a terminal on natedev:", push.body.casefold())
+        self.assertIn("in a terminal on natedev, run:", push.body.casefold())
 
     def test_holdout_push_uses_the_canonical_label_without_the_login_email(self) -> None:
         for reason, expected_id in (("showing a form", "shutdown.holdout"), ("waiting", "shutdown.holdout_unanswered")):
@@ -4060,7 +4078,7 @@ class SettleTests(ShutdownTestCase):
         self.assertIn("Held", push.title)
         self.assertIn("shutdown", push.title)
         self.assertIn("is blocked", push.title)
-        self.assertIn("in a terminal on mac:", push.body.casefold())
+        self.assertIn("in a terminal on mac, run:", push.body.casefold())
         self.assertIn(f"now {LABEL} --here --only held", push.body)
         self.assertIn(f"now {LOGIN} --here --only held", cast(str, sender.call_args.args[2]))
 

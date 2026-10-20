@@ -41,7 +41,8 @@ LIST = """# Change review list
 | --- | --- | --- | --- |
 | C70 | Older | works | 2026-10-13 |
 """
-SEE = "Change-Review: The grid fades more gently | Look across the floor"
+GRID = Visible("The grid fades more gently", "Run `hana` in a natedev terminal", "The grid lines fade out farther away")
+SEE = f"Change-Review: {GRID.change} | {GRID.check} | {GRID.see}"
 # A production doc as the vault records it; a write never reads the doc itself.
 PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
 DOC = str(PRODUCTION)
@@ -51,7 +52,7 @@ class ParseTest(unittest.TestCase):
     def test_a_visible_line_a_none_line_and_a_malformed_line(self) -> None:
         self.assertEqual(change_review.entries(f"checkpoint(x): y\n\n{SEE}\nChange-Review: none — scripts only\n"
                                                + "Change-Review: something\n"),
-                         [Visible("The grid fades more gently", "Look across the floor"), Invisible("scripts only"),
+                         [GRID, Invisible("scripts only"),
                           Malformed("something")])
 
     def test_only_a_checkpoint_that_changes_more_than_markdown_needs_a_line(self) -> None:
@@ -62,8 +63,20 @@ class ParseTest(unittest.TestCase):
 
     def test_a_missing_or_malformed_line_is_named(self) -> None:
         self.assertIn("no Change-Review line", change_review.problem("checkpoint(x): y", "checkpoint(x): y\n", ("a.py",)))
-        self.assertIn("neither", change_review.problem("checkpoint(x): y", "Change-Review: grid\n", ("a.py",)))
+        self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "checkpoint(x): y\n", ("a.py",)))
+        self.assertIn(change_review.FORM, change_review.problem("checkpoint(x): y", "Change-Review: grid\n", ("a.py",)))
         self.assertEqual(change_review.problem("checkpoint(x): y", SEE, ("a.py",)), "")
+
+    def test_a_line_without_exactly_three_full_parts_is_refused(self) -> None:
+        for value in ("The grid fades | Look across the floor", "A | B | ", " | B | C", "A | B | C | D"):
+            self.assertEqual(change_review.parse(value), Malformed(value.strip()), value)
+            problem = change_review.problem("checkpoint(x): y", f"Change-Review: {value}\n", ("a.py",))
+            self.assertIn("needs three parts", problem, value)
+            self.assertIn(change_review.FORM, problem, value)
+
+    def test_the_check_cell_is_how_to_try_it_then_what_you_see(self) -> None:
+        self.assertEqual(GRID.how(), "Run `hana` in a natedev terminal. You see: The grid lines fade out farther away")
+        self.assertEqual(Visible("A", "Type `x`:", "B").how(), "Type `x`: You see: B")
 
 
 class ListTest(unittest.TestCase):
@@ -77,17 +90,17 @@ class ListTest(unittest.TestCase):
         _ = self.path.write_text(LIST, encoding="utf-8")
 
     def test_rows_take_the_next_number_in_the_whole_file_and_end_the_table(self) -> None:
-        rows = change_review.append_rows(self.path, [Visible("A | B", "Look"), Visible("C", "D")],
+        rows = change_review.append_rows(self.path, [Visible("A | B", "Look", "It"), Visible("C", "D.", "E")],
                                          date(2026, 10, 14), "61b65bbf", PRODUCTION)
-        self.assertEqual(rows, ["| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look |",
-                                "| C82 | C | 2026-10-14 · 61b65bbf | not yet | D |"])
+        self.assertEqual(rows, ["| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look. You see: It |",
+                                "| C82 | C | 2026-10-14 · 61b65bbf | not yet | D. You see: E |"])
         lines = self.path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(lines[lines.index("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font |") + 1], rows[0])
 
     def test_a_list_without_the_section_is_refused_and_left_alone(self) -> None:
         _ = self.path.write_text("# list\n", encoding="utf-8")
         self.assertRaises(change_review.ChangeReviewError, change_review.append_rows, self.path,
-                          [Visible("A", "B")], date(2026, 10, 14), "abc", PRODUCTION)
+                          [Visible("A", "B", "C")], date(2026, 10, 14), "abc", PRODUCTION)
         self.assertEqual(self.path.read_text(encoding="utf-8"), "# list\n")
 
     def test_a_production_doc_names_its_list_or_none(self) -> None:
@@ -152,7 +165,7 @@ class StampTest(unittest.TestCase):
         return lines[:lines.index("---", 1) + 1]
 
     def test_a_write_moves_date_modified_and_keeps_a_listed_production_in_either_form(self) -> None:
-        _ = change_review.append_rows(self.path, [Visible("A", "B")], date(2026, 10, 15), "",
+        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "",
                                       Path("~/worktrees/demo-trunk/docs/plans/demo-production.md"))
         self.assertEqual(self.frontmatter(), [
             "---", 'date_created: "[[2026-10-14]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
@@ -160,7 +173,7 @@ class StampTest(unittest.TestCase):
 
     def test_a_new_production_is_added_after_the_listed_ones(self) -> None:
         other = Path.home() / "rust/cargo-liner/docs/child-production.md"
-        _ = change_review.append_rows(self.path, [Visible("A", "B")], date(2026, 10, 15), "", other)
+        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "", other)
         _ = change_review.record_verdict(self.path, "C1", "works", date(2026, 10, 16), other)
         self.assertEqual(self.frontmatter()[2:6], [
             'date_modified: "[[2026-10-16]]"', "productions:", f'  - "{PRODUCTION}"',
@@ -168,7 +181,7 @@ class StampTest(unittest.TestCase):
 
     def test_a_list_without_frontmatter_gains_it_on_its_next_write(self) -> None:
         _ = self.path.write_text(change_review.BODY, encoding="utf-8")
-        _ = change_review.append_rows(self.path, [Visible("A", "B")], date(2026, 10, 15), "", PRODUCTION)
+        _ = change_review.append_rows(self.path, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION)
         self.assertEqual(self.frontmatter(), [
             "---", 'date_created: "[[2026-10-15]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---"])
@@ -197,52 +210,89 @@ class ActionTest(unittest.TestCase):
         self.fresh = Path(directory.name) / "change-review" / "change-review - natedev.md"
 
     def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
-        rows = change_review.append_rows(self.fresh, [Visible("A", "B")], date(2026, 10, 15), "", PRODUCTION)
-        self.assertEqual(rows, ["| C1 | A | 2026-10-15 | B |"])
+        rows = change_review.append_rows(self.fresh, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION)
+        self.assertEqual(rows, ["| C1 | A | 2026-10-15 | B. You see: C |"])
         self.assertEqual(self.fresh.read_text(encoding="utf-8").split("\n\n## To review")[0], "\n".join([
             "---", 'date_created: "[[2026-10-15]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---", "",
             "# natedev showrunner: changes to review", "",
             'Ask for "change review" any time to walk it one change at a time. A reviewed row moves to Reviewed '
             + "with your verdict."]))
-        self.assertIn("| --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
+        self.assertIn("| --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look",
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look", "--see", "It",
                              "--merged", "216c4e1d"), (0, "C81\n", ""))
         day = change_review.today().isoformat()
-        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look |\n\n## Questions",
+        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look. You see: It |\n\n## Questions",
                       self.path.read_text(encoding="utf-8"))
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B")[1], "C1\n")
-        self.assertIn(f"| C1 | A | {day} | B |", self.fresh.read_text(encoding="utf-8"))
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
+        self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
 
     def test_back_to_back_adds_in_one_shell_each_append_the_next_number(self) -> None:
-        changes = [("cargo-handler nests a showrunner | inside its parent", "open `cargo-handler` on natedev"),
-                   ("tile titles carry the role: showrunner, unit director", "read the tile titles"),
-                   ("cargo-tile no longer panics at startup", "start it; ~/.config/cargo-tile/panic.log gains nothing"),
-                   ("cargo-berth gives each phase its own reservation", "run `cargo-berth board | grep phase`")]
+        changes = [Visible("cargo-handler nests a showrunner | inside its parent", "open `cargo-handler` on natedev",
+                           "the showrunner tile sits inside its parent"),
+                   Visible("tile titles carry the role: showrunner, unit director", "read the tile titles",
+                           "each title names its role"),
+                   Visible("cargo-tile no longer panics at startup", "start it in a natedev terminal",
+                           "~/.config/cargo-tile/panic.log gains nothing"),
+                   Visible("cargo-berth gives each phase its own reservation", "run `cargo-berth board | grep phase`",
+                           "one line per phase")]
         script = str(Path(change_review.__file__))
         for path, first in ((self.fresh, 1), (self.path, 81)):
-            numbers = [subprocess.run([sys.executable, script, "add", "--production", DOC, "--list", str(path), "--change", change,
-                                       "--check", check, "--merged", "4ad20245"],
+            numbers = [subprocess.run([sys.executable, script, "add", "--production", DOC, "--list", str(path),
+                                       "--change", item.change, "--check", item.check, "--see", item.see,
+                                       "--merged", "4ad20245"],
                                       capture_output=True, text=True, check=True).stdout.strip()
-                       for change, check in changes]
+                       for item in changes]
             self.assertEqual(numbers, [f"C{number}" for number in range(first, first + len(changes))])
             rows = [row for row in change_review.pending(path) if row["#"] in numbers]
             self.assertEqual([(row["#"], row["Change"], row[change_review.CHECK]) for row in rows],
-                             [(number, change, check) for number, (change, check) in zip(numbers, changes)])
+                             [(number, item.change, item.how()) for number, item in zip(numbers, changes)])
 
     def test_add_refuses_an_empty_or_multi_line_part_and_writes_nothing(self) -> None:
-        for change, check in (("", "Look"), ("A", " "), ("A\nB", "Look")):
-            code, _, error = run("add", "--production", DOC, "--list", str(self.path), "--change", change, "--check", check)
+        for change, check, see in (("", "Look", "It"), ("A", " ", "It"), ("A\nB", "Look", "It"), ("A", "Look", "")):
+            code, _, error = run("add", "--production", DOC, "--list", str(self.path), "--change", change, "--check", check,
+                                 "--see", see)
             self.assertEqual(code, 1)
             self.assertIn("needs one line of words", error)
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
-    def test_show_walks_the_rows_to_review_and_reads_only(self) -> None:
+    def test_add_without_see_is_refused_and_writes_nothing(self) -> None:
+        code, output, error = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "Look")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("--see needs one line of words", error)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+
+    def test_edit_rewrites_one_row_in_place_and_keeps_its_id_merged_cell_and_place(self) -> None:
+        self.assertEqual(run("edit", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                             "--change", "Panels | shields stay", "--check", "Run `hana` in a natedev terminal",
+                             "--see", "Each panel keeps its shield"),
+                         (0, "| C76 | Panels \\| shields stay | 2026-10-14 | not yet | Run `hana` in a natedev terminal. "
+                          + "You see: Each panel keeps its shield |\n", ""))
+        # The write stamps frontmatter above the list; every line below it is the list with the one row changed.
+        self.assertEqual(self.path.read_text(encoding="utf-8").split("\n---\n\n", 1)[1], LIST.replace(
+            "| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana |",
+            "| C76 | Panels \\| shields stay | 2026-10-14 | not yet | Run `hana` in a natedev terminal. "
+            + "You see: Each panel keeps its shield |"))
+
+    def test_edit_refuses_a_row_not_to_review_and_a_missing_part(self) -> None:
+        for row in ("C70", "C99", "76"):
+            code, output, error = run("edit", "--production", DOC, "--list", str(self.path), "--row", row,
+                                      "--change", "A", "--check", "B", "--see", "C")
+            self.assertEqual((code, output), (1, ""), row)
+            self.assertEqual(len(error.splitlines()), 1, row)
+        self.assertIn("C99 is not on the list to review", run("edit", "--production", DOC, "--list", str(self.path),
+                                                              "--row", "C99", "--change", "A", "--check", "B",
+                                                              "--see", "C")[2])
+        self.assertIn("--see needs one line of words", run("edit", "--production", DOC, "--list", str(self.path),
+                                                           "--row", "C76", "--change", "A", "--check", "B")[2])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
+
+    def test_show_prints_only_the_first_row_to_review_and_reads_only(self) -> None:
         self.assertEqual(run("show", "--list", str(self.path)), (0, (
             "C76 Panels keep shields\n  How to check: Launch Hana\n  Merged: 2026-10-14\n  On the Mac build: not yet\n\n"
-            + "C77 Fonts redraw\n  How to check: Change a font\n  Merged: 2026-10-14\n  On the Mac build: not yet\n"), ""))
+            + "1 more to review\n"), ""))
         self.assertEqual(run("show", "--list", str(self.fresh)), (0, "nothing to review\n", ""))
         self.assertFalse(self.fresh.parent.exists())
 
@@ -272,7 +322,7 @@ class ActionTest(unittest.TestCase):
         held = os.open(self.path.parent, os.O_RDONLY)
         fcntl.flock(held, fcntl.LOCK_EX)
         writers = [threading.Thread(target=change_review.append_rows,
-                                    args=(self.path, [Visible(f"Row {index}", "Look")], date(2026, 10, 15), "", PRODUCTION))
+                                    args=(self.path, [Visible(f"Row {index}", "Look", "It")], date(2026, 10, 15), "", PRODUCTION))
                    for index in range(8)]
         for writer in writers:
             writer.start()
@@ -324,27 +374,35 @@ class CommitTest(unittest.TestCase):
         return self.git("log", "-1", "--format=%s"), self.git("show", "--name-only", "--format=", "HEAD").splitlines()
 
     def test_add_commits_a_new_list_and_then_the_existing_one(self) -> None:
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B"), (0, "C1\n", ""))
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
         self.assertEqual(self.last(), ("change-review: hana add C1", ["change-review/change-review - hana.md"]))
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--merged", "4ad20245"),
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E", "--merged", "4ad20245"),
                          (0, "C2\n", ""))
         self.assertEqual(self.last(), ("change-review: hana row C2 from 4ad20245", ["change-review/change-review - hana.md"]))
-        _ = change_review.append_rows(self.path, [Visible("E", "F"), Visible("G", "H")], date(2026, 10, 15), "61b65bbf", PRODUCTION)
+        _ = change_review.append_rows(self.path, [Visible("E", "F", "S"), Visible("G", "H", "S")], date(2026, 10, 15), "61b65bbf", PRODUCTION)
         self.assertEqual(self.last(), ("change-review: hana rows C3–C4 from 61b65bbf", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("status", "--porcelain"), "")
 
     def test_a_verdict_commits_the_list(self) -> None:
-        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B")
+        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
         self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C1", "--verdict", "works"),
                          (0, "C1 landed\n", ""))
         self.assertEqual(self.last(), ("change-review: hana verdict C1", ["change-review/change-review - hana.md"]))
         self.assertIn("| C1 | A | works |", self.git("show", "HEAD:change-review/change-review - hana.md"))
 
+    def test_an_edit_commits_the_list(self) -> None:
+        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
+        _ = run("edit", "--production", DOC, "--list", str(self.path), "--row", "C1", "--change", "D", "--check", "E",
+                "--see", "F")
+        self.assertEqual(self.last(), ("change-review: hana edit C1", ["change-review/change-review - hana.md"]))
+        self.assertIn("| C1 | D |", self.git("show", "HEAD:change-review/change-review - hana.md"))
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
     def test_another_staged_file_stays_staged_and_uncommitted(self) -> None:
         _ = (self.repo / "note.md").write_text("staged edit\n", encoding="utf-8")
         _ = (self.repo / "draft.md").write_text("new\n", encoding="utf-8")
         _ = self.git("add", "note.md", "draft.md")
-        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B")
+        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
         self.assertEqual(self.last(), ("change-review: hana add C1", ["change-review/change-review - hana.md"]))
         self.assertEqual(self.git("diff", "--cached", "--name-only").splitlines(), ["draft.md", "note.md"])
         self.assertEqual(self.git("show", ":note.md"), "staged edit")
@@ -353,14 +411,14 @@ class CommitTest(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         outside = Path(directory.name) / "change-review" / "hana.md"
-        self.assertEqual(run("add", "--production", DOC, "--list", str(outside), "--change", "A", "--check", "B"), (0, "C1\n", ""))
+        self.assertEqual(run("add", "--production", DOC, "--list", str(outside), "--change", "A", "--check", "B", "--see", "C"), (0, "C1\n", ""))
         self.assertIn("| C1 | A |", outside.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
 
     def test_a_held_index_lock_warns_writes_and_the_next_add_commits_both_rows(self) -> None:
         lock = self.repo / ".git" / "index.lock"
         _ = lock.write_text("", encoding="utf-8")
-        code, output, error = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B")
+        code, output, error = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C")
         self.assertEqual((code, output), (0, "C1\n"))
         self.assertEqual(len(error.splitlines()), 1)
         self.assertIn(f"change review: {self.path} written but not committed: ", error)
@@ -368,7 +426,7 @@ class CommitTest(unittest.TestCase):
         self.assertIn("| C1 | A |", self.path.read_text(encoding="utf-8"))
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
         lock.unlink()
-        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D"), (0, "C2\n", ""))
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "C", "--check", "D", "--see", "E"), (0, "C2\n", ""))
         self.assertEqual(self.last(), ("change-review: hana add C2", ["change-review/change-review - hana.md"]))
         committed = self.git("show", "HEAD:change-review/change-review - hana.md")
         self.assertIn("| C1 | A |", committed)
@@ -414,14 +472,14 @@ class RepositoryTest(unittest.TestCase):
         commits = change_review.unit_commits(self.repo, checkpoint, self.previous, "merge")
         self.assertEqual([commit.subject for commit in commits], ["checkpoint(u): grid"])
         self.assertEqual(change_review.missing(commits), [])
-        self.assertEqual(change_review.visible(commits), [Visible("The grid fades more gently", "Look across the floor")])
+        self.assertEqual(change_review.visible(commits), [GRID])
 
     def test_a_markdown_only_checkpoint_needs_no_line_but_its_line_is_read(self) -> None:
         _ = self.commit("a.md", "checkpoint(u): doc without a line")
         checkpoint = self.commit("b.md", f"checkpoint(u): doc with a line\n\n{SEE}")
         commits = change_review.unit_commits(self.repo, checkpoint, self.previous, "merge")
         self.assertEqual(change_review.missing(commits), [])
-        self.assertEqual(change_review.visible(commits), [Visible("The grid fades more gently", "Look across the floor")])
+        self.assertEqual(change_review.visible(commits), [GRID])
 
     def test_a_checkpoint_without_a_line_is_refused_even_when_the_named_checkpoint_is_a_merge(self) -> None:
         _ = self.commit("a.py", "checkpoint(u): grid")
@@ -439,7 +497,7 @@ class RepositoryTest(unittest.TestCase):
         _ = self.commit("b.py", f"checkpoint(u): change review\n\n{SEE}\nChange-Review-Covers: {early[:8]}")
         commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "merge")
         self.assertEqual(change_review.missing(commits), [])
-        self.assertEqual(change_review.visible(commits), [Visible("The grid fades more gently", "Look across the floor")])
+        self.assertEqual(change_review.visible(commits), [GRID])
 
     def test_a_checkpoint_made_before_the_rule_landed_is_not_read(self) -> None:
         _ = self.commit("a.py", "checkpoint(u): before the rule", day="2026-10-14T23:59:00-04:00")

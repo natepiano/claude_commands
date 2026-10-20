@@ -26,7 +26,9 @@ class Gate(Protocol):
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 gate = cast(Gate, cast(object, module))
-SEE = "Change-Review: The grid fades more gently | Look across the floor"
+SEE = ("Change-Review: The grid fades more gently | Run `hana` in a natedev terminal"
+       + " | The grid lines fade out farther away")
+FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 
 
 class RefusalTest(unittest.TestCase):
@@ -66,7 +68,17 @@ class RefusalTest(unittest.TestCase):
 
     def test_a_malformed_line_is_refused(self) -> None:
         self.stage("a.py")
-        self.assertIn("neither", self.refused('git commit -m "checkpoint(u): grid" -m "Change-Review: the grid"'))
+        self.assertIn(FORM, self.refused('git commit -m "checkpoint(u): grid" -m "Change-Review: the grid"'))
+
+    def test_a_two_part_line_is_refused_with_the_three_part_form(self) -> None:
+        self.stage("a.py")
+        refused = self.refused('git commit -m "checkpoint(u): grid" -m "Change-Review: The grid fades | Look across the floor"')
+        self.assertIn("needs three parts", refused)
+        self.assertIn(FORM, refused)
+
+    def test_a_checkpoint_without_any_line_names_the_three_part_form(self) -> None:
+        self.stage("a.py")
+        self.assertIn(FORM, self.refused('git commit -m "checkpoint(u): grid"'))
 
     def test_a_checkpoint_with_a_line_passes(self) -> None:
         self.stage("a.py")

@@ -1,4 +1,4 @@
-/** The disk contract written by scripts/delegate/board_json.py. */
+/** The disk contract written by scripts/direct/board_json.py. */
 export interface BoardTime { at: number; text: string }
 export type EtaTrail = [eta_at: BoardTime, stated_at: BoardTime][];
 export type BoardGate =

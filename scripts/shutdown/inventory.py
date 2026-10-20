@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("whoami", "message", "production", "herdr", "delegate", "lib", "hooks"):
+for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import account
@@ -28,7 +28,7 @@ from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
     from record import PausedSeat
-    from ..delegate.worker_state import worker_ledger
+    from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
 import herdr
@@ -609,6 +609,11 @@ def _terminal_host(pid: int, desktop: Desktop) -> SessionHost:
     return {"kind": "unknown"}
 
 
+# The updater's main() also refreshes the vault's agent notes, which reads every Claude login.
+# Shutdown needs only the desktops; an updater from before the flag ignores it and stays correct.
+SKIP_AGENT_NOTES = "AGENT_SESSIONS_SKIP_AGENT_NOTES"
+
+
 def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
     if sys.platform == "darwin":
         return {}
@@ -622,6 +627,7 @@ def _snapshot_desktops(*, refresh: bool = True) -> dict[str, str]:
                 text=True,
                 timeout=60,
                 check=False,
+                env={**os.environ, SKIP_AGENT_NOTES: "1"},
             )
         except (OSError, subprocess.TimeoutExpired):
             pass

@@ -25,11 +25,9 @@ from add_unit import read_production
 
 if TYPE_CHECKING:
     from scripts.notify import review
-    from scripts.hooks.showrunner_footer import read_pending_reviewed, PendingReviewUnavailableQuestion
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     import review
-    from showrunner_footer import read_pending_reviewed, PendingReviewUnavailableQuestion
 
 SCRIPT = Path(__file__).with_name("update_registration.py")
 
@@ -485,8 +483,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         rows = cast(list[dict[str, str]], json.loads(outstanding.read_text()))
         self.assertEqual(rows[0]["question"], full)
         self.assertEqual(rows[0]["reviewed"], accepted)
-        saved = cast(dict[str, list[dict[str, str]]], json.loads(pending.read_text()))
-        self.assertEqual([item["text"] for item in saved["items"]], ["Retry build", "Choose compiler"])
         lines = [cast(dict[str, str], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertEqual(lines[1]["reviewed"], accepted)
 
@@ -555,9 +551,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertEqual(rows[1]["question"], unavailable)
         self.assertEqual(rows[1]["review_unavailable"], "timeout")
         self.assertNotIn("reviewed", rows[1])
-        pending = self.state / "notifier/showrunner-example/pending_reviewed.json"
-        saved = cast(dict[str, list[dict[str, str]]], json.loads(pending.read_text()))
-        self.assertEqual([item["kind"] for item in saved["items"]], ["reviewed", "review unavailable"])
         with (mock.patch.dict(os.environ, self.env),
               mock.patch.object(showrunners, "user_facing", return_value=["example"]),
               redirect_stdout(io.StringIO()) as output):
@@ -639,21 +632,6 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         history = [cast(dict[str, str], json.loads(line))
                    for line in self.outstanding().with_suffix(".history.jsonl").read_text().splitlines()]
         self.assertEqual([row["text"] for row in history], ["Retry build", "Reminder"])
-
-    def test_replacing_outstanding_removes_closed_pending_questions_and_keeps_open_ones(self) -> None:
-        instance = self.question_instance()
-        question = "Retry build 42?"
-        other = "Use stable?"
-        state = self.question_state([{"text": "Retry build", "question": question},
-                                     {"text": "Compiler", "question": other}])
-        with mock.patch.object(review, "review_question", side_effect=[
-                review.QuestionAccepted(question), review.QuestionReviewUnavailable(other, "timeout")]):
-            _ = self.run_questions(state)
-        _ = self.run_questions(self.question_state(["Compiler"]))
-        self.assertEqual(read_pending_reviewed(instance), [
-            PendingReviewUnavailableQuestion("Compiler", other, "timeout")])
-        _ = self.run_questions(self.question_state([]))
-        self.assertFalse((instance / "pending_reviewed.json").exists())
 
     def test_questions_state_updates_outstanding_only_when_open_items_are_present(self) -> None:
         outstanding = self.outstanding()

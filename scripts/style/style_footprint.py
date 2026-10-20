@@ -24,10 +24,17 @@ QUOTED_LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|b?'(?:\\.|[^'\\\n])' '
 NUMBER = re.compile(r"\d[\w.]*(?:[+-]\d+)?")
 IDENTIFIER = re.compile(r"(?:r#)?[A-Za-z_][A-Za-z_0-9]*")
 PUNCTUATION = re.compile(r"::|->|=>|==|!=|<=|>=|&&|\|\||[{}()\[\];:,.<>!&|+*/%=\-?#@'$^~]")
+FILE_CHANGED_LINE_LIMIT = 200
+# The std traits whose derives add no names to the item they decorate.
+STD_DERIVES = frozenset({"Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Debug"})
 
 
 class FootprintError(Exception):
     pass
+
+
+class CheckCouldNotRun(Exception):
+    """A git command failed, so the change was not judged."""
 
 
 @dataclass(frozen=True)
@@ -115,7 +122,7 @@ def git(repo: Path, *arguments: str, input_text: str = "") -> str:
     result = subprocess.run(["git", "-C", str(repo), *arguments], input=input_text,
                             capture_output=True, text=True, errors="surrogateescape", check=False)
     if result.returncode:
-        raise FootprintError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+        raise CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
     return result.stdout
 
 
@@ -130,7 +137,7 @@ def folded_base(repo: Path, base: str, head: str) -> str:
             if result.returncode == 1:
                 raise FootprintError("merge in range")
             if result.returncode:
-                raise FootprintError(f"git merge-tree: {result.stderr.strip()} (exit {result.returncode})")
+                raise CheckCouldNotRun(f"git merge-tree: {result.stderr.strip()} (exit {result.returncode})")
             tree = result.stdout.splitlines()[0]
             # Subsequent folds need ancestry, not merely the intermediate tree.
             environment = dict(os.environ, GIT_AUTHOR_NAME="Style footprint", GIT_AUTHOR_EMAIL="style@example.invalid",
@@ -139,7 +146,7 @@ def folded_base(repo: Path, base: str, head: str) -> str:
                                     input="Fold merged-in work for style comparison\n", capture_output=True,
                                     text=True, env=environment, check=False)
             if commit.returncode:
-                raise FootprintError(commit.stderr.strip())
+                raise CheckCouldNotRun(commit.stderr.strip())
             current = commit.stdout.strip()
     return current
 
@@ -1266,7 +1273,6 @@ def function_bodies(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
 def enum_bodies(words: tuple[str, ...]) -> tuple[EnumBody, ...]:
     result: list[EnumBody] = []
     attributes = decorated_items(words)
-    allowed = {"Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Debug"}
     for index, word in enumerate(words[:-1]):
         if word != "enum":
             continue
@@ -1296,7 +1302,7 @@ def enum_bodies(words: tuple[str, ...]) -> tuple[EnumBody, ...]:
         for start, finish in attribute_spans(attached):
             attribute = attached[start:finish]
             if len(attribute) < 6 or attribute[2:4] != ("derive", "(") or any(
-                name not in allowed and name != "," for name in attribute[4:-2]
+                name not in STD_DERIVES and name != "," for name in attribute[4:-2]
             ):
                 safe = False
         result.append(EnumBody(words[index + 1], begin, end, tuple(variants), frozenset(attributed_variants), safe))
@@ -1682,13 +1688,12 @@ def changed_text_without_lint_attributes(change: FileChange, proof: LintAttribut
 def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
     reasons: list[str] = []
     proofs = normalizations(finding.changes, before)
-    changed_lines = sum(len(hunk.removed) + len(hunk.added) for change in finding.changes for hunk in change.hunks)
-    if changed_lines >= 200:
-        reasons.append("check 5: 200 or more changed lines")
     if len(finding.changes) > 10 or len({before.crate(change.path) for change in finding.changes}) > 1:
         if any(tokens(change.before) != tokens(change.after) for change in finding.changes):
             reasons.append("check 4: rename exceeds one crate or 10 files")
     for change in finding.changes:
+        if sum(len(hunk.removed) + len(hunk.added) for hunk in change.hunks) >= FILE_CHANGED_LINE_LIMIT:
+            reasons.append(f"check 5: {change.path}: {FILE_CHANGED_LINE_LIMIT} or more changed lines (size only)")
         proof = proofs[change.path]
         lines = changed_text_without_lint_attributes(change, proof.lint_attributes)
         words = {token.value for token in tokens(lines)}
@@ -1738,7 +1743,7 @@ def worktree_commit(repo: Path) -> str:
             result = subprocess.run(["git", "-C", str(repo), *arguments], env=environment,
                                     capture_output=True, text=True, check=False)
             if result.returncode:
-                raise FootprintError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
+                raise CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
             return result.stdout.strip()
 
         _ = snapshot_git("add", "-A", "--", ":/")
@@ -1780,7 +1785,10 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(prefix + "mechanical")
         return int(needs_review)
-    except (FootprintError, OSError, ValueError, StopIteration) as error:
+    except (CheckCouldNotRun, OSError, StopIteration) as error:
+        print(f"error: {error}")
+        return 2
+    except (FootprintError, ValueError) as error:
         print(f"review: {error}")
         return 1
 

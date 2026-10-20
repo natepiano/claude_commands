@@ -33,7 +33,7 @@ SEND_SECONDS = 10
 SEND_RUN_SECONDS = SEND_SECONDS + 10 + 15
 ROSTER = SCRIPTS / "message/roster.py"
 SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
-VERIFY = SCRIPTS / "delegate/verify.sh"
+VERIFY = SCRIPTS / "direct/verify.sh"
 LEDGER = SCRIPTS / "style/style_ledger.py"
 TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
 

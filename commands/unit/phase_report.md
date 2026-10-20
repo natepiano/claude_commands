@@ -97,7 +97,7 @@ owns the ask.
 
 **Count.** Read it from
 
-`python3 ~/.claude/scripts/delegate/progress_history.py phase-count --plan-doc "<plan>"`
+`python3 ~/.claude/scripts/direct/progress_history.py phase-count --plan-doc "<plan>"`
 
 and report its `todo` and `total`. Never count phases by hand or by grep: a
 heading takes three forms over its life and any pattern keyed on `status:`

@@ -108,7 +108,12 @@ set -euo pipefail
 source "$1"
 shift
 require_nextest() {{ :; }}
+# run_once claims the share once the memory gate admits the step; this stand-in admits at once.
 run() {{
+    if [[ -n "${{LINT_NEXTEST_SHARE:-}}" ]]; then
+        nextest_share_claim "$@"
+        set -- "${{LINT_NEXTEST_SHARED_ARGV[@]}}"
+    fi
     printf '<%s>' "$@"
     printf '\\n'
 }}
@@ -126,6 +131,9 @@ run_nextest "$@"
             "BUILDLOG_OFF": "1",
             "BUILDLOG_CALL_ID": "",
             "BUILDLOG_CALLER": "",
+            # Every lint step waits for natedev's hold: a real hold must not stop the case.
+            "BUILD_HOLD_DIR": str(self.root / "holders"),
+            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "LINT_CONFIG_READER": str(config_reader),
         }
         result = subprocess.run(
@@ -145,7 +153,8 @@ run_nextest "$@"
         _ = self.hold("a")
         _ = self.hold("b")
         output = self.run_nextest("logical", "--workspace")
-        self.assertEqual(output, "<cargo><nextest><run><--test-threads><10><--workspace>\n")
+        self.assertEqual(output, "nextest: 10 of 32 test threads, shared with the runs in flight\n"
+                         + "<cargo><nextest><run><--test-threads><10><--workspace>\n")
         self.assertEqual(self.markers(), ["a.run", "b.run"])
 
     def test_caller_width_wins_over_runs_in_flight(self) -> None:

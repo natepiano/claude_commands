@@ -40,8 +40,18 @@ build_hold_mark() {
     if [[ -n "${2:-}" ]]; then arguments+=(--outcome "$2"); fi
     # An app launch is no build: it never ends a turn a queued run holds.
     if [[ "${3:-}" == launch ]]; then arguments+=(--launch); fi
+    # Another caller's call id goes to mark only when no session owns the run
+    # (build_hold.owning_session reads these variables). Then the queue keys the
+    # call as verify:<id>, and only its id ends its turn. A session's build
+    # marks the session's entry with no call id, as before.
+    local call_id=""
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then
-        arguments+=(--call-id "$BUILDLOG_CALL_ID")
+        call_id=$BUILDLOG_CALL_ID
+    elif [[ -z "${CLAUDE_CODE_SESSION_ID:-}${PLAN_DELEGATE_BOARD_DIR:-}${PLAN_DELEGATE_SESSION_DIR:-}" ]]; then
+        call_id="${BUILDLOG_HOLD_CALL_ID:-}"
+    fi
+    if [[ -n "$call_id" ]]; then
+        arguments+=(--call-id "$call_id")
         if [[ -n "${BUILDLOG_HOLD_ADMISSION_FILE:-}" && -r "$BUILDLOG_HOLD_ADMISSION_FILE" ]]; then
             IFS=' ' read -r cycle_id generation < "$BUILDLOG_HOLD_ADMISSION_FILE" || true
             [[ -z "$cycle_id" ]] || arguments+=(--cycle-id "$cycle_id")
@@ -66,10 +76,44 @@ build_hold_nothing_held() {
     return 0
 }
 
+# natedev's hold queue knows each waiting step by a call id. A verify.sh step
+# uses verify's BUILDLOG_CALL_ID. A step from any other caller (cargo-port, an
+# agent that runs lint) gets an id of the same form, made once per shell when
+# a hold is first seen. The id stays in this shell and is not exported: build
+# log rows join BUILDLOG_CALL_ID to verify's call records, and this caller has
+# no call record.
+BUILDLOG_HOLD_CALL_ID="${BUILDLOG_HOLD_CALL_ID:-}" BUILDLOG_HOLD_CALLER=""
+
+# Status 0 when natedev's hold applies to this step's caller. The Mac leg of a
+# test (verify-mac) and every run on the Mac answer to the Mac's claims, not
+# to natedev's hold. A holder directory that does not exist holds nothing:
+# build_hold.read_holders gives the same answer, with no Python start.
+build_hold_applies() {
+    if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then return 0; fi
+    [[ "${BUILDLOG_CALLER:-}" != verify-mac && "${OSTYPE:-}" != darwin* ]] || return 1
+    local holder_dir="${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}"
+    [[ -z "$holder_dir" || -e "$holder_dir" || -L "$holder_dir" ]]
+}
+
+# Sets BUILDLOG_HOLD_CALL_ID and BUILDLOG_HOLD_CALLER for build_targets.py.
+# BUILDLOG_HOLD_CALLER is empty for verify, so verify's messages keep their text.
+build_hold_call() {
+    if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then
+        BUILDLOG_HOLD_CALL_ID=$BUILDLOG_CALL_ID BUILDLOG_HOLD_CALLER=""
+        return 0
+    fi
+    BUILDLOG_HOLD_CALLER="${BUILDLOG_CALLER:-lint}"
+    if [[ -z "${BUILDLOG_HOLD_CALL_ID:-}" ]]; then
+        BUILDLOG_HOLD_CALL_ID="v$(date -u +%Y%m%dT%H%M%S)-$$-$RANDOM"
+    fi
+}
+
 build_hold_wait_local() {
-    [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]] || return 0
+    build_hold_applies || return 0
     if build_hold_nothing_held; then return 0; fi
-    local waiter_pid status=0 arguments=(wait-local --call-id "$BUILDLOG_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}")
+    build_hold_call
+    local waiter_pid status=0 arguments=(wait-local --call-id "$BUILDLOG_HOLD_CALL_ID" --pid "${BUILDLOG_HOLD_PID:-$$}")
+    if [[ -n "$BUILDLOG_HOLD_CALLER" ]]; then arguments+=(--caller "$BUILDLOG_HOLD_CALLER"); fi
     # A held natedev cannot start the step, so the leave hook also runs here:
     # status 75 (LINT_LEFT_QUEUE_STATUS) means another machine is free.
     if [[ -n "${LINT_QUEUE_LEAVE_HOOK:-}" ]]; then arguments+=(--leave-hook "$LINT_QUEUE_LEAVE_HOOK"); fi
@@ -80,9 +124,12 @@ build_hold_wait_local() {
 }
 
 build_hold_check_admission() {
-    [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]] || return 0
+    build_hold_applies || return 0
     if build_hold_nothing_held; then return 0; fi
-    python3 "$BUILD_TARGETS_SCRIPT" check-admission --call-id "$BUILDLOG_CALL_ID"
+    build_hold_call
+    local arguments=(check-admission --call-id "$BUILDLOG_HOLD_CALL_ID")
+    if [[ -n "$BUILDLOG_HOLD_CALLER" ]]; then arguments+=(--caller "$BUILDLOG_HOLD_CALLER"); fi
+    python3 "$BUILD_TARGETS_SCRIPT" "${arguments[@]}"
 }
 
 build_hold_step_started() {

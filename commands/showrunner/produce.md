@@ -54,7 +54,7 @@ State:
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
   remove an item once it is reported; it needs no review), and `next` (a list
-  of one-line text: each action you owe and what sets it off; see Compaction). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that first asks it carries the printed `reviewed question` text, once. The Stop hook asks for it only until one reply has carried it.
+  of one-line text: each action you owe and what sets it off; see Compaction). Before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices, register an item with the full ask in `question`; the reply that asks it carries the printed `reviewed question` text.
 - `OUTSTANDING` — `~/.local/state/showrunner/outstanding/<slug>.json`, written
   by `update_registration.py questions --state` when `SHOWRUNNER_STATE` includes
   `open_for_user`. Omitting that key leaves the durable list unchanged.
@@ -233,9 +233,13 @@ State:
     For add-ons, give each number `current`, `next` or `drop`: build it in
     this run, save it for later, or drop it. An add-on that fixes a wrong
     result is `current`.
-  - A unit's finished proposal is filed as a hanadocs issue through `/issue`,
-    with `proposed_by` and its proposed stars, and reaches the user only when
-    they ask (`/showrunner:proposal`).
+  - Style tools file one decision per rule and crate under one rule text.
+    `/showrunner:proposals` lists decisions; `style_proposals.py sites` shows a
+    decision's sites. Rule candidates are not proposals: `style_proposals.py
+    candidates` lists them; make a rule with `/new_style` or drop one with
+    `style_proposals.py drop-candidate --idea "<text>"`. The user answers a
+    decision once. Other finished proposals use `/issue`. Show proposals only
+    when asked (`/showrunner:proposal`).
   - Tell a unit what to do and change in its design without being asked, when
     you see a better answer.
   - Your answer goes as your own message. Never begin it `From the user (via
@@ -260,6 +264,8 @@ State:
   The user sees the count at all times in the Claude Code status line's
   `For you: …` row, under the quota row, with the changes, proposals and
   projects.
+  When the user asks for the next question, show only the oldest due item
+  (`/next question`).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
   --production PRODUCTION_DOC` and show its list, oldest first, each item led
@@ -296,11 +302,6 @@ State:
   holder files in `~/.local/state/build-hold/`, and a dailies input marks each
   held unit. A pending or active Mac block comes from
   `~/.local/state/mac-test/`.
-
-  `scripts/hooks/stop-showrunner-footer.py` checks each reply in the session
-  targeted by `UPDATES`. It blocks a reply that asks the user something not
-  stored through `questions`, and a reply that leaves out a reviewed question
-  still waiting to be asked. It passes on errors.
 
   An `/adhoc_review` in this session pauses current dailies, then asks whether
   to turn them back on at the end (`commands/adhoc_review.md` Steps 2 and 5).
@@ -342,7 +343,7 @@ Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
 last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
-again and retargets the instance. A reboot needs nothing.
+again and retargets the instance. After a reboot, the herdr boot unit and `pane_restore.py` bring each pane back on its own account (`docs/as-built/herdr-restore.md`).
 
 When the production doc's **Production rules** say CI does not apply, pass
 `--no-ci` to this and every lifecycle subcommand.
@@ -361,16 +362,8 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
-When the production doc has a **Review pool** line, prepare the review plan
-on `MERGE_BRANCH` before launching. It has the Production header from
-`docs/production_format.md` and the one standing phase in
-`commands/review/direct.md` → <ReviewPoolStart/>. Commit a new or changed
-plan there; `add_unit.py` reads the committed merge-branch tree in preflight.
-Then launch `review-unit` first:
-`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC review --plan <review plan> --owns "—"`.
-It has an ordinary Units row, worktree and branch; its opening runs
-`/review:direct <absolute production doc path>`. Its standing phase stays
-`todo` and has no final checkpoint. Each unit keeps one permanent reviewer per type, and every
+When the production doc has a **Review pool** line, no unit runs the pool:
+the first review of each type primes it. Each unit keeps one permanent reviewer per type, and every
 code review goes to it (`docs/production_format.md`, unit rule 16). Before
 you mark a unit `retired`, run `review_pool.py retire` for it
 (`docs/production_format.md`, Units).
@@ -501,7 +494,7 @@ whatever arrived:
 | the user asks for a status | `/showrunner:dailies`, `gantt` unless they name a length |
 | the user asks which phase or task each unit is on | `/showrunner:units` |
 | the user asks which proposals are open | `/showrunner:proposals` |
-| the user asks for "change review" or "the next change" | `/change_review` show; each verdict through <CloseChangeReview/> |
+| the user asks for "change review" or the next change, proposal, efficiency proposal or question | `/next <thing>`: one item, then stop; a change's verdict through <CloseChangeReview/> |
 | a change for the user to check that no checkpoint `Change-Review:` line carries | `/change_review` add |
 | a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
@@ -641,15 +634,6 @@ message.
    build report (`/build:report`) carries it and pushes again. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
-   When the production doc has a **Review pool** line, send `review-unit`
-   one line per merged code checkpoint:
-   `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>`.
-   Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/unit_run.py
-   --production PRODUCTION_DOC <unit>`: its first field is the session
-   directory's name for the merge line; on exit 1, send the merge line with
-   `session dir unavailable` and tell `review-unit` why. Take the verdict from step 3;
-   use `not applicable` when nothing users see changed. Append the same line
-   to `LOG`. A shrink sends no memory line.
 </MergeCheckpoint>
 
 ---
@@ -1126,9 +1110,8 @@ each in your session.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
-With a **Review pool** line, exclude `review-unit`'s standing phase from
-that condition. A unit whose Plan cell is `permanent` (the nightly review) is
-outside it too: wrap neither waits on it nor retires its worktree or branch.
+A unit whose Plan cell is `permanent` (the nightly review) is outside that
+condition: wrap neither waits on it nor retires its worktree or branch.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion
@@ -1140,9 +1123,8 @@ outside it too: wrap neither waits on it nor retires its worktree or branch.
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
-   With a **Review pool** line, tell `review-unit` to end and wait for its
-   acknowledgment that no more primes will run. Then run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop --production <slug>`.
+   With a **Review pool** line, run
+   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py stop --production <slug>`.
    On failure, report its reason and run `stop` again; do not finish wrap
    until it succeeds. `<slug>` is the production doc's file name without
    `-production.md`.

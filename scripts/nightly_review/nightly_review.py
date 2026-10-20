@@ -11,7 +11,7 @@ The unit does the modes in order; for each it writes NIGHT/<mode>.md and message
 distills the proposals into NIGHT/digest.md and the ledger (/watcher). The night is skipped when no
 running production holds the unit.
 
-Nothing offers the proposals: the ledger's queue grows until the user asks for /nightly_next
+Nothing offers the proposals: the ledger's queue grows until the user asks for /efficiency_next
 (user, 2026-10-10).
 """
 

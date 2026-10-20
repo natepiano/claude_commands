@@ -1,5 +1,5 @@
 ---
-description: Add a change for the user to check to the top-level showrunner's change review list, walk the list when the user asks for "change review", and record their verdicts.
+description: Add a change for the user to check to the top-level showrunner's change review list, show the next change when the user asks for one, and record their verdicts.
 ---
 
 # Change review
@@ -53,23 +53,40 @@ carries: a showrunner's own change, a fix outside a run, or a change nobody
 sees in the app, such as a table's columns or a status line.
 
 ```sh
-… add <production> --change "<what the user sees change>" --check "<how to check it>" [--merged <hash>]
+… add <production> --change "<what changed for you>" --check "<how to try it: where and what to type>" --see "<what you see>" [--merged <hash>]
 ```
 
-One row per change. Each part is one line in plain words. Pass `--merged` when
-a commit holds the change. It prints the new row's id, such as `C12`.
+One row per change, written for a person with no context. Each part is one
+line. `--check` names the machine (natedev or the Mac), the session (a
+terminal, a showrunner session, a unit session, any Claude session) and what to
+type; `--see` is what the person then sees. Example: `--change "The unit board
+shows each unit's phase" --check "In a showrunner session on natedev, type
+/showrunner:unit_board" --see "Each row has a Phase column"`. The row's How to
+check cell is `<how to try it> You see: <what you see>`. Pass `--merged` when a
+commit holds the change. It prints the new row's id, such as `C12`.
+
+## edit
+
+To rewrite a row still to review, such as one that lacks where to try it or
+what the person sees:
+
+```sh
+… edit <production> --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
+```
+
+The row keeps its id, its Merged cell and its place. It prints the new row.
 
 ## show
 
-Only when the user asks for "change review". Run `show <production>`. It
-prints each row to review: its id and change, how to check it, and when it
-merged, or `nothing to review`. Walk the rows one at a time, in order. For each,
-say what changed and how to check it in plain words, then wait for the user's
-verdict in their reply. Never use a form; ask in one plain-text line.
+Only when the user asks for "change review" or "the next change"
+(`/next change`). Run `show <production>`. It prints the first row to review:
+its id and change, how to check it, when it merged, and how many rows wait
+after it; or `nothing to review`. Say what changed, how to try it and what the
+user sees, even if already shown, then wait for the user's verdict in their
+reply. Never use a form; ask in one plain-text line.
 
-A request for "the next change" means the user is returning to the terminal:
-show the current unconfirmed row in full, even if already shown. Never show a
-later row until the current one has a verdict (user, 2026-10-16).
+Show one row per request. After its verdict, stop: never show the next row
+until the user asks for it (user, 2026-10-20).
 
 ## verdict
 

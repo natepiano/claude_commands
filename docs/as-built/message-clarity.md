@@ -2,7 +2,7 @@
 
 ## What it is
 
-The user wanted every message sent to them to be checked for clarity by an agent that speaks for them. This feature does that. A written message guide sets the rules for pushes, questions and replies. Sessions load the guide with `/message_style` before they write to the user. Before any phone push is posted, a headless reviewer reads it cold against the guide. The reviewer can approve it, rewrite it, ask for missing facts or withhold it. A push that fails review is not sent, and the sender is told to revise it. Claude's built-in `PushNotification` is gated so it cannot bypass the review. Every fixed script push is a catalog entry that has been approved ahead of time. When a showrunner asks the user a question in a reply, the question is registered and reviewed first, and a Stop hook blocks any reply that asks without registering. A nightly `messages` pass measures how messages did and proposes new guide rules.
+The user wanted every message sent to them to be checked for clarity by an agent that speaks for them. This feature does that. A written message guide sets the rules for pushes, questions and replies. Sessions load the guide with `/message_style` before they write to the user. Before any phone push is posted, a headless reviewer reads it cold against the guide. The reviewer can approve it, rewrite it, ask for missing facts or withhold it. A push that fails review is not sent, and the sender is told to revise it. Claude's built-in `PushNotification` is gated so it cannot bypass the review. Every fixed script push is a catalog entry that has been approved ahead of time. When a showrunner asks the user a question in a reply, the question is registered and reviewed first; no hook checks the reply (user, 2026-10-19). A nightly `messages` pass measures how messages did and proposes new guide rules.
 
 ## How it works
 
@@ -194,7 +194,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - `shutdown.holdout` when a form is shown.
   - `shutdown.holdout_unanswered` for any other hold.
 
-  `shutdown.holdout` uses the user's four lines: title `{session} {operation} is blocked`, `Session: {session}`, the Action line and `Reason: …`. `shutdown.holdout_unanswered` keeps the Session and Action lines, but its title is `Your Claude {operation} is stuck`. Its body says the session has not paused and that stopping it keeps its uncommitted work, then gives the bare command. The user's title and `Reason:` line failed the push review here (reader-starts-cold, title-names-the-stake, short-plain-sentences) and were sent anyway as a registry push, so the showrunner had the text rewritten on 2026-10-16. Both give a stop command, which names the account label (`note_file.canonical_label`) with `--here` and never the login. No raw hold-detail list reaches the push; the requesting session's message keeps it.
+  `shutdown.holdout` uses the user's four lines: title `{session} {operation} is blocked`, `Session: {session}`, the Action line and `Reason: …`. Two choice lines follow, each saying what it does: `Answer the form (recommended): the session pauses, and the {operation} goes on.` and `Stop the session: it ends, its uncommitted work stays, and the {operation} goes on without it. In a terminal on {machine}, run:`, then the command on its own line. The user found the old `Or stop it instead` line unclear (change review C9, 2026-10-19). `shutdown.holdout_unanswered` keeps the Session and Action lines, but its title is `Your Claude {operation} is stuck`. Its body says the session has not paused and that stopping it keeps its uncommitted work, then gives the bare command. The user's title and `Reason:` line failed the push review here (reader-starts-cold, title-names-the-stake, short-plain-sentences) and were sent anyway as a registry push, so the showrunner had the text rewritten on 2026-10-16. Both give a stop command, which names the account label (`note_file.canonical_label`) with `--here` and never the login. No raw hold-detail list reaches the push; the requesting session's message keeps it.
 - `scripts/notify/push_texts_reviewed.json` has the form `{text_id: {example_name: {sha256, time, reviewer, objections?}}}`:
   - It is read only through `review.text_approvals()`.
   - `texts --approve` writes passing examples only.
@@ -222,20 +222,11 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
     - `QuestionAwaitingFacts(question, questions)`
     - `QuestionReviewFailed(question, details)`
     - `QuestionReviewUnavailable(question, reason)`: stored as written. A blank rewrite from the reviewer lands here.
-  - An awaiting-facts or failed outcome fails the whole registration with `question held for review: …`. Nothing is written: outstanding, pending and history stay unchanged.
+  - An awaiting-facts or failed outcome fails the whole registration with `question held for review: …`. Nothing is written: outstanding and history stay unchanged.
   - Such a question is held in `~/.local/state/notify/questions/<sha256(slug+text)[:16]>.json` (`QuestionHoldRecord`). Running the same item again counts as its revision. Question holds never reach the post path.
 - **Stored fields:** an outstanding item carries `question` plus either `reviewed` or `review_unavailable`. Items that were already outstanding keep their fields and are not reviewed again. Accepted text is printed as `reviewed question: <text>`, and the reply must carry that text. `commands/showrunner/produce.md` (under `open_for_user`) tells the showrunner to register before any reply asks the user a question, makes a request such as "Say go and I'll …", or offers `(recommended` choices.
-- **Pending records:** `<notifier state>/showrunner-<slug>/pending_reviewed.json` holds `{items: [{kind: "reviewed", text, reviewed} | {kind: "review unavailable", text, question, reason}]}`:
-  - It is read and written only through `showrunner_footer.read_pending_reviewed`, `add_pending_reviewed`, `write_pending_reviewed` and `delete_pending_reviewed`.
-  - It is written only when the instance has a `conf`.
-  - Replacing the outstanding list drops pending items whose text closed.
 - **History:** `record_question_history()` appends each newly outstanding item's `text`, `question` and `reviewed` to `~/.local/state/showrunner/outstanding/<slug>.history.jsonl`. History is kept for 48 h.
-- **Stop hook:**
-  - `scripts/hooks/stop-showrunner-footer.py` skips subagent payloads (`agent_id`). It finds showrunner instances whose notifier `conf` has `TARGET=session:<id>` and calls `showrunner_footer.block_reason`.
-  - `check_reviewed_text` is the whole check (the reply footer it once ran before is gone, user 2026-10-18):
-    1. Each pending item's reviewed (or unavailable) text must appear in the reply, whitespace-normalised. Otherwise the reply is blocked with `Question '<text>': paste its reviewed question into this reply:`.
-    2. The reply's asks come from `review.user_reply_questions(reply)`. These are question and request sentences plus `(recommended` choice lines. The registered texts are the pending texts plus `text`, `question` and `reviewed` from every current outstanding item for the instance's slug and every slug below it. Both sides go through `choice_comparison_text` and `review.question_prose`. A match means either string contains the other. Any ask without a match blocks the reply with `Unregistered ask '<sentence>': record the item with update_registration.py questions --state and paste its reviewed question into this reply.`
-  - A pending item leaves the file as soon as a reply carries its text, whatever else the hook says of that reply (user, 2026-10-17): a question is shown in full once, when it opens, and no later reply, a hook retry included, is made to repeat it. After that the status line's counts row counts it.
+- **No Stop hook checks a reply** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). The hook file was deleted after `settings.json` stopped naming it. Registering a question and carrying its reviewed text is the showrunner's rule in `commands/showrunner/produce.md`; the nightly count still reads the history.
 - **Question detection** (in `review.py`):
   - `question_prose(text)` removes inline code and collapses whitespace.
   - `reply_questions(text) -> ReplyAsks(sentences, has_choices, choice_lines)` skips fenced code and `>` quotes. It finds sentences ending in `?`, and requests that start with reply, choose, pick, confirm, decide, approve, tell me, let me know, say, would you, do you want, shall I or should I. `(recommended` lines are counted as choices.
@@ -259,7 +250,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - Replies with asks are not reviewed. They count as having an unregistered question when any sentence matches nothing in `registered_questions(since)` (current outstanding plus history lines after the cutoff, fields `text`, `reviewed` and `question`), or when a choices-only reply contains no registered item.
   - It dry-reviews up to `limit` of the newest remaining replies with `reply,all`, logs `sample: true` and posts and holds nothing.
   - It prints `sample: N replies; passed; failed; unreviewed; replies with unregistered questions; unreadable transcripts` and `sample failed rules: …`. It exits 1 only when a transcript was unreadable.
-- The nightly pass proposes at most one new guide rule, through `DIR/messages.md` and the ledger, which leads to `/nightly_next`.
+- The nightly pass proposes at most one new guide rule, through `DIR/messages.md` and the ledger, which leads to `/efficiency_next`.
 
 ### State and config
 
@@ -349,12 +340,10 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 - Modules that load in copied trees import `review` lazily, because those trees lack `scripts/notify/`:
   - `sweep.send_floor_alert`
   - `update_registration.review_open_question`
-  - `showrunner_footer.check_reviewed_text`
   - `nightly_review.messages()`, with `showrunners` imported only in discovery
 
 **Question checks:**
 - A heading that only names a unit or session, with no `to` or `for` and no attribution, is a subject, not a recipient. Questions under it stay the user's. Status replies use such headings often.
-- The Stop hook matches against current outstanding and pending items, not history. The nightly count also reads history.
 - A dry check run against an outstanding snapshot taken after the replies over-reports. Questions registered before their reply and closed before the snapshot read as unregistered.
 - The nightly unregistered count includes asks addressed to peers.
 
@@ -370,5 +359,5 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 - **User-specified texts are approved with recorded objections:** the user's own four lines win over the reviewer's rewrite.
 - **No source tracking for example values:** the logs hold no real sends for those senders, so the catalog says where its examples come from instead.
 - **No recipient filter in the nightly count:** one day's measurement found 29 of 578 showrunner replies with an unregistered ask. Only one (3.4%) was addressed to a peer only, well under the one-in-four bar, so peer asks are too small a share to matter.
-- **The Stop hook blocks unregistered asks:** that same day showed 28 user asks never registered ("Say go and I'll …", "Want me to …?", `(recommended` lines). Recipient detection is limited to the hook so that relayed questions pass. A rule that treated any heading naming a unit as a relay was rejected: it hid real user asks under status headings.
+- **No Stop hook for unregistered asks** (user, 2026-10-19: "i have already asked you to get rid of the stop hook that does this"). It once blocked 28 unregistered asks in one day; the nightly count still measures them.
 - **One loader for the UX and message guides:** one way to do a thing.

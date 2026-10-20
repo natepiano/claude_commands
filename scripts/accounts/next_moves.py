@@ -206,8 +206,24 @@ class CodexWorkersTarget:
 
 
 @dataclass(frozen=True)
+class DefaultClaudeAccount:
+    """Use the caller's account or the showrunners account for Claude work."""
+
+
+@dataclass(frozen=True)
+class ClaudeWorkersTarget:
+    label: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"claude[1-9][0-9]*", self.label):
+            raise NextMoveError("next: workers target must be a numbered Claude account")
+
+
+@dataclass(frozen=True)
 class DelegateToClaude:
     """Route future workers work to Claude until the source weekly reset."""
+
+    account: ClaudeWorkersTarget | DefaultClaudeAccount = DefaultClaudeAccount()
 
 
 @dataclass(frozen=True)
@@ -237,7 +253,9 @@ NextMoveGroup = Literal["units", "showrunners", "workers"]
 def target_label(entry: NextMove) -> str:
     if isinstance(entry, ClaudeGroupMove):
         return entry.to
-    return entry.to.label if isinstance(entry.to, CodexWorkersTarget) else "claude"
+    if isinstance(entry.to, CodexWorkersTarget):
+        return entry.to.label
+    return entry.to.account.label if isinstance(entry.to.account, ClaudeWorkersTarget) else "claude"
 
 
 def next_moves_file() -> Path:
@@ -280,7 +298,9 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
             if group == "workers":
                 if hold != 0 or mode != "fixed":
                     raise NextMoveError("next: workers entries cannot hold minutes")
-                destination = DelegateToClaude() if target == "claude" else CodexWorkersTarget(target)
+                destination = (DelegateToClaude() if target == "claude" else
+                               DelegateToClaude(ClaudeWorkersTarget(target)) if target.startswith("claude") else
+                               CodexWorkersTarget(target))
                 entry = WorkersMove(name, float(percent), destination, datetime.fromisoformat(added))
             else:
                 entry = ClaudeGroupMove(name, group, float(percent),

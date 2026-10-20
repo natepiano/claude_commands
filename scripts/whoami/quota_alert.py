@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude gets one phone reminder when a low account lacks a next-move entry.
+"""Claude gets one phone reminder when a low account lacks an account-move entry.
 
 Codex refusal reruns reach only the stopped command's director; other notices are logged.
 Failed phone delivery stays due until the next timer pass. Claude recovery closes
@@ -127,25 +127,26 @@ def reset_display(reset: refusals.KnownReset | refusals.NoResetKnown | accounts.
 
 
 def _save_codex_readings(readings: CodexAlertPassReadings, now: datetime) -> None:
-    held = usage_store.load()
-    changed = False
-    for checked in readings.checked_homes:
-        if (not checked.report.problem and not checked.report.quota_problem
-                and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE):
-            if checked.report.email:
-                previous = held.get(usage_store.key("Codex", checked.report.email), {})
-                if "weekly" in previous:
-                    try:
-                        if datetime.fromisoformat(previous["weekly"]["at"]) > checked.observed_at:
-                            continue
-                    except ValueError:
-                        pass
-            changed = usage_store.merge(held, [checked.report], checked.observed_at) or changed
-    if changed:
-        try:
-            usage_store.write(held)
-        except (OSError, ValueError) as error:
-            print(f"usage store: {error}", file=sys.stderr)
+    try:
+        with usage_store.read_lock():
+            held = usage_store.load()
+            changed = False
+            for checked in readings.checked_homes:
+                if (not checked.report.problem and not checked.report.quota_problem
+                        and timedelta(0) <= now - checked.observed_at <= CODEX_READING_MAX_AGE):
+                    if checked.report.email:
+                        previous = held.get(usage_store.key("Codex", checked.report.email), {})
+                        if "weekly" in previous:
+                            try:
+                                if datetime.fromisoformat(previous["weekly"]["at"]) > checked.observed_at:
+                                    continue
+                            except ValueError:
+                                pass
+                    changed = usage_store.merge(held, [checked.report], checked.observed_at) or changed
+            if changed:
+                usage_store.write(held)
+    except (OSError, ValueError) as error:
+        print(f"usage store: {error}", file=sys.stderr)
 
 
 def _reading_for_account(readings: CodexAlertPassReadings, identity: agent_accounts.KnownCodexAccount,
@@ -295,6 +296,7 @@ class ScheduledMoveHold:
 
 
 NO_FALLBACK_HOLD = NoFallbackHold()
+DEFAULT_CLAUDE_ACCOUNT = next_moves.DefaultClaudeAccount()
 
 
 @dataclass(frozen=True)
@@ -303,6 +305,7 @@ class AccountCodexQuotaFallback:
     at: str
     moved: tuple[str, ...]
     hold: CreditsOffHold | ScheduledMoveHold | NoFallbackHold = NO_FALLBACK_HOLD
+    claude_account: next_moves.ClaudeWorkersTarget | next_moves.DefaultClaudeAccount = DEFAULT_CLAUDE_ACCOUNT
 
 
 @dataclass(frozen=True)
@@ -370,6 +373,7 @@ class StoredFallback(TypedDict):
     owner: NotRequired[agent_accounts.StoredCodexAccount]
     credits_off_until: NotRequired[str]
     scheduled_move_until: NotRequired[str]
+    claude_account: NotRequired[str]
 
 
 class StoredState(TypedDict):
@@ -405,7 +409,10 @@ def _read_fallback(value: object) -> CodexQuotaFallback:
             scheduled = record.get("scheduled_move_until")
             if isinstance(scheduled, str):
                 hold = ScheduledMoveHold(datetime.fromisoformat(scheduled))
-            return AccountCodexQuotaFallback(agent_accounts.KnownCodexAccount(Path(home), login, note_file.canonical_label(label)), at, entries, hold)
+            target = record.get("claude_account")
+            destination = (next_moves.ClaudeWorkersTarget(target) if isinstance(target, str)
+                           else next_moves.DefaultClaudeAccount())
+            return AccountCodexQuotaFallback(agent_accounts.KnownCodexAccount(Path(home), login, note_file.canonical_label(label)), at, entries, hold, destination)
     return UnknownOwnerCodexQuotaFallback(at, entries)
 
 
@@ -427,6 +434,8 @@ def _stored_state(state: State) -> StoredState:
     if not isinstance(fallback, NoCodexQuotaFallback):
         record = StoredFallback(at=fallback.at, moved=list(fallback.moved))
         if isinstance(fallback, AccountCodexQuotaFallback):
+            if isinstance(fallback.claude_account, next_moves.ClaudeWorkersTarget):
+                record["claude_account"] = fallback.claude_account.label
             if isinstance(fallback.hold, CreditsOffHold):
                 record["credits_off_until"] = fallback.hold.until.isoformat()
             if isinstance(fallback.hold, ScheduledMoveHold):
@@ -587,6 +596,7 @@ def state_file() -> Generator[State]:
             tmp = STATE.with_name(f".{STATE.name}.tmp")
             _ = tmp.write_text(json.dumps(_stored_state(state), indent=2) + "\n", encoding="utf-8")
             os.replace(tmp, STATE)
+
 
 
 def ahead(resets: str | None) -> bool:
@@ -753,7 +763,8 @@ CodexWorkSwitch = CodexWorkMovedToClaude | NoWorkOnCodex | CodexWorkSwitchFailed
 
 def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_accounts.KnownCodexAccount, *,
                      hold: CreditsOffHold | ScheduledMoveHold | NoFallbackHold = NO_FALLBACK_HOLD,
-                     why: str = "Codex refused work for quota") -> CodexWorkSwitch:
+                     why: str = "Codex refused work for quota",
+                     claude_account: next_moves.ClaudeWorkersTarget | next_moves.DefaultClaudeAccount = DEFAULT_CLAUDE_ACCOUNT) -> CodexWorkSwitch:
     """Move Codex assignments to Claude and report what the registry confirms."""
     episode = state["episodes"].get(note.label)
     account = f"{note.label} at {percent(note)}, resets {note.get('resets')}"
@@ -763,13 +774,33 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
     reason = why if cause == "auto" else "credits off" if cause == "credits off" else "Codex refused work for quota"
     trigger = reason
     moved: list[str] = []
+    previous_route: role_map.WorkersClaudeAccount = role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT
+    route_written = False
+    confirmed = False
     try:
+        if isinstance(claude_account, next_moves.ClaudeWorkersTarget):
+            if not isinstance(hold, ScheduledMoveHold):
+                raise ValueError("named Claude workers route needs a weekly reset")
+            route = role_map.NamedWorkersClaudeAccount(claude_account.label, hold.until)
+        else:
+            route = role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT
         on_codex = [key for key, family in registry_assignments().items() if family == "codex"]
+        if on_codex:
+            previous_route = role_map.read_role_map().workers_claude
+            role_map.write_role_map(role_map.WorkersClaudeRouteChange(route, reason, stamp))
+            route_written = True
         error = edit_registry("agents_set_all_assignments", "claude") if on_codex else None
         # The registry, not the exit status, says what moved: one mv writes the whole switch.
         moved = [key for key, family in registry_assignments().items() if key in on_codex and family == "claude"]
-    except OSError as failure:
+        confirmed = True
+    except (OSError, ValueError) as failure:
         error = str(failure)
+    if confirmed and not moved and route_written:
+        try:
+            role_map.write_role_map(role_map.WorkersClaudeRouteChange(previous_route, "Claude switch did not move work", stamp))
+        except (OSError, ValueError) as failure:
+            rollback_error = f"route rollback failed: {failure}"
+            error = f"{error}; {rollback_error}" if error else rollback_error
     if not moved and error:
         if episode is not None:
             episode["switch_failed"] = error
@@ -782,9 +813,11 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
         return CodexWorkSwitchFailed(note.label, error)
     if not moved:
         return NoWorkOnCodex(note.label)
-    state["fallback"] = AccountCodexQuotaFallback(owner, stamp, tuple(moved), hold)
+    state["fallback"] = AccountCodexQuotaFallback(owner, stamp, tuple(moved), hold, claude_account)
     state["pending_routing"] = moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
         fallback_at=stamp, owner=owner.label, moved=moved, cause=cause, why=reason)
+    if isinstance(claude_account, next_moves.ClaudeWorkersTarget):
+        state["pending_routing"]["claude_account"] = claude_account.label
     # Keep the fallback and its journal retry even when the append fails.
     _ = _retry_pending_move_journal(state)
     restoration = (f"and stay there until the source weekly reset at {local_time(hold.until.isoformat())}."
@@ -860,6 +893,8 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
             codex_can_work(selected_codex_report(readings, now), now, agent_accounts.codex_credits_setting(readings.workers.label)), CodexWorkAvailable):
         return NoCodexFallbackRestoration()
     restored_account = selected if isinstance(selected, agent_accounts.KnownCodexAccount) else NO_RESTORATION_ACCOUNT
+    role_map.write_role_map(role_map.WorkersClaudeRouteChange(
+        role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "Codex recovered", now.isoformat()))
     state["fallback"] = NoCodexQuotaFallback()
     if isinstance(fallback, AccountCodexQuotaFallback):
         _ = state.get("refusal_notices", {}).pop(str(fallback.owner.home), None)
@@ -952,7 +987,7 @@ def codex_next_move_push(note: AgentNote, fallback: CodexQuotaFallback = NO_CODE
 
     left = remaining(note)
     if left is None or not 0 < left <= 2:
-        return QuotaStatusNote(note.label, "no Codex next-move reminder outside 0–2% weekly usage left")
+        return QuotaStatusNote(note.label, "no Codex account-move reminder outside 0–2% weekly usage left")
     at = now or datetime.now(timezone.utc)
     if (isinstance(fallback, AccountCodexQuotaFallback) and isinstance(fallback.hold, ScheduledMoveHold)
             and at < fallback.hold.until):
@@ -1007,7 +1042,7 @@ def _retry_pending_move_journal(state: State) -> bool:
             moves.append_move(failures[0])
             del failures[0]
     except OSError as error:
-        print(f"next moves: cannot record pending workers move: {error}")
+        print(f"account moves: cannot record pending workers move: {error}")
         return False
     return True
 
@@ -1080,12 +1115,12 @@ def notify_blocked_next_move(group: str, target: str, entry_id: str, reason: Blo
                              now: datetime) -> bool:
     config = load_config()
     text = blocked_next_move_line(group, target, entry_id, reason)
-    return deliver_notice([Job("", recipient, text, "next move blocked")
+    return deliver_notice([Job("", recipient, text, "account move blocked")
         for recipient in recipients(config)], now.isoformat())
 
 
 def workers_entry_pending() -> bool:
-    """An unreadable next list cannot prove workers have no next move."""
+    """An unreadable next list cannot prove workers have no account move."""
     try:
         return any(isinstance(entry, next_moves.WorkersMove) for entry in next_moves.read_next_moves())
     except (OSError, next_moves.NextMoveError):
@@ -1164,6 +1199,12 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                 stamp = now.isoformat(timespec="seconds")
                 why = f"auto: {entry.id}"
                 if isinstance(entry.to, next_moves.DelegateToClaude):
+                    if isinstance(entry.to.account, next_moves.ClaudeWorkersTarget):
+                        try:
+                            _ = accounts.claude_workers_account(entry.to.account.label)
+                        except (accounts.AccountsError, OSError) as error:
+                            _workers_head_blocked(entry, TargetAccountUnavailable(str(error)), now)
+                            continue
                     reset = report.weekly_reset
                     if reset is None or reset.tzinfo is None or reset <= now:
                         continue
@@ -1174,7 +1215,8 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                         if (isinstance(fallback, AccountCodexQuotaFallback)
                                 and isinstance(fallback.hold, ScheduledMoveHold) and now < fallback.hold.until):
                             continue
-                        result = switch_to_claude(state, note, stamp, owner, hold=ScheduledMoveHold(reset), why=why)
+                        result = switch_to_claude(state, note, stamp, owner, hold=ScheduledMoveHold(reset), why=why,
+                                                  claude_account=entry.to.account)
                         journal_ready = "pending_routing" not in state
                     if not journal_ready:
                         return WorkersNextMovePass(readings, moves.UnreadableMoveJournal())
@@ -1234,7 +1276,7 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                     _ = state.get("workers_move_notices", {}).pop(entry.id, None)
                 return WorkersNextMovePass(readings, history)
     except (OSError, next_moves.NextMoveError) as error:
-        print(f"next moves: workers pass failed: {error}")
+        print(f"account moves: workers pass failed: {error}")
     return WorkersNextMovePass(readings, history)
 
 

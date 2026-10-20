@@ -238,6 +238,17 @@ def _lookup_slug(slug: str) -> str:
     return canonical_slug(slug)
 
 
+def _claude_places(places: list[MarkedUnit]) -> list[MarkedUnit]:
+    """The unit's places that may hold its Claude, when one does; else every place.
+
+    The marks are environment variables, so every child process inherits them. A detached run, such as
+    a worker's build that mesh_runs supervises, stays in the herdr service's cgroup with the unit's marks
+    and a pane id that can be out of date. Such a process is not a second session of the unit.
+    """
+    with_claude = [place for place in places if not isinstance(place.claude, ClaudeNotRunning)]
+    return with_claude or places
+
+
 def every_marked_unit() -> MarkedProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
     try:
@@ -255,6 +266,7 @@ def every_marked_unit() -> MarkedProductions:
     units: dict[str, dict[str, MarkedUnit]] = {}
     faults: dict[str, dict[str, str]] = {}
     for slug, production in found.items():
+        production = {name: _claude_places(places) for name, places in production.items()}
         units[slug] = {name: places[0] for name, places in production.items() if len(places) == 1}
         for name, places in production.items():
             if len(places) > 1:

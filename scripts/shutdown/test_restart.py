@@ -21,7 +21,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal, TypedDict, cast, final, override
-from unittest.mock import patch
+from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -400,7 +400,7 @@ class RestartTests(ShutdownTestCase):
                 run = self.root / "worker run"
                 run.mkdir(exist_ok=True)
                 old_prompt = str(run / "old prompt.md")
-                launcher = ["bash", "/config/scripts/delegate/implement.sh", "--phase", "1", *(["--to", "impl"] if moved else []), str(run), owner["cwd"], old_prompt,
+                launcher = ["bash", "/config/scripts/direct/implement.sh", "--phase", "1", *(["--to", "impl"] if moved else []), str(run), owner["cwd"], old_prompt,
                             "task", "task instructions", "impl", "continue task", "0", "impl", "mesh-prefix"]
                 seats = [
                     record.PausedSeat(run_dir=str(run), seat="impl", role="impl", thread_id="private-thread-impl", turn_live=True, launcher_command=launcher),
@@ -441,15 +441,15 @@ class RestartTests(ShutdownTestCase):
                 # Seats with no readable launcher get every launcher argument, ready to run as pasted.
                 idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
                 self.assertTrue(idle_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "delegate" / "review.sh"), "--to", "review", str(run), owner["cwd"],
+                    str(restart.SCRIPTS / "direct" / "review.sh"), "--to", "review", str(run), owner["cwd"],
                     str(run / "review.resume-prompt.md"), "review", "resume after a move", "resuming after a move"])))
                 unread_line = next(line for line in lines if line.startswith("test (test, was working):"))
                 self.assertTrue(unread_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
+                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
                     str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
                 repaired_line = next(line for line in lines if line.startswith("project-impl (fix, idle):"))
                 self.assertTrue(repaired_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "delegate" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
+                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
                     str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"])))
                 self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)
@@ -1446,6 +1446,26 @@ class RestartTests(ShutdownTestCase):
                 self.assertTrue(any(row[2:4] == ["agent", "start"] for row in calls))
                 self.assertFalse(any(row[2:4] in (["workspace", "list"], ["workspace", "close"])
                                      for row in calls))
+
+    def test_a_started_shared_server_that_keeps_its_layout_restores_its_other_panes_once(self) -> None:
+        import pane_restore
+
+        owner, _, _ = self.herdr_restart_fixture()
+        for server, kept, restored in ((herdr.ServerCreated(), True, [call("writing", dry_run=False)]),
+                                       (herdr.ServerCreated(), False, []), (herdr.ServerAdopted(), True, [])):
+            with (self.subTest(server=server, kept=kept), patch.object(herdr, "restore_server", return_value=server),
+                  patch.object(herdr, "keeps_restored_layout", return_value=kept),
+                  patch.object(pane_restore, "restore", return_value=0) as restore):
+                result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                self.assertEqual(restore.call_args_list, restored)
+        for failed in (1, herdr.HerdrFailure("pane list refused")):
+            with (self.subTest(failed=failed), patch.object(herdr, "restore_server", return_value=herdr.ServerCreated()),
+                  patch.object(herdr, "keeps_restored_layout", return_value=True),
+                  patch.object(pane_restore, "restore", side_effect=[failed]), redirect_stdout(io.StringIO()) as output):
+                result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+                self.assertIn("writing restart issue: pane restore left panes not resumed", output.getvalue())
 
     def test_ssh_mac_refusal_keeps_claude_records_restartable_and_reaches_peer_json(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
@@ -3339,6 +3359,17 @@ class RestartTests(ShutdownTestCase):
         argv = next((shlex.split(line) for line in output.getvalue().splitlines() if 'add_unit.py' in line))
         self.assertIn('--permanent', argv)
         self.assertNotIn('--standby', argv)
+
+    def test_retired_unit_is_refused_with_its_reason_and_never_launched(self) -> None:
+        doc = self.root / 'production.md'
+        _ = doc.write_text('\n'.join(['# Demo', '', '## Units', '', '| Unit | Plan | Worktree | Branch | Port | Owns |', '| --- | --- | --- | --- | --- | --- |', '| nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /w/nightly | demo-nightly-review | — | — |', '']), encoding='utf-8')
+        moved = entry(unit('nightly-review', doc=str(doc), plan=inventory.NoRunRecord(kind='no run record')))
+        self.create(records_for_test([moved]))
+        output = io.StringIO()
+        with patch.object(restart, '_live_session_ids', return_value=frozenset()), patch.object(settle, 'record_time', return_value=RESTARTED), redirect_stdout(output):
+            _ = restart.up(LOGIN, dry_run=True)
+        self.assertNotIn('add_unit.py', output.getvalue())
+        self.assertIn('nightly-review-unit is retired in the Units table', output.getvalue())
 
     def test_brief_unit_without_a_run_record_resumes_with_its_stub_plan(self) -> None:
         doc = self.root / 'production.md'

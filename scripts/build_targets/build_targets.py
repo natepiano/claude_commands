@@ -76,6 +76,7 @@ class CliArguments(argparse.Namespace):
         self.package: str = ""
         self.local_reason: str = ""
         self.leave_hook: str = ""
+        self.caller: str = ""
 
 
 def local_time(instant: datetime) -> str:
@@ -179,7 +180,7 @@ class LocalAdmissionWait(Protocol):
 # This CLI's import root excludes delegate; keep the runtime import at a typed
 # provider boundary rather than expanding the shared checker configuration.
 release_waiter = cast(Callable[[Path, Path], LocalAdmissionWait], getattr(
-    importlib.import_module("scripts.delegate.local_release_wait"), "local_release_waiter"))
+    importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))
 
 LOCAL_ADMISSION_WAIT: ContextVar[LocalAdmissionWait | NoActiveLocalAdmissionWait] = ContextVar(
     "local_admission_wait", default=NoActiveLocalAdmissionWait())
@@ -214,8 +215,18 @@ def leave_hook_says_free(leave_hook: str) -> bool:
         return False
 
 
-def wait_diagnostic(reason: str) -> str:
-    return f"verify.sh: natedev's hold state cannot be read ({display_field(reason)}); not starting."
+VERIFY_SPEAKER = "verify.sh"
+
+
+def speaker(caller: str) -> str:
+    """The name the wait messages start with: verify.sh, or lint and the caller that ran it."""
+    if not caller:
+        return VERIFY_SPEAKER
+    return "lint" if caller == "lint" else f"lint ({display_field(caller)})"
+
+
+def wait_diagnostic(reason: str, caller: str = "") -> str:
+    return f"{speaker(caller)}: natedev's hold state cannot be read ({display_field(reason)}); not starting."
 
 
 def record_admission(admission: build_hold.AdmittedTurn) -> None:
@@ -284,8 +295,12 @@ def command_register_local(call_id: str, *, pid: int) -> int:
         return 12
 
 
-def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "") -> int:
+def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", caller: str = "") -> int:
+    """Wait until natedev's hold admits the call. An empty caller is verify.sh; any other caller is a lint step."""
     key = ""
+    name = speaker(caller)
+    # verify.sh runs a test on the Mac when it can; a lint step only waits.
+    waiting = "; waiting (tests that can run on the Mac keep running there)." if not caller else "; waiting for the release."
     started = wait_clock()
     announced = False
     escalated = False
@@ -322,7 +337,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "") -> i
             release_events.arm()
             state = target_state(target)
             if isinstance(state, StateUnreadable):
-                print(wait_diagnostic(state.reason), file=sys.stderr, flush=True)
+                print(wait_diagnostic(state.reason, caller), file=sys.stderr, flush=True)
                 return 12
             if not isinstance(state, Held) or caller_holds_only_own():
                 return 0
@@ -330,7 +345,7 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "") -> i
                 key = build_hold.waiter_key(call_id)
             admission = build_hold.read_admission(key, call_id)
             if isinstance(admission, build_hold.AdmissionReadError):
-                print(wait_diagnostic(admission.reason), file=sys.stderr, flush=True)
+                print(wait_diagnostic(admission.reason, caller), file=sys.stderr, flush=True)
                 return 12
             if isinstance(admission, build_hold.AdmittedTurn):
                 record_admission(admission)
@@ -346,8 +361,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "") -> i
                     continue
             if not announced:
                 announced = True
-                print(f"verify.sh: natedev is held by {display_field(state.holder)} for "
-                      + f"{display_field(state.reason)}; waiting (tests that can run on the Mac keep running there).",
+                print(f"{name}: natedev is held by {display_field(state.holder)} for "
+                      + f"{display_field(state.reason)}{waiting}",
                       file=sys.stderr, flush=True)
             # A held natedev cannot start this step, so a free Mac wins and the
             # call's turn passes to the next waiter. As in memory_gate.sh, the
@@ -355,17 +370,17 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "") -> i
             # free-now said free costs one poll interval, never a tight loop.
             if polled and leave_hook_says_free(leave_hook):
                 cancelled = True
-                print("verify.sh: the Mac is free: leaving natedev's hold wait to run there.",
+                print(f"{name}: the Mac is free: leaving natedev's hold wait to run there.",
                       file=sys.stderr, flush=True)
                 return LEFT_QUEUE_STATUS
             if not escalated and (wait_clock() - state.since).total_seconds() >= escalation:
-                print(f"verify.sh: natedev has been held for 2 h by {display_field(state.holder)}; ask them.",
+                print(f"{name}: natedev has been held for 2 h by {display_field(state.holder)}; ask them.",
                       file=sys.stderr, flush=True)
                 escalated = True
             wait_sleep(interval)
             polled = True
     except (ConfigError, OSError, build_hold.ReleaseRecordReadError) as error:
-        print(wait_diagnostic(str(error)), file=sys.stderr, flush=True)
+        print(wait_diagnostic(str(error), caller), file=sys.stderr, flush=True)
         return 12
     finally:
         notifications.close()
@@ -412,24 +427,24 @@ def command_interrupt_local(call_id: str, signal_name: str) -> int:
         return 12
 
 
-def command_check_admission(call_id: str) -> int:
+def command_check_admission(call_id: str, caller: str = "") -> int:
     try:
         state = target_state(local_target())
         if isinstance(state, StateUnreadable):
-            print(wait_diagnostic(state.reason), file=sys.stderr)
+            print(wait_diagnostic(state.reason, caller), file=sys.stderr)
             return 12
         if not isinstance(state, Held) or caller_holds_only_own():
             return 0
         admission = build_hold.read_admission(build_hold.waiter_key(call_id), call_id)
         if isinstance(admission, build_hold.AdmissionReadError):
-            print(wait_diagnostic(admission.reason), file=sys.stderr)
+            print(wait_diagnostic(admission.reason, caller), file=sys.stderr)
             return 12
         if isinstance(admission, build_hold.AdmittedTurn):
             record_admission(admission)
             return 0
         return 10
     except (ConfigError, OSError, build_hold.ReleaseRecordReadError) as error:
-        print(wait_diagnostic(str(error)), file=sys.stderr)
+        print(wait_diagnostic(str(error), caller), file=sys.stderr)
         return 12
 
 
@@ -504,9 +519,11 @@ def parser() -> argparse.ArgumentParser:
     _ = waiter.add_argument("--call-id", required=True)
     _ = waiter.add_argument("--pid", type=positive_pid, default=0)
     _ = waiter.add_argument("--leave-hook", default="")
+    _ = waiter.add_argument("--caller", default="")
     _ = commands.add_parser("check-local")
     admission = commands.add_parser("check-admission")
     _ = admission.add_argument("--call-id", required=True)
+    _ = admission.add_argument("--caller", default="")
     interrupt = commands.add_parser("interrupt-local")
     _ = interrupt.add_argument("--call-id", required=True)
     _ = interrupt.add_argument("--signal", dest="signal_name", choices=("INT", "TERM"), default="TERM")
@@ -524,11 +541,11 @@ def main() -> int:
     if args.command == "register-local":
         return command_register_local(args.call_id, pid=args.pid)
     if args.command == "wait-local":
-        return command_wait_local(args.call_id, pid=args.pid, leave_hook=args.leave_hook)
+        return command_wait_local(args.call_id, pid=args.pid, leave_hook=args.leave_hook, caller=args.caller)
     if args.command == "check-local":
         return command_check_local()
     if args.command == "check-admission":
-        return command_check_admission(args.call_id)
+        return command_check_admission(args.call_id, args.caller)
     if args.command == "interrupt-local":
         return command_interrupt_local(args.call_id, args.signal_name)
     if args.command == "finish-local":

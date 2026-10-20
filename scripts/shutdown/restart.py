@@ -162,6 +162,10 @@ class NoUnitPlan(Exception):
     """Neither the unit's Units row nor a run record says what it resumes with."""
 
 
+class UnitRetired(Exception):
+    """The unit's Units row says it is retired, so nothing brings it back."""
+
+
 @dataclass(frozen=True)
 class AccountNamed:
     """An account name was given at the command line."""
@@ -981,6 +985,8 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
     recorded_plan = host["plan"]
     # The Units row first: a brief unit's row names its stub plan before any run record exists.
     row_plan = _units_row_plan(host["doc"], host["unit"])
+    if row_plan is not None and production_units.plan_cell_is_retired(row_plan):
+        raise UnitRetired(f"{host['unit']} is retired in the Units table of {host['doc']}")
     plan_arguments: list[str]
     if row_plan in ("standby", "permanent"):
         plan_arguments = ["--" + row_plan]
@@ -1139,6 +1145,19 @@ def _herdr_launch(
                     f"herdr server {name} carries {variable} from where it started; "
                     + f"stop it with herdr --session {name} server stop and restart again"
                 )
+        if isinstance(server, (herdr.ServerCreated, herdr.WindowServerCreated)) and herdr.keeps_restored_layout(name):
+            # The restored panes no shutdown record owns come back on their own accounts.
+            import pane_restore
+
+            try:
+                left = pane_restore.restore(name, dry_run=False)
+            except herdr.HerdrFailure as error:
+                left, reason = 1, f": {error}"
+            else:
+                reason = ""
+            if left:
+                print(f"{name} restart issue: pane restore left panes not resumed{reason}; run "
+                      + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py")
         client = herdr.Herdr(name)
         agents = client.agents()
         if any((isinstance(destination, NewHerdrSession)
@@ -1868,7 +1887,7 @@ def launch_entry(
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
         return EntrySettled()
-    except NoUnitPlan as error:
+    except (NoUnitPlan, UnitRetired) as error:
         if dry_run:
             print(f"cannot restart {session['name']}: {error}")
         else:
@@ -1910,10 +1929,10 @@ def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
     if resumed is not None:
         return resumed
-    start = [str(SCRIPTS / "delegate" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
+    start = [str(SCRIPTS / "direct" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
     if launcher == "review.sh":
         return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
-    from scripts.delegate.worker_state import worker_slot
+    from scripts.direct.worker_state import worker_slot
 
     # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
     team_role = worker_slot(Path(seat["run_dir"]), seat["seat"]) or seat["role"]

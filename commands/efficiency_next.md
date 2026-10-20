@@ -1,0 +1,10 @@
+---
+description: Present the one nightly-review proposal with the largest measured impact that is not yet implemented, decide it with the user, and record the outcome in the ledger.
+---
+
+LEDGER is `~/.local/state/nightly-review/ledger.md`; each night's reports are in `<night>/config.md`, `<night>/rust.md` and `<night>/messages.md` beside it.
+
+1. **Candidates.** Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/nightly_review/candidates.py"`: it prints every LEDGER line ending `— proposed` or `— deferred`, best first. A night's proposal and each of its **Also found** and **Noted** items is a LEDGER line of its own. Where a cheap check exists (its measurement script, the line it cites), confirm the candidate still holds; one already fixed is recorded done and dropped.
+2. **Rank** is the table's order: measured gain per week, user-visible time (waiting, red CI, failed runs) first, then share of tokens, and an unmeasured item below every measured one. The gain is the line's `[gain/week: …]` tag. When an open line has none and its report gives the numbers, write the tag before the line's closing ` — ` (`[gain/week: 38 min waiting]`, `[gain/week: 3.1% of tokens]`) and run the script again. `/showrunner:nightly` prints the same table, so its `recommended` row is the candidate presented here.
+3. **Present exactly one**, the top candidate; never list the backlog. Open with the line as it reads today next to the line as proposed (file:line), then the measured gain, then the cost. End with one choice line: `approve (recommended — reason) / decline / defer / elaborate`; a fix that belongs to another session offers `relay` in place of `approve`.
+4. **Record** the outcome in LEDGER as soon as it is decided. The outcome goes on the candidate's own line: its `— proposed` becomes `— accepted <date>, applied (<repo> <sha>)`, `— declined`, `— deferred`, `— done <date>` or `— relayed <date>`. Apply an approved change; commit and push only when the user says so. Then stop: present the next candidate only when the user asks (`/next efficiency`).
