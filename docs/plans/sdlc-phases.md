@@ -31,6 +31,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 ## Delegation Context
 
 - **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts that run the user's productions. This plan measures the phase process and the doc pipeline before it, and changes them one approved step at a time.
+- **Project started:** 2026-10-20T20:53:27.319+00:00
 - **Stack:** Python 3.13, standard library only; Markdown.
 - **Layout:**
   - `scripts/direct/phase_process.py`, `scripts/direct/test_phase_process.py` — the measure script and its tests (new)
@@ -62,7 +63,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 ## Phases
 
-### Phase 1 — One command measures each step of a phase and the doc pipeline before a plan, and the design doc maps the process  · status: todo
+### Phase 1 — One command measures each step of a phase and the doc pipeline before a plan, and the design doc maps the process  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -77,7 +78,8 @@ For active process redesigns, as we are currently undergoing with promotions and
   4. **Doc pipeline.** For each phased plan with a `run_started` event in the window: the first commit of the plan doc (and of any doc the plan header or Source names as its source) in git, the first `run_started`, the first `phase_started`, and the time between each; the commands that made the docs before it where git messages or the doc header name them. Print `not recorded` where no source has it.
   5. **Plan churn.** Per phased plan: Work Order edits between phases (commits that touch a `todo` phase), pending decisions opened and closed, phases inserted or split after the run started.
   - The script reads natedev's records. A table whose source the Mac also keeps says `natedev only`.
-  - The script writes no store of its own. It reads the same sources fix-rounds-unit reads (`history.py`, the findings ledger, the phase records) and keeps no second copy of their facts (showrunner, 2026-10-20). Where the two units' measures meet is set by the showrunner when fix-rounds-unit's plan is written.
+  - The script writes no store of its own. It reads the same sources fix-rounds-unit reads (`history.py`, the findings ledger, the phase records) and keeps no second copy of their facts (showrunner, 2026-10-20).
+  - **Where the measures meet** (showrunner, 2026-10-20). fix-rounds-unit owns what a phase is in the run records, and the fix time, round count and round cause per phase: its `scripts/history/rounds.py` (`history.py rounds`). A run record can hold more than one plan phase. Until rounds.py merges, phase boundaries and fix time each sit behind one function that reads the `phase_started`/`phase_finished` events as they are, and fix time prints as one stub row that names `history.py rounds` as its source. This script does not split multi-phase records and does not count fix time a second time.
 - The design doc `docs/plans/sdlc-phases-design.md`, sections:
   - **Map.** Each step of a phase, in order, from Work Order compose to the next phase's start: the tag or file that defines it, who runs it (director, worker, reviewer, script), what it reads, what it writes, and its row in the baseline. Then the same for the doc pipeline before a plan: each doc kind (proposal issue, review output, design doc, phased plan, production doc, unit plan, as-built), the command that writes it, the command that reads it, and its format file.
   - **Baseline.** The `phase_process.py baseline` output for the 14 days to the run, with the command and its window.
@@ -105,6 +107,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Goal:** the design doc proposes candidate changes for the largest friction, recommends the best, and splits them into small steps, each with the measure it moves.
 
 **Spec:**
+- First, when fix-rounds-unit's `scripts/history/rounds.py` is on the merge branch (the showrunner says so), merge the merge branch and swap `phase_process.py`'s phase-boundary and fix-time functions for rounds.py's phases and fix time; delete the stub row. Re-run `phase_process.py baseline` and replace the design doc's Baseline with the new output. If rounds.py is not merged yet, keep the stub and say so in Baseline.
 - Section **Candidates.** For each of the five largest Friction lines by measured cost (time or tokens), at least two candidate changes, each with what changes (files and steps), who it affects, and what it costs to build. Seeds, not limits:
   - **Shorter contract load:** split `direct.md` so a director reads only the part for the step it is on; each step names one file.
   - **Less director time between passes:** move Work Order compose for the next phase into the review wait of this one; merge checkpoint, shrink and phase review into one step.
@@ -117,13 +120,14 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Before the gate, the unit director runs `/adversarial` on the recommendation against the runner-up and `/astra_review` on the doc, and folds their findings into the doc.
 
 **Files:**
-- `docs/plans/sdlc-phases-design.md` — new sections above
+- `docs/plans/sdlc-phases-design.md` — new sections above; Baseline replaced
+- `scripts/direct/phase_process.py`, `scripts/direct/test_phase_process.py` — the swap to rounds.py
 
-**Workers:** `1 writer + 1 tester` — nothing splits: one doc. `impl` takes it.
-- `impl` — `docs/plans/sdlc-phases-design.md`
-- `test` — opens as impl — re-runs `phase_process.py baseline` for the doc's Comparison window and checks each number the doc cites against it; it writes no doc text
+**Workers:** `2 writers` — the swap and the doc are disjoint.
+- `impl` — `scripts/direct/phase_process.py`, `scripts/direct/test_phase_process.py`; then re-runs `phase_process.py baseline` for the doc's Comparison window and checks each number the doc cites against it
+- `test` — opens as impl — `docs/plans/sdlc-phases-design.md`
 
-**Constraints from prior phases:** the map, the baseline, the friction and the user's answers to the Phase 1 questions are in the design doc.
+**Constraints from prior phases:** the map, the baseline, the friction and the user's answers to the Phase 1 questions are in the design doc. Phase boundaries and fix time in `phase_process.py` sit behind one function each, with fix time as a stub row, until rounds.py replaces them.
 
 **Acceptance gate:** the doc has the four sections; each candidate has a score on every measure and rule; each step names its measure, its size and how to undo it; the adversarial and astra findings are folded in. At phase end the unit director sends the showrunner the Recommendation and Step 1 as one question for the user, with the answers it can build and the one it recommends.
 
