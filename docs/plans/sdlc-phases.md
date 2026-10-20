@@ -77,6 +77,7 @@ For active process redesigns, as we are currently undergoing with promotions and
   4. **Doc pipeline.** For each phased plan with a `run_started` event in the window: the first commit of the plan doc (and of any doc the plan header or Source names as its source) in git, the first `run_started`, the first `phase_started`, and the time between each; the commands that made the docs before it where git messages or the doc header name them. Print `not recorded` where no source has it.
   5. **Plan churn.** Per phased plan: Work Order edits between phases (commits that touch a `todo` phase), pending decisions opened and closed, phases inserted or split after the run started.
   - The script reads natedev's records. A table whose source the Mac also keeps says `natedev only`.
+  - The script writes no store of its own. It reads the same sources fix-rounds-unit reads (`history.py`, the findings ledger, the phase records) and keeps no second copy of their facts (showrunner, 2026-10-20). Where the two units' measures meet is set by the showrunner when fix-rounds-unit's plan is written.
 - The design doc `docs/plans/sdlc-phases-design.md`, sections:
   - **Map.** Each step of a phase, in order, from Work Order compose to the next phase's start: the tag or file that defines it, who runs it (director, worker, reviewer, script), what it reads, what it writes, and its row in the baseline. Then the same for the doc pipeline before a plan: each doc kind (proposal issue, review output, design doc, phased plan, production doc, unit plan, as-built), the command that writes it, the command that reads it, and its format file.
   - **Baseline.** The `phase_process.py baseline` output for the 14 days to the run, with the command and its window.
@@ -94,7 +95,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Constraints from prior phases:** none.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` green; `basedpyright scripts/direct scripts/production` has the `0 errors, 0 warnings` line; the merge gate (Delegation Context → Test) green; `phase_process.py baseline` runs on real data on natedev in under 60 s and its output is in the doc; every Friction line names a source. At phase end the unit director sends the showrunner the Questions section as one message for the user, and sends guilds-unit and fix-rounds-unit the Map.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` green; `basedpyright scripts/direct scripts/production` has the `0 errors, 0 warnings` line; the merge gate (Delegation Context → Test) green; `phase_process.py baseline` runs on real data on natedev in under 60 s and its output is in the doc; every Friction line names a source. At phase end the unit director sends the showrunner the Questions section as one message, never to the user: the showrunner brings each one to the user (showrunner, 2026-10-20). It also sends guilds-unit and fix-rounds-unit the Map.
 
 ### Phase 2 — The design doc recommends changes to the phase process and the doc pipeline, split into steps  · status: todo
 **Depends on:** Phase 1
