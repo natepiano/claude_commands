@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Pause a session's automatic updates when a conversation begins."""
+"""Pause a session's automatic updates when a conversation begins, and record the user's activity."""
 
 from __future__ import annotations
 
 import json
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from types import FrameType
@@ -42,6 +43,29 @@ def _record_typed_prompt() -> None:
         )
 
 
+def _record_activity(session_id: str) -> None:
+    """Tell auto silence the user typed in a showrunner or unit director session.
+
+    The call runs detached, so neither natedev's push nor the Mac's ssh slows the prompt.
+    """
+    try:
+        import conversation_pause
+
+        if not conversation_pause.is_showrunner_or_unit_director(session_id):
+            return
+        override = os.environ.get("AUTO_SILENCE_COMMAND")
+        script = Path(__file__).resolve().parent.parent / "notify" / "auto_silence.py"
+        command = [override] if override else [sys.executable, str(script)]
+        _ = subprocess.Popen([*command, "active"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except HookBudgetSpent:
+        raise
+    except Exception as error:
+        lines = str(error).splitlines()
+        detail = lines[0] if lines else ""
+        print(f"conversation-pause: auto silence: {type(error).__name__}: {detail}", file=sys.stderr)
+
+
 def main() -> None:
     payload = cast(PromptPayload, json.loads(sys.stdin.read()))
     if "agent_id" in payload:
@@ -68,6 +92,7 @@ def main() -> None:
         )
         if source is conversation_pause.PromptSource.TYPED:
             _record_typed_prompt()
+            _record_activity(session_id)
         return_question = conversation_pause.is_return_question(prompt)
         if (source in {conversation_pause.PromptSource.SCHEDULED,
                        conversation_pause.PromptSource.NOTICE}

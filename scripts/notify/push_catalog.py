@@ -201,4 +201,16 @@ ENTRIES = (
                                      "description": "You asked to be told when the tile and handler renames finish. "
                                      + "Both are done, and both units run under their new names."})),
         header=False),
+    # Auto silence (user spec, 2026-10-20: "a very compact format"): auto_silence.py sends one when the
+    # user goes idle, before silence starts, and one when their next prompt ends it.
+    PushText("silence.auto_on", "{sender}", "note", "{sender} auto silence on", NoActionNeeded(),
+        "Idle {minutes} min.",
+        (PushExample("typical", {"sender": "natedev", "minutes": "45"}),
+         PushExample("long_idle", {"sender": "natedev", "minutes": "1440"})),
+        header=False),
+    PushText("silence.auto_off", "{sender}", "note", "{sender} auto silence off", NoActionNeeded(),
+        "You are back; {kept} kept.",
+        (PushExample("typical", {"sender": "natedev", "kept": "3"}),
+         PushExample("none_kept", {"sender": "natedev", "kept": "0"})),
+        header=False),
 )
