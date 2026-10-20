@@ -52,43 +52,27 @@ For active process redesigns, as we are currently undergoing with promotions and
 ## Phases
 
 ### Phase 1 — A true count of repair rounds per phase  · status: done
-**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `history.py rounds` lists phases by repair rounds, most first, with the cause of each round and a flag on records that hold more than one phase.
-
-**Spec:**
-- New module `scripts/history/rounds.py`; `history.py` gets a `rounds` subcommand that calls `rounds.run(args)`. Reuse `history.py`'s `_events`, `_since_epoch`, `_status_filter`, `_emit`, `_duration` by importing them; do not copy them. Add `history` to `TEST_SUITES` in `scripts/production/merge_gate.py` :47.
-- **An importable API** (the sdlc showrunner, 2026-10-20). phases-unit's `scripts/direct/phase_process.py baseline` takes fix time and phase boundaries from `rounds.py` and never counts them a second time. So `rounds.py` exposes typed pure functions over parsed records, with no printing and no argument parsing inside them: `load_phases(events: list[dict[str, object]]) -> list[PhaseRounds]` (one per `(run_id, phase_instance_id)`, boundaries included), `phase_rounds(...)`, and the `PhaseRounds` / `Round` TypedDicts (`run_id`, `phase_id`, `phase_instance_id`, `title`, `plan`, `started_at`, `finished_at`, `rounds: list[Round]`, `causes: dict[str, int]`, `findings`, `fix_seconds`, `check: "ok" | "mixed"`, `past_landing`). Only `run(args)` prints. phases-unit is waiting on this; the Phase 1 checkpoint goes out as soon as Phase 1 is green.
-- **A repair round** is one dispatch of repair work in one phase: every `pass_kind == "fix"` pass of one `phase_instance_id` whose start falls within an open round. A round opens at a fix pass start and closes when its last concurrent fix pass finishes (passes in different `team_slot`s that overlap in time are one round). A ledger round (`finding_batch_dispatched`) that matches a fix pass by `round == fix_pass` in the same `phase_instance_id` is the same round, never a second one.
-- **The cause of each round**, first match wins:
-  1. `review` — a ledger round: its `finding_batch_dispatched.covered` names findings; split into `review-ux` when any covered finding's `lens` holds `ux`, else `review-code`.
-  2. `gate` — the activity text names a failed test, lint, clippy, type check or gate (`test`, `tests`, `lint`, `clippy`, `basedpyright`, `gate`, `failing`, `broke`).
-  3. `merge` — the activity names a merge, conflict, port or rebase.
-  4. `live` — the activity follows a live check, shot or smoke activity in the same phase that finished within 30 minutes before it.
-  5. `other` — everything else. The report prints the share of `other`; the acceptance gate needs it under 25% on the 60-day window.
-  Keep the word lists as module constants with one comment line each, so Phase 2 can tune them.
-- **Record check.** Flag a `(run, phase_instance_id)` record `mixed` when any of these hold: a pass activity names `Phase <N>` with N ≠ its `phase_id`; its first and last pass are more than 72 hours apart; it holds `merge` rounds from more than one merge. A `mixed` record is listed, never dropped, and is marked in the table.
-- **Output** (table, `--format json|csv` as in `phases`): columns `run  phase  title  plan  rounds  review-ux  review-code  gate  merge  live  other  findings  fix-time  span  check`. `plan` is the plan file's basename from `run_started.project_plan_doc`; `title` from `phase_started.phase_title`, cut to 40 characters; `findings` counts `finding_opened` in the phase; `span` is first to last pass; `check` is `ok` or `mixed`. Sort by `rounds` descending, then fix time. Flags: `--since`, `--until` (new; same forms as `--since`), `--status`, `--top N` (default 25), `--plan <substring>`.
-- **Summary lines** under the table: phases counted; median rounds; share of phases with ≥3 rounds and the share of fix time they hold; rounds by cause as a share of all rounds; count of `mixed` records.
-- **Hard-landing check** per phase, printed in the JSON row as `past_landing`: the number of rounds from round 4 on (the rule starts at round 3, so round 3 itself may still carry kept findings). Phase 2 reads it to tell rules that do not hold from rules that are not followed.
-- `commands/history.md`: add `rounds` to the subcommand list in one line, and change `summary`'s "Next:" hint in `history.py` (:1087) to name `history.py rounds` in place of `phases --sort fix_passes`.
+- `history.py rounds` lists `/unit:direct` phases by repair rounds, most first. Columns: `run  phase  title  plan  rounds  review-ux  review-code  gate  merge  live  other  findings  fix-time  span  check`; `--format json|csv`; flags `--since`, `--until` (on `rounds` only), `--status`, `--top N` (default 25), `--plan <substring>`. Summary lines: phases counted, median rounds, share of phases with 3 or more rounds and the share of fix time they hold, rounds by cause, count of `mixed` records. The JSON row also carries `past_landing`, the number of rounds from round 4 on.
+- A repair round is the set of concurrent `fix` passes of one `phase_instance_id`; a ledger round (`finding_batch_dispatched`) matched by `round == fix_pass` is the same round. Ledger events join their run through `phase_instance_id`.
+- Cause, first match wins: `review-ux` / `review-code` (a ledger round; `ux` when any covered finding's lens holds `ux`), `gate`, `merge`, `live` (a live, shot or smoke activity finished within 30 minutes before), `other`.
+- A record is `mixed` when a pass activity names another phase number, its passes span more than 72 hours, or its merge rounds are more than 24 hours apart. A `mixed` record is listed and marked, never dropped.
+- The merge gate runs the `history` suite.
 
 **Files:**
-- `scripts/history/rounds.py` — new: the round builder, cause classifier, record check and the `rounds` command.
-- `scripts/history/history.py` — the `rounds` subparser, `--until`, and the `summary` hint.
-- `scripts/history/test_rounds.py` — new.
+- `scripts/history/rounds.py` — the round builder, cause classifier, record check and the `rounds` command.
+- `scripts/history/history.py` — the `rounds` subparser; the `summary` hint names `history.py rounds`.
+- `scripts/history/test_rounds.py` — tests on synthetic event lists.
 - `commands/history.md` — one line for `rounds`.
-- `scripts/production/merge_gate.py` — `history` in `TEST_SUITES`.
+- `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate.py` — `history` in `TEST_SUITES` and `EXPECTED_SUITES`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/history/rounds.py`, `scripts/history/history.py`, `commands/history.md`, `scripts/production/merge_gate.py`; hub: `scripts/history/history.py` (the subparser and shared readers).
-- `test` — `scripts/history/test_rounds.py` from the Spec alone: synthetic event lists for each cause, overlapping slots as one round, a ledger round matched to its fix pass counted once, ledger events joined to their run through `phase_instance_id`, each `mixed` trigger, `--until`, and `past_landing`.
+**Binds later work:** `rounds.py` is an importable API with no printing outside `run(args)`: `load_phases(events: list[dict[str, object]]) -> list[PhaseRounds]`, `phase_rounds(events) -> list[Round]`, and the `PhaseRounds` / `Round` TypedDicts. phases-unit's `phase_process.py baseline` imports it. The word lists are the module constants `GATE_WORDS`, `MERGE_WORDS`, `LIVE_WORDS`; `MERGE_SEPARATION_SECONDS = 24 * 3600`.
 
-**Constraints from prior phases:** none.
+**Gotchas:** passes sort by start with unfinished passes last, and a pass with no finish never extends a round, so counts do not depend on event order.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` green; `basedpyright scripts/history` `0 errors, 0 warnings`; the merge gate green. `python3 scripts/history/history.py rounds --since 60d --status all` prints the table with `other` under 25% of rounds, and marks run `189487ea` phase `6` `mixed`.
+**Ruled out:** `--until` on `runs` (it ignored the flag); marking a record `mixed` because two merge rounds name different merges (merge texts vary).
 
 ### Phase 2 — Why the phases with the most rounds needed them  · status: todo
 **Depends on:** Phase 1
@@ -123,7 +107,11 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `docs/plans/sdlc-fix-rounds-study.md`; phases 1–8 of the ranked list, the rule check and the totals; hub: `docs/plans/sdlc-fix-rounds-study.md` (the second writer sends its sections to `impl` to place).
 - `test` — opens as `impl`: phases 9–15 and the 3 `mixed` records, sent to `impl` as finished sections; owns `scripts/history/rounds.py` and `scripts/history/test_rounds.py` for word list tuning.
 
-**Constraints from prior phases:** set at Phase 1's checkpoint.
+**Constraints from prior phases:**
+- From Phase 1: `scripts/history/rounds.py` is an API that phases-unit's `phase_process.py baseline` imports. Word list tuning changes only the constants `GATE_WORDS`, `MERGE_WORDS`, `LIVE_WORDS` (each a tuple of lower-case words or phrases matched against the pass activity); never the signatures of `load_phases(events) -> list[PhaseRounds]` and `phase_rounds(events) -> list[Round]`, and never a `PhaseRounds` or `Round` field.
+- From Phase 1: a record is `mixed` when a pass activity names another phase number, its passes span more than 72 h, or its merge rounds are more than 24 h apart (`MERGE_SEPARATION_SECONDS`). A pass with no finish never extends a round.
+- From Phase 1: the 60-day baseline on 2026-10-20 was 1,863 phases; median 0 rounds; 221 phases with 3 or more rounds hold 79% of fix time; rounds by cause review-ux 18.9%, review-code 61.6%, gate 7.3%, merge 1.9%, live 0.2%, other 10.1%; 44 `mixed` records. The top two records, `189487ea` phase 6 (56 rounds) and `03f9b80e` phase 20 (42 rounds), are both `mixed`. `live` at 0.2% shows `LIVE_WORDS` barely match: check it first in the hand reading.
+- From Phase 1: the merge gate runs the `history` suite (`scripts/production/merge_gate.py` `TEST_SUITES`), so a `rounds.py` change must keep `python3 -m unittest discover -s scripts/history -p 'test_*.py'` green.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/history -p 'test_*.py'` green and `basedpyright scripts/history` `0 errors, 0 warnings` when `rounds.py` changed. Every round line in the study names its evidence; every phase section's rounds match `history.py rounds` for that record; the totals table sums to the rounds counted.
 
