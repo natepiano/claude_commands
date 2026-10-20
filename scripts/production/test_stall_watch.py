@@ -31,6 +31,9 @@ EDIT_PROMPT = ("— holding: waiting on the seats\n\n Edit file\n scripts/herdr/
                + " Do you want to make this edit to panes.py?\n ❯ 1. Yes\n   2. No\n")
 BASH_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read lines 5 to the end of a saved output\n\n"
                + " Do you want to proceed?\n ❯ 1. Yes\n   3. No, and tell Claude what to do differently (esc)\n")
+AUTO_DENY_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read lines 5 to the end of a saved output\n"
+                    + " ⚠ Claude Code will automatically deny this request in 0:41, to avoid blocking progress on an"
+                    + " unattended session.\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
 
 
 def executable(path: Path, source: str) -> None:
@@ -380,6 +383,20 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.tick(START + 1060).returncode, 0)
         self.assertEqual([item["to"] for item in self.sent()[2:]], ["user"])
 
+    def test_a_unit_at_a_prompt_with_the_auto_deny_banner_gets_no_alert_and_no_bump(self) -> None:
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = AUTO_DENY_PROMPT
+        self.assertEqual(self.tick(START).returncode, 0)
+        self.assertEqual(self.tick(START + 60).returncode, 0)
+        self.assertEqual(self.tick(START + 900).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        # The same unit at a prompt without the banner waits on the user, and its alert time starts then.
+        self.panes["unit-one"]["pane"] = EDIT_PROMPT
+        self.assertEqual(self.tick(START + 901).returncode, 0)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.tick(START + 961).returncode, 0)
+        self.assertEqual([item["to"] for item in self.sent()], ["user"])
+
     def test_the_request_is_read_from_the_prompt_at_the_bottom_of_the_pane(self) -> None:
         import stall_watch
         self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT), "edit panes.py")
@@ -389,6 +406,15 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(stall_watch.prompt_request("Bash command\n\n   ls\n\n Do you want to proceed?\n"),
                          "run a shell command")
         self.assertEqual(stall_watch.prompt_request("— holding: waiting\n"), "go on with its work")
+
+    def test_the_request_skips_the_auto_deny_banner(self) -> None:
+        import stall_watch
+        self.assertEqual(stall_watch.prompt_request(AUTO_DENY_PROMPT),
+                         "run a shell command to read lines 5 to the end of a saved output")
+        self.assertTrue(stall_watch.auto_denied(AUTO_DENY_PROMPT))
+        # The banner quoted in the transcript above a prompt is not the prompt's own banner.
+        quoted = " The push said ⚠ Claude Code will automatically deny this request in 0:41.\n\n" + EDIT_PROMPT
+        self.assertFalse(stall_watch.auto_denied(quoted))
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)
@@ -772,22 +798,8 @@ raise SystemExit(1 if record['to'] in fail else 0)
         self.assertEqual(self.sent(), [])
         self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "unit-one").name).exists())
 
-    def test_an_idle_review_unit_is_not_bumped_while_a_unit_beside_it_is(self) -> None:
-        import stall_watch
-        self.configure_registered({"showrunner": [("review-unit", "running"), ("hook-unit", "running")]},
-                                  review_pool=True)
-        for name in ("review-unit", "hook-unit"):
-            _ = self.unit(name)
-
-        self.assertEqual(self.tick(START).returncode, 0)
-        self.assertEqual(self.tick(START + 600).returncode, 0)
-        sent = self.sent()
-        self.assertEqual({item["key"].rsplit(":", 1)[-1] for item in sent}, {"bump", "tell"})
-        self.assertTrue(all(item["key"].startswith("stall-watch:hook-unit:") for item in sent), sent)
-        self.assertFalse((self.state / stall_watch.stretch_path("showrunner", "review-unit").name).exists())
-
-    def test_a_unit_named_review_unit_with_no_review_pool_is_bumped(self) -> None:
-        self.configure_registered({"showrunner": [("review-unit", "running")]})
+    def test_a_unit_named_review_unit_beside_a_review_pool_is_bumped(self) -> None:
+        self.configure_registered({"showrunner": [("review-unit", "running")]}, review_pool=True)
         _ = self.unit("review-unit")
 
         self.assertEqual(self.tick(START).returncode, 0)

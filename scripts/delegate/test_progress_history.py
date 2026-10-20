@@ -295,10 +295,6 @@ print('two homes isolated; recorder lock retained; caller restored')
             )
         with (
             patch.dict(os.environ, environment, clear=True),
-            patch(
-                "scripts.delegate.progress_history.shutil.which",
-                return_value=None,
-            ),
             run_patch,
             redirect_stdout(stdout),
             redirect_stderr(stderr),
@@ -589,7 +585,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             ],
         )
         self.assertIn("▸ **Fix 2 - correcting retry recovery**", header)
-        self.assertEqual(header.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+        self.assertEqual(header.splitlines()[-1], "**now 1970-01-01 05:35:00**")
 
         _ = self.run_command(
             "calibrate",
@@ -728,7 +724,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 ]
                 self.assertEqual(report.splitlines()[:6], expected)
                 self.assertEqual(report.splitlines()[-1],
-                                 "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+                                 "**now 1970-01-01 05:35:00**")
                 if tables:
                     self.assertEqual(self.table_rows(report, SUMMARY_HEADER)[1][:3],
                                      ["Phase 3", "20", "00:01:40"])
@@ -738,7 +734,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                     )
                 else:
                     self.assertEqual(report.splitlines(), [
-                        *expected, "**now 1970-01-01 05:35:00 - next report 05:38:00**",
+                        *expected, "**now 1970-01-01 05:35:00**",
                     ])
 
     def test_ad_hoc_run_reuses_plan_project_time_for_the_same_worktree_branch(
@@ -817,156 +813,8 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("| Project |  40 | 1 day 03:30:10 ", header)
         self.assertIn("| Phase 3 |  10 |       00:00:10 |", header)
 
-    def test_the_clock_line_names_the_armed_timer_then_falls_back_to_the_interval(
-        self,
-    ) -> None:
-        started_at = 20_000
-        session_dir = self.start_run("clock", started_at)
-        self.start_phase_and_pass(session_dir, started_at)
-
-        # A timer armed and still ahead of the clock is the real next tick, so
-        # its deadline wins over the interval added to the current time.
-        _ = (session_dir / "progress_timer").write_text(
-            f"deadline_epoch={started_at + 400}\npid=1234\ninterval_seconds=600\n",
-            encoding="utf-8",
-        )
-        armed = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:40:00**", armed)
-
-        # progress_timer.sh clears the marker as it ticks, and an expired one
-        # left behind names a tick that has already happened. Both fall through
-        # to the configured interval.
-        _ = (session_dir / "progress_timer").write_text(
-            f"deadline_epoch={started_at + 50}\npid=1234\ninterval_seconds=600\n",
-            encoding="utf-8",
-        )
-        expired = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:38:00**", expired)
-
-        (session_dir / "progress_timer").unlink()
-        self.write_interval(90_000)
-        crosses_midnight = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn(
-            "**now 1970-01-01 05:35:00 - next report 1970-01-02 06:35:00**",
-            crosses_midnight,
-        )
-
-        # An unusable interval degrades the clause rather than stopping the
-        # header: the report is not the timer, and progress_timer.sh is the
-        # caller that fails loudly on the same key.
-        self.write_interval("not-a-number")
-        unusable = self.run_progress(session_dir, at=started_at + 100)
-        self.assertIn("**now 1970-01-01 05:35:00**", unusable)
-        self.assertNotIn("next report", unusable)
-
-    def test_the_clock_line_uses_the_restarted_unit_notifier(self) -> None:
-        started_at = 20_000
-        report_at = started_at + 100
-        session_dir = self.start_run("notifier-clock", started_at)
-        self.start_phase_and_pass(session_dir, started_at)
-        state_dir = self.root / "notifier"
-        environment = os.environ.copy()
-        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
-        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
-        _ = subprocess.run(
-            [
-                "zsh",
-                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
-                "new",
-                f"unit-{session_dir.name}",
-                "--to",
-                "session:test-claude-session",
-                "--every",
-                "15",
-                "--command",
-                "/unit:report",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        # A legacy marker must yield to the live instance's new deadline.
-        _ = (session_dir / "progress_timer").write_text(
-            f"deadline_epoch={started_at + 400}\npid=1234\ninterval_seconds=600\n",
-            encoding="utf-8",
-        )
-        with patch.dict(os.environ, {"NOTIFIER_STATE_DIR": str(state_dir)}):
-            report = self.run_progress(session_dir, at=report_at)
-        self.assertIn("**now 1970-01-01 05:35:00 - next report 05:50:00**", report)
-        state = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-        self.assertEqual(state["LAST_RESTART"], str(report_at))
-        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
-
-    def test_missing_cap_stage_restarts_unit_notifier(self) -> None:
-        started_at = 50_000
-        report_at = started_at + 100
-        session_dir = self.start_run("refused-cap-stage", started_at)
-        self.start_phase_and_pass(session_dir, started_at)
-        state_dir = self.root / "notifier"
-        environment = os.environ.copy()
-        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
-        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
-        _ = subprocess.run(
-            [
-                "zsh",
-                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
-                "new",
-                f"unit-{session_dir.name}",
-                "--to",
-                "session:test-claude-session",
-                "--every",
-                "15",
-                "--command",
-                "/unit:report",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
-        with patch.dict(
-            os.environ,
-            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
-        ):
-            result = self.run_failing_command(
-                "progress", "--tables",
-                "--session-dir",
-                str(session_dir),
-                "--project-raw-percent",
-                "40",
-                "--project-percent",
-                "40",
-                "--phase-raw-percent",
-                "40",
-                "--phase-percent",
-                "40",
-                "--activity",
-                "implementing",
-                at=report_at,
-            )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--cap-stage is required", result.stderr)
-        state = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-        self.assertEqual(state["LAST_RESTART"], str(report_at))
-        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
-
-    def test_a_finished_phase_is_refused_and_restarts_unit_notifier(self) -> None:
-        """With no active phase there is nothing to report, and the clock still moves."""
+    def test_a_finished_phase_is_refused(self) -> None:
+        """With no active phase there is nothing to report."""
         started_at = 20_000
         report_at = started_at + 100
         session_dir = self.start_run("refused-phase", started_at)
@@ -979,53 +827,17 @@ print('two homes isolated; recorder lock retained; caller restored')
             "completed",
             at=started_at + 60,
         )
-        state_dir = self.root / "notifier"
-        environment = os.environ.copy()
-        environment["NOTIFIER_STATE_DIR"] = str(state_dir)
-        environment["NOTIFIER_NOW_EPOCH"] = str(started_at)
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
-        _ = subprocess.run(
-            [
-                "zsh",
-                str(SCRIPT.parents[1] / "message" / "notifier.sh"),
-                "new",
-                f"unit-{session_dir.name}",
-                "--to",
-                "session:test-claude-session",
-                "--every",
-                "15",
-                "--command",
-                "/unit:report",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
+        result = self.run_failing_command(
+            "progress", "--tables",
+            "--session-dir",
+            str(session_dir),
+            "--activity",
+            "implementing",
+            at=report_at,
         )
-        with patch.dict(
-            os.environ,
-            {"NOTIFIER_STATE_DIR": str(state_dir), "NOTIFIER_NOW_EPOCH": str(report_at)},
-        ):
-            result = self.run_failing_command(
-                "progress", "--tables",
-                "--session-dir",
-                str(session_dir),
-                "--activity",
-                "implementing",
-                at=report_at,
-            )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No active phase to report: phase completed.", result.stderr)
         self.assertIn("say nothing about whether the workers are alive", result.stderr)
-        state = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
-        )
-        self.assertEqual(state["LAST_RESTART"], str(report_at))
-        self.assertEqual(state["NEXT_DUE"], str(report_at + 15 * 60))
 
     def test_a_closed_phase_with_a_running_activity_reports_its_last_tables(
         self,
@@ -1111,7 +923,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertNotIn("No pass or activity is open.", report)
         self.assertEqual(
             report.splitlines()[-1],
-            "**now 1970-01-01 05:40:00 - next report 05:43:00**",
+            "**now 1970-01-01 05:40:00**",
         )
         self.assertEqual(history.read_text(encoding="utf-8"), events_before)
         self.assertEqual(state_path.read_text(encoding="utf-8"), state_before)
@@ -1187,7 +999,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             [["Fix 2", "05:33:30", "1m", "fix 1m running", "-", "running"]],
         )
         self.assertIn("▸ **Fix 2 - implementing**", report)
-        self.assertEqual(report.splitlines()[-1], "**now 1970-01-01 05:35:00 - next report 05:38:00**")
+        self.assertEqual(report.splitlines()[-1], "**now 1970-01-01 05:35:00**")
 
     def test_an_activity_after_a_closed_phase_keeps_the_phase_record(self) -> None:
         started_at = 21_000
@@ -1507,14 +1319,28 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertGreater(lines.index(warning), lines.index(next(
             line for line in lines if line.startswith("| Fix 2 ")
         )))
-        self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00 - next report 05:55:00**")
-        restart = dict(
-            line.split("=", 1)
-            for line in (state_dir / f"unit-{session_dir.name}" / "state")
-            .read_text(encoding="utf-8")
-            .splitlines()
+        self.assertEqual(lines[-1], "**now 1970-01-01 05:40:00**")
+
+    def test_a_phase_between_windows_prints_recorded_summary_without_tables_flag(self) -> None:
+        started_at = 20_000
+        session_dir = self.start_run("between-summary", started_at)
+        self.start_phase_and_pass(session_dir, started_at)
+        _ = self.run_progress(session_dir, at=started_at + 100)
+        self.close_the_only_pass(session_dir, at=started_at + 200)
+
+        report = self.run_command(
+            "progress", "--session-dir", str(session_dir),
+            "--activity", "waiting on the repair writers", at=started_at + 400,
         )
-        self.assertEqual(restart["LAST_RESTART"], str(report_at))
+
+        self.assertIn("as of 05:35:00, the last progress report", report)
+        self.assertIn("No pass or activity is open.", report)
+        self.assertEqual(
+            [row[:3] for row in self.table_rows(report, SUMMARY_HEADER)],
+            [["Project", "40", "00:01:40"], ["Phase 3", "30", "00:01:40"]],
+        )
+        self.assertFalse(any(line.startswith("| Stage ") for line in report.splitlines()), report)
+        self.assertFalse(any(line.startswith("Earlier:") for line in report.splitlines()), report)
 
     def test_a_phase_never_reported_still_prints_both_tables(self) -> None:
         """Before the first report the clocks read as of the phase start."""
@@ -3152,6 +2978,34 @@ print('two homes isolated; recorder lock retained; caller restored')
             header,
         )
 
+    def test_a_worker_finished_over_ten_minutes_ago_drops_out_of_the_report(self) -> None:
+        """Only the report's worker lines drop it; a worker still at work stays."""
+        started_at = 65_000
+        session_dir = self.start_run("finished", started_at)
+        self.start_phase(session_dir, started_at)
+        for slot in ("impl", "test"):
+            self.run_board(session_dir, "post", slot, "register", "role=fix; up", at=started_at + 1)
+            self.start_slot_pass(session_dir, slot, "fix", started_at + 10, fix_pass=1)
+        for slot in ("impl", "test"):
+            self.finish_slot_pass(session_dir, slot, "completed", started_at + 310)
+        # A second round opens for test alone, so impl's round is over.
+        self.start_slot_pass(session_dir, "test", "fix", started_at + 320, fix_pass=2)
+        self.team_slot = ""
+
+        def report(at: int) -> str:
+            return self.run_command(
+                "progress", "--session-dir", str(session_dir),
+                "--project-raw-percent", "40", "--project-percent", "40",
+                "--phase-raw-percent", "30", "--phase-percent", "30",
+                "--cap-stage", "implementation", "--activity", "implementing", at=at,
+            )
+
+        recent = report(started_at + 400)
+        self.assertIn("- **Agent 1** (impl) fix 5m done", recent)
+        later = report(started_at + 310 + 601)
+        self.assertNotIn("**Agent 1**", later)
+        self.assertIn("- **Agent 2** (test) fix", later)
+
     def broad_review(self, session_dir: Path, lenses: tuple[str, ...], started_at: int) -> None:
         """Both workers write, then the broad review workers one pass per lens.
 
@@ -4412,6 +4266,61 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("| 1 of 4 done |", header)
         self.assertIn("| Phase 3 |", header)
 
+    def test_the_phases_count_adds_a_run_phase_the_plan_has_no_heading_for(self) -> None:
+        """Phase 3 opened before its plan listed phases, and the plan lists 1 and 2.
+
+        The count takes Phase 3 in, so the report never puts "Phase 3" beside
+        "of 2" (hana cables, 2026-10-19: "19 of 31 done" beside "Phase 32").
+        """
+        session_dir = self.start_run("unlisted", 0)
+        self.start_phase_and_pass(session_dir, 70_000)
+        plan_path = self.working_dir / "docs" / "unlisted.md"
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8")
+            + "### Phase 1 — Done work  · status: done\n\n"
+            + "### Phase 2 — Waiting  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        header = self.run_progress(session_dir, 80_000)
+        self.assertIn("| 1 of 3 done |", header)
+        self.assertIn("| Phase 3 |", header)
+
+    def test_start_phase_refuses_a_phase_the_plan_has_no_heading_for(self) -> None:
+        session_dir = self.start_run("refused", 0)
+        plan_path = self.working_dir / "docs" / "refused.md"
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8") + "### Phase 1 — Only phase  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        result = self.run_failing_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "3",
+            "--phase-title", "Retry handling", at=70_000,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Phase 3 has no heading in", result.stderr)
+        state = cast(dict[str, object], json.loads(
+            (session_dir / "progress_history_state.json").read_text(encoding="utf-8")
+        ))
+        self.assertIsNone(state["phase"])
+
+    def test_start_phase_finds_a_standing_plan_phase_by_its_title_id(self) -> None:
+        session_dir = self.start_run("standing", 0)
+        plan_path = self.working_dir / "docs" / "standing.md"
+        # style_plan.py next-phase writes the ticket id as the title, not the number.
+        _ = plan_path.write_text(
+            plan_path.read_text(encoding="utf-8") + "### Phase 201 — types-unit-201  · status: todo\n\n",
+            encoding="utf-8",
+        )
+        _ = self.run_command(
+            "start-phase", "--session-dir", str(session_dir), "--phase-id", "types-unit-201",
+            "--phase-title", "types-unit-201", at=70_000,
+        )
+        state = cast(dict[str, object], json.loads(
+            (session_dir / "progress_history_state.json").read_text(encoding="utf-8")
+        ))
+        phase = cast(dict[str, object], state["phase"])
+        self.assertEqual(phase["id"], "types-unit-201")
+
     def test_the_header_names_a_worktree_once_when_its_branch_shares_the_name(
         self,
     ) -> None:
@@ -4573,6 +4482,12 @@ print('two homes isolated; recorder lock retained; caller restored')
         return next(line for line in report.splitlines()
                     if line.startswith(("ETA ", "gated ")))
 
+    def assert_summary_without_round_table(self, report: str) -> None:
+        rows = self.table_rows(report, [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]])
+        self.assertEqual([row[0] for row in rows], ["Project", "Phase 3"])
+        self.assertFalse(any(line.startswith("| Stage ") for line in report.splitlines()), report)
+        self.assertFalse(any(line.startswith("Earlier:") for line in report.splitlines()), report)
+
     def test_short_progress_keeps_promises_stage_and_worker_narration_without_tables(self) -> None:
         session_dir = self.short_report_fixture("short-workers")
 
@@ -4591,7 +4506,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.assertIn(model, worker)
             self.assertIn("fix", worker)
             self.assertIn(state, worker)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_short_progress_names_the_first_eta_and_completed_fix_round(self) -> None:
         session_dir = self.short_report_fixture("short-first", promises=("16:10",), running_fix=False)
@@ -4599,7 +4514,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         report = self.short_progress(session_dir, self.report_time(16))
 
         self.assertEqual(self.eta_report_line(report), "ETA 16:10 (on its first ETA, 1 fix round)")
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_short_progress_retains_each_worker_while_the_director_runs_an_activity(self) -> None:
         session_dir = self.short_report_fixture("short-concurrent-activity")
@@ -4616,7 +4531,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.assertRegex(worker, rf"\({slot}\) fix \S+ {state} ·")
             self.assertIn(model, worker)
         self.assertIn("▸ **Fix 2 - implementing**", report)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_short_eta_names_a_running_fix_round_without_zero_completed_rounds(self) -> None:
         session_dir = self.short_report_fixture("short-running-fix", completed_fix=False)
@@ -4672,16 +4587,19 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("repairing retry recovery", report)
         self.assertIn("waiting for retry fixture", report)
         self.assertIn("No pass or activity is open.", report)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
         self.assertEqual((state.read_bytes(), history.read_bytes()), before)
 
-    def test_tables_flag_adds_both_tables_and_keeps_the_same_eta_line(self) -> None:
+    def test_tables_flag_adds_the_round_table_and_keeps_the_summary_and_eta_line(self) -> None:
         session_dir = self.short_report_fixture("short-tables")
 
         short = self.short_progress(session_dir, self.report_time(16))
         detailed = self.short_progress(session_dir, self.report_time(16), tables=True)
 
         self.assertEqual(self.eta_report_line(detailed), self.eta_report_line(short))
+        self.assert_summary_without_round_table(short)
+        header = [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]]
+        self.assertEqual(self.table_rows(detailed, header)[:2], self.table_rows(short, header))
         self.assertEqual(
             [row[0] for row in self.table_rows(
                 detailed, [*SUMMARY_HEADER[:5], "Phases", *SUMMARY_HEADER[5:]],
@@ -4708,14 +4626,14 @@ print('two homes isolated; recorder lock retained; caller restored')
 
                 self.assertEqual(self.eta_report_line(report),
                                  "ETA 18:30 (first 17:15, +1:15, moved 2×, 1 fix round + 1 running)")
-                self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+                self.assert_summary_without_round_table(report)
                 for offset, slot in enumerate(("impl", "test")):
                     self.finish_slot_pass(session_dir, slot, "completed", self.report_time(16, 1) + offset)
                 self.team_slot = ""
                 between = self.short_progress(session_dir, self.report_time(16, 10))
                 self.assertEqual(self.eta_report_line(between),
                                  "ETA 18:30 (first 17:15, +1:15, moved 2×, 3 fix rounds)")
-                self.assertFalse(any(line.startswith("|") for line in between.splitlines()), between)
+                self.assert_summary_without_round_table(between)
 
     def test_eta_line_names_only_the_requested_phases_own_gate(self) -> None:
         eta_line = cast(Callable[[Path, str], str], vars(progress_history)["_phase_eta_line"])
@@ -4745,7 +4663,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertIn("shrink", stage)
         self.assertIn("recording the as-built phase", stage)
         self.assertNotIn("No pass or activity is open.", report)
-        self.assertFalse(any(line.startswith("|") for line in report.splitlines()), report)
+        self.assert_summary_without_round_table(report)
 
     def test_project_eta_uses_the_last_chain_finish_and_shifts_the_open_eta_band(self) -> None:
         session_dir, report = self.report_eta_chain("project-chain")

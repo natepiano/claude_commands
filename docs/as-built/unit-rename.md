@@ -63,6 +63,7 @@ steps:
    - the reviewer leases and memory;
    - the newest run record and the recorder state;
    - this production's open proposal issues and phase notes (`phase_table.owned_notes`).
+   - the herdr pane record drops the old unit's entries (`pane_record.forget_unit`), in each session's file. The relaunched unit records its new pane at SessionStart; an old entry would resume the old name.
 8. **Retire.** The old branch is deleted once origin holds the new tip.
 9. **Restart record.** The fields that move:
    - `host.unit`;
@@ -100,5 +101,5 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the showrunner checkout and the new worktree, as git sees them;
   - the six showrunner state files.
 
-  A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
+  The postmaster's replies are history. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   On natedev a sweep takes about 80 s.

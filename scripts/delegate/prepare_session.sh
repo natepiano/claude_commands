@@ -38,16 +38,6 @@ if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
   printf '%s\n' "${SESSION_DIR}" > "${ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
   rm -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}"
   "${SCRIPT_DIR}/../lib/py" "${SCRIPT_DIR}/../usage/agents_log.py" append --id "${CLAUDE_CODE_SESSION_ID}" --role director || true
-  # Pinned: an inherited test override would send the notifier to another marker.
-  if notifier_output="$(PLAN_DELEGATE_ACTIVE_DIR="${ACTIVE_DIR}" zsh "${SCRIPT_DIR}/unit_notifier.sh" "${CLAUDE_CODE_SESSION_ID}" 2>&1)"; then
-    while IFS= read -r line; do
-      if [[ "${line}" == next_due=* || "${line}" == "progress updates on demand:"* ]]; then
-        printf '%s\n' "${line}"
-      fi
-    done <<< "${notifier_output}"
-  else
-    printf 'notifier instance not created: %s\n' "${notifier_output}"
-  fi
 fi
 
 echo "Session ready at ${SESSION_DIR}"

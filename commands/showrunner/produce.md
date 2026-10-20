@@ -341,7 +341,7 @@ Run `python3 ~/.claude/scripts/production/production_lifecycle.py load
 the checkout, copies any state that `<SCRATCH>` holds and `STATE_DIR` does not, reads the last `### STATE` block of `LOG`, rebuilds each unit's
 last code checkpoint from first-parent merge history, and checks its herdr
 session. Use its lines to restore state. <StartUpdates/> registers this session
-again and retargets the instance. A reboot needs nothing.
+again and retargets the instance. After a reboot, the herdr boot unit and `pane_restore.py` bring each pane back on its own account (`docs/as-built/herdr-restore.md`).
 
 When the production doc's **Production rules** say CI does not apply, pass
 `--no-ci` to this and every lifecycle subcommand.
@@ -360,16 +360,8 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
-When the production doc has a **Review pool** line, prepare the review plan
-on `MERGE_BRANCH` before launching. It has the Production header from
-`docs/production_format.md` and the one standing phase in
-`commands/review/direct.md` → <ReviewPoolStart/>. Commit a new or changed
-plan there; `add_unit.py` reads the committed merge-branch tree in preflight.
-Then launch `review-unit` first:
-`$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC review --plan <review plan> --owns "—"`.
-It has an ordinary Units row, worktree and branch; its opening runs
-`/review:direct <absolute production doc path>`. Its standing phase stays
-`todo` and has no final checkpoint. Each unit keeps one permanent reviewer per type, and every
+When the production doc has a **Review pool** line, no unit runs the pool:
+the first review of each type primes it. Each unit keeps one permanent reviewer per type, and every
 code review goes to it (`docs/production_format.md`, unit rule 16). Before
 you mark a unit `retired`, run `review_pool.py retire` for it
 (`docs/production_format.md`, Units).
@@ -640,15 +632,6 @@ message.
    build report (`/build:report`) carries it and pushes again. Run
    `review_regime.py ack` only on the user's own acknowledgment. Pass `--no-ci`
    to `due` when the production rules say CI does not apply.
-   When the production doc has a **Review pool** line, send `review-unit`
-   one line per merged code checkpoint:
-   `review merge: unit <unit>; phase <phase>; session dir <path>; design check: <verdict>`.
-   Run `~/.claude/scripts/lib/py ~/.claude/scripts/production/unit_run.py
-   --production PRODUCTION_DOC <unit>`: its first field is the session
-   directory's name for the merge line; on exit 1, send the merge line with
-   `session dir unavailable` and tell `review-unit` why. Take the verdict from step 3;
-   use `not applicable` when nothing users see changed. Append the same line
-   to `LOG`. A shrink sends no memory line.
 </MergeCheckpoint>
 
 ---
@@ -1125,9 +1108,8 @@ each in your session.
 <Wrap>
 When every unit's final-gate and as-built checkpoints are merged:
 
-With a **Review pool** line, exclude `review-unit`'s standing phase from
-that condition. A unit whose Plan cell is `permanent` (the nightly review) is
-outside it too: wrap neither waits on it nor retires its worktree or branch.
+A unit whose Plan cell is `permanent` (the nightly review) is outside that
+condition: wrap neither waits on it nor retires its worktree or branch.
 
 1. Run a final <CIPoint/> and all <PromoteMain/> checks on its exact sha:
    local validation, smoke launch and GitHub CI verdict, then the promotion
@@ -1139,8 +1121,7 @@ outside it too: wrap neither waits on it nor retires its worktree or branch.
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
-   With a **Review pool** line, tell `review-unit` to end and wait for its
-   acknowledgment that no more primes will run. Then run
+   With a **Review pool** line, run
    `~/.claude/scripts/lib/py ~/.claude/scripts/delegate/review_pool.py stop --production <slug>`.
    On failure, report its reason and run `stop` again; do not finish wrap
    until it succeeds. `<slug>` is the production doc's file name without

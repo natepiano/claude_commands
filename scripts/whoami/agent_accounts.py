@@ -38,8 +38,9 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -306,11 +307,36 @@ class NoWeeklyReadSkip:
 class UsageReadOutcome(str, Enum):
     """The result of the latest attempt to read a login's usage."""
 
+    HELD = "held"
     OK = "ok"
     STALE_TOKEN = "stale_token"
     REFUSED_401 = "refused_401"
     RATE_LIMITED_429 = "rate_limited_429"
     ERROR = "error"
+
+
+@dataclass(frozen=True)
+class UsageReadClaim:
+    """This reader owns the login's attempt at this time."""
+
+    at: datetime
+
+
+@dataclass(frozen=True)
+class UsageReadUnclaimed:
+    """This report has no stored read claim."""
+
+
+@dataclass(frozen=True)
+class UsageReadHeld:
+    """Another recent attempt supplies this login's reading."""
+
+
+class UsageReadStore(Protocol):
+    """The store claims and keeps each live usage attempt."""
+
+    def claim_read(self, login: str, now: datetime) -> UsageReadClaim | UsageReadHeld: ...
+    def finish_read(self, login: str, claim: UsageReadClaim, report: Report) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -346,6 +372,7 @@ class Report:
     codex_startup: CodexStartupStatus = field(default_factory=NoCodexStartupFailure)
     weekly_read_skip: StaleTokenSkip | NoWeeklyReadSkip = field(default_factory=NoWeeklyReadSkip)
     usage_read_outcome: UsageReadOutcome = UsageReadOutcome.ERROR
+    usage_read_claim: UsageReadClaim | UsageReadUnclaimed = field(default_factory=UsageReadUnclaimed)
     last_known_login: KnownUsageLogin | UnknownUsageLogin = field(default_factory=UnknownUsageLogin)
 
     @property
@@ -702,6 +729,8 @@ def claude_five_hour(usage: dict[str, object]) -> Quota | None:
 
 
 def claude_live(config_dir: Path | None = None) -> Report:
+    store = cast(UsageReadStore, cast(object, import_module("scripts.whoami.usage_store")))
+
     report = Report("Claude", source=ClaudeDirectorySource(
         claude_config_dir() if config_dir is None else config_dir,
     ))
@@ -725,6 +754,7 @@ def claude_live(config_dir: Path | None = None) -> Report:
     if account.get("authMethod") != "claude.ai":
         report.quota_problem = "Weekly quota: unavailable for this authentication method"
         return report
+    claim: UsageReadClaim | UsageReadHeld = UsageReadHeld()
     try:
         token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") if config_dir is None else None
         if not token:
@@ -744,6 +774,17 @@ def claude_live(config_dir: Path | None = None) -> Report:
             "https://api.anthropic.com/api/oauth/usage",
             headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},
         )
+        if not report.email:
+            raise RuntimeError("usage login unavailable")
+        try:
+            claim = store.claim_read(report.email, datetime.now(timezone.utc))
+        except (OSError, ValueError):
+            print("usage store: could not claim the read; read without a hold", file=sys.stderr)
+        else:
+            if isinstance(claim, UsageReadHeld):
+                report.usage_read_outcome = UsageReadOutcome.HELD
+                return report
+            report.usage_read_claim = claim
         opened = cast(http.client.HTTPResponse, urllib.request.urlopen(request, timeout=15))
         with opened as response:
             usage = cast(dict[str, object], json.loads(response.read()))
@@ -759,6 +800,12 @@ def claude_live(config_dir: Path | None = None) -> Report:
         report.quota_problem = f"Weekly quota: unavailable (HTTP {error.code}; try Claude /usage)"
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
         report.quota_problem = "Weekly quota: unavailable (could not read live usage; try Claude /usage)"
+    finally:
+        if report.email and isinstance(claim, UsageReadClaim):
+            try:
+                store.finish_read(report.email, claim, report)
+            except (OSError, ValueError):
+                print("usage store: could not save the read; keep the live report", file=sys.stderr)
     return report
 
 

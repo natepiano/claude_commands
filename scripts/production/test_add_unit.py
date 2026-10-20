@@ -395,7 +395,7 @@ class AddUnitTests(ShutdownTestCase):
             screen = "/remote-control is active" if (self.state / "ready").exists() else "Waiting for remote control"
             responses[f"--session {name} pane read w1:p1 --source recent --lines 60"] = CommandResponse(
                 code=0, stdout=screen)
-            responses[f"--session {name} pane read w1:p1 --source visible"] = CommandResponse(
+            responses[f"--session {name} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
                 code=0, stdout="────────\n❯ \n────────")
             process = self.root / "proc/102"
             server = self.root / "proc/101"
@@ -1211,21 +1211,39 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
         self.assertEqual(self.repository_state(), before)
 
-    def test_new_work_and_a_promote_still_refuse_a_row_off_the_naming_pattern(self) -> None:
+    def test_new_work_still_refuses_a_row_off_the_naming_pattern(self) -> None:
         recorded = self.commit_row_off_the_naming_pattern()
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
-        promote = ("--resume", "session-123", "--cwd", str(recorded),
-                   "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
-        for launch, flags in (("new work", ()), ("promote", promote)):
-            with self.subTest(launch=launch):
-                result = self.cli("trunk", "--plan", "docs/plans/given.md", *flags)
-                self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                self.assertEqual(
-                    result.stderr,
-                    f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
-                )
-                self.assert_no_launch_change(document, head)
+        result = self.cli("trunk", "--plan", "docs/plans/given.md")
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(
+            result.stderr,
+            f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
+        )
+        self.assert_no_launch_change(document, head)
+
+    def test_a_resume_in_its_row_worktree_off_the_naming_pattern_launches_there(self) -> None:
+        """hana's startup-polish row predates the naming rule (2026-10-19); its resume was refused."""
+        recorded = self.commit_row_off_the_naming_pattern()
+        result = self.cli("trunk", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(recorded), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+        # The fixture marks only alpha-unit, so the launch ends at the mark wait, after the row check.
+        self.assertNotIn("Worktree is", result.stderr)
+        self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(recorded))
+
+    def test_a_resume_outside_its_row_worktree_is_refused_with_exit_two(self) -> None:
+        recorded = self.commit_row_off_the_naming_pattern()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        document = self.doc.read_text()
+        head = self.git("rev-parse", "HEAD")
+        result = self.cli("trunk", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                          "--cwd", str(elsewhere), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
+        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+        self.assertEqual(result.stderr,
+                         f"add_unit: unit trunk-unit resumes in {elsewhere.resolve()}; its Units row names {recorded}\n")
+        self.assert_no_launch_change(document, head)
 
     def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there(self) -> None:
         self.commit_prepared_row(self.unit_row())
@@ -1696,33 +1714,8 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: herdr session attach build-followups-alpha", result.stdout)
 
-    def test_review_unit_uses_an_ordinary_row_and_worktree_with_review_direct_opening(self) -> None:
+    def test_a_review_named_unit_opens_unit_direct_beside_a_review_pool(self) -> None:
         _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
-        _ = self.successful("review", "--plan", "docs/plans/given.md")
-        worktree = self.root / "project-review"
-        self.assertTrue(worktree.is_dir())
-        self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
-                         "build-followups-review")
-        row = next(line for line in self.doc.read_text().splitlines() if line.startswith("| review-unit |"))
-        self.assertEqual([cell.strip() for cell in row.strip("|").split("|")],
-                         ["review-unit", "docs/plans/given.md", str(worktree),
-                          "build-followups-review", "—", "—"])
-        self.assertTrue(row.endswith("| — | — |"), row)
-        self.assertEqual({key: value for key, value in self.pane_environment().items() if key.startswith("SHOWRUNNER_")},
-                         {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"})
-        self.assertIn(shlex.quote(f"/review:direct {self.doc}"), self.launch_command())
-        self.assertNotIn("/unit:direct", self.launch_command())
-
-    def test_promoted_review_unit_uses_review_direct_with_its_identity(self) -> None:
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
-        _ = self.successful("review-unit", "--plan", "docs/plans/given.md",
-                            "--resume", "session-123", "--cwd", str(self.checkout), "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
-        command = self.launch_command()
-        self.assertIn("You are now review-unit in production build-followups", command)
-        self.assertIn(f"Run /review:direct {self.doc}.", command)
-        self.assertNotIn("Run /unit:direct", command)
-
-    def test_review_named_unit_without_a_pool_keeps_unit_direct_opening(self) -> None:
         _ = self.successful("review", "--plan", "docs/plans/given.md")
         self.assertIn(shlex.quote("/unit:direct docs/plans/given.md"), self.launch_command())
         self.assertNotIn("/review:direct", self.launch_command())

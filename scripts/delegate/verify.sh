@@ -817,6 +817,7 @@ CLIPPY_FIX_LIMIT_REACHED=0
 RUN_STARTED=0
 CALL_NOTED=0
 TOKEN_WAIT_S=0
+TOKEN_WAIT_FILE=""
 LOOKUP_KEY=""
 LOOKUP_STATUS=0
 EXIT_STATUS=0
@@ -889,11 +890,17 @@ note_event() {
     if [[ -n "${MEM_KILL_FILE:-}" && -f "$MEM_KILL_FILE" ]]; then
         mem_kills=$(wc -c < "$MEM_KILL_FILE")
     fi
+    local token_wait_s=${TOKEN_WAIT_S:-0} step_wait
+    if [[ -n "${TOKEN_WAIT_FILE:-}" && -f "$TOKEN_WAIT_FILE" ]]; then
+        while IFS= read -r step_wait; do
+            token_wait_s=$(( token_wait_s + step_wait ))
+        done < "$TOKEN_WAIT_FILE"
+    fi
     local mem_kill_stopped=0
     if [[ -n "${MEM_KILL_FILE:-}" && -f "${MEM_KILL_FILE}.stopped" ]]; then
         mem_kill_stopped=1
     fi
-    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="${TOKEN_WAIT_S:-0}" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
+    BUILDLOG_MEM_KILLS="$mem_kills" BUILDLOG_MEM_KILL_STOPPED="$mem_kill_stopped" BUILDLOG_TOKEN_WAIT_S="$token_wait_s" BUILDLOG_MAC="$BUILDLOG_MAC" BUILDLOG_MAC_HOLDER="$BUILDLOG_MAC_HOLDER" BUILDLOG_MAC_REASON="$BUILDLOG_MAC_REASON" BUILDLOG_MAC_S="$BUILDLOG_MAC_S" \
         BUILDLOG_MAC_COPY="$BUILDLOG_MAC_COPY" BUILDLOG_MAC_COPY_S="$BUILDLOG_MAC_COPY_S" \
         BUILDLOG_MAC_COPY_COUNT="$BUILDLOG_MAC_COPY_COUNT" BUILDLOG_MAC_COPY_NATEDEV_S="$BUILDLOG_MAC_COPY_NATEDEV_S" \
         "$PY" "$BUILDLOG_RECORD" call "$outcome" "$status" "$cached" "$wait" "$wall" \
@@ -1533,7 +1540,11 @@ if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${PLAN_DELEGATE_SESSION_DIR
     BOARD_DIR="${PLAN_DELEGATE_SESSION_DIR}"
     BOARD_SLOT=director
 fi
+# TOKEN_USED: this run takes the token. TOKEN_HELD: it holds the token now. The
+# token is given back for each memory wait, so the two differ between steps.
+TOKEN_USED=0
 TOKEN_HELD=0
+TOKEN_WAITER_PID=""
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
     # the real board. Normal calls retain Bash's elapsed-seconds clock.
@@ -1543,18 +1554,58 @@ token_wait_clock() {
         TOKEN_CLOCK_NOW=$SECONDS
     fi
 }
-if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
-    token_wait_clock
-    TOKEN_WAIT_STARTED=$TOKEN_CLOCK_NOW
-    if bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-        --pid $$ --hold 3600 --wait 1800 >/dev/null 2>&1; then
-        TOKEN_HELD=1
-    else
-        echo "verify.sh: waited for the cargo token and did not get it." >&2
-        exit 1
+# A run ended during its token wait stops the waiting acquire, gives back a
+# token that acquire took in the last instant, then ends by its caller's trap,
+# or by the signal itself when the caller has none.
+token_wait_interrupted() {
+    local signal_name=$1
+    trap - INT TERM HUP
+    if [[ -n "$TOKEN_WAITER_PID" ]]; then
+        kill "$TOKEN_WAITER_PID" 2>/dev/null || true
+        wait "$TOKEN_WAITER_PID" 2>/dev/null || true
     fi
+    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
+    eval "$TOKEN_CALLER_TRAPS"
+    kill -s "$signal_name" "${BASHPID:-$$}"
+}
+# Waits until this run holds the token, with no time limit: the pid reclaim and
+# the 3600 s hold already free a dead or stuck holder, and board.sh stops the
+# wait when this run's pid is gone. Sets TOKEN_WAITED to the seconds it waited.
+acquire_token() {
+    TOKEN_WAITED=0
+    [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
+    local started
+    # A step's subshell has no traps of its own, though trap -p there prints
+    # the parent's: restoring those would run the parent's cleanup in the step.
+    TOKEN_CALLER_TRAPS=""
+    if [[ "${BASHPID:-$$}" == "$$" ]]; then
+        TOKEN_CALLER_TRAPS="$(trap -p INT TERM HUP)"
+    fi
+    trap 'token_wait_interrupted INT' INT
+    trap 'token_wait_interrupted TERM' TERM
+    trap 'token_wait_interrupted HUP' HUP
     token_wait_clock
-    TOKEN_WAIT_S=$(( TOKEN_CLOCK_NOW - TOKEN_WAIT_STARTED ))
+    started=$TOKEN_CLOCK_NOW
+    while :; do
+        bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+            --pid $$ --hold 3600 --wait 60 >/dev/null 2>&1 &
+        TOKEN_WAITER_PID=$!
+        if wait "$TOKEN_WAITER_PID"; then
+            break
+        fi
+        sleep 1
+    done
+    TOKEN_WAITER_PID=""
+    TOKEN_HELD=1
+    trap - INT TERM HUP
+    eval "$TOKEN_CALLER_TRAPS"
+    token_wait_clock
+    TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
+}
+if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
+    TOKEN_USED=1
+    acquire_token
+    TOKEN_WAIT_S=$TOKEN_WAITED
 fi
 
 # Fork before starting each step. The child creates its own session, records
@@ -1633,6 +1684,16 @@ buildlog_exec() {
 }
 
 release_token() {
+    # A step that gave the token back and left for the Mac did so in run()'s
+    # subshell; its mark tells this shell the token is no longer held. A step
+    # killed as its acquire returned may hold it all the same, so free that.
+    if [[ -n "${TOKEN_WAIT_FILE:-}" && -e "${TOKEN_WAIT_FILE}.given_back" ]]; then
+        rm -f "${TOKEN_WAIT_FILE}.given_back"
+        if [[ "${TOKEN_HELD}" -eq 1 ]]; then
+            bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
+        fi
+        TOKEN_HELD=0
+    fi
     [[ "${TOKEN_HELD}" -eq 1 ]] || return 0
     local release_status=0
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null \
@@ -1641,6 +1702,24 @@ release_token() {
     # new holder owns the token; the old step's result remains authoritative.
     (( release_status == 0 || release_status == 3 )) || return "$release_status"
     TOKEN_HELD=0
+}
+
+# The token is for natedev cargo only. A step gives it back while it waits for
+# memory, and takes it again once the gate admits it; a step that leaves the
+# wait for the Mac does not. The step runs in run()'s subshell, so its token
+# wait reaches the call record through TOKEN_WAIT_FILE.
+eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
+buildlog_wait_for_memory() {
+    if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        : > "${TOKEN_WAIT_FILE}.given_back"
+    fi
+    buildlog_wait_for_memory_only "$@"
+    [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
+    acquire_token
+    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
+    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    fi
 }
 
 # Again with the token held: a peer running this same call on this tree held
@@ -1653,6 +1732,7 @@ if cache_lookup; then
 fi
 RUN_STARTED=${SECONDS}
 MEM_KILL_FILE="$(mktemp)"
+TOKEN_WAIT_FILE="$(mktemp)"
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
@@ -1715,6 +1795,7 @@ verify_cleanup() {
     if ! release_token && (( EXIT_STATUS == 0 )); then
         EXIT_STATUS=1
     fi
+    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "$TOKEN_WAIT_FILE" "${TOKEN_WAIT_FILE}.given_back"
 }
 # EXIT alone would report success for a failed cargo run, so branch on the
 # status the trap receives; a lint failure record keeps it.

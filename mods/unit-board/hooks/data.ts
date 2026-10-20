@@ -149,9 +149,9 @@ export async function loadAccounts(
   }
   ensureOpen();
   const result = await calls.run([`${home}/.claude/scripts/lib/py`, `${home}/.claude/scripts/accounts/accounts.py`,
-    'status', '--json', '--stored', '--with-login']);
+    'status', '--json', '--stored']);
   ensureOpen();
-  // Process output can contain logins; failure details never leave the pane loader.
+  // Failure details never leave the pane loader: the pane shows a fixed reason, never process output.
   if (result.exitCode !== 0) throw new Error('Stored accounts status could not be read.');
   try {
     const status = JSON.parse(result.stdout) as StoredAccountsStatus;

@@ -5,7 +5,7 @@ description: Show or change what happens next when an account's weekly usage run
 Translate $ARGUMENTS into `python3 ~/.claude/scripts/accounts/accounts.py next`:
 
 - “when units reach 1% switch to claude2” → `add units 1 claude2`.
-- “when workers reach 1% switch to codex2” → `add workers 1 codex2`; `claude` is also a workers target.
+- “when workers reach 1% switch to codex2” → `add workers 1 codex2`; `claudeN` and bare `claude` are also workers targets. A numbered Claude target sets the account for worker launches; bare `claude` keeps the caller or showrunners account. Subagents inside a Claude session use that session’s account.
 - For units or showrunners, “hold for half a point” adds `--hold half-point`; a fixed duration adds `--hold-minutes N`.
 - “what's set up” → `list`.
 - “drop units 2” → `remove units 2`.

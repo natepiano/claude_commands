@@ -4,7 +4,7 @@ import json
 import os
 import platform
 import sys
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict, cast
@@ -450,7 +450,7 @@ def setup_bake_nodes(material: bpy.types.Material, image: bpy.types.Image) -> bp
 @contextmanager
 def bake_nodes_context(
     materials: list[bpy.types.Material], img: bpy.types.Image
-) -> Iterator[list[tuple[bpy.types.Material, bpy.types.Node]]]:
+) -> Generator[list[tuple[bpy.types.Material, bpy.types.Node]]]:
     """Context manager for bake node setup and cleanup
 
     Args:

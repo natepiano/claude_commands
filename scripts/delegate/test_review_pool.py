@@ -196,6 +196,9 @@ class ReviewPoolTests(unittest.TestCase):
             "POOL_STUB_CONTROL": str(self.control_file),
             "POOL_STUB_EVENTS": str(self.events_dir),
             "POOL_TEST_HELPER_DIR": str(SCRIPT.parent),
+            # No base prompt unless a test writes one: an allocate then keeps the template a test primed.
+            "REVIEW_POOL_CONFIG": str(self.root / "config"),
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
         })
         return environment
 
@@ -419,32 +422,71 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertTrue((self.pool / "prime" / f"{old_hash}.md").is_file())
         self.assertEqual(self.allocate()["prime_hash"], old_hash)
 
-    def test_unit_memory_prints_only_the_named_unit_file_without_added_newline(self) -> None:
-        memory = self.pool / "memory"
-        memory.mkdir(parents=True)
-        content = "## Unit memory\n2026-10-12 — Source: finding 2. Preserve café."
-        _ = (memory / "unit.md").write_text(content, encoding="utf-8")
-        _ = (memory / "other.md").write_text("Another unit.", encoding="utf-8")
-        _ = (memory / "repository.md").write_text("Repository memory.", encoding="utf-8")
-        result = self.run_pool("unit-memory", "--unit", "unit")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, content)
-        self.assertEqual(result.stderr, "")
-        self.assertFalse((self.pool / "pool.json").exists())
+    def base_prompt(self, reviewer_type: str, text: str) -> str:
+        """Write the type's base prompt; returns the hash of the standing prompt it gives."""
+        path = self.root / "config" / f"{reviewer_type}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(text, encoding="utf-8")
+        return hashlib.sha256((text.rstrip() + "\n").encode()).hexdigest()
+
+    def test_the_first_allocate_primes_the_template_from_the_base_prompt(self) -> None:
+        expected = self.base_prompt("code", "Review the code.\n\n")
+        allocation = self.allocate()
+        self.assertEqual(allocation["prime_hash"], expected)
+        prime, = self.events("prime")
+        self.assertEqual(prime["instructions"], "Review the code.\n")
+        self.assertEqual(self.state()["templates"], {"code": {
+            "name": f"code-template-{expected[:8]}", "thread_id": f"thread-code-template-{expected[:8]}",
+            "prime_hash": expected}})
+
+    def test_a_changed_base_prompt_primes_again_and_keeps_the_unit_s_reviewer(self) -> None:
+        _ = self.base_prompt("code", "Review the code.\n")
+        first = self.allocate()
+        self.release(str(first["reviewer"]))
+        _ = self.allocate()
+        self.release(str(first["reviewer"]))
+        self.assertEqual(len(self.events("prime")), 1)
+        changed = self.base_prompt("code", "Review the code and its tests.\n")
+        again = self.allocate()
+        self.assertEqual((again["reviewer"], again["thread_id"], again["prime_hash"]),
+                         (first["reviewer"], first["thread_id"], changed))
+        self.assertEqual(len(self.events("prime")), 2)
+
+    def test_with_no_base_prompt_and_no_template_allocate_names_the_cause(self) -> None:
+        result = self.run_pool(*self.allocation_args())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("review_pool: no primed code template: no code base prompt", result.stderr)
         self.assertEqual(self.events(), [])
 
-    def test_unit_memory_is_empty_when_the_file_is_absent(self) -> None:
-        result = self.run_pool("unit-memory", "--unit", "unit")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "")
-        self.assertFalse(self.pool.exists())
+    def test_a_ui_prompt_carries_the_production_s_ux_rules(self) -> None:
+        repository = self.root / "repository"
+        guide = repository / "ux"
+        (repository / "docs/hana").mkdir(parents=True)
+        guide.mkdir()
+        _ = subprocess.run(["git", "init", "-q", str(repository)], check=True)
+        _ = (guide / "spacing.md").write_text("---\ntest: gaps are even\n---\nEven gaps.\n", encoding="utf-8")
+        _ = (guide / "README.md").write_text("---\ntitle: guide\n---\nNot a rule.\n", encoding="utf-8")
+        _ = (repository / "docs/design-decisions.md").write_text("One button per action.\n", encoding="utf-8")
+        _ = (repository / "docs/hana/targets.md").write_text("Phone first.\n", encoding="utf-8")
+        doc = repository / "docs/production-production.md"
+        _ = doc.write_text(f"# Production\n\n- **UX guide:** `{guide}`\n", encoding="utf-8")
+        instance = self.root / "notifier/showrunner-production"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:sid-production\nCHECK=zsh /x/production_check.sh {doc}\n", encoding="utf-8")
+        _ = self.base_prompt("ui", "Review the screens.\n")
+        _ = self.allocate(reviewer_type="ui", lens="ux")
+        prime, = self.events("prime")
+        self.assertEqual(prime["instructions"], "\n\n".join([
+            "Review the screens.", "## Rules", f"UX guide: {guide.resolve()}",
+            "### spacing.md\n\n---\ntest: gaps are even\n---\nEven gaps.",
+            "## Design decisions\n\nOne button per action.", "## Targets\n\nPhone first."]) + "\n")
 
-    def test_unit_memory_refuses_a_unit_outside_the_memory_directory(self) -> None:
-        result = self.run_pool("unit-memory", "--unit", "../other")
+    def test_a_ui_allocate_without_a_ux_guide_names_the_cause(self) -> None:
+        _ = self.base_prompt("ui", "Review the screens.\n")
+        result = self.run_pool(*self.allocation_args(reviewer_type="ui", lens="ux"))
         self.assertEqual(result.returncode, 1)
-        self.assertIn("unit must name one memory file", result.stderr)
-        self.assertEqual(result.stdout, "")
+        self.assertIn("review_pool: no primed ui template: no production doc for production", result.stderr)
 
     def test_closure_after_a_memory_change_resumes_the_same_reviewer_with_the_new_prompt(self) -> None:
         old_hash = self.prime()
@@ -521,7 +563,7 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(self.fork_sources(), ["code1", "code-template-current"])
         self.assertIn("fork of code1 failed", result.stderr)
         self.assertEqual(self.reviewer("code2")["thread_id"], "thread-code2")
-        # The template fork has none of the unit's context, so its first turn carries the unit memory.
+        # The template fork has none of the unit's context, so its lease starts again at the first review.
         self.assertEqual(parse_object(result.stdout)["lease_ordinal"], 1)
 
     def test_unit_reviewer_with_an_old_hash_is_reused_not_forked(self) -> None:
@@ -649,7 +691,7 @@ class ReviewPoolTests(unittest.TestCase):
         self.assertEqual(after["thread_id"], "replacement-thread")
         self.assertIsNone(after["busy_pid"])
         self.assertEqual(after["reviews"], 6)
-        # A new thread holds none of the unit memory, so the next review counts as the first.
+        # A new thread holds none of the unit's reviews, so the next review counts as the first.
         self.assertEqual(after["lease"], {"unit": "unit", "ordinal": 0})
         again = self.allocate()
         self.assertEqual((again["reviewer"], again["thread_id"], again["lease_ordinal"]),
@@ -704,10 +746,44 @@ class ReviewPoolTests(unittest.TestCase):
     def test_retire_ends_every_reviewer_of_the_unit_and_no_other(self) -> None:
         self.seed({"code1": self.idle("unit"), "ui1": {**self.idle("unit"), "type": "ui"},
                    "code2": self.idle("other"), "code3": self.idle("unit-unit")})
-        other = self.reviewer("code2")
-        self.assertEqual(sorted(self.succeed("retire", "--unit", "unit").splitlines()), ["code1", "code3", "ui1"])
-        self.assertEqual(self.reviewers(), {"code2": other})
-        self.assertEqual(sorted(str(event["name"]) for event in self.events("end")), ["code1", "code3", "ui1"])
+        kept = {name: self.reviewer(name) for name in ("code2", "code3")}
+        self.assertEqual(sorted(self.succeed("retire", "--unit", "unit").splitlines()), ["code1", "ui1"])
+        self.assertEqual(self.reviewers(), kept)
+        self.assertEqual(sorted(str(event["name"]) for event in self.events("end")), ["code1", "ui1"])
+
+    def units_table(self, *units: str) -> None:
+        """Register the production's doc with a Units table of these ids."""
+        doc = self.root / "production-production.md"
+        _ = doc.write_text("\n".join(["## Units", "", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                                       "| --- | --- | --- | --- | --- | --- |",
+                                       *(f"| {unit} | p.md | /w/{unit} | {unit} | — | — |" for unit in units)]) + "\n",
+                           encoding="utf-8")
+        instance = self.root / "notifier/showrunner-production"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:sid-production\nCHECK=zsh /x/production_check.sh {doc}\n", encoding="utf-8")
+
+    def test_retire_of_one_unit_leaves_a_unit_whose_name_extends_it(self) -> None:
+        self.units_table("handler-enh", "handler-enh-unit")
+        self.seed({"code7": self.idle("handler-enh"), "code3": self.idle("handler-enh-unit")})
+        kept = self.reviewer("code3")
+        self.assertEqual(self.succeed("retire", "--unit", "handler-enh").splitlines(), ["code7"])
+        self.assertEqual(self.reviewers(), {"code3": kept})
+
+    def test_retire_of_a_leased_short_name_leaves_the_units_row_it_would_resolve_to(self) -> None:
+        self.units_table("handler-enh-unit")
+        self.seed({"code7": self.idle("handler-enh"), "code3": self.idle("handler-enh-unit")})
+        kept = self.reviewer("code3")
+        self.assertEqual(self.succeed("retire", "--unit", "handler-enh").splitlines(), ["code7"])
+        self.assertEqual(self.reviewers(), {"code3": kept})
+
+    def test_a_short_name_resolves_to_its_units_row_for_retire_and_allocate(self) -> None:
+        self.units_table("trunk-unit")
+        _ = self.prime()
+        allocation = self.allocate(unit="trunk")
+        self.assertEqual(self.reviewer(str(allocation["reviewer"]))["lease"], {"unit": "trunk-unit", "ordinal": 1})
+        self.release(str(allocation["reviewer"]))
+        self.assertEqual(self.succeed("retire", "--unit", "trunk").splitlines(), [allocation["reviewer"]])
 
     def test_retire_removes_a_reservation_whose_owner_died(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "pass"])

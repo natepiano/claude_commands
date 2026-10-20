@@ -2,8 +2,9 @@
 """Refuse a checkpoint commit that does not say what the user sees change.
 
 A Bash call that runs `git commit` with a checkpoint(...) subject must carry a line
-`Change-Review: <what you see change> | <how to check it>` or `Change-Review: none — <why nothing
-visible changes>`, in its -m text, its heredoc or its -F file. A checkpoint that stages only
+`Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`
+(three parts) or `Change-Review: none — <why nothing visible changes>`, in its -m text, its heredoc or
+its -F file. A checkpoint that stages only
 Markdown needs none, and every other commit passes untouched. The merge gate reads the same lines
 and refuses a unit checkpoint without one, so this hook is the early half of that gate.
 A broken hook never blocks a call.

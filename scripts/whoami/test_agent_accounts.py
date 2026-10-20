@@ -1,6 +1,7 @@
 """Mac usage credentials belong to the exact folder selected at launch."""
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import io
 import json
@@ -10,13 +11,19 @@ import sys
 import tempfile
 import unicodedata
 import unittest
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from email.message import Message
+from threading import Barrier
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import override
+from typing import final, override
 from unittest.mock import patch
 
-from scripts.whoami import agent_accounts
+from scripts.whoami import agent_accounts, usage_store
 
 
 def folder_service(folder: Path) -> str:
@@ -116,6 +123,171 @@ class NamedKeychainCredentialsTests(unittest.TestCase):
             credentials = agent_accounts.claude_credentials()
         self.assertTrue(credentials.get("claudeAiOauth", {}).get("accessToken") == "synthetic-named-token")
         self.assertEqual([call[3] for call in self.keychain.calls], [service])
+
+
+@final
+class SharedUsageReadTests(unittest.TestCase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.home = Path()
+        self.now = datetime(2026, 10, 19, 12, 11, tzinfo=timezone.utc)
+        self.claim = usage_store.claim_read
+
+    @override
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True))
+        self.now = datetime(2026, 10, 19, 12, 11, tzinfo=timezone.utc)
+        _ = self.enterContext(patch.object(agent_accounts, "command_json", return_value={
+            "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai"}))
+        _ = self.enterContext(patch.object(agent_accounts, "claude_credentials", return_value={
+            "claudeAiOauth": {"accessToken": "fixture"}}))
+        self.claim = usage_store.claim_read
+        _ = self.enterContext(patch.object(usage_store, "claim_read", side_effect=self.claim_now))
+
+    def claim_now(self, login: str, _now: datetime) -> agent_accounts.UsageReadClaim | agent_accounts.UsageReadHeld:
+        return self.claim(login, self.now)
+
+    def read(self) -> agent_accounts.Report:
+        return agent_accounts.claude_live(self.home / ".claude2")
+
+    def response(self, _request: urllib.request.Request, *, timeout: int) -> io.BytesIO:
+        self.assertEqual(timeout, 15)
+        return io.BytesIO(b'{"seven_day":{"utilization":25,"resets_at":"2026-10-25T12:00:00Z"}}')
+
+    def test_the_http_call_does_not_hold_the_store_lock(self) -> None:
+        def unlocked_response(request: urllib.request.Request, *, timeout: int) -> io.BytesIO:
+            with usage_store.store_file().with_name("usage.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_UN)
+            return self.response(request, timeout=timeout)
+
+        with patch.object(urllib.request, "urlopen", side_effect=unlocked_response):
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+
+    def test_threads_share_one_read_then_a_read_after_ninety_seconds_runs(self) -> None:
+        start = Barrier(2)
+
+        def read_together() -> agent_accounts.Report:
+            _ = start.wait(timeout=2)
+            return self.read()
+
+        with patch.object(urllib.request, "urlopen", side_effect=self.response) as http:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first, second = pool.submit(read_together), pool.submit(read_together)
+                reports = [first.result(timeout=3), second.result(timeout=3)]
+            self.assertCountEqual([report.usage_read_outcome for report in reports],
+                [agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD])
+            held = next(report for report in reports if report.usage_read_outcome == agent_accounts.UsageReadOutcome.HELD)
+            self.assertEqual(held.quotas, [])
+            self.assertIsNone(held.quota_problem)
+            http.assert_called_once()
+            self.now += timedelta(seconds=91)
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+            self.assertEqual(http.call_count, 2)
+        stored = usage_store.load()["shared@example.invalid"]
+        self.assertEqual(stored.get("attempted_at"), self.now.isoformat())
+        self.assertEqual(stored.get("attempt_outcome"), agent_accounts.UsageReadOutcome.OK)
+
+    def test_a_second_process_holds_a_claim_made_by_this_reader(self) -> None:
+        with patch.object(urllib.request, "urlopen", side_effect=self.response):
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+        script = """
+from pathlib import Path
+from unittest.mock import patch
+from scripts.whoami import agent_accounts
+with (patch.object(agent_accounts, 'command_json', return_value={
+        'loggedIn': True, 'email': 'shared@example.invalid', 'authMethod': 'claude.ai'}),
+      patch.object(agent_accounts, 'claude_credentials', return_value={
+        'claudeAiOauth': {'accessToken': 'fixture'}}),
+      patch('urllib.request.urlopen', side_effect=AssertionError('held read reached HTTP'))):
+    report = agent_accounts.claude_live(Path.home() / '.claude3')
+    assert report.usage_read_outcome == agent_accounts.UsageReadOutcome.HELD
+    assert not report.quotas and report.quota_problem is None
+"""
+        # The child uses the same synthetic time as the parent's claim.
+        script = ("from datetime import datetime, timezone\nfrom scripts.whoami import usage_store\n"
+                  + "claim = usage_store.claim_read\n"
+                  + f"usage_store.claim_read = lambda login, now: claim(login, datetime.fromisoformat({self.now.isoformat()!r}))\n"
+                  + script)
+        result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rate_limit_holds_for_ten_minutes_even_when_the_caller_does_not_save(self) -> None:
+        with patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError(
+                "https://fixture.invalid", 429, "fixture", Message(), None)) as http:
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.RATE_LIMITED_429)
+            self.now += timedelta(minutes=9)
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.HELD)
+            http.assert_called_once()
+        with patch.object(urllib.request, "urlopen", side_effect=self.response) as http:
+            self.now += timedelta(minutes=1)
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+            http.assert_called_once()
+
+    def test_http_errors_are_kept_without_a_later_save(self) -> None:
+        for code, outcome in ((401, agent_accounts.UsageReadOutcome.REFUSED_401),
+                              (503, agent_accounts.UsageReadOutcome.ERROR)):
+            with self.subTest(code=code):
+                self.now += timedelta(minutes=11)
+                with patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError(
+                        "https://fixture.invalid", code, "fixture", Message(), None)):
+                    _ = self.read()
+                stored = usage_store.load()["shared@example.invalid"]
+                self.assertEqual(stored.get("attempt_outcome"), outcome)
+                self.assertEqual(stored.get("attempted_at"), self.now.isoformat())
+
+    def test_a_late_save_keeps_a_newer_failure_from_live_reads(self) -> None:
+        with patch.object(urllib.request, "urlopen", side_effect=self.response):
+            good = self.read()
+        self.now += timedelta(seconds=91)
+        with patch.object(urllib.request, "urlopen", side_effect=urllib.error.HTTPError(
+                "https://fixture.invalid", 429, "fixture", Message(), None)):
+            _ = self.read()
+        before = usage_store.store_file().read_bytes()
+        usage_store.save([good], self.now, {"claude2": "shared@example.invalid"})
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+        self.assertEqual(usage_store.load()["shared@example.invalid"].get("read_outcome"),
+                         agent_accounts.UsageReadOutcome.RATE_LIMITED_429)
+        self.assertTrue(usage_store.label_file().exists())
+
+    def test_a_claim_store_error_still_returns_the_live_read(self) -> None:
+        for error in (OSError("disk full"), ValueError("bad store")):
+            with (self.subTest(error=type(error).__name__),
+                  patch.object(usage_store, "claim_read", side_effect=error),
+                  patch.object(usage_store, "finish_read") as finish,
+                  patch.object(urllib.request, "urlopen", side_effect=self.response) as http,
+                  redirect_stderr(io.StringIO()) as errors):
+                report = self.read()
+            self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+            self.assertEqual(report.quotas[0].remaining_percent, 75)
+            self.assertIsNone(report.quota_problem)
+            http.assert_called_once()
+            finish.assert_not_called()
+            self.assertEqual(errors.getvalue().splitlines(),
+                ["usage store: could not claim the read; read without a hold"])
+
+    def test_a_finish_store_error_keeps_the_good_live_report(self) -> None:
+        for error in (OSError("disk full"), ValueError("bad store")):
+            self.now += timedelta(minutes=2)
+            with (self.subTest(error=type(error).__name__),
+                  patch.object(usage_store, "finish_read", side_effect=error),
+                  patch.object(urllib.request, "urlopen", side_effect=self.response) as http,
+                  redirect_stderr(io.StringIO()) as errors):
+                report = self.read()
+            self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
+            self.assertEqual(report.quotas[0].remaining_percent, 75)
+            self.assertIsNone(report.quota_problem)
+            http.assert_called_once()
+            self.assertEqual(errors.getvalue().splitlines(),
+                ["usage store: could not save the read; keep the live report"])
+
+    def test_stale_token_makes_no_attempt(self) -> None:
+        with (patch.object(agent_accounts, "claude_credentials", return_value={
+                "claudeAiOauth": {"accessToken": "fixture", "expiresAt": 1}}),
+              patch.object(urllib.request, "urlopen", side_effect=AssertionError("stale token sent"))):
+            self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.STALE_TOKEN)
+        self.assertFalse(usage_store.store_file().exists())
 
 
 if __name__ == "__main__":

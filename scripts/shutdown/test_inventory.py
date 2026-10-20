@@ -317,6 +317,15 @@ class InventoryTests(ShutdownTestCase):
         updater.assert_not_called()
         self.assertEqual(desktops[DESKTOP_ID], "Writing")
 
+    def test_desktop_snapshot_update_skips_the_agent_notes_refresh(self) -> None:
+        with (patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),
+              patch.object(subprocess, "run") as updater):
+            _ = inventory._snapshot_desktops()  # pyright: ignore[reportPrivateUsage]
+        updater.assert_called_once()
+        environment = cast("dict[str, str]", updater.call_args.kwargs["env"])
+        self.assertEqual(environment[inventory.SKIP_AGENT_NOTES], "1")
+        self.assertEqual(environment["PATH"], os.environ["PATH"])
+
     def test_nested_shutdown_inventory_reads_existing_snapshot_without_updating_notes(self) -> None:
         with (patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "read existing"}),
               patch.object(shutil, "which", return_value="/fixture/agent-sessions-snapshot"),

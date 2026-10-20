@@ -8,13 +8,13 @@ argument-hint: '[--detail | exec claudeN|codexN|units|showrunners|workers [args�
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/accounts/accounts.py" $ARGUMENTS`
 and print its output exactly as it comes, with nothing added.
 
-- No arguments: the units and showrunners accounts, then one Markdown table for numbered Claude and Codex accounts, logged in or not. `~/.claude` has no row; `~/.codex` has one only while signed in. Problems follow the table.
+- No arguments: one Markdown table for numbered Claude and Codex accounts, logged in or not. `~/.claude` has no row; `~/.codex` has one only while signed in. Problems follow the table.
 - `--detail`: the same, then each live session's account, the Codex workers line with its refusal destination
   and held worker continuations, the last ten account moves with their cause and outcomes, and `Codex work routing:` with open, recovered or failed assignment fallbacks.
 - An argument it does not recognise: run the no-argument form instead and print only its output, with no explanation.
 - A proof refusal affects only its ungrouped probe; it changes no account refusal or other session’s pick. Hand moves record `by hand`; group retries keep their transition ID and cause.
 - Claude sessions refused by the provider move automatically on the notes timer;
-  `/next_moves` sets ordered one-shot moves on natedev, with an optional hold. A recorded group choice removes its entry; retries keep `auto: <id>`. Covered groups suppress the Claude low-quota phone reminder. Claude session alerts and `/quota_ack` are removed. See `docs/accounts.md`.
+  `/account_moves` sets ordered one-shot moves on natedev, with an optional hold. A recorded group choice removes its entry; retries keep `auto: <id>`. Covered groups suppress the Claude low-quota phone reminder. Claude session alerts and `/quota_ack` are removed. See `docs/accounts.md`.
   The shutdown progress line keeps their target and reason visible until safe to stop.
 - `setup claudeN`: builds the folder and prints how to log in.
 - `exec claudeN|codexN|units|showrunners|workers [args…]`: starts Claude or Codex on that account or group's selection, passing arguments unchanged; `--probe` before the label is Claude-only.

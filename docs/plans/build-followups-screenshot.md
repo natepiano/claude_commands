@@ -59,13 +59,13 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
   - The hourly scan reads only new bytes since its cache, and stays under 30 s on a run with nothing new.
   - Each number in a report states its window, its split and its count. Medians and p90 come with n.
   - Python is typed throughout, with no `Any` and no file-level type ignores.
-  - Times state PDT. Transcript and buildlog stamps are UTC.
+  - User-facing times use `config/user_zone.conf` through `scripts/lib/user_zone.py`, with the applicable zone label and offset; `USER_ZONE` may pin tests. Transcript and buildlog stamps remain UTC.
 
 ## Gates
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 6's next re-rank | a week of `/hana_shot` data after the user deferred the refusal fix | the clock: Wed 2026-10-14 07:50 PDT |
+| G1 | Phase 6's next re-rank | a week after Phase 10's failure texts landed | the clock: Thu 2026-10-22 15:07:01Z (11:07:01 EDT) |
 
 ## Phases
 
@@ -257,7 +257,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Depends on:** Phase 10 — the next re-rank measures the week after the failure texts land.
 
-**Blocked by:** G1 — the next re-rank waits until Wed 2026-10-14 10:50 EDT (07:50 PDT).
+**Blocked by:** G1 — do not re-rank before 2026-10-22T15:07:01Z (11:07:01 EDT); the acceptance gate also requires source coverage through that instant.
 
 #### Work Order
 
@@ -291,7 +291,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Seats:** none — the unit director ranks and proposes from the report; no code is written until a proposal becomes its own phase.
 
-**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which is a speed candidate, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. The window-level restore (Phase 9) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 10:08 PDT; it is not proposed again. Since that change, a `/hana_shot` run ended by Ctrl-C, SIGTERM or SIGHUP writes its invocation record with `status: failure`, `exit_code` 130, 143 or 129 and `failure_reason: shot_failed`; before it, SIGTERM and SIGHUP left no record. When a candidate is priced from failures in `invocations.jsonl`, count records with those exit codes apart from failed shots. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation. Since Phase 10 (540c062, in `changes.json` as a product change and a measurement change on natedev and the Mac, effective 2026-10-15 11:07 EDT), every failed invocation and failed attempt carries its failure text in `error`, so a re-rank reads failure texts from the records, not from transcripts; it compares the weeks before and after that time, and does not propose the failure texts again.
+**Constraints from prior phases:** Failure logging, Codex transcript scanning and kept-shot detection are delivered, so `analysis.md` → Next improvements entry 2, entry 3 and the failure-logging half of entry 1 are not proposed again; what fills long `/hana_shot` episodes is answered by the report's "What fills long /hana_shot episodes" section: agent thinking holds 61–67% of long minutes, other BRP calls 7–12%, file work 8–11%, retries 3–5% and shot calls 2–3%, so it is not proposed again. Its first window was under one day; re-rank from that section after a full week of `/hana_shot` data. The hourly phase supplies source-host coverage and says whether each attempt count is exact or inferred from images. The Mac catch-up delivers Codex transcripts and timings and finished in five hourly runs (`scan_status.json` → `mac_read_state`; check it before each estimate); Mac Claude transcripts stay out above 100 files or 100 MB, so every Mac estimate names that limit. A `changes.json` entry is either a product change, which records changed product behavior and bounds comparison windows, or a measurement change, which the report lists separately and never counts as a speed gain; an approved proposal appends a product change carrying its effective time and affected hosts. Scale-aware `--window` (Phase 8, d1efe4c) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 08:04 PDT; it is not proposed again. The window-level restore (Phase 9) is in `changes.json` as a product change on natedev and the Mac, effective 2026-10-07 10:08 PDT; it is not proposed again. Since that change, a `/hana_shot` run ended by Ctrl-C, SIGTERM or SIGHUP writes its invocation record with `status: failure`, `exit_code` 130, 143 or 129 and `failure_reason: shot_failed`; before it, SIGTERM and SIGHUP left no record. When a candidate is priced from failures in `invocations.jsonl`, count records with those exit codes apart from failed shots. Price weekly agent minutes from an observed eligible weekly count, keep per-shot milliseconds distinct from episode minutes, and leave a candidate unpriced when its evidence cannot support that calculation. Since Phase 10 (540c062, in `changes.json` as a product change and a measurement change on natedev and the Mac, effective 2026-10-15 11:07 EDT), every failed invocation and failed attempt carries its failure text in `error`, so a re-rank reads failure texts from the records, not from transcripts; it compares the weeks before and after that time, and does not propose the failure texts again. Read `error` when present. Older failures without `error` remain in total failure counts but have unavailable text classification; do not read a missing field as no failure, or compare text-category counts across the measurement change without equivalent evidence. Report the classified and unclassified counts on each side, and leave category-specific savings unpriced when either side lacks sufficient evidence. Phase 11 (6d32781) delivers target-local face orientation (`face` on views, invocation and attempt records); do not propose it again. Face shots remain ordinary shots for pricing, and records without `face` remain eligible. Its product-change entry at 2026-10-15T20:53:36Z ends Phase 10's isolated after window on both hosts; name the full following week as containing both changes, and do not attribute its whole difference to Phase 10. Phase 12 (4727ce04) adds a launch warning that names uncommitted `crates/` files a Hana binary was built with; it changes no shot behavior and has no `changes.json` entry by design, so do not add one and do not propose it.
 
 **Acceptance gate:** each proposal cites a report less than 24 h old whose scan covers every host it uses through a time at or after G1 (`scan_status.json` → `last_success` and `host_coverage`), the covered window and n for every number, both splits when it uses episode time, exact or inferred attempt evidence when it uses kept shots, and the calculation of expected agent-minutes saved per week. A candidate without those inputs is labeled unpriced and ranks below every priced one.
 
@@ -398,34 +398,47 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 ### Phase 11 — A view can face its target along the target's own axis · status: done
 
-**Source:** the hana showrunner via natedev, 2026-10-15 16:2x EDT: "hana_shot cannot express 'face along the entity's own normal': view yaw and pitch are world angles only (hana_shot.py Pose(focus, yaw, pitch, radius)), so a tilted panel, such as Hana's Frame time panel on the tilted placement disk, cannot be shot face-on from a named view. Add a view option that faces a target entity along its local forward or normal (radius still applies), with a test."
+#### As-built
 
-#### Work Order
+**Source:** a named view could not shoot a tilted panel face-on, because view yaw and pitch are world angles only.
 
-**Goal:** a stored view or a `shot` call can say "look at this target face-on from its own +z side", and the camera lands square to a tilted panel without anyone working out yaw and pitch.
-
-**Spec:**
-- New view key `face` and `shot` flag `--face`, one of `+x`, `-x`, `+y`, `-y`, `+z`, `-z`: a local axis of the target. The camera sits on that side of the target and looks back along the axis. Bevy's local forward is `-z`, so a panel whose readable side faces its local `+z` uses `face = "+z"`.
-- The script reads the target's `GlobalTransform` over BRP, takes the named axis column of its 3×3 part (x, y, z axes, then translation; see `affine_point`), negates it for a `-` axis, and normalizes it, so scale does not matter. It turns that world direction `d` into orbit angles with Hana's convention (`hana_lagrange` `orbit_transform.rs`: the camera offset from the focus is `rotation * (0, 0, r)` with `rotation = yaw about Y * (-pitch about X)`, so `yaw = atan2(d.x, d.z)`, `pitch = asin(d.y)`, Y up). One pure function maps a transform and an axis to `(yaw, pitch)`. The tests call it directly.
-- `face` works in the two modes that take angles:
-  - `fit`: the derived angles go to `AnimateToFit`, and margin applies as today. Stored views stay fit views where they can, because a fit follows its target.
-  - `pose`: radius applies. The focus defaults to the target's world translation, so `--focus` is optional with `face`, and `pose` with `face` needs a target. An explicit `--focus` still wins.
-  - `face` with `hana-frame` or `home` is refused with a text that names `fit` and `pose`.
-- `face` together with an explicit yaw or pitch (flag, or view key present) is refused: the two disagree. The refusal names both and says to drop one. `Shot` must tell an explicit angle from the default 0, so carry the angles as given, or as derived from the face, without a sentinel number.
-- When `d` is within 1° of straight up or down, yaw is undefined, and Hana's orbit pitch clamp keeps the camera from reaching it. Refuse with a text that says so and suggests `--yaw 0 --pitch 1.55` (or -1.55) as a pose that comes close.
-- The move key that skips an unchanged camera move (`take`, `move_key`) uses the angles derived on this run, so a repeated face view still moves when the target has turned.
-- `views add` stores `face` when it is given and leaves out yaw and pitch. `views check` runs face views like any other. `views show` prints the key. `VIEW_KEYS`, `ViewValue`, `validate_view` and `format_view` learn it; the header comment names it.
-- `pose get/set` is unchanged.
-- `commands/hana_shot.md` documents `face`/`--face` in the list of view keys and flags, with the Frame time example: `face = "+z"` on `tool:FrameTimeInfoPanel`.
-- The timing and invocation records carry `face` when it is set, as an optional field that old records lack. `/shot_report` needs no change.
+- View key `face` and `shot` flag `--face` take one of `FACES` (`+x`, `-x`, `+y`, `-y`, `+z`, `-z`), a local axis of the target; the camera sits on that side and looks back along it. `face_angles(matrix, axis) -> (yaw, pitch)` takes the axis column of the target's `GlobalTransform`, negates it for `-`, normalizes it (scale has no effect), and returns `yaw = atan2(d.x, d.z)`, `pitch = asin(d.y)` in Hana's orbit convention.
+- `request_orientation` turns the given flags into `DefaultAngles`, `ExplicitAngles` or `TargetFace`; `resolve_face` reads the target's `GlobalTransform` over BRP at shot time and yields `ResolvedTargetFace`. Only `take` reads these states, and its move key uses the angles derived on this run, so a face view still moves when the target has turned.
+- `fit` passes the derived angles to `AnimateToFit` with margin as before. `pose` applies radius, and its focus defaults to the target's world translation; an explicit `--focus` wins.
+- Refusals, each naming its next step on stderr and in the invocation record's `error`: `face` with an explicit yaw or pitch; `face` with `hana-frame` or `home` (names `fit` and `pose`); `face` without a target or, in pose, without a radius; an axis within 1° of vertical (suggests `--yaw 0 --pitch 1.55` or `-1.55`); `views add --from-current --face`.
+- `views add` stores `face` without yaw or pitch; `views show` prints it; `views_check` counts a face refusal as that view's failure and continues to the next view. `pose get/set` is unchanged.
+- Invocation and attempt records carry `face` as an optional field when a shot used it.
 
 **Files:**
-- `scripts/hana_shot/hana_shot.py` — `face` key and flag, the axis-to-angles function, the GlobalTransform read, the refusals, the move key, views add/show
-- `scripts/hana_shot/test_hana_shot.py` — the axis-to-angles function on an identity, a yawed, a pitched and a tilted, scaled transform for all six axes (check the round trip: the camera offset built from the returned angles points along `d`); a fake-server fit shot and a pose shot with `face` (the fit event carries the derived angles; the pose mutation carries the target's translation as its focus and the given radius); the refusals for face with yaw or pitch, for hana-frame/home, and for a vertical axis; views add writing `face` without angles; a stored face view loading and validating
-- `commands/hana_shot.md` — the key, the flag and the example
+- `scripts/hana_shot/hana_shot.py` — `FACES`, `face_angles`, the orientation states, `request_orientation`, `resolve_face`, the face refusals, `views_check`
+- `scripts/hana_shot/test_hana_shot.py` — `face_angles` round trips over 24 transforms (all six axes on identity, yawed, pitched, tilted and scaled), fake-server fit and pose face shots, the refusals, `face` on success and failure records, stored face views through add/show/check, `views check` continuing past a refusal
+- `commands/hana_shot.md` — `face`/`--face` docs and the example `face = "+z"` on `tool:FrameTimeInfoPanel`
 
-**Workers:** two — `impl` owns `hana_shot.py` and `commands/hana_shot.md`; `test` owns `test_hana_shot.py`. They agree the names of the new function and refusal texts by message first.
+**Binds later work:** the screenshot proposals re-rank prices face shots as ordinary shots and does not propose the face option as a speed candidate; records carry `face` when a shot used it.
 
-**Constraints from prior phases:** failure records carry `error` (Phase 10); every refusal names its next step (Phase 10), and the new refusals follow that rule. The fake BRP server projects only requested components, so a test that reads `GlobalTransform` on the target must have the query ask for it. Python is typed throughout: no `Any`, no file-level ignores. basedpyright reports 0 errors, 0 warnings and 0 notes on each changed .py file.
+**Gotchas:**
+- Hana's orbit pitch clamp keeps the camera from a vertical face axis, so that axis is refused.
+- The trunk Frame time panel faces local +z and is only yawed (2.4°), not tilted; the tilted case is proven by the unit tests, not live.
+- The fake BRP server returns only requested components, so a test reading the target's `GlobalTransform` must request it.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/hana_shot -p 'test_*.py'` passes, and basedpyright is clean on `scripts/hana_shot/hana_shot.py` and `test_hana_shot.py`. A live shot of `tool:FrameTimeInfoPanel` with `--face +z`, in fit mode and in pose mode, shows the panel square to the camera on Hana on port 15797. The unit director takes these shots.
+### Phase 12 — `/hana_shot launch` says when its binary holds uncommitted code · status: done
+
+#### As-built
+
+**Source:** a live run rebuilt `hana` from a worktree with another phase's uncommitted `crates/` edits, and nothing said so (showrunner, 2026-10-19).
+
+- `uncommitted_build_paths(root, executable) -> list[str]` runs one `git -C <root> status --porcelain=v1 -z --untracked-files=all -- crates/ Cargo.toml Cargo.lock` (3 s timeout, stdin closed) and returns sorted repository-relative paths. With the binary present: each modified, added, untracked or renamed-to file whose mtime is at or before the binary's, plus each deleted or renamed-away path (its removal cannot be dated). With the binary missing: every dirty path under `crates/` and each dirty root `Cargo.toml` or `Cargo.lock`. A git failure, a timeout or a non-git root returns `[]`, so the check never blocks a launch.
+- `launch` calls it once after it resolves the executable; every launch path (`launch`, and `--launch` on `shot` and `views check`) goes through `launch`. Binary present and paths found: stderr gets `hana_shot: warning: <binary> was built after uncommitted edits in crates/ or the root Cargo files, so this Hana runs that code: <paths>` before the start, and the launch continues. Binary missing: the existing refusal adds `; uncommitted edits in crates/ or the root Cargo files will be included by a build: <paths>`. `build_paths_label` names at most 10 paths, then `, and N more`.
+- `LaunchState` has an optional `uncommitted_paths: list[str]`, saved only when non-empty and holding every path. No other command changes and no refusal is added.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — `uncommitted_build_paths`, `build_paths_label`, the launch warning and refusal hint, `LaunchState.uncommitted_paths`
+- `scripts/hana_shot/test_hana_shot.py` — `LaunchBuildWarningTests`: temporary git repositories with a fake binary and `os.utime` mtimes (clean, older/equal/newer, untracked with unusual names, staged, deleted, renamed, path scope, missing binary, non-git, git timeout, root `Cargo.lock` and `Cargo.toml`, a `Cargo.toml` outside the root), the missing-binary refusal, and the capped warning before a stubbed `Popen`
+- `commands/hana_shot.md` — one sentence under launch
+
+**Binds later work:** the screenshot proposals re-rank treats the launch warning as no shot behavior change; it has no `changes.json` entry and is not a candidate.
+
+**Gotchas:**
+- In `-z` output a rename or copy record is followed by a separate original-path record; the parser consumes it so it is not read as a status entry.
+- The mtime test is a heuristic, not proof of what the binary holds. Only `crates/` and the root `Cargo.toml` and `Cargo.lock` are checked (the root files added at e031f5e9).
+- Tests never start Hana: the natedev Hana ban holds, so live launch is untested.
