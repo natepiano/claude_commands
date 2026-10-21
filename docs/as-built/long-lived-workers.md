@@ -112,7 +112,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
   1. one `remove_workers.py` call with a `--session-dir` per held run
   2. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
   3. one `sweep --root <root of the first held run> --stop`
-  4. removal of each held run's `verify_cache/`
+  4. one `remove_run_scratch.py` call for every held run: it removes `verify_cache/` and every git checkout (a folder holding `.git`, a folder or a file) and cargo target (a folder holding `.rustc_info.json` or `CACHEDIR.TAG`) at any depth, without descending into what it removes or following a link; ledgers, logs, diffs, json and the run folder stay (2026-10-21: gate copies under `phases/`, exports under `scratch/` and builds such as `p62_bin` had filled run folders)
   5. removal of the marker run's notifier
   6. removal of the run-active marker
 
@@ -163,6 +163,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 | `scripts/direct/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
 | `scripts/direct/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
 | `scripts/direct/end_session.sh` | Ends the workers of every run the director holds (`stop`) and sweeps |
+| `scripts/direct/remove_run_scratch.py` | Removes `verify_cache/`, checkouts and cargo targets from each ended run folder |
 | `scripts/direct/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
 | `scripts/lib/unit_runs.py` | `held`: every run folder a director holds |
 | `scripts/direct/progress_history.py` | Agent columns for extra workers |
