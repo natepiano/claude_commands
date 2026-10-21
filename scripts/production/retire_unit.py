@@ -322,7 +322,7 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
             for pid in inside if (leader := _session_of(pid)) in leaders}
 
 
-def _same_unit(lease: str, unit: str) -> bool:
+def same_unit(lease: str, unit: str) -> bool:
     # review_pool's own rule: some leases name `trunk`, others `trunk-unit`.
     return lease.removesuffix("-unit") == unit.removesuffix("-unit")
 
@@ -334,7 +334,7 @@ def reviewers(unit: Unit) -> tuple[Reviewer, ...]:
     found: list[Reviewer] = []
     for line in listed.stdout.splitlines():
         fields = line.split("\t")
-        if len(fields) >= 4 and fields[2] != "unleased" and _same_unit(fields[2].rsplit(":", 1)[0], unit.name):
+        if len(fields) >= 4 and fields[2] != "unleased" and same_unit(fields[2].rsplit(":", 1)[0], unit.name):
             found.append(Reviewer(fields[0], fields[3] == "busy"))
     return tuple(found)
 

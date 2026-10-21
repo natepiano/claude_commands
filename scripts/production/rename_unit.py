@@ -31,7 +31,7 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -90,6 +90,24 @@ POLL_SECONDS = 1.0
 
 class RenameWaiting(RenameRefused):
     """The unit is still stopping after STOP_WAIT_SECONDS: a rerun of apply resumes once it has stopped."""
+
+
+class StopTarget(Protocol):
+    """What the stop steps read: the unit's production and ids, and where its worktree is now.
+    A rename and a transfer both stop a unit this way."""
+    @property
+    def slug(self) -> str: ...
+    @property
+    def old(self) -> str: ...
+    @property
+    def new(self) -> str: ...
+    @property
+    def id_matches(self) -> bool: ...
+    # The stop step fills these with the record the unit relaunches from.
+    account: str
+    session_id: str
+
+    def worktree(self) -> Path: ...
 
 
 @dataclass
@@ -207,7 +225,7 @@ def _unit_of_session(slug: str, name: str, units: list[str]) -> str:
         raise RenameRefused(f"{name}: cannot tell which unit's session it names: {error}") from error
     found = {unit for unit, place in marked.items()
              if isinstance(place.claude, unit_lookup.LiveClaude) and place.claude.name == name}
-    for item in _records(slug, tuple(units)):
+    for item in shutdown_records(slug, tuple(units)):
         host = item["session"]["host"]
         if host["kind"] == "unit" and item["session"]["name"] == name:
             found.add(host["unit"])
@@ -224,7 +242,7 @@ def _session_name(slug: str, unit: str) -> str:
         raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {error}") from error
     if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         return found.claude.name
-    names = [item["session"]["name"] for item in _records(slug, (unit,))]
+    names = [item["session"]["name"] for item in shutdown_records(slug, (unit,))]
     return names[0] if names else ""
 
 
@@ -249,7 +267,7 @@ def _check_stopped(rename: UnitRename) -> None:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
 
 
-def _check_stoppable(rename: UnitRename) -> None:
+def check_stoppable(rename: StopTarget) -> None:
     """What the stop step cannot settle: the new id running, a Claude it cannot read, or processes
     in the worktree of a unit with no Claude to stop. A live old unit is the stop step's to stop."""
     try:
@@ -284,7 +302,7 @@ def _preflight(rename: UnitRename) -> None:
     checkout = Path(rename.checkout)
     _check_checkout(rename)
     if rename.id_matches:
-        _check_stoppable(rename)
+        check_stoppable(rename)
         return
     if unit_move.branch_tip(checkout, rename.new_branch) or unit_move.remote_tip(checkout, rename.new_branch):
         raise RenameRefused(f"branch {rename.new_branch} already exists")
@@ -294,7 +312,7 @@ def _preflight(rename: UnitRename) -> None:
         raise RenameRefused(f"{rename.slug}: finish the production rename first")
     # A unit mid-phase is renamed too: its commits move with the branch, and _merge leaves work in
     # progress alone (user, 2026-10-18).
-    _check_stoppable(rename)
+    check_stoppable(rename)
 
 
 def _token(old: str, new: str, text: str) -> str:
@@ -460,7 +478,7 @@ def _retire(rename: UnitRename, _save: Callable[[], None]) -> None:
     unit_move.delete_branch(checkout, rename.old_branch, rename.merged)
 
 
-def _shutdown(*arguments: str) -> None:
+def run_shutdown(*arguments: str) -> None:
     """Run one shutdown verb on this machine. Without a session id in its environment it finds the
     account that holds the session, not the showrunner's own."""
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
@@ -470,12 +488,12 @@ def _shutdown(*arguments: str) -> None:
         raise RenameRefused(f"shutdown {arguments[0]}: {(result.stderr or result.stdout).strip()}")
 
 
-def _unit_records(rename: UnitRename) -> list[SessionShutdown]:
+def _unit_records(rename: StopTarget) -> list[SessionShutdown]:
     """This production's shutdown records of the unit, under either id."""
-    return _records(rename.slug, (rename.old, rename.new))
+    return shutdown_records(rename.slug, (rename.old, rename.new))
 
 
-def _records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
+def shutdown_records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
     try:
         saved = shutdown_record.all_session_records()
     except (shutdown_record.InvalidRecord, OSError) as error:
@@ -488,7 +506,7 @@ def _records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
     return found
 
 
-def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
+def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     """Stop the unit through the shutdown path, so its record carries the relaunch, and wait for it.
 
     A live process cannot change its env mark and the director's context holds the old paths, so a
@@ -504,13 +522,13 @@ def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
             return
         if isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
-        _shutdown("down", "--only", found.claude.session_id)
+        run_shutdown("down", "--only", found.claude.session_id)
     saved = _await_stopped(rename)
     rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
     _stop_runs(rename)
 
 
-def _stop_runs(rename: UnitRename) -> None:
+def _stop_runs(rename: StopTarget) -> None:
     """SIGTERM what the unit's runs leave in its worktree once the unit has stopped: a detached
     run's supervisor with its command, and an app-server's idle-stop watcher. Each leads its own
     session, so the shutdown path does not end it, and nothing starts it again."""
@@ -522,7 +540,7 @@ def _stop_runs(rename: UnitRename) -> None:
         raise RenameRefused("; ".join(left) + "; rerun apply once they stop")
 
 
-def _await_stopped(rename: UnitRename) -> SessionShutdown:
+def _await_stopped(rename: StopTarget) -> SessionShutdown:
     """The unit's shutdown record once it reads stopped. The stop is waited for here, so one apply
     does the whole rename (user, 2026-10-18). A stop that waits for an idle or ready mark is forced
     with `shutdown.py now`, once for each kind it reads."""
@@ -541,7 +559,7 @@ def _await_stopped(rename: UnitRename) -> SessionShutdown:
         if progress in STOPPED:
             return records[0]
         if progress in FORCEABLE and progress != forced:
-            _shutdown("now", "--only", records[0]["session"]["session_id"])
+            run_shutdown("now", "--only", records[0]["session"]["session_id"])
             forced = progress
         if progress not in STOPPING:
             raise RenameRefused(f"{rename.old}'s shutdown record reads {progress}; settle it first")
@@ -645,7 +663,7 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
 
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
     if rename.session_id:
-        _shutdown("restart", "--only", rename.session_id)
+        run_shutdown("restart", "--only", rename.session_id)
         _await_live(rename)
 
 
@@ -866,7 +884,7 @@ def _describe_verify(r: UnitRename) -> str:
 
 
 STEPS = (
-    Step(_stop, _describe_stop, stopped=False, locked=False),
+    Step(stop_unit, _describe_stop, stopped=False, locked=False),
     Step(_merge, _describe_merge),
     Step(_move_git, _describe_git),
     Step(_move_claude, _describe_claude),
@@ -881,7 +899,7 @@ STEPS = (
 
 
 # The steps a name-only rename runs; the rest name the id, which already is the new one.
-NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (_stop, _restart_record, _relaunch, _verify)
+NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (stop_unit, _restart_record, _relaunch, _verify)
 
 
 def step_number(run: Callable[[UnitRename, Callable[[], None]], None]) -> int:
