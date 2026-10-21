@@ -1021,7 +1021,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** creating, renaming or moving a vault note so that `[[style]]` resolves to a different page; changing an issue with any area other than `[[unfiled]]` or none.
 
-### Phase 38 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: todo
+### Phase 38 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: done
 **Depends on:** none
 
 #### Work Order

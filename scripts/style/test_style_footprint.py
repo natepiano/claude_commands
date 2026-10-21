@@ -195,6 +195,126 @@ class StyleFootprintTests(unittest.TestCase):
         _ = self.commit()
         self.assert_mechanical(base)
 
+    def test_erasing_an_unused_required_trait_implementation_parameter_is_mechanical(self) -> None:
+        before = ("trait Reader { fn read(&self, input: usize); }\n"
+                  "struct Value;\nimpl Reader for Value { fn read(&self, _input: usize) {} }\n")
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_erasing_a_bodyless_trait_method_parameter_is_mechanical(self) -> None:
+        self.write("src/lib.rs", "trait Reader { fn read(&self, _input: usize); }\n")
+        base = self.commit()
+        self.write("src/lib.rs", "trait Reader { fn read(&self, _: usize); }\n")
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_erasing_an_unused_function_or_default_method_parameter_is_mechanical(self) -> None:
+        for before in (
+            "fn read(_input: usize) -> usize { 7 }\n",
+            "trait Reader { fn read(&self, _input: usize) -> usize { 7 } }\n",
+        ):
+            with self.subTest(before=before):
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+                _ = self.commit()
+                self.assert_mechanical(base)
+
+    def test_erasing_a_parameter_still_read_by_the_body_requires_review(self) -> None:
+        for before in (
+            "fn read(_input: usize) -> usize { _input }\n",
+            "trait Reader { fn read(&self, _input: usize) -> usize { _input } }\n",
+        ):
+            with self.subTest(before=before):
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_erasing_a_parameter_named_inside_a_macro_requires_review(self) -> None:
+        before = "fn read(_input: usize) { consume!(_input); }\n"
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_erasing_a_parameter_read_through_a_raw_identifier_requires_review(self) -> None:
+        before = "fn read(_input: usize) -> usize { r#_input }\n"
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_erasing_a_parameter_captured_through_literal_escapes_requires_review(self) -> None:
+        for literal in (r'"{\u{5f}input}"', r'"{\x5finput}"'):
+            with self.subTest(literal=literal):
+                before = f"fn read(_input: usize) {{ println!({literal}); }}\n"
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_erasing_a_parameter_with_unavailable_token_spans_requires_review(self) -> None:
+        before = "fn read(_input: usize) { let café = 1; }\n"
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_erasing_a_parameter_captured_by_a_plain_or_raw_format_literal_requires_review(self) -> None:
+        for literal in ('"{_input}"', '"{_input:04}"', 'r#"{_input}"#', 'r#"{_input:04}"#'):
+            with self.subTest(literal=literal):
+                before = f"fn read(_input: usize) {{ println!({literal}); }}\n"
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_erasing_an_unused_parameter_with_a_type_change_requires_review(self) -> None:
+        self.write("src/lib.rs", "fn read(_input: usize) {}\n")
+        base = self.commit()
+        self.write("src/lib.rs", "fn read(_: u64) {}\n")
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_erasing_an_unused_externally_reachable_function_parameter_is_mechanical(self) -> None:
+        self.write("src/lib.rs", "pub fn read(_input: usize) {}\n")
+        base = self.commit()
+        self.write("src/lib.rs", "pub fn read(_: usize) {}\n")
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_erasing_an_unused_public_trait_method_parameter_is_mechanical(self) -> None:
+        for ending in (";", " {}"):
+            with self.subTest(ending=ending):
+                before = f"pub trait Reader {{ fn read(&self, _input: usize){ending} }}\n"
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace("_input: usize", "_: usize"))
+                _ = self.commit()
+                self.assert_mechanical(base)
+
+    def test_parameter_erasure_keeps_review_for_another_public_signature_change(self) -> None:
+        for before in (
+            "pub fn read(_input: usize) -> usize { 7 }\n",
+            "pub trait Reader { fn read(&self, _input: usize) -> usize { 7 } }\n",
+        ):
+            with self.subTest(before=before):
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace("_input: usize", "_: usize").replace("-> usize", "-> u64"))
+                _ = self.commit()
+                self.assertIn("check 2", self.assert_review(base))
+
     def test_complete_rename_used_by_stringify_requires_review(self) -> None:
         before = (
             "fn read_value(input: usize) -> usize { input }\n"
