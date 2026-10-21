@@ -43,14 +43,20 @@ Loop/verbose only:
 5. First record a first touch no hook recorded. When the state is still
    `EnrolledAwaitingFirstTouch`, this checks every path of this phase changed
    since `${PHASE_DIR}/phase_baseline` and writes `Active` from the clear
-   answer; every other state it leaves as it is:
+   answer. When the state is `Active`, it reads the recorded reservation on
+   berth's board (`cargo-berth board --reservation <id> --json`). A released one
+   takes the phase's live reservation from the same check, so drift never names
+   a released id; with no live one to take, it exits 1 and names the stale id.
+   Every other state it leaves as it is:
 
    ```sh
    phase_reservation.py record-active --session-dir "${SESSION_DIR}" --phase <phase id>
    ```
 
    Exit `1` means the check was refused: answer the overlap it names under
-   `/unit:direct` <BerthDecisions/>, then run it again. Then read and validate
+   `/unit:direct` <BerthDecisions/>, then run it again. An exit `1` that names a
+   released reservation with no live one blocks the checkpoint: apply
+   <RetainDelegatedPhaseReservation/> and report the line. Then read and validate
    `${PHASE_DIR}/delegated_phase_reservation_state.json`; never use a value
    remembered from conversation or the harness-session mapping.
 

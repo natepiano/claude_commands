@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -289,7 +290,10 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             "SEND_LOG": str(self.send_log),
             "SESSION_SOCKET": str(self.socket_path),
             "SESSION_RUNNING": "1",
-            "AUTO_SILENCE_COMMAND": str(self.activity_stub),
+            # The detached auto silence call outlives the hook, so a stub that writes could still
+            # be writing in the temp dir as it is removed. Only a test that waits for the log
+            # writes one (`record_activity`).
+            "AUTO_SILENCE_COMMAND": shutil.which("true") or "/bin/true",
             "AUTO_SILENCE_LOG": str(self.activity_log),
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.unit_active_root),
         }
@@ -600,6 +604,10 @@ print("SENT: delivered")
         self.assertEqual((scheduled.returncode, scheduled.stderr), (0, ""))
         self.assertFalse(stamp.exists())
 
+    def record_activity(self) -> None:
+        """Make the detached auto silence call write its arguments; every write then needs a wait."""
+        self.environment["AUTO_SILENCE_COMMAND"] = str(self.activity_stub)
+
     def activity_calls(self, expected: int) -> list[list[str]]:
         """The detached call lands after the hook exits: wait for `expected` lines, briefly."""
         deadline = time.monotonic() + 10
@@ -611,6 +619,7 @@ print("SENT: delivered")
         return []
 
     def test_typed_prompt_in_a_showrunner_or_unit_director_records_activity(self) -> None:
+        self.record_activity()
         _ = self.create_instance("showrunner-demo")
         self.assertEqual(self.run_prompt("hello").returncode, 0)
         self.assertEqual(self.activity_calls(1), [["active"]])
@@ -621,6 +630,7 @@ print("SENT: delivered")
         self.assertEqual(self.activity_calls(1), [["active"]])
 
     def test_other_sessions_and_prompts_record_no_activity(self) -> None:
+        self.record_activity()
         plain = self.run_prompt("hello")
         self.assertEqual((plain.returncode, plain.stderr), (0, ""))
         _ = self.create_instance("showrunner-demo")
