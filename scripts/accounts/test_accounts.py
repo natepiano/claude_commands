@@ -21,7 +21,7 @@ import time
 import unittest
 import urllib.request
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from collections.abc import Callable, Generator, Iterator
@@ -3471,7 +3471,8 @@ class AccountsTests(unittest.TestCase):
         document = cast(dict[str, object], json.loads(output))
         self.assertEqual(set(document), {"accounts", "problems"})
         rows = cast(list[dict[str, object]], document["accounts"])
-        keys = {"label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at"}
+        keys = {"label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at",
+                "read_ok", "credits_in_use"}
         self.assertTrue(all(set(row) == keys for row in rows))
         expected: list[tuple[str, str, list[str], float | None, str | None, float | str | None, bool, str | None]] = [
             ("claude1", "claude", [], None, None, None, False, None),
@@ -3484,6 +3485,8 @@ class AccountsTests(unittest.TestCase):
         ]
         fields = ("label", "tool", "roles", "weekly_left_percent", "resets_at", "credits", "use_credits", "read_at")
         self.assertEqual([tuple(row[field] for field in fields) for row in rows], expected)
+        self.assertEqual([row["read_ok"] for row in rows], [False, True, True, False, True, False, True])
+        self.assertEqual([row["credits_in_use"] for row in rows], [False, False, False, False, True, False, False])
         notes = table.split("\n\n", 1)[1].strip().splitlines()
         self.assertIn("accounts.py setup codex2", "\n".join(notes))
         self.assertEqual(document["problems"], [note.removeprefix("* ") for note in notes])
@@ -6031,6 +6034,69 @@ class PickerTests(unittest.TestCase):
                 self.assertFalse(accounts.accounts_config_file().exists())
                 self.assertFalse(accounts.roles_history_file().exists())
                 process.assert_not_called()
+
+
+class SharedStatusDocumentTests(unittest.TestCase):
+    """The stored JSON adds access and spending signals without changing its text view."""
+
+    at: datetime = datetime(2026, 10, 16, 18, tzinfo=timezone.utc)
+
+    def row(self) -> accounts.StatusRow:
+        return accounts.StatusRow(
+            label="fixture", tool="codex", folder="~/.codex1", login="fixture@example.invalid",
+            roles=("workers",), weekly_left_percent=60, resets_at=self.at + timedelta(days=1),
+            credits=13446, on_credits="no", use_credits=True, read_at=self.at,
+            read_outcome=agent_accounts.UsageReadOutcome.OK, attempted_at=self.at)
+
+    def reading(self, row: accounts.StatusRow) -> accounts.StatusReading:
+        return accounts.StatusReading(rows=(row,), notes=("* Fixture problem.",), detail_lines=(),
+                                      zone=ZoneInfo("America/New_York"), checked_at=self.at)
+
+    def document(self, row: accounts.StatusRow) -> dict[str, object]:
+        status = cast(dict[str, object], json.loads(accounts.render_status_json(self.reading(row))))
+        self.assertEqual(status["problems"], ["Fixture problem."])
+        return cast(list[dict[str, object]], status["accounts"])[0]
+
+    def test_access_requires_a_stored_reading_and_an_ok_or_held_latest_outcome(self) -> None:
+        for outcome in agent_accounts.UsageReadOutcome:
+            for has_reading in (True, False):
+                with self.subTest(outcome=outcome, has_reading=has_reading):
+                    row = replace(self.row(), read_outcome=outcome,
+                                  read_at=self.at if has_reading else accounts.StatusUnavailable())
+                    document = self.document(row)
+                    expected = has_reading and outcome in (
+                        agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD)
+                    self.assertIs(document.get("read_ok"), expected)
+                    self.assertIs(document.get("credits_in_use"), False)
+                    self.assertEqual(document["read_at"], self.at.isoformat() if has_reading else None)
+
+    def test_credit_spending_is_independent_of_enabled_balance_and_access(self) -> None:
+        for enabled in (True, False):
+            for spending in ("yes", "no", "—"):
+                with self.subTest(enabled=enabled, spending=spending):
+                    row = replace(self.row(), on_credits=spending, use_credits=enabled,
+                                  credits=accounts.StatusUnavailable())
+                    document = self.document(row)
+                    self.assertIs(document.get("credits_in_use"), spending == "yes")
+                    self.assertIs(document.get("read_ok"), True)
+                    self.assertIs(document["use_credits"], enabled)
+                    self.assertIsNone(document["credits"])
+
+    def test_new_json_signals_leave_the_existing_text_table_exactly_unchanged(self) -> None:
+        reading = self.reading(self.row())
+        self.assertEqual(accounts.render_status_table(reading), (
+            '| Folder    | Label   | Role    | Weekly left | Weekly resets       | On credits | Credits left | Read      |\n'
+            '| --------- | ------- | ------- | ----------- | ------------------- | ---------- | ------------ | --------- |\n'
+            '| ~/.codex1 | fixture | workers | 60%         | Sat 10-17 14:00 EDT | no         | 13,446       | 14:00 EDT |\n'
+            '\n'
+            '* Fixture problem.'
+        ))
+        self.assertEqual(self.document(self.row()), {
+            "label": "fixture", "tool": "codex", "roles": ["workers"],
+            "weekly_left_percent": 60, "resets_at": "2026-10-17T18:00:00+00:00",
+            "credits": 13446, "use_credits": True, "read_at": "2026-10-16T18:00:00+00:00",
+            "read_ok": True, "credits_in_use": False,
+        })
 
 
 if __name__ == "__main__":

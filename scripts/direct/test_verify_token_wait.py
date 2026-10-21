@@ -676,6 +676,160 @@ exec "$TEST_REAL_SLEEP" "$@"
                         self.end_group(process.pid)
                     _ = process.wait(timeout=300)
 
+    def test_a_step_waiting_for_a_busy_token_keeps_no_memory_reservation(self) -> None:
+        # A reservation kept through the token wait promises memory no build
+        # uses; with many such steps the gate held every step back. The waiter
+        # gives the token back for its memory wait, a peer takes it, then the
+        # waiter's gate admits it while the token is busy.
+        board = self.root / "board"
+        admission = self.root / "buildlog" / "admission"
+        waiting = self.root / "waiting-for-token"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        peer_meminfo = self.root / "peer-meminfo"
+        _ = peer_meminfo.write_text("MemAvailable: 50331648 kB\n")
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the token wait test needs sleep on PATH")
+        sleep = self.root / "stubs" / "sleep"
+        _ = sleep.write_text("#!/bin/sh\n"
+                             + 'if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
+                             + 'exec "$TEST_REAL_SLEEP" "$@"\n')
+        sleep.chmod(0o755)
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
+                       "TEST_REAL_SLEEP": real_sleep}
+        output = self.root / "waiter.out"
+        waiter = self.start_memory_waiter({**environment, "TEST_WAITING": str(waiting)}, output)
+        holder: subprocess.Popen[bytes] | None = None
+        try:
+            holder = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"], cwd=self.root,
+                                      env={**environment, "BUILDLOG_MEMINFO": str(peer_meminfo),
+                                           "TEST_BLOCK": "1"},
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      start_new_session=True)
+            self.started_groups.add(holder.pid)
+            self.wait_for_running(self.root / "running", holder)
+            held = sorted(admission.glob("*.reservation"))
+            self.assertEqual(len(held), 1, "the running step holds one reservation")
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            self.wait_for_running(waiting, waiter)
+            self.assertEqual(sorted(admission.glob("*.reservation")), held)
+            _ = (self.root / "release").touch()
+            self.assertEqual(holder.wait(timeout=300), 0)
+            self.assertEqual(waiter.wait(timeout=300), 0, output.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
+            self.assertEqual(list(admission.glob("*.reservation")), [])
+        finally:
+            _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+            _ = (self.root / "release").touch()
+            for process in (waiter, holder):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=300)
+
+    def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
+        """A held natedev for the step's hold wait only.
+
+        verify.sh's first wait-local, before it takes the token, returns at once;
+        the step's wait-local marks `hold-waiting`, then waits for `hold-release`
+        and exits with `wait_status`. Every other verb succeeds.
+        """
+        holds = self.root / "build-hold"
+        holds.mkdir(exist_ok=True)
+        _ = (holds / "holder.json").write_text("{}")
+        stub = self.root / "build_targets_stub.py"
+        _ = stub.write_text(r"""import os, sys, time
+from pathlib import Path
+root = Path(os.environ["TEST_HOLD_ROOT"])
+if sys.argv[1] == "wait-local":
+    calls = root / "wait-local-calls"
+    count = len(calls.read_text().splitlines()) if calls.exists() else 0
+    with calls.open("a") as stream:
+        _ = stream.write("wait-local\n")
+    if count >= 1:
+        (root / "hold-waiting").touch()
+        while not (root / "hold-release").exists():
+            time.sleep(0.01)
+        raise SystemExit(int(os.environ["TEST_HOLD_STATUS"]))
+""")
+        return {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILD_TARGETS_SCRIPT": str(stub),
+                "TEST_HOLD_ROOT": str(self.root), "TEST_HOLD_STATUS": str(wait_status)}
+
+    def start_hold_waiter(self, environment: dict[str, str], output: Path) -> subprocess.Popen[bytes]:
+        with output.open("wb") as stream:
+            process = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                       cwd=self.root, env=environment, stdout=stream,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(process.pid)
+        self.wait_for_running(self.root / "hold-waiting", process)
+        return process
+
+    def test_a_hold_wait_gives_the_token_to_a_peer_and_takes_it_back_before_its_step(self) -> None:
+        board = self.root / "board"
+        lock = board / "locks" / "cargo.d"
+        environment = self.hold_environment(board, 0)
+        output = self.root / "held.out"
+        held = self.start_hold_waiter(environment, output)
+        peer: subprocess.Popen[bytes] | None = None
+        try:
+            self.assertFalse(lock.exists(), "the hold wait kept the token")
+            peer_holds = self.root / "peer-holds"
+            peer_holds.mkdir()
+            peer = subprocess.Popen(["bash", str(VERIFY), "check", "sample", "--no-cache"],
+                                    cwd=self.root,
+                                    env={**environment, "BUILD_HOLD_DIR": str(peer_holds), "TEST_BLOCK": "1"},
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            self.started_groups.add(peer.pid)
+            self.wait_for_running(self.root / "running", peer)
+            self.assertEqual((lock / "holder_pid").read_text(), str(peer.pid))
+
+            (self.root / "hold-release").touch()
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
+            _ = (self.root / "release").touch()
+            self.assertEqual(peer.wait(timeout=300), 0)
+            self.assertEqual(held.wait(timeout=300), 0, output.read_text())
+            self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
+            self.assertFalse(lock.exists())
+        finally:
+            for marker in ("hold-release", "release"):
+                (self.root / marker).touch()
+            for process in (held, peer):
+                if process is not None:
+                    if process.poll() is None:
+                        self.end_group(process.pid)
+                    _ = process.wait(timeout=300)
+
+    def test_a_hold_wait_that_leaves_for_the_mac_does_not_take_the_token_again(self) -> None:
+        board = self.root / "board"
+        environment = self.hold_environment(board, 75)
+        output = self.root / "held.out"
+        held = self.start_hold_waiter(environment, output)
+        try:
+            (self.root / "hold-release").touch()
+            _ = held.wait(timeout=300)
+        finally:
+            if held.poll() is None:
+                self.end_group(held.pid)
+                _ = held.wait(timeout=300)
+        log = (board / "board.log").read_text()
+        self.assertEqual(log.count("token cargo acquired"), 1, log)
+        self.assertFalse((board / "locks" / "cargo.d").exists())
+        self.assertFalse((self.root / "cargo-calls").exists(), "the step ran on natedev")
+
+    def test_no_hold_gives_nothing_back(self) -> None:
+        board = self.root / "board"
+        (self.root / "build-hold").mkdir()
+        result = self.verify({**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                              "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        log = (board / "board.log").read_text()
+        # The first take, then the memory gate's give-back and take; the hold wait adds none.
+        self.assertEqual((log.count("token cargo acquired"), log.count("token cargo released")), (2, 2), log)
+
     def test_a_long_token_wait_never_gives_up(self) -> None:
         # Each refused acquire moves the clock past the old 1800 s limit.
         home = self.root / "busy-home"

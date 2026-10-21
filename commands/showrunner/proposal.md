@@ -22,12 +22,14 @@ in the vault's `archive/` beside it is taken. Name a proposal to the user by
 its number and title, such as `P12 selection widgets toggle`. On a
 missing file or one without frontmatter it exits 2: report the line.
 
-| State | `status` / `stage` | Set |
+| State | `status` / `stage` | Set by |
 | --- | --- | --- |
-| written | open / backlog | `proposed_by` |
-| approved, not started | open / backlog | `showrunner`, `unit`, `plan` |
-| being built | open / active | |
-| built | closed | `as_built` |
+| waiting for approval | open / backlog | filing (`proposed_by`) |
+| in progress | open / active | `approve` (`showrunner`, `unit`, `plan`), or `start` for a plan issue that has no approval |
+| built | closed | `close` (`as_built` or `reason`) |
+
+The footer's proposal count and the table's `waiting for your review` rows are
+the waiting proposals only; approval moves a proposal to in progress.
 
 ## File
 
@@ -60,6 +62,11 @@ all five and delete the `Proposed ranking:` line:
 
 Never ask star by star, and never through a form.
 
+A proposal that blocks work, or matters by a date, takes a level for the
+user's review order: `proposal_issue.py urgency <issue> --level blocks` (or
+`soon --due <ISO>`, `later`). When the user calls one important, run
+`proposal_issue.py mark-important <issue>`.
+
 ## Approve
 
 For a style decision, record the user's approval with its unit's own plan
@@ -68,6 +75,9 @@ copy and no phase numbers:
 ```sh
 … proposal_issue.py approve <issue> --showrunner "<name>" --unit <unit> --plan "<unit plan copy>"
 ```
+
+Proposals approved before 2026-10-20 move with `proposal_issue.py
+move-approved <issues folder>` (`--dry-run` first); a second run moves none.
 
 Refill builds its approved findings in small tickets. The decision stays open
 until every finding is built or waived. Decline only through:
@@ -80,30 +90,44 @@ For other proposals, send the approved issue to the unit that builds it.
 The unit adds phases that cite it and puts it on the plan's `> **Issues:**`
 line. Record that plan and its phases with the same `approve` command.
 `--showrunner` is the session name from `showrunners.py name <slug>`;
-`--unit` is the full name in the production's Units table. The stage stays
-backlog until work starts. Other declined proposals close through `/close_issue`.
+`--unit` is the full name in the production's Units table. Approve sets the
+stage active: the proposal is in progress and leaves the waiting count. Other
+declined proposals close through `/close_issue`.
 
 ## Start and close
 
 Style refill marks a decision active. Run `style_proposals.py complete` after
 each merge. It closes only approved decisions, when all findings are built or
 waived. It also closes an approved decision with no merged ticket when no
-finding is left to build. A decision closed with nothing left to build opens
-again with its approval for a later finding, as a decision closed as built does.
+finding is left to build. A later finding opens a closed, approved decision
+again with its approval when each of its findings is built, waived or withdrawn, whatever its close
+reason says. `file` skips a closed decision that still has a filed finding
+(`closed decision has unbuilt findings`): open it with
+`proposal_issue.py reopen <issue>`, then file again. A closed decision with no
+answer takes a later finding only when its close reason starts with `built in `
+or `nothing left to build: ` (else `closed decision has no approval`).
 A finding is built only when its change is in the code. Repair a decision
 or an old issue that closed too early with `style_proposals.py reopen --repo
 <style checkout> --issue <issue> --parent <slug>`; add `--dry-run` to see the
 lines first. It exits 1 when a built rename has no check; read the code and
 pass `--finding <id>` (not applied) or `--applied <id>`, with `--by <who>`.
 Filing withdraws a filed finding that an `exception` under its rule's newer
-text supersedes, and closes a decision left with no filed finding. Run that step
+text supersedes, and an unfiled finding whose site that text judged again.
+It closes a decision left with no filed finding. Run that step
 alone with `style_proposals.py withdraw --repo <style checkout> --proposals
 <folder>`; add `--dry-run` to see the lines first.
-Filing first moves a finding to the one file that now declares its item, marks a
+Filing first moves a finding to the one file that now declares its item, or to its
+item's new name after a built rename, marks a
 filed rename built when its new name is declared, leaves a filed finding whose
 item is gone from its file, and withdraws the rest; run that step alone with `style_proposals.py
 follow --repo <style checkout> --proposals <folder>`, and add `--dry-run` to see
 the lines first.
+An outside rename can also follow automatically. Its old name must be absent from declarations throughout its crate.
+The source diff must map the renamed item, or exactly one changed file in that crate must gain it.
+At least half its non-blank body lines must remain after replacing only the renamed identifier.
+A child needs a proved owner rename and its own retained binding or member name.
+A refused search keeps the finding and decision, even when the source file is gone.
+Read its `left` line for the mapped declaration, candidate files, body counts and failed checks.
 Drop the bare duplicates of qualified renames from every open decision with
 `style_proposals.py drop-duplicates --repo <style checkout>`; add `--dry-run`
 to see the lines first. When a plain merge, not a ticket, built filed findings,

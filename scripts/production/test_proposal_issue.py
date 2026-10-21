@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from collections.abc import Generator
 from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
@@ -59,6 +60,20 @@ class ProposalIssueTests(unittest.TestCase):
         self.runtime = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
 
+    def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
+        code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
+        self.assertEqual((code, out), (0, f"urgency {self.issue.name}: set review_urgency, review_due, date_modified\n"))
+        self.assertIn('review_urgency: "soon"\nreview_due: "2026-10-22"\n', self.issue.read_text())
+        self.assertEqual(self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")[1],
+                         f"urgency {self.issue.name}: unchanged\n")
+        self.assertEqual(self.run_cli("urgency", str(self.issue), "--level", "blocks", "--due", "2026-10-22")[0], 2)
+        self.assertEqual(self.run_cli("mark-important", str(self.issue))[0], 0)
+        text = self.issue.read_text()
+        self.assertIn('review_urgency: "user"\nreview_marked: "', text)
+        self.assertNotIn("review_due", text)
+        _ = self.run_cli("urgency", str(self.issue), "--level", "normal")
+        self.assertNotIn("review_", self.issue.read_text())
+
     def run_cli(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -98,7 +113,8 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
         self.assertNotIn("style_findings", fields)
         self.assertEqual(fields["style_count"], ["3"])
-        self.assertEqual(fields["area"], ["unfiled"])
+        self.assertEqual(fields["area"], ["style"])
+        self.assertIn('area: "[[style]]"\n', issue.read_text())
         self.assertEqual(fields["category"], ["refactor"])
         self.assertEqual(fields["backlog_goal"], [])
         self.assertEqual(fields["project"], ["alpha"])
@@ -109,6 +125,94 @@ class ProposalIssueTests(unittest.TestCase):
         arguments[arguments.index("--rule-blob") + 1] = "c"
         self.assertEqual(self.run_cli(*arguments)[0], 2)
         self.assertEqual(issue.read_bytes(), original)
+
+    def test_area_style_sets_the_area_and_vault_date_on_current_and_closed_legacy_issues(self) -> None:
+        forms = (
+            ("decision", 'area: "[[unfiled]]"\n', 'style_rule: "global:rust/names.md"\n', "open"),
+            ("missing area", "", 'style_rule: "global:rust/names.md"\n', "closed"),
+            ("legacy", 'area: "[[unfiled]]"\n',
+             'style_rules: ["https://example.test/names.md"]\nstyle_findings: ["held-1"]\n', "closed"),
+        )
+        for name, area, metadata, status in forms:
+            with self.subTest(form=name):
+                folder = self.root / name
+                folder.mkdir()
+                issue = folder / "proposal.md"
+                original = (f'---\n{area}date_modified: "[[2000-01-01]]"\nstatus: {status}\n'
+                            + 'unit: "names-unit"\nplan: "unit.md"\n' + metadata
+                            + 'tags: ["issue", "proposal", "style"]\n---\nUser notes stay.\n')
+                _ = issue.write_text(original)
+                code, out, err = self.run_cli("area-style", str(folder))
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(len(out.splitlines()), 1)
+                self.assertIn(issue.name, out)
+                updated = issue.read_text()
+                self.assertIn('area: "[[style]]"\n', updated)
+                self.assertIn(f"date_modified: {self.today()}\n", updated)
+                self.assertEqual(updated.replace('area: "[[style]]"\n', ""),
+                                 original.replace(area, "", 1).replace('"[[2000-01-01]]"', self.today()))
+
+    def test_area_style_keeps_comments_after_the_area_line_when_it_updates_the_issue(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue = folder / "decision.md"
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                original = (b'---\narea: "[[unfiled]]"\n# Keep this comment and its spacing.  \n\n'
+                            b'date_modified: "[[2000-01-01]]"\nstyle_rule: "global:rust/names.md"\n'
+                            b'status: open\n---\nUser notes stay.\n').replace(b"\n", newline)
+                _ = issue.write_bytes(original)
+                expected = original.replace(b'area: "[[unfiled]]"', b'area: "[[style]]"').replace(
+                    b'"[[2000-01-01]]"', self.today().encode())
+                action = (0, f"area-style {issue.name}: area [[style]]\n", "")
+                self.assertEqual(self.run_cli("area-style", str(folder), "--dry-run"), action)
+                self.assertEqual(issue.read_bytes(), original)
+                self.assertEqual(self.run_cli("area-style", str(folder)), action)
+                self.assertEqual(issue.read_bytes(), expected)
+                self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+                self.assertEqual(issue.read_bytes(), expected)
+
+    def test_area_style_keeps_non_style_issues_and_other_areas_byte_identical(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        originals: dict[Path, bytes] = {}
+        for name, metadata, area in (
+            ("plain", "", '"[[unfiled]]"'),
+            ("other area", 'style_rule: "global:rust/names.md"\n', '"[[tooling]]"'),
+            ("already style", 'style_rules: ["https://example.test/names.md"]\n', '"[[style]]"'),
+        ):
+            path = folder / (name + ".md")
+            original = (f'---\narea: {area}\ndate_modified: "[[2000-01-01]]"\n{metadata}'
+                        + 'status: open\n---\nstyle_rule: body text is not metadata\n').encode()
+            _ = path.write_bytes(original)
+            originals[path] = original
+        stamps = {path: path.stat().st_mtime_ns for path in originals}
+        self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        self.assertEqual({path: path.stat().st_mtime_ns for path in originals}, stamps)
+
+    def test_area_style_dry_run_and_second_run_write_nothing(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue = folder / "decision.md"
+        original = (b'---\narea: "[[unfiled]]"\ndate_modified: "[[2000-01-01]]"\n'
+                    b'style_rule: "global:rust/names.md"\nstatus: open\n---\nKeep notes.\n')
+        _ = issue.write_bytes(original)
+        stamp = issue.stat().st_mtime_ns
+        dry = self.run_cli("area-style", str(folder), "--dry-run")
+        self.assertEqual((dry[0], dry[2]), (0, ""))
+        self.assertEqual(len(dry[1].splitlines()), 1)
+        self.assertIn(issue.name, dry[1])
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        self.assertEqual(list(folder.iterdir()), [issue])
+        self.assertEqual(self.run_cli("area-style", str(folder)), dry)
+        updated, stamp = issue.read_bytes(), issue.stat().st_mtime_ns
+        self.assertNotEqual(updated, original)
+        self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+        self.assertEqual(issue.read_bytes(), updated)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        self.assertEqual(list(folder.iterdir()), [issue])
 
     def test_number_gives_each_proposal_the_next_free_number_oldest_first(self) -> None:
         folder = self.root / "issues"
@@ -141,6 +245,74 @@ class ProposalIssueTests(unittest.TestCase):
                                       "abc", "--count", "1", "--body-file", str(body), "--template", str(template))
         self.assertEqual((code, out), (0, "create decision.md: created\n"), err)
         self.assertIn('proposal_id: "P1"\n', issue.read_text())
+
+    def test_create_keeps_a_same_key_decision_that_appears_before_the_folder_lock(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
+                    b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
+                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+
+        @contextlib.contextmanager
+        def competing_create(folder: Path) -> Generator[None]:
+            self.assertEqual(folder, self.root)
+            _ = issue.write_bytes(original)
+            stamp = issue.stat().st_mtime_ns
+            yield
+            self.assertEqual(issue.stat().st_mtime_ns, stamp)
+
+        with mock.patch.object(proposal_issue, "_folder_lock", side_effect=competing_create):
+            self.assertFalse(proposal_issue.create(
+                issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                "# New examples\n", template, date(2026, 10, 20), initial_fields={}))
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
+        self.assertEqual({path.name for path in self.root.iterdir()},
+                         {"a proposal.md", "template.yaml", "decision.md"})
+
+    def test_create_refuses_a_different_key_decision_that_appears_before_the_folder_lock(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\nstyle_rule: "global:rust/names.md"\nstyle_crate: "alpha"\n'
+                    b'style_rule_blob: "other-blob"\nproposal_id: "P47"\n---\nOther decision.\n')
+
+        @contextlib.contextmanager
+        def competing_create(folder: Path) -> Generator[None]:
+            self.assertEqual(folder, self.root)
+            _ = issue.write_bytes(original)
+            stamp = issue.stat().st_mtime_ns
+            try:
+                yield
+            finally:
+                self.assertEqual(issue.stat().st_mtime_ns, stamp)
+
+        with mock.patch.object(proposal_issue, "_folder_lock", side_effect=competing_create):
+            with self.assertRaises(proposal_issue.Refusal) as refusal:
+                _ = proposal_issue.create(
+                    issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                    "# New examples\n", template, date(2026, 10, 20), initial_fields={})
+        self.assertEqual(str(refusal.exception), f"{issue}: different decision key")
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
+
+    def test_create_gives_two_different_decisions_distinct_proposal_numbers(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        first, second = self.root / "alpha.md", self.root / "beta.md"
+        self.assertTrue(proposal_issue.create(
+            first, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+            "# Alpha examples\n", template, date(2026, 10, 20), initial_fields={}))
+        original = first.read_bytes()
+        self.assertTrue(proposal_issue.create(
+            second, "alpha", "a", "style", ["style"], "global:rust/names.md", "beta", "abc", 1,
+            "# Beta examples\n", template, date(2026, 10, 20), initial_fields={}))
+        from issues import frontmatter
+        self.assertEqual((frontmatter(first)["proposal_id"], frontmatter(second)["proposal_id"]),
+                         (["P1"], ["P2"]))
+        self.assertEqual(first.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
 
     def test_create_with_rules_preserves_existing_decision_and_answer(self) -> None:
         template = self.root / "template.yaml"
@@ -178,7 +350,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(self.issue.stat().st_mtime_ns, stamp)
 
     def test_reopen_removes_every_close_field_and_keeps_the_answer(self) -> None:
-        _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md"}, date(2026, 10, 15))
+        _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md", "stage": "active"}, date(2026, 10, 15))
         from issues import frontmatter
         def fields() -> dict[str, list[str]]:
             return {key: value for key, value in frontmatter(self.issue).items() if key != "date_modified"}
@@ -213,14 +385,22 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_every_writing_verb_holds_the_issue_lock_outside_the_issue_folder(self) -> None:
         today = datetime.now(user_zone()).date()
-        verbs = (("edit", lambda: proposal_issue.edit(self.issue, {"stage": "active"}, today)),
-                 ("rules", lambda: proposal_issue.edit_rules(self.issue, ["https://example.invalid/rule.md"], today)),
-                 ("refresh", lambda: proposal_issue.refresh_decision(self.issue, 3, "# Locked\n", "effort", today)),
-                 ("reopen", lambda: proposal_issue.reopen(self.issue, today)))
-        for name, verb in verbs:
+        def closed() -> None:
+            self.decision_issue()
+            _ = proposal_issue.edit(self.issue, {"status": "closed"}, date(2026, 10, 15))
+        def approved_at_backlog() -> None:
+            self.decision_issue()
+            _ = self.issue.write_text(self.text().replace("tags:\n- issue\n- proposal\n", "tags: [issue, proposal]\n"))
+            _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md"}, date(2026, 10, 15))
+        verbs = (("edit", closed, lambda: proposal_issue.edit(self.issue, {"stage": "active"}, today)),
+                 ("rules", closed, lambda: proposal_issue.edit_rules(self.issue, ["https://example.invalid/rule.md"], today)),
+                 ("refresh", closed, lambda: proposal_issue.refresh_decision(self.issue, 3, "# Locked\n", "effort", today)),
+                 ("reopen", closed, lambda: proposal_issue.reopen(self.issue, today)),
+                 ("move-approved", approved_at_backlog,
+                  lambda: list(proposal_issue.move_approved(self.root, today, dry_run=False))))
+        for name, setup, verb in verbs:
             with self.subTest(verb=name):
-                self.decision_issue()
-                _ = proposal_issue.edit(self.issue, {"status": "closed"}, date(2026, 10, 15))
+                setup()
                 blocked: list[bool] = []
                 def write(path: Path, text: str) -> None:
                     lock, = self.runtime.glob("proposal-issue-*.lock")
@@ -277,6 +457,25 @@ class ProposalIssueTests(unittest.TestCase):
         from issues import frontmatter
         self.assertEqual((frontmatter(issue)["unit"], frontmatter(issue)["plan"]), (["names-unit"], ["unit.md"]))
 
+    def test_a_decision_created_with_an_inherited_approval_starts_in_progress(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        body = self.root / "body.md"
+        _ = body.write_text("# Examples\n")
+        from issues import frontmatter
+        for name, fields, stage in (("approved", '{"unit": "names-unit", "plan": "unit.md", "stage": "backlog"}', "active"),
+                                    ("unanswered", '{"plan": "unit.md", "stage": "backlog"}', "backlog"),
+                                    ("waiting", '{"showrunner": "hana", "stage": "waiting"}', "waiting"),
+                                    ("no fields", "{}", "backlog")):
+            with self.subTest(name=name):
+                issue = self.root / f"{name}.md"
+                code, _, error = self.run_cli(
+                    "create", str(issue), "--project", "sample", "--short", "s", "--proposed-by", "style",
+                    "--rule", "global:rust/names.md", "--crate", "alpha", "--rule-blob", "abc123", "--count", "1",
+                    "--template", str(template), "--body-file", str(body), "--initial-fields", fields)
+                self.assertEqual(code, 0, error)
+                self.assertEqual(frontmatter(issue)["stage"], [stage])
+
     def test_rules_sets_list_preserving_other_keys_and_body_bytes(self) -> None:
         url = "https://github.com/o/r/blob/main/rust/names.md"
         for existing in ("", 'style_rules: ["old"]\n'):
@@ -300,7 +499,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertIn("status: closed", self.text())
         self.assertNotIn("as_built:", self.text())
 
-    def test_approve_sets_three_fields_and_keeps_stage(self) -> None:
+    def test_approve_moves_the_proposal_to_in_progress(self) -> None:
         code, out, _ = self.run_cli(
             "approve", str(self.issue), "--showrunner", "hana", "--unit", "build-report",
             "--plan", "docs/plans/x.md Phase 4–6",
@@ -310,9 +509,116 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertIn('showrunner: "hana"\n', text)
         self.assertIn('unit: "build-report"\n', text)
         self.assertIn('plan: "docs/plans/x.md Phase 4–6"\n', text)
-        self.assertIn("stage: backlog\n", text)
+        self.assertIn("stage: active\n", text)
+        self.assertNotIn("stage: backlog", text)
         self.assertIn(f"date_modified: {self.today()}\n", text)
-        self.assertEqual(out, "approve a proposal.md: set showrunner, unit, plan, date_modified\n")
+        self.assertEqual(out, "approve a proposal.md: set showrunner, unit, plan, stage, date_modified\n")
+        from issues import Issue, frontmatter
+        self.assertEqual(proposal_issue.proposal_progress(Issue(self.issue, frontmatter(self.issue))),
+                         proposal_issue.InProgress())
+
+    def test_reopen_of_an_approved_proposal_closed_at_backlog_puts_it_in_progress(self) -> None:
+        from issues import frontmatter
+        for name, fields, stage, changed in (("approved", {"unit": "names-unit", "plan": "unit.md"}, "active",
+                                              "reason, status, stage, date_modified"),
+                                             ("unanswered", {}, "backlog", "reason, status, date_modified")):
+            with self.subTest(name=name):
+                _ = self.issue.write_text(ISSUE, encoding="utf-8")
+                _ = proposal_issue.edit(self.issue, {**fields, "status": "closed", "reason": "built"}, date(2026, 10, 15))
+                self.assertEqual(frontmatter(self.issue)["stage"], ["backlog"])
+                code, out, error = self.run_cli("reopen", str(self.issue))
+                self.assertEqual(code, 0, error)
+                self.assertEqual((frontmatter(self.issue)["status"], frontmatter(self.issue)["stage"]), (["open"], [stage]))
+                self.assertEqual(out, f"reopen a proposal.md: set {changed}\n")
+
+    def test_close_from_in_progress_closes_the_proposal_and_keeps_its_stage(self) -> None:
+        _ = self.run_cli("approve", str(self.issue), "--showrunner", "hana", "--unit", "u", "--plan", "p")
+        code, _, error = self.run_cli("close", str(self.issue), "--reason", "built in u-1")
+        self.assertEqual(code, 0, error)
+        from issues import frontmatter
+        self.assertEqual((frontmatter(self.issue)["status"], frontmatter(self.issue)["stage"]), (["closed"], ["active"]))
+
+    def test_proposal_progress_reads_an_approval_or_an_active_stage_as_in_progress(self) -> None:
+        from issues import Issue
+        approval = {"unit": ["names-unit"], "plan": ["unit.md"]}
+        for name, fields, expected in (
+                ("approved at backlog", {**approval, "stage": ["backlog"]}, proposal_issue.InProgress()),
+                ("approved at waiting", {**approval, "stage": ["waiting"]}, proposal_issue.InProgress()),
+                ("unanswered at active", {"stage": ["active"]}, proposal_issue.InProgress()),
+                ("unanswered at backlog", {"stage": ["backlog"], "plan": ["unit.md"]}, proposal_issue.AwaitingApproval()),
+                ("declined and open", {**approval, "stage": ["active"], "style_answer": ["declined"]},
+                 proposal_issue.AwaitingApproval())):
+            with self.subTest(name=name):
+                issue = Issue(self.issue, {"status": ["open"], "tags": ["issue", "proposal"], **fields})
+                self.assertEqual(proposal_issue.proposal_progress(issue), expected)
+
+    def approved_folder(self) -> Path:
+        """One folder of issues: one open approved proposal at backlog, and each kind move-approved leaves alone."""
+        folder = self.root / "issues"
+        folder.mkdir()
+        approval = 'plan: "unit.md"\nunit: "names-unit"\n'
+        for name, answer, stage, status, tags in (
+                ("approved", approval, "backlog", "open", "[issue, proposal]"),
+                ("unanswered", 'plan: ""\n', "backlog", "open", "[issue, proposal]"),
+                ("approved at waiting", approval, "waiting", "open", "[issue, proposal]"),
+                ("approved and closed", approval, "backlog", "closed", "[issue, proposal]"),
+                ("declined", approval + 'style_answer: "declined"\n', "backlog", "open", "[issue, proposal]"),
+                ("approved untagged", approval, "backlog", "open", "[issue]")):
+            text = (ISSUE.replace('plan: ""\n', answer).replace("stage: backlog\n", f"stage: {stage}\n")
+                    .replace("status: open\ntags:\n- issue\n- proposal\n", f"status: {status}\ntags: {tags}\n"))
+            _ = (folder / f"{name}.md").write_text(text, encoding="utf-8")
+        return folder
+
+    def test_move_approved_moves_only_open_approved_proposals_at_backlog(self) -> None:
+        folder = self.approved_folder()
+        before = {path.name: path.read_bytes() for path in folder.iterdir()}
+        code, out, error = self.run_cli("move-approved", str(folder))
+        self.assertEqual(code, 0, error)
+        self.assertEqual(out, "move-approved approved.md: stage active\nmove-approved: 1 moved\n")
+        moved = before["approved.md"].decode().replace("stage: backlog\n", "stage: active\n").replace(
+            'date_modified: "[[2026-10-01]]"', f"date_modified: {self.today()}")
+        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()},
+                         {**before, "approved.md": moved.encode()})
+
+    def test_a_second_move_approved_changes_nothing(self) -> None:
+        folder = self.approved_folder()
+        self.assertEqual(self.run_cli("move-approved", str(folder))[0], 0)
+        before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()}
+        code, out, error = self.run_cli("move-approved", str(folder))
+        self.assertEqual(code, 0, error)
+        self.assertEqual(out, "move-approved: 0 moved\n")
+        self.assertEqual({path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()}, before)
+
+    def test_move_approved_dry_run_prints_the_same_lines_and_writes_nothing(self) -> None:
+        folder = self.approved_folder()
+        before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()}
+        code, out, error = self.run_cli("move-approved", str(folder), "--dry-run")
+        self.assertEqual(code, 0, error)
+        self.assertEqual(out, "move-approved approved.md: stage active\nmove-approved: 1 moved\n")
+        self.assertEqual({path.name: (path.read_bytes(), path.stat().st_mtime_ns) for path in folder.iterdir()}, before)
+
+    def test_move_approved_dry_run_refuses_the_files_the_real_run_refuses_and_both_go_on(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        approved = (ISSUE.replace('plan: ""\n', 'plan: "unit.md"\nunit: "names-unit"\n')
+                    .replace("tags:\n- issue\n- proposal\n", "tags: [issue, proposal]\n"))
+        for name, text in (("a-good", approved), ("b-bad", approved.replace("---\n", "--- \n", 1)), ("c-good", approved)):
+            _ = (folder / f"{name}.md").write_text(text, encoding="utf-8")
+        bad = (folder / "b-bad.md").read_bytes()
+        lines = (f"move-approved a-good.md: stage active\n"
+                 f"move-approved b-bad.md: refused {folder / 'b-bad.md'} has no frontmatter\n"
+                 f"move-approved c-good.md: stage active\n"
+                 f"move-approved: 2 moved\n")
+        self.assertEqual(self.run_cli("move-approved", str(folder), "--dry-run")[:2], (2, lines))
+        self.assertEqual(self.run_cli("move-approved", str(folder))[:2], (2, lines))
+        self.assertIn("stage: active\n", (folder / "a-good.md").read_text(encoding="utf-8"))
+        self.assertIn("stage: active\n", (folder / "c-good.md").read_text(encoding="utf-8"))
+        self.assertEqual((folder / "b-bad.md").read_bytes(), bad)
+
+    def test_move_approved_refuses_a_missing_folder(self) -> None:
+        code, out, error = self.run_cli("move-approved", str(self.root / "absent"))
+        self.assertEqual((code, out), (2, ""))
+        self.assertIn("absent is not a folder", error)
 
     def test_insert_goes_before_the_closing_fence_and_replace_stays_in_place(self) -> None:
         _ = self.run_cli(

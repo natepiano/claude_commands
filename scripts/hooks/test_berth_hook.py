@@ -241,6 +241,14 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(self.state(), AWAITING)
 
+    def test_an_unreadable_ledger_allows_the_edit_as_the_engine_does(self) -> None:
+        # A scratch clone carries the berth configuration but no ledger (hana, 2026-10-20).
+        self.answer(envelope("ledger_unreadable", "cargo-berth could not establish edit safety; "
+                             + "editing is allowed because ledger loss fails open."))
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state(), AWAITING)
+
     def test_a_codex_session_that_is_no_seat_is_never_checked(self) -> None:
         self.environment["CLAUDE_CODE_SESSION_ID"] = "sid-not-a-unit"
         result = self.hook(patch_text("*** Update File: src/lib.rs"))

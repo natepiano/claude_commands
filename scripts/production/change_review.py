@@ -4,10 +4,11 @@
     change_review.py check --repo R --checkpoint C --previous P --merge-branch B
     change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
     change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
-    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M]
+    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>]
     change_review.py edit [--production DOC] [--list L] --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row C<n> --verdict "<the user's words>"
+    change_review.py mark-important [--production DOC] [--list L] --row C<n>
     change_review.py list-path [--production DOC]
     change_review.py showrunner [--production DOC]
 
@@ -24,8 +25,13 @@ unit's checkpoint without one, then adds one row per visible line under the list
 the next C number, the push date and the merged hash, the How to check cell `<how to try it> You
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
-its id, Merged cell and position; `show` prints the first row still to review and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
-date. Every write holds a lock on the list's directory, and the first write to a missing list
+its id, Merged cell and position; `show` prints the current row and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
+date; `mark-important` marks a row the user called important.
+
+To review keeps the order of urgency.py, rewritten on every write: the row `show` last printed
+first until its verdict, then by urgency, then by C number. A row's Urgency cell holds its level,
+due time and prerequisite (`soon, due 2026-10-22, after C3`); it is empty for a normal row, and a
+list gains the column on its first row that needs it. Every write holds a lock on the list's directory, and the first write to a missing list
 creates it from the skeleton. Every write sets the frontmatter's date_modified and adds the
 writing production's doc to its productions. A list in a git work tree is committed alone after
 each write, still under the lock, and never pushed; a refused commit warns and the next write
@@ -53,6 +59,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 # The merge gate imports this module as scripts.production.change_review; its siblings still resolve.
@@ -64,6 +71,7 @@ LIST_HEADER = "- **Change review:**"
 SECTION = "## To review"
 REVIEWED = "## Reviewed"
 CHECK = "How to check"
+URGENCY = "Urgency"
 NOT_YET = "not yet"
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 SEPARATOR = " | "
@@ -358,6 +366,7 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
         text = path.read_text(encoding="utf-8") if path.exists() else skeleton(path, production, day)
         lines = text.splitlines(keepends=True)
         result = write(lines)
+        _sort(path, lines)
         _stamp(path, lines, production, day)
         _ = path.write_text("".join(lines), encoding="utf-8")
         _commit(path, what(result))
@@ -421,21 +430,71 @@ def _insert(lines: list[str], at: int, rows: list[str]) -> None:
     lines[at:at] = [row + "\n" for row in rows]
 
 
-def append_rows(path: Path, changes: list[Visible], day: date, merged: str, production: Path) -> list[str]:
-    """Add one row per change at the end of the To review table; return the rows written.
+def queue(path: Path) -> str:
+    """The name urgency.py pins this list's current row under."""
+    return f"change-{_owner(path)}"
+
+
+def _add_column(path: Path, lines: list[str], section: str, name: str) -> None:
+    """Give the table under `section` an empty last column `name`, unless it has one."""
+    columns, first, end = _table(path, lines, section)
+    if name in columns:
+        return
+    header = first - 2
+    for index in range(header, end):
+        cell = f" {name} |" if index == header else " --- |" if index == header + 1 else " |"
+        lines[index] = lines[index].rstrip("\r\n") + cell + "\n"
+
+
+def _rank(row: dict[str, str]) -> tuple[urgency.Urgency, str]:
+    """A row's urgency and prerequisite, from its Urgency cell."""
+    try:
+        return urgency.parse_cell(row.get(URGENCY, ""))
+    except urgency.UrgencyError as error:
+        raise ChangeReviewError(f"{row.get('#', '')}: {error}") from None
+
+
+def _number(row_text: str) -> int:
+    found = re.match(r"C(\d+)$", row_text)
+    return int(found.group(1)) if found else 0
+
+
+def ordered(rows: list[dict[str, str]], current: str) -> list[dict[str, str]]:
+    """The rows in urgency.py's order: `current` first while it waits, then by urgency, then by C number."""
+    entries: list[urgency.Entry[dict[str, str]]] = []
+    for row in sorted(rows, key=lambda row: _number(row.get("#", ""))):
+        level, after = _rank(row)
+        entries.append(urgency.Entry(row.get("#", ""), row, level, after=after))
+    return [entry.item for entry in urgency.order(entries, current)]
+
+
+def _sort(path: Path, lines: list[str]) -> None:
+    """Write the To review rows in the order `show` takes them."""
+    columns, first, end = _table(path, lines, SECTION)
+    rows = {_cells(line)[0]: line for line in lines[first:end]}
+    named = [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+    lines[first:end] = [rows[row["#"]] for row in ordered(named, urgency.pinned(queue(path)))]
+
+
+def append_rows(path: Path, changes: list[Visible], day: date, merged: str, production: Path,
+                rank: str = "") -> list[str]:
+    """Add one row per change to the To review table; return the rows written.
 
     `merged` is the merge's hash, or empty for a change no merge names. The Mac build column is
     written only when the table has one. `production` is the doc whose change the rows are.
+    `rank` is the rows' Urgency cell; empty is a normal row.
     """
     if not changes:
         return []
 
     def write(lines: list[str]) -> list[str]:
+        if rank:
+            _add_column(path, lines, SECTION, URGENCY)
         columns, _, end = _table(path, lines, SECTION)
         number = next_number("".join(lines))
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
-                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how())})
+                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank)})
                 for offset, item in enumerate(changes)]
         _insert(lines, end, rows)
         return rows
@@ -458,8 +517,8 @@ def pending(path: Path) -> list[dict[str, str]]:
 
 
 def describe(row: dict[str, str]) -> str:
-    """One row in plain lines: its id and change, how to check it, then each other column."""
-    rest = [f"  {column}: {value}" for column, value in row.items() if column not in ("#", "Change", CHECK)]
+    """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
+    rest = [f"  {column}: {value}" for column, value in row.items() if column not in ("#", "Change", CHECK) and value]
     return "\n".join([f"{row.get('#', '')} {row.get('Change', '')}", f"  {CHECK}: {row.get(CHECK, '')}", *rest])
 
 
@@ -491,6 +550,21 @@ def edit_row(path: Path, row: str, item: Visible, day: date, production: Path) -
         return written
 
     return _edit(path, production, day, write, lambda _: f"edit {row}")
+
+
+def mark_row(path: Path, row: str, now: datetime, production: Path) -> str:
+    """Mark `row` important to the user, keeping its prerequisite; return the row written."""
+
+    def write(lines: list[str]) -> str:
+        _add_column(path, lines, SECTION, URGENCY)
+        columns, index = _to_review(path, lines, row)
+        cells = dict(zip(columns, _cells(lines[index])))
+        _, after = _rank({"#": row, URGENCY: _plain(cells.get(URGENCY, ""))})
+        written = _row(path, columns, {**cells, URGENCY: _cell(urgency.cell(urgency.mark(now), after))})
+        lines[index] = written + "\n"
+        return written
+
+    return _edit(path, production, now.date(), write, lambda _: f"mark {row} important")
 
 
 def record_verdict(path: Path, row: str, verdict: str, day: date, production: Path) -> str:
@@ -590,6 +664,9 @@ class CommandLine(argparse.Namespace):
     row: str = ""
     verdict: str = ""
     production: str = ""
+    urgency: str = ""
+    due: str = ""
+    after: str = ""
 
 
 def _list(options: CommandLine) -> Path:
@@ -604,27 +681,49 @@ def _visible(options: CommandLine) -> Visible:
 
 def _row_option(options: CommandLine) -> str:
     """The row id --row names, such as C3."""
-    row = options.row.strip()
+    return _row_id("row", options.row)
+
+
+def _row_id(name: str, value: str) -> str:
+    row = value.strip()
     if _ROW.match(row) is None:
-        raise ChangeReviewError(f"--row {row!r} is not a row id such as C3")
+        raise ChangeReviewError(f"--{name} {row!r} is not a row id such as C3")
     return row
+
+
+def _rank_option(options: CommandLine) -> str:
+    """The Urgency cell --urgency, --due and --after give; empty for a normal row."""
+    try:
+        level = urgency.read(options.urgency, options.due)
+    except urgency.UrgencyError as error:
+        raise ChangeReviewError(str(error)) from None
+    if level.level == urgency.USER:
+        level = urgency.mark(datetime.now(user_zone()).replace(tzinfo=None))
+    return urgency.cell(level, _row_id("after", options.after) if options.after.strip() else "")
 
 
 def _run(options: CommandLine) -> int:
     match options.action:
         case "add":
-            item = _visible(options)
+            item, rank = _visible(options), _rank_option(options)
             rows = append_rows(_list(options), [item], today(), options.merged.strip(),
-                               production_doc(options.production))
+                               production_doc(options.production), rank)
             print(row_id(rows[0]))
         case "edit":
             row, item = _row_option(options), _visible(options)
             print(edit_row(_list(options), row, item, today(), production_doc(options.production)))
         case "show":
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
-            waiting = pending(_list(options))
-            print(describe(waiting[0]) + (f"\n\n{len(waiting) - 1} more to review" if len(waiting) > 1 else "")
-                  if waiting else "nothing to review")
+            path = _list(options)
+            waiting = pending(path)
+            entries = [urgency.Entry(row["#"], row) for row in ordered(waiting, urgency.pinned(queue(path)))]
+            shown = urgency.top(entries, queue(path))
+            print(describe(shown.item) + (f"\n\n{len(waiting) - 1} more to review" if len(waiting) > 1 else "")
+                  if shown is not None else "nothing to review")
+        case "mark-important":
+            row = _row_option(options)
+            now = datetime.now(user_zone()).replace(tzinfo=None)
+            print(mark_row(_list(options), row, now, production_doc(options.production)))
         case "verdict":
             row = _row_option(options)
             verdict = _words("verdict", options.verdict)
@@ -654,10 +753,10 @@ def _run(options: CommandLine) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("action", choices=("check", "append", "drift", "add", "edit", "show", "verdict",
-                                                   "list-path", "showrunner"))
+                                                   "mark-important", "list-path", "showrunner"))
     _ = parser.add_argument("--repo", default=".")
     for name in ("checkpoint", "previous", "merge-branch", "list", "merged", "since", "change", "check", "see",
-                 "row", "verdict", "production"):
+                 "row", "verdict", "production", "urgency", "due", "after"):
         _ = parser.add_argument(f"--{name}", default="")
     try:
         return _run(cast(CommandLine, parser.parse_args(argv)))

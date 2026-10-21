@@ -269,22 +269,29 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertEqual(subject, "production(parent): retire demo-unit, promoted to showrunner of child")
         self.assertIn("demo-unit is now the showrunner of child", out)
 
-    def test_unready_showrunner_leaves_the_units_row_unchanged_and_offers_only_attach(self) -> None:
+    def test_unready_showrunner_still_retires_the_units_row_and_names_the_owed_prompt(self) -> None:
+        """cbc14765, 2026-10-20: the session opened, its prompt was refused, and the row stayed a live unit."""
+        self.started = add_showrunner.SESSION_NOT_READY
+        with mock.patch.object(promote_showrunner, "restore_line") as restore:
+            code, out, err = self.run_main()
+        self.assertEqual((code, err), (1, ""))
+        restore.assert_not_called()
+        self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
+        self.assertIn("demo-unit is open as the session child, but its showrunner prompt is not proven to have run; "
+                      + "its Units row is retired.", out)
+        self.assertIn("herdr session attach child", out)
+        self.assertIn(f"/showrunner:produce {self.child_doc} resume", out)
+        self.assertNotIn("add_unit.py", out)
+
+    def test_unready_showrunner_whose_retire_fails_reports_the_row_as_owed(self) -> None:
         self.started = add_showrunner.SESSION_NOT_READY
         before = self.parent_doc.read_text()
-        with mock.patch.object(promote_showrunner, "retire") as retire, \
-                mock.patch.object(promote_showrunner, "restore_line") as restore:
+        with mock.patch.object(promote_showrunner, "retire", side_effect=OSError("disk full")):
             code, out, err = self.run_main()
         self.assertEqual((code, err), (1, ""))
         self.assertEqual(self.parent_doc.read_text(), before)
-        retire.assert_not_called()
-        restore.assert_not_called()
-        self.assertIn("session is open but not ready", out)
-        self.assertIn("showrunner prompt was not sent", out)
-        self.assertIn("herdr session attach child", out)
-        self.assertNotIn("add_unit.py", out)
-        self.assertNotIn("--resume", out)
-        self.assertTrue(self.events[-1].startswith("start"))
+        self.assertIn("its Units row was not retired and is owed: disk full.", out)
+        self.assertIn(f"/showrunner:produce {self.child_doc} resume", out)
 
     def test_prompted_showrunner_not_yet_attached_still_retires_the_units_row(self) -> None:
         self.started = 1

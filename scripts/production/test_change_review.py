@@ -48,6 +48,13 @@ PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
 DOC = str(PRODUCTION)
 
 
+def setUpModule() -> None:
+    """The pin on the row `show` printed goes to a temporary folder, never ~/.local/state/next."""
+    folder = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(folder.cleanup)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": folder.name}))
+
+
 class ParseTest(unittest.TestCase):
     def test_a_visible_line_a_none_line_and_a_malformed_line(self) -> None:
         self.assertEqual(change_review.entries(f"checkpoint(x): y\n\n{SEE}\nChange-Review: none — scripts only\n"
@@ -289,12 +296,56 @@ class ActionTest(unittest.TestCase):
                                                            "--row", "C76", "--change", "A", "--check", "B")[2])
         self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
 
-    def test_show_prints_only_the_first_row_to_review_and_reads_only(self) -> None:
+    def test_show_prints_only_the_first_row_to_review_and_leaves_the_list_as_it_is(self) -> None:
         self.assertEqual(run("show", "--list", str(self.path)), (0, (
             "C76 Panels keep shields\n  How to check: Launch Hana\n  Merged: 2026-10-14\n  On the Mac build: not yet\n\n"
             + "1 more to review\n"), ""))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), LIST)
         self.assertEqual(run("show", "--list", str(self.fresh)), (0, "nothing to review\n", ""))
         self.assertFalse(self.fresh.parent.exists())
+
+    def test_the_most_urgent_row_shows_first_and_the_shown_row_stays_until_its_verdict(self) -> None:
+        def add(*rank: str) -> str:
+            code, out, error = run("add", "--production", DOC, "--list", str(self.fresh), "--change", f"change {len(rank)}",
+                                   "--check", "B", "--see", "C", *rank)
+            self.assertEqual((code, error), (0, ""))
+            return out.strip()
+
+        def shown() -> str:
+            return run("show", "--list", str(self.fresh))[1].split(" ", 1)[0]
+
+        normal = add()
+        self.assertEqual(shown(), normal)
+        blocks = add("--urgency", "blocks")
+        soon = add("--urgency", "soon", "--due", "2026-10-22")
+        # The shown row stays current while a more urgent one waits.
+        self.assertEqual(shown(), normal)
+        text = self.fresh.read_text(encoding="utf-8")
+        self.assertLess(text.index(f"| {normal} |"), text.index(f"| {blocks} |"))
+        self.assertLess(text.index(f"| {blocks} |"), text.index(f"| {soon} |"))
+        self.assertIn(f"| {soon} | change 4 | ", text)
+        self.assertIn("| soon, due 2026-10-22 |", text)
+        _ = run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", normal, "--verdict", "works")
+        self.assertEqual(shown(), blocks)
+        # The user's mark takes the slot after the shown row.
+        self.assertEqual(run("mark-important", "--production", DOC, "--list", str(self.fresh), "--row", soon)[0], 0)
+        self.assertIn(f"| {soon} | change 4 |", self.fresh.read_text(encoding="utf-8"))
+        self.assertEqual(shown(), blocks)
+        _ = run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", blocks, "--verdict", "works")
+        self.assertEqual(shown(), soon)
+
+    def test_a_row_waits_for_its_prerequisite_and_a_bad_level_is_refused(self) -> None:
+        _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B", "--see", "C",
+                "--urgency", "blocks", "--after", "C77")
+        text = self.path.read_text(encoding="utf-8")
+        self.assertLess(text.index("| C77 |"), text.index("| C81 |"))
+        self.assertLess(text.index("| C81 |"), text.index("| C76 |"))
+        self.assertIn("| Urgency |\n| --- | --- | --- | --- | --- | --- |", text)
+        self.assertIn("| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana | |", text)
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
+                             "--see", "C", "--urgency", "soon")[0], 1)
+        self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
+                             "--see", "C", "--after", "later")[0], 1)
 
     def test_a_verdict_moves_the_row_to_the_top_of_reviewed(self) -> None:
         self.assertEqual(change_review.record_verdict(self.path, "C76", "Works, thanks", date(2026, 10, 15), PRODUCTION), "2026-10-14")

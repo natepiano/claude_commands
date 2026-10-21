@@ -27,11 +27,11 @@ function statusFixture(): StoredAccountsStatus {
   return { accounts: [
     { label: 'Low', tool: 'claude', roles: ['unit directors', 'showrunners'],
       weekly_left_percent: 9, resets_at: '2026-10-18T18:00:00+00:00', credits: 42,
-      use_credits: true, read_at: '2026-10-16T17:59:00+00:00' },
+      use_credits: true, read_ok: true, credits_in_use: true, read_at: '2026-10-16T17:59:00+00:00' },
     { label: 'Watch', tool: 'codex', roles: ['workers'],
-      weekly_left_percent: 24, resets_at: null, credits: 'unlimited', use_credits: false, read_at: null },
+      weekly_left_percent: 24, resets_at: null, credits: 'unlimited', use_credits: false, read_ok: false, credits_in_use: false, read_at: null },
     { label: 'Unknown', tool: 'claude', roles: [], weekly_left_percent: null,
-      resets_at: null, credits: null, use_credits: false, read_at: null },
+      resets_at: null, credits: null, use_credits: false, read_ok: false, credits_in_use: false, read_at: null },
   ], problems: ['Stored reading unavailable for one account.'] };
 }
 const OLD_HEADINGS = ['Login', 'Weekly left', 'Weekly resets', 'On credits', 'Credits left'];
@@ -39,64 +39,63 @@ const OLD_HEADINGS = ['Login', 'Weekly left', 'Weekly resets', 'On credits', 'Cr
 function readableFixture(): StoredAccountsStatus {
   return { accounts: [
     { label: 'Gamma', tool: 'claude', roles: ['workers'], weekly_left_percent: 74,
-      resets_at: '2026-10-24T18:00:00Z', credits: null, use_credits: false,
+      resets_at: '2026-10-24T18:00:00Z', credits: null, use_credits: false, read_ok: true, credits_in_use: false,
       read_at: '2026-10-16T17:55:00Z' },
     { label: 'beta', tool: 'codex', roles: ['workers'], weekly_left_percent: 20.2,
-      resets_at: '2026-10-17T18:00:00Z', credits: 13446.2, use_credits: false,
-      read_at: '2026-10-16T17:58:00Z' },
+      resets_at: '2026-10-17T18:00:00Z', credits: 13446.2, use_credits: false, read_ok: false, credits_in_use: false,
+      read_at: '2026-10-16T17:48:00Z' },
     { label: 'Echo', tool: 'claude', roles: ['showrunners', 'unit directors'], weekly_left_percent: null,
-      resets_at: null, credits: null, use_credits: false, read_at: null },
+      resets_at: null, credits: null, use_credits: false, read_ok: false, credits_in_use: false, read_at: null },
     { label: 'aLpha', tool: 'claude', roles: ['showrunners', 'unit directors'], weekly_left_percent: 60.4,
-      resets_at: '2026-10-16T18:00:00Z', credits: 'unlimited', use_credits: true,
-      read_at: '2026-10-16T17:59:00Z' },
+      resets_at: '2026-10-16T18:00:00Z', credits: 'unlimited', use_credits: true, read_ok: true, credits_in_use: true,
+      read_at: '2026-10-16T17:59:15Z' },
     { label: 'Foxtrot', tool: 'codex', roles: ['spare'], weekly_left_percent: 90,
-      resets_at: '2026-10-22T18:00:00Z', credits: null, use_credits: false,
+      resets_at: '2026-10-22T18:00:00Z', credits: null, use_credits: true, read_ok: true, credits_in_use: false,
       read_at: '2026-10-16T17:56:00Z' },
     { label: 'Charlie', tool: 'claude', roles: ['workers'], weekly_left_percent: 8.4,
-      resets_at: '2026-10-18T18:00:00Z', credits: null, use_credits: false,
-      read_at: '2026-10-16T17:57:00Z' },
+      resets_at: '2026-10-18T18:00:00Z', credits: null, use_credits: false, read_ok: true, credits_in_use: false,
+      read_at: '2026-10-16T16:00:00Z' },
     { label: 'Delta', tool: 'codex', roles: ['spare'], weekly_left_percent: 25,
-      resets_at: '2026-10-23T18:00:00Z', credits: null, use_credits: false,
-      read_at: '2026-10-16T17:54:00Z' },
+      resets_at: '2026-10-23T18:00:00Z', credits: null, use_credits: false, read_ok: true, credits_in_use: false,
+      read_at: '2026-10-13T18:00:00Z' },
   ], problems: [
     'Stored weekly reading is unavailable for the spare account; keep its previous assignment until another reading arrives.',
     'The role cache has an old showrunner assignment that needs refreshing before the next production starts.',
   ] };
 }
-// Literal cell positions and lines from the phase 19 spec; no renderer-derived expectations.
+// Literal cells from the phase 20 shared-table spec; no renderer-derived expectations.
 const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
-  120: [
-    '   Label    Roles                        Left     Resets  Credits            Read',
-    '●  aLpha    showrunners, unit directors   60%      14:00  unlimited in use  13:59',
-    '●  beta     workers                       20%  Sat 14:00  13,446            13:58',
-    '●  Charlie  workers                        8%  Sun 14:00                    13:57',
-    '●  Delta    spare                         25%     23 Oct                    13:54',
+  140: [
+    '   account  role                         left     resets    credits  enabled  in use  read',
+    '●  aLpha    showrunners, unit directors   60%      14:00  unlimited  yes      yes      45s',
+    '●  beta     workers                       20%  Sat 14:00     13,446                    12m',
+    '●  Charlie  workers                        8%  Sun 14:00                                2h',
+    '●  Delta    spare                         25%     23 Oct                                3d',
     '●  Echo     showrunners, unit directors     —',
-    '●  Foxtrot  spare                         90%  Thu 14:00                    13:56',
-    '●  Gamma    workers                       74%     24 Oct                    13:55',
+    '●  Foxtrot  spare                         90%  Thu 14:00             yes                4m',
+    '●  Gamma    workers                       74%     24 Oct                                5m',
     '',
     'Problems',
-    '• Stored weekly reading is unavailable for the spare account; keep its previous assignment until another reading',
-    '  arrives.',
+    '• Stored weekly reading is unavailable for the spare account; keep its previous assignment until another reading arrives.',
     '• The role cache has an old showrunner assignment that needs refreshing before the next production starts.',
   ],
   60: [
-    '   Label    Roles                        Left',
-    '     Resets  Credits            Read',
+    '   account  role                         left',
+    '     resets    credits  enabled  in use  read',
     '●  aLpha    showrunners, unit directors   60%',
-    '      14:00  unlimited in use  13:59',
+    '      14:00  unlimited  yes      yes      45s',
     '●  beta     workers                       20%',
-    '  Sat 14:00  13,446            13:58',
+    '  Sat 14:00     13,446                    12m',
     '●  Charlie  workers                        8%',
-    '  Sun 14:00                    13:57',
+    '  Sun 14:00                                2h',
     '●  Delta    spare                         25%',
-    '     23 Oct                    13:54',
+    '     23 Oct                                3d',
     '●  Echo     showrunners, unit directors     —',
     '',
     '●  Foxtrot  spare                         90%',
-    '  Thu 14:00                    13:56',
+    '  Thu 14:00             yes                4m',
     '●  Gamma    workers                       74%',
-    '     24 Oct                    13:55',
+    '     24 Oct                                5m',
     '',
     'Problems',
     '• Stored weekly reading is unavailable for the spare',
@@ -109,26 +108,27 @@ const TABLE_DRAWN_LINES: Record<number, readonly string[]> = {
     '● aLpha  showrunners, unit',
     '  directors',
     '  60% left · resets 14:00',
-    '  credits unlimited in use',
-    '  read 13:59',
+    '  credits unlimited · enabled',
+    '  in use · read 45s ago',
     '● beta  workers',
     '  20% left · resets Sat 14:00',
-    '  credits 13,446 · read 13:58',
+    '  credits 13,446',
+    '  read 12m ago',
     '● Charlie  workers',
     '  8% left · resets Sun 14:00',
-    '  read 13:57',
+    '  read 2h ago',
     '● Delta  spare',
     '  25% left · resets 23 Oct',
-    '  read 13:54',
+    '  read 3d ago',
     '● Echo  showrunners, unit',
     '  directors',
-    '  no reading',
+    '  — left',
     '● Foxtrot  spare',
     '  90% left · resets Thu 14:00',
-    '  read 13:56',
+    '  enabled · read 4m ago',
     '● Gamma  workers',
     '  74% left · resets 24 Oct',
-    '  read 13:55',
+    '  read 5m ago',
     '',
     'Problems',
     '• Stored weekly reading is',
@@ -315,7 +315,7 @@ function hasSensitivePath(paths: readonly string[]) {
 }
 describe('accounts table', () => {
   for (const surface of ['terminal', 'desktop'] as const) {
-    for (const columns of [120, 60, 30]) {
+    for (const columns of [140, 60, 30]) {
       test(`${surface}: exact table form at ${columns} cells keeps every fact and problem`, async ($, on) => {
         const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
         const data = readableFixture();
@@ -339,8 +339,8 @@ describe('accounts table', () => {
           expect(labels.length).toBeGreaterThan(0);
           expect(labels.every(span => span.bold && span.color === 'default')).toBe(true);
         }
-        for (const heading of ['Label', 'Roles', 'Left', 'Resets', 'Credits', 'Read']) {
-          const headings = spans.filter(span => span.text.includes(heading));
+        for (const heading of ['account', 'role', 'left', 'resets', 'credits', 'enabled', 'in use', 'read']) {
+          const headings = spans.filter(span => span.bold && span.text.trim() === heading);
           expect(headings.length).toBe(columns === 30 ? 0 : 1);
           expect(headings.every(span => span.bold && span.color === 'default')).toBe(true);
         }
@@ -364,14 +364,14 @@ describe('accounts table', () => {
     const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
     fake.replace(readableFixture());
     await $.command.run(command());
-    for (const columns of [120, 60]) {
+    for (const columns of [140, 60]) {
       const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface: 'terminal',
         props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
       const header = lines[0]!;
-      expect(header.indexOf('Label')).toBe(3);
-      expect(header.indexOf('Roles')).toBe(12);
-      expect(header.indexOf('Left')).toBe(41);
+      expect(header.indexOf('account')).toBe(3);
+      expect(header.indexOf('role')).toBe(12);
+      expect(header.indexOf('left')).toBe(41);
       const firstRows = lines.filter(line => line.startsWith('● '));
       for (const [i, row] of firstRows.entries()) {
         expect(row.indexOf(LABELS[i]!)).toBe(3);
@@ -380,21 +380,25 @@ describe('accounts table', () => {
         expect(row.slice(41, 45).trim()).toBe(['60%', '20%', '8%', '25%', '—', '90%', '74%'][i]);
         expect(row[44]).toBe(i === 4 ? '—' : '%');
       }
-      const detail = columns === 120 ? firstRows : LABELS.map((_, i) => lines[3 + i * 2]!);
-      const resetStart = columns === 120 ? 47 : 2;
-      const creditStart = columns === 120 ? 58 : 13;
-      const readStart = columns === 120 ? 76 : 31;
+      const detail = columns === 140 ? firstRows : LABELS.map((_, i) => lines[3 + i * 2]!);
+      const resetStart = columns === 140 ? 47 : 2;
+      const creditStart = columns === 140 ? 58 : 13;
+      const enabledStart = columns === 140 ? 69 : 24;
+      const inUseStart = columns === 140 ? 78 : 33;
+      const readStart = columns === 140 ? 86 : 41;
       for (const [i, row] of detail.entries()) {
         expect(row.slice(resetStart, resetStart + 9).trim()).toBe(['14:00', 'Sat 14:00', 'Sun 14:00', '23 Oct', '', 'Thu 14:00', '24 Oct'][i]);
-        expect(row.slice(creditStart, creditStart + 16).trim()).toBe(i === 0 ? 'unlimited in use' : i === 1 ? '13,446' : '');
-        expect(row.slice(readStart, readStart + 5).trim()).toBe(['13:59', '13:58', '13:57', '13:54', '', '13:56', '13:55'][i]);
+        expect(row.slice(creditStart, creditStart + 9).trim()).toBe(i === 0 ? 'unlimited' : i === 1 ? '13,446' : '');
+        expect(row.slice(enabledStart, enabledStart + 7).trim()).toBe(i === 0 || i === 5 ? 'yes' : '');
+        expect(row.slice(inUseStart, inUseStart + 6).trim()).toBe(i === 0 ? 'yes' : '');
+        expect(row.slice(readStart, readStart + 4).trim()).toBe(['45s', '12m', '2h', '3d', '', '4m', '5m'][i]);
       }
       await ui.unmount();
     }
   });
 
-  for (const columns of [120, 60]) {
-    test(`the whole list omits Credits at ${columns} cells when no balance exists`, async ($, on) => {
+  for (const columns of [140, 60]) {
+    test(`all columns remain at ${columns} cells when no balance exists`, async ($, on) => {
       const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
       const data = readableFixture();
       data.accounts = data.accounts.map(account => ({ ...account, credits: null }));
@@ -404,11 +408,11 @@ describe('accounts table', () => {
       const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane', surface: 'terminal',
         props: { ...props, bodyColumns: columns } });
       const lines = rowLines(await ui.drawn());
-      // Removing Credits reduces the full table to 63 cells: 60 still uses two rows.
-      expect(lines.slice(0, columns === 120 ? 1 : 2).join(' ').trim().split(/\s+/))
-        .toEqual(['Label', 'Roles', 'Left', 'Resets', 'Read']);
-      expect(lines.join(' ')).not.toContain('Credits');
-      expect(lines.join(' ')).not.toContain('in use');
+      // Empty balances do not remove a column or hide the independent switches.
+      expect(lines.slice(0, columns === 140 ? 1 : 2).join(' ').trim().split(/\s+/))
+        .toEqual(['account', 'role', 'left', 'resets', 'credits', 'enabled', 'in', 'use', 'read']);
+      expect(lines.join(' ')).toContain('credits');
+      expect(lines.join(' ')).toContain('in use');
       expect(lines.filter(line => line.startsWith('● '))).toHaveLength(7);
     });
   }
@@ -429,7 +433,7 @@ describe('accounts table', () => {
     expect(lines.join('')).not.toContain('…');
   });
 
-  test('dots and weekly values use thresholds, while labels, roles and time values keep the default tone', async ($, on) => {
+  test('access marks are independent of quota and only quota cells use low-quota tones', async ($, on) => {
     const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
     const data = readableFixture();
     data.problems = [];
@@ -437,31 +441,29 @@ describe('accounts table', () => {
     await $.command.run(command());
     const ui = await mount($);
     const tree = await ui.drawn();
-    expect(textInColor(tree, 'error').replace(/\s/g, '')).toBe('●8%');
-    expect(textInColor(tree, 'warning').replace(/\s/g, '')).toBe('inuse●20%');
-    expect(textInColor(tree, 'success').replace(/\s/g, '')).toBe('●●●●');
-    const inactive = textInColor(tree, 'inactive');
-    expect(inactive).toContain('●');
-    expect(inactive.replace(/resets|credits|read| · |●|\s/g, '')).toBe('');
+    expect(textInColor(tree, 'error').replace(/\s/g, '')).toBe('●8%●');
+    expect(textInColor(tree, 'warning').replace(/\s/g, '')).toBe('yes20%');
+    expect(textInColor(tree, 'success').replace(/\s/g, '')).toBe('●●●●●');
+    expect(textInColor(tree, 'inactive')).not.toContain('●');
     const ordinary = textInColor(tree, 'default');
     for (const fact of ['60%', '25%', '90%', '74%', '—',
-      'showrunners, unit directors', 'workers', 'spare', 'unlimited', '13,446', '14:00', '13:59', '24 Oct']) {
+      'showrunners, unit directors', 'workers', 'spare', 'unlimited', '13,446', '14:00', '45s', '24 Oct']) {
       expect(ordinary).toContain(fact);
     }
   });
 
-  test('the exact ten and twenty-five percent boundaries choose warning and success', async ($, on) => {
+  test('quota boundaries color the left cell without recoloring accessible marks', async ($, on) => {
     const fake = accountsHost(on);
     const data = statusFixture();
     data.accounts = [9, 10, 24, 25].map(value => ({ ...data.accounts[0]!, label: `Level ${value}`,
-      weekly_left_percent: value, credits: null, use_credits: false }));
+      weekly_left_percent: value, credits: null, use_credits: false, credits_in_use: false }));
     data.problems = [];
     fake.replace(data);
     await $.command.run(command());
     const tree = await (await mount($)).drawn();
-    expect(textInColor(tree, 'error').replace(/\s/g, '')).toBe('●9%');
-    expect(textInColor(tree, 'warning').replace(/\s/g, '')).toBe('●10%●24%');
-    expect(textInColor(tree, 'success').trim()).toBe('●');
+    expect(textInColor(tree, 'error').replace(/\s/g, '')).toBe('9%');
+    expect(textInColor(tree, 'warning').replace(/\s/g, '')).toBe('10%24%');
+    expect(textInColor(tree, 'success').replace(/\s/g, '')).toBe('●●●●');
     expect(textInColor(tree, 'default')).toContain('25%');
   });
 
@@ -472,14 +474,14 @@ describe('accounts table', () => {
     ['2026-10-09T18:00:00Z', '9 Oct'],
     ['2026-10-24T18:00:00Z', '24 Oct'],
   ] as const) {
-    test(`short reset and read times in the resolved zone render ${at} as ${expected}`, async ($, on) => {
+    test(`short reset times in the resolved zone render ${at} as ${expected}`, async ($, on) => {
       const fake = accountsHost(on, [], { USER_ZONE: 'America/New_York' });
-      const account = { ...statusFixture().accounts[0]!, resets_at: at, read_at: at };
+      const account = { ...statusFixture().accounts[0]!, resets_at: at };
       fake.replace({ accounts: [account], problems: [] });
       await $.command.run(command());
       const rows = rowLines(await (await mount($)).drawn());
-      expect(rows[0]!.trim().split(/\s+/)).toEqual(['Label', 'Roles', 'Left', 'Resets', 'Credits', 'Read']);
-      expect(rows[1]!.split(expected)).toHaveLength(3);
+      expect(rows[0]!.trim().split(/\s+/)).toEqual(['account', 'role', 'left', 'resets', 'credits', 'enabled', 'in', 'use', 'read']);
+      expect(rows[1]!.split(expected)).toHaveLength(2);
     });
   }
 
@@ -492,14 +494,63 @@ describe('accounts table', () => {
     await $.command.run(command());
     const tree = await (await mount($)).drawn();
     expect(rowLines(tree)).toEqual([
-      '   Label    Roles  Left  Resets  Credits  Read',
-      '●  Invalid            —',
-      '●  Unknown            —',
-      '●  Zero              0%          0',
+      '   account  role  left  resets  credits  enabled  in use  read',
+      '●  Invalid           —                   yes',
+      '●  Unknown           —',
+      '●  Zero             0%                0',
     ]);
     const text = rowLines(tree).join(' ');
-    for (const missing of ['no reading', 'in use', 'null', 'undefined', 'Problems']) expect(text).not.toContain(missing);
+    for (const missing of ['no reading', 'null', 'undefined', 'Problems']) expect(text).not.toContain(missing);
   });
+
+  for (const columns of [140, 60, 30]) {
+    for (const [ageSeconds, expected] of [
+      [45.9, '45s'], [59.999, '59s'], [60, '1m'], [779.9, '12m'],
+      [3599.9, '59m'], [3600, '1h'], [10799.9, '2h'],
+      [86399.9, '23h'], [86400, '1d'], [345599.9, '3d'],
+    ] as const) {
+      test(`${columns} cells: read age floors ${ageSeconds}s to ${expected}`, async ($, on) => {
+        const fake = accountsHost(on);
+        const account = { ...statusFixture().accounts[0]!,
+          read_at: new Date(NOW - ageSeconds * 1000).toISOString() };
+        fake.replace({ accounts: [account], problems: [] });
+        await $.command.run(command());
+        const ui = await $.ui.mount({ plugin: 'unit-board', requestId: 'accounts-board', component: 'Pane',
+          surface: 'terminal', props: { ...props, bodyColumns: columns } });
+        const lines = rowLines(await ui.drawn());
+        if (columns === 30) expect(normalized(lines)).toContain(`read ${expected} ago`);
+        else expect(lines.at(-1)?.trim().split(/\s+/).at(-1)).toBe(expected);
+        for (const line of lines) expect(cellWidth(line)).toBeLessThanOrEqual(columns);
+      });
+    }
+  }
+
+  test('display projection carries independent access and spending booleans', () => {
+    const enabled = accountDisplay(readableFixture().accounts.find(account => account.label === 'Foxtrot')!);
+    expect([enabled.readOk, enabled.creditsInUse, enabled.useCredits]).toEqual([true, false, true]);
+    const spending = accountDisplay(readableFixture().accounts.find(account => account.label === 'aLpha')!);
+    expect([spending.readOk, spending.creditsInUse, spending.useCredits]).toEqual([true, true, true]);
+  });
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`${surface}: older JSON without either signal keeps a red mark and blank in use`, async ($, on) => {
+      const fake = accountsHost(on);
+      const { read_ok: _access, credits_in_use: _spending, ...legacy } = statusFixture().accounts[0]!;
+      // Deliberately exercise the untyped process-JSON boundary of an older producer.
+      fake.replace({ accounts: [{ ...legacy, weekly_left_percent: 80 }], problems: [] } as unknown as StoredAccountsStatus);
+      await $.command.run(command());
+      const tree = await (await mount($, surface)).drawn();
+      expect(textInColor(tree, 'error').replace(/\s/g, '')).toBe('●');
+      expect(textInColor(tree, 'success').trim()).toBe('');
+      expect(textInColor(tree, 'warning').trim()).toBe('');
+      const lines = rowLines(tree);
+      const inUse = lines[0]!.indexOf('in use');
+      expect(inUse).toBeGreaterThan(0);
+      expect(lines[1]!.slice(inUse, inUse + 6).trim()).toBe('');
+      const display = accountDisplay(legacy as StoredAccountsStatus['accounts'][number]);
+      expect([display.readOk, display.creditsInUse]).toEqual([false, false]);
+    });
+  }
 
   test('the display projection drops a legacy login address', () => {
     const account = legacyLoginFixture().accounts[0]!;
@@ -570,7 +621,7 @@ describe('accounts pane', () => {
       const ui = await mount($);
       const text = drawnText(await ui.drawn());
       expect(text.includes('03:00')).toBe(true);
-      expect(text.includes('02:59')).toBe(true);
+      expect(text.includes('1m')).toBe(true);
       expect(fake.fs.includes(config === 'override' ? '/test-zone.conf' : `${HOME}/.claude/config/user_zone.conf`)).toBe(true);
       expect(fake.accountRuns()).toEqual([ARGV]);
     });
@@ -584,7 +635,7 @@ describe('accounts pane', () => {
     const ui = await mount($);
     const text = drawnText(await ui.drawn());
     expect(text.includes('14:00')).toBe(true);
-    expect(text.includes('13:59')).toBe(true);
+    expect(text.includes('1m')).toBe(true);
   });
 
   test('an environment zone overrides the stored zone without reading its file', async ($, on) => {
@@ -594,7 +645,7 @@ describe('accounts pane', () => {
     const ui = await mount($);
     const text = drawnText(await ui.drawn());
     expect(text.includes('18:00')).toBe(true);
-    expect(text.includes('17:59')).toBe(true);
+    expect(text.includes('1m')).toBe(true);
     expect(fake.fs.includes(`${HOME}/.claude/config/user_zone.conf`)).toBe(false);
   });
 
@@ -807,7 +858,7 @@ describe('accounts pane', () => {
       await fake.clock.advance(10_000);
       const text = drawnText(await ui.drawn());
       expect(fake.accountStateKind()).toBe('accounts');
-      expect(text.includes('Left')).toBe(true);
+      expect(text.includes('left')).toBe(true);
       expect(text.includes('9%')).toBe(true);
       for (const heading of OLD_HEADINGS) expect(text.includes(heading)).toBe(false);
       expect(fake.accountRuns().every(argv => JSON.stringify(argv) === JSON.stringify(ARGV))).toBe(true);

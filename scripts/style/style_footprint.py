@@ -1430,6 +1430,140 @@ def local_binding_is_safe(old: tuple[Token, ...], new: tuple[Token, ...], index:
     return True
 
 
+@dataclass(frozen=True)
+class ParameterBody:
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class BodylessFunction:
+    pass
+
+
+@dataclass(frozen=True)
+class FunctionParameters:
+    function: int
+    start: int
+    end: int
+    parameters: tuple[tuple[int, int], ...]
+    body: ParameterBody | BodylessFunction
+
+
+def function_parameters(source: tuple[Token, ...]) -> tuple[FunctionParameters, ...]:
+    """Read named function parameters outside attributes and macro token trees."""
+    words = tuple(token.value for token in source)
+    ends = delimiter_ends(words)
+    excluded = list(attribute_spans(words))
+    for index, word in enumerate(words):
+        if word == "!":
+            begin = index + 2 if index and words[index - 1] == "macro_rules" else index + 1
+            if begin in ends:
+                excluded.append((index, ends[begin] + 1))
+    result: list[FunctionParameters] = []
+    for index, word in enumerate(words[:-1]):
+        if word != "fn" or not IDENTIFIER.fullmatch(words[index + 1]) or any(
+            start <= index < end for start, end in excluded
+        ):
+            continue
+        cursor = index + 2
+        if cursor < len(words) and words[cursor] == "<":
+            depth = 1
+            cursor += 1
+            while cursor < len(words) and depth:
+                if words[cursor] in {"{", ";"}:
+                    break
+                depth += (words[cursor] == "<") - (words[cursor] == ">")
+                cursor += 1
+            if depth:
+                continue
+        if cursor not in ends or words[cursor] != "(":
+            continue
+        start, end = cursor, ends[cursor]
+        parameters: list[tuple[int, int]] = []
+        begin, cursor, depth = start + 1, start + 1, 0
+        while cursor < end:
+            if cursor in ends:
+                cursor = ends[cursor] + 1
+                continue
+            depth += (words[cursor] == "<") - (words[cursor] == ">")
+            if words[cursor] == "," and depth == 0:
+                parameters.append((begin, cursor))
+                begin = cursor + 1
+            cursor += 1
+        if depth:
+            continue
+        if begin < end:
+            parameters.append((begin, end))
+        cursor, depth = end + 1, 0
+        while cursor < len(words):
+            word = words[cursor]
+            if not depth and word in {"{", ";", "}"}:
+                break
+            depth += (word == "<") - (word == ">")
+            if depth < 0:
+                break
+            cursor = ends[cursor] + 1 if cursor in ends else cursor + 1
+        if cursor == len(words) or depth or words[cursor] == "}":
+            continue
+        if words[cursor] == ";":
+            body = BodylessFunction()
+        elif cursor in ends:
+            body = ParameterBody(cursor + 1, ends[cursor])
+        else:
+            continue
+        result.append(FunctionParameters(index, start, end, tuple(parameters), body))
+    return tuple(result)
+
+
+def prove_parameter_erasures(old: tuple[Token, ...], new: tuple[Token, ...]) -> tuple[TokenRewrite, ...]:
+    if len(old) != len(new):
+        return ()
+    following = {item.function: item for item in function_parameters(new)}
+    result: list[TokenRewrite] = []
+    for item in function_parameters(old):
+        revised = following.get(item.function)
+        if revised is None or (item.start, item.end, item.parameters) != (
+            revised.start, revised.end, revised.parameters
+        ) or old[item.function:item.start] != new[item.function:revised.start]:
+            continue
+        for start, end in item.parameters:
+            name = old[start].value
+            if not re.fullmatch(r"_[A-Za-z_0-9]+", name) or new[start].value != "_" or (
+                start + 1 >= end or old[start + 1].value != ":" or old[start + 1:end] != new[start + 1:end]
+            ):
+                continue
+            capture = re.compile(r"\{" + re.escape(name) + r"(?=[}:])")
+            bodies = tuple(source[body.start:body.end] for source, body in (
+                (old, item.body), (new, revised.body),
+            ) if isinstance(body, ParameterBody))
+            if any((token.kind == "identifier" and token.value.removeprefix("r#") == name) or (
+                       token.kind == "literal" and (
+                           capture.search(token.value) or ("\\" in token.value and "{" in token.value)
+                       )
+                   )
+                   for body in bodies for token in body):
+                continue
+            result.append(TokenRewrite(start, start + 1, (new[start],)))
+    return tuple(result)
+
+
+def erase_proven_parameters(change: FileChange) -> FileChange:
+    """Remove only proved name erasures before the existing semantic checks."""
+    erasures = prove_parameter_erasures(tokens(change.before), tokens(change.after))
+    if not erasures:
+        return change
+    spans = token_spans(change.before)
+    if not spans:
+        return change
+    before = change.before
+    for rewrite in reversed(erasures):
+        span = spans[rewrite.start]
+        before = before[:span.start] + "_" + before[span.end:]
+    patch = "\n".join(difflib.unified_diff(before.splitlines(), change.after.splitlines(), n=0, lineterm=""))
+    return FileChange(change.status, change.old_path, change.path, before, change.after, parse_hunks(patch))
+
+
 def enum_name_is_unique(originals: dict[str, str], owned: dict[str, str], enum: str) -> bool:
     kinds = {"struct", "enum", "union", "type", "trait", "const", "static", "mod", "fn"}
     for revised in (False, True):
@@ -1687,7 +1821,8 @@ def changed_text_without_lint_attributes(change: FileChange, proof: LintAttribut
 
 def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
     reasons: list[str] = []
-    proofs = normalizations(finding.changes, before)
+    semantic_changes = {change.path: erase_proven_parameters(change) for change in finding.changes}
+    proofs = normalizations(tuple(semantic_changes.values()), before)
     if len(finding.changes) > 10 or len({before.crate(change.path) for change in finding.changes}) > 1:
         if any(tokens(change.before) != tokens(change.after) for change in finding.changes):
             reasons.append("check 4: rename exceeds one crate or 10 files")
@@ -1695,6 +1830,7 @@ def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
         if sum(len(hunk.removed) + len(hunk.added) for hunk in change.hunks) >= FILE_CHANGED_LINE_LIMIT:
             reasons.append(f"check 5: {change.path}: {FILE_CHANGED_LINE_LIMIT} or more changed lines (size only)")
         proof = proofs[change.path]
+        semantic_change = semantic_changes[change.path]
         lines = changed_text_without_lint_attributes(change, proof.lint_attributes)
         words = {token.value for token in tokens(lines)}
         lint_only = bool(proof.lint_attributes.before) and rewrite_tokens(
@@ -1703,16 +1839,16 @@ def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
         if change.status is not FileStatus.MODIFIED or ("mod" in words and not lint_only):
             reasons.append("check 1: file or module layout changes")
         glob_reexported = before.has_public_glob(before.crate(change.path))
-        public_before = shapes(change.before, True, glob_reexported=glob_reexported)
+        public_before = shapes(semantic_change.before, True, glob_reexported=glob_reexported)
         public_after = shapes(change.after, True, glob_reexported=glob_reexported)
         if before.externally_reachable(change.path) and public_before != public_after:
             reasons.append("check 2: externally reachable item changes")
-        normalized = normalized_source(change, proof)
+        normalized = normalized_source(semantic_change, proof)
         if shapes(" ".join(token.value for token in normalized), False) != shapes(change.after, False):
             reasons.append("check 3: type, fields, variants, generics or trait impl changes")
-        if flagged_hunks(change, proof):
+        if flagged_hunks(semantic_change, proof):
             reasons.append("check 6: condition, literal or control flow flagged")
-        if changes_macro_invocation(change):
+        if changes_macro_invocation(semantic_change):
             reasons.append("check 6: macro invocation requires review")
         if documented_text(change.before) != documented_text(change.after) or re.search(r"#\s*\[\s*(?:serde|reflect)|\brename\s*=", lines):
             reasons.append("check 6: serialized, reflected, configured or documented name flagged")

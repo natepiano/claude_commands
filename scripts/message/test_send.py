@@ -1205,6 +1205,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             send.template_fix_notice(record)
             launch.assert_called_once()
 
+    def test_a_user_specified_template_gets_no_fix_notice(self) -> None:
+        record: dict[str, object] = {"text_id": "nate.adhoc", "title": "natedev it is ready", "body": "It is ready.\n\nadhoc",
+                                     "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
+        with mock.patch.object(subprocess, "Popen") as launch:
+            send.template_fix_notice(record)
+            launch.assert_not_called()
+
     def test_template_fix_launch_failure_does_not_change_a_successful_registry_delivery(self) -> None:
         record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "action": "Choose retry.", "body": "The work stopped.", "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
         message = send.Message("user", "script", "Choose an account", "The work stopped.", None)
@@ -1373,6 +1380,19 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertFalse(self.failure_marker().exists())
             self.assertEqual(self.log()[-1]["outcome"], "replaced")
         self.assertEqual(send.pending("user"), "")
+
+    def test_a_push_kept_during_silence_reports_kept_locally_and_remotely_without_a_fallback(self) -> None:
+        self.writer_session()
+        detail = "for the user: silence until 07:00 EDT; it goes out when silence ends"
+        for extra, reply, printed in (([], 'pushover: reviewed JSON: {}\npushover: kept: silence until 07:00 EDT\n', "KEPT: " + detail),
+                                      (["--machine", "natedev"], "KEPT: " + detail + "\n", "KEPT: on natedev: " + detail)):
+            with (self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, reply, "")),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
+            self.assertEqual(output.getvalue(), printed + "\n")
+            self.assertEqual(errors.getvalue(), "")
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "kept")
 
     def test_only_a_named_session_without_from_is_answerable(self) -> None:
         self.writer_session()

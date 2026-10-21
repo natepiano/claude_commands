@@ -19,20 +19,30 @@ usage line and stop.
 Change, proposal and question run in the showrunner session. Efficiency runs
 in any session.
 
+Order: every queue shows the most useful item first, by
+`~/.claude/scripts/lib/urgency.py`. First what the user called important (the
+newest mark first), then what blocks work, then what is due soon (soonest
+first), then normal, then later. Inside a level: the higher value first, then
+the oldest. An item with a prerequisite comes after it. The item shown stays
+current until it has its answer, also when a more urgent item arrives.
+
+When the user calls an item important, mark it: `mark-important` on its
+queue's script (below).
+
 ## change
 
 The next change for the user to check, from the top-level showrunner's change
-review list. Run `/change_review` → show; it prints the first row still to
-review. Say what changed, how to try it and what the user sees, in plain words.
+review list. Run `/change_review` → show; it prints the current row.
+Mark: `change_review.py mark-important --row C<n>`. Say what changed, how to try it and what the user sees, in plain words.
 Record the user's verdict through `/change_review` → verdict.
 
 ## proposal
 
-The next proposal waiting for the user's review. Run `/showrunner:proposals`
-and take the first row whose State is `waiting for your review`; with none,
-say `no proposal is waiting for your review`. Read the proposal in full: an
-issue is `<title without its P number>.md` in the folder the production doc's `Proposals` line
-names, and a plan backlog line names its file. Lead with its P number and
+The next proposal waiting for the user's review. Run `"$HOME/.claude/scripts/lib/py"
+"$HOME/.claude/scripts/production/proposals_table.py" --next`; it prints the
+proposal and its file, or `no proposal is waiting for your review`. Read the
+proposal in full: an issue is that file, and a plan backlog line in the
+ledger names its file. Mark: `proposal_issue.py mark-important <issue>`. Lead with its P number and
 title, then say what it changes and why in plain words, then its proposed
 ranking values in one plain-text line. Record
 the user's answer through `/showrunner:proposal`.
@@ -44,9 +54,10 @@ The open nightly-review proposal with the largest measured gain. Run
 
 ## question
 
-The oldest open question that is due. Run `python3
-~/.claude/scripts/production/update_registration.py open --production
-PRODUCTION_DOC` and take its item 1 only; with none, say `no question is
-open`. Ask it in full: what is asked, why, and the answer choices. Act on the
+The current open question. Run `python3
+~/.claude/scripts/production/update_registration.py next --production
+PRODUCTION_DOC`; it prints one item, or `no question is open`. Mark:
+`update_registration.py mark-important --production PRODUCTION_DOC --item
+"<its text>"`. Ask it in full: what is asked, why, and the answer choices. Act on the
 user's answer as `/showrunner:produce` → Throughout says, and remove the item
 through its Open-questions list.
