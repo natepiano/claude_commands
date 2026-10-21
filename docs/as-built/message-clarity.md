@@ -22,7 +22,7 @@ The user wanted every message sent to them to be checked for clarity by an agent
 
 - A tag filter always includes `all`. That gives 11 rules for `push,all`, 8 for `question,all` and 7 for `reply,all`.
 - The loader is `zsh ~/.claude/scripts/ux_style/load-ux-style.sh --guide <dir> [--tags t1,t2] [--checklist]`, the same loader the UX guide uses. It prints each rule body, then a `=== UX_CHECKLIST ===` block with one `stem — title — test` line per rule. The header name only matters for display.
-- `commands/message_style.md` runs the loader on the whole guide and confirms the rule count. `/alert_user`, `/message`, `/message_review`, `/build:report`, `/fix` and the `<Notify>` section of `commands/showrunner/produce.md` load it before their first message to the user in a session.
+- `commands/message_style.md` runs the loader on the whole guide and confirms the rule count. `/alert_user`, `/message`, `/message_review`, `/build:report` and the `<Notify>` section of `commands/showrunner/produce.md` load it before their first message to the user in a session.
 - Push form:
   - The first line is `Action: <what the user does>` or `No action needed.`, with an optional `Session: <name>` line above it. Every order rule in the guide applies after these lines.
   - The title is under 45 characters, names what is at stake and has no fixed prefix.
