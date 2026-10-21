@@ -4,7 +4,24 @@ description: Ask a gpt-6-astra Codex reviewer, on the current workers account, t
 
 # astra_review
 
-**Usage:** `/astra_review <document path> [focus text]`
+<Guild>
+
+Your guild is `reviewers`. Your head is the `reviewers` unit director in the top-level `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/reviewers/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `reviewers`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
+
+Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
+
+Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+
+**Usage:** `/astra_review [--run-directory <dir> --phase <id>] <document path> [focus text]`
+
+A holder passes both flags before the document for phase work; omit both for a
+standalone review. Consume both flags and their values before Step 1 reads the
+document path. Pass these flags to `astra_review.py` in Step 2. For exit 2 in
+Step 3, report an `astra_review:` line naming a phase or the tips baseline as
+that line; do not report a missing document for these errors. The script
+loads the reviewers block and tip text into the worker prompt and saves the
+assignment header. A Codex holder relays a guild report in the reply unchanged.
+</Guild>
 
 One Codex turn with gpt-6-astra at reasoning xhigh reads the document read-only
 and reviews it: clarity, correctness, gaps, risks and what it would change, with
