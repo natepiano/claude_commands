@@ -15,7 +15,8 @@ Verbs:
   start      [--session-dir D --to NAME] [--director-dir D] [--label L]
              [--done-message-file F] -- command...
              Write the run record, spawn its supervisor and return at once. Exit 3 when the
-             caller is not a mesh worker, so the caller runs the command attached.
+             caller is not a mesh worker, so the caller runs the command attached. NAME may be
+             the seat's role, the last part of its roster name; the record keeps the roster name.
   supervise  <record>
              Run the command, wait for it, deliver its result, then mark the record finished.
 
@@ -32,6 +33,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -60,6 +62,13 @@ RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
 SEND_TIMEOUT_SECS = 120
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
+# places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
+# Worker cargo builds ran at the panes' weight in herdr-agents.service (2026-10-20). The scope
+# writes the marker just before the command starts; a marker missing after the scope exits proves
+# the scope never ran it (no user manager, a systemd that rejects an option), so the command runs
+# plainly. BUILDLOG_SCOPE=0 turns the scope off, as it does for invoke.sh.
+SCOPE_SCRIPT = ': > "$0" || exit 125; exec "$@"'
 
 
 class RunRecord(TypedDict):
@@ -147,6 +156,18 @@ def _read_record(path: Path) -> RunRecord:
     return cast(RunRecord, cast(object, raw))
 
 
+def seat_name(session_dir: str, name: str) -> str:
+    """The roster's name for the seat `--to` names. A seat may call itself by its role, the last
+    part of its roster name: on 2026-10-20 tool-based-ui-trunk-box started five runs with `--to box`,
+    no roster entry matched at delivery, and each result was lost. A name the roster does not hold,
+    such as a reviewer that registers after its run starts, stays as given."""
+    roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+    if name in roster:
+        return name
+    matches = [seat for seat in roster if seat.endswith(f"-{name}")]
+    return matches[0] if len(matches) == 1 else name
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
@@ -165,6 +186,8 @@ def command_start(args: argparse.Namespace) -> int:
         if isinstance(caller, NotMeshWorker):
             return NOT_A_MESH_WORKER
         session_dir, name, thread_id = caller.session_dir, caller.name, caller.thread_id
+    else:
+        name = seat_name(session_dir, name)
     label = str(getattr(args, "label", "") or "") or " ".join(command)
     done_file = str(getattr(args, "done_message_file", "") or "")
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
@@ -246,7 +269,13 @@ def send_to_director(session_id: str, summary: str, text: str) -> bool:
 
 
 def _director_sessions(record: RunRecord) -> list[str]:
-    return codex_mesh._marker_sessions(RUN_ROOTS, Path(record["director_dir"]))  # pyright: ignore[reportPrivateUsage]
+    """The sessions whose run marker names the run folder, then the director the folder records.
+    A director that runs two folders has one marker, naming the other folder, so only the
+    recorded director finds it (trunk's phase 140 folder, 2026-10-20)."""
+    folder = Path(record["director_dir"])
+    marked = codex_mesh._marker_sessions(RUN_ROOTS, folder)  # pyright: ignore[reportPrivateUsage]
+    recorded = unit_runs.director(folder)
+    return [*marked, recorded] if recorded and recorded not in marked else marked
 
 
 def deliver(record: RunRecord, exit_code: int) -> str:
@@ -286,6 +315,36 @@ def deliver(record: RunRecord, exit_code: int) -> str:
     return f"held for {name}'s next dispatch: no director was found"
 
 
+def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
+    """The argv that runs a command in a builds.slice scope, or nothing where no scope is possible."""
+    runtime = environment.get("XDG_RUNTIME_DIR", "")
+    if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
+            or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
+        return []
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
+            "--slice=builds.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+
+
+def _run(command: list[str], cwd: str, environment: dict[str, str], log: Path) -> int:
+    """Run the command with its output appended to the log, forward signals to it, and return its status."""
+    try:
+        with log.open("ab") as output:
+            child = subprocess.Popen(command, cwd=cwd or None, env=environment,
+                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        with log.open("a", encoding="utf-8") as output:
+            _ = output.write(f"mesh_runs: command did not start: {exc}\n")
+        return 127
+
+    def forward(signum: int, _frame: FrameType | None) -> None:
+        with contextlib.suppress(OSError):
+            child.send_signal(signum)
+
+    for forwarded in FORWARDED_SIGNALS:
+        _ = signal.signal(forwarded, forward)
+    return _exit_status(child.wait())
+
+
 def command_supervise(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", "")))
     record = _read_record(record_path)
@@ -296,22 +355,12 @@ def command_supervise(args: argparse.Namespace) -> int:
         "PLAN_DELEGATE_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
     })
     log = Path(record["log"])
-    try:
-        with log.open("ab") as output:
-            child = subprocess.Popen(record["command"], cwd=record["cwd"] or None, env=environment,
-                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
-    except OSError as exc:
-        with log.open("a", encoding="utf-8") as output:
-            _ = output.write(f"mesh_runs: command did not start: {exc}\n")
-        exit_code = 127
-    else:
-        def forward(signum: int, _frame: FrameType | None) -> None:
-            with contextlib.suppress(OSError):
-                child.send_signal(signum)
-
-        for forwarded in FORWARDED_SIGNALS:
-            _ = signal.signal(forwarded, forward)
-        exit_code = _exit_status(child.wait())
+    marker = log.with_suffix(".scope")
+    prefix = scope_prefix(marker, environment)
+    exit_code = _run(prefix + record["command"], record["cwd"], environment, log)
+    if prefix and not marker.exists():
+        exit_code = _run(record["command"], record["cwd"], environment, log)
+    marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
     delivery = deliver(record, exit_code)

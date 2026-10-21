@@ -20,13 +20,14 @@ from enum import Enum
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import cast
+from typing import assert_never, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
+import coverage_report
 from approved_renames import (RUST_KEYWORDS, AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, declaration_sites, enclosing, file_rename, inline_modules, item_starts)
@@ -1273,7 +1274,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
                file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
                crate_targets: CrateTargets = CrateTargets.LIBRARY,
-               proposal_cells: tuple[style_ledger.ProposalCell, ...] = ()) -> str:
+               proposal_cells: tuple[style_ledger.ProposalCell, ...] = (),
+               waived_findings: tuple[style_ledger.HeldFinding, ...] = ()) -> str:
     ticket_id = ticket["id"]
     number = ticket_id.rsplit("-", 1)[1]
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -1296,6 +1298,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
     held_lines = (["Already-held findings: do not hold these again; record held for a file whose finding still stands."]
                   + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
                      for finding in held_findings]) if per_file_structure and held_findings else []
+    waived_lines = (["Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."]
+                    + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
+                       for finding in waived_findings]) if per_file_structure and waived_findings else []
     approved = ticket["kind"] == "proposal"
     # The gate takes reference edits in other files only for these pairs, so the text names them.
     pairs = approved_rename_pairs(held_findings)
@@ -1375,6 +1380,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
              if per_file_structure else "Record each rule's crate verdict only after every file has been judged against it."),
             *[f"Record `{rule}` once with `--path {ticket['crate']}` after reading the manifests." for rule in manifest_rules],
             *held_lines,
+            *waived_lines,
         ] if ticket["kind"] == "structure" else []),
         *([
             "Judge window by window: take the files under **Files** in order, and each file's windows in order.",
@@ -1454,6 +1460,22 @@ def atomic_write(path: Path, data: bytes) -> None:
         staged.unlink(missing_ok=True)
 
 
+def _waived_ticket_findings(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                            rule_paths: Mapping[str, Path]) -> tuple[style_ledger.HeldFinding, ...]:
+    """Map waived sites with the ticket's pinned rules and repository layout."""
+    if ticket["kind"] != "structure":
+        return ()
+    metadata = {rule: frontmatter(path) for rule, path in rule_paths.items()}
+    manifest_rules = {rule for rule, fields in metadata.items()
+                      if fields.get("tier") == ["D"] and fields.get("input_scope") == ["manifest"]}
+    directories = (tuple(member.directory for member in coverage_report.workspace(ledger, ticket["base"]))
+                   if manifest_rules else ())
+    cells = {(rule, path) for rule, path in ticket["cells"]}
+    return tuple(finding for finding in ledger.held_findings(style_ledger.HeldFindingsInState("waived"))
+                 if (finding.rule, style_proposals.crate_for(directories, finding.path)
+                     if finding.rule in manifest_rules else finding.path) in cells)
+
+
 def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, plan: Path, text: str) -> None:
     texts = ledger.pinned_rule_texts(ticket["id"])
     ticket["base"] = ledger.ticket_base(ticket["id"])
@@ -1477,11 +1499,13 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
         held = tuple(finding for finding in ledger.proposal_findings(Path(ticket["proposal"]))
                      if finding.finding_id in identities)
     cells = ledger.proposal_cells(ticket["id"]) if ticket["kind"] == "proposal" else ()
-    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells)
+    rule_paths = {pinned.rule_id: plan.parent.parent / "rules" / (pinned.blob + ".md") for pinned in texts}
     for pinned in texts:
-        path = plan.parent.parent / "rules" / (pinned.blob + ".md")
+        path = rule_paths[pinned.rule_id]
         if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
             atomic_write(path, pinned.text)
+    waived = _waived_ticket_findings(ledger, ticket, rule_paths)
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells, waived)
     if any(match.group("id") == ticket["id"] for match in PHASE.finditer(text)):
         updated = PHASE.sub(lambda match: phase if match.group("id") == ticket["id"] else match.group(0), text)
         if updated != text:
@@ -1602,11 +1626,21 @@ def _select_phase(
         for finding_id, outcome in left.items():
             match outcome:
                 case style_ledger.DeclaredInSeveralFiles():
-                    where = f"declared in {len(outcome.paths)} files"
+                    where = f"declared in {len(outcome.paths)} files: {', '.join(sorted(outcome.paths))}"
                 case style_ledger.DeclaredInAnotherCrate():
                     where = f"declared in another crate: {outcome.path}"
                 case style_ledger.DeclarationGoneFromFile():
                     where = "declaration gone"
+                case style_ledger.TraitIdentityUncertain():
+                    where = "trait identity uncertain"
+                case style_ledger.OutsideRenameUnresolved():
+                    where = style_ledger.outside_evidence_line(outcome.evidence)
+                case _:
+                    assert_never(outcome)
+            if (isinstance(outcome, (style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate,
+                                     style_ledger.DeclarationGoneFromFile))
+                    and isinstance(outcome.evidence, style_ledger.OutsideRenameNotProven)):
+                where += "; " + style_ledger.outside_evidence_line(outcome.evidence)
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)

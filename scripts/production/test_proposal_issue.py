@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from collections.abc import Generator
 from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
@@ -59,6 +60,20 @@ class ProposalIssueTests(unittest.TestCase):
         self.runtime = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
 
+    def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
+        code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
+        self.assertEqual((code, out), (0, f"urgency {self.issue.name}: set review_urgency, review_due, date_modified\n"))
+        self.assertIn('review_urgency: "soon"\nreview_due: "2026-10-22"\n', self.issue.read_text())
+        self.assertEqual(self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")[1],
+                         f"urgency {self.issue.name}: unchanged\n")
+        self.assertEqual(self.run_cli("urgency", str(self.issue), "--level", "blocks", "--due", "2026-10-22")[0], 2)
+        self.assertEqual(self.run_cli("mark-important", str(self.issue))[0], 0)
+        text = self.issue.read_text()
+        self.assertIn('review_urgency: "user"\nreview_marked: "', text)
+        self.assertNotIn("review_due", text)
+        _ = self.run_cli("urgency", str(self.issue), "--level", "normal")
+        self.assertNotIn("review_", self.issue.read_text())
+
     def run_cli(self, *argv: str) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -98,7 +113,8 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
         self.assertNotIn("style_findings", fields)
         self.assertEqual(fields["style_count"], ["3"])
-        self.assertEqual(fields["area"], ["unfiled"])
+        self.assertEqual(fields["area"], ["style"])
+        self.assertIn('area: "[[style]]"\n', issue.read_text())
         self.assertEqual(fields["category"], ["refactor"])
         self.assertEqual(fields["backlog_goal"], [])
         self.assertEqual(fields["project"], ["alpha"])
@@ -109,6 +125,94 @@ class ProposalIssueTests(unittest.TestCase):
         arguments[arguments.index("--rule-blob") + 1] = "c"
         self.assertEqual(self.run_cli(*arguments)[0], 2)
         self.assertEqual(issue.read_bytes(), original)
+
+    def test_area_style_sets_the_area_and_vault_date_on_current_and_closed_legacy_issues(self) -> None:
+        forms = (
+            ("decision", 'area: "[[unfiled]]"\n', 'style_rule: "global:rust/names.md"\n', "open"),
+            ("missing area", "", 'style_rule: "global:rust/names.md"\n', "closed"),
+            ("legacy", 'area: "[[unfiled]]"\n',
+             'style_rules: ["https://example.test/names.md"]\nstyle_findings: ["held-1"]\n', "closed"),
+        )
+        for name, area, metadata, status in forms:
+            with self.subTest(form=name):
+                folder = self.root / name
+                folder.mkdir()
+                issue = folder / "proposal.md"
+                original = (f'---\n{area}date_modified: "[[2000-01-01]]"\nstatus: {status}\n'
+                            + 'unit: "names-unit"\nplan: "unit.md"\n' + metadata
+                            + 'tags: ["issue", "proposal", "style"]\n---\nUser notes stay.\n')
+                _ = issue.write_text(original)
+                code, out, err = self.run_cli("area-style", str(folder))
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(len(out.splitlines()), 1)
+                self.assertIn(issue.name, out)
+                updated = issue.read_text()
+                self.assertIn('area: "[[style]]"\n', updated)
+                self.assertIn(f"date_modified: {self.today()}\n", updated)
+                self.assertEqual(updated.replace('area: "[[style]]"\n', ""),
+                                 original.replace(area, "", 1).replace('"[[2000-01-01]]"', self.today()))
+
+    def test_area_style_keeps_comments_after_the_area_line_when_it_updates_the_issue(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue = folder / "decision.md"
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                original = (b'---\narea: "[[unfiled]]"\n# Keep this comment and its spacing.  \n\n'
+                            b'date_modified: "[[2000-01-01]]"\nstyle_rule: "global:rust/names.md"\n'
+                            b'status: open\n---\nUser notes stay.\n').replace(b"\n", newline)
+                _ = issue.write_bytes(original)
+                expected = original.replace(b'area: "[[unfiled]]"', b'area: "[[style]]"').replace(
+                    b'"[[2000-01-01]]"', self.today().encode())
+                action = (0, f"area-style {issue.name}: area [[style]]\n", "")
+                self.assertEqual(self.run_cli("area-style", str(folder), "--dry-run"), action)
+                self.assertEqual(issue.read_bytes(), original)
+                self.assertEqual(self.run_cli("area-style", str(folder)), action)
+                self.assertEqual(issue.read_bytes(), expected)
+                self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+                self.assertEqual(issue.read_bytes(), expected)
+
+    def test_area_style_keeps_non_style_issues_and_other_areas_byte_identical(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        originals: dict[Path, bytes] = {}
+        for name, metadata, area in (
+            ("plain", "", '"[[unfiled]]"'),
+            ("other area", 'style_rule: "global:rust/names.md"\n', '"[[tooling]]"'),
+            ("already style", 'style_rules: ["https://example.test/names.md"]\n', '"[[style]]"'),
+        ):
+            path = folder / (name + ".md")
+            original = (f'---\narea: {area}\ndate_modified: "[[2000-01-01]]"\n{metadata}'
+                        + 'status: open\n---\nstyle_rule: body text is not metadata\n').encode()
+            _ = path.write_bytes(original)
+            originals[path] = original
+        stamps = {path: path.stat().st_mtime_ns for path in originals}
+        self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        self.assertEqual({path: path.stat().st_mtime_ns for path in originals}, stamps)
+
+    def test_area_style_dry_run_and_second_run_write_nothing(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue = folder / "decision.md"
+        original = (b'---\narea: "[[unfiled]]"\ndate_modified: "[[2000-01-01]]"\n'
+                    b'style_rule: "global:rust/names.md"\nstatus: open\n---\nKeep notes.\n')
+        _ = issue.write_bytes(original)
+        stamp = issue.stat().st_mtime_ns
+        dry = self.run_cli("area-style", str(folder), "--dry-run")
+        self.assertEqual((dry[0], dry[2]), (0, ""))
+        self.assertEqual(len(dry[1].splitlines()), 1)
+        self.assertIn(issue.name, dry[1])
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        self.assertEqual(list(folder.iterdir()), [issue])
+        self.assertEqual(self.run_cli("area-style", str(folder)), dry)
+        updated, stamp = issue.read_bytes(), issue.stat().st_mtime_ns
+        self.assertNotEqual(updated, original)
+        self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+        self.assertEqual(issue.read_bytes(), updated)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        self.assertEqual(list(folder.iterdir()), [issue])
 
     def test_number_gives_each_proposal_the_next_free_number_oldest_first(self) -> None:
         folder = self.root / "issues"
@@ -141,6 +245,74 @@ class ProposalIssueTests(unittest.TestCase):
                                       "abc", "--count", "1", "--body-file", str(body), "--template", str(template))
         self.assertEqual((code, out), (0, "create decision.md: created\n"), err)
         self.assertIn('proposal_id: "P1"\n', issue.read_text())
+
+    def test_create_keeps_a_same_key_decision_that_appears_before_the_folder_lock(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
+                    b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
+                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+
+        @contextlib.contextmanager
+        def competing_create(folder: Path) -> Generator[None]:
+            self.assertEqual(folder, self.root)
+            _ = issue.write_bytes(original)
+            stamp = issue.stat().st_mtime_ns
+            yield
+            self.assertEqual(issue.stat().st_mtime_ns, stamp)
+
+        with mock.patch.object(proposal_issue, "_folder_lock", side_effect=competing_create):
+            self.assertFalse(proposal_issue.create(
+                issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                "# New examples\n", template, date(2026, 10, 20), initial_fields={}))
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
+        self.assertEqual({path.name for path in self.root.iterdir()},
+                         {"a proposal.md", "template.yaml", "decision.md"})
+
+    def test_create_refuses_a_different_key_decision_that_appears_before_the_folder_lock(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\nstyle_rule: "global:rust/names.md"\nstyle_crate: "alpha"\n'
+                    b'style_rule_blob: "other-blob"\nproposal_id: "P47"\n---\nOther decision.\n')
+
+        @contextlib.contextmanager
+        def competing_create(folder: Path) -> Generator[None]:
+            self.assertEqual(folder, self.root)
+            _ = issue.write_bytes(original)
+            stamp = issue.stat().st_mtime_ns
+            try:
+                yield
+            finally:
+                self.assertEqual(issue.stat().st_mtime_ns, stamp)
+
+        with mock.patch.object(proposal_issue, "_folder_lock", side_effect=competing_create):
+            with self.assertRaises(proposal_issue.Refusal) as refusal:
+                _ = proposal_issue.create(
+                    issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                    "# New examples\n", template, date(2026, 10, 20), initial_fields={})
+        self.assertEqual(str(refusal.exception), f"{issue}: different decision key")
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
+
+    def test_create_gives_two_different_decisions_distinct_proposal_numbers(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        first, second = self.root / "alpha.md", self.root / "beta.md"
+        self.assertTrue(proposal_issue.create(
+            first, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+            "# Alpha examples\n", template, date(2026, 10, 20), initial_fields={}))
+        original = first.read_bytes()
+        self.assertTrue(proposal_issue.create(
+            second, "alpha", "a", "style", ["style"], "global:rust/names.md", "beta", "abc", 1,
+            "# Beta examples\n", template, date(2026, 10, 20), initial_fields={}))
+        from issues import frontmatter
+        self.assertEqual((frontmatter(first)["proposal_id"], frontmatter(second)["proposal_id"]),
+                         (["P1"], ["P2"]))
+        self.assertEqual(first.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
 
     def test_create_with_rules_preserves_existing_decision_and_answer(self) -> None:
         template = self.root / "template.yaml"

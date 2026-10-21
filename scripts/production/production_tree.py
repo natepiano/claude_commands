@@ -13,6 +13,10 @@ ids; a Codex worker member is its thread id, since a Codex worker has no Claude 
 - a unit director to each pool reviewer it leases, role `review`, its member the reviewer's thread
   id, from the review pool's `pool.json`. It also carries `unit` (the lease's unit), `thread_id`,
   `state` (`busy` while its `busy_pid` runs, else `idle`) and `type`. Templates are left out.
+- a Claude manager to each local Astra thread it holds, role `astra-designer` or
+  `astra-reviewer`, from the Astra role records. Each adds `codex_home` and `state`
+  (`busy` while its mesh worker runs or waits for capacity, or its exec pid runs; else `idle`).
+  A thread with an Astra role has no Codex worker edge.
 
 Runs are found by scanning both run roots, not through the session markers: a director runs
 independent phases side by side, each in its own run folder, and its one marker names only one of
@@ -36,12 +40,14 @@ from typing import Literal, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.astra import astra_roles  # noqa: E402
 import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
 from sessions import running_sessions  # noqa: E402
 
-Role = Literal["showrunner", "unit", "impl", "test", "review", "fix"]
+Role = Literal["showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 WORKER_ROLES: tuple[Role, ...] = ("impl", "test", "review", "fix")
 # A worker in either state has ended its thread; every other status is a live thread.
 ENDED_STATUSES = frozenset({"ended", "failed"})
@@ -63,6 +69,11 @@ class ReviewerEdge(Edge):
     thread_id: str
     state: Literal["busy", "idle"]
     type: str
+
+
+class AstraEdge(Edge):
+    codex_home: str
+    state: Literal["busy", "idle"]
 
 
 def pool_root() -> Path:
@@ -241,7 +252,17 @@ def reviewer_edges(running: set[str], marked: unit_lookup.MarkedProductions) -> 
     return edges
 
 
-def worker_edges(running: set[str]) -> list[Edge]:
+def astra_edges() -> list[AstraEdge]:
+    """Each live Astra thread under its Claude manager, wherever that manager runs."""
+    return [AstraEdge(manager=record["manager"], member=record["thread_id"],
+                      role="astra-designer" if record["role"] == "designer" else "astra-reviewer",
+                      codex_home=record["codex_home"], state=record["state"])
+            for record in astra_roles.live_roles()]
+
+
+def worker_edges(running: set[str], astra_threads: set[str] | None = None) -> list[Edge]:
+    if astra_threads is None:
+        astra_threads = {record["thread_id"] for record in astra_roles.live_roles()}
     edges: list[Edge] = []
     for root in unit_runs.run_roots():
         try:
@@ -257,7 +278,7 @@ def worker_edges(running: set[str]) -> list[Edge]:
             if director not in running:
                 continue
             if server:
-                edges.extend(_codex_edges(director, run))
+                edges.extend(edge for edge in _codex_edges(director, run) if edge["member"] not in astra_threads)
             edges.extend(_claude_edges(director, run, claude))
     return edges
 
@@ -266,8 +287,10 @@ def tree() -> list[Edge]:
     running = {record["sessionId"] for record in running_sessions()}
     sessions = showrunner_sessions()
     marked = marked_units()
+    astra = astra_edges()
     managed: list[Edge] = [*unit_edges(sessions, running, marked), *reviewer_edges(running, marked)] if marked is not None else []
-    return [*showrunner_edges(sessions, running), *managed, *worker_edges(running)]
+    return [*showrunner_edges(sessions, running), *managed,
+            *worker_edges(running, {edge["member"] for edge in astra}), *astra]
 
 
 def main(argv: list[str]) -> int:

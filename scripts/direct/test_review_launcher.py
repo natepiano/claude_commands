@@ -859,6 +859,25 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
         self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
 
+    def test_a_pool_review_naming_an_older_open_phase_records_its_turn_in_that_phase(self) -> None:
+        session = self.start_implementation("named-phase-turn")
+        self.finish_implementation(session)
+        older = cast("dict[str, object]", json.loads(
+            (session / "progress_history_state.json").read_text(encoding="utf-8"))["phase"])
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
+        environment = self.pool_fixture()
+        environment["STUB_FINDINGS"] = "1. First finding\n2. Second finding\n"
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record, = self.turn_records(session)
+        current = cast("dict[str, object]", json.loads(
+            (session / "progress_history_state.json").read_text(encoding="utf-8"))["phase"])
+        self.assertNotEqual(older["instance_id"], current["instance_id"])
+        self.assertEqual(record["phase_instance_id"], older["instance_id"])
+        self.assertEqual(record["raised"], 2)
+
     def test_a_review_naming_its_phase_writes_its_files_in_that_phase_directory(self) -> None:
         # Two phases reviewing at once each pass their own id, so neither reads the other's findings.
         session = self.start_implementation("phase-directory-files")

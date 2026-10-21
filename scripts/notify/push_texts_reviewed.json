@@ -11,6 +11,34 @@
       "time": "2026-10-14T04:25:55.369515-04:00"
     }
   },
+  "nate.adhoc": {
+    "long_sender": {
+      "objections": [
+        {
+          "quote": "cargo-liner-style renames",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "both units run under their new names",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:23:00.784022-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "natedev the /nate skill is ready",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:22:51.437039-04:00"
+    }
+  },
   "nixos.disk_low": {
     "no_free_space": {
       "reviewer": "opus",
@@ -499,6 +527,102 @@
       "time": "2026-10-14T17:14:02.345122-04:00"
     }
   },
+  "silence.auto_off": {
+    "none_kept": {
+      "objections": [
+        {
+          "quote": "You are back; 0 kept.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence off",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "natedev auto silence off",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "You are back; 0 kept.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
+      "time": "2026-10-20T16:21:05.918014-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "You are back; 3 kept.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "3 kept",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "natedev auto silence off",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "You are back; 3 kept.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
+      "time": "2026-10-20T16:20:58.301946-04:00"
+    }
+  },
+  "silence.auto_on": {
+    "long_idle": {
+      "objections": [
+        {
+          "quote": "Idle 1440 min.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Idle 1440 min.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "aab611c0e487c2f7b5caed05a58bdb66448bdb6edb53fcdc4e1c147702936601",
+      "time": "2026-10-20T16:20:50.954293-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "Idle 45 min.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Idle 45 min.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "aab611c0e487c2f7b5caed05a58bdb66448bdb6edb53fcdc4e1c147702936601",
+      "time": "2026-10-20T16:20:43.314939-04:00"
+    }
+  },
   "stall_watch.permission_prompt": {
     "edit": {
       "objections": [
@@ -529,14 +653,34 @@
   },
   "sweep.disk_floor": {
     "no_free_space": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:24:04.260987-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "/tmp/claude-1000/scratch",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:33.124483-04:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:23:53.034006-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Action: In the Claude session named natedev, name the paths below that it may remove.\nThe natedev computer has 290.0 GiB free. Builds need 300.0 GiB. They may fail until 10.0 GiB more is free. Build cache cleanup freed 2.0 GiB and has no idle build output left.\n\n/tmp/claude-1000/scratch (recommended): frees 86.0 GiB. That alone is enough, and no running process is at risk.\n\n/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\nThe session removes only the paths you name.",
+          "rule": "push-body-under-500"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:22.184346-04:00"
     }
   }
 }

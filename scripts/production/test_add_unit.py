@@ -2691,6 +2691,41 @@ class AddUnitTests(ShutdownTestCase):
                     with self.assertRaisesRegex(RuntimeError, "did not become active\\nunreadable"):
                         _ = add_unit.wait_for_remote_control(request)
 
+    def test_remote_control_is_read_from_the_session_record_after_the_pane_line_scrolls_off(self) -> None:
+        request = add_unit.UnitLaunch(
+            production=add_unit.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
+            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
+            launch_kind=add_unit.NewWorkLaunch(), timeout=0,
+        )
+        registry = self.root / "registry"
+        registry.mkdir()
+        place = HerdrPlace("native", "w1:p1")
+        live = unit_lookup.LiveClaude("alpha", "session-123", "/socket", 4242)
+        starting = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
+        marked = unit_lookup.MarkedUnit("alpha-unit", live, place)
+        busy_pane = "⏺ Reading the plan\n  ⎿  Read 400 lines"
+        cases: tuple[tuple[str, dict[str, str], bool], ...] = (
+            ("bridged", {"bridgeSessionId": "session_bridge"}, True),
+            ("no bridge", {}, False),
+            ("empty bridge", {"bridgeSessionId": ""}, False),
+            ("another session's record", {"sessionId": "session-other", "bridgeSessionId": "session_bridge"}, False))
+        for label, extra, active in cases:
+            with self.subTest(label):
+                _ = (registry / "4242.json").write_text(json.dumps({
+                    "pid": 4242, "sessionId": "session-123", "name": "alpha", "messagingSocketPath": "/socket",
+                    "updatedAt": 1, **extra}))
+                # The first lookup finds the mark before the record names the live Claude.
+                with patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}), \
+                        patch.object(add_unit, "launched_unit", side_effect=[
+                            add_unit.MarkedUnitFound(starting), add_unit.MarkedUnitFound(marked)]), \
+                        patch.object(session_pane, "read_place", return_value=busy_pane):
+                    if active:
+                        self.assertEqual(add_unit.wait_for_remote_control(request), marked)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "did not become active\\n⏺ Reading the plan"):
+                            _ = add_unit.wait_for_remote_control(request)
+
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"
         _ = self.checkout.rename(renamed)

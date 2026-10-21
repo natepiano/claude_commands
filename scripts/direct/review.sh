@@ -137,7 +137,7 @@ esac
 # nobody reads and record a pass under a worker no column renders, both silently.
 case "${LENS}" in
   '') LENS_SLOT='' ;;
-  adversary) LENS_SLOT=test ;;
+  adversary) LENS_SLOT="test" ;;
   contract) LENS_SLOT=impl ;;
   # No writer sits in `review` since the three-worker team was folded into two,
   # so the third lens takes it and its pass never closes a writer's window.
@@ -526,7 +526,9 @@ interrupt_pool_review() {
 if [[ -n "${POOL_TYPE}" || -n "${FOLLOW_TO}" ]]; then
   TURN_STARTED_AT="$(date +%s)"
   TURN_LEASE="${POOL_LEASE}"
-  TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" <<'PY'
+  # The record joins to the phase --phase names, the same phase start-pass stamps:
+  # with phases open side by side, the newest open phase is often another one.
+  TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" "${PHASE_ID}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -535,6 +537,9 @@ try:
 except (OSError, ValueError):
     state = {}
 phase = state.get("phase") or {}
+named = [record for record in [phase, *(state.get("open_phases") or [])]
+         if sys.argv[4] and record.get("status") == "active" and record.get("id") == sys.argv[4]]
+phase = named[0] if named else phase
 try:
     roster = json.loads((Path(sys.argv[2]) / "mesh_roster.json").read_text(encoding="utf-8"))
 except (OSError, ValueError):
@@ -556,6 +561,7 @@ PY
   fi
 fi
 
+# shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
   if [[ -z "${REVIEW_WORKER}" ]]; then
@@ -568,6 +574,7 @@ fi
 # configured when that worker first opens. A worker opened by review.sh must use
 # the same anchor even though this turn runs the review model; otherwise the
 # first role switch back to implementation rejects its own retained thread.
+# shellcheck disable=SC2153  # agents_resolve sets AGENT_MODEL.
 DURABLE_WORKER_MODEL="${AGENT_MODEL}"
 if [[ -n "${NEW_SLOT}" ]]; then
   IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" implementation)"
@@ -716,6 +723,8 @@ if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
   STAGE_TWO_FILE="${ARTIFACT_DIR}/review_stage2_${PASS_INDEX}${SUFFIX}.$$.txt"
   printf 'Stage 2: the final diff is at %s; review it per your prompt'"'"'s Stage 2.\n' \
     "${EARLY_READY_FILE%.ready}.diff" > "${STAGE_TWO_FILE}"
+  # The inner script reads its own $1..$3, so the single quotes are meant (SC2016).
+  # shellcheck disable=SC2016
   if ! "$PY" "${MESH_RUNS_SCRIPT:-${SCRIPT_DIR}/../agents/mesh_runs.py}" start \
     --session-dir "${MESH_SESSION_DIR}" --to "${REVIEW_WORKER}" --director-dir "${SESSION_DIR}" \
     --label "final diff ready" --done-message-file "${STAGE_TWO_FILE}" -- \
@@ -839,7 +848,7 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
     TURN_RECORD_STATUS="reviewed"
     bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" wrapper "${BEAT_TAG} agent finished" || true
   fi
-  board_post done \
+  board_post "done" \
     "launcher: ${LENS} review finished; findings in review_findings_${PASS_INDEX}${SUFFIX}.txt"
 else
   echo "error" > "${STATUS_FILE}"

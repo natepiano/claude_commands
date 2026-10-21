@@ -388,6 +388,19 @@ class CodexHomesTests(unittest.TestCase):
                     quotas=[agent_accounts.Quota("Weekly", weekly, future)], credit_balance=credits)
                 self.assertIsInstance(agent_accounts.codex_can_work(report, now, agent_accounts.CreditsOn()), expected)
 
+    def test_codex_work_readiness_reads_a_missing_five_hour_window_as_unused(self) -> None:
+        # Codex reports no 5-hour window for an account with no use in it (codex1, 2026-10-21).
+        now = datetime.now(timezone.utc)
+        week = now + timedelta(days=7)
+        for weekly, credits, expected in (
+            (0, "0", agent_accounts.CodexWorkAvailable),
+            (100, "0", agent_accounts.CodexWorkExhausted),
+            (100, "3", agent_accounts.CodexWorkAvailable),
+        ):
+            with self.subTest(weekly=weekly, credits=credits):
+                report = Report("Codex", quotas=[agent_accounts.Quota("Weekly", weekly, week)], credit_balance=credits)
+                self.assertIsInstance(agent_accounts.codex_can_work(report, now, agent_accounts.CreditsOn()), expected)
+
     def test_codex_work_readiness_does_not_use_expired_or_missing_allowance(self) -> None:
         now = datetime.now(timezone.utc)
         future = now + timedelta(hours=1)

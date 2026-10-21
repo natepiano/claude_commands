@@ -1704,22 +1704,77 @@ release_token() {
     TOKEN_HELD=0
 }
 
+# One try for the token, with no wait. Status 0 when it is held.
+try_token_now() {
+    [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
+    bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+        --pid $$ --hold 3600 --wait 0 >/dev/null 2>&1 || return 1
+    TOKEN_HELD=1
+}
+
 # The token is for natedev cargo only. A step gives it back while it waits for
 # memory, and takes it again once the gate admits it; a step that leaves the
-# wait for the Mac does not. The step runs in run()'s subshell, so its token
-# wait reaches the call record through TOKEN_WAIT_FILE.
+# wait for the Mac does not. A token that is not free at once means a wait,
+# and a reservation kept through it promises memory that no build uses: the
+# gate then holds every other step back (257 GiB promised on 2026-10-20). So
+# the step gives the reservation back, waits for the token, and passes the
+# gate again with the token held. The step runs in run()'s subshell, so its
+# token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
 buildlog_wait_for_memory() {
+    local memory_wait
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
     buildlog_wait_for_memory_only "$@"
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
+    TOKEN_WAITED=0
+    if ! try_token_now; then
+        buildlog_release_memory 0
+        acquire_token
+        memory_wait=$BUILDLOG_MEM_WAIT_S
+        buildlog_wait_for_memory_only "$@"
+        BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+        if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+            if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
+                : > "${TOKEN_WAIT_FILE}.given_back"
+            fi
+            return 0
+        fi
+    fi
+    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
+    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    fi
+}
+
+# A build hold stops every natedev build, so a step gives the token back while
+# it waits out a hold too, and takes it again after the release; a step that
+# leaves the hold wait for the Mac (status LINT_LEFT_QUEUE_STATUS) does not. The
+# hold time stays in the hold wait record; only the time to take the token
+# again counts as token wait. With no hold present, nothing is given back.
+eval "$(declare -f build_hold_wait_local | sed '1s/build_hold_wait_local/build_hold_wait_local_only/')"
+build_hold_wait_local() {
+    local status=0
+    if ! build_hold_applies || build_hold_nothing_held; then
+        return 0
+    fi
+    # A step without the token (before the first take, or after a Mac trip) only waits.
+    if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
+        build_hold_wait_local_only "$@"
+        return
+    fi
+    if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        : > "${TOKEN_WAIT_FILE}.given_back"
+    fi
+    build_hold_wait_local_only "$@" || status=$?
+    [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]] || return "$status"
     acquire_token
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
         printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
     fi
+    return "$status"
 }
 
 # Again with the token held: a peer running this same call on this tree held

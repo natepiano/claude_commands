@@ -21,7 +21,7 @@ import tomllib
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
 import change_review
@@ -63,7 +63,8 @@ class NoMac(NamedTuple):
 
 
 class MacCheckout(NamedTuple):
-    path: Path
+    path: PurePosixPath
+    """As written in the doc; a leading ~ is the Mac's home, so the Mac's shell expands it."""
 
 
 class PromoteTo(NamedTuple):
@@ -259,7 +260,7 @@ def promotion_from_doc(lines: list[str]) -> NoPromotion | PromoteTo:
     for item in promote_raw.split(","):
         item = item.strip()
         if item.startswith("mac "):
-            mac = MacCheckout(Path(item[4:].strip()).expanduser())
+            mac = MacCheckout(PurePosixPath(item[4:].strip()))
         elif item:
             local.append(Path(item).expanduser())
     return PromoteTo(tuple(local), mac) if local or isinstance(mac, MacCheckout) else NoPromotion()
@@ -509,11 +510,20 @@ def record_changes(request: MergeRequest, commits: list[change_review.Commit], m
         report("change review", "drift", line)
 
 
+def merge_paths(checkout: Path, base: str, tip: str) -> tuple[str, ...]:
+    """The paths a merge of `tip` into `base` changes. A three-dot diff picks one merge base, so after a
+    criss-cross merge it also lists paths `base` already holds; the merged tree does not. A conflicted
+    merge still writes a tree, with the conflicted paths in it, and the conflicts step holds that merge."""
+    tree = git(checkout, "merge-tree", "--write-tree", base, tip)
+    if tree.returncode not in (0, 1):
+        _ = good(tree, "scope")
+    output = good(git(checkout, "diff", "--name-only", base, tree.stdout.split("\n", 1)[0].strip()), "scope")
+    return tuple(line for line in output.splitlines() if line)
+
+
 def changed_paths(request: MergeRequest, base: str = "") -> tuple[str, ...]:
     """The paths the checkpoint changes from `base`, by default the merge branch's tip."""
-    output = good(git(request.production.checkout, "diff", "--name-only",
-                      f"{base or request.production.merge_branch}...{request.commit}"), "scope")
-    return tuple(line for line in output.splitlines() if line)
+    return merge_paths(request.production.checkout, base or request.production.merge_branch, request.commit)
 
 
 def allowed(path: str, ownership: tuple[str, ...]) -> bool:
@@ -606,7 +616,7 @@ def gate_names(request: MergeRequest, first_code_merge: bool) -> str:
     return ", ".join(found) if found else "no gate"
 
 
-def into(path: Path, branch: str, why: str, unblocks: str) -> None:
+def into(path: PurePath, branch: str, why: str, unblocks: str) -> None:
     print(f"into: {path} ({branch}) — {why}; unblocks: {unblocks}", flush=True)
 
 
@@ -752,12 +762,16 @@ def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint:
 
 
 def test_passed(command: list[str], result: subprocess.CompletedProcess[str]) -> bool:
-    if result.returncode == 0:
-        return True
+    """Judge basedpyright as merge_gate.py does: status 0 or 3 and its clean summary line anywhere.
+
+    It exits 3 and prints a `.venv` warning on stderr, after the summary, because pyrightconfig
+    names a `.venv` no checkout has.
+    """
     if Path(command[0]).name != "basedpyright":
-        return False
-    lines = (result.stdout + result.stderr).strip().splitlines()
-    return bool(lines and re.fullmatch(r"0 errors, 0 warnings(?:, 0 notes)?", lines[-1].strip()))
+        return result.returncode == 0
+    output = f"{result.stdout}\n{result.stderr}"
+    clean = re.search(r"^0 errors, 0 warnings(?:, 0 notes)?\s*$", output, re.MULTILINE)
+    return result.returncode in (0, 3) and clean is not None
 
 
 def undo_failed_push(production: Production, old_origin: str) -> None:
@@ -854,8 +868,18 @@ def promote_local_checkout(checkout: Path, merge_branch: str, tip: str) -> (
     return PromotionAdvanced(tip)
 
 
-def pull_mac_checkout(mac: Path, source: Path) -> None:
-    remote = (f"cd {shlex.quote(str(mac))} && git pull --ff-only "
+def remote_path(path: PurePosixPath) -> str:
+    """Quote a Mac path for its shell, leaving a leading ~ for the Mac to expand to its own home."""
+    text = str(path)
+    if text == "~":
+        return '"$HOME"'
+    if text.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(text[2:])
+    return shlex.quote(text)
+
+
+def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
+    remote = (f"cd {remote_path(mac)} && git pull --ff-only "
               f"natedev:{shlex.quote(str(source))} main; printf 'rc=%s\\n' \"$?\"")
     result = subprocess.run(["ssh", "mac", remote], capture_output=True, text=True, check=False)
     match = re.search(r"(?:^|\n)rc=(\d+)", result.stdout)
@@ -1191,7 +1215,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     if staged:
         raise Refusal(f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}")
     if isinstance(delivery, NotMerged):
-        paths = tuple(good(git(checkout, "diff", "--name-only", f"{branch}...{checkpoint}"), "scope").splitlines())
+        paths = merge_paths(checkout, branch, checkpoint)
         _ = good(git(checkout, "merge-tree", "--write-tree", branch, checkpoint), "conflicts")
         subject = f"Merge {request.child.slug} hand-off ({checkpoint[:7]}) into {branch}"
         _ = good(git(checkout, "merge", "--no-ff", "-m", subject, checkpoint), "merge")
