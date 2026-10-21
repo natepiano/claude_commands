@@ -11,7 +11,7 @@
   "executionEnvironments": [
     {
       "root": "scripts/guilds",
-      "extraPaths": [".", "scripts/guilds", "scripts/direct", "scripts/lib"]
+      "extraPaths": [".", "scripts/guilds", "scripts/direct", "scripts/lib", "scripts/history"]
     },
     {
       "root": "scripts/hierarchies",

@@ -194,7 +194,7 @@ Read 2026-10-21 by the plan author:
 
 **Ruled out:** a non-blocking tips lock that fails a publish at once while a load holds it; a relative design-doc path in the guild sites.
 
-### Phase 5 — The guilds production doc, its four head units and their daily read  · status: todo
+### Phase 5 — The guilds production doc, its four head units and their daily read  · status: done
 **Depends on:** Phase 4
 
 #### Work Order
