@@ -140,14 +140,14 @@ roster.
 Colors for each role and account in the status line, plus usage-level colors
 and thresholds for context tokens used and quota percentages left. Role keys are
 `role.showrunner` (purple), `role.unit-director` (yellow),
-`role.astra-designer` (pink) and `role.astra-reviewer` (bright-green). Workers and
+`role.astra-designer` (mauve) and `role.astra-reviewer` (bright-green). Workers and
 unassigned sessions have no key and show as plain text. `counts.<type>`
 colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,
 `proposals` and `projects`.
 `scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;
 an edit applies on the next refresh. A missing or bad entry leaves that piece
 uncolored. Colors use ANSI names (`cyan`, `bright-magenta`, and so on) or the
-named 256-color entries `orange`, `purple`, `pink`, `teal` and `brown`.
+named 256-color entries `orange`, `purple`, `pink`, `teal`, `brown` and `mauve`.
 `/new_account` adds the new Claude account's `account.` line.
 
 ## cargo-fmt-exclusions.json

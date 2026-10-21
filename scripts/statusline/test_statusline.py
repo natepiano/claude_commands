@@ -128,7 +128,8 @@ class ColorTests(unittest.TestCase):
         self.assertEqual(line.split(" | ")[0], "unassigned")
 
     def test_named_extended_colors_render_their_256_color_codes(self) -> None:
-        for color, code in (("orange", 208), ("purple", 141), ("pink", 211), ("teal", 30), ("brown", 137)):
+        for color, code in (("orange", 208), ("purple", 141), ("pink", 211), ("teal", 30), ("brown", 137),
+                            ("mauve", 139)):
             with self.subTest(color=color):
                 field = status_lines({}, colors=f"account.claude1={color}\n")[1].split(" | ")[0]
                 self.assertEqual(field, f"\x1b[38;5;{code}mclaude1\x1b[0m")
