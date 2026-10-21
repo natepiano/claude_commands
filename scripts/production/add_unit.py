@@ -74,6 +74,8 @@ class ProfiledLaunch(NamedTuple):
 
 LaunchProfile = StandardLaunch | ProfiledLaunch
 NIGHTLY_REVIEW_UNIT = "nightly-review-unit"
+GUILDS_PRODUCTION = "guilds"
+GUILD_HEAD_IDS = ("designers", "reviewers", "showrunners", "units")
 
 
 def launch_profile(unit: str) -> LaunchProfile:
@@ -356,7 +358,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
-        unit=f"{name}-unit",
+        unit=(name if production.slug == GUILDS_PRODUCTION and name in GUILD_HEAD_IDS else f"{name}-unit"),
         branch=branch,
         worktree=worktree,
         plan=plan,
