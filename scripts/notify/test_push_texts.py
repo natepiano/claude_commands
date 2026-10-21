@@ -164,6 +164,16 @@ class PushTextTests(unittest.TestCase):
         self.assertIn("refused 1 command in messaging. It pushes", one.body)
         self.assertTrue(one.body.endswith(" The rule: Bash(git push:*)"))
 
+    def test_paid_credits_keeps_the_user_approved_lines(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits")
+        self.assertEqual(entry.need, "decision")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
+        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT.\n\n"
+                         + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
+                         + "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.")
+
     def test_header_is_fingerprinted_and_cannot_hide_an_action_or_session(self) -> None:
         entry = replace(self.entry(), action=push_texts.NoActionNeeded())
         self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, header=False)))

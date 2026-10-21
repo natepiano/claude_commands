@@ -420,6 +420,50 @@
       "time": "2026-10-14T17:21:34.175899-04:00"
     }
   },
+  "quota.paid_credits": {
+    "from_session": {
+      "objections": [
+        {
+          "quote": "natedev: codex1 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "To stop it, set use_credits: off",
+          "rule": "first-150-stand-alone"
+        },
+        {
+          "quote": "codex1 has 6,370 paid credits left.",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
+      "sha256": "ef78c5d0af761155edfc6129883ea294405dc08a68906927def1ecf56d5603d5",
+      "time": "2026-10-21T07:51:58.757542-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "quota_alert: codex2 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "codex2 has 25,345 paid credits left.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
+      "sha256": "ef78c5d0af761155edfc6129883ea294405dc08a68906927def1ecf56d5603d5",
+      "time": "2026-10-21T07:51:44.021181-04:00"
+    }
+  },
   "rust.errors": {
     "many_errors": {
       "reviewer": "opus",

@@ -137,6 +137,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 | `HELD: not sent, failed review: <why> This push was not sent because it failed review. Revise it and resend it with send.py; no fallback is allowed.` | 4 | pushover 6 |
 | `HELD: <pushover message>` | 4 | pushover 4 (no marker) |
 | `HELD: not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: <call>` | 4 | `send()`, before the claim and pushover (no marker) |
+| `HELD: not sent: this push reports paid credit use. Send it with the quota.paid_credits template: <call>` | 4 | `send()`, before the claim and pushover (no marker) |
 | `REPLACED: a newer version replaced this push; nothing was sent` | 0 | pushover 5 (no marker) |
 | `REFUSED: <why>` | 2 | pushover 2 with `refused before sending:` (no marker) |
 | `FAILED: the user was not reached: <why> fallback text:` + one line, or `… <UNREVIEWED_FALLBACK>` | 3 | Any other failure: exit 1, keys missing, timeout |
@@ -148,6 +149,8 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
   - `reviewed` is true only when the text came from a `pushover: reviewed JSON:` line.
 - `user_failure()` writes the fallback marker `~/.local/state/notify/failed/<session_id>.json` under `failed/.lock`. It does this only when `$CLAUDE_PID` resolves a `sessionId` from `~/.claude/sessions/<pid>.json`, and never on a refusal. The marker holds `time`, `title`, `action`, `body`, `message`, `fallback`, `reviewed`, `need`, `held`, and optionally `held_source`, `held_identity` and `held_machine` (empty means local).
 - An auto-mode refusal goes only through `--text-id auto_mode.refused`. A push without it whose title or text has `auto mode` (or `auto-mode`) and `refused`, `denied` or `stopped` is held, before the claim, so a resend with the template is not skipped by `--repeat-minutes`.
+- Paid credit use goes only through `--text-id quota.paid_credits`. A free-text push (no `--text-id`) whose title, text or action has `paid credits` or `use_credits` is held the same way (`wrong_template()`). Other registered `quota.*` pushes that name paid credits are not held.
+- `--text-id quota.paid_credits`: the caller gives `account`, `machine`, `credits`, `refill` and `next_reset`. `paid_credits_values()` fills `sender` from the session's own record; with no record (a script such as `quota_alert.py` on its timer, or the far side of `--machine`), it uses `--value sender`, then `--from`, and refuses a run with none.
 - `--text-id auto_mode.refused`: the session gives `session`, `machine`, `count`, `does`, `waits` and an optional `rule`. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), and `noun`, `they`, `this` and `rule_line` from `count` and `rule`. It refuses `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the templates a session sends (`SESSION_TEMPLATES`).
 - The wait for a user send is raised to at least `review.user_send_seconds()`.
 - `--answerable` is an internal flag, valid only with `--to user`. `send.py` sets it automatically when there is no `--from` and the default sender resolved a session name, and `remote()` forwards it. It is recorded in the `Draft` but no longer changes the outcome.
@@ -195,6 +198,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,ups_battery,ups_shutdown}`.
 - `auto_mode.refused` (user approved 2026-10-21, need `decision`): title `{sender}: auto mode stopped {session}`, `Session: {session}`, Action `On {machine}, in the {session} pane, approve the prompt or add an allow rule`, then the refusal line and the `Approve:` and `Allow rule:` choice lines.
+- `quota.paid_credits` (user approved 2026-10-21, need `decision`): title `{sender}: {account} now uses paid credits`, Action `To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}`, then the credits and refill line, `Leave on (recommended):` and `Turn off:`. It is to replace `quota.codex_on_credits` and `quota.codex_on_credits_last`; those stay until `quota_alert.py` (accounts unit) sends the new id.
 - Shutdown holdout texts. `settle.HoldoutKind.from_reason` picks one of two entries:
   - `shutdown.holdout` when a form is shown.
   - `shutdown.holdout_unanswered` for any other hold.

@@ -11,7 +11,7 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py --to user --summary TITLE [--need note|decision|blocked]
           (--action TEXT | --no-action) ...                              the user
   send.py --to user --text-id ID --value KEY=VALUE ...    a registered push; --help lists
-                                                          the ones a session sends
+                                                          the ones a session or script sends
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
@@ -57,8 +57,8 @@ message text as one JSON line in STATE/log.jsonl:
   KEPT: why      the user's silence is on; posted when it ends    exit 0
   REFUSED: why   rejected before delivery; not kept              exit 2
   HELD: not sent, failed review; revise and resend, no fallback     exit 4
-        also a free-text push that reports an auto-mode refusal:
-        the detail gives the auto_mode.refused call to send instead
+        also a free-text push that reports an auto-mode refusal or paid credit use:
+        the detail gives the auto_mode.refused or quota.paid_credits call to send instead
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -116,9 +116,18 @@ AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --
                   + ' --value session=<session> --value machine=<machine> --value count=<number of commands>'
                   + ' --value "does=<what they do; the verb agrees with count>" --value "waits=<a sentence: what waits>"'
                   + ' [--value "rule=<the allow rule>"]')
-# Registered pushes a session sends itself with --text-id; `send.py --help` lists them.
+PAID_CREDITS_TEXT = "quota.paid_credits"
+PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
+                     + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
+                     + ' --value "refill=<when its plan refills>" --value "next_reset=<the next Codex reset>"')
+PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\buse_credits\b", re.IGNORECASE)
+PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
+                     + PAID_CREDITS_CALL)
+# Registered pushes a session or script sends with --text-id; `send.py --help` lists them.
 SESSION_TEMPLATES = {
     AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
+    PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
+                        + PAID_CREDITS_CALL),
     "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
@@ -1226,8 +1235,28 @@ def auto_mode_values(values: dict[str, str], sender: str) -> dict[str, str]:
             "does": values["does"], "waits": values["waits"], "rule_line": " The rule: " + rule if rule else ""}
 
 
+def paid_credits_values(values: dict[str, str], session: str, named: str | None) -> dict[str, str]:
+    """The quota.paid_credits values with the sender filled: this session's own name. A script with no
+    session record names itself with --value sender or --from (a remote send forwards both)."""
+    sender = session or values.get("sender", "") or named or ""
+    if not sender.strip():
+        raise ValueError(PAID_CREDITS_TEXT + " needs a sender: send it from a Claude session, or name the script with --from")
+    return values | {"sender": sender}
+
+
 def reports_auto_mode_refusal(text: str) -> bool:
     return AUTO_MODE_REPORT.search(text) is not None and AUTO_MODE_REFUSAL.search(text) is not None
+
+
+def wrong_template(options: Options, shown: str) -> str | None:
+    """The hold detail when a user push tells in free text what a registered template carries, else None."""
+    if options.to != USER:
+        return None
+    if options.text_id != AUTO_MODE_TEXT and reports_auto_mode_refusal(shown):
+        return AUTO_MODE_HELD
+    if not options.text_id and PAID_CREDITS_REPORT.search(shown) is not None:
+        return PAID_CREDITS_HELD
+    return None
 
 
 def attr(args: argparse.Namespace, name: str) -> object:
@@ -1251,7 +1280,7 @@ def parse(argv: list[str]) -> Options:
                                      ),
                                      formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]\n\n"
-                                     + "Registered pushes a session sends with --text-id:\n"
+                                     + "Registered pushes a session or script sends with --text-id:\n"
                                      + "\n".join(f"  {text_id}: {use}" for text_id, use in SESSION_TEMPLATES.items()))
     _ = parser.add_argument(
         "--to",
@@ -1301,6 +1330,9 @@ def parse(argv: list[str]) -> Options:
                 if attr(args, "sender") is not None or attr(args, "machine") is not None:
                     parser.error(AUTO_MODE_TEXT + " takes no --from or --machine: it goes from this session's own name and machine")
                 values = auto_mode_values(values, own_session_name())
+                raw_values = [f"{key}={item}" for key, item in values.items()]
+            elif text_id == PAID_CREDITS_TEXT:
+                values = paid_credits_values(values, own_session_name(), optional_str(attr(args, "sender")))
                 raw_values = [f"{key}={item}" for key, item in values.items()]
             rendered = push_texts.render(text_id, **values)
         except ValueError as error:
@@ -1424,12 +1456,12 @@ def send(options: Options) -> Result:
     started = now()
     window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
     # Held before the claim, so the resend with the template is not skipped by --repeat-minutes.
-    wrong_template = (options.to == USER and options.text_id != AUTO_MODE_TEXT
-                      and reports_auto_mode_refusal(summary + "\n" + text))
-    skip = None if wrong_template else claim(message, window, started)
+    action_text = options.action.text if isinstance(options.action, ActionRequired) else ""
+    held = wrong_template(options, "\n".join((summary, text, action_text)))
+    skip = None if held is not None else claim(message, window, started)
     log_route: Route = NO_CLAUDE_ROUTE
-    if wrong_template:
-        result = Result("held", AUTO_MODE_HELD)
+    if held is not None:
+        result = Result("held", held)
     elif skip is not None:
         result = Result("skipped", skip)
     elif isinstance(route, RecipientLookupFailed):

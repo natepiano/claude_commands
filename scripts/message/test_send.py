@@ -1424,6 +1424,61 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
             _ = send.parse(["--help"])
         self.assertIn("auto_mode.refused: auto mode refused a command and the session waits for the user.", output.getvalue())
+        self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
+
+    def paid_credits_arguments(self, *extra: str) -> list[str]:
+        values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 EDT",
+                  "next_reset": "Sat 10-24 16:40 EDT"}
+        return ["--to", "user", "--text-id", "quota.paid_credits",
+                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")), *extra]
+
+    def test_paid_credits_template_takes_its_sender_from_this_session_else_the_script_name(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        # The session record wins over a name the caller gives.
+        options = local_options(self.paid_credits_arguments("--value", "sender=quota_alert"))
+        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.need, "decision")
+        self.assertIn("sender=natedev", options.values)
+        self.assertEqual(options.action, ActionRequired(
+            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+        self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "quota.paid_credits")
+        self.assertIn("sender=natedev", command)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
+            script = local_options(self.paid_credits_arguments("--from", "quota_alert"))
+            self.assertEqual(script.summary, "quota_alert: codex2 now uses paid credits")
+            self.assertEqual(local_options(self.paid_credits_arguments("--value", "sender=quota_alert")).summary,
+                             "quota_alert: codex2 now uses paid credits")
+            with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = local_options(self.paid_credits_arguments())
+            self.assertIn("needs a sender", errors.getvalue())
+
+    def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
+        self.writer_session()
+        for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
+                                    ("Codex workers", "They spend credits now.", "Set use_credits: off in codex2.md"),
+                                    ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):
+            with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                                  "--action", action, "--key", "credits", "--repeat-minutes", "30", "--text", text])
+            self.assertEqual(code, 4)
+            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push reports paid credit use."))
+            self.assertIn("--text-id quota.paid_credits --value account=<account>", output.getvalue())
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "held")
+        # The hold claims no repeat window, and registered pushes about credits are not held.
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options(
+                [*self.paid_credits_arguments(), "--key", "credits", "--repeat-minutes", "30"])).outcome, "sent")
+            self.assertEqual(send.send(local_options(
+                ["--to", "user", "--text-id", "quota.codex_credits_forecast", "--value", "account=codex1",
+                 "--value", "forecast=Workers used 120 paid credits.", "--value", "destination=", "--value", "horizon=x"])).outcome,
+                "sent")
 
     def test_cancelled_user_revision_reports_replaced_locally_and_remotely_without_a_fallback(self) -> None:
         self.writer_session()
