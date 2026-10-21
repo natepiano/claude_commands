@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Sequence
@@ -15,7 +16,10 @@ from compare import OPUS, SONNET, load_turns
 from stats import bootstrap_diff, percentile, request_cost
 from turns import Turn, load_roster, session_ids
 
-DEFAULT_RUNS = Path.home() / ".local/state/plan-delegate/runs"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from unit_runs import history_root  # noqa: E402
+
+DEFAULT_RUNS = history_root() / "runs"
 DEFAULT_ROSTER = Path(__file__).with_name("roster.json")
 DEFAULT_REGISTRY = Path.home() / ".claude/sessions"
 

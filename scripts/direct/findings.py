@@ -63,6 +63,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs  # noqa: E402
+
+# What history written before the rename records for a finding a worker caught.
+FORMER_WORKER = "delegate"
+
 
 SCHEMA_VERSION = 1
 STATE_FILENAME = "findings_state.json"
@@ -492,11 +498,13 @@ def _live_rounds(state: dict[str, object]) -> list[dict[str, object]]:
     return [entry for entry in _rounds(state) if not entry.get("abandoned")]
 
 
+def _caught_by(args: argparse.Namespace) -> str:
+    caught_by = _arg_string(args, "caught_by")
+    return "worker" if caught_by == FORMER_WORKER else caught_by
+
+
 def _history_root() -> Path:
-    configured = os.environ.get("UNIT_HISTORY_DIR")
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".local" / "state" / "plan-delegate"
+    return unit_runs.history_root()
 
 
 class PhasePass(TypedDict):
@@ -768,7 +776,7 @@ def _open(args: argparse.Namespace) -> None:
         "line": _arg_integer(args, "line"),
         "title": _arg_string(args, "title"),
         "detail": _arg_string(args, "detail"),
-        "caught_by": _arg_string(args, "caught_by"),
+        "caught_by": _caught_by(args),
         "lens": _arg_string(args, "lens"),
         "state": STATE_OPEN,
         "opened_at": now,
@@ -791,7 +799,7 @@ def _open(args: argparse.Namespace) -> None:
             "file": _arg_string(args, "file"),
             "line": _arg_integer(args, "line"),
             "title": _arg_string(args, "title"),
-            "caught_by": _arg_string(args, "caught_by"),
+            "caught_by": _caught_by(args),
             "lens": _arg_string(args, "lens"),
             "round": len(_rounds(state)),
         },
@@ -1142,8 +1150,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _ = opened.add_argument("--file", default="")
     _ = opened.add_argument("--line", type=int, default=0)
     _ = opened.add_argument("--detail", default="")
+    # `delegate` is the former name of `worker`, kept for directors started before the rename.
     _ = opened.add_argument(
-        "--caught-by", choices=("delegate", "main", "both"), required=True
+        "--caught-by", choices=("worker", "main", "both", FORMER_WORKER), required=True
     )
     # Which broad-review lenses raised it, comma-separated: `adversary` and
     # `contract` read the diff against its work order, `craft` reads its code

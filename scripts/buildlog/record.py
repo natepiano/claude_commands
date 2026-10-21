@@ -170,7 +170,7 @@ def who() -> dict[str, str | None]:
     board = env.get("UNIT_RUN_DIR") or env.get("UNIT_SESSION_DIR")
     return {
         "worker": env.get("UNIT_TEAM_ROLE") or None,
-        "delegate_session": Path(board.rstrip("/")).name if board else None,
+        "unit_session": Path(board.rstrip("/")).name if board else None,
         "session": env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None,
     }
 
@@ -485,7 +485,7 @@ def backfill(args: list[str]) -> None:
             "branch": event["branch"] or None,
             "sha": event["commit"] or None,
             "worker": None,
-            "delegate_session": event["session"] or None,
+            "unit_session": event["session"] or None,
             "session": None,
             "backfilled": True,
         }

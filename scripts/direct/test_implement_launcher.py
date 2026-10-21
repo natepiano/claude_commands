@@ -673,7 +673,7 @@ printf '%s\\n' '{answer}'
         findings = self.root / "scripts" / "direct" / "findings.py"
         for arguments in (
             ("open", "--severity", "blocker", "--title", "Repair retry",
-             "--caught-by", "delegate"),
+             "--caught-by", "worker"),
             ("dispatch", "--covers", "F001"),
         ):
             result = subprocess.run(

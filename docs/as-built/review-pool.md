@@ -49,7 +49,7 @@ A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug
 
 A new file starts with `generation: 0`. `stopping` is present only while a stop is unfinished. A file without `next_index` reads each counter as 1. A file written before reviewers became permanent may still hold `split`, a lease `phase` or a reviewer's `served`; they load and the next write drops them. Types are `code` and `ui`; reviewer names are `<type><n>` (`code1`, `ui2`); a template is named `<type>-template-<hash8>`. In code a lease is `Unleased` or `UnitLease(unit, ordinal)`, and a reviewer's ownership is `IdleReviewer` or `ClaimedReviewer`; `null` appears only where `pool.json` is read and written. A lease's `ordinal` counts the reviews the reviewer has carried on its current thread.
 
-`<history root>` is `UNIT_HISTORY_DIR`, or `~/.local/state/plan-delegate`. Review turn records and UI verdict pairs live in its `review_turns/<session dir name>/`.
+`<history root>` is `UNIT_HISTORY_DIR`, or `~/.local/state/unit-history` (`~/.local/state/plan-delegate` until `unit_runs.py move-history` moves it). Review turn records and UI verdict pairs live in its `review_turns/<session dir name>/`.
 
 ### `review_pool.py` verbs
 

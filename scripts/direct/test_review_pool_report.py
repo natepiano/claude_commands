@@ -137,7 +137,7 @@ class ReviewPoolReportTests(unittest.TestCase):
                             encoding="utf-8")
         return path
 
-    def finding(self, *, phase_instance: str = "phase-instance", caught_by: str = "delegate",
+    def finding(self, *, phase_instance: str = "phase-instance", caught_by: str = "worker",
                 lens: str = "contract", event_type: str = "finding_opened") -> dict[str, object]:
         self.sequence += 1
         return {"event_type": event_type, "event_id": f"event-{self.sequence}",

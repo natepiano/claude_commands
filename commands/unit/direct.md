@@ -1284,7 +1284,7 @@ instructions name; with none, skip and say so in one line.
      helper and use only the pool's result.
    - Save the full helper verdict, when run, and the successful pool verdict
      from `${PHASE_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
-     records in `${UNIT_HISTORY_DIR:-$HOME/.local/state/plan-delegate}/review_turns/<session dir name>/`,
+     records in `$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/unit_runs.py history-root)/review_turns/<session dir name>/`,
      as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`. Preserve each
      pair. A failed shadow pool check leaves its pool file missing and gets
      an error note; the helper's verdict still governs. An adopted pool
@@ -1305,7 +1305,7 @@ instructions name; with none, skip and say so in one line.
 4. Open each defect row as a finding — blocker, because the showrunner's merge
    check holds a checkpoint on any visible defect. A `no rule` row is still a
    finding:
-   `findings.py open --severity blocker --lens ux --caught-by delegate --title <defect> --file <shot path> --detail "<rule>: <fix>"`
+   `findings.py open --severity blocker --lens ux --caught-by worker --title <defect> --file <shot path> --detail "<rule>: <fix>"`
    Then obey `findings.py gate` exactly as <Synthesize/> step 5 does, the same
    repair round under <FixDispatch/>, except that `converged` continues to
    <PhaseEnd/> in loop or verbose, or <RunPhaseReview/> in `single`.

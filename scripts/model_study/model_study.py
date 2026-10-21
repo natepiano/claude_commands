@@ -20,6 +20,7 @@ import results as study_results
 from turns import RECORDED_ZONE, Compaction, Dropped, Turn, load_roster, read_session, recompute_switch_turns, session_ids
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
+from unit_runs import history_root  # noqa: E402
 
 DEFAULT_STATE = Path.home() / ".local/state/model-study"
 DEFAULT_ROSTER = Path(__file__).with_name("roster.json")
@@ -201,7 +202,7 @@ def main() -> None:
     _ = compare_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
     phases_parser = subcommands.add_parser("phases", help="compare completed unit phases")
     _ = phases_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
-    _ = phases_parser.add_argument("--runs-dir", type=Path, default=Path.home() / ".local/state/plan-delegate/runs")
+    _ = phases_parser.add_argument("--runs-dir", type=Path, default=history_root() / "runs")
     _ = phases_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")
     _ = phases_parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
     report_parser = subcommands.add_parser("report", help="render director numbers and the default recommendation")
@@ -213,7 +214,7 @@ def main() -> None:
     _ = report_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
     _ = report_parser.add_argument("--projects-dir", type=Path, default=Path.home() / ".claude/projects")
     _ = report_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")
-    _ = report_parser.add_argument("--runs-dir", type=Path, default=Path.home() / ".local/state/plan-delegate/runs")
+    _ = report_parser.add_argument("--runs-dir", type=Path, default=history_root() / "runs")
     _ = report_parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
     _ = report_parser.add_argument("--now", type=datetime.fromisoformat)
     _ = report_parser.add_argument("--no-history", action="store_true")
@@ -224,7 +225,7 @@ def main() -> None:
     _ = results_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
     _ = results_parser.add_argument("--projects-dir", type=Path, default=Path.home() / ".claude/projects")
     _ = results_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")
-    _ = results_parser.add_argument("--runs-dir", type=Path, default=Path.home() / ".local/state/plan-delegate/runs")
+    _ = results_parser.add_argument("--runs-dir", type=Path, default=history_root() / "runs")
     _ = results_parser.add_argument("--roster", type=Path, default=DEFAULT_ROSTER)
     _ = results_parser.add_argument("--docs-dir", type=Path, default=Path(__file__).resolve().parents[2] / "docs/as-built")
     _ = results_parser.add_argument("--now", type=datetime.fromisoformat)

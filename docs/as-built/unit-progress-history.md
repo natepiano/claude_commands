@@ -5,7 +5,7 @@ Claude and Codex implementations of `/unit:direct`. It writes append-only
 per-run JSONL files under:
 
 ```text
-~/.local/state/plan-delegate/runs/<run-id>.jsonl
+~/.local/state/unit-history/runs/<run-id>.jsonl
 ```
 
 The live session cache remains in
@@ -227,7 +227,7 @@ as slow, not where it is cut off.
 ## Commands
 
 ```text
-findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by delegate|main|both [--file <path>] [--line <N>] [--detail <text>]
+findings.py open --session-dir <dir> [--phase <id>] --severity blocker|minor|nit --title <text> --caught-by worker|main|both [--file <path>] [--line <N>] [--detail <text>]
 findings.py verdict --session-dir <dir> [--phase <id>] --id <F00N> --state accepted|still_open|reopened [--evidence <hunk>]
 findings.py gate --session-dir <dir> [--phase <id>]
 findings.py dispatch --session-dir <dir> [--phase <id>] --covers F001,F002,...

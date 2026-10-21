@@ -168,7 +168,7 @@ class InventoryTests(ShutdownTestCase):
                 patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"):
             found = inventory._active_run_directories()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(
-            (found.get("unit-director"), found.get("worker-director")),
+            (found.get("unit-director"), found.get("delegate-director")),
             ([Path("/runs/unit")], [Path("/runs/delegate")]),
         )
 

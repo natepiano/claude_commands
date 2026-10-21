@@ -1030,7 +1030,7 @@ def main() -> int:
     window = Window(since if since is not None else end - timedelta(days=14).total_seconds(), end)
     if window.since >= window.until:
         parser.error("--since must be before --until")
-    events, problems = read_events((Path.home() / ".local/state/plan-delegate/runs").glob("*.jsonl"))
+    events, problems = read_events((plan_history.history_root() / "runs").glob("*.jsonl"))
     phases = phase_boundaries(events, window)
     usage_window = Window(min((phase.start for phase in phases), default=window.since), window.until)
     selected_runs = {phase.run for phase in phases}

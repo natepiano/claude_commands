@@ -35,7 +35,7 @@ SCHEMA_VERSION = 1
 # to tell "worker changed its events" apart from "the shared format changed",
 # and one number cannot say both once other skills write to the same spine.
 SPINE_VERSION = 1
-SKILL_NAME = "plan-delegate"
+SKILL_NAME = "unit-history"
 MIN_CALIBRATION_SAMPLES = 5
 # How long a stretch with no pass or activity open still counts as phase work: the unit
 # director reviews, gates and writes the next prompt between dispatches. Past it the phase

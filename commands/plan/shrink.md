@@ -120,11 +120,13 @@ start; read that record.
    `no run record`:
 
    ```python
-   import json, os, pathlib
+   import json, os, pathlib, sys
+   sys.path.insert(0, str(pathlib.Path.home() / ".claude/scripts/lib"))
+   from unit_runs import history_root
    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
    markers = [pathlib.Path(f"/tmp/claude/{name}/active/{sid}") for name in ("unit", "delegate")]
    marker = next((path for path in markers if path.is_file()), markers[0])
-   runs = pathlib.Path.home() / ".local/state/plan-delegate/runs"
+   runs = history_root() / "runs"
    active = runs / f"{pathlib.Path(marker.read_text().strip()).name}.jsonl" \
        if sid and marker.is_file() else None
 

@@ -170,7 +170,7 @@ for number in (1, 2):
         assert [call.args[1] for call in lock.call_args_list][0] == fcntl.LOCK_EX
         assert lock.call_args_list[-1].args[1] == fcntl.LOCK_UN
         assert (session / '.progress_history.lock').exists()
-    history, = (home / '.local/state/plan-delegate/runs').glob('*.jsonl')
+    history, = (home / '.local/state/unit-history/runs').glob('*.jsonl')
     events = [json.loads(line) for line in history.read_text().splitlines()]
     started, = [event for event in events if event['event_type'] == 'pass_started']
     assert started['config_digest'] == hashlib.sha256(registry.read_bytes() + settings.read_bytes()).hexdigest()[:12]
@@ -3148,7 +3148,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.finish_slot_pass(session_dir, "review", "completed", started_at + 620)
         _ = self.run_findings(
             session_dir, "open", "--severity", "minor", "--title", "earlier phase",
-            "--caught-by", "delegate", "--lens", "craft", at=started_at + 630,
+            "--caught-by", "worker", "--lens", "craft", at=started_at + 630,
         )
         self.team_slot = ""
         _ = self.run_command(
@@ -3180,7 +3180,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         for lens in ("ux", "craft", "adversary,craft", "both", "contract"):
             _ = self.run_findings(
                 session_dir, "open", "--severity", "minor", "--title", f"raised by {lens}",
-                "--caught-by", "delegate", "--lens", lens, at=base + 5_400,
+                "--caught-by", "worker", "--lens", lens, at=base + 5_400,
             )
 
         # 3050 s is 50.8 minutes, which rounds to 51 rather than truncating to 50.
@@ -3274,7 +3274,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         instance_id = cast(str, cast(dict[str, object], state["phase"])["instance_id"])
         _ = self.run_findings(
             session_dir, "open", "--severity", "minor", "--title", "opened by the director",
-            "--caught-by", "delegate", "--lens", "contract", at=started_at + 20,
+            "--caught-by", "worker", "--lens", "contract", at=started_at + 20,
         )
 
         def trial() -> str:
@@ -3317,7 +3317,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         def repair(finding: str, lens: str, round_number: int, workers: tuple[tuple[str, int], ...], at: int) -> None:
             _ = self.run_findings(
                 session_dir, "open", "--severity", "blocker", "--title", f"{lens} finding",
-                "--file", "src/lib.rs", "--caught-by", "delegate", "--lens", lens, at=at,
+                "--file", "src/lib.rs", "--caught-by", "worker", "--lens", lens, at=at,
             )
             _ = self.run_findings(session_dir, "gate", at=at + 5)
             _ = self.run_findings(session_dir, "dispatch", "--covers", finding, at=at + 10)

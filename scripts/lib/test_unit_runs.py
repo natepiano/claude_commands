@@ -134,6 +134,43 @@ class UnitRunsTest(unittest.TestCase):
             self.assertNotIn("sid-ended", shown.getvalue())
             self.assertIn("the former name can go", shown.getvalue())
 
+    def test_the_history_root_is_the_override_else_the_new_name_once_it_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            new, old = state / "unit-history", state / "plan-delegate"
+            with patch.object(unit_runs, "state_dir", lambda: state), patch.dict(os.environ, {"UNIT_HISTORY_DIR": ""}):
+                self.assertEqual(unit_runs.history_root(), new)
+                old.mkdir()
+                self.assertEqual(unit_runs.history_root(), old)
+                new.mkdir()
+                self.assertEqual(unit_runs.history_root(), new)
+                with patch.dict(os.environ, {"UNIT_HISTORY_DIR": f"{folder}/scratch"}):
+                    self.assertEqual(unit_runs.history_root(), state / "scratch")
+
+    def test_move_history_waits_for_live_runs_then_moves_both_folders_once(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            new, old, runs = state / "unit-history", state / "plan-delegate", state / "unit"
+            (old / "runs").mkdir(parents=True)
+            _ = (old / "runs/run-1.jsonl").write_text("{}\n")
+            (state / "usage-model/delegate-archive").mkdir(parents=True)
+            (runs / "run-1").mkdir(parents=True)
+            beat = runs / "run-1" / unit_runs.HEARTBEAT
+            _ = beat.write_text("beat\n")
+            now = beat.stat().st_mtime
+            later = now + unit_runs.LIVE_HEARTBEAT_SECS
+            with patch.object(unit_runs, "RUN_ROOT", runs), patch.object(unit_runs, "FORMER_RUN_ROOT", state / "none"), \
+                    contextlib.redirect_stdout(io.StringIO()) as shown, contextlib.redirect_stderr(io.StringIO()) as refused:
+                self.assertEqual(unit_runs.move_history(now, state), 1)
+                self.assertTrue(old.is_dir())
+                self.assertIn(str(runs / "run-1"), refused.getvalue())
+                self.assertEqual(unit_runs.move_history(later, state), 0)
+                self.assertEqual((new / "runs/run-1.jsonl").read_text(), "{}\n")
+                self.assertFalse(old.exists())
+                self.assertTrue((state / "usage-model/unit-archive").is_dir())
+                self.assertFalse((state / "usage-model/delegate-archive").exists())
+                self.assertEqual(unit_runs.move_history(later, state), 0)
+            self.assertIn("nothing to move", shown.getvalue())
 
 if __name__ == "__main__":
     _ = unittest.main()

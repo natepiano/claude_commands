@@ -661,7 +661,7 @@ class RecordTests(unittest.TestCase):
             "repo_path": str(self.repo),
             "branch": "main",
             "worker": "impl2",
-            "delegate_session": "run-7",
+            "unit_session": "run-7",
             "session": "session-1",
             "backfilled": False,
         }
@@ -876,7 +876,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual((ran["status"], ran["build_s"], ran["cached"], ran["backfilled"]), (0, 40, True, True))
         failed = by_outcome["failed"]
         self.assertEqual((failed["host"], failed["status"], failed["sha"]), ("Nates-MacBook-Pro-2023", None, "abc1234"))
-        self.assertEqual((failed["delegate_session"], failed["repo_path"]), ("run-3", "/r/hana"))
+        self.assertEqual((failed["unit_session"], failed["repo_path"]), ("run-3", "/r/hana"))
         self.assertIsNone(by_outcome["reused"]["sha"])
 
         second = self.record("backfill-verify", str(ledger))

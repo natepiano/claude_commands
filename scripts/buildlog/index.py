@@ -30,7 +30,9 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
+# Step and call fields under a former name, renamed in the file on its next read.
+FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -78,7 +80,7 @@ STEP_COLUMNS: list[Column] = [
     ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
     ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), brp-launch (build and app start), agent, alias, unknown"),
     ("worker", "TEXT", "worker role (UNIT_TEAM_ROLE)"),
-    ("delegate_session", "TEXT", "unit session folder name"),
+    ("unit_session", "TEXT", "unit session folder name"),
     ("session", "TEXT", "Claude Code session id or Codex thread id"),
     ("call_id", "TEXT", "calls.id of the verify.sh call that ran this step"),
     ("tty", "INTEGER", "1 when a terminal watched it; then no log facts are recorded"),
@@ -175,7 +177,7 @@ CALL_COLUMNS: list[Column] = [
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "short commit"),
     ("worker", "TEXT", "worker role"),
-    ("delegate_session", "TEXT", "unit session folder name"),
+    ("unit_session", "TEXT", "unit session folder name"),
     ("session", "TEXT", "Claude Code session or Codex thread"),
     ("backfilled", "INTEGER", "1 when copied from the old events.jsonl ledger"),
 ]
@@ -606,9 +608,11 @@ def migrate_worker_fields(path: Path) -> None:
                 continue
             if isinstance(value, dict):
                 fields = cast(dict[str, object], value)
-                if fields.get("kind") in ("step", "call") and "seat" in fields:
-                    _ = fields.setdefault("worker", fields["seat"])
-                    del fields["seat"]
+                renamed = [(old, new) for old, new in FORMER_FIELDS if old in fields]
+                if fields.get("kind") in ("step", "call") and renamed:
+                    for old, new in renamed:
+                        _ = fields.setdefault(new, fields[old])
+                        del fields[old]
                     raw = (json.dumps(fields, ensure_ascii=False) + "\n").encode()
                     changed = True
             lines.append(raw)

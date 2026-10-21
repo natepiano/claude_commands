@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs  # noqa: E402
 
 
 # How far the percentage beside an ETA is assumed to be off when no calibration
@@ -63,10 +67,7 @@ class EtaProjectionUnavailable(NamedTuple):
 
 
 def history_root() -> Path:
-    configured = os.environ.get("UNIT_HISTORY_DIR")
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".local" / "state" / "plan-delegate"
+    return unit_runs.history_root()
 
 
 def now_epoch() -> float:

@@ -228,14 +228,17 @@ class IndexTests(unittest.TestCase):
 
     def test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends(self) -> None:
         partial = encode(step("pending", worker="next"))[:20]
-        self.write(self.host_file, step("old-step", seat="impl"), call("old-call", seat="test"))
+        self.write(self.host_file, step("old-step", seat="impl", delegate_session="run-1"),
+                   call("old-call", seat="test"))
         with self.host_file.open("ab") as output:
             _ = output.write(partial)
         self.assertEqual(index.update(), 2)
         self.assertEqual(self.rows("SELECT worker FROM steps"), [("impl",)])
         self.assertEqual(self.rows("SELECT worker FROM calls"), [("test",)])
         rewritten = self.host_file.read_bytes()
+        self.assertEqual(self.rows("SELECT unit_session FROM steps"), [("run-1",)])
         self.assertNotIn(b'"seat"', rewritten)
+        self.assertNotIn(b'"delegate_session"', rewritten)
         self.assertTrue(rewritten.endswith(partial))
         modified = self.host_file.stat().st_mtime_ns
         self.assertEqual(index.update(), 0)
@@ -382,7 +385,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("UPDATE samples SET power_profile = NULL, power_profile_since = NULL")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(17,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(18,)])
         self.assertEqual(self.rows("SELECT power_profile, power_profile_since FROM samples"), [("power-saver", STAMP)])
 
     def test_reindex_reads_everything_again(self) -> None:
@@ -588,7 +591,7 @@ class IndexTests(unittest.TestCase):
                 ("old", None, None, None, None),
             ],
         )
-        self.assertEqual(index.SCHEMA_VERSION, 17)
+        self.assertEqual(index.SCHEMA_VERSION, 18)
 
     def test_copy_call_fields_reach_index_and_old_records_read_as_null(self) -> None:
         self.write(
@@ -611,7 +614,7 @@ class IndexTests(unittest.TestCase):
             _ = connection.execute("UPDATE calls SET copy = NULL, copy_s = NULL")
             connection.commit()
         self.assertEqual(index.update(), 1)
-        self.assertEqual(self.rows("PRAGMA user_version"), [(17,)])
+        self.assertEqual(self.rows("PRAGMA user_version"), [(18,)])
         self.assertEqual(self.rows("SELECT copy, copy_s, copy_count FROM calls"), [("gave_way", 12.0, 1)])
 
     def test_natedev_nextest_stopped_by_a_copy_win_is_not_a_failure(self) -> None:

@@ -175,7 +175,7 @@ record_eta_range(target, earliest, latest, source, rendered_time, now) -> Render
 ### Roots and overrides
 
 - `PHASE_TABLE_VAULT`: the vault root (`_vault_root`), default `~/rust/hanadocs/showrunners`.
-- `UNIT_HISTORY_DIR`: the recorder's history root (`_history_root`), default `~/.local/state/plan-delegate`; run files sit in its `runs/`. `UNIT_NOW_EPOCH` replaces the clock (`now_epoch`).
+- `UNIT_HISTORY_DIR`: the recorder's history root (`_history_root`), default `~/.local/state/unit-history` (`~/.local/state/plan-delegate` until `unit_runs.py move-history` moves it); run files sit in its `runs/`. `UNIT_NOW_EPOCH` replaces the clock (`now_epoch`).
 - `NOTIFIER_STATE_DIR`, `NOTIFIER_SESSIONS_DIR`: where `scripts/production/showrunners.py` finds a showrunner, defaults `~/.local/state/notifier` and `~/.claude/sessions`.
 - `DAILIES_PHASE_TABLE`: the table script the dailies builder calls (`phase_table_path`), default `scripts/direct/phase_table.py`.
 

@@ -450,7 +450,7 @@ PY
 }
 
 write_turn_record() {
-  "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
+  UNIT_LIB_DIR="${SCRIPT_DIR%/*}/lib" "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
     "${POOL_TYPE}" "${POOL_PRODUCTION}" "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
     "${TURN_LEASE}" "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" \
     "${LEASE_ORDINAL}" "${PRIME_HASH}" "${TURN_RAISED}" <<'PY'
@@ -476,8 +476,9 @@ record = {
     "finished_at": time.time(), "lease_ordinal": int(ordinal), "prime_hash": prime_hash,
     "status": status, "raised": int(raised),
 }
-history = Path(os.environ.get("UNIT_HISTORY_DIR", "~/.local/state/plan-delegate")).expanduser()
-root = history / "review_turns" / Path(session).name
+sys.path.insert(0, os.environ["UNIT_LIB_DIR"])
+from unit_runs import history_root
+root = history_root() / "review_turns" / Path(session).name
 root.mkdir(parents=True, exist_ok=True)
 with (root / f"{started}-{pid}.json").open("x", encoding="utf-8") as output:
     json.dump(record, output, ensure_ascii=False)

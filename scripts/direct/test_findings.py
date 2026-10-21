@@ -157,7 +157,7 @@ class FindingsLedgerTests(unittest.TestCase):
 
     def open_finding(self, severity: str, title: str, *, at: int = 1_000) -> str:
         return self.run_command(
-            "open", "--severity", severity, "--title", title, "--caught-by", "delegate", at=at
+            "open", "--severity", severity, "--title", title, "--caught-by", "worker", at=at
         )
 
     def gate(self, *, at: int = 1_000) -> dict[str, object]:
@@ -214,9 +214,9 @@ class FindingsLedgerTests(unittest.TestCase):
     def test_a_landed_repair_for_the_older_open_phase_touches_only_its_ledger(self) -> None:
         self.write_two_open_phases()
         fifteen = self.run_command("open", "--phase", "15", "--severity", "blocker",
-                                   "--title", "fifteen's finding", "--caught-by", "delegate")
+                                   "--title", "fifteen's finding", "--caught-by", "worker")
         sixteen = self.run_command("open", "--phase", "16", "--severity", "blocker",
-                                   "--title", "sixteen's finding", "--caught-by", "delegate")
+                                   "--title", "sixteen's finding", "--caught-by", "worker")
         _ = self.run_command("dispatch", "--phase", "15", "--covers", fifteen)
         _ = self.run_command("dispatch", "--phase", "16", "--covers", sixteen)
 
@@ -235,7 +235,7 @@ class FindingsLedgerTests(unittest.TestCase):
     def test_a_ledger_call_naming_no_phase_is_refused_while_two_are_open(self) -> None:
         self.write_two_open_phases()
         result = self.run_failing_command("open", "--severity", "blocker", "--title", "which phase",
-                                          "--caught-by", "delegate")
+                                          "--caught-by", "worker")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("2 phases are open (15, 16); name one with --phase", result.stderr)
         self.assertEqual(list(self.session_dir.glob("findings_state*.json")), [])
@@ -256,7 +256,7 @@ class FindingsLedgerTests(unittest.TestCase):
         self.write_progress_state("instance-a")
         _ = self.run_command(
             "open", "--severity", "minor", "--title", "stale caller",
-            "--caught-by", "delegate", "--lens", "contract",
+            "--caught-by", "worker", "--lens", "contract",
         )
         _ = self.open_finding("minor", "main review only")
         findings = cast(list[dict[str, object]], self.status()["findings"])
@@ -264,13 +264,21 @@ class FindingsLedgerTests(unittest.TestCase):
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["lens"] for event in opened], ["contract", ""])
 
+    def test_the_former_caught_by_name_is_stored_as_worker(self) -> None:
+        self.write_progress_state("instance-a")
+        _ = self.run_command("open", "--severity", "minor", "--title", "old prompt", "--caught-by", "delegate")
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual([entry["caught_by"] for entry in findings], ["worker"])
+        opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
+        self.assertEqual([event["caught_by"] for event in opened], ["worker"])
+
     def test_a_finding_names_every_lens_that_raised_it(self) -> None:
         """One lens, several, or the legacy `both`, each stored as the ledger reads it."""
         self.write_progress_state("instance-a")
         for lens in ("craft", "adversary,craft", "ux", "both", "craft, ux,craft"):
             _ = self.run_command(
                 "open", "--severity", "minor", "--title", f"raised by {lens}",
-                "--caught-by", "delegate", "--lens", lens,
+                "--caught-by", "worker", "--lens", lens,
             )
         expected = ["craft", "adversary,craft", "ux", "both", "craft,ux"]
         findings = cast(list[dict[str, object]], self.status()["findings"])
@@ -283,7 +291,7 @@ class FindingsLedgerTests(unittest.TestCase):
         for lens in ("style", "adversary,style", "both,craft", "craft,"):
             result = self.run_failing_command(
                 "open", "--severity", "minor", "--title", "misspelt lens",
-                "--caught-by", "delegate", "--lens", lens,
+                "--caught-by", "worker", "--lens", lens,
             )
             self.assertEqual(result.returncode, 2, lens)
             self.assertIn("argument --lens: unknown lens", result.stderr)
