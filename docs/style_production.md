@@ -218,7 +218,11 @@ Fingerprints use committed Git objects at the rule's `file`, `crate` or
 `manifest` scope. A `clean`, `exception` or `held` verdict with `--input-scope file`
 uses the file's own fingerprint. It stays current when other files in its crate
 or module change. On a crate or module cell of a Rust file, these three verdicts
-must give `--input-scope file` or `--input-scope rule`. The manifest scope covers the workspace root and member
+must give `--input-scope file` or `--input-scope rule`. With `--input-scope rule`,
+use `--reads <files>` to name each other file the verdict rests on. The fingerprint
+uses the cell's own file plus those named files, so only a change to one of them
+brings the cell back. Without `--reads`, the fingerprint uses the whole crate or
+module. Each named file must exist at the checked commit. The manifest scope covers the workspace root and member
 manifests; crate `.` covers only its own files. Exceptions expire with their
 inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 `exception` (reviewed allowed case), `held` (proposal deferred) and `waived`
@@ -303,7 +307,7 @@ code, and run the printed `held built` command when the change is there. A rerun
 of `ticket merge` on a merged ticket prints these lines again. A finding whose
 change is not there waits for a person, who makes the change and
 runs that command, or waives the finding with
-`style_ledger.py held waive --repo <checkout> --id <finding id>`.
+`style_ledger.py held waive --repo <checkout> --id <finding id> --person <name>`.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.
@@ -395,6 +399,19 @@ An uncertain result goes to review. Every tier D finding and every
 edits from the applied diff; merge the remainder after its gate passes.
 Record each held finding with `style_ledger.py held add` and its cell with
 `record --verdict held`.
+
+Each `style_ledger.py held waive --id <finding id>` requires exactly one actor:
+`--ticket <judging ticket>` for the unit that found it, or `--person <name>` for
+a person. The ledger records the actor supplied by the caller.
+
+To correct the after text of a waived finding, use `style_ledger.py held replace
+--id <waived id> --after <text>`. It accepts a unit's waive, keeps the id and
+judging ticket, returns the finding to unfiled, and restores a newest waived
+cell judgment to held. For an old waive with no recorded source, add
+`--person <name>`; the ledger records who undid it, as `unwaive` does. A person's
+waive is always refused by `replace`. When there is no waived cell judgment,
+record `held` for the cell after replacement. Plain `held add` keeps an existing
+waive.
 
 Run from the unit worktree, using the ticket's recorded start commit:
 
@@ -526,7 +543,7 @@ the finding stays as it is for a person to waive or fix in the code. No file:
   Its `left` line names the mapped declaration, sorted candidate sites, body counts and failed checks.
   Earlier ambiguous-move, cross-crate, open-ticket and uncertain-trait refusals still apply.
 - Another filed finding whose file is still there stays filed for a person. A
-  person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
+  person runs `style_ledger.py held waive --repo <checkout> --id <finding> --person <name>`, or
   puts the item back in the code.
 - An unfiled finding, or a filed finding whose file is gone, is withdrawn, with
   no decision when it was unfiled.

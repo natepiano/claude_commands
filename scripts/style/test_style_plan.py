@@ -46,6 +46,7 @@ class StylePlanTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
         self.unit = self.root / "sample-style-names"
@@ -53,6 +54,7 @@ class StylePlanTests(unittest.TestCase):
         self.repo.mkdir()
         self.rule_dir.mkdir(parents=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
         })))
@@ -274,7 +276,7 @@ class StylePlanTests(unittest.TestCase):
             + "A cell is recorded only after both judges have judged it: held when either judge holds a finding in it, ",
             self.plan.read_text())
 
-    def test_written_phase_requires_an_input_scope_on_crate_and_module_cells(self) -> None:
+    def test_written_phase_names_read_files_and_explains_refill_without_reads(self) -> None:
         _ = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
@@ -284,9 +286,46 @@ class StylePlanTests(unittest.TestCase):
             + "the ledger takes its pinned rule blob.\n"
             + "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.\n"
             + "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.\n"
-            + "Use `--input-scope rule` when the verdict rests on other files in the crate or module.\n",
+            + "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
+            + "Without `--reads`, the cell comes back after any change in its crate or module.\n",
             self.plan.read_text(),
         )
+
+    def test_refill_offers_rule_cell_again_only_when_a_named_read_file_changes(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        legacy = self.rule("legacy-read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        path = self.sources[0]
+        read = "crates/alpha/src/b.rs"
+        self.write(read, "pub fn read() {}\n")
+        self.tip = self.commit()
+        self.unit_takes_tip()
+        self.sync()
+        self.assertTrue(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
+        result = subprocess.run(
+            [sys.executable, str(Path(style_ledger.__file__)), "record", "--repo", str(self.repo),
+             "--rule", rule, "--path", path, "--commit", self.tip, "--rule-blob",
+             next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule),
+             "--verdict", "clean", "--ticket", "outside", "--worker", "test", "--input-scope", "rule",
+             "--reads", read], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.record(legacy, path, self.tip)
+        self.assertFalse(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
+        self.assertFalse(any(legacy in ticket.rules and path in ticket.files for ticket in self.candidates()))
+
+        self.write(self.sources[1], "pub fn unrelated() {}\n")
+        self.tip = self.commit()
+        self.unit_takes_tip()
+        self.sync()
+        candidates = self.candidates()
+        self.assertFalse(any(rule in ticket.rules and path in ticket.files for ticket in candidates))
+        self.assertTrue(any(legacy in ticket.rules and path in ticket.files for ticket in candidates))
+
+        self.write(read, "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.unit_takes_tip()
+        self.sync()
+        self.assertTrue(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
 
     def test_written_names_read_phase_uses_two_blind_judges_for_small_and_large_slices(self) -> None:
         rule = self.rule("read")
@@ -851,7 +890,7 @@ class StylePlanTests(unittest.TestCase):
         finding = ledger.hold(rule, path, 1, "Keep this name", "rename", "value", "amount", blob, "outside")
         ledger.record(rule, path, self.tip, blob, "held", ticket="outside", input_scope=style_ledger.DeclaredInputScope.RULE)
         result = subprocess.run([sys.executable, style_ledger.__file__, "held", "waive", "--repo", str(self.repo),
-                                 "--id", finding.finding_id], capture_output=True, text=True, check=False)
+                                 "--id", finding.finding_id, "--person", "nate"], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.write(self.sources[1], "pub fn sibling_changed() {}\n")
         self.tip = self.commit()
@@ -890,11 +929,11 @@ class StylePlanTests(unittest.TestCase):
         waived = ledger.hold(rule, self.sources[0], 2, "Already waived", "restructure", "before", "after", blob, "outside")
         _ = ledger.decline_findings((waived.finding_id,), "declined")[waived.finding_id]
         outside = ledger.hold(rule, self.sources[2], 1, "Different batch", "restructure", "before", "after", blob, "outside")
-        ledger.waive_held(outside.finding_id)
+        ledger.waive_held(outside.finding_id, style_ledger.WaiveByPerson("nate"))
         other_rule = self.rule("other-family")
         other_blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == other_rule)
         other = ledger.hold(other_rule, self.sources[0], 3, "Other rule", "rename", "before", "after", other_blob, "outside")
-        ledger.waive_held(other.finding_id)
+        ledger.waive_held(other.finding_id, style_ledger.WaiveByPerson("nate"))
         worktree = self.root / "modules"
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
         plan = worktree / "docs/style-production/units/modules-unit.md"
@@ -921,7 +960,7 @@ class StylePlanTests(unittest.TestCase):
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         finding = ledger.hold(rule, self.sources[0], 1, "Keep this module", "restructure",
                               "before", "after", blob, "outside")
-        ledger.waive_held(finding.finding_id)
+        ledger.waive_held(finding.finding_id, style_ledger.WaiveByPerson("nate"))
         plan = self.modules_unit()
         self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
         expected = plan.read_bytes()
@@ -3161,7 +3200,6 @@ class StylePlanTests(unittest.TestCase):
 
         Files replace or add HEAD files, and each pair adds a finding that renames an item of the file.
         """
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")})))
         old = "crates/alpha/src/ledger/lock.rs"
         self.write(self.sources[0], "pub mod ledger;\n")
         self.write("crates/alpha/src/ledger/mod.rs", self.LEDGER_MOD)
