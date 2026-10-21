@@ -681,8 +681,9 @@ def codex_can_work(report: Report, now: datetime, credits: CodexCreditsSetting) 
     # missing 5-hour window means no use in it yet: all of it is left.
     windows = (weekly,) if report.five_hour is None else (weekly, report.five_hour)
     for window in windows:
-        if (window is None or window.remaining_percent is None or window.resets_at is None
-                or window.resets_at.tzinfo is None or window.resets_at <= now):
+        if (window is None or window.remaining_percent is None
+                or window.resets_at is not None and (window.resets_at.tzinfo is None or window.resets_at <= now)
+                or window.resets_at is None and window is not weekly):
             return CodexWorkUnknown("current 5-hour and weekly usage is unavailable; refresh and try again")
     if all(window is not None and (window.remaining_percent or 0) > 0 for window in windows):
         return CodexWorkAvailable()

@@ -292,3 +292,15 @@ with (patch.object(agent_accounts, 'command_json', return_value={
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class CodexAllowanceRoomTests(unittest.TestCase):
+    def test_positive_weekly_usage_without_a_reset_can_serve_work(self) -> None:
+        now = datetime.now(timezone.utc)
+        for left in (0, 100):
+            with self.subTest(left=left):
+                report = agent_accounts.Report("Codex", quotas=[
+                    agent_accounts.Quota("Weekly", 100 - left, None)])
+                result = agent_accounts.codex_can_work(report, now, agent_accounts.CreditsOff())
+                self.assertIsInstance(result, agent_accounts.CodexWorkAvailable if left else
+                                      agent_accounts.CodexWorkExhausted)
