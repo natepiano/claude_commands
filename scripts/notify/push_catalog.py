@@ -209,6 +209,51 @@ ENTRIES = (
                                      "description": "You asked to be told when the tile and handler renames finish. "
                                      + "Both are done, and both units run under their new names."})),
         header=False),
+    # Auto-mode refusal (user approved 2026-10-21): a session sends it with send.py --text-id auto_mode.refused.
+    # send.py fills sender from the session's own name, and noun, they, this and rule_line from count and rule.
+    PushText("auto_mode.refused", "{sender}", "decision", "{sender}: auto mode stopped {session}",
+        ActionTemplate("On {machine}, in the {session} pane, approve the prompt or add an allow rule"),
+        "Auto mode refused {count} {noun} in {session}. {they} {does}. {waits}.\n\n"
+        + "Approve: {session} goes on now, but the same {noun} can stop it again later.\n\n"
+        + "Allow rule: {session} goes on now and never stops on {this} {noun} again.{rule_line}",
+        (PushExample("typical", {"sender": "cargo-liner-style", "session": "types", "machine": "natedev",
+            "count": "2", "noun": "commands", "they": "They", "this": "these",
+            "does": "save and merge one finished ticket",
+            "waits": "Three builds you approved wait for them", "rule_line": ""}),
+         PushExample("one_with_rule", {"sender": "build-followups", "session": "messaging", "machine": "natedev",
+            "count": "1", "noun": "command", "they": "It", "this": "this",
+            "does": "pushes finished messaging work to GitHub",
+            "waits": "The merge of that work waits for it",
+            "rule_line": " The rule: Bash(git push:*)"})),
+        session=SessionTemplate("{session}")),
+    # Paid credits (user approved 2026-10-21): sent with send.py --text-id quota.paid_credits. send.py fills
+    # sender from the session's own name; a script with no session record names itself with --from.
+    # Examples: the codex2 values the user approved, and codex1 sent from the natedev session.
+    PushText("quota.paid_credits", "{sender}", "decision", "{sender}: {account} now uses paid credits",
+        ActionTemplate("To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}"),
+        "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
+        + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
+        + "Turn off: work moves to Claude until {next_reset}.",
+        (PushExample("typical", {"sender": "quota_alert", "account": "codex2", "machine": "natedev",
+            "credits": "25,345", "refill": "Tue 10-27 02:33 EDT", "next_reset": "Sat 10-24 16:40 EDT"}),
+         PushExample("from_session", {"sender": "natedev", "account": "codex1", "machine": "natedev",
+            "credits": "6,370", "refill": "Thu 10-29 07:00 EDT", "next_reset": "Sat 10-24 16:40 EDT"}))),
+    # A session waits for a go (user approved 2026-10-21): sent with send.py --text-id session.needs_go.
+    # send.py fills sender from the session's own name. Examples: the trunk push the user approved, and the
+    # herdr-panes worktree left after herdr-unit took over herdr work (2026-10-18).
+    PushText("session.needs_go", "{sender}", "decision", "{sender}: {session} waits for your go",
+        ActionTemplate("On {machine}, in the {session} pane, type: {go}"),
+        "{why}.\nYour go {does}.",
+        (PushExample("typical", {"sender": "natedev", "session": "trunk", "machine": "natedev",
+            "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
+            "why": "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix",
+            "does": "removes it from step 130, and trunk goes on"}),
+         PushExample("delete_worktree", {"sender": "build-followups", "session": "herdr", "machine": "natedev",
+            "go": "Go: delete the herdr-panes worktree and its branch",
+            "why": "The herdr session tried to delete the old herdr-panes worktree, and your permission check refused it. "
+            + "The main branch has all its work",
+            "does": "deletes them, and herdr starts its next phase"})),
+        session=SessionTemplate("{session}")),
     # Auto silence (user spec, 2026-10-20: "a very compact format"): auto_silence.py sends one when the
     # user goes idle, before silence starts, and one when their next prompt ends it.
     PushText("silence.auto_on", "{sender}", "note", "{sender} auto silence on", NoActionNeeded(),

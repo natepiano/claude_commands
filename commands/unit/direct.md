@@ -204,7 +204,9 @@ The closed list:
   question being asked.
 - **blocked** — a hard stop this command defines: a structural check that blocks
   checkpoint, a refused tool call, a launch failure that survived
-  <DelegateLaunchFailure/>'s retry.
+  <DelegateLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
+  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (`send.py --help`),
+  and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
 - **done** — <RunSummary/> has been emitted.
 
 Nothing else authorizes a turn end, however complete it feels:
