@@ -1,6 +1,6 @@
 # sdlc-guilds
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** A lasting, resumable designer role and reviewer role that a unit director or a showrunner holds, a designer guild and a reviewer guild that share tips and common documents over our messaging, and named roles throughout.
+> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** A lasting, resumable designer role and reviewer role that a unit director or a showrunner holds, and four guilds (designers, reviewers, showrunners, units) whose heads keep tips in `~/rust/nate_style/guilds` and hear from members when set events fire.
 
 > **As-built disposition: create** — `docs/as-built/guilds.md`
 
@@ -18,6 +18,23 @@ I like goddesses of wisdom and judgement for the chief designers and reviewers. 
 
 For active process redesigns, as we are currently undergoing with promotions and unit director renames and responsibility changes and process changes, those should come back to me as questions.
 
+2026-10-21, the user's guilds review with the sdlc showrunner (relayed 2026-10-21; table copied from `docs/plans/sdlc-production.md`, Review decisions, guilds-unit). The user's model: "the goal of a guild is to help guild members do their jobs better. Showrunners and unit directors share behavior and get guild functionality too, not only designers and reviewers. Heads do not read every member turn: that costs too much. Set events make members write to their guild or head. The user sends all guild feedback through the head. Each skill that starts a member role carries short guidance on how to work with the guild and its head." The user: "resume your work with the revisions we made."
+
+| # | Decision |
+| --- | --- |
+| G1 | Four guilds: designers, reviewers, showrunners, units. Workers have no guild (Codex code and test threads, pooled code and UI reviewers); they get better guidance through their unit director's work orders. |
+| G1b | Each head is a unit director, one per guild, under one lasting top-level `guilds` showrunner, not under sdlc. In herdr: a top-level guilds space, the guilds showrunner in the first tab, then the four heads in alphabetical order. This replaces "each head is a top-level showrunner". |
+| G2 | Heads do not read every member turn. They read turns when an event fires (G3). Once a day they read the records already kept: repair rounds per phase (`rounds.py`), time per phase step (`phase_process.py`) and review findings. They read turns only where a record looks bad. |
+| G3 | A member sends one short message to its head only, never to the whole guild, when: the user corrects it; a phase reaches repair round 4; the same review finding comes back twice; it works around a tool fault or a rule that slowed it; it finds a way that saved real time. The head decides what goes to the whole guild. |
+| G3b | Tips live in `~/rust/nate_style/guilds/<guild>/`, one tip per markdown file like the rust rules; shared tips in `~/rust/nate_style/guilds/common/`. Each guild gets a base folder with Obsidian views by tag, like `rust_base`. The head adds and edits tip files. A member loads its guild's tips when its skill starts. Tips reach both machines through git. Drop the copy step, the publication manifests and receipts, and `docs/guilds` in `~/.claude`. |
+| G4 | The user gives guild feedback in the head's tab or through any showrunner, which passes it on. The head writes it as a tip file. |
+| G5 | `/showrunner:produce`, `/unit:direct` and the designer and reviewer start prompts each get a short guild block: who your head is, load your guild's tips, the G3 events, and how to write to the head. |
+| G6 | The heads live in the guilds herdr space on natedev. |
+| G7 | The top level is named `guilds`. The four guilds and their head units are named `designers`, `reviewers`, `showrunners` and `units`. Goddess names are on hold. G1 and G7 settle the old questions A and B. |
+| G8 | Keep phase 1. Revise the phase 2 design doc: keep its lasting-role half, change its guild half. |
+| G9 | New phases: 3 revise the design doc and review it; 4 the tip folders and views in `nate_style/guilds`, plus the guild block and the G3 events in each starting skill; 5 the guilds production doc, then the showrunner starts the guilds showrunner as top level with its four head units, each with its daily record read; 6 the lasting designer and reviewer threads (the old phase 3). sdlc's guild-process unit director owns the guild process; the guilds showrunner runs each guild by that process. |
+| G10 | hierarchies-unit moves into sdlc as its own unit beside guild-process-unit. Read its findings: its "record waits" step feeds the heads' events. |
+
 2026-10-20 16:19 EDT, to fps/frame-time-unit (hana), as its handoff records it: "Astra is the DESIGNER, not me. ONE Codex session gpt-6-astra xhigh writes + revises in the same thread; optionally ONE Astra reviewer session (same model/effort, one thread). No more than one of each. My part: brief designer, pass each review, judge when good. At least 2 review rounds. Save each round."
 
 ## What exists today (read 2026-10-20 16:40–16:55 EDT by the plan author)
@@ -34,14 +51,25 @@ For active process redesigns, as we are currently undergoing with promotions and
 - **cargo-liner's handler Phase 21** (`~/rust/cargo-liner-handler/docs/cargo-port/remove-running-section-handler-footer-colors.md:632-663`) waits on two things from `~/.claude` main, target 21:45 EDT (sdlc log 16:48): one `production_tree.py --json` edge per Astra session while it holds the role, `{"manager": <Claude session id>, "member": <Codex thread id>, "role": "astra-designer" | "astra-reviewer", "codex_home": <CODEX_HOME>, "state": "busy" | "idle"}`, and the keys `role.astra-designer=pink`, `role.astra-reviewer=bright-green`. Its guild view waits on where guild membership lives.
 - **hierarchies-unit** (build-followups, `docs/plans/build-followups-hierarchies.md` at `4b477220`) lists the chief designer and chief reviewer as planned top-level showrunners, peers in a flat organization, and leaves the role design to this unit. Its constraints C39 (no downgrade of a judgment role on speed or tokens), C40 (Codex workers kept across phases and account moves) and C41 (pooled reviewers kept for later runs) bind these roles.
 
+Read 2026-10-21 by the plan author:
+
+- **hierarchies-unit's design** (`~/worktrees/claude-build-followups-hierarchies/docs/plans/build-followups-hierarchies-design.md` at `86ba29d3`) still names the chief designer and chief reviewer as top-level peers (C03, Map → Roles, Productions); G1b replaces that. Its Step 2 "Record waits and delivery" (Q8) proposes typed wait events in `scripts/direct/progress_history.py` (phase, owner, UTC start/end, one of WaitingForQuotaRefusal, WaitingForMemoryOrSlot, WaitingForMergeGate, WaitingForUser, WaitingForSupplier, ReadyWithoutCapacity; missing history is HistoryNotRecorded) and merge receipts. Those records are a source for the heads' daily read (G2, G10).
+- **The records a head reads daily** exist: `scripts/history/rounds.py` (repair rounds per phase), `scripts/direct/phase_process.py` (time per phase step), the findings ledgers (`scripts/direct/findings.py`, one per phase in each run's session dir).
+- **`~/rust/nate_style`** is its own GitHub repo (`git@github.com:natepiano/nate_style.git`, branch `main`, no merge branch). It holds `rust/` (54 rule files), `message/`, `prompt/`, and base folders `rust_base/`, `prompt_base/` of Obsidian `.base` views, one per tag (`views: - type: table … filters: and: - file.hasTag("<tag>")`). A rule file has YAML front matter (`tier`, `family`, `date_created`, `date_modified`, `tags`, `mechanism`, …) then one `##` heading and its text. Its working tree has an uncommitted `review-charter.md` change and an untracked `.obsidian/` that this unit does not own.
+- **No designer or reviewer start skill exists.** A lasting designer's opening prompt is written per design by its holder (phase 2's was `phases/2/` in this run); `/astra_review` (`commands/astra_review.md`) starts the Astra reviewer turn.
+
 ## Decisions
 
 - **Phase 1 delivers the Astra edges cargo-liner asked for, before any design** (showrunner, 2026-10-20 16:48: "astra edge = guilds-unit first phase, target before 21:45 EDT"). It records which session holds an Astra role so cargo-handler shows it; it changes no process, so it needs no question.
-- **Every change to a role, a responsibility, a name or the process is a question for the user** (user, 2026-10-20). Phase 2 writes the design and ends with the questions; Phases 3–5 each carry a Pending decision and do not dispatch before the user's answers (plan author).
+- **Every change to a role, a responsibility, a name or the process is a question for the user** (user, 2026-10-20). Phase 2 wrote the design and its questions; the user answered them in the 2026-10-21 review (G1–G10, Source). A new process question the revision raises goes to the showrunner, which brings it to the user (plan author).
+- **The showrunner settled the Phase 2 lasting-role questions on 2026-10-20** (peer decision under the production rules): Q1 both holders, one per design; Q2 a separate Astra store on the mesh lifecycle; Q5 the production prefix, adopted mesh names kept as aliases; Q8 names now; Q12 pending records, no automatic wake; Q14 one natedev registry, each pair on its holder's host; Q16 adopt idle designers with an explicit ownership transfer. Q9, Q10, Q11 and Q15 were guild-head and publication answers that G1b and G3b replace.
+- **Phase 3 revises the design with the same designer thread** (`claude-build-followups-sdlc-guilds-design`, resumed with `implement.sh --to`) and the Astra review rule above; a simplicity pass precedes the last round (experiments-unit lesson, showrunner 2026-10-20) (plan author).
+- **Phase 4 commits and pushes in `~/rust/nate_style` only after the showrunner widens this unit's Owns cell**; the unit director sends the commit and push method first (showrunner, 2026-10-21).
+- **The held Phase 2 messages to cargo-liner, roles-unit and phases-unit are not sent**; new versions go after the Phase 3 design doc lands (showrunner, 2026-10-21).
 - **The design is written by one Astra designer and reviewed by Astra, at least 2 rounds and at most 3, each round saved** (user's rule to fps/frame-time-unit, 2026-10-20 16:19; showrunner's answer to experiments-unit, 16:48). The unit director briefs, passes each review and judges. The tester slot stays closed in that phase: the rule allows one designer and one reviewer (plan author, from the user's rule).
 - **One design doc**: `docs/plans/sdlc-guilds-design.md` (plan author). It becomes `docs/as-built/guilds.md` at run end.
-- **The edge role ids `astra-designer` and `astra-reviewer` name the Codex role a session holds** (cargo-liner's Phase 21 contract). The guild heads use the same ids until the user picks the goddess names (production doc, Guild heads). The design doc names both uses apart and asks the user for the names through cargo-liner (cargo-liner picks role names with the user, production rules).
-- **This unit designs the guilds and the roles; it does not run the guild heads** (production doc, Guild heads). Starting a head is a question in Phase 2.
+- **The edge role ids `astra-designer` and `astra-reviewer` name the Codex role a session holds** (cargo-liner's Phase 21 contract). They stay for the per-design threads; the heads are named `designers`, `reviewers`, `showrunners` and `units`, and goddess names are on hold (G7; production doc, Review decisions, R3).
+- **This unit designs the guild process and the roles; it does not run the guild heads** (production doc, Guild heads; G9: the guilds showrunner runs each guild by this unit's process). Phase 5 writes the guilds production doc; the sdlc showrunner starts the guilds showrunner and its heads from it.
 - **Each guild design change goes to cargo-liner** by `SendMessage` to `showrunners.py address remove-running-section`, and the design goes to hierarchies-unit and roles-unit through the sdlc showrunner (production rules).
 
 ## Delegation Context
@@ -54,6 +82,8 @@ For active process redesigns, as we are currently undergoing with promotions and
   - `scripts/production/production_tree.py` — the census edges cargo-handler reads
   - `config/statusline.conf`, `config/README.md` — role colors and their key format
   - `docs/plans/sdlc-guilds-design.md` — the design doc (new)
+  - `docs/plans/guilds-production.md` — the guilds production doc (new, Phase 5)
+  - outside the repository, Phase 4: `~/rust/nate_style/guilds/` — the tip folders and base views (its own GitHub repo, branch `main`)
   - read only, outside the repository: `~/.local/state/review-pool/`, `/tmp/claude/astra/`, the run roots' `mesh_roster.json` and `mesh_server.json`, `~/rust/hanadocs/showrunners/cargo-liner/experiments/astra-design-notes.md`, the fps designer's folder `/tmp/claude/delegate/f6cf2c4f-858a-494f-bf69-6133ba872601/design/`
 - **Key files:**
   - `scripts/astra/astra_review.py` — one Astra review turn
@@ -120,20 +150,96 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a head file and head discovery in this version; join/leave membership verbs; a `/guild:announce` wrapper; raw `stop --pause` for held roles; a design type inside the review pool; the three-round review ceiling outside this unit; host transfer or authority failover.
 
-### Phase 3 — The designer and reviewer roles open, resume and outlive a run, under a unit director or a showrunner  · status: todo
+### Phase 3 — The design doc defines four guilds, their heads, events and tips, and keeps the lasting roles  · status: done
 **Depends on:** Phase 2
 
-**Pending decision: the user's answers to the Phase 2 questions on the roles.**
-- **Actual problem:** a designer or Astra reviewer is started by hand, keeps its thread id in notes, and ends with its run; a designer outside a phase cannot save its work.
-- **What exists now:** `codex_mesh.py` threads in run folders; `review_pool.py` threads in `~/.local/state/review-pool/`; `astra_roles.py` records (Phase 1).
-- **What should change:** one launcher opens, resumes, pauses and ends a named designer or reviewer for a unit director or a showrunner, keeps its thread outside the run roots, reserves its output file, and records the role for the census.
-- **Recommendation:** the design doc's Roles section and its recommended answers.
+#### Work Order
+
+**Goal:** `docs/plans/sdlc-guilds-design.md` describes the guild process the user decided on 2026-10-21 (G1–G10) and keeps its lasting-role design, so Phases 4–6 take their Spec from it.
+
+**Spec:**
+- **Keep the lasting-role half** (Lessons, Roles, Names, and the role parts of Choices, Steps and Command changes). Apply the showrunner's settled answers (Decisions): Q1 both holders, one per design; Q2 a separate Astra store on the mesh lifecycle; Q5 the production prefix, adopted mesh names kept as aliases; Q8 names now; Q12 pending records, no automatic wake; Q14 one natedev registry, each pair on its holder's host; Q16 adopt idle designers with an explicit ownership transfer. Remove each settled question from Questions for the user and state its answer where the design uses it.
+- **Replace the guild half** with the G1–G10 model (Source):
+  - **Guilds (G1, G7):** `designers` (Astra designers), `reviewers` (Astra reviewers), `showrunners`, `units` (unit directors). Workers — Codex code and test threads, pooled code and UI reviewers — have no guild. Say how a session knows its guild from what it already is (its skill, its role record), with no join or leave step.
+  - **Heads (G1b, G6, G7):** one head per guild, each a unit director of the lasting top-level `guilds` production on natedev. herdr: a top-level `guilds` space, the guilds showrunner in tab 1, then `designers`, `reviewers`, `showrunners`, `units`. Say what each head's standing plan does (a head runs no phased build; define its loop), how a member finds its head's address (`showrunners.py address`-style lookup or the roster), and what the guilds showrunner does (relays the user, keeps heads running, reports).
+  - **Events (G3):** the five events, each with its exact trigger and where a member detects it (the user's correction in the conversation; `findings.py gate` round 4; a finding title that repeats in one run's ledger; a tool fault or slow rule worked around; a saved-time way). One short message to the head only, its form and length, sent with `~/.claude/scripts/message/send.py` or `SendMessage`. A Codex member (designer, reviewer thread) sends through its holder or its own `send.py` call — say which, given that a Codex thread between turns takes no peer message (`commands/message.md:35`).
+  - **Daily read (G2, G10):** once a day each head reads `scripts/history/rounds.py`, `scripts/direct/phase_process.py` and the findings ledgers for its members, plus hierarchies-unit's wait events and merge receipts when they exist (its Step 2, Q8). It reads turns only where a record looks bad; define "looks bad" with numbers from today's records. Say what runs the read (a scheduled check-in of the head session, or a script the head runs) and what it prints.
+  - **Tips (G3b, G4):** `~/rust/nate_style/guilds/<guild>/` per guild and `~/rust/nate_style/guilds/common/`, one tip per markdown file in the rust-rule form (YAML front matter with `tags`, `date_created`, `date_modified`; one `##` heading; text); a base folder per guild of Obsidian `.base` views by tag, like `rust_base/`. Only the head adds and edits its tips; the user's feedback reaches the head in its tab or through any showrunner, and the head writes it as a tip. Tips reach both machines by git push and pull of `nate_style`; say who pushes and who pulls and when. A member loads its guild's tips (and `common/`) when its skill starts. No copy step, publication manifest, receipt or `docs/guilds`.
+  - **Guild block (G5):** the exact short block for `/showrunner:produce`, `/unit:direct`, the designer opening prompt and the `/astra_review` reviewer prompt: who your head is, load your guild's tips, the G3 events, how to write to the head. Name where each block goes (file and section) and each file's owner from the production doc's hub table; a `commands/unit/direct.md` change goes to phases-unit and `commands/showrunner/produce.md` to roles-unit as hub contributions.
+- **Rewrite Steps** to the new phases: Phase 4 tips and guild blocks, Phase 5 the guilds production doc and the daily read, Phase 6 the lasting roles. Each step keeps Changes, Checks and Undo.
+- **Questions for the user** keeps only questions the revision itself raises about a role, responsibility, name or process. Each names the answers and a recommendation.
+- **Cut** what the guild change makes dead: design-guild/review-guild, `scripts/guilds/guilds.py` publication, `broadcast.py --guild`, receipts, manifests, delivery marks, guild-head questions. The doc does not grow: at most its present 308 lines.
+- **Cross-reads:** roles-unit's duty map (`origin/sdlc-roles`, `docs/plans/sdlc-roles-design.md`, Duty matrix, Term table) and phases-unit's Map (`origin/sdlc-phases`, `docs/plans/sdlc-phases-design.md`). Where a row differs, the design says so and why.
+
+**Process:** the designer thread `claude-build-followups-sdlc-guilds-design` revises (resumed with `implement.sh --to`; it keeps its Phase 2 context). Then Astra review rounds through `/astra_review` (`~/.claude/scripts/lib/py ~/.claude/scripts/astra/astra_review.py <doc> <focus>`), at least 2 and at most 3, each round's doc and review saved under `${SESSION_DIR}/design/phase3/`. Give the reviewer the Key files list. Before the last round the designer runs a simplicity pass: cut each mechanism that adds a concept with no correctness gain. The designer pushes back on findings that add a concept with no correctness gain. The tester slot stays closed.
+
+**Files:**
+- `docs/plans/sdlc-guilds-design.md` — the revised design
+
+**Workers:** `1 writer` — the Astra designer; one document.
+- `design` — `docs/plans/sdlc-guilds-design.md`
+
+**Constraints from prior phases:** the Phase 2 As-built (above): the doc authorizes no implementation by itself; `astra_review.py` starts a fresh `codex exec` thread each call. Phase 1's `AstraEdge` fields and the `astra-designer` / `astra-reviewer` ids stay.
+
+**Acceptance gate:** at least 2 Astra rounds saved with their reviews; the last review has no open defect the director accepts; the doc is at most 308 lines; each G1–G10 decision appears where the design uses it; no forbidden word (the forbidden-words hook passes); the merge gate green (`env HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only`). At phase end the unit director sends the new versions of the held messages to cargo-liner (guild view: four guilds, heads, tip folders), roles-unit (rows that differ) and phases-unit (rows that differ and `direct.md` requests).
+
+### Phase 4 — Each guild has a tip folder and views, and each starting skill carries the guild block  · status: todo
+**Depends on:** Phase 3
+
+**Pending decision: who edits each starting-skill file.** Before dispatch the unit director sends the showrunner the list of files that get the guild block (`commands/showrunner/produce.md`, `commands/unit/direct.md`, the designer opening prompt file, `commands/astra_review.md`, as the Phase 3 design names them); the showrunner settles who edits each one.
+
+**Settled 2026-10-21 (showrunner):** the Owns cell covers `~/rust/nate_style/guilds/` as a separate repo. Commit on its `main` after the phase gates, staging exact paths only (never `review-charter.md` or `.obsidian/`), `git pull --ff-only` first, push fast-forward only; each checkpoint notice names the `nate_style` commit.
+
+#### Work Order
+
+**Goal:** `~/rust/nate_style/guilds/` holds a folder per guild, a `common/` folder and a base folder of views per guild, and each skill that starts a member role tells the member its head, its tips, the five events and how to write to the head.
+
+**Spec:** `docs/plans/sdlc-guilds-design.md`, sections Tips, Events and Guild block, and Steps → Phase 4. The Phase 3 phase review fills the exact paths and text from the revised doc.
+
+**Files:**
+- `~/rust/nate_style/guilds/designers/`, `reviewers/`, `showrunners/`, `units/`, `common/` — new; a seed tip per folder only where the design names one
+- `~/rust/nate_style/guilds/` base folders — new: Obsidian `.base` views by tag, like `rust_base/`
+- `commands/showrunner/produce.md` — hub (owner roles-unit): the guild block
+- `commands/unit/direct.md` — hub (owner phases-unit): the guild block
+- `commands/astra_review.md` — the reviewer guild block
+- the designer opening prompt file the design names — the designer guild block
+
+**Workers:** `2 writers` — the `nate_style` folders, and the skill blocks, on disjoint files.
+
+**Constraints from prior phases:** a rule file in `nate_style` has YAML front matter then one `##` heading; a `.base` view filters by `file.hasTag("<tag>")` (What exists today). Do not stage `review-charter.md` or `.obsidian/` in `nate_style`. Each hub edit is named in the checkpoint notice as `also touches <path> (owner <unit>), tested against <owner tip>` (`docs/production_format.md` <ProductionUnit/> item 9).
+
+**Acceptance gate:** each `.base` file parses as YAML and each tip has `tags`; each of the four starting skills has the block, word for word as the design gives it; the merge gate green; live (director): a new session that loads `/unit:direct` names its head and lists the `units` tips.
+
+### Phase 5 — The guilds production doc, its four head units and their daily read  · status: todo
+**Depends on:** Phase 4
+
+#### Work Order
+
+**Goal:** the sdlc showrunner can start the top-level `guilds` showrunner and its four head unit directors from one production doc, and each head reads its members' records once a day.
+
+**Spec:** `docs/plans/sdlc-guilds-design.md`, sections Heads and Daily read, and Steps → Phase 5; `docs/production_format.md` for the production doc form. The Phase 3 phase review fills the exact paths from the revised doc.
+
+**Files:**
+- `docs/plans/guilds-production.md` — new: the guilds production doc (top level, herdr space `guilds`, units `designers`, `reviewers`, `showrunners`, `units` in that tab order)
+- `docs/plans/guilds-designers.md`, `guilds-reviewers.md`, `guilds-showrunners.md`, `guilds-units.md` — new: each head's standing plan
+- the daily-read script the design names, and its test
+
+**Workers:** `1 writer + 1 tester` — the docs and the script, and the script's tests.
+
+**Constraints from prior phases:** the tip folders and guild blocks as Phase 4 built them. The heads are unit directors, not showrunners (G1b). The production doc names no goddess name (G7).
+
+**Acceptance gate:** the daily-read tests and the merge gate green; `basedpyright` clean on the script's folder; live (director): the daily read prints one day of records for one guild from this run's ledgers. At phase end the unit director sends the showrunner the production doc path to start the guilds showrunner.
+
+### Phase 6 — The designer and reviewer roles open, resume and outlive a run, under a unit director or a showrunner  · status: todo
+**Depends on:** Phase 4 (its designer opening prompt and tip baseline; Astra review round 1, 2026-10-21)
+
+The Phase 2 role questions are settled (Decisions: Q1, Q2, Q5, Q8, Q12, Q14, Q16); the Phase 3 phase review refreshes this Work Order from the revised doc.
 
 #### Work Order
 
 **Goal:** a unit director or a showrunner opens a named designer or reviewer once and resumes the same thread across phases, runs and account moves.
 
-**Spec:** `docs/plans/sdlc-guilds-design.md`, sections Roles and Names, as the user's answers settle them; those sections name each function this phase changes. Its Steps → Phase 3 text:
+**Spec:** `docs/plans/sdlc-guilds-design.md`, sections Roles and Names, as Phase 3 revised them with the settled answers (Decisions); those sections name each function this phase changes. Its Steps → lasting-roles text (Phase 3 renumbers it Phase 6):
 - Implement the role store, registry, authority, held-review route, lifecycle, access policy, atomic claim, binding, adoption and holds. Add the `config/guilds.conf`, mesh, account, hook, roster, detached-result, cleanup, retirement, transport and `commands/astra_review.md` integrations, with tests and the `scripts/guilds` pyright entry. Coordinate the reservation bridge with phases-unit and hub changes with roles-unit; preserve the Astra edge wire IDs and color keys.
 - Model and effort come from `config/agents.conf` rows `[guild.codex] designer=gpt-6-astra:xhigh`, `reviewer=gpt-6-astra:xhigh`, assignment `guild=codex`, resolved through `scripts/agents/agents_config.sh`; never hardcoded, no fallback.
 - Checks: prove one pair across simultaneous two-host opens, lost acknowledgement, aliases and unreachable authority; reject holder/pair host mismatch at open or transfer and `open` after end. Preserve threads across revisions/run end, holder restart and incomplete holds. Exercise busy and idle moves **without an existing marker**, preserving queued text: mark before interrupt, release the old writer, continue interrupted work, move idle work on its next assignment. Cover paused-state entry/recovery, racing claims and failure before marker/acceptance; raw `stop --pause` refuses held roles.
@@ -178,80 +284,3 @@ For active process redesigns, as we are currently undergoing with promotions and
 - Roles, Names and the guild word list follow roles-unit's design (`origin/sdlc-roles`, `docs/plans/sdlc-roles-design.md`, D30–D32, D51–D52 and its Term table); its Q1, Q3 and Q5 answers bind this phase as the design doc's Questions section says.
 
 **Acceptance gate:** the tests named in Files and the merge gate green; `basedpyright` clean on every changed folder; live (director): adopt an idle designer, finish its old run, resume the same thread through the new role, and show one Astra edge in `production_tree.py --json`.
-
-### Phase 4 — Each guild has members, shared documents and a message group  · status: todo
-**Depends on:** Phase 3
-
-**Pending decision: the user's answers to the Phase 2 questions on the guilds.**
-- **Actual problem:** designers and reviewers learn alone; nothing shares their tips or reaches them as a group, and cargo-handler has no guild data to show.
-- **What exists now:** fixed broadcast groups in `broadcast.py`; standing prompts per review type in `config/review_pool/`; no guild record.
-- **What should change:** a guild record of members, a common document and one per guild that reach every member, a guild message group, and a `--json` view for cargo-handler.
-- **Recommendation:** the design doc's Guilds section and its recommended answers.
-
-#### Work Order
-
-**Goal:** a message to a guild reaches each member, a change to a guild document reaches each member's standing instructions, and one command prints the guilds and their members as JSON.
-
-**Spec:** `docs/plans/sdlc-guilds-design.md`, section Guilds, as the user's answers settle it. Its Steps → Phase 4 text:
-- **First, a document-only predecessor checkpoint** for the approved `docs/guilds/common.md`, `design.md` and `review.md`: before dispatch the director splits these three files into their own phase, inserted before this one, with ordinary authorization, reservation, review and document checks; it checkpoints and lands through the production merge gate. Its acceptance needs no guild publication or live member.
-- Then implement derived membership, publication records, census, broadcast, receipts and dispatch integration. Membership derives from the durable role records: there are no join or leave verbs. `scripts/guilds/guilds.py` provides `list --json` and `publish-instructions`. The `broadcast.py --guild design-guild|review-guild` group (`GuildMembers(guild_id)` beside `WorkersOfUnit`) updates parsing, selection, `ending`, `_group_name` and `_remote_arguments` together. Change `scripts/production/codex_winddown.py` only if its broadcast interface changes.
-- The director publishes the predecessor's existing commit, confirms both guilds on both hosts, then enables guild dispatch and runs the live gate. The implementation checkpoint follows that gate. Send cargo-liner the schema and a sample before consumer work.
-- Checks: no-manifest baseline with absent heads, partial transfer blocking dispatch, ordinary retry enabling first resume; both holders/hosts, overlapping groups, missing holders, unreadable roles and end/move recovery. Active and idle messages remain pending until accepted input; test launcher death after queued send, refused-send fallback and uncertain acceptance. Derive empty/new/ended membership without join/leave. Common publication changes both guilds; guild-only leaves the other unchanged. Test unavailable Mac, lost receipt, wrong hash, stale/competing publication and crash before local commit. Prompts use accepted bytes; partial transfer never reports completion. Measure local census without network.
-- Undo: before publication, revert baseline documents through an ordinary reviewed checkpoint. After publication, restore earlier approved tips only with a higher-sequence publication. Disable new publication/group selection but retain receipts, pending messages, manifests and prompts; keep ordinary roles usable. Never report pending work delivered. Head launch stays separate.
-
-**Files:**
-- `scripts/guilds/guilds.py` — new: derived member maps, publications, `list --json`, `publish-instructions`
-- `scripts/guilds/test_guilds.py` — new
-- `scripts/guilds/roles.py` — composes the accepted guild text into each new assignment's prompt
-- `scripts/guilds/test_roles.py` — that composition
-- `scripts/production/broadcast.py` — the `--guild` group
-- `scripts/production/test_broadcast.py` — the `--guild` group
-- `scripts/message/send.py` — guild sends report queued, not delivered; holder route with the same message ID
-- `scripts/message/test_send.py` — those reports
-- `scripts/agents/codex_mesh.py` — `_start_turn` and `_move_resident` mark delivery after turn acceptance
-- `scripts/agents/test_codex_mesh.py` — delivery marks
-- `docs/guilds/common.md`, `docs/guilds/design.md`, `docs/guilds/review.md` — new: the shared documents; they move to the predecessor phase at the split
-- `scripts/production/codex_winddown.py` — only if the `broadcast()` signature changes (`docs/as-built/session-roster.md:377`)
-
-**Workers:** `2 writers` — the guild scripts, and the broadcast and delivery route, on disjoint files.
-- `impl` — `scripts/guilds/guilds.py`, `scripts/guilds/test_guilds.py`, `scripts/guilds/roles.py`, `scripts/guilds/test_roles.py`, `docs/guilds/*.md`
-- `test` — opens as impl — `scripts/production/broadcast.py`, `scripts/production/test_broadcast.py`, `scripts/production/codex_winddown.py`, `scripts/message/send.py`, `scripts/message/test_send.py`, `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`
-
-**Constraints from prior phases:**
-- Guild membership derives from the durable role records the role launcher writes; an open, not-ended designer is in `design-guild` and an Astra reviewer in `review-guild`. No member file and no join or leave verb exist.
-- A held designer or reviewer already shows in `production_tree.py --json` as an `astra-designer` or `astra-reviewer` edge whose `member` is its Codex thread id, with `manager`, `codex_home` and `state` (`scripts/astra/astra_roles.py` records, read by `live_roles()`). The guild view names each member by that same thread id, so cargo-handler can join the two.
-- Tests run as `python3 -m unittest scripts.production.test_<name>` from the worktree root; `scripts/production/test_production_tree.py` shows the import form that works there. Never name a test helper `run` (it hides `unittest.TestCase.run`).
-
-**Acceptance gate:** the tests named in Files and the merge gate green; `basedpyright` clean; live (director, after the predecessor commit is published to both guilds on both hosts): a guild message to an idle designer goes through its holder and is accepted on its next turn, and the JSON view lists it. At phase end the unit director sends cargo-liner the JSON command and its fields.
-
-### Phase 5 — The command contracts name the roles and the guilds  · status: todo
-**Depends on:** Phase 4
-
-**Pending decision: the user's answers to the Phase 2 questions on the command changes.**
-- **Actual problem:** `/unit:direct`, `/showrunner:produce`, the production format and the messaging rules do not know the roles or the guilds, so no director or showrunner uses them.
-- **What exists now:** the Command changes section of the design doc; the hub files and their owners in the production doc.
-- **What should change:** each contract says when to open and resume a designer or reviewer, how to use its guild, and the new words.
-- **Recommendation:** the design doc's Command changes section.
-
-#### Work Order
-
-**Goal:** each named contract says when a unit director or showrunner uses a designer, a reviewer and their guild, and the production format defines the new words.
-
-**Spec:** `docs/plans/sdlc-guilds-design.md`, section Command changes, as the user's answers settle it. Its Steps → Phase 5 text:
-- Submit each `commands/unit/direct.md` change request to phases-unit at its row in Command changes; phases-unit owns every direct.md change. This unit does not edit direct.md.
-- Coordinate the other four contracts with their owners: `commands/showrunner/produce.md` and `docs/production_format.md` with roles-unit; `commands/message.md` and `codex/AGENTS-messaging.md` change word for word together. Use the implemented verbs and paths, identical guild text in both messaging documents, and no announcement wrapper: guild announcements use `broadcast.py --guild` only.
-- Each hub-file edit goes through cargo-berth's normal flow and is named in the checkpoint notice as `also touches <path> (owner <unit>), tested against <owner tip>` (`docs/production_format.md` <ProductionUnit/> item 9). Trial-merge hubs and send final contracts to cargo-liner.
-- Undo restores prior command text while preserving recovery records and ownership fences.
-
-**Files:**
-- `commands/showrunner/produce.md` — hub (roles-unit): DesignAuthority and DesignCheck
-- `docs/production_format.md` — hub (roles-unit): Words and ProductionUnit, the new words
-- `commands/message.md`, `codex/AGENTS-messaging.md` — guild flag and holder delivery, word for word
-
-**Workers:** `2 writers` — the showrunner contract with the format, and the messaging text, on disjoint files.
-- `impl` — `commands/showrunner/produce.md`, `docs/production_format.md`; hub: `commands/showrunner/produce.md`, `docs/production_format.md` (owner roles-unit)
-- `test` — opens as impl — `commands/message.md`, `codex/AGENTS-messaging.md`
-
-**Constraints from prior phases:** the launcher (Phase 3) and the guild commands (Phase 4) as built. `commands/astra_review.md` changes in the lasting-roles phase, not here. No `/guild:announce` command exists. The Astra role record CLI is `python3 scripts/astra/astra_roles.py hold designer|reviewer (--session-dir <run> --worker <name> | --thread <id> --codex-home <dir> --pid <pid>) [--manager <id>]`, `release <thread id>` and `list [--json]`; a contract that names it uses these verbs. `/astra_review` holds its own `astra-reviewer` record while its `codex exec` runs; its exit codes and output did not change.
-
-**Acceptance gate:** the merge gate green; each hub file trial-merged against its owner's tip; each changed contract names the launcher and guild commands by their real verbs; the direct.md change requests sent to phases-unit. At phase end the unit director sends cargo-liner the final role and guild design (production Close-out).
