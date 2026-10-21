@@ -12,7 +12,7 @@ The feature log is the current account of what seven projects do: hana, natedev,
 | --- | --- |
 | `scripts/feature_log/feature_log.py` | The only writer of feature notes. The CLI, plus the importable `PROJECTS`, `vault_dir`, `state_dir` and `locked`. |
 | `scripts/feature_log/inventory.py` | Read-only inventory of backfill evidence. Owns the frozen ledgers. |
-| `scripts/feature_log/test_feature_log.py` | 117 `unittest` cases on a temp vault and temp state. |
+| `scripts/feature_log/test_feature_log.py` | 124 `unittest` cases on a temp vault, temp state and temp git checkouts. |
 | `scripts/feature_log/test_inventory.py` | 32 cases on temp git repositories. |
 | `commands/feature_log.md` | `/feature_log digest [--since]` and `/feature_log live <project> [filters]`. Reads only. |
 | `commands/showrunner/produce.md` | `<ChangeReviewFeatureLog/>` inside `<MergeCheckpoint/>`, and `<CloseChangeReview/>`: the hana and claude close-out. |
@@ -29,19 +29,19 @@ Every call is `~/.claude/scripts/lib/py ~/.claude/scripts/feature_log/feature_lo
 
 ### Projects and crates
 
-`PROJECTS: dict[str, ProjectSpec]` with `ProjectSpec(repo: str, crates: frozenset[str], published: frozenset[str])` is the one table of valid projects, crates and published crates.
+`PROJECTS: dict[str, ProjectSpec]` with `ProjectSpec(repo: str, crates: frozenset[str], published: frozenset[str], checkouts: tuple[Path, ...])` is the one table of valid projects, crates, published crates and local checkouts.
 
-| Project | Repo | Crates | Published |
-| --- | --- | --- | --- |
-| `hana` | `natepiano/hana` | 27 package names from `~/rust/hana` and `~/rust/hana_catalyst` | `hana_clerestory`, `hana_kana`, `hana_lagrange`, `hana_liminal`, `hana_rigging`, `hana_rubric` |
-| `natedev` | `natepiano/nixos` | none | none |
-| `cargo-liner` | `natepiano/cargo-liner` | `cargo-berth`, `cargo-berth-test-support`, `cargo-handler`, `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane` | `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane` |
-| `bevy_brp` | `natepiano/bevy_brp` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`, `bevy_brp_test_apps`, `test-app-a`, `test-app-b` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros` |
-| `obsidian_knife` | `natepiano/obsidian_knife` | `obsidian_knife` | none |
-| `nateroids` | `natepiano/nateroids` | `nateroids` | none |
-| `claude` | `natepiano/claude_commands` | none | none |
+| Project | Repo | Crates | Published | Checkouts |
+| --- | --- | --- | --- | --- |
+| `hana` | `natepiano/hana` | 27 package names from `~/rust/hana` and `~/rust/hana_catalyst` | `hana_clerestory`, `hana_kana`, `hana_lagrange`, `hana_liminal`, `hana_rigging`, `hana_rubric` | `~/rust/hana`, `~/rust/hana_catalyst` |
+| `natedev` | `natepiano/nixos` | none | none | `/etc/nixos` |
+| `cargo-liner` | `natepiano/cargo-liner` | `cargo-berth`, `cargo-berth-test-support`, `cargo-handler`, `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane` | `cargo-mend`, `cargo-port`, `cargo-tile`, `tui_pane` | `~/rust/cargo-liner` |
+| `bevy_brp` | `natepiano/bevy_brp` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros`, `bevy_brp_test_apps`, `test-app-a`, `test-app-b` | `bevy_brp_extras`, `bevy_brp_mcp`, `bevy_brp_mcp_macros` | `~/rust/bevy_brp` |
+| `obsidian_knife` | `natepiano/obsidian_knife` | `obsidian_knife` | none | `~/rust/obsidian_knife` |
+| `nateroids` | `natepiano/nateroids` | `nateroids` | none | `~/rust/nateroids` |
+| `claude` | `natepiano/claude_commands` | none | none | `~/.claude` |
 
-The folder is the repository boundary; `crate` narrows ownership. A project with no crates (natedev, claude) takes none. `published` holds crates confirmed on crates.io on 2026-10-10. A crate that may publish but has not (`cargo-berth`, `cargo-handler`, `obsidian_knife`, `nateroids`) is not in it. A first publication or a new workspace member is an edit to `PROJECTS`.
+The folder is the repository boundary; `crate` narrows ownership. A project with no crates (natedev, claude) takes none. `published` holds crates confirmed on crates.io on 2026-10-10. A crate that may publish but has not (`cargo-berth`, `cargo-handler`, `obsidian_knife`, `nateroids`) is not in it. A first publication or a new workspace member is an edit to `PROJECTS`. `checkouts` lists the project's local clones on natedev, in lookup order; a new note reads its default completed date from them (see Note format). Every write runs on natedev, a forwarded one included, so only natedev's paths count.
 
 ### Vault layout
 
@@ -95,7 +95,7 @@ unit:
 | Field | Form | Source |
 | --- | --- | --- |
 | `area` | `"[[topic]]"`; optional | `--area` |
-| `completed_date` | `"[[YYYY-MM-DD]]"` | `--completed`, default `today()` |
+| `completed_date` | `"[[YYYY-MM-DD]]"` | `--completed`, default the linked commit's committer date in the user's zone (`_commit_date`) |
 | `crate` | sorted package names; `[]` only for natedev and claude, at least one elsewhere | `--crate` |
 | `date_created`, `date_modified` | date links | `today()`; `date_modified` moves on every rewrite |
 | `kind` | `feature`, `fix`, `change`, `perf`, `deprecation`, `removal`, `security` | `--kind` |
@@ -116,6 +116,7 @@ unit:
 - `behavior` and `see` may not contain a `## See it` or `## Evidence` line. Evidence is at least one single-line item.
 - `Note` (a `TypedDict`) is the frontmatter boundary type: `area` and `production` are `str | None`, mirroring whether the key is present.
 - `validate_note` is shared by every write and by `check`.
+- `_commit_date(project: ProjectSpec, sha: str) -> str` gives the default `completed_date`. It runs `git -C <checkout> show -s --format=%cI <sha>`, with no shell, in each of the project's `checkouts` in order. The first exit 0 gives the committer date (for a merge commit, the merge date), converted to `user_zone()` as `YYYY-MM-DD`. A missing checkout, a non-zero exit or an `OSError` is a miss, and the next checkout is tried. A given `--completed` runs no git.
 
 ### State directory
 
@@ -163,6 +164,7 @@ New-note flags: `--project --title --kind --summary --behavior --see --link --ev
 
 New-note rules:
 
+- `_new_note` builds the note for `add`, `supersede` and `propose`. An omitted `--completed` takes `_commit_date` of the canonical link's sha, not the logging date. `date_created` and `date_modified` are `today()`. When no checkout holds the commit, the call is refused: `feature_log: cannot date commit <sha>: no checkout of <repo> holds it; pass --completed`. When git prints a date that does not parse: `feature_log: cannot date commit <sha>: invalid committer date in <checkout>; pass --completed`. Both refusals come before any write.
 - Without `--backfill`, each published crate in `--crate` adds `crate@Unreleased`, so the new entry is pending for that crate and an exact `--release` version of it in the same call is refused: `feature_log: release cannot hold both X@Unreleased and X@<version>`, where `X@Unreleased` is the default. With `--backfill`, `release` holds only the `--release` values given; a released version on a new entry takes `--backfill`.
 - `VERSION_RE` accepts `Unreleased` or `N.N.N` with optional prerelease identifiers; an empty identifier (`1.2.3-..`) is refused by every writer.
 - `--crate` is refused for natedev and claude: `feature_log: <project> does not accept crates`.
@@ -176,7 +178,7 @@ Repeats and the link rule:
 - A repeated `supersede` finishes any `--old` note still live. An `--old` note superseded by something else is refused with `old note <title> is not live`.
 - `supersede --split` lifts that refusal: an `--old` note that is already superseded gains the new note in `replaced_by` and stays superseded, and the call prints `superseded: <old> → <new>`. On a live `--old` note the flag changes nothing. A repeat prints `unchanged:` for the new note and adds no event. Replacements of one note that share a link pass `--separate-result`, because the link rule exempts only the `--old` notes. `--split` with `--review` is refused (`--split cannot be combined with --review`), and `propose` does not take the flag. argparse turns it into `ReplacementPolicy = ReplaceLiveNotes | ExtendReplacementSet`.
 - `amend --evidence` skips items already stored. `amend --crate` drops `release` values of crates that left the list.
-- `amend --backfill --link <commit> --completed <date>` replaces both together (`_amend_provenance` returns `KeepAcceptingProvenance` or `CorrectAcceptingProvenance(link, completed)`) and runs the link rule again.
+- `amend --backfill --link <commit> --completed <date>` takes no commit-date default: both flags are given and replace both together (`_amend_provenance` returns `KeepAcceptingProvenance` or `CorrectAcceptingProvenance(link, completed)`) and runs the link rule again.
 - `amend --backfill --release` adds `crate@version` and `crate@Unreleased` values; an unpublished crate or a crate absent from the note is refused. `X@Unreleased` marks a live note pending for X. The same call takes `--summary` and `--kind`, so a backfilled note becomes the pending entry of its changelog bullet in one write. A value already stored prints `unchanged`.
 
 Release refusals, each checked before any write:
@@ -210,12 +212,12 @@ Release refusals, each checked before any write:
 
 ### Review rows
 
-`FeatureLogProposal = OpenProposal | LandedProposal | DroppedProposal`, discriminated by `status`. Each holds `row`, `verb` (`supersede` when `--old` is given, else `add`), `args: ProposalArgs` (all 17 new-note arguments, `completed` saved resolved) and `at`. `LandedProposal` adds `note`; `DroppedProposal` adds `verdict`.
+`FeatureLogProposal = OpenProposal | LandedProposal | DroppedProposal`, discriminated by `status`. Each holds `row`, `verb` (`supersede` when `--old` is given, else `add`), `args: ProposalArgs` (all 17 new-note arguments, `completed` saved resolved: the given `--completed`, else the commit date `propose` read) and `at`. `LandedProposal` adds `note`; `DroppedProposal` adds `verdict`.
 
 | Call | Open proposal | Landed | Dropped | None |
 | --- | --- | --- | --- | --- |
 | `propose --review ROW …` | replaced; `completed` is kept unless `--completed` is passed | refused | refused | saved |
-| `add`/`supersede --review ROW` | lands with the saved arguments; prints the write lines, then `[[<title>]]` | `unchanged: [[<note>]]` | refused | `no proposal for <ROW>; run propose first` |
+| `add`/`supersede --review ROW` | lands with the saved arguments, the saved `completed` included; prints the write lines, then `[[<title>]]` | `unchanged: [[<note>]]` | refused | `no proposal for <ROW>; run propose first` |
 | `drop --review ROW --verdict TEXT` | becomes dropped | refused | `unchanged: <ROW>` | refused |
 
 A row is `A<n>` or `C<n>`, bare for a row of hana's list `~/rust/hanadocs/change-review/change-review - hana.md`, else qualified by its list: `<list>/C<n>`, where `<list>` is the showrunner `~/rust/hanadocs/change-review/change-review - <list>.md` is named for (`natedev/C3`). Every list numbers its rows from 1, so only the qualifier keeps two lists' rows apart; a qualified row is stored at `proposals/<list>/<ROW>.json`. `propose` refuses a bare row for any project but hana: `feature_log: a claude review row names its list: <list>/C3`. `add`, `supersede` and `drop` take the row as `propose` saved it.
@@ -349,7 +351,7 @@ Rules the backfill followed, which bind any correction:
 
 ### Tests
 
-`python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'`. `test_feature_log.py` pins the two example notes byte for byte, every refusal leaving vault and events unchanged with no temp file, repeats, an interrupted supersede, splits, amend corrections and retries, the pending mark and its refusals, the pending-or-released rule in `add`, `supersede`, `amend` and `check`, exact event keys, proposals, list-qualified review rows for claude beside a bare hana row of the same number, the digest cursor and lock, every changelog kind, the headings a comparison covers, release stamping, and forwarding through injected callables. `test_inventory.py` pins each record kind, an excluded range, non-ASCII paths, a repeat `collect` leaving the ledger byte-identical, claims, path prefixes, `mark` refusals, `status` exits, and that no command changes a repository.
+`python3 -m unittest discover -s scripts/feature_log -p 'test_*.py'`. `test_feature_log.py` pins the two example notes byte for byte, every refusal leaving vault and events unchanged with no temp file, repeats, an interrupted supersede, splits, amend corrections and retries, the pending mark and its refusals, the pending-or-released rule in `add`, `supersede`, `amend` and `check`, the commit-date default (zone conversion, an explicit date that runs no git, the second checkout, a refusal with no writes for each new-note writer, `supersede`, and `propose` through landing), exact event keys, proposals, list-qualified review rows for claude beside a bare hana row of the same number, the digest cursor and lock, every changelog kind, the headings a comparison covers, release stamping, and forwarding through injected callables. `temporary_checkout` builds temp git repositories with fixed committer dates, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` set to `/dev/null`; `setUp` points every project's `checkouts` at one shared temp checkout. `test_inventory.py` pins each record kind, an excluded range, non-ASCII paths, a repeat `collect` leaving the ledger byte-identical, claims, path prefixes, `mark` refusals, `status` exits, and that no command changes a repository.
 
 ## Invariants
 
@@ -363,6 +365,7 @@ Rules the backfill followed, which bind any correction:
 - One live note per link per project unless `--separate-result`. A live note has `replaced_by: []`; a superseded note names at least one replacement, and every note it names exists.
 - A split loses nothing: every sentence of the old note is in a replacement or in a remainder that holds no release.
 - `--link`, `--completed` and `--release` on `amend` require `--backfill`; link and date travel together.
+- A new note's `completed_date` is the given `--completed` or the linked commit's committer date. It never falls back to the logging date: a commit no checkout holds is refused.
 - `events.jsonl` is append-only, and lines already on disk stay readable: a new key needs a reader that still accepts the old key set, as `LegacyAmendEvent` does.
 - The changelog emits summaries unchanged. A released section keeps superseded notes. An unpublished crate gets no output.
 - A note holds a crate as pending or as released, never both. Every write refuses a release list that holds `X@Unreleased` and an exact version of X, `amend` refuses either one onto a note that stores the other, and `check` reports a stored note that holds both.
@@ -372,7 +375,7 @@ Rules the backfill followed, which bind any correction:
 - The crate's `CHANGELOG.md` stays the published record. The log never rewrites a changelog and never blocks a release.
 - A ledger is frozen: `collect` never rewrites one, and only `claim` and `outcome` change. A record holds a note or a reason, never both.
 - A note is true at the audit ref. Backfill invents no result.
-- Tests never touch the live vault or state: `FEATURE_LOG_VAULT` and `XDG_STATE_HOME` point at temp dirs, and no test runs `ssh`.
+- Tests never touch the live vault, the live state or a real checkout: `FEATURE_LOG_VAULT` and `XDG_STATE_HOME` point at temp dirs, `checkouts` point at temp git repositories, and no test runs `ssh` or reaches the network.
 - Python: no `Any`, a `TypedDict` per JSON layout, no file-level ignores. Both scripts stay importable on Python 3.10.
 - Times shown to the user are in the user's zone (`config/user_zone.conf`, read through `scripts/lib/user_zone.py`).
 
@@ -389,7 +392,9 @@ The script:
 - The scripts run under Python 3.10 on the Mac (`scripts/lib/py`); the tests run only on natedev's 3.13 and use 3.12 names.
 - A tool or test run off natedev without `FEATURE_LOG_VAULT` reaches natedev's live vault. An empty `FEATURE_LOG_VAULT` stops forwarding and selects the local `~/rust/hanadocs`.
 - A forwarded call runs natedev's deployed `~/.claude` copy, not the caller's checkout.
-- Note dates use the vault host's local date (natedev is America/New_York); event times are in the user's zone.
+- `date_created` and `date_modified` use the vault host's local date (natedev is America/New_York); a defaulted `completed_date` and event times are in the user's zone.
+- A test that omits `--completed` needs a link to a real commit in a temp checkout; a made-up sha is refused.
+- A note is dated from natedev's checkouts. A commit not yet fetched into any of them is refused until it is fetched or `--completed` is given.
 - A kill between a note and its event leaves a note with no event; the next identical call appends it. For link, date and release amendments the order is reversed: the event exists and the note lags until a retry.
 - `propose` checks a link against notes already written. Two open proposals for one merge cannot see each other, so the second is refused at landing unless every row carries `--separate-result`.
 - `--backfill` only omits the `@Unreleased` default; `add`, `supersede` and `amend` each accept `--backfill --release X@Unreleased`.
@@ -432,6 +437,7 @@ Ledgers and evidence:
 - **Silent writes, digest on request.** A message per entry is noise.
 - **One vault with forwarding.** Obsidian has natedev's vault open; the Mac clone syncs only through git and lacks `change-review.md`.
 - **Own frontmatter parser and writer.** No YAML library is installed under `scripts/lib/py`. The output follows Obsidian Linter's form (sorted keys and arrays, compact lists, date links), so a save in the editor leaves a note valid.
+- **The completed date is the commit's date.** The log records when a result landed, not when an agent logged it. Local git needs no network and no GitHub sign-in. A silent fallback to the logging date is the defect the default replaced, so a commit no checkout holds is refused.
 - **Folder, title and link identify a note.** No generated id exists; the link rule is the duplicate check.
 - **Events are separate from notes.** The digest and event repair need history the notes do not hold. An accepting correction writes its event first because the event carries the old link and date, which exist nowhere else once the note is rewritten.
 - **`Unreleased` reads live notes only; a released version reads all.** A later replacement must not erase an older release's notes, and a pending entry replaced before release never shipped.

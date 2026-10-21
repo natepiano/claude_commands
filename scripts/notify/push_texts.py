@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import re
 import string
 import sys
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from user_action import (ActionRequired, NoActionRequired, UserAction, Notificat
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
 SEND_SCRIPT = Path(__file__).resolve().parents[1] / "message/send.py"
+# A unit id such as "types-unit": the whole value is one session name. The user knows it as "types".
+_UNIT_ID = re.compile(r"[A-Za-z0-9][\w-]*-unit")
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,8 @@ class PushText:
     action: ActionTemplate | NoActionNeeded
     body: str
     examples: tuple[PushExample, ...]
+    # One line for /nate help: when the push goes out. Not part of the approval fingerprint.
+    purpose: str
     session: SessionTemplate | NoSessionLine = NO_SESSION_LINE
     # False: the phone shows the title and body exactly as rendered, with no
     # "No action needed." line. Only an entry with no action and no session can opt out.
@@ -84,7 +89,13 @@ def catalog() -> tuple[PushText, ...]:
     return entries
 
 
-def render_entry(entry: PushText, values: dict[str, str]) -> RenderedPush:
+def shown_value(key: str, value: str) -> str:
+    """A session name loses its "-unit" end: the {sender} and {session} values, and any value that is
+    a whole unit id. Free text keeps every word, "per-unit" included (reviewer, 2026-10-21)."""
+    return value.removesuffix("-unit") if key in ("sender", "session") or _UNIT_ID.fullmatch(value) else value
+
+
+def render_entry(entry: PushText, given: dict[str, str]) -> RenderedPush:
     templates = [entry.sender, entry.title, entry.body]
     if isinstance(entry.action, ActionTemplate):
         templates.append(entry.action.text)
@@ -97,6 +108,7 @@ def render_entry(entry: PushText, values: dict[str, str]) -> RenderedPush:
                 if not field.isidentifier():
                     raise ValueError(f"{entry.id}: placeholder must be a name: {field}")
                 fields.add(field)
+    values = {key: shown_value(key, value) for key, value in given.items()}
     if fields != set(values):
         raise ValueError(f"{entry.id}: missing values {sorted(fields - set(values))}; extra values {sorted(set(values) - fields)}")
     action = ActionRequired(entry.action.text.format(**values)) if isinstance(entry.action, ActionTemplate) else NoActionRequired()
@@ -111,6 +123,27 @@ def render(id: str, **values: str) -> RenderedPush:
         if entry.id == id:
             return render_entry(entry, values)
     raise ValueError(f"unknown push text id: {id}")
+
+
+def listing(entries: tuple[PushText, ...]) -> str:
+    """One line per entry, sorted by id: the id in one column, then its purpose."""
+    ordered = sorted(entries, key=lambda entry: entry.id)
+    width = max(len(entry.id) for entry in ordered)
+    return "\n".join(f"{entry.id:<{width}}  {entry.purpose}" for entry in ordered)
+
+
+def shown(entry: PushText) -> str:
+    """The entry's template with its placeholders, then its first example as the phone shows it."""
+    template = RenderedPush(entry.id, entry.sender, entry.need, entry.title,
+                            ActionRequired(entry.action.text) if isinstance(entry.action, ActionTemplate) else NoActionRequired(),
+                            entry.body, {},
+                            SessionLine(entry.session.text) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE,
+                            entry.header)
+    example = entry.examples[0]
+    filled = render_entry(entry, example.values)
+    return (f"{entry.id}  {entry.purpose}\n\n"
+            + f"Template:\nTitle: {template.title}\n{template.message}\n\n"
+            + f"Example ({example.name}):\nTitle: {filled.title}\n{filled.message}")
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",

@@ -90,7 +90,8 @@ def missing_approvals(entries: tuple[PushText, ...], path: Path) -> list[str]:
 class PushTextTests(unittest.TestCase):
     def entry(self) -> PushText:
         return PushText("test", "test", "decision", "Choose {version}", ActionTemplate("Reply upgrade or wait."),
-                        "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})))
+                        "The check passed on {version}.", (PushExample("typical", {"version": "1.2"}), PushExample("long", {"version": "1.2000"})),
+                        purpose="Test.")
 
     def test_every_catalog_example_has_current_approval(self) -> None:
         entries = push_texts.catalog()
@@ -125,6 +126,32 @@ class PushTextTests(unittest.TestCase):
                     push = push_texts.render_entry(entry, example.values)
                     self.assertNotIn("@", push.sender + "\n" + push.title + "\n" + push.message)
 
+    def test_every_catalog_entry_has_a_one_line_purpose(self) -> None:
+        for entry in push_texts.catalog():
+            with self.subTest(id=entry.id):
+                self.assertTrue(entry.purpose.strip())
+                self.assertNotIn("\n", entry.purpose)
+                self.assertLessEqual(len(entry.purpose), 72)
+
+    def test_purpose_is_not_part_of_the_fingerprint(self) -> None:
+        entry = self.entry()
+        self.assertEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, purpose="Other.")))
+
+    def test_listing_prints_one_padded_line_per_entry_sorted_by_id(self) -> None:
+        entries = (replace(self.entry(), id="zeta", purpose="Last."), replace(self.entry(), id="a.long_id", purpose="First."))
+        self.assertEqual(push_texts.listing(entries), "a.long_id  First.\nzeta       Last.")
+        ordered = sorted(push_texts.catalog(), key=lambda entry: entry.id)
+        lines = push_texts.listing(push_texts.catalog()).splitlines()
+        self.assertEqual([line.split()[0] for line in lines], [entry.id for entry in ordered])
+        self.assertEqual(len({line.rindex(entry.purpose) for line, entry in zip(lines, ordered)}), 1)
+
+    def test_shown_prints_the_template_then_its_first_example_as_sent(self) -> None:
+        entry = replace(self.entry(), session=SessionTemplate("{version}"))
+        push = push_texts.render_entry(entry, {"version": "1.2"})
+        self.assertEqual(push_texts.shown(entry),
+                         "test  Test.\n\nTemplate:\nTitle: Choose {version}\nSession: {version}\nAction: Reply upgrade or wait.\n"
+                         + "The check passed on {version}.\n\nExample (typical):\nTitle: Choose 1.2\n" + push.message)
+
     def test_session_template_renders_before_action_and_body(self) -> None:
         entry = replace(self.entry(), session=SessionTemplate("{version}"))
         push = push_texts.render_entry(entry, {"version": "1.2"})
@@ -149,6 +176,40 @@ class PushTextTests(unittest.TestCase):
         push = push_texts.render("nate.adhoc", sender="natedev", title="the /nate skill is ready", description="It is ready now.")
         self.assertEqual(push.title, "natedev the /nate skill is ready")
         self.assertEqual(push.message, "It is ready now.\n\nadhoc")
+
+    def test_auto_mode_refusal_keeps_the_user_approved_lines(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
+        self.assertEqual(entry.need, "decision")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertEqual(push.title, "cargo-liner-style: auto mode stopped types")
+        self.assertEqual(push.message.split("\n")[:3], [
+            "Session: types", "Action: On natedev, in the types pane, approve the prompt or add an allow rule",
+            "Auto mode refused 2 commands in types. They save and merge one finished ticket. Three builds you approved wait for them."])
+        self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Approve", "Allow rule"])
+        self.assertTrue(push.body.endswith("never stops on these commands again."))
+        one = push_texts.render_entry(entry, entry.examples[1].values)
+        self.assertIn("refused 1 command in messaging. It pushes", one.body)
+        self.assertTrue(one.body.endswith(" The rule: Bash(git push:*)"))
+
+    def test_paid_credits_keeps_the_user_approved_lines(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits")
+        self.assertEqual(entry.need, "decision")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
+        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT.\n\n"
+                         + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
+                         + "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.")
+
+    def test_needs_go_keeps_the_user_approved_lines(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "session.needs_go")
+        self.assertEqual(entry.need, "decision")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertEqual(push.title, "natedev: trunk waits for your go")
+        self.assertEqual(push.message, "Session: trunk\n"
+                         + "Action: On natedev, in the trunk pane, type: Go: remove arrange_jacks/ from phases/130/files; 140 owns it\n"
+                         + "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.\n"
+                         + "Your go removes it from step 130, and trunk goes on.")
 
     def test_header_is_fingerprinted_and_cannot_hide_an_action_or_session(self) -> None:
         entry = replace(self.entry(), action=push_texts.NoActionNeeded())

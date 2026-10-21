@@ -66,6 +66,7 @@ if verb == 'start':
         'turn_id': 'turn-1',
         'status': 'running',
         'role': option('--role'),
+        'task': option('--task'),
         'context_tokens': 12000,
     }
     (session / 'follow_message.txt').write_text(
@@ -115,6 +116,7 @@ elif verb == 'follow':
         sys.exit(1)
     entry['status'] = 'running'
     entry['role'] = option('--role')
+    entry['task'] = option('--task')
     pathlib.Path(session / 'follow_message.txt').write_text(
         pathlib.Path(option('--message-file')).read_text()
     )
@@ -1471,6 +1473,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
         )
         self.assertEqual(roster[worker]["role"], "review")
+        self.assertEqual(roster[worker]["task"], "delegate.review")
         reviews = [
             event for event in self.pass_events("assigned")
             if event.get("pass_kind") == "review"
@@ -1505,6 +1508,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         worker = "project-review2"
         self.assertEqual(roster[worker]["status"], "done")
         self.assertEqual(roster[worker]["role"], "review")
+        self.assertEqual(roster[worker]["task"], "delegate.review")
         self.assertEqual(
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",

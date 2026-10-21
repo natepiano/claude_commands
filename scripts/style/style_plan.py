@@ -27,6 +27,7 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
+import coverage_report
 from approved_renames import (RUST_KEYWORDS, AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, declaration_sites, enclosing, file_rename, inline_modules, item_starts)
@@ -36,7 +37,7 @@ import style_ledger
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
-from production_units import Refusal, production_field
+from production_units import Refusal, cell_value, production_field, unit_table
 from proposal_issue import ApprovedDecision, decision_answer
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 
@@ -118,17 +119,25 @@ class MissingUnitPlan:
     pass
 
 
+def _unit_plan(doc: Path, unit: str, worktree: Path) -> Path:
+    for row in unit_table(doc.read_text().splitlines()):
+        if cell_value(row["Unit"]) == unit:
+            return worktree / Path(cell_value(row["Plan"]))
+    raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
+
+
 def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
     """Read each style unit's own standing plan copy."""
     texts: dict[rules.Family, str | MissingUnitPlan] = {}
     for row in unit_worktrees(doc):
-        for family in FAMILIES:
-            if row.unit == family + "-unit":
-                plan = row.worktree / "docs/style-production/units" / (row.unit + ".md")
-                try:
-                    texts[family] = plan.read_text()
-                except FileNotFoundError:
-                    texts[family] = MissingUnitPlan()
+        family = rules.style_family(row.unit)
+        if isinstance(family, rules.NotStyleUnit):
+            continue
+        plan = _unit_plan(doc, row.unit, row.worktree)
+        try:
+            texts[family] = plan.read_text()
+        except FileNotFoundError:
+            texts[family] = MissingUnitPlan()
     return texts
 
 
@@ -137,7 +146,7 @@ def family_plan_settings(doc: Path, repo: Path, *, unit: str = "") -> Mapping[ru
     return {family: unit_plan_settings(text, repo) if isinstance(text, str)
             else UnitPlanSettings(AllCrates(), frozenset())
             for family, text in family_plan_texts(doc).items()
-            if not unit or unit == family + "-unit"}
+            if not unit or rules.style_family(unit) == family}
 
 
 def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
@@ -1273,7 +1282,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
                file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
                crate_targets: CrateTargets = CrateTargets.LIBRARY,
-               proposal_cells: tuple[style_ledger.ProposalCell, ...] = ()) -> str:
+               proposal_cells: tuple[style_ledger.ProposalCell, ...] = (),
+               waived_findings: tuple[style_ledger.HeldFinding, ...] = ()) -> str:
     ticket_id = ticket["id"]
     number = ticket_id.rsplit("-", 1)[1]
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -1296,6 +1306,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
     held_lines = (["Already-held findings: do not hold these again; record held for a file whose finding still stands."]
                   + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
                      for finding in held_findings]) if per_file_structure and held_findings else []
+    waived_lines = (["Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."]
+                    + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
+                       for finding in waived_findings]) if per_file_structure and waived_findings else []
     approved = ticket["kind"] == "proposal"
     # The gate takes reference edits in other files only for these pairs, so the text names them.
     pairs = approved_rename_pairs(held_findings)
@@ -1375,6 +1388,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
              if per_file_structure else "Record each rule's crate verdict only after every file has been judged against it."),
             *[f"Record `{rule}` once with `--path {ticket['crate']}` after reading the manifests." for rule in manifest_rules],
             *held_lines,
+            *waived_lines,
         ] if ticket["kind"] == "structure" else []),
         *([
             "Judge window by window: take the files under **Files** in order, and each file's windows in order.",
@@ -1426,7 +1440,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         *record_lines,
         "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
         "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
-        "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
+        "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
+        + "Without `--reads`, the cell comes back after any change in its crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/direct/verify.sh check <package>`",
@@ -1454,6 +1469,22 @@ def atomic_write(path: Path, data: bytes) -> None:
         staged.unlink(missing_ok=True)
 
 
+def _waived_ticket_findings(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                            rule_paths: Mapping[str, Path]) -> tuple[style_ledger.HeldFinding, ...]:
+    """Map waived sites with the ticket's pinned rules and repository layout."""
+    if ticket["kind"] != "structure":
+        return ()
+    metadata = {rule: frontmatter(path) for rule, path in rule_paths.items()}
+    manifest_rules = {rule for rule, fields in metadata.items()
+                      if fields.get("tier") == ["D"] and fields.get("input_scope") == ["manifest"]}
+    directories = (tuple(member.directory for member in coverage_report.workspace(ledger, ticket["base"]))
+                   if manifest_rules else ())
+    cells = {(rule, path) for rule, path in ticket["cells"]}
+    return tuple(finding for finding in ledger.held_findings(style_ledger.HeldFindingsInState("waived"))
+                 if (finding.rule, style_proposals.crate_for(directories, finding.path)
+                     if finding.rule in manifest_rules else finding.path) in cells)
+
+
 def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, plan: Path, text: str) -> None:
     texts = ledger.pinned_rule_texts(ticket["id"])
     ticket["base"] = ledger.ticket_base(ticket["id"])
@@ -1477,11 +1508,13 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
         held = tuple(finding for finding in ledger.proposal_findings(Path(ticket["proposal"]))
                      if finding.finding_id in identities)
     cells = ledger.proposal_cells(ticket["id"]) if ticket["kind"] == "proposal" else ()
-    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells)
+    rule_paths = {pinned.rule_id: plan.parent.parent / "rules" / (pinned.blob + ".md") for pinned in texts}
     for pinned in texts:
-        path = plan.parent.parent / "rules" / (pinned.blob + ".md")
+        path = rule_paths[pinned.rule_id]
         if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
             atomic_write(path, pinned.text)
+    waived = _waived_ticket_findings(ledger, ticket, rule_paths)
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells, waived)
     if any(match.group("id") == ticket["id"] for match in PHASE.finditer(text)):
         updated = PHASE.sub(lambda match: phase if match.group("id") == ticket["id"] else match.group(0), text)
         if updated != text:
@@ -1554,8 +1587,8 @@ def _select_phase(
         ledger.ticket_drop(ticket["id"])
         reason = "files busy" if in_scope else "outside pilot scope"
         print(f"dropped {ticket['id']}: {reason}")
-    family = unit.removesuffix("-unit")
-    if family not in FAMILIES:
+    family = rules.style_family(unit)
+    if isinstance(family, rules.NotStyleUnit):
         raise style_ledger.LedgerError(f"{unit}: unknown style family")
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
@@ -1638,7 +1671,7 @@ def _select_phase(
         # A finding in a removed file, or whose site a merge moved to another file, can never build at its
         # site, so it is waived and the decision can close.
         for words, finding_ids in sorted(gone.items()):
-            _ = ledger.decline_findings(finding_ids, words)
+            _ = ledger.decline_findings(finding_ids, words, style_ledger.WaiveByLedger())
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
         if (gone or withdrew or built) and style_proposals.close_finished_decision(ledger, issue.path):
             closed = True
@@ -1705,7 +1738,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
     if row is None:
         raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
-    expected = row.worktree.resolve() / "docs/style-production/units" / (unit + ".md")
+    expected = _unit_plan(doc, unit, row.worktree).resolve()
     if plan != expected:
         raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
     original = plan.read_text()
@@ -1799,13 +1832,13 @@ def main(argv: list[str]) -> int:
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
                 settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
-                branches = {row.unit: row.branch for row in unit_worktrees(doc)}
-                for family in FAMILIES:
-                    unit = family + "-unit"
-                    if args.unit and args.unit != unit:
+                for row in unit_worktrees(doc):
+                    unit = row.unit
+                    family = rules.style_family(unit)
+                    if isinstance(family, rules.NotStyleUnit) or (args.unit and args.unit != unit):
                         continue
                     first_files = settings[family].first_files if family in settings else _NO_FIRST_FILES
-                    base = unit_base(args.repo, branches[unit]) if unit in branches else NoUnitBranch()
+                    base = unit_base(args.repo, row.branch)
                     for ticket in candidate_tickets(args.repo, ledger, busy, family, scopes.get(family, _ALL_CRATES),
                                                     scopes, base=base, first_files=first_files):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")

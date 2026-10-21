@@ -819,7 +819,8 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_texts_reviews_every_example_and_approves_only_unchanged_send_results(self) -> None:
         entry = push_texts.PushText("test", "script", "decision", "Choose version", push_texts.ActionTemplate("Choose retry."),
-                                   "The check passed on {version}.", (push_texts.PushExample("typical", {"version": "1"}), push_texts.PushExample("long", {"version": "2000"})))
+                                   "The check passed on {version}.", (push_texts.PushExample("typical", {"version": "1"}), push_texts.PushExample("long", {"version": "2000"})),
+                                   purpose="Test.")
         approvals = self.root / "reviewed.json"
         reviewed: list[str] = []
         def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -841,7 +842,7 @@ class LocalReviewTests(unittest.TestCase):
     def test_user_spec_approves_original_text_and_keeps_ask_objections_and_existing_approvals(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner remote-control is off",
             push_texts.ActionTemplate("run /remote-control"), "Reason: Remote control is off.",
-            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+            (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
         draft = review.Draft("shutdown", "1", entry.title, ActionRequired("run /remote-control"),
                              entry.body, False, SessionLine("Owner"))
         objections = [review.RuleFailureRecord(rule="reader-starts-cold", quote="Remote control is off.")]
@@ -876,7 +877,7 @@ class LocalReviewTests(unittest.TestCase):
     def test_approving_prunes_retired_examples_only_for_selected_texts_and_keeps_current_failed_approvals(self) -> None:
         entry = push_texts.PushText("selected", "shutdown", "decision", self.draft.title,
             push_texts.ActionTemplate(cast(ActionRequired, self.draft.action).text), self.draft.body,
-            (push_texts.PushExample("typical", {}), push_texts.PushExample("new", {})))
+            (push_texts.PushExample("typical", {}), push_texts.PushExample("new", {})), purpose="Test.")
         other = replace(entry, id="other")
         old: review.TextApproval = {"sha256": "old-digest", "time": "yesterday", "reviewer": "opus"}
         existing = {"selected": {"typical": old, "retired": old}, "other": {"retired": old}}
@@ -916,6 +917,21 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.main(["texts", "--id", "shutdown.holdout", "--approve",
                                           "--user-spec", "User words"]), 0)
         texts.assert_called_once_with(["shutdown.holdout"], True, authority=review.UserSpecifiedText("User words"))
+
+    def test_list_and_show_cli_print_the_catalog(self) -> None:
+        listing = push_texts.listing(push_texts.catalog())
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["list"]), 0)
+        self.assertEqual(output.getvalue(), listing + "\n")
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["show", "session.needs_go"]), 0)
+        shown = output.getvalue()
+        self.assertIn("Title: {sender}: {session} waits for your go\nSession: {session}\n", shown)
+        self.assertIn("Example (typical):\nTitle: natedev: trunk waits for your go\nSession: trunk\n", shown)
+        self.assertNotIn("{", shown.split("Example (typical):")[1])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["show", "no.such"]), 1)
+        self.assertEqual(output.getvalue(), f"No template named no.such.\n\n{listing}\n")
 
     def test_retiring_a_rejected_claim_preserves_a_newer_hold_from_the_same_source(self) -> None:
         original = self.held()

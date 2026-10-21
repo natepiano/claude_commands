@@ -1447,6 +1447,23 @@ def texts(ids: list[str], approve: bool = False, *, runner: ProcessRunner = run_
     return int(failed)
 
 
+def list_texts() -> int:
+    import push_texts
+    print(push_texts.listing(push_texts.catalog()))
+    return 0
+
+
+def show_text(text_id: str) -> int:
+    import push_texts
+    entries = push_texts.catalog()
+    for entry in entries:
+        if entry.id == text_id:
+            print(push_texts.shown(entry))
+            return 0
+    print(f"No template named {text_id}.\n\n{push_texts.listing(entries)}")
+    return 1
+
+
 def switch(direction: str) -> int:
     path = state_path() / "review_off"
     if direction == "off":
@@ -1466,6 +1483,9 @@ def main(argv: list[str]) -> int:
     _ = text_parser.add_argument("--id", action="append", default=[])
     _ = text_parser.add_argument("--approve", action="store_true")
     _ = text_parser.add_argument("--user-spec", metavar="SOURCE")
+    _ = commands.add_parser("list", help="one line per phone text: its id and purpose")
+    show_parser = commands.add_parser("show", help="one phone text's template and its first example")
+    _ = show_parser.add_argument("id")
     release_parser = commands.add_parser("release")
     _ = release_parser.add_argument("--identity", required=True)
     _ = release_parser.add_argument("source")
@@ -1494,6 +1514,10 @@ def main(argv: list[str]) -> int:
                 parser.error("--user-spec requires --approve and a nonempty source")
             authority = UserSpecifiedText(source)
         return texts(cast(list[str], arguments.id), cast(bool, arguments.approve), authority=authority)
+    if command == "list":
+        return list_texts()
+    if command == "show":
+        return show_text(cast(str, arguments.id))
     if command == "release":
         print(release_if_matches(cast(str, arguments.source), cast(str, arguments.identity)).value)
         return 0

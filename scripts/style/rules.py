@@ -23,6 +23,20 @@ RuleOrigin = Literal["global", "local"]
 
 
 @dataclass(frozen=True)
+class NotStyleUnit:
+    """The unit id does not name a style family."""
+
+
+def style_family(unit: str) -> Family | NotStyleUnit:
+    families: tuple[Family, ...] = ("names", "values", "types", "modules")
+    for family in families:
+        suffix = f"{family}-unit"
+        if unit == suffix or unit.endswith("-" + suffix):
+            return family
+    return NotStyleUnit()
+
+
+@dataclass(frozen=True)
 class RepoReach:
     """The rule governs the entire repository."""
 
