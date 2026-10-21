@@ -65,7 +65,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
 
 | Gate | Waiting | Waits on | Clears when |
 | --- | --- | --- | --- |
-| G1 | Phase 6's next re-rank | a week after Phase 10's failure texts landed | the clock: Thu 2026-10-22 15:07:01Z (11:07:01 EDT) |
+| G1 | Phase 6's next re-rank | a week after Phase 10's failure texts landed | the clock: Thu 2026-10-22 15:07:01Z (11:07:01 AST) |
 
 ## Phases
 
@@ -257,7 +257,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 
 **Depends on:** Phase 10 — the next re-rank measures the week after the failure texts land.
 
-**Blocked by:** G1 — do not re-rank before 2026-10-22T15:07:01Z (11:07:01 EDT); the acceptance gate also requires source coverage through that instant.
+**Blocked by:** G1 — do not re-rank before 2026-10-22T15:07:01Z (11:07:01 AST); the acceptance gate also requires source coverage through that instant.
 
 #### Work Order
 
