@@ -16,7 +16,7 @@ from typing import cast
 VERIFY = Path(__file__).with_name("verify.sh")
 # A Codex worker running this suite must not make verify.sh detach its call.
 WORKER_FREE_ENVIRONMENT = {name: value for name, value in os.environ.items()
-                           if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}}
+                           if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}}
 
 
 def classifier_functions() -> str:

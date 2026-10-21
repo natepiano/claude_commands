@@ -487,7 +487,7 @@ class RoundsCommandTests(unittest.TestCase):
                plan: str = "", top: int = 25, status: str = "all", cli: bool = False) -> JsonReport:
         args = argparse.Namespace(since=since, until=until, status=status, top=top,
                                   plan=plan, format="json", skill="")
-        collected = [("unit-history", record) for record in events]
+        collected = [("plan-delegate", record) for record in events]
         tally = {"unreadable": 0, "future_spine": 0, "unknown_stage": 0}
         output = io.StringIO()
         with patch.object(rounds, "_events", return_value=(collected, tally)), contextlib.redirect_stdout(output):

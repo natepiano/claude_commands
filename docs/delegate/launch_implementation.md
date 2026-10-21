@@ -21,7 +21,7 @@ completes.
    "${PHASE_DIR}/implementation_prompt.md"`. Use `ad hoc` plus scope without a
    phased plan; pass the original prompt only. Both run before the dispatch in
    step 4, never after it.
-3. `~/.claude/config/agents.conf` owns worker family/model/effort, one row
+3. `~/.claude/config/agents.conf` owns delegate family/model/effort, one row
    per kind. On a worker's first phase, its kind is its opening role from the Work
    Order's `Workers:` field: `impl` for the `impl` slot, and for `test` whatever
    its Workers line opens it as — `test` under the default opening. On later
@@ -75,18 +75,18 @@ completes.
 7. On completion, read `${PHASE_DIR}/impl_status_impl` and `impl_status_test`; the phase is
    done only when both are terminal. `implemented` on `impl` loads
    `impl_summary_impl.txt` into `${IMPL_SUMMARY}`; read `impl_summary_test.txt`
-   for what it completed and for findings it posted. If `impl` errors, apply <WorkerLaunchFailure/>
+   for what it completed and for findings it posted. If `impl` errors, apply <DelegateLaunchFailure/>
    first — a worker that died in seconds is resolved there, not reported. A
    genuine error then cancels any early-launched
-   reviewer per <EarlyReviewArm/>, applies <RetainPhaseReservation/>,
+   reviewer per <EarlyReviewArm/>, applies <RetainDelegatedPhaseReservation/>,
    reports `impl_agent_impl.log`, records
    `finish-run --status error`, runs `end_session.sh`, and stops; multi-phase
    runs also emit <RunSummary/>.
-8. `implemented` is the worker's claim, not a passed gate. Read
+8. `implemented` is the delegate's claim, not a passed gate. Read
    `${IMPL_SUMMARY}` for a verification line it left running, unread, or
    unmentioned — "still running", "I'll report once it completes", a listed
    command with no stated result. When one is there, run that command yourself
    under <VerificationContract/> before <DualReview/> and review against its real
-   output. A failing gate the worker never read is a finding like any other,
+   output. A failing gate the delegate never read is a finding like any other,
    not a reason to reject the phase.
 </LaunchImplementation>

@@ -252,7 +252,7 @@ ParallelCheck = CouldStart | NothingToStart | DependenciesUnknown
 
 
 class PhaseRecord(NamedTuple):
-    """The complete read-only phase view for one worker session."""
+    """The complete read-only phase view for one delegate session."""
 
     plan: Path
     updated: datetime
@@ -347,7 +347,7 @@ class OutsidePlan(NamedTuple):
 
 
 class ProductionReference(NamedTuple):
-    """The production and unit named by a worker plan."""
+    """The production and unit named by a delegate plan."""
 
     production: str
     unit: str
@@ -387,11 +387,11 @@ class NoOwnedPhaseNote(NamedTuple):
 
 
 class NoState(Exception):
-    """The requested worker session has no readable progress state."""
+    """The requested delegate session has no readable progress state."""
 
 
 class NoPlan(Exception):
-    """The requested worker session does not identify a readable plan."""
+    """The requested delegate session does not identify a readable plan."""
 
 
 def _json_object(text: str) -> dict[str, object] | None:

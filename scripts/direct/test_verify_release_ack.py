@@ -68,7 +68,7 @@ PY
         sweep.chmod(0o755)
         self.environment = {
             **{name: value for name, value in os.environ.items()
-               if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}},
+               if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}},
             "HOME": str(self.root),
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "TMPDIR": str(self.root),
@@ -79,9 +79,9 @@ PY
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
             "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILD_TARGETS_SCRIPT": str(INVOKE.parent.parent / "build_targets" / "build_targets.py"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
-            "UNIT_RUN_DIR": "",
-            "UNIT_SESSION_DIR": "",
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_SESSION_DIR": "",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_MEMINFO": str(meminfo),
@@ -123,11 +123,11 @@ PY
         )
 
     def set_owner_marker(self) -> None:
-        run = self.root / "unit-run"
-        active = Path(self.environment["UNIT_ACTIVE_DIR"])
+        run = self.root / "delegate-run"
+        active = Path(self.environment["PLAN_DELEGATE_ACTIVE_DIR"])
         active.mkdir()
         _ = (active / "unit-director").write_text(str(run) + "\n")
-        self.environment["UNIT_RUN_DIR"] = str(run)
+        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
         self.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
 
     def release_memory_after_poll(self) -> None:
@@ -267,9 +267,9 @@ class VerifyRoutingTests(unittest.TestCase):
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
             "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
-            "UNIT_ACTIVE_DIR": str(root / "active"),
-            "UNIT_RUN_DIR": "",
-            "UNIT_TEAM_ROLE": "",
+            "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+            "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_TEAM_ROLE": "",
             "NOTIFIER_SESSIONS_DIR": str(root / "sessions"),
             "MAC_TEST_STATE_DIR": str(root / "mac-state"),
             "VERIFY_MAC_RUNNER": str(root / "no-mac-runner"),
@@ -284,12 +284,12 @@ class VerifyRoutingTests(unittest.TestCase):
         self.fixture.environment["BUILD_TARGETS_NOW"] = ""
 
     def set_owner_marker(self) -> None:
-        run = self.fixture.root / "unit-run"
+        run = self.fixture.root / "delegate-run"
         run.mkdir()
-        active = Path(self.fixture.environment["UNIT_ACTIVE_DIR"])
+        active = Path(self.fixture.environment["PLAN_DELEGATE_ACTIVE_DIR"])
         active.mkdir()
         _ = (active / "unit-director").write_text(str(run) + "\n")
-        self.fixture.environment["UNIT_RUN_DIR"] = str(run)
+        self.fixture.environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
         self.fixture.environment["CLAUDE_CODE_SESSION_ID"] = "stale-session"
 
     def reset_cycle(self) -> None:
@@ -351,8 +351,8 @@ class VerifyRoutingTests(unittest.TestCase):
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
         self.fixture.environment.update({
-            "CLAUDE_CODE_SESSION_ID": "", "UNIT_RUN_DIR": "",
-            "UNIT_SESSION_DIR": "",
+            "CLAUDE_CODE_SESSION_ID": "", "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_SESSION_DIR": "",
         })
         cycle = read_cycle_file(self.cycle_file)
         cycle["entries"] = []
@@ -372,8 +372,8 @@ class VerifyRoutingTests(unittest.TestCase):
         _ = self.fixture.package()
         _ = self.fixture.example(source="#[test]\nfn check() {}\nfn main() {}\n")
         self.fixture.environment.update({
-            "CLAUDE_CODE_SESSION_ID": "", "UNIT_RUN_DIR": "",
-            "UNIT_SESSION_DIR": "",
+            "CLAUDE_CODE_SESSION_ID": "", "PLAN_DELEGATE_BOARD_DIR": "",
+            "PLAN_DELEGATE_SESSION_DIR": "",
         })
         before = self.cycle_file.read_bytes()
         result = self.fixture.verify("test", "sample")

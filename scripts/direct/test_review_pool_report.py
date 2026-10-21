@@ -137,7 +137,7 @@ class ReviewPoolReportTests(unittest.TestCase):
                             encoding="utf-8")
         return path
 
-    def finding(self, *, phase_instance: str = "phase-instance", caught_by: str = "worker",
+    def finding(self, *, phase_instance: str = "phase-instance", caught_by: str = "delegate",
                 lens: str = "contract", event_type: str = "finding_opened") -> dict[str, object]:
         self.sequence += 1
         return {"event_type": event_type, "event_id": f"event-{self.sequence}",
@@ -186,7 +186,7 @@ class ReviewPoolReportTests(unittest.TestCase):
                       usage_store: Literal["ready", "absent", "unreadable"] = "ready") -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment["HOME"] = str(self.home)
-        environment["UNIT_HISTORY_DIR"] = str(self.history)
+        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history)
         environment["REVIEW_POOL_STATE"] = str(self.home / "review-pool")
         usage_state = self.home / "usage-state"
         self.populate_usage_store(usage_state)
@@ -849,7 +849,7 @@ class ReviewPoolReportTests(unittest.TestCase):
 
     def shadow(self, *options: str, explicit_root: bool = True) -> str:
         environment = os.environ.copy()
-        environment.update({"HOME": str(self.home), "UNIT_HISTORY_DIR": str(self.history),
+        environment.update({"HOME": str(self.home), "PLAN_DELEGATE_HISTORY_DIR": str(self.history),
                             "REVIEW_POOL_STATE": str(self.home / "review-pool"),
                             "USAGE_STATE_DIR": str(self.home / "absent-store"),
                             "PYTHONDONTWRITEBYTECODE": "1"})

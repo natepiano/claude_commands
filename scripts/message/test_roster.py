@@ -54,7 +54,7 @@ class RosterTests(unittest.TestCase):
     home: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     sessions: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     notifier: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    runs: Path  # pyright: ignore[reportUninitializedInstanceVariable]
+    delegate: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     ps_state: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     production_doc: Path  # pyright: ignore[reportUninitializedInstanceVariable]
     director_run: Path  # pyright: ignore[reportUninitializedInstanceVariable]
@@ -69,10 +69,10 @@ class RosterTests(unittest.TestCase):
         self.home = self.root / "home"
         self.sessions = self.root / "sessions"
         self.notifier = self.root / "notifier"
-        self.runs = self.root / "runs"
+        self.delegate = self.root / "delegate"
         binaries = self.root / "bin"
         for directory in (
-            self.home, self.sessions, self.notifier, self.runs / "active", binaries,
+            self.home, self.sessions, self.notifier, self.delegate / "active", binaries,
             self.root / "history" / "runs",
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -122,8 +122,8 @@ class RosterTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "SHOWRUNNERS_CONFIG": str(config),
             "SHOWRUNNERS_SESSIONS": str(Path(__file__).with_name("sessions.py")),
-            "UNIT_HISTORY_DIR": str(self.root / "history"),
-            "ROSTER_RUN_ROOT": str(self.runs),
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "ROSTER_DELEGATE_ROOT": str(self.delegate),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "ROSTER_PS_FIXTURE": str(self.ps_state),
             "PROCESS_TABLE_PS": f"cat {self.ps_state}",
@@ -244,9 +244,9 @@ class RosterTests(unittest.TestCase):
         self._write_session("free-old", "old-free-name", "sid-free", free_cwd, updated=1)
         self._write_session("free-new", "free-claude", "sid-free", free_cwd, status="ready", updated=2)
 
-        self.director_run = self.runs / "director-run"
+        self.director_run = self.delegate / "director-run"
         self.director_run.mkdir()
-        _ = (self.runs / "active" / "sid-director").write_text(
+        _ = (self.delegate / "active" / "sid-director").write_text(
             str(self.director_run) + "\n", encoding="utf-8",
         )
         _ = (self.director_run / "workers").write_text(
@@ -279,13 +279,13 @@ class RosterTests(unittest.TestCase):
             "alpha-no-thread": {"status": "starting", "launcher_pid": os.getpid()},
         })
 
-        solo_run = self.runs / "solo-run"
+        solo_run = self.delegate / "solo-run"
         solo_run.mkdir()
-        _ = (self.runs / "active" / "sid-solo").write_text(
+        _ = (self.delegate / "active" / "sid-solo").write_text(
             str(solo_run) + "\n", encoding="utf-8",
         )
 
-        orphan_run = self.runs / "orphan-run"
+        orphan_run = self.delegate / "orphan-run"
         self._write_mesh(orphan_run, {
             "orphan-impl": {
                 "thread_id": "thread-orphan", "turn_id": "turn-orphan", "status": "running",
@@ -295,18 +295,18 @@ class RosterTests(unittest.TestCase):
         })
         (orphan_run / "heartbeat.log").touch()
 
-        stale_run = self.runs / "stale-marker-run"
+        stale_run = self.delegate / "stale-marker-run"
         self._write_mesh(stale_run, {
             "stale-impl": {
                 "thread_id": "thread-stale", "turn_id": "turn-stale", "status": "running",
                 "launcher_pid": os.getpid(),
             },
         })
-        _ = (self.runs / "active" / "dead-director").write_text(
+        _ = (self.delegate / "active" / "dead-director").write_text(
             str(stale_run) + "\n", encoding="utf-8",
         )
 
-        dead_server_run = self.runs / "dead-server-run"
+        dead_server_run = self.delegate / "dead-server-run"
         self._write_mesh(dead_server_run, {
             "dead-impl": {
                 "thread_id": "thread-dead", "turn_id": "turn-dead", "status": "running",
@@ -499,7 +499,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(worker) - len(worker.lstrip()), len(director) - len(director.lstrip()) + 2)
         self.assertLess(lines.index(runner), lines.index(director))
         self.assertLess(lines.index(director), lines.index(worker))
-        orphan_header = f"  director not running: {self.runs / 'orphan-run'}"
+        orphan_header = f"  director not running: {self.delegate / 'orphan-run'}"
         self.assertIn(orphan_header, lines)
         orphan_worker = next(line for line in lines if line.lstrip().startswith("worker orphan-impl"))
         self.assertTrue(orphan_worker.startswith("    "))
@@ -547,7 +547,7 @@ class RosterTests(unittest.TestCase):
                                      len(director) - len(director.lstrip()) + 2)
                     self.assertLess(lines.index(director), lines.index(worker))
                     self.assertEqual(sum(line.lstrip().startswith(f"worker {name}") for line in lines), 1)
-                self.assertIn(f"  director not running: {self.runs / 'orphan-run'}", lines)
+                self.assertIn(f"  director not running: {self.delegate / 'orphan-run'}", lines)
                 if arguments:
                     self.assertIn("(context)", director)
 
@@ -709,7 +709,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(by_name["orphan-fix"]["address"], "")
 
     def test_same_worker_name_in_two_live_runs_has_two_unique_addresses(self) -> None:
-        second_run = self.runs / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        second_run = self.delegate / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         self._write_mesh(second_run, {
             "alpha-impl": {
                 "thread_id": "thread-other-run", "turn_id": "turn-other-run",
@@ -749,10 +749,10 @@ class RosterTests(unittest.TestCase):
             },
         })
         (second_run / "heartbeat.log").touch()
-        environment = {name: value for name, value in os.environ.items() if name != "ROSTER_RUN_ROOT"}
+        environment = {name: value for name, value in os.environ.items() if name != "ROSTER_DELEGATE_ROOT"}
 
         with mock.patch.dict(os.environ, environment, clear=True), \
-                mock.patch.object(unit_runs, "RUN_ROOT", self.runs), \
+                mock.patch.object(unit_runs, "RUN_ROOT", self.delegate), \
                 mock.patch.object(unit_runs, "FORMER_RUN_ROOT", former), \
                 mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
             found = roster.roster(os.environ, roster.ThisMachine())
@@ -960,7 +960,7 @@ class RosterTests(unittest.TestCase):
     def test_live_run_workers_survive_server_exit_but_ended_workers_and_dead_runs_do_not(self) -> None:
         for liveness in ("active marker", "fresh heartbeat", "dead run"):
             with self.subTest(liveness=liveness):
-                run = self.runs / liveness.replace(" ", "-")
+                run = self.delegate / liveness.replace(" ", "-")
                 records: dict[str, dict[str, object]] = {
                     f"{run.name}-{status}": {
                         "thread_id": f"{run.name}-{status}-thread",
@@ -971,7 +971,7 @@ class RosterTests(unittest.TestCase):
                 }
                 self._write_mesh(run, records)
                 if liveness == "active marker":
-                    _ = (self.runs / "active" / "sid-director").write_text(str(run) + "\n")
+                    _ = (self.delegate / "active" / "sid-director").write_text(str(run) + "\n")
                 else:
                     heartbeat = run / "heartbeat.log"
                     heartbeat.touch()
@@ -1300,7 +1300,7 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len([problem for problem in found.problems if "process" in problem]), 1)
 
     def test_recent_heartbeat_is_live_but_an_old_one_is_not(self) -> None:
-        orphan = self.runs / "orphan-run" / "heartbeat.log"
+        orphan = self.delegate / "orphan-run" / "heartbeat.log"
         old = time.time() - unit_runs.LIVE_HEARTBEAT_SECS - 5
         os.utime(orphan, (old, old))
         entries = self._entries()

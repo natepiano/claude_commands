@@ -191,7 +191,7 @@ class SessionStartHookTests(unittest.TestCase):
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         self.assertEqual([(row["id"], row["role"]) for row in self.records()], [(SESSION, "interactive")])
 
-    def test_hook_then_worker_writer_uses_the_worker_role_from_its_assignment(self) -> None:
+    def test_hook_then_delegate_writer_uses_the_delegate_role_from_its_assignment(self) -> None:
         result = self.deliver(session_id=SESSION)
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         initial = agents_log.assignments(self.log_path).assignments[SESSION][0]
@@ -211,7 +211,7 @@ class SessionStartHookTests(unittest.TestCase):
                 self.assertEqual(agents_log.role_at(log, SESSION, query),
                                  agents_log.Assignment(delegated_at, "director", None, False))
 
-    def test_worker_writer_then_hook_preserves_the_worker_role_and_lens(self) -> None:
+    def test_delegate_writer_then_hook_preserves_the_delegate_role_and_lens(self) -> None:
         agents_log.append(SESSION, "review", "adversary", AT)
         before = self.log_path.read_bytes()
 

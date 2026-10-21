@@ -324,7 +324,7 @@ class MacTestCommandTests(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         }
         self.children = []
@@ -715,16 +715,16 @@ class MacTestCommandTests(unittest.TestCase):
         owner = self.start_child()
         active = self.root / "active"
         active.mkdir()
-        board = str(self.root / "run")
+        board = str(self.root / "delegate")
         _ = (active / "worker-owner").write_text(board)
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "",
-                       "UNIT_RUN_DIR": board, "UNIT_SESSION_DIR": ""}
+                       "PLAN_DELEGATE_BOARD_DIR": board, "PLAN_DELEGATE_SESSION_DIR": ""}
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "worker tests",
                                          environment=environment), 0, "claimed\n")
         self.assertEqual(self.run_state().get("holder_session"), "worker-owner")
         self.assert_command(self.command("release", "--pid", str(owner.pid)), 0, "")
         environment = {**self.environment, "CLAUDE_CODE_SESSION_ID": "",
-                       "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": ""}
+                       "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": ""}
         self.assert_command(self.command("claim", "--pid", str(owner.pid), "--what", "unowned tests",
                                          environment=environment), 0, "claimed\n")
         self.assertNotIn("holder_session", self.run_state())

@@ -23,8 +23,8 @@ from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid, wait
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 
 
-DIRECT_DIR = Path(__file__).parent
-AGENTS_DIR = DIRECT_DIR.parent / "agents"
+DELEGATE_DIR = Path(__file__).parent
+AGENTS_DIR = DELEGATE_DIR.parent / "agents"
 
 # The wrapper calls this as: <task> readonly <working_dir> <prompt> <findings> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
@@ -202,9 +202,9 @@ ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
 AGENTS_REGISTRY = """[assignments]
-direct=codex
+delegate=codex
 
-[direct.codex]
+[delegate.codex]
 implementation=gpt-called:xhigh
 review=gpt-blind:max
 
@@ -212,7 +212,7 @@ review=gpt-blind:max
 gpt-called=low,medium,high,xhigh,max
 gpt-blind=low,medium,high,xhigh,max
 
-[direct.options]
+[delegate.options]
 codex_mesh=1
 """
 
@@ -305,11 +305,11 @@ class ReviewLauncherPassTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.config_file = self.root / "direct.conf"
+        self.config_file = self.root / "delegate.conf"
         _ = self.config_file.write_text(
             "\n".join([
-                "UNIT_PROGRESS_INTERVAL_SECONDS=180",
-                "UNIT_COMPACT_ABOVE_TOKENS=100000",
+                "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=180",
+                "PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=100000",
                 "",
             ]),
             encoding="utf-8",
@@ -350,22 +350,22 @@ class ReviewLauncherPassTests(unittest.TestCase):
         Mesh, agent execution, pool allocation and the waiting heartbeat watcher
         are controlled so tests spend no model tokens or minute-long sleeps.
         """
-        direct_dir = self.root / "scripts" / "direct"
+        delegate = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
         lib = self.root / "scripts" / "lib"
-        direct_dir.mkdir(parents=True)
+        delegate.mkdir(parents=True)
         agents.mkdir(parents=True)
         lib.mkdir(parents=True)
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
+        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py",
             "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
         ):
-            _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
+            _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
         for name in ("agents_config.sh", "heartbeat.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         # Keep the watcher alive for early-launch tests without a shell sleep
@@ -396,8 +396,8 @@ else:
         mesh = agents / "codex_mesh.py"
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
-        _ = (direct_dir / "review_pool.py").write_text(STUB_POOL, encoding="utf-8")
-        return direct_dir / "review.sh"
+        _ = (delegate / "review_pool.py").write_text(STUB_POOL, encoding="utf-8")
+        return delegate / "review.sh"
 
     def test_heartbeat_watcher_ends_without_pidfd_support(self) -> None:
         marker = self.root / "portable-watcher-ready"
@@ -464,13 +464,13 @@ else:
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = environment.pop("CLAUDE_PYTHON", None)
-        environment["UNIT_EARLY_POLL_SECS"] = "0.01"
-        environment["UNIT_WORKER_POLL_SECS"] = "0.01"
-        environment["UNIT_WORKER_WAIT_ATTEMPTS"] = "30000"
-        environment["UNIT_SYNC_WRITES"] = "0"
-        environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
-        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["UNIT_CONFIG"] = str(self.config_file)
+        environment["PLAN_DELEGATE_EARLY_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_POLL_SECS"] = "0.01"
+        environment["PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS"] = "30000"
+        environment["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+        environment["TEST_WAIT_HELPER_DIR"] = str(DELEGATE_DIR.resolve())
+        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
@@ -490,7 +490,7 @@ else:
 
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()
-        environment["UNIT_PASS_OWNER"] = "launcher"
+        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
         result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -509,8 +509,8 @@ else:
         entered = session / "poll-entered"
         arguments = session / "poll-arguments"
         environment = self.environment()
-        for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
-                    "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
+        for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
+                    "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
             _ = environment.pop(key, None)
         environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
                             "TEST_POLL_ARGUMENTS": str(arguments), "TEST_POLL_ENTERED": str(entered),
@@ -582,7 +582,7 @@ else:
         self.recorder(
             "start-pass", "--session-dir", str(session_dir),
             "--pass-kind", "impl", "--activity", "writing the retry path",
-            "--called-task", "direct.implementation", "--called-family", "codex",
+            "--called-task", "delegate.implementation", "--called-family", "codex",
             "--called-model", "gpt-called", "--called-effort", "xhigh",
         )
         return session_dir
@@ -1175,7 +1175,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
     def test_pool_requires_codex_mesh_before_allocation(self) -> None:
         session = self.start_implementation("pool-mesh-off")
         environment = self.pool_fixture()
-        environment["UNIT_CODEX_MESH"] = "0"
+        environment["PLAN_DELEGATE_CODEX_MESH"] = "0"
         result = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
                                 text=True, check=False, timeout=300)
         self.assertEqual(result.returncode, 2, result.stderr)
@@ -1250,10 +1250,10 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         self.assertEqual(state["pass"]["pool_code1"]["status"], "active")
         slot = (session / "review_slot_contract").read_text().strip()
         self.assertEqual(slot, "pool_code1")
-        environment["UNIT_TEAM_ROLE"] = slot
-        _ = environment.pop("UNIT_PASS_OWNER", None)
+        environment["PLAN_DELEGATE_TEAM_ROLE"] = slot
+        _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
         canceled = subprocess.run(
-            ["python3", str(DIRECT_DIR / "progress_history.py"), "finish-pass",
+            ["python3", str(DELEGATE_DIR / "progress_history.py"), "finish-pass",
              "--session-dir", str(session), "--status", "canceled", "--orphaned-launcher"],
             env=environment, capture_output=True, text=True, check=False, timeout=300,
         )

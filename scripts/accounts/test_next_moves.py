@@ -70,7 +70,7 @@ class NextMovesTests(unittest.TestCase):
     def test_positional_edits_preserve_surviving_ids_and_the_other_groups_interleaved_order(self) -> None:
         entries: tuple[next_moves.NextMove, ...] = (
             next_moves.ClaudeGroupMove("unit-one", "units", 1, 5, "claude2", NOW),
-            next_moves.WorkersMove("worker-one", 1, next_moves.WorkersToClaude(), NOW),
+            next_moves.WorkersMove("worker-one", 1, next_moves.DelegateToClaude(), NOW),
             next_moves.ClaudeGroupMove("runner-one", "showrunners", 1, 0, "claude3", NOW),
             next_moves.ClaudeGroupMove("unit-two", "units", 2, 5, "claude3", NOW),
             next_moves.ClaudeGroupMove("runner-two", "showrunners", 2, 0, "claude2", NOW),
@@ -147,7 +147,7 @@ class NextMovesTests(unittest.TestCase):
         assert isinstance(codex, next_moves.WorkersMove)
         assert isinstance(claude, next_moves.WorkersMove)
         self.assertEqual(codex.to, next_moves.CodexWorkersTarget("codex2"))
-        self.assertEqual(claude.to, next_moves.WorkersToClaude())
+        self.assertEqual(claude.to, next_moves.DelegateToClaude())
         entries = next_moves.read_next_moves()
         self.assertEqual(entries, (unit, codex, claude))
         self.assertIn("workers 1: at 1% → codex2", next_moves.render_next_move(codex))
@@ -162,7 +162,7 @@ class NextMovesTests(unittest.TestCase):
         entry = next_moves.add_next_move("workers", 1, "claude4")
         self.assertEqual(next_moves.read_next_moves(), (entry,))
         assert isinstance(entry, next_moves.WorkersMove)
-        self.assertEqual(entry.to, next_moves.WorkersToClaude(next_moves.ClaudeWorkersTarget("claude4")))
+        self.assertEqual(entry.to, next_moves.DelegateToClaude(next_moves.ClaudeWorkersTarget("claude4")))
         self.assertIn("workers 1: at 1% → claude4", next_moves.list_next_moves())
 
     def test_workers_hold_and_wrong_tool_targets_are_refused_without_changing_the_log(self) -> None:
@@ -271,7 +271,7 @@ class NextMovesTests(unittest.TestCase):
             entries: tuple[next_moves.NextMove, ...] = (
                 next_moves.ClaudeGroupMove("unit", "units", percent, 5, "claude2", NOW),
                 next_moves.ClaudeGroupMove("runner", "showrunners", percent, 5, "claude3", NOW),
-                next_moves.WorkersMove("worker", percent, next_moves.WorkersToClaude(), NOW))
+                next_moves.WorkersMove("worker", percent, next_moves.DelegateToClaude(), NOW))
             with self.subTest(percent=percent):
                 for line in next_moves.render_next_moves(entries).splitlines():
                     if line:

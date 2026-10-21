@@ -10,12 +10,12 @@ The usage ledger is one SQLite store, on natedev, of every model request made on
 
 The code that assigns a role records it when it assigns it, in an append-only `<state_dir>/agents.jsonl` on each machine. `state_dir()` is `USAGE_STATE_DIR` when set, else `~/.local/state/usage-model`.
 
-- A line is `{"id", "role", "at"}`, plus `"lens"` when known and `"approximate": true` for a backfilled line. `id` is a Claude session id, a Claude subagent id (`a` + 16 hex), a Codex thread id, or the 8-hex prefix of a worker's transcript uuid.
+- A line is `{"id", "role", "at"}`, plus `"lens"` when known and `"approximate": true` for a backfilled line. `id` is a Claude session id, a Claude subagent id (`a` + 16 hex), a Codex thread id, or the 8-hex prefix of a delegate worker's transcript uuid.
 - `Role = Literal["showrunner", "director", "impl", "test", "fix", "review", "worker", "interactive", "subagent"]`; `Lens = Literal["adversary", "contract", "craft", "ux"]`. The CLI refuses any other value with exit 2.
 - `append(agent_id, role, lens, at, approximate=False)` writes under an exclusive `fcntl.flock` and starts a new line after a truncated tail.
 - `register_default(agent_id, role, at) -> bool` reads the log and appends under the same lock, only when no line already names the agent. A line names it when its id equals `agent_id`, or when its id is 8 hex characters and a prefix of `agent_id`. Concurrent deliveries write one line.
 - `assignments(path) -> RoleLog(assignments, problems)` reads the file as bytes and decodes each line inside its own handler. A malformed or undecodable line is a counted `problems` entry; the reader never raises.
-- `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`. For a full id it merges the history recorded under `agent_id[:8]` when that prefix is a recorded 8-hex id, so a worker reads `interactive` until `agent_bg.sh`'s `worker` line, then `worker`.
+- `role_at(log, agent_id, at) -> Assignment | Unassigned` returns the latest assignment at or before `at`. For a full id it merges the history recorded under `agent_id[:8]` when that prefix is a recorded 8-hex id, so a delegate worker reads `interactive` until `agent_bg.sh`'s `worker` line, then `worker`.
 - CLI: `append`, `register --id --role`, `backfill [--archive] [--live]`, `show [--id]`. A write failure prints one `agents_log: <reason>` stderr line and exits 0.
 
 **Writers.**
@@ -187,7 +187,7 @@ A new metric, dimension or outcome is one registry entry. The report reads `turn
 
 ### Compaction replay: `scripts/usage/compaction_replay.py`
 
-`python3 -m scripts.usage.compaction_replay [--db PATH] [--since DAY] [--until DAY] [--follow-up-prompt TOKENS]` replays stored Codex threads under other compaction limits, to set `UNIT_COMPACT_ABOVE_TOKENS`. Defaults: the collector's store, follow-up prompt 11,000 tokens. `--since` and `--until` are read in the user's zone and select whole threads by their first request.
+`python3 -m scripts.usage.compaction_replay [--db PATH] [--since DAY] [--until DAY] [--follow-up-prompt TOKENS]` replays stored Codex threads under other compaction limits, to set `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`. Defaults: the collector's store, follow-up prompt 11,000 tokens. `--since` and `--until` are read in the user's zone and select whole threads by their first request.
 
 - Covered: `codex` threads with a compaction and a request, every request of which has a weight entry. A thread's requests, in `(at, turn_key)` order, are cut into segments at each compaction; a request at the same instant as a compaction stays in the earlier segment.
 - `RULES`: `LimitRule` at 100,000, 150,000, 200,000 and 250,000; `NeverRule()`; `NewWorkerRule()` (limit 100,000, and a new worker when the kept size is over 90,000).
@@ -273,8 +273,8 @@ The roster carries each worker's role and the context size that decides when a l
 - **Token counts** outside 0..`MAX_SQLITE_INTEGER` (2**63-1) are never measurements: locally the line is skipped and its cursor advances; on the wire one ends the pass as a failed read.
 - **Listing** uses `os.scandir`, because Python 3.13 `Path.glob` hides listing errors. A nested folder that cannot be listed makes the source `partial`.
 - **Codex key collisions**: the key holds the file's last path component only, so a moved file keeps its keys, and two files of one thread with the same name would share them. Codex names files `rollout-<date-time>-<id>.jsonl`.
-- **Hook order**: for a worker the hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix; the prefix merge in `role_at` handles that. `register_default` reads the whole log at every session start. Sessions started before the hook reached a machine's `~/.claude` have no line and are `unassigned`.
-- **Backfill limits**: the worker archive keeps no `mesh_roster.json` or `workers` ledger, so archived runs backfill nothing; older review logs do not name the worker, so their lens stays unrecorded; a review outside a run (`agent_exec.sh`) records nothing.
+- **Hook order**: for a delegate worker the hook writes `interactive` under the full uuid before `agent_bg.sh` writes `worker` under the prefix; the prefix merge in `role_at` handles that. `register_default` reads the whole log at every session start. Sessions started before the hook reached a machine's `~/.claude` have no line and are `unassigned`.
+- **Backfill limits**: the delegate archive keeps no `mesh_roster.json` or `workers` ledger, so archived runs backfill nothing; older review logs do not name the worker, so their lens stays unrecorded; a review outside a run (`agent_exec.sh`) records nothing.
 - **Role coverage is thin for old history.** At first import most Codex requests were `unassigned` (460,601 of about 496,500); Claude about half (191,755 of about 400,000).
 - **Checkpoints** are read on natedev only, so a commit made on the Mac counts once natedev's repository has it. A candidate repository path that no longer exists (a removed worktree; 4 of 18 at first read) is skipped. 6 of 637 real phase ids contain spaces.
 - **Weights above 272K input**: the `gpt-6-sol` and `gpt-6-astra` entries leave out the 2× input and cache and 1.5× output premium, so a weighted figure for such a request is under its cost. The only model left unweighted on natedev's store is `<synthetic>` (458 requests).
@@ -294,7 +294,7 @@ The roster carries each worker's role and the context size that decides when a l
   | `limit 250,000` | 683 | 8,066,593,866 | +39.6% | 111,029 |
   | `never` | 0 | 23,242,221,181 | +302.3% | 210,404 |
 
-  The new-worker row equals `limit 100,000` with 0 new workers: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `UNIT_COMPACT_ABOVE_TOKENS` stays 100000.
+  The new-worker row equals `limit 100,000` with 0 new workers: the fitted slope is negative, so the kept size never passes about 84,000. Stored weighted tokens of the same threads: 5,551,641,863; the replay's base is about 4% over it, because it does not cost the compaction request and does not simulate Codex compacting a full context. `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` stays 100000.
 - **Compaction reread share** by role and model: `gpt-6.1-sol` 4.4% (director) and 6.8% (unassigned); Claude director models 4.9% to 7.0%; `gpt-5.6-sol` 0.4% to 0.5%.
 
 - **Unclassified rows**: a row stored before version 10 whose file is gone (or a Mac file not yet re-read) stays `unclassified`; the report counts such turns in its coverage.
@@ -308,7 +308,7 @@ The roster carries each worker's role and the context size that decides when a l
 - **SQLite, one store on natedev.** Metrics are joins of requests against roles and outcomes, and SQLite ships with Python. The store and the timer are on natedev because the Mac sleeps with its lid closed; a Mac that does not answer is caught up on the next hourly pass.
 - **Roles recorded at assignment.** The sources that knew a role (active markers, `mesh_roster.json`, `/tmp`) are deleted or overwritten when a run ends; inferring later loses it. Storing only id, role, lens and time follows the user's rule of 2026-10-08: store only what a script cannot look up.
 - **A lens recorded, never inferred from a worker name.** Any worker runs any lens, so the name says nothing.
-- **Every Claude session and subagent records itself by hook.** Worker tooling covers only its own agents; the hook makes interactive sessions and subagents rows of their own, so a subagent's usage counts once, under the subagent.
+- **Every Claude session and subagent records itself by hook.** Delegate tooling covers only its own agents; the hook makes interactive sessions and subagents rows of their own, so a subagent's usage counts once, under the subagent.
 - **Claude requests deduplicated by (message id, request id), keeping the largest of each class.** Counting a message once per file or per agent double-counted 0.19% of all tokens; keeping the first copy of a repeated message lost 5.8% of output.
 - **Run-history directors dated from the first event naming them**, not from the run's start: dating from the start backdated a mid-run takeover.
 - **The Mac read on the Mac.** Copying raw logs to natedev would hold transcripts twice, and sending whole files in one transaction hit a 720 s limit twice and kept nothing. Sending run-history files as bytes cost 49.6 MB and 117 s on every pass, so only their kept events cross.

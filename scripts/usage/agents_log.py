@@ -189,7 +189,7 @@ def _review_lens(run: Path, name: str) -> Lens | None:
 
 
 def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
-    # The remote reader loads this module without a worker checkout.
+    # The remote reader loads this module without a delegate checkout.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.direct.worker_state import worker_ledger
 
@@ -318,8 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = registrar.add_argument("--id", required=True)
     _ = registrar.add_argument("--role", choices=ROLES, required=True)
     importer = commands.add_parser("backfill", help="recover surviving run assignments")
-    _ = importer.add_argument("--archive", type=Path, default=None,
-                              help="the run archive; default: its new name, else its former one")
+    _ = importer.add_argument("--archive", type=Path, default=Path.home() / ".local/state/usage-model/delegate-archive")
     _ = importer.add_argument("--live", type=Path, action="append", help="a run root; default: both run-folder names")
     reader = commands.add_parser("show", help="print recorded assignments as a Markdown table")
     _ = reader.add_argument("--id")
@@ -334,8 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
             from scripts.lib import unit_runs
 
-            archive = cast(Path | None, args.archive) or unit_runs.run_archive()
-            added = backfill(archive, *(cast(list[Path] | None, args.live) or unit_runs.run_roots()))
+            added = backfill(cast(Path, args.archive), *(cast(list[Path] | None, args.live) or unit_runs.run_roots()))
             print(f"Backfilled {added} assignments.")
         else:
             _show(assignments(state_dir() / "agents.jsonl"), cast(str | None, args.id))

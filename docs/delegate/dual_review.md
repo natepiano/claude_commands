@@ -261,7 +261,7 @@ final diff only.
 5. If this main pass confirms a substantial, unambiguous spec-defined defect
    while blind reviewers remain active, read each log once, cancel them all, and
    close each one's own pass with
-   `UNIT_TEAM_ROLE=<worker> … finish-pass --status canceled
+   `PLAN_DELEGATE_TEAM_ROLE=<worker> … finish-pass --status canceled
    --orphaned-launcher` per <PassOwnership/>, using each selected review slot
    unless the production doc names a review pool. With a pool, read each
    review's slot from the one line in `${PHASE_DIR}/review_slot_<lens>`;

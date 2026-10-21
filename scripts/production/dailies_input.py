@@ -242,7 +242,7 @@ class UnitRow(NamedTuple):
     # The unit's session name at this moment, read from its live session; empty when none runs.
     # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
-    # Read from the records of the unit's /unit:direct runs.
+    # Read from the records of the unit's /unit:delegate runs.
     run: unit_lookup.UnitState
 
 

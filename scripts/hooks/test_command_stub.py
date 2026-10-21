@@ -1,4 +1,4 @@
-"""The unit command and the hooks that re-read it."""
+"""The old unit command forwards to the renamed workflow."""
 
 from __future__ import annotations
 
@@ -12,6 +12,20 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 class CommandStubTests(unittest.TestCase):
+    def test_delegate_stub_is_a_regular_file(self) -> None:
+        stub = REPO / "commands/unit/delegate.md"
+
+        self.assertTrue(stub.is_file())
+        self.assertFalse(stub.is_symlink())
+
+    def test_delegate_stub_forwards_arguments_to_direct(self) -> None:
+        text = (REPO / "commands/unit/delegate.md").read_text()
+
+        self.assertIn("~/.claude/commands/unit/direct.md", text)
+        self.assertIn("/unit:direct", text)
+        self.assertIn("$ARGUMENTS", text)
+        self.assertLessEqual(len(text.splitlines()), 20)
+
     def test_direct_command_is_a_regular_file_with_direct_usage(self) -> None:
         command = REPO / "commands/unit/direct.md"
 
@@ -26,7 +40,7 @@ class CommandStubTests(unittest.TestCase):
 
     def test_hooks_reread_the_direct_command(self) -> None:
         for name in (
-            "session-start-direct-resume.py",
+            "session-start-delegate-resume.py",
             "stop-direct-continue.py",
         ):
             with self.subTest(name=name):

@@ -282,7 +282,7 @@ class MacRunTests(unittest.TestCase):
         self.environment.update({
             "BUILD_HOLD_DIR": str(self.root / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })

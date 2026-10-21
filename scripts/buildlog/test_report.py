@@ -162,7 +162,7 @@ class ReportSpeedTests(unittest.TestCase):
                         record = call(f"call-{number}", started_at=stamp,
                                       ended_at=(at + timedelta(seconds=1)).isoformat().replace("+00:00", "Z"),
                                       wall_s=1, package=f"package-{number % 20}",
-                                      unit_session=f"session-{number % 20}", worker="writer",
+                                      delegate_session=f"session-{number % 20}", worker="writer",
                                       target="natedev", hold_wait_s=0.4 if number % 100 == 0 else 0,
                                       token_wait_s=0, build_s=1)
                         if number % 100 == 0:
@@ -213,7 +213,7 @@ def local_clock(at: str) -> str:
     return datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone().strftime("%H:%M %Z")
 
 
-def token_holder(record_id: str, acquired_at: str, released_at: str, worker: str, unit_session: str) -> Record:
+def token_holder(record_id: str, acquired_at: str, released_at: str, worker: str, delegate_session: str) -> Record:
     started_at = "2026-10-01T12:00:00Z"
     started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
     acquired = datetime.fromisoformat(acquired_at.replace("Z", "+00:00"))
@@ -223,7 +223,7 @@ def token_holder(record_id: str, acquired_at: str, released_at: str, worker: str
         ended_at=released_at,
         wait_s=int((acquired - started).total_seconds()),
         worker=worker,
-        unit_session=unit_session,
+        delegate_session=delegate_session,
     )
 
 
@@ -672,7 +672,7 @@ class ReportTests(unittest.TestCase):
             with self.subTest(name=name, longest=longest):
                 records = [
                     call("waiter", started_at="2026-10-02T12:00:00Z", token_wait_s=token_wait,
-                         wait_s=600, unit_session="group" if shares_own_turn else None, worker="writer"),
+                         wait_s=600, delegate_session="group" if shares_own_turn else None, worker="writer"),
                     step("memory", mem_wait_s=memory_wait),
                 ]
                 if shares_own_turn:
@@ -686,7 +686,7 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=STAMP, token_wait_s=600, wait_s=600,
-                 unit_session="group", worker="writer"),
+                 delegate_session="group", worker="writer"),
             token_holder("holder", STAMP, "2026-10-02T12:10:00Z", "writer", "group"),
         )
         name = "Build-folder turn, behind its own call"
@@ -789,8 +789,8 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T12:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/alpha", worker="impl", unit_session="unit-a"),
-            token_holder("holder", "2026-10-02T12:00:00Z", "2026-10-02T12:10:00Z", "impl", "unit-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/alpha", worker="impl", delegate_session="delegate-a"),
+            token_holder("holder", "2026-10-02T12:00:00Z", "2026-10-02T12:10:00Z", "impl", "delegate-a"),
         )
 
         rows = self.waiting_rows()
@@ -806,8 +806,8 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T13:08:00Z",
-                 wait_s=420, token_wait_s=420, worktree="/r/beta", worker="impl", unit_session="unit-a"),
-            token_holder("holder", "2026-10-02T13:00:00Z", "2026-10-02T13:07:00Z", "test", "unit-a"),
+                 wait_s=420, token_wait_s=420, worktree="/r/beta", worker="impl", delegate_session="delegate-a"),
+            token_holder("holder", "2026-10-02T13:00:00Z", "2026-10-02T13:07:00Z", "test", "delegate-a"),
         )
 
         rows = self.waiting_rows()
@@ -823,9 +823,9 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T14:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/gamma", worker="impl", unit_session="unit-a"),
-            token_holder("own", "2026-10-02T14:00:00Z", "2026-10-02T14:04:00Z", "impl", "unit-a"),
-            token_holder("other", "2026-10-02T14:04:00Z", "2026-10-02T14:10:00Z", "test", "unit-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/gamma", worker="impl", delegate_session="delegate-a"),
+            token_holder("own", "2026-10-02T14:00:00Z", "2026-10-02T14:04:00Z", "impl", "delegate-a"),
+            token_holder("other", "2026-10-02T14:04:00Z", "2026-10-02T14:10:00Z", "test", "delegate-a"),
         )
 
         rows = self.waiting_rows()
@@ -839,16 +839,16 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T15:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/delta", worker="impl", unit_session="unit-a"),
-            token_holder("own", "2026-10-02T15:00:00Z", "2026-10-02T15:02:00Z", "impl", "unit-a"),
-            token_holder("other", "2026-10-02T15:02:00Z", "2026-10-02T15:05:00Z", "test", "unit-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/delta", worker="impl", delegate_session="delegate-a"),
+            token_holder("own", "2026-10-02T15:00:00Z", "2026-10-02T15:02:00Z", "impl", "delegate-a"),
+            token_holder("other", "2026-10-02T15:02:00Z", "2026-10-02T15:05:00Z", "test", "delegate-a"),
         )
 
         rows = self.waiting_rows()
         self.assertEqual(rows["Build-folder turn, behind another worker"][0], f"8.0 min (delta, {local_clock(at)})")
         self.assertEqual(rows["Build-folder turn, behind its own call"][0], f"2.0 min (delta, {local_clock(at)})")
 
-    def test_build_folder_wait_without_unit_session_counts_as_another_worker(self) -> None:
+    def test_build_folder_wait_without_delegate_session_counts_as_another_worker(self) -> None:
         at = "2026-10-02T16:00:00Z"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
@@ -865,9 +865,9 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T18:06:00Z",
-                 wait_s=300, token_wait_s=300, worktree="/r/eta", worker="impl", unit_session="unit-a"),
+                 wait_s=300, token_wait_s=300, worktree="/r/eta", worker="impl", delegate_session="delegate-a"),
             call("lint", tool="port-lint", started_at=at, ended_at="2026-10-02T18:05:00Z",
-                 worktree="/r/eta", worker="impl", unit_session="unit-a"),
+                 worktree="/r/eta", worker="impl", delegate_session="delegate-a"),
         )
 
         rows = self.waiting_rows()
@@ -875,13 +875,13 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(rows["Build-folder turn, behind another worker"][2], "1 of 1 calls")
         self.assertEqual(rows["Build-folder turn, behind its own call"][2], "0 of 1 calls")
 
-    def test_holder_from_another_unit_session_is_ignored(self) -> None:
+    def test_holder_from_another_delegate_session_is_ignored(self) -> None:
         at = "2026-10-02T17:00:00Z"
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T17:06:00Z",
-                 wait_s=300, token_wait_s=300, worktree="/r/zeta", worker="impl", unit_session="unit-a"),
-            token_holder("unrelated", "2026-10-02T17:00:00Z", "2026-10-02T17:05:00Z", "impl", "unit-b"),
+                 wait_s=300, token_wait_s=300, worktree="/r/zeta", worker="impl", delegate_session="delegate-a"),
+            token_holder("unrelated", "2026-10-02T17:00:00Z", "2026-10-02T17:05:00Z", "impl", "delegate-b"),
         )
 
         rows = self.waiting_rows()
@@ -1750,7 +1750,7 @@ class ReportTests(unittest.TestCase):
                 mac_reason="",
                 mac_s=10.0,
                 build_s=60,
-                unit_session="worker-a",
+                delegate_session="worker-a",
             ),
             call(
                 "mac-only",
@@ -1759,7 +1759,7 @@ class ReportTests(unittest.TestCase):
                 mac_reason="",
                 mac_s=20.0,
                 build_s=600,
-                unit_session="worker-a",
+                delegate_session="worker-a",
             ),
             self.nextest_step(
                 "local-step",
@@ -1902,7 +1902,7 @@ class ReportTests(unittest.TestCase):
                 call_id,
                 started_at=at,
                 ended_at=at,
-                unit_session=worker,
+                delegate_session=worker,
                 session=session,
                 verb=verb,
                 command=command,
@@ -1974,10 +1974,10 @@ class ReportTests(unittest.TestCase):
         ratios, _ = self.per_edit_tables()
         self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
 
-    def test_unit_session_then_session_identifies_independent_workers(self) -> None:
-        self.verify_call(0, "tree-a", worker="unit-a", session="shared")
-        self.verify_call(1, "tree-b", worker="unit-b", session="shared")
-        self.verify_call(2, "tree-b", worker="unit-a", session="shared")
+    def test_delegate_session_then_session_identifies_independent_workers(self) -> None:
+        self.verify_call(0, "tree-a", worker="delegate-a", session="shared")
+        self.verify_call(1, "tree-b", worker="delegate-b", session="shared")
+        self.verify_call(2, "tree-b", worker="delegate-a", session="shared")
         self.verify_call(3, "tree-c", worker=None, session="fallback")
         self.verify_call(4, "tree-d", worker=None, session="fallback")
         ratios, _ = self.per_edit_tables()

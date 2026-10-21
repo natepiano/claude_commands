@@ -10,7 +10,7 @@
 # Callers own scope (--workspace vs -p <pkg>, target selection); this file
 # owns how each tool always runs once scoped.
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
-# judges the result. Worker verdict keys include this policy file.
+# judges the result. Delegate verdict keys include this policy file.
 
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 LINT_INVOKE_SOURCED=1
@@ -279,7 +279,7 @@ run_once() {
     # $RANDOM too: a background sweep's run() shares this shell's $$.
     local log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
-    # prove a worker is alive, so buffering a long build looks like a hang.
+    # prove a delegate is alive, so buffering a long build looks like a hang.
     set +e
     buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
     status=${PIPESTATUS[0]}

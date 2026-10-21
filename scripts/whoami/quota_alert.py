@@ -1198,7 +1198,7 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                     continue
                 stamp = now.isoformat(timespec="seconds")
                 why = f"auto: {entry.id}"
-                if isinstance(entry.to, next_moves.WorkersToClaude):
+                if isinstance(entry.to, next_moves.DelegateToClaude):
                     if isinstance(entry.to.account, next_moves.ClaudeWorkersTarget):
                         try:
                             _ = accounts.claude_workers_account(entry.to.account.label)

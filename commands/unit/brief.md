@@ -33,7 +33,7 @@ the briefing and discussion already described does not stale it.
 
 When an auto control arrives and every covered phase is freshly briefed, that
 control is the batch approval: set the approved `AUTO_WINDOW` and proceed to
-<CoordinatePhaseReservation/> without repeating briefings or asking for
+<CoordinateDelegatedPhaseReservation/> without repeating briefings or asking for
 `proceed`. If any
 covered phase is unbriefed, stale, or has an unresolved decision, route to
 <AutoWindowBatchBriefing/>. Compressed rows and phase titles are not briefings.
@@ -158,7 +158,7 @@ fresh range is authorized by the auto control itself; otherwise route to
 <AutoWindowBatchBriefing>
 Resolve the covered todo phases and apply <BriefingFreshness/> first. If every
 covered phase is fresh, set the approved `AUTO_WINDOW` and continue directly to
-<CoordinatePhaseReservation/> without another briefing or gate.
+<CoordinateDelegatedPhaseReservation/> without another briefing or gate.
 Otherwise run <ReviewPendingAddOns/>, read every Work Order
 now, and emit one complete <CombinedWindowBriefing/> for the covered range;
 surface any pending decision. Ask:

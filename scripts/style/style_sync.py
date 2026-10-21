@@ -119,7 +119,7 @@ def lint(repo: Path, checkout: Path, tip: str) -> int:
         _ = git(checkout, "worktree", "add", "--detach", str(snapshot), tip)
         result = subprocess.run(
             ["bash", str(VERIFY), "lint", "--workspace", "--check", "--no-cache"], cwd=snapshot,
-            env={**os.environ, "UNIT_DETACHED_RUN": "1"},
+            env={**os.environ, "PLAN_DELEGATE_DETACHED_RUN": "1"},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False,
         )
         print(result.stdout, end="")

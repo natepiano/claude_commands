@@ -18,13 +18,11 @@ from typing import NamedTuple, cast
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
 sys.path.insert(0, str(MESSAGE.parent / "herdr"))
-sys.path.insert(0, str(MESSAGE.parents[1]))
 import herdr  # noqa: E402
 import showrunners  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
 from showrunners import canonical_slug  # noqa: E402
-from scripts.lib import unit_runs  # noqa: E402
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 UNIT_MARK = "SHOWRUNNER_UNIT_ID"
@@ -84,7 +82,8 @@ class MarkedProductions(NamedTuple):
 
 def runs_dir() -> Path:
     """Where /unit:direct keeps one record per run. Read at each call, as the recorder reads it."""
-    return unit_runs.history_root() / "runs"
+    root = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    return (Path(root).expanduser() if root else Path.home() / ".local/state/plan-delegate") / "runs"
 
 
 def _events(path: Path) -> list[dict[str, object]]:

@@ -29,7 +29,7 @@ def _plan(workers_block: str) -> str:
         """\
         # Feature
 
-        > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** one line
+        > **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** one line
 
         ## Delegation Context
 

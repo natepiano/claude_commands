@@ -37,7 +37,7 @@ class BoardReclaimTests(unittest.TestCase):
     def board(self, command: str, *arguments: str, epoch: int = 1000) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", str(BOARD), command, str(self.root), *arguments],
-            env={**os.environ, "UNIT_NOW_EPOCH": str(epoch)},
+            env={**os.environ, "PLAN_DELEGATE_NOW_EPOCH": str(epoch)},
             capture_output=True, text=True, check=False, timeout=10,
         )
 
@@ -117,7 +117,7 @@ class BoardReclaimTests(unittest.TestCase):
         waiter = subprocess.Popen(
             ["bash", str(BOARD), "acquire", str(self.root), "next", "cargo",
              "--pid", str(run.pid), "--wait", "600"],
-            env={**os.environ, "UNIT_NOW_EPOCH": "1000"},
+            env={**os.environ, "PLAN_DELEGATE_NOW_EPOCH": "1000"},
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
         run.kill()

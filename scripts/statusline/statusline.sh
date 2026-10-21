@@ -87,7 +87,7 @@ for conf in "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}"/showrunner-*/co
 done
 
 showrunner=
-if [ -n "${SHOWRUNNER_UNIT:-}" ] && [ -z "${UNIT_TEAM_ROLE:-}" ]; then
+if [ -n "${SHOWRUNNER_UNIT:-}" ] && [ -z "${PLAN_DELEGATE_TEAM_ROLE:-}" ]; then
   target=
   { read -r target < "${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}/showrunner-$SHOWRUNNER_UNIT/conf"; } 2>/dev/null
   case $target in

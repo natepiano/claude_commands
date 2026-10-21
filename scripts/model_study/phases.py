@@ -1,10 +1,9 @@
-"""Join director requests to completed unit phases."""
+"""Join director requests to completed plan-delegate phases."""
 
 from __future__ import annotations
 
 import json
 import os
-import sys
 import tempfile
 from collections import defaultdict
 from collections.abc import Sequence
@@ -16,10 +15,7 @@ from compare import OPUS, SONNET, load_turns
 from stats import bootstrap_diff, percentile, request_cost
 from turns import Turn, load_roster, session_ids
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from unit_runs import history_root  # noqa: E402
-
-DEFAULT_RUNS = history_root() / "runs"
+DEFAULT_RUNS = Path.home() / ".local/state/plan-delegate/runs"
 DEFAULT_ROSTER = Path(__file__).with_name("roster.json")
 DEFAULT_REGISTRY = Path.home() / ".claude/sessions"
 
@@ -283,7 +279,7 @@ def work_order_size_text(value: int | None) -> str:
 
 
 def markdown(report: PhaseReport) -> str:
-    lines = ["## Unit phases", "", "### Every completed phase", "",
+    lines = ["## Plan-delegate phases", "", "### Every completed phase", "",
              "| Director | Plan | Phase | Title | Arm | Requests | Director s | Cost USD | Output | Repair rounds | Findings | Abandoned batches | Elapsed s | Work Order words / lines | Requests / 1k words | Seconds / 1k words | Cost / 1k words |",
              "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in report["phases"]:

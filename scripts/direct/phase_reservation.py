@@ -9,7 +9,7 @@ a clear `cargo-berth check` acquires turns it `Active`. Each phase checks as its
 session, `<director session id>.phase-<phase>`, so a phase opened beside another holds its own
 reservation; a path a sibling phase already holds answers `left_unmapped` with the sibling's
 reservation, which is never recorded here (`commands/unit/direct.md` →
-<PhaseReservationContract/>). With one open phase there is no sibling: a `left_unmapped`
+<DelegatedPhaseReservationContract/>). With one open phase there is no sibling: a `left_unmapped`
 reservation that cargo-berth's session map names for the director's bare session id, from an edit
 the director made itself, is that phase's own. Codex seats edit through `apply_patch`, so the Codex
 pre-edit hook (`scripts/hooks/pre-tool-use-berth.py`) runs that check and writes `Active`

@@ -22,7 +22,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
@@ -40,48 +39,11 @@ LIVE_HEARTBEAT_SECS = 600
 DIRECTOR_FILE = "director"
 # Names the run's history, whose first line is the `run_started` event `start-run` writes.
 STATE_FILE = "progress_history_state.json"
-# Every run's durable history: runs/, review_turns/, archives. The former name is read until
-# `unit_runs.py move-history` moves the folder; a test or a scratch run names its own with
-# UNIT_HISTORY_DIR. Both sit under the state folder, read at each call, since a caller may change HOME.
-HISTORY_NAME = "unit-history"
-FORMER_HISTORY_NAME = "plan-delegate"
-# Run folders the usage backfill keeps after their runs end, under the same state folder.
-RUN_ARCHIVE_NAME = "usage-model/unit-archive"
-FORMER_RUN_ARCHIVE_NAME = "usage-model/delegate-archive"
-# The same choice for a script sent over ssh, which cannot import this module: it sets `root`
-# from the argument, else the override, else the new name once it exists, else the former one.
-REMOTE_HISTORY_ROOT = f"""state = Path.home() / '.local/state'
-new, former = state / '{HISTORY_NAME}', state / '{FORMER_HISTORY_NAME}'
-root = Path(sys.argv[1] or os.environ.get('UNIT_HISTORY_DIR')
-            or (former if not new.exists() and former.exists() else new)).expanduser()
-"""
 
 
 def run_roots(override: str | Path | None = None) -> tuple[Path, ...]:
     """The folders that hold run folders, the new name first."""
     return (Path(override),) if override else (RUN_ROOT, FORMER_RUN_ROOT)
-
-
-def history_root() -> Path:
-    """The history folder: the override, else the new name once it exists, else the former one."""
-    configured = os.environ.get("UNIT_HISTORY_DIR")
-    if configured:
-        return Path(configured).expanduser()
-    return history_root_in(state_dir())
-
-
-def state_dir() -> Path:
-    return Path.home() / ".local/state"
-
-
-def history_root_in(state: Path) -> Path:
-    """The history folder inside one state folder, as history_root picks it, for a reader given that folder."""
-    return moved_folder(state / HISTORY_NAME, state / FORMER_HISTORY_NAME)
-
-
-def run_archive() -> Path:
-    """The usage backfill's run archive under its new name once it exists, else the former one."""
-    return moved_folder(state_dir() / RUN_ARCHIVE_NAME, state_dir() / FORMER_RUN_ARCHIVE_NAME)
 
 
 def active_dirs(override: str | Path | None = None) -> tuple[Path, ...]:
@@ -220,48 +182,6 @@ def removal_check(running: Mapping[str, str]) -> int:
     return 1
 
 
-def live_run_folders(now: float) -> list[Path]:
-    """Run folders under either name whose heartbeat moved in the live window."""
-    live: list[Path] = []
-    for root in run_roots():
-        for beat in sorted(root.glob(f"*/{HEARTBEAT}")):
-            try:
-                if now - beat.stat().st_mtime < LIVE_HEARTBEAT_SECS:
-                    live.append(beat.parent)
-            except OSError:
-                continue
-    return live
-
-
-def moved_folder(new: Path, former: Path) -> Path:
-    """The new name once it exists, else the former one while only it exists."""
-    return former if not new.exists() and former.exists() else new
-
-
-def move_history(now: float, state: Path | None = None) -> int:
-    """Move the history folder and the run archive to their new names once, while no unit run writes.
-
-    The usage collector reads the moved files again from the start under their new paths; every
-    history row it writes is keyed by its event, so the second read adds nothing.
-    """
-    state = state or state_dir()
-    names = ((FORMER_HISTORY_NAME, HISTORY_NAME), (FORMER_RUN_ARCHIVE_NAME, RUN_ARCHIVE_NAME))
-    moves = [(state / former, state / new) for former, new in names if (state / former).exists() and not (state / new).exists()]
-    if not moves:
-        print("nothing to move")
-        return 0
-    live = live_run_folders(now)
-    if live:
-        print(f"not moved: {len(live)} unit run(s) are live and write history", file=sys.stderr)
-        for run in live:
-            print(f"  {run}", file=sys.stderr)
-        return 1
-    for former, new in moves:
-        _ = former.rename(new)
-        print(f"moved {former} to {new}")
-    return 0
-
-
 def _held_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="unit_runs.py held", description="Print each run folder a session directs.")
     _ = parser.add_argument("session_id")
@@ -283,14 +203,8 @@ def main(argv: list[str]) -> int:
             print(f"unit_runs: director not recorded in {argv[1]}: {error}", file=sys.stderr)
             return 1
         return 0
-    if argv == ["history-root"]:
-        print(history_root())
-        return 0
-    if argv == ["move-history"]:
-        return move_history(time.time())
     if argv != ["removal-check"]:
-        print("usage: unit_runs.py removal-check | history-root | move-history | record-director <run folder> | held <session id>",
-              file=sys.stderr)
+        print("usage: unit_runs.py removal-check | record-director <run folder> | held <session id>", file=sys.stderr)
         return 2
     if TYPE_CHECKING:
         from ..message.sessions import running_sessions

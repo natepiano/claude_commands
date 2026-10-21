@@ -17,13 +17,13 @@ set -euo pipefail
 SESSION_DIR="${1:?Usage: progress_timer.sh <session_dir> [seconds]}"
 SECONDS_TO_WAIT="${2:-}"
 
-DIRECT_CONF="${HOME}/.claude/config/direct.conf"
+DELEGATE_CONF="${HOME}/.claude/config/delegate.conf"
 INTERVAL_ORIGIN="argument"
 if [[ -z "${SECONDS_TO_WAIT}" ]]; then
-  INTERVAL_ORIGIN="UNIT_PROGRESS_INTERVAL_SECONDS in ${DIRECT_CONF}"
+  INTERVAL_ORIGIN="PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS in ${DELEGATE_CONF}"
   SECONDS_TO_WAIT="$(
-    sed -n 's/^UNIT_PROGRESS_INTERVAL_SECONDS=\([0-9][0-9]*\).*/\1/p' \
-      "${DIRECT_CONF}" 2>/dev/null | head -1
+    sed -n 's/^PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=\([0-9][0-9]*\).*/\1/p' \
+      "${DELEGATE_CONF}" 2>/dev/null | head -1
   )"
 fi
 # No default interval: an unconfigured timer would run at a length nobody chose,
@@ -53,4 +53,4 @@ printf 'deadline_epoch=%s\npid=%s\ninterval_seconds=%s\n' \
   "${DEADLINE}" "$$" "${SECONDS_TO_WAIT}" > "${MARKER}"
 
 sleep "${SECONDS_TO_WAIT}"
-printf 'UNIT_PROGRESS_TICK\n'
+printf 'PLAN_DELEGATE_PROGRESS_TICK\n'

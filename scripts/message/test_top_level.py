@@ -53,7 +53,7 @@ class TopLevelTests(unittest.TestCase):
             "CLAUDE_CODE_SESSION_ID": "current-id", "CODEX_THREAD_ID": "",
             "BUILD_HOLD_DIR": str(self.folder / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.folder / "release"),
-            "ROSTER_RUN_ROOT": str(self.folder / "runs"),
+            "ROSTER_DELEGATE_ROOT": str(self.folder / "delegate"),
             "ROSTER_CODEX_SOCKET": str(self.folder / "no-daemon.sock"),
             "PROCESS_TABLE_PS": f"cat {self.folder / 'ps'}",
         }, clear=True))
@@ -303,7 +303,7 @@ class TopLevelRunningRecordTests(unittest.TestCase):
             "HOME": str(self.folder), "NOTIFIER_SESSIONS_DIR": str(self.directory),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}", "SSH_RECORD": str(self.folder / "ssh.log"),
             "NOTIFIER_STATE_DIR": str(self.folder / "notifier"),
-            "ROSTER_RUN_ROOT": str(self.folder / "runs"),
+            "ROSTER_DELEGATE_ROOT": str(self.folder / "delegate"),
             "ROSTER_CODEX_SOCKET": str(self.folder / "no-daemon.sock"),
         }, clear=True))
         _ = self.enterContext(environment)

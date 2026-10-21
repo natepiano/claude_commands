@@ -107,7 +107,7 @@ class BroadcastTests(unittest.TestCase):
             "PROCESS_TABLE_PS": f"cat {self.root / 'ps'}",
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
-            "ROSTER_RUN_ROOT": str(self.root / "runs"),
+            "ROSTER_DELEGATE_ROOT": str(self.root / "delegate"),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
         }
         self.rows = [

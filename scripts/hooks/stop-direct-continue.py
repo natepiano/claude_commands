@@ -16,7 +16,7 @@ It stays out of the way unless all of these hold:
   * context is at or past the same handoff threshold the PostToolUse hook uses
   * this turn is not already the product of a block (`stop_hook_active`)
   * the agent is the main thread, not a subagent
-  * nothing is in flight that will wake the session by itself -- a live worker
+  * nothing is in flight that will wake the session by itself -- a live delegate
     dispatch, or anything in the payload's `background_tasks`. That wake-up is
     the next request, so compaction gets its chance without a block
 
@@ -47,7 +47,7 @@ from context_usage import (
     pending_background_tasks,
     trigger_tokens,
 )
-from direct_run import active_run, workers_working
+from delegate_run import active_run, delegate_working
 
 REASON = """\
 /unit:direct run active, {tokens:,} / {trigger:,} tokens ({percent}%). Do not end the \
@@ -80,15 +80,15 @@ def main() -> None:
     session_dir = active_run(session_id)
     if session_dir is None:
         return
-    # Parked on a completion waiter: the worker's own notification will supply
+    # Parked on a completion waiter: the delegate's own notification will supply
     # the next request, and compaction fires there. Nothing to force.
-    if workers_working(session_dir):
+    if delegate_working(session_dir):
         return
-    # The same situation, read from the CLI instead of from a worker
+    # The same situation, read from the CLI instead of from a delegate
     # heartbeat: anything in `background_tasks` wakes this session on its own,
     # and that wake-up is the request compaction needs. The heartbeat covers
-    # worker dispatches only, so a run waiting on ordinary Agent-tool
-    # subagents looked idle to `workers_working` and got ordered back to work
+    # delegate dispatches only, so a run waiting on ordinary Agent-tool
+    # subagents looked idle to `delegate_working` and got ordered back to work
     # with nothing to do -- a blocked stop, a restated "still waiting", and no
     # compaction, since the count was nowhere near the trigger.
     if pending_background_tasks(payload):

@@ -620,7 +620,7 @@ class RoleMapTests(unittest.TestCase):
         run = self.home / "scratch-run"
         run.mkdir()
         prompt = run / "prompt.txt"
-        _ = prompt.write_text("Scratch worker task")
+        _ = prompt.write_text("Scratch delegate task")
         output, error = io.StringIO(), io.StringIO()
         with (patch.object(role_map, "ssh_role_map", side_effect=self.remote),
               patch.object(codex_mesh, "_start_server") as start,

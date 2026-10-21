@@ -25,7 +25,6 @@ from typing import IO, Literal, TypedDict, cast
 # Sibling scripts are also executable directly from this directory.
 REPOSITORY = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPOSITORY))
-from scripts.lib import unit_runs
 from scripts.production import review_regime
 from scripts.usage import collect, usage_report, weights
 from scripts.whoami.worker_usage import parse_boundary
@@ -408,7 +407,8 @@ def remote_command(root: str, quality: bool) -> str:
     # Codex usage comes from the store; SSH carries review records and quality events.
     script = '''import json, os, sys
 from pathlib import Path
-''' + unit_runs.REMOTE_HISTORY_ROOT + '''quality = sys.argv[2] == '1'
+root = Path(sys.argv[1] or os.environ.get('PLAN_DELEGATE_HISTORY_DIR', '~/.local/state/plan-delegate')).expanduser()
+quality = sys.argv[2] == '1'
 histories = set()
 def emit(kind, path):
  try:
@@ -505,8 +505,7 @@ def quality_lines(records: Sequence[ReviewRecord], sources: ReportSources) -> li
             if (event.get("event_type") != "finding_opened" or
                     event.get("phase_instance_id") != record.phase_instance_id or event.get("lens") == "ux"):
                 continue
-            # `delegate` is what history written before the rename records for `worker`.
-            if event.get("caught_by") in ("worker", "delegate", "both"):
+            if event.get("caught_by") in ("delegate", "both"):
                 confirmed += 1
             elif event.get("caught_by") == "main":
                 escapes += 1
@@ -678,7 +677,7 @@ def main() -> int:
         parser.error("--since is required unless --shadow is used")
     try:
         configured_root = cast(str | None, args.root)
-        root = Path(configured_root).expanduser() if configured_root else collect.history_root()
+        root = Path(configured_root or os.environ.get("PLAN_DELEGATE_HISTORY_DIR", "~/.local/state/plan-delegate")).expanduser()
         if shadow:
             print(render_shadow(root))
             return 0

@@ -65,7 +65,7 @@ the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
 different file for a checkout's scripts in tests. Installed scripts refuse to
 run with `MAC_TEST_CONFIG` set.
 
-## direct.conf
+## delegate.conf
 
 The `/unit:direct` tuning file: the convergence limits — how many automatic
 fix rounds one phase runs before the gate remarks on how it is going — plus
@@ -83,7 +83,7 @@ hard ceiling (5). The rest bound the other patterns worth reporting:
 agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
-`UNIT_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
+`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
 `<CodexDispatchWait/>` in `commands/unit/direct.md`; Codex requires a positive
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
@@ -92,7 +92,7 @@ someone asks (2026-10-19): no notifier instance or timer sends them.
 the next `findings.py gate` with nothing to restart. The file is authoritative:
 no limit has a compiled default, so a missing key, a non-numeric value, or a
 value below its minimum makes `findings.py` list every problem it found and
-exit 2 before running the command. `UNIT_CONFIG` overrides the path,
+exit 2 before running the command. `PLAN_DELEGATE_CONFIG` overrides the path,
 which is how `test_findings.py` supplies its own limits rather than this
 machine's.
 

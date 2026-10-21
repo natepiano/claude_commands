@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agent_bg.sh — Launch a worker as a NAMED BACKGROUND Claude session and block
+# agent_bg.sh — Launch a delegate as a NAMED BACKGROUND Claude session and block
 # until it finishes, so callers can treat it like any foreground worker.
 #
 # Usage: agent_bg.sh <mesh_name> <working_dir> <prompt_file> <summary_file>
@@ -15,15 +15,15 @@
 #                                 session is registered, for the caller's
 #                                 cleanup -- direct/remove_workers.py reads it
 #
-# Why this exists rather than agent_exec.sh: a worker launched with
+# Why this exists rather than agent_exec.sh: a delegate launched with
 # `claude --print` is INVISIBLE. It holds the ListAgents/SendMessage tools but
 # registers nowhere, so it sees no peers, no peer sees it, and the orchestrator
 # cannot reach it -- verified by running two concurrent print sessions in one
 # directory, each of which reported "no reachable agents" four times while the
 # other was live. `claude --bg` registers the session instead: it appears in
 # ListAgents as a peer, `claude agents --json` lists it, and messages flow in
-# every direction (worker to worker, worker to the main session, and back).
-# That mesh is the whole point -- a worker that finds a blocker can tell the
+# every direction (delegate to delegate, delegate to the main session, and back).
+# That mesh is the whole point -- a delegate that finds a blocker can tell the
 # user's session directly instead of burying it in a summary nobody reads until
 # the phase ends.
 #
@@ -34,7 +34,7 @@
 #
 # The session is deliberately LEFT ALIVE when its turn ends. A message resumes a
 # stopped-turn session from its transcript, so a finished implementer can still
-# answer the tester's question. The caller ends it: a worker through the
+# answer the tester's question. The caller ends it: a delegate worker through the
 # AGENT_BG_LEDGER record and direct/remove_workers.py, a friend through the id
 # in <id_file>.
 
@@ -147,7 +147,7 @@ PY
   fi
   # The transcript index identifies this turn even if it finishes before the
   # first poll. Keep it with the launcher's claim for killed-launch recovery.
-  if [[ -n "${UNIT_RUN_DIR:-}" && -n "${UNIT_TEAM_ROLE:-}" ]]; then
+  if [[ -n "${PLAN_DELEGATE_BOARD_DIR:-}" && -n "${PLAN_DELEGATE_TEAM_ROLE:-}" ]]; then
     FOLLOW_TURN_INDEX="$((before + 1))" "$PY" - "$(dirname "${BASH_SOURCE[0]}")/../direct" <<'PY'
 import fcntl
 import json
@@ -158,8 +158,8 @@ import sys
 sys.path.insert(0, sys.argv[1])
 from worker_state import worker_claim_lock
 
-root = Path(os.environ["UNIT_RUN_DIR"])
-slot = os.environ["UNIT_TEAM_ROLE"]
+root = Path(os.environ["PLAN_DELEGATE_BOARD_DIR"])
+slot = os.environ["PLAN_DELEGATE_TEAM_ROLE"]
 with worker_claim_lock(root):
     path = root / f"impl_claim_{slot}.json"
     try:
@@ -208,10 +208,10 @@ fi
 # `claude --bg` runs the session in a spare process of one long-lived per-user
 # daemon, so the session inherits the environment of whichever launch started
 # the daemon, not this one's: on 2026-10-05 every unit's workers took one unit's
-# cargo token and filed into its session. Hand the worker its worker variables
+# cargo token and filed into its session. Hand the worker its delegate variables
 # through settings, empty when unset (every reader treats empty as unset), and
 # keep them off the launch below so a daemon it starts carries none.
-WORKER_ENV_NAMES=(UNIT_RUN_DIR UNIT_TEAM_ROLE AGENTS_CONFIG_FILE)
+WORKER_ENV_NAMES=(PLAN_DELEGATE_BOARD_DIR PLAN_DELEGATE_TEAM_ROLE AGENTS_CONFIG_FILE)
 worker_settings="$("$PY" -c '
 import json
 import os
@@ -232,8 +232,8 @@ if [[ -n "${EFFORT}" ]]; then
 fi
 
 banner="$(cd "${WORKING_DIR}" \
-            && env -u UNIT_RUN_DIR -u UNIT_TEAM_ROLE -u AGENTS_CONFIG_FILE \
-                   -u UNIT_RESOLVES_ROUND -u AGENT_BG_WORKERS \
+            && env -u PLAN_DELEGATE_BOARD_DIR -u PLAN_DELEGATE_TEAM_ROLE -u AGENTS_CONFIG_FILE \
+                   -u PLAN_DELEGATE_RESOLVES_ROUND -u AGENT_BG_WORKERS \
                    "${CLAUDE_BIN}" "${launch_args[@]}" \
             -- "$(cat "${PROMPT_FILE}")" 2>&1 || true)"
 
@@ -337,7 +337,7 @@ while true; do
 done
 
 refresh_log
-# The worker writes its own summary (its prompt says so) because --bg has no
+# The delegate writes its own summary (its prompt says so) because --bg has no
 # output redirect to capture. Fall back to the visible log so a caller that
 # reads the summary never finds nothing at all.
 if [[ ! -s "${SUMMARY_FILE}" ]]; then

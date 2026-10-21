@@ -37,7 +37,7 @@ missing directory, multiple phase ids, or closeout without `--phases`.
 `/unit:direct` runs closeout mode after the code commit, beside the next
 phase's workers, then makes a plan-doc-only shrink commit. Standalone mode remains
 for legacy accumulated plans and immediately before `/plan:to_as_built`.
-Phase-end order: `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
 This command does not change code and does not commit.
 
@@ -75,7 +75,7 @@ pre-shrink input; forward propagation happened before this command.
 
 **Never renumber, merge, split, delete, or reorder a phase.** This is a statement
 about *this command's* scope, not about whether phase numbers may ever move. They
-may: `~/.claude/docs/direct_plan_format.md` requires bare contiguous integers
+may: `~/.claude/docs/delegate_plan_format.md` requires bare contiguous integers
 and resequences from the edit point on any spine edit. That procedure lives in
 `/plan:to_phased_plan` → `<PhaseNumbering/>`. Shrink rewrites archive prose and
 splices by exact heading match, so a number changing underneath it would break
@@ -120,13 +120,11 @@ start; read that record.
    `no run record`:
 
    ```python
-   import json, os, pathlib, sys
-   sys.path.insert(0, str(pathlib.Path.home() / ".claude/scripts/lib"))
-   from unit_runs import history_root
+   import json, os, pathlib
    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
    markers = [pathlib.Path(f"/tmp/claude/{name}/active/{sid}") for name in ("unit", "delegate")]
    marker = next((path for path in markers if path.is_file()), markers[0])
-   runs = history_root() / "runs"
+   runs = pathlib.Path.home() / ".local/state/plan-delegate/runs"
    active = runs / f"{pathlib.Path(marker.read_text().strip()).name}.jsonl" \
        if sid and marker.is_file() else None
 
@@ -163,7 +161,7 @@ start; read that record.
 
 **Sanity-check whatever came back** before continuing: the path exists and its
 head carries a `## Delegation Context` section. A plan doc that fails this is not
-direct-ready and this command does not apply to it — say so and stop.
+delegate-ready and this command does not apply to it — say so and stop.
 
 **Running mid-run is fine** — shrinking only touches `done` phases, and the
 phase `/unit:direct` is working is `todo`. Under `/unit:direct`, the code
@@ -178,7 +176,7 @@ against pre-shrink text will fail loudly, not silently).
 <Locate>
 Execute `<ResolvePlan/>` to get the plan doc path.
 
-Read `~/.claude/docs/direct_plan_format.md` — the shared contract this command
+Read `~/.claude/docs/delegate_plan_format.md` — the shared contract this command
 rewrites the archive half of.
 
 **Do not read the plan doc.** Reading it is the cost this command exists to
@@ -306,7 +304,7 @@ Each prompt must include:
 
 <KeepDrop>
 The replacement block reads as a record of code that exists. Present tense,
-declarative, no first person, no reference to the plan, the worker, the
+declarative, no first person, no reference to the plan, the delegate, the
 reviewer, or the sequence of attempts.
 
 ```markdown
@@ -379,7 +377,7 @@ would otherwise be re-proposed. Omit if none.>
   incident.
 - **Resolved `**Pending decision:**` blocks** left in a `done` phase — the
   outcome is in the shipped code.
-- Worker/review vocabulary, pass numbers, session references, commit hashes in
+- Delegate/review vocabulary, pass numbers, session references, commit hashes in
   prose (the heading carries the one that matters).
 
 **Calibration:** a shrunk phase typically lands at 10–25% of its original

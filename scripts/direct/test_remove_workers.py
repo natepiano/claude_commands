@@ -53,7 +53,7 @@ class RemoveWorkersTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         base = Path(self.temporary.name)
-        self.root = base / "runs"
+        self.root = base / "delegate"
         (self.root / "active").mkdir(parents=True)
         self.removed = base / "removed"
         self.rows = base / "rows.json"
@@ -140,7 +140,7 @@ class RemoveWorkersTest(unittest.TestCase):
             CLAUDE_CODE_SESSION_ID=caller,
             SHUTDOWN_STATE_DIR=str(self.state_root),
         )
-        command = [sys.executable, str(SCRIPT), "--run-root", str(self.root)]
+        command = [sys.executable, str(SCRIPT), "--delegate-root", str(self.root)]
         for run in [session_dir] if isinstance(session_dir, Path) else session_dir or []:
             command += ["--session-dir", str(run)]
         result = subprocess.run(
@@ -266,7 +266,7 @@ class RemoveWorkersTest(unittest.TestCase):
             os.fspath(SCRIPT),
             "--session-dir",
             os.fspath(own),
-            "--run-root",
+            "--delegate-root",
             os.fspath(self.root),
         ]
         with patch.object(sys, "argv", arguments), \

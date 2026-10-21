@@ -75,7 +75,7 @@ the phase style review report `Off`.
 
 A check gated off inside `verify.sh` prints
 `SKIPPED: <command> — <key>=off in <config path>` and exits 0. When you see that
-line in a worker log, report the check as `Off`, never as passed.
+line in a delegate log, report the check as `Off`, never as passed.
 
 ## Examples
 

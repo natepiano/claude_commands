@@ -7,16 +7,16 @@ ephemeral: write it only under `${SESSION_DIR}`, use it to update remaining Work
 Orders and prepare as-built input, then let `/unit:direct` delete it after the
 shrink. The forward review also checks the plan's sibling `{plan-name}-next.md`
 when present. Never append review prose to either file.
-Phase-end order: `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
 **Read `~/.claude/docs/type_design.md` first and follow it.** Apply its type-name
 and `Option<T>` rules to the temporary retrospective, remaining-phase review, and all
 Work Order revisions. Include its complete contents verbatim in the architect
 subagent prompt so the reviewer receives the same contract as `/unit:direct`.
 
-**Direct-ready plans.** If the plan follows `~/.claude/docs/direct_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/unit:direct <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
+**Delegate-ready plans.** If the plan follows `~/.claude/docs/delegate_plan_format.md` (a `## Delegation Context` section + per-phase `#### Work Order`), this command must keep every remaining phase **dispatch-ready**: learnings are folded *into* the remaining Work Orders (Spec, Files, Acceptance gate, and especially **Constraints from prior phases**), not merely appended as review notes. The test after this command runs: `/unit:direct <plan> phase <next>` can assemble its prompt with zero codebase research. See `<MaintainWorkOrders/>` in Step 5.
 
-**Auto mode.** If `$ARGUMENTS` contains the token `auto` (passed by the `/unit:direct` loop), this command asks the user nothing: significant findings that survive filtering are deferred into the affected phase's Work Order as `**Pending decision:**` blocks (format: `~/.claude/docs/direct_plan_format.md`) instead of being presented. Invocations without `auto` behave exactly as written below.
+**Auto mode.** If `$ARGUMENTS` contains the token `auto` (passed by the `/unit:direct` loop), this command asks the user nothing: significant findings that survive filtering are deferred into the affected phase's Work Order as `**Pending decision:**` blocks (format: `~/.claude/docs/delegate_plan_format.md`) instead of being presented. Invocations without `auto` behave exactly as written below.
 
 ## Step 1: Locate the plan doc
 
@@ -143,7 +143,7 @@ what actually changed — those are the architect's subject. It still reads the
 others for consistency, but it verifies the named ones against real code. An
 unscoped invocation covers every remaining phase as before.
 
-**Dispatch it through the worker launcher, not the Agent tool.** A launcher
+**Dispatch it through the delegate launcher, not the Agent tool.** A launcher
 dispatch writes a status file and streams `[wrapper]` beats with an activity
 digest into the shared heartbeat log, so the orchestrating agent can watch this
 review and narrate it exactly like an implementation or code review. An Agent-tool
@@ -151,7 +151,7 @@ subagent produces no readable liveness signal — its only output is a full
 transcript too large to read — which leaves the user with an unexplained
 multi-minute silence at the same point in every phase.
 
-Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`. In a worker
+Write the prompt to `${SESSION_DIR}/architect_prompt_<phase>.md`. In a delegate
 run, select an open worker per `/unit:direct`'s `<RunPhaseReview/>`, then:
 
 ```
@@ -167,10 +167,10 @@ architect review of the remaining phases against what phase <phase> actually shi
 
 If every open worker is busy, use the same call with `--slot review` in place of
 `--to "<full-worker-name>"`; that worker stays open. Only a phase review outside a
-unit run calls `review.sh` with neither option.
+delegate run calls `review.sh` with neither option.
 
-- `review` is the subtask name; it resolves through `[worker.<family>]` in
-  `~/.claude/config/agents.conf` like every other worker subtask. There is no
+- `review` is the subtask name; it resolves through `[delegate.<family>]` in
+  `~/.claude/config/agents.conf` like every other delegate subtask. There is no
   separate `architect` row: that key named an agent tier rather than a kind of
   work, and every architecture-review pass ever recorded already ran as kind
   `review`. The four subtasks are `impl`, `test`, `fix`, `review`.
@@ -206,7 +206,7 @@ The prompt must include:
      what a user should see or be able to do, and which remaining Work Order
      owns that surface and its acceptance test. If no external surface is
      appropriate, confirm the implementation-only reason.
-  6. (Direct-ready plans only) For each remaining phase, is its `#### Work Order` still self-contained — could a fresh codex session implement it from the named files + Delegation Context alone? Name any Work Order that now needs an added **Constraints from prior phases** fact, a corrected file/line ref, or a changed acceptance gate because of what just shipped.
+  6. (Delegate-ready plans only) For each remaining phase, is its `#### Work Order` still self-contained — could a fresh codex session implement it from the named files + Delegation Context alone? Name any Work Order that now needs an added **Constraints from prior phases** fact, a corrected file/line ref, or a changed acceptance gate because of what just shipped.
   7. Do type names state their semantic role, state, lifetime, or guarantee
      without requiring the reader to inspect callers? Does any remaining phase
      introduce or retain a bare `Option<T>` in a domain-owned type or API where
@@ -216,7 +216,7 @@ The prompt must include:
      make any item inaccurate, redundant, already satisfied, or aimed at the
      wrong target? Quote the current item and propose its exact replacement or
      removal with concrete evidence. Do not propose optional polish.
-  9. (Direct-ready plans only) For each remaining phase, does its **Workers**
+  9. (Delegate-ready plans only) For each remaining phase, does its **Workers**
      still describe a real partition against the code that now exists —
      disjoint owner sets, one owner per hub file, a test lane that exists? Name
      a better opening where one is visible, in the field's own words
@@ -291,7 +291,7 @@ Execute <NextItemAmendments/> before `<MinorFindings/>` or
 `<SignificantFindings/>`.
 
 <MaintainWorkOrders>
-**Direct-ready plans only** (skip for plans not in the format-doc structure).
+**Delegate-ready plans only** (skip for plans not in the format-doc structure).
 Before processing findings, keep the remaining Work Orders dispatch-ready:
 
 **Write boundary:** only remaining `todo` Work Orders may change. The current
@@ -299,7 +299,7 @@ phase is replaced later by shrink; every earlier `done` phase must remain
 byte-identical.
 
 1. **Propagate forward.** Apply the **Propagate-Forward** rule from the format doc
-   (`~/.claude/docs/direct_plan_format.md` → "Forward-propagation") for the facts
+   (`~/.claude/docs/delegate_plan_format.md` → "Forward-propagation") for the facts
    the just-shipped phase produced. This is the single most important maintenance
    step: it is what lets the next `/unit:direct` assemble without research.
 2. **Reassign workers.** For each remaining Work Order that shares files or crates with
@@ -341,7 +341,7 @@ affected Work Order, not a prose review note.
 </MaintainWorkOrders>
 
 <MinorFindings>
-Edit each minor finding straight into the plan — inline amendment to the affected remaining phase or a short note under that phase. No user gate. For a direct-ready plan, "inline amendment" means editing the affected phase's Work Order per `<MaintainWorkOrders/>`.
+Edit each minor finding straight into the plan — inline amendment to the affected remaining phase or a short note under that phase. No user gate. For a delegate-ready plan, "inline amendment" means editing the affected phase's Work Order per `<MaintainWorkOrders/>`.
 </MinorFindings>
 
 <SignificantFindings>

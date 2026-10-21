@@ -44,7 +44,7 @@ class UnitLookupTests(unittest.TestCase):
                             "HOME": str(self.root / "home"),
                             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
                             "NOTIFIER_SESSIONS_DIR": str(self.records),
-                            "UNIT_HISTORY_DIR": str(self.root / "history"),
+                            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
                             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
                             "HERDR_PROC": str(self.root / "proc"),
                             "HERDR_PLATFORM": "linux",

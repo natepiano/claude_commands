@@ -93,7 +93,7 @@ Under ${REVIEW_POSTURE} = **open**: premise-challenges are first-class; this fir
 <LaunchExpertTeam>
 **Goal:** Launch parallel expert agents to analyze the topic from different dimensions.
 
-Launch **3-5 external CLI agents in parallel**, each with a distinct analytical lens, through `~/.claude/scripts/agents/agent_exec.sh` using the `team_review.expert` registry task and `readonly` mode. Readonly mode is the readonly review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+Launch **3-5 external CLI agents in parallel**, each with a distinct analytical lens, through `~/.claude/scripts/agents/agent_exec.sh` using the `team_review.expert` registry task and `readonly` mode. Readonly mode is the delegate-review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
 
 On the first cycle, create an absolute `${SESSION_DIR}` under `/tmp/claude/team_review/<uuid>/`. Set `${WORKING_DIR}` to the project root that contains the reviewed topic, normally the command session's current working directory; never use `~/.claude` unless it is itself the reviewed project. Before any agent launch:
 

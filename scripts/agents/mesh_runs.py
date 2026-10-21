@@ -350,9 +350,9 @@ def command_supervise(args: argparse.Namespace) -> int:
     record = _read_record(record_path)
     environment = dict(os.environ)
     environment.update({
-        "UNIT_DETACHED_RUN": "1",
-        "UNIT_RUN_DIR": record["session_dir"],
-        "UNIT_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
+        "PLAN_DELEGATE_DETACHED_RUN": "1",
+        "PLAN_DELEGATE_BOARD_DIR": record["session_dir"],
+        "PLAN_DELEGATE_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
     })
     log = Path(record["log"])
     marker = log.with_suffix(".scope")

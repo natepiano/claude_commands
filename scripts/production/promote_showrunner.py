@@ -60,7 +60,7 @@ def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def run_marker(session_id: str) -> Path:
-    return unit_runs.marker(session_id, os.environ.get("UNIT_ACTIVE_DIR"))
+    return unit_runs.marker(session_id, os.environ.get("PLAN_DELEGATE_ACTIVE_DIR"))
 
 
 def _unit_row(lines: list[str], unit: str) -> dict[str, str]:
@@ -98,7 +98,7 @@ def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveCl
 def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path) -> None:
     """Refuse a unit with a run open, whose workers end only with the run, or with work uncommitted."""
     if run_marker(claude.session_id).exists():
-        raise Refusal(f"{unit} has a /unit:direct run open, and its workers with it; the run finishes first")
+        raise Refusal(f"{unit} has a /unit:delegate run open, and its workers with it; the run finishes first")
     status = _git(worktree, "status", "--porcelain")
     if status.returncode != 0:
         raise Refusal(f"cannot read {unit}'s worktree {worktree}: {status.stderr.strip()}")

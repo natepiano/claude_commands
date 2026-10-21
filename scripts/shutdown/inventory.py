@@ -297,7 +297,7 @@ def _notifier_state_dir() -> Path:
 
 
 def _run_roots() -> tuple[Path, ...]:
-    return unit_runs.run_roots(os.environ.get("SHUTDOWN_RUN_ROOT"))
+    return unit_runs.run_roots(os.environ.get("SHUTDOWN_DELEGATE_ROOT"))
 
 
 def _session_file(record: sessions.SessionRecord) -> SessionFile:

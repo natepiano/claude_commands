@@ -15,7 +15,7 @@ active, say so in one line and stop.
 point. It defines <ConsiderNextItems/> and <ReviewPendingAddOns/> in full. Never
 work from memory of an earlier read: silence in automatic mode and the
 one-line reporting rule are the parts that drift.
-Phase-end order: `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
+Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
 Everything below is the contract.
 

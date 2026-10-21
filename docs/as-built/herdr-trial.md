@@ -55,7 +55,7 @@ The showrunner's first lookup at 13:24 said "not running", one minute after laun
 | Memory | 46–83 MB per pane, plus a 0.3–5 MB `codex-code-mode` child | shared server per session |
 | State | herdr reads `idle`, `working` and `done` correctly; misses the trust screen | launcher reads turn status |
 | Interrupt | `agent send-keys <name> esc` stopped a turn cleanly | steer/interrupt via the mesh |
-| Daemon | uses the account's managed app-server daemon (`--managed-daemon`); none new started | one app-server per worker session |
+| Daemon | uses the account's managed app-server daemon (`--managed-daemon`); none new started | one app-server per delegate session |
 
 One Codex pane stalled with `Working` and a frozen timer on a one-line task. `trial.py wait` timed out as designed, and `esc` recovered the pane (issue 19). No worker hit a quota limit. Claude 1 used 5% of its 5-hour window across the run.
 
@@ -111,6 +111,6 @@ herdr 0.9.0:
 
 ## Teardown
 
-The trial ended 2026-10-13 15:13 EDT, when the user said they were done and want herdr for every production and standalone session. `trial.py teardown` exited 0. It closed workspaces `w8` and `w9` without sending a key, stopped the herdr server and both systemd units, and removed the scratch tree, `~/.config/herdr/sessions/herdr-trial` and `herdr-devcheck`, and the fake showrunner's notifier and showrunner state. It named five worker mesh servers as `not a managed Codex daemon; retained` and left them running; all five were alive afterwards. `trial.py leftovers` then exited 0. The 20 logged issues are in this document; their archive and the cleanup manifest were deleted.
+The trial ended 2026-10-13 15:13 EDT, when the user said they were done and want herdr for every production and standalone session. `trial.py teardown` exited 0. It closed workspaces `w8` and `w9` without sending a key, stopped the herdr server and both systemd units, and removed the scratch tree, `~/.config/herdr/sessions/herdr-trial` and `herdr-devcheck`, and the fake showrunner's notifier and showrunner state. It named five delegate mesh servers as `not a managed Codex daemon; retained` and left them running; all five were alive afterwards. `trial.py leftovers` then exited 0. The 20 logged issues are in this document; their archive and the cleanup manifest were deleted.
 
 **Retained, by design:** Claude's `hasTrustDialogAccepted` for `repo/`, Codex's `trust_level=trusted` for `repo/`, and the Codex hooks trust in `~/.codex1/config.toml`. They are left for the user to remove.

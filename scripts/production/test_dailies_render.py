@@ -321,7 +321,7 @@ for name in ("first", "second"):
             "BUILD_HOLD_RELEASE_DIR": str(Path(scratch) / "release"),
             "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-state"),
             "NOTIFIER_SESSIONS_DIR": str(Path(scratch) / "sessions"),
-            "UNIT_ACTIVE_DIR": str(Path(scratch) / "active"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(Path(scratch) / "active"),
             "TZ": ZONE, "USER_ZONE": ZONE,
         }):
             record = holder(purpose="the writer's timings")

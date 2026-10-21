@@ -139,7 +139,7 @@ class ReviewPoolTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
+        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.pool = self.root / "state" / "production"
@@ -178,9 +178,9 @@ class ReviewPoolTests(unittest.TestCase):
         for durable in (True, False):
             with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
                 if durable:
-                    _ = os.environ.pop("UNIT_SYNC_WRITES", None)
+                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
                 else:
-                    os.environ["UNIT_SYNC_WRITES"] = "0"
+                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
                 with production.locked() as pool:
                     pool.generation += 1
                     generation = pool.generation

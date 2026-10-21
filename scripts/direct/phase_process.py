@@ -478,9 +478,9 @@ def measure_contract(files: Sequence[tuple[str, bytes]]) -> tuple[ContractFile, 
     direct = contents.get("commands/unit/direct.md", b"").decode("utf-8")
     required = {"commands/unit/direct.md": "per phase"}
     cadence_by_file = {
-        "docs/direct/write_prompt_contract.md": "per dispatch",
-        "docs/direct/dual_review.md": "per dispatch",
-        "docs/direct/final_gate_commit.md": "final gate only",
+        "docs/delegate/write_prompt_contract.md": "per dispatch",
+        "docs/delegate/dual_review.md": "per dispatch",
+        "docs/delegate/final_gate_commit.md": "final gate only",
         "commands/unit/brief.md": "on request",
         "commands/unit/phase_report.md": "on request",
     }
@@ -490,8 +490,8 @@ def measure_contract(files: Sequence[tuple[str, bytes]]) -> tuple[ContractFile, 
         required[name] = cadence_by_file.get(name, "per phase")
     # TagReferenceContract requires the whole tagged contract at its call site.
     # PhaseChecks is a per-phase full read expressed by that table, not a Read sentence.
-    if re.search(r"\| <PhaseChecks/> \| `docs/direct/phase_checks.md`", direct):
-        required["docs/direct/phase_checks.md"] = "per phase"
+    if re.search(r"\| <PhaseChecks/> \| `docs/delegate/phase_checks.md`", direct):
+        required["docs/delegate/phase_checks.md"] = "per phase"
     for name, cadence in tuple(required.items()):
         if name == "commands/unit/direct.md" or cadence not in ("per phase", "per dispatch"):
             continue
@@ -1030,7 +1030,7 @@ def main() -> int:
     window = Window(since if since is not None else end - timedelta(days=14).total_seconds(), end)
     if window.since >= window.until:
         parser.error("--since must be before --until")
-    events, problems = read_events((plan_history.history_root() / "runs").glob("*.jsonl"))
+    events, problems = read_events((Path.home() / ".local/state/plan-delegate/runs").glob("*.jsonl"))
     phases = phase_boundaries(events, window)
     usage_window = Window(min((phase.start for phase in phases), default=window.since), window.until)
     selected_runs = {phase.run for phase in phases}
@@ -1041,7 +1041,7 @@ def main() -> int:
     root = Path(__file__).resolve().parents[2]
     paths = [*sorted((root / "commands/unit").glob("*.md")),
              *sorted((root / "commands/plan").glob("*.md")),
-             *sorted((root / "docs/direct").glob("*.md"))]
+             *sorted((root / "docs/delegate").glob("*.md"))]
     contract = measure_contract([(str(path.relative_to(root)), path.read_bytes()) for path in paths])
     plans = load_plan_histories(events, window)
     detail = cast(str | None, args.detail)

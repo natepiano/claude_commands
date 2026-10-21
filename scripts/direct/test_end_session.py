@@ -1,4 +1,4 @@
-"""Regression tests for the unit run's terminal cleanup."""
+"""Regression tests for the delegate run's terminal cleanup."""
 
 from __future__ import annotations
 
@@ -50,15 +50,15 @@ class EndSessionTests(unittest.TestCase):
         self.runs.mkdir()
 
         scripts = self.root / "scripts"
-        direct_dir = scripts / "direct"
+        delegate = scripts / "direct"
         agents = scripts / "agents"
-        direct_dir.mkdir(parents=True)
+        delegate.mkdir(parents=True)
         agents.mkdir()
         (scripts / "lib").mkdir()
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
-        self.script = direct_dir / "end_session.sh"
+        self.script = delegate / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
-        _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
+        _ = (delegate / "remove_workers.py").write_text("", encoding="utf-8")
         _ = (agents / "codex_mesh.py").write_text("", encoding="utf-8")
 
         python_shim = self.root / ".claude" / "scripts" / "lib" / "py"
@@ -83,8 +83,8 @@ class EndSessionTests(unittest.TestCase):
             "HOME": str(self.root),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "END_SESSION_CALLS": str(self.calls),
-            "UNIT_ACTIVE_DIR": str(self.marker.parent),
-            "UNIT_RUN_ROOT": str(self.runs),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.marker.parent),
+            "PLAN_DELEGATE_RUN_ROOT": str(self.runs),
         })
         return environment
 

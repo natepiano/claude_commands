@@ -1,4 +1,4 @@
-"""Read worker state after converting names from earlier runs."""
+"""Read delegate worker state after converting names from earlier runs."""
 from __future__ import annotations
 
 import fcntl

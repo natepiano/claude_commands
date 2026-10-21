@@ -266,7 +266,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
 | `template-fixes/`, `template-fix-errors.jsonl` | Daily template-fix stamps and errors |
 
 - `config/notify.conf` holds `REVIEW_TIMEOUT_SECONDS=60` and an optional `TEMPLATE_FIX_SESSION`. `review.NOTIFY_CONFIG` is a module constant, and tests patch it.
-- Worker agents are called "workers", not "seats". Worker naming and its migration are in `docs/as-built/long-lived-workers.md` and `docs/accounts.md`, not here.
+- Delegate agents are called "workers", not "seats". Worker naming and its migration are in `docs/as-built/long-lived-workers.md` and `docs/accounts.md`, not here.
 
 ## Invariants
 

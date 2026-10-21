@@ -279,8 +279,8 @@ class MessageTests(unittest.TestCase):
             "CODEX_WINDDOWN_STATE": str(self.root / "prompts"), "LOG": str(self.root / "log"),
             "PROCESS_TABLE_PS": f"cat {self.root / 'ps'}",
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
-            "ROSTER_RUN_ROOT": str(self.root / "runs"),
-            "UNIT_HISTORY_DIR": str(self.root / "history"),
+            "ROSTER_DELEGATE_ROOT": str(self.root / "delegate"),
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
         }
         self.environment.update(fake_unit_host.environment(self.root))
         fake_unit_host.write({**os.environ, **self.environment}, [

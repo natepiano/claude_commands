@@ -33,7 +33,7 @@ if os.environ.get("UNIT_RUN_SSH_FAIL") == "1":
     raise SystemExit(255)
 environment = dict(os.environ)
 environment["HOME"] = os.environ["UNIT_RUN_MAC_HOME"]
-environment["UNIT_HISTORY_DIR"] = os.environ["UNIT_RUN_MAC_HISTORY"]
+environment["PLAN_DELEGATE_HISTORY_DIR"] = os.environ["UNIT_RUN_MAC_HISTORY"]
 environment["XDG_CACHE_HOME"] = str(Path(environment["HOME"]) / ".cache")
 result = subprocess.run(["/bin/bash", "-c", sys.argv[-1]], env=environment,
                         cwd=environment["HOME"], check=False)
@@ -75,7 +75,7 @@ class UnitRunTests(unittest.TestCase):
             "HOME": str(self.home),
             "XDG_CACHE_HOME": str(self.root / "cache"),
             "PATH": str(bin_directory) + os.pathsep + os.environ.get("PATH", ""),
-            "UNIT_HISTORY_DIR": str(self.history),
+            "PLAN_DELEGATE_HISTORY_DIR": str(self.history),
             "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "USAGE_STATE_DIR": str(self.root / "usage"),
             "UNIT_RUN_SSH_LOG": str(self.ssh_log),
@@ -202,7 +202,7 @@ class UnitRunTests(unittest.TestCase):
                           "explicit-run", "natedev", 10)
 
     def test_history_root_defaults_to_the_local_state_directory(self) -> None:
-        _ = self.environment.pop("UNIT_HISTORY_DIR")
+        _ = self.environment.pop("PLAN_DELEGATE_HISTORY_DIR")
         _ = self.record(self.home / ".local/state/plan-delegate", "default-run", str(self.worktree), 10)
         self.assert_match(self.run_script("--no-mac"), "default-run", "natedev", 10)
 

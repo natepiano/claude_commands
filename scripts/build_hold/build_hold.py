@@ -487,10 +487,10 @@ class Busy:
 
 def owning_session() -> OwningSession | NoOwningSession:
     """Find the session that owns this run before using the shell's session id."""
-    run = os.environ.get("UNIT_RUN_DIR", "") or os.environ.get("UNIT_SESSION_DIR", "")
+    run = os.environ.get("PLAN_DELEGATE_BOARD_DIR", "") or os.environ.get("PLAN_DELEGATE_SESSION_DIR", "")
     if run:
         markers: list[Path] = []
-        for active in unit_runs.active_dirs(os.environ.get("UNIT_ACTIVE_DIR")):
+        for active in unit_runs.active_dirs(os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")):
             try:
                 markers.extend(active.iterdir())
             except OSError:

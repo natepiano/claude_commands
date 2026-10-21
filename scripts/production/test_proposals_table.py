@@ -207,8 +207,8 @@ class ProposalsTableTests(unittest.TestCase):
     def test_add_ons_are_found_under_either_run_folder_name(self) -> None:
         plan = self.root / "unit/docs/plans/footers.md"
         _ = self.write("unit-runs/run-new/next_items_pending.md", "- add: New-folder add-on\n")
-        _ = self.write("former-runs/run-old/next_items_pending.md", "- add: Former-folder add-on\n")
-        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "unit-runs", self.root / "former-runs")), \
+        _ = self.write("delegate-runs/run-old/next_items_pending.md", "- add: Former-folder add-on\n")
+        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "unit-runs", self.root / "delegate-runs")), \
                 self.runs_of({plan: [Path("/history/runs/run-new.jsonl"), Path("/history/runs/run-old.jsonl")]}):
             rows = proposals_table.unit_add_on_rows("footer-unit", plan)
         self.assertEqual(sorted(row.proposal for row in rows), ["Former-folder add-on", "New-folder add-on"])

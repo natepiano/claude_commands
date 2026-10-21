@@ -88,12 +88,12 @@ It prints a `# set …` or `# cleared …` line, then `/agent <function>` output
 /agent module_review                      show just module_review's rows
 /agent claude                             every function switches to the claude family
 /agent gpt-6-sol                          every function on gpt-6-sol (codex), efforts kept
-/agent worker gpt-6-sol                 /unit:direct on gpt-6-sol, efforts kept
-/agent worker claude                    /unit:direct switches to the claude family
-/agent direct.review gpt-5.6-sol:max     set agent and effort for one subtask
+/agent delegate gpt-6-sol                 /unit:direct on gpt-6-sol, efforts kept
+/agent delegate claude                    /unit:direct switches to the claude family
+/agent delegate.review gpt-5.6-sol:max     set agent and effort for one subtask
 /agent cli.commit_prep sonnet             set agent, keep the CLI default effort
-/agent worker fast                      every codex worker row on the fast tier
-/agent direct.review inherit            review follows worker's tier again
+/agent delegate fast                      every codex delegate row on the fast tier
+/agent delegate.review inherit            review follows delegate's tier again
 ```
 
 `sonnet` is a claude agent, so that last example edits `[cli.claude]` even while `cli` runs on codex — it reports the row dormant and leaves the live codex row alone. To make it live: `/agent cli claude`.

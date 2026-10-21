@@ -22,7 +22,7 @@ import sys
 from pathlib import Path
 from typing import TypedDict, cast
 
-from direct_run import active_run
+from delegate_run import active_run
 
 
 class SessionStartInput(TypedDict, total=False):
@@ -52,7 +52,7 @@ summary has no reason to preserve -- take it from the handoff doc, not from \
 inference, and do not assume a phase is approved.
 3. Delete the handoff doc once the phase it describes is committed.
 
-Unit session directory: {session_dir}
+Delegate session directory: {session_dir}
 Status on demand (single read, never a wait loop): {session_dir}/heartbeat.log
 
 Then continue the run. Do not stop to announce the compaction, do not ask whether \

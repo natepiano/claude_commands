@@ -76,13 +76,13 @@ class BerthHookTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "CLAUDE_CODE_SESSION_ID": DIRECTOR,
-            "UNIT_ACTIVE_DIR": str(self.root / "unit" / "active"),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "unit" / "active"),
             "FAKE_BERTH_LOG": str(self.root / "berth.log"),
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
         }
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
         # A test run from inside a seat inherits its run; each test names the run it wants.
-        _ = self.environment.pop("UNIT_RUN_DIR", None)
+        _ = self.environment.pop("PLAN_DELEGATE_BOARD_DIR", None)
         self.answer(envelope("clear", acquisition=acquired()))
         _ = self.state(AWAITING)
 
@@ -193,7 +193,7 @@ class BerthHookTests(unittest.TestCase):
 
     def test_a_seat_of_a_side_run_checks_its_own_runs_phase_not_the_markers(self) -> None:
         run = self.side_run()
-        self.environment["UNIT_RUN_DIR"] = str(run)
+        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-7"])
@@ -210,7 +210,7 @@ class BerthHookTests(unittest.TestCase):
 
     def test_a_board_dir_that_is_gone_falls_back_to_the_marker(self) -> None:
         _ = self.side_run()
-        self.environment["UNIT_RUN_DIR"] = str(self.root / "unit" / "ended-run")
+        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(self.root / "unit" / "ended-run")
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-15"])

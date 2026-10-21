@@ -38,7 +38,7 @@ must not drift from it:
   reports. It writes no implementation code.
 - **Worker** — a Codex worker thread the unit director dispatches. Implementation
   workers open once per run, continue across phases and repairs in whatever role
-  is needed, attempt compaction above `UNIT_COMPACT_ABOVE_TOKENS` but
+  is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
   continue after a failed attempt, press on after context overflow with
   `Continue where you stopped.`, open anew only when no open worker can take the
   work, and end at `end_session.sh`. Reviews run on the unit's workers, or on the
@@ -256,7 +256,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `From the user (via the showrunner):`.
 3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
    notice after each final-gate and as-built commit. Timing:
-   `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
+   `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
 
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.

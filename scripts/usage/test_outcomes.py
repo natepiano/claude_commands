@@ -377,7 +377,7 @@ class OutcomeTests(OutcomeFixture):
         passes = self.rows("SELECT * FROM passes ORDER BY started_at")
         self.assertEqual(self.values(passes, "pass_instance_id", "kind", "task", "slot", "fix_pass", "state",
                                      "finished_at", "source_event"), [
-            ("fixture-pass", "review", "direct.review", "test", 0, "passed", "2026-10-10T21:12:00+00:00", "pass-create"),
+            ("fixture-pass", "review", "delegate.review", "test", 0, "passed", "2026-10-10T21:12:00+00:00", "pass-create"),
             ("unfinished-pass", None, None, None, None, "open", None, "pass-open"),
         ])
         self.assertEqual(self.values(self.rows("SELECT * FROM findings ORDER BY opened_at"), "finding_id", "severity",

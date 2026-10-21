@@ -1,11 +1,11 @@
 ---
-description: Compile a design/plan doc into a direct-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:direct can dispatch by assembly with zero research.
+description: Compile a design/plan doc into a delegate-ready phased implementation plan — strip design narrative, bake in the codebase context every phase needs, and front each phase with a self-contained Work Order so /unit:direct can dispatch by assembly with zero research.
 ---
 
 # Phase Plan
 
-**Purpose:** Turn a plan/design doc into a **direct-ready implementation plan**
-(format: `~/.claude/docs/direct_plan_format.md`). After this runs, a compacted
+**Purpose:** Turn a plan/design doc into a **delegate-ready implementation plan**
+(format: `~/.claude/docs/delegate_plan_format.md`). After this runs, a compacted
 orchestrator can hand any phase to `/unit:direct` by copy-and-assemble — the
 expensive codebase research is paid **once**, here, and baked into the doc.
 
@@ -103,21 +103,21 @@ not modified — otherwise the two silently drift while looking in sync. Reducin
 the source doc to a pointer is a **separate, later** action the user takes once
 the compiled plan is good; never do it as part of this run.
 
-Read `~/.claude/docs/direct_plan_format.md` — it is the target format and the
+Read `~/.claude/docs/delegate_plan_format.md` — it is the target format and the
 contract `/unit:direct`, `/plan:phase_review`, and `/plan:to_as_built` all depend on.
 
 Resolve `${PLAN_REPOSITORY_ROOT}` from `${DEST}`'s containing Git repository.
 When `${DEST}` is not in Git, use its parent directory.
 
-**Detect the mode.** The doc is already direct-ready if it has both a
+**Detect the mode.** The doc is already delegate-ready if it has both a
 `## Delegation Context` section and the `Status: IMPLEMENTATION PLAN — phased,
-direct-ready` line.
+delegate-ready` line.
 
-- Not direct-ready → **${MODE} = compile** (the original full compile).
-  State: `Compiling <relative/path> into a direct-ready plan.`
-- Already direct-ready → **${MODE} = reconcile**. The plan is in flight; the job
+- Not delegate-ready → **${MODE} = compile** (the original full compile).
+  State: `Compiling <relative/path> into a delegate-ready plan.`
+- Already delegate-ready → **${MODE} = reconcile**. The plan is in flight; the job
   is to bring uncompiled/edited phases up to standard without disturbing the rest.
-  State: `Reconciling <relative/path> — already direct-ready; compiling uncompiled phases only.`
+  State: `Reconciling <relative/path> — already delegate-ready; compiling uncompiled phases only.`
 
 In **reconcile** mode, also identify the **target phases**: every `todo` phase
 whose body is *not* a well-formed `#### Work Order` (rough narrative, a stub, a
@@ -160,7 +160,7 @@ block — nothing else. The prompt must include:
   5. **Build / Test / Lint** — for Rust, always these `verify.sh` lines with
      the package name filled in (never raw cargo commands — Cargo's default
      target selection compiles a package's examples even under `-p <pkg>`,
-     and the worker must have no flag choices to make):
+     and the delegate must have no flag choices to make):
      Build = `bash ~/.claude/scripts/direct/verify.sh check <pkg>`;
      Test = `bash ~/.claude/scripts/direct/verify.sh test <pkg>`;
      Lint = `bash ~/.claude/scripts/direct/verify.sh lint <pkg>`.
@@ -198,7 +198,7 @@ not codebase searching.
      plan look finished when it is not.
    - **Order phases so every gated phase falls after the work it depends on**,
      and carry the gate onto the phase itself: a phase blocked by `G2` opens with
-     `**Blocked by:** G2 — <the unblocking event>`. A worker reaching that
+     `**Blocked by:** G2 — <the unblocking event>`. A delegate reaching that
      phase must be able to see it cannot start without reading the whole doc.
    - **Do not mark a gated phase ready.** `/unit:direct` runs phases in order;
      a gated phase is a deliberate stop, and the report at STEP 5 should say
@@ -206,7 +206,7 @@ not codebase searching.
    - **`**Scope now:**` sets the working repo** for the early phases. When the
      placement names a worktree, the Delegation Context's paths and `verify.sh`
      package names refer to *that* checkout, not the primary — getting this wrong
-     sends every worker to the wrong tree. Write those paths relative to the
+     sends every delegate to the wrong tree. Write those paths relative to the
      repository, never the worktree's absolute path or its branch: /unit:direct
      reads both from git at dispatch, so a renamed worktree needs no plan edit.
    - **Open questions in the placement become phases or blockers**, never silent
@@ -223,12 +223,12 @@ not codebase searching.
    leaves the tree green. Prefer the smallest set of phases that are each a real
    chunk of work; do not over-split.
 
-   **Right-size each phase — split signals.** A phase must be **worker-sized**:
+   **Right-size each phase — split signals.** A phase must be **delegate-sized**:
    two concurrent workers on disjoint file sets, with no prior context, get the
    tree green in a single pass — one writer where the files cannot split, two
    where they can. Whether the spine is inherited or freshly decomposed,
    test every phase against these signals **before** drafting its Work Order.
-   If any fires, split the phase into worker-sized units — the usual split is
+   If any fires, split the phase into delegate-sized units — the usual split is
    **types → systems/wiring**, or one subsystem per file group. Tests are never
    the split: the `test` worker writes them inside the phase, against the Spec,
    while the writers build.
@@ -267,7 +267,7 @@ not codebase searching.
    - **Goal** — one line, the observable outcome.
    - **Spec** — the implementation detail. Where the source doc has a resolved
      design (concrete types, signatures, constraints), copy it **verbatim** into
-     the Spec. Do NOT compress a settled decision to a summary — the worker
+     the Spec. Do NOT compress a settled decision to a summary — the delegate
      needs the detail to implement without searching.
    - **Files** — the files to create/modify, with line refs the doc already cites.
    - **Workers** — the opening. One line `1 writer + 1 tester` or `2 writers` and
@@ -313,7 +313,7 @@ not codebase searching.
 - Do **not** re-decompose the plan or touch the phase spine — the insert/edit
   already set it — **except** to apply the **Right-size** check (step 1) to the
   remaining `todo` phases. Run that check now: any `todo` phase that trips a split
-  signal is split into worker-sized phases, preserving order and leaving every
+  signal is split into delegate-sized phases, preserving order and leaving every
   `done` phase untouched. Splitting is a spine edit: resequence per
   `<PhaseNumbering/>` — splitting `4` into three makes them `4`, `5`, `6` and
   pushes the old `5..N` down to `7..N+2`, with every reference updated. This is
@@ -325,7 +325,7 @@ not codebase searching.
   **Workers** is not already-complete: add that field from its Files and **Test
   lanes**, and leave every other byte alone.
 - **Forward-propagate.** For each freshly compiled target phase, apply the
-  **Propagate-Forward** rule from the format doc (`~/.claude/docs/direct_plan_format.md`
+  **Propagate-Forward** rule from the format doc (`~/.claude/docs/delegate_plan_format.md`
   → "Forward-propagation"): push the facts it produces into the **Constraints from
   prior phases** of every *later* phase that depends on them. A phase inserted
   after done-`4` becomes the new `5` and pushes the old `5..N` down one; those
@@ -346,13 +346,13 @@ status line, done phases, untouched todo phases, links) exactly as found. Then g
 
 **Compile mode:** rewrite the doc **in place** to the format-doc structure:
 
-1. Title + a one-line `> **Status: IMPLEMENTATION PLAN — phased, direct-ready.**`
+1. Title + a one-line `> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.**`
 1b. Directly under it, the source doc's `As-built disposition:` line, carried
    across verbatim when it has one. `/plan:to_as_built` reads it there at the end
    of the run, so it survives this rewrite rather than going out with the
    stripped narrative. A source doc without one leaves the line absent, which
    that command reads as `create`. Carry its `Issues:` line across the same
-   way (`~/.claude/docs/direct_plan_format.md`).
+   way (`~/.claude/docs/delegate_plan_format.md`).
 2. `## Delegation Context` = ${DELEGATION_CONTEXT}.
 3. `## Phases` — each phase with its `#### Work Order`. Completed phases keep their
    archive form (status `done`, Work Order, Retrospective) below or after the live
@@ -392,7 +392,7 @@ Order before this command returns. Do not copy the parser into this command.
 ```markdown
 | Area | Result |
 | --- | --- |
-| Compiled | <plan path → direct-ready; N phases> |
+| Compiled | <plan path → delegate-ready; N phases> |
 | Live phases | <count of todo phases, with titles> |
 | Workers | <per todo phase: `N: <opening line>`> |
 | Archived | <count of done phases preserved, or None> |
@@ -405,7 +405,7 @@ Order before this command returns. Do not copy the parser into this command.
 ```markdown
 | Area | Result |
 | --- | --- |
-| Mode | Reconcile (already direct-ready) |
+| Mode | Reconcile (already delegate-ready) |
 | Compiled (new) | <target phases brought up to Work Order, with titles> |
 | Workers | <per compiled phase or phase with reassigned workers: `N: <opening line>`> |
 | Propagated | <later phases whose Constraints from prior phases were updated, or None> |
@@ -432,10 +432,10 @@ Then stop. Do not start implementing a phase.
   It also carries **Workers** (format doc rule 7), so the opening is decided here
   and never at launch.
 - Never delete completed-phase history. Strip design *narrative*, not shipped facts.
-- Every phase must be **worker-sized** (Restructure step 1): two workers on
+- Every phase must be **delegate-sized** (Restructure step 1): two workers on
   disjoint files build it green in one pass, one writer where nothing splits.
   Apply the split signals at compile time — an over-size phase is a
-  decomposition miss, not the worker's problem to absorb.
+  decomposition miss, not the delegate's problem to absorb.
 - Reconcile mode is **additive and surgical**: it compiles uncompiled/edited phases
   and propagates their facts forward (format doc → "Forward-propagation"). It never
   re-runs the full Explore sweep and never rewrites a `done` phase or an

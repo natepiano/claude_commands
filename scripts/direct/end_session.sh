@@ -14,16 +14,16 @@
 # Removes every claude worker those runs launched, and any a dead run left
 # alive (remove_workers.py). Also stops each run's codex app-server, if one was
 # started. That server is detached on purpose -- it has to outlive each
-# worker so a peer can still reach a thread between turns -- so the end of
+# delegate so a peer can still reach a thread between turns -- so the end of
 # the run is the only point that knows nobody needs it any more.
 #
 # Deletes each run's verify.sh pass records (verify_cache/); the time they
 # saved is already in ~/.local/state/verify/saved.jsonl.
 #
-# UNIT_RUN_ROOT, set by tests, replaces both run roots for the scan.
+# PLAN_DELEGATE_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
 # Safe to run when no run is active. The rest of the session directory is left
-# alone; heartbeat and worker logs stay readable after the run.
+# alone; heartbeat and delegate logs stay readable after the run.
 
 set -euo pipefail
 
@@ -40,8 +40,8 @@ if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
 fi
 
 # The marker is under unit/, or delegate/ for a run started before the rename.
-if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
-  MARKER="${UNIT_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
+if [[ -n "${PLAN_DELEGATE_ACTIVE_DIR:-}" ]]; then
+  MARKER="${PLAN_DELEGATE_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
 else
   MARKER="/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}"
   if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}" ]]; then
@@ -62,11 +62,11 @@ if [[ -n "${SESSION_DIR}" ]]; then
   RUNS+=("${SESSION_DIR}")
 fi
 HELD_ARGS=(held "${CLAUDE_CODE_SESSION_ID}")
-if [[ -n "${UNIT_RUN_ROOT:-}" ]]; then
-  HELD_ARGS+=(--root "${UNIT_RUN_ROOT}")
+if [[ -n "${PLAN_DELEGATE_RUN_ROOT:-}" ]]; then
+  HELD_ARGS+=(--root "${PLAN_DELEGATE_RUN_ROOT}")
 fi
-if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
-  HELD_ARGS+=(--active "${UNIT_ACTIVE_DIR}")
+if [[ -n "${PLAN_DELEGATE_ACTIVE_DIR:-}" ]]; then
+  HELD_ARGS+=(--active "${PLAN_DELEGATE_ACTIVE_DIR}")
 fi
 HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}" || true)"
 while IFS= read -r run; do

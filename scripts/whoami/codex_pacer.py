@@ -430,7 +430,7 @@ def make_plan(state: State, notes: Sequence[AgentNote], registry: str, now: date
 
 
 def registry_tier() -> str:
-    """The worker rows' stored tier: what the bulk of codex launches carry."""
+    """The delegate rows' stored tier: what the bulk of codex launches carry."""
     section = ""
     try:
         lines = AGENTS_CONF.read_text(encoding="utf-8").splitlines()
@@ -440,7 +440,7 @@ def registry_tier() -> str:
         text = line.split("#", 1)[0].strip()
         if text.startswith("["):
             section = text.strip("[]")
-        elif section == "direct.options" and text.startswith("codex_service_tier="):
+        elif section == "delegate.options" and text.startswith("codex_service_tier="):
             return text.split("=", 1)[1].strip()
     return ""
 

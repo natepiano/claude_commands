@@ -254,7 +254,7 @@ class MoveJournalTests(unittest.TestCase):
         moves.append_move(unrelated)
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=self.common()["at"],
             tool="codex", fallback_at=self.common()["at"], owner="codex1", cause="auto",
-            why="auto: workers-claude", moved=["direct"]))
+            why="auto: workers-claude", moved=["delegate"]))
         evidence = moves.recorded_auto_entries()
         self.assertIsInstance(evidence, moves.RecordedAutoEntries)
         assert isinstance(evidence, moves.RecordedAutoEntries)
@@ -294,7 +294,7 @@ class MoveJournalTests(unittest.TestCase):
         with patch.object(os, "write", wraps=os.write) as write:
             moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=self.common()["at"],
                 tool="codex", fallback_at=self.common()["at"], owner="codex1", cause="auto",
-                why="auto: route", moved=["direct"]))
+                why="auto: route", moved=["delegate"]))
         write.assert_called_once()
         self.assertTrue(cast(bytes, write.call_args.args[1]).endswith(b"\n"))
 
@@ -333,7 +333,7 @@ class MoveJournalTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(json.dumps({"kind": "routed to claude", "at": self.common()["at"],
             "tool": "codex", "fallback_at": self.common()["at"], "owner": "codex1",
-            "cause": "refusal", "moved": ["direct"]}) + "\n")
+            "cause": "refusal", "moved": ["delegate"]}) + "\n")
         rows = moves.read_journal()
         self.assertEqual(len(rows), 1)
         route = rows[0]
@@ -607,10 +607,10 @@ class MoveJournalTests(unittest.TestCase):
         common: dict[str, object] = {"at": "2026-10-13T12:00:00Z", "tool": "codex",
             "fallback_at": "2026-10-13T11:00:00+00:00", "owner": "codex2"}
         variants: list[dict[str, object]] = [
-            {**common, "kind": "routed to claude", "cause": "refusal", "why": "Codex refused work for quota", "moved": ["direct"]},
-            {**common, "kind": "routed back", "restored": ["direct"], "kept": []},
+            {**common, "kind": "routed to claude", "cause": "refusal", "why": "Codex refused work for quota", "moved": ["delegate"]},
+            {**common, "kind": "routed back", "restored": ["delegate"], "kept": []},
             {**common, "kind": "routing not restored", "outcome": "partial",
-             "restored": ["direct"], "kept": [], "failed": ["fix (unreadable)"]},
+             "restored": ["delegate"], "kept": [], "failed": ["fix (unreadable)"]},
         ]
         for entry in variants:
             with self.subTest(kind=entry["kind"]):
@@ -627,7 +627,7 @@ class MoveJournalTests(unittest.TestCase):
     def test_mixed_journal_separates_routing_and_preserves_unresolved_historical_accounts(self) -> None:
         routing: moves.RoutedToClaude = {"kind": "routed to claude", "at": self.common()["at"],
             "tool": "codex", "fallback_at": "2026-10-13T11:00:00Z", "owner": "codex2",
-            "cause": "refusal", "why": "Codex refused work for quota", "moved": ["direct"]}
+            "cause": "refusal", "why": "Codex refused work for quota", "moved": ["delegate"]}
         accounts: list[moves.MoveEntry] = [self.requested(),
             moves.ConfirmedMove(**self.common(), kind="confirmed", home="/temporary/codex2"),
             moves.WaitedMove(**self.common(), kind="waited", window="five_hour", reset="2026-10-13T12:19:00Z"),
@@ -650,12 +650,12 @@ class MoveJournalTests(unittest.TestCase):
     def test_routing_writes_once_per_kind_and_fallback_without_resolving_unknown_owner(self) -> None:
         entry: moves.RoutedToClaude = {"kind": "routed to claude", "at": self.common()["at"],
             "tool": "codex", "fallback_at": "2026-10-13T11:00:00Z", "owner": "unknown",
-            "cause": "credits off", "why": "credits off", "moved": ["direct", "fix"]}
+            "cause": "credits off", "why": "credits off", "moved": ["delegate", "fix"]}
         moves.append_routing(entry)
         moves.append_routing(entry)
         recovery: moves.RoutedBack = {"kind": "routed back", "at": "2026-10-13T13:00:00Z",
             "tool": "codex", "fallback_at": entry["fallback_at"], "owner": "unknown",
-            "restored": ["direct"], "kept": ["fix"]}
+            "restored": ["delegate"], "kept": ["fix"]}
         moves.append_routing(recovery)
         moves.append_routing(recovery)
         self.assertEqual(len(moves.store_file().read_text().splitlines()), 2)

@@ -19,7 +19,7 @@ Every memory (`~/.claude/projects/*/memory/`; the Mac's over `ssh mac` if it ans
 <Scope mode="rust">
 Choose one target with fresh evidence: hana, cargo-liner, bevy_brp, obsidian_knife, nateroids, or showrunner.
 - A project: correctness, performance, tooling, and style rules that cost more than they catch. Leave code style sweeps to its style production.
-- `showrunner`: the showrunner, producer and unit commands under `~/.claude/commands/` with their docs and scripts, against run history (`/history`) and worker progress logs: steps that repeat work, stall, or wait on the user without need.
+- `showrunner`: the showrunner, producer and unit commands under `~/.claude/commands/` with their docs and scripts, against run history (`/history`) and delegate progress logs: steps that repeat work, stall, or wait on the user without need.
 </Scope>
 
 <Scope mode="messages">

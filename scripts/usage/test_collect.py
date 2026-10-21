@@ -166,7 +166,7 @@ class CollectorFixture(unittest.TestCase):
         environment["HOME"] = str(self.root)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PATH"] = f"{self.root / 'bin'}:{environment.get('PATH', '')}"
-        environment["UNIT_HISTORY_DIR"] = (
+        environment["PLAN_DELEGATE_HISTORY_DIR"] = (
             "" if history_override == "empty" else str(self.root / ".local/state/plan-delegate"))
         command = [sys.executable, str(COLLECTOR), "--db", str(db), "--durability", "off",
                    "--machine", machine, "--claude-root", str(self.claude_root),

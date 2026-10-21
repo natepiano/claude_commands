@@ -6,7 +6,7 @@ Read at the point of use from `/unit:direct`. Defines `<PhaseEnd/>` in full.
 `commands/unit/direct.md` and never commits.
 
 Pointing files: `commands/unit/direct.md`, `commands/unit/checkpoint.md`,
-`docs/direct/run_phase_review.md`, `docs/production_format.md`,
+`docs/delegate/run_phase_review.md`, `docs/production_format.md`,
 `commands/unit/add_ons.md`, `commands/plan/shrink.md`, and
 `commands/plan/phase_review.md`.
 

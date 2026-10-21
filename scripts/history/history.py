@@ -48,7 +48,7 @@ __all__ = [
 
 SPINE_VERSION = 1
 
-# Worker pass kinds and activity labels onto the stage vocabulary the spine
+# Delegate pass kinds and activity labels onto the stage vocabulary the spine
 # defines. Any label not listed is `other` rather than being forced into a
 # stage: an unrecognised activity is unclassified data, not a final step.
 PASS_STAGE: dict[str, str] = {
@@ -123,7 +123,7 @@ def _clean_task(task: str) -> str:
     questions and neither could be read off a name. On 2026-08-30 the tier axis
     was removed from the config and the 6141 events carrying a retired name were
     rewritten in place to the kind each had actually run under; the pre-migration
-    logs are at `~/.local/state/unit-history/backup-runs-2026-08-30-four-kinds`.
+    logs are at `~/.local/state/plan-delegate/backup-runs-2026-08-30-four-kinds`.
     Nothing is mapped at read time, so a retired name appearing here again means
     a writer was missed, not a log to translate.
     """
@@ -249,16 +249,6 @@ def _object(text: str) -> dict[str, object] | None:
     if not isinstance(parsed, dict):
         return None
     return cast(dict[str, object], parsed)
-
-
-# Unit runs recorded `plan-delegate` as their skill until the history folder moved to `unit-history`.
-FORMER_SKILLS = {"plan-delegate": "unit-history"}
-
-
-def _skill(event: dict[str, object], default: str) -> str:
-    """The event's skill under its current name, so one skill reads as one across its rename."""
-    skill = _string(event.get("skill"), default)
-    return FORMER_SKILLS.get(skill, skill)
 
 
 def _string(value: object, default: str = "") -> str:
@@ -413,7 +403,7 @@ def _normalize(
         task = _clean_task(_string(event.get("called_task")))
         result = _string(event.get("activity_result"))
     elif event_type == "stage_finished":
-        # The spine's own event, for skills instrumented after /unit:direct. It
+        # The spine's own event, for skills instrumented after delegate. It
         # arrives unvalidated, so every field is coerced the way the branches
         # above build theirs.
         label = _string(event.get("label")).strip().lower()
@@ -434,7 +424,7 @@ def _normalize(
         # stamp files each one a whole duration late in a `--since` window.
         started = _number(event.get("timestamp_epoch")) - float(seconds)
     return StageRow(
-        skill=_skill(event, store_skill),
+        skill=_string(event.get("skill"), store_skill),
         spine=_spine_of(event),
         schema=_integer(event.get("schema_version")),
         run=_string(event.get("run_id")),
@@ -805,7 +795,7 @@ def _cmd_runs(args: argparse.Namespace) -> None:
         _ = started.setdefault(run, _number(event.get("run_started_at"), stamp))
         last[run] = max(last.get(run, 0.0), stamp)
         branch[run] = _string(event.get("branch"), branch.get(run, ""))
-        skill[run] = _skill(event, skill.get(run, store_skill))
+        skill[run] = _string(event.get("skill"), skill.get(run, store_skill))
         if _string(event.get("event_type")) == "run_finished":
             # `delegate_session.jsonl` reuses one run id across sessions, so
             # the longest close is the run rather than the last line written.
@@ -871,7 +861,7 @@ def _cmd_versions(args: argparse.Namespace) -> None:
     events, tally = _events(_skills(args))
     counts: dict[tuple[str, str, str], int] = defaultdict(int)
     for store_skill, event in events:
-        skill = _skill(event, f"{store_skill} (from store)")
+        skill = _string(event.get("skill"), f"{store_skill} (from store)")
         spine = str(_spine_of(event)) if "spine_version" in event else "0 (pre-spine)"
         counts[(skill, spine, str(_integer(event.get("schema_version"))))] += 1
     table = [

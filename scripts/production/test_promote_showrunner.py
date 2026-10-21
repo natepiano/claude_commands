@@ -117,7 +117,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
         self.runs_production, self.pane, self.child_refusal = True, unit_effort.Ready(), ""
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(sessions), "UNIT_ACTIVE_DIR": str(self.root / "active")}))
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(sessions), "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active")}))
         self.assertEqual(accounts.setup("claude2"), [])
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "marked_unit", self.marked_unit),
@@ -207,7 +207,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "demo-unit has no live session under parent": lambda: self.marked.clear(),
             "demo-unit is mid-turn": mid_turn,
             "demo-unit's pane: a form, prompt or menu is open": form,
-            "demo-unit has a /unit:direct run open": run_open,
+            "demo-unit has a /unit:delegate run open": run_open,
             "has uncommitted work; it checkpoints first": lambda: (self.worktree / "draft.py").write_text("x"),
             "child already has a running showrunner (ending demo)": child_taken,
         }

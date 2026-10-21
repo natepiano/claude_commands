@@ -3,7 +3,7 @@
 
 `prepare_session.sh` drops a marker file named for `CLAUDE_CODE_SESSION_ID`
 (verified identical to the `session_id` in every hook payload) holding the
-unit session directory. `end_session.sh` removes it. Anything that needs to
+delegate session directory. `end_session.sh` removes it. Anything that needs to
 know "is this session mid-unit-run" reads the marker.
 
 Markers are in /tmp and a killed run never removes its own, so a run with no
@@ -28,9 +28,9 @@ else:
     import unit_runs
 
 # A test's own marker folder; unset, the marker is under either run-folder name.
-ACTIVE_OVERRIDE = os.environ.get("UNIT_ACTIVE_DIR")
+ACTIVE_OVERRIDE = os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")
 
-# Long enough to span a slow worker build plus the user's time at a gate, short
+# Long enough to span a slow delegate build plus the user's time at a gate, short
 # enough that yesterday's abandoned run cannot block today's turns. It bounds
 # silence, not total run length: a multi-day run stays active as long as it keeps
 # writing.
@@ -64,7 +64,7 @@ def _recently_active(session_dir: Path) -> bool:
 
 
 def active_run(session_id: str) -> Path | None:
-    """The unit session directory for an active run, or None."""
+    """The delegate session directory for an active run, or None."""
     try:
         recorded = marker_path(session_id).read_text(encoding="utf-8").strip()
     except OSError:
@@ -75,10 +75,10 @@ def active_run(session_id: str) -> Path | None:
     return session_dir if _recently_active(session_dir) else None
 
 
-def workers_working(session_dir: Path) -> bool:
-    """True when a worker is mid-dispatch, judged by a moving heartbeat.
+def delegate_working(session_dir: Path) -> bool:
+    """True when a delegate is mid-dispatch, judged by a moving heartbeat.
 
-    An agent parked on a completion waiter has nothing to do until the worker
+    An agent parked on a completion waiter has nothing to do until the delegate
     finishes, and the completion notification re-invokes it anyway -- that
     re-invocation is a new request, so compaction fires there on its own. There
     is nothing to gain by refusing that stop.

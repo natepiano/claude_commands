@@ -148,16 +148,16 @@ class PhaseProcessTests(unittest.TestCase):
         self.assertEqual(turns, (process.UsageTurn(DIRECTOR, 30, 10, 5),))
 
     def test_contract_sums_full_reads_and_separates_final_gate(self) -> None:
-        direct = b"Read `~/.claude/docs/direct/work.md` in full each phase.\nRead `~/.claude/docs/direct/final_gate_commit.md` in full once.\n"
+        direct = b"Read `~/.claude/docs/delegate/work.md` in full each phase.\nRead `~/.claude/docs/delegate/final_gate_commit.md` in full once.\n"
         result = process.measure_contract([("commands/unit/direct.md", direct),
-                                           ("docs/direct/work.md", b"one\ntwo\n"),
-                                           ("docs/direct/final_gate_commit.md", b"end\n"),
-                                           ("docs/direct/unused.md", b"no\n")])
+                                           ("docs/delegate/work.md", b"one\ntwo\n"),
+                                           ("docs/delegate/final_gate_commit.md", b"end\n"),
+                                           ("docs/delegate/unused.md", b"no\n")])
         costs = {row.path: row for row in result}
-        self.assertEqual(costs["docs/direct/work.md"].lines, 2)
-        self.assertEqual(costs["docs/direct/work.md"].bytes, 8)
-        self.assertEqual(costs["docs/direct/final_gate_commit.md"].cadence, "final gate only")
-        self.assertNotIn("docs/direct/unused.md", costs)
+        self.assertEqual(costs["docs/delegate/work.md"].lines, 2)
+        self.assertEqual(costs["docs/delegate/work.md"].bytes, 8)
+        self.assertEqual(costs["docs/delegate/final_gate_commit.md"].cadence, "final gate only")
+        self.assertNotIn("docs/delegate/unused.md", costs)
 
     def test_pipeline_sources_and_commands_do_not_read_body_references(self) -> None:
         text = "# Plan\nProduction: `docs/production.md`\nSource: `docs/plans/header.md`\n## Source\n`docs/plans/design.md` via /plan:to_phased_plan\n`/fixture/issues/proposal.md`\n## Work\n`docs/plans/unrelated.md`\n"
@@ -357,27 +357,27 @@ class PhaseProcessTests(unittest.TestCase):
     def test_contract_follows_command_reads_one_level_and_marks_cadence(self) -> None:
         direct = (b"Read `~/.claude/commands/unit/checkpoint.md` in full each phase.\n"
                   b"Read `~/.claude/commands/unit/add_ons.md` in full each phase.\n"
-                  b"Read `~/.claude/docs/direct/run_phase_review.md` in full each phase.\n"
-                  b"Read `~/.claude/docs/direct/write_prompt_contract.md` in full before dispatch.\n"
-                  b"Read `~/.claude/docs/direct/final_gate_commit.md` in full.\n"
+                  b"Read `~/.claude/docs/delegate/run_phase_review.md` in full each phase.\n"
+                  b"Read `~/.claude/docs/delegate/write_prompt_contract.md` in full before dispatch.\n"
+                  b"Read `~/.claude/docs/delegate/final_gate_commit.md` in full.\n"
                   b"Read `~/.claude/commands/unit/brief.md` in full.\n"
-                  b"| <PhaseChecks/> | `docs/direct/phase_checks.md` | - |\n")
+                  b"| <PhaseChecks/> | `docs/delegate/phase_checks.md` | - |\n")
         review = (b"Read `~/.claude/commands/plan/phase_review.md` in full.\n"
                   b"Read `~/.claude/commands/plan/shrink.md` in full.\n")
-        files = [("commands/unit/direct.md", direct), ("docs/direct/run_phase_review.md", review),
+        files = [("commands/unit/direct.md", direct), ("docs/delegate/run_phase_review.md", review),
                  ("commands/plan/phase_review.md", b"Read `docs/grandchild.md` in full.\n"),
                  ("commands/plan/shrink.md", b"Shrink.\n"), ("commands/unit/checkpoint.md", b"Commit.\n"),
-                 ("commands/unit/add_ons.md", b"Consider.\n"), ("docs/direct/phase_checks.md", b"Check.\n"),
-                 ("docs/direct/write_prompt_contract.md", b"Prompt.\n"),
-                 ("docs/direct/final_gate_commit.md", b"Read `commands/plan/to_as_built.md` in full.\n"),
+                 ("commands/unit/add_ons.md", b"Consider.\n"), ("docs/delegate/phase_checks.md", b"Check.\n"),
+                 ("docs/delegate/write_prompt_contract.md", b"Prompt.\n"),
+                 ("docs/delegate/final_gate_commit.md", b"Read `commands/plan/to_as_built.md` in full.\n"),
                  ("commands/unit/brief.md", b"Brief.\n"), ("docs/grandchild.md", b"No.\n"),
                  ("commands/plan/to_as_built.md", b"Final only.\n")]
         costs = {row.path: row for row in process.measure_contract(files)}
         self.assertEqual(costs["commands/unit/checkpoint.md"].bytes, 8)
         self.assertEqual(costs["commands/unit/add_ons.md"].cadence, "per phase")
         self.assertEqual(costs["commands/plan/shrink.md"].lines, 1)
-        self.assertEqual(costs["docs/direct/phase_checks.md"].cadence, "per phase")
-        self.assertEqual(costs["docs/direct/write_prompt_contract.md"].cadence, "per dispatch")
+        self.assertEqual(costs["docs/delegate/phase_checks.md"].cadence, "per phase")
+        self.assertEqual(costs["docs/delegate/write_prompt_contract.md"].cadence, "per dispatch")
         self.assertEqual(costs["commands/unit/brief.md"].cadence, "on request")
         self.assertNotIn("docs/grandchild.md", costs)
         self.assertNotIn("commands/plan/to_as_built.md", costs)
