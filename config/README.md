@@ -129,6 +129,8 @@ file named.
   `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`.
 - `USER_ZONE` in the environment wins over the file. Tests whose expected
   output is in one zone pin it this way.
+- `/zone <place>` changes it on both machines and tells every session; a bare
+  `/zone` shows it. The status line reads the file in `statusline.sh`.
 
 A production keeps its own `User zone` line in its production doc, and the
 dailies read that. A time stored without an offset keeps the zone it was

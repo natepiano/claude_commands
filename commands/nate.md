@@ -32,7 +32,8 @@ and print its output as is, in a text block. An unknown id prints a short messag
 A delay comes after the template name, in the user's plain words: `in ten minutes`, `in an hour`,
 `at 3pm`, `tomorrow at 9`. No delay: now. Delayed commands go through
 `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send_later.py" (--in <span> | --at <time>) [--run silence] -- <arguments>`,
-with a systemd span (`10min`, `1h`), or `--at "YYYY-MM-DD HH:MM"` in America/New_York from `date`.
+with a systemd span (`10min`, `1h`), or `--at "YYYY-MM-DD HH:MM"` in the user's zone, from
+`TZ=$(python3 ~/.claude/scripts/lib/user_zone.py) date`.
 
 ## adhoc
 
@@ -50,7 +51,7 @@ The send.py arguments:
 ```
 
 Now: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py" <arguments>`. Report the
-result in one line; a delayed one names the send time in EDT.
+result in one line; a delayed one names the send time in the user's zone, with its label.
 
 The user receives:
 
@@ -76,4 +77,5 @@ pushes always go through. The delay says when silence starts. Act on the instruc
   push; their next prompt there ends it, with one push. A silence set by hand never ends this way.
 
 Now: `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/silence.py" <subcommand>`. Delayed:
-send_later.py with `--run silence -- <subcommand>`. Report one line with the start and end in EDT.
+send_later.py with `--run silence -- <subcommand>`. Report one line with the start and end in the
+user's zone, with its label.

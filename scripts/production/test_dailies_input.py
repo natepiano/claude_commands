@@ -1570,7 +1570,8 @@ class DailiesInputTests(unittest.TestCase):
         # The report zone is Pacific; 20:55 EDT is 17:55 there, still ahead of 17:00.
         for stated, shown in (("ETA 20:55 EDT", "17:55"), ("Phase ETA: 18:10 PDT", "18:10"),
                               ("ETA 01:30 UTC", "18:30"), ("ETA 20:55 ET (range 20:40-21:10)", "17:55"),
-                              ("ETA 17:40 XYZ", "17:40"), ("ETA 02:10+1 EDT", "23:10")):
+                              ("ETA 17:40 XYZ", "17:40"), ("ETA 02:10+1 EDT", "23:10"),
+                              ("ETA 20:55 AST", "17:55"), ("ETA 21:55 ADT", "17:55")):
             with self.subTest(stated=stated):
                 self.status_lines(f"== {ALPHA}", "● Checking panel labels", stated)
                 self.judgment_file(alpha={"eta": {"percent": 60}})
