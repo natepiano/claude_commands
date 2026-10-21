@@ -63,7 +63,7 @@ class UserActionTests(unittest.TestCase):
 
     def test_messages_without_session_share_the_explicit_absence_state(self) -> None:
         entry = push_texts.PushText("test", "script", "note", "Done", push_texts.NoActionNeeded(),
-                                   "The check passed.", (push_texts.PushExample("typical", {}),))
+                                   "The check passed.", (push_texts.PushExample("typical", {}),), purpose="Test.")
         rendered = push_texts.render_entry(entry, {})
         draft = review.Draft("script", "0", rendered.title, rendered.action, rendered.body, False)
         parsed = pushover.parse(["--no-action", rendered.title, rendered.body])
@@ -121,7 +121,7 @@ class PushoverTests(unittest.TestCase):
     def test_catalog_session_reaches_the_post_and_review_record(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
             push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
-            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+            (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
         with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()) as output:
             code, form = self.run_send(["--text-id", "test"])
         self.assertEqual(code, 0)
@@ -138,7 +138,7 @@ class PushoverTests(unittest.TestCase):
         entry = push_texts.PushText("test", "{sender}", "decision", "{sender}: {session} is blocked",
             push_texts.ActionTemplate("stop {session}"), "Reason: {why}. Next: {next}.",
             (push_texts.PushExample("typical", {"sender": "x", "session": "y", "why": "z", "next": "w"}),),
-            session=push_texts.SessionTemplate("{session}"))
+            purpose="Test.", session=push_texts.SessionTemplate("{session}"))
         pushover.LOG_FILE.unlink()
         with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()):
             code, form = self.run_send(["--text-id", "test", "--value", "sender=cargo-liner-unit", "--value", "session=types-unit",
