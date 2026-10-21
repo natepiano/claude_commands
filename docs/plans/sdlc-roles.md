@@ -80,41 +80,30 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:** The tool follows Python output references in lexical scope only. It does not follow helper call arguments into parameters; the report header says so. It does not count shell `cat >&2 <<EOF` stderr heredocs. The term `change` also means menu actions in some files; `other_meaning_files` excludes those files.
 
-### Phase 2 — The design doc recommends who owns each duty and what each thing is called, split into steps  · status: todo
-**Depends on:** Phase 1
+### Phase 2 — The design doc recommends who owns each duty and what each thing is called, split into steps  · status: done
 
-#### Work Order
-
-**Goal:** the design doc proposes candidate changes for each `conflict`, `duplicate` and `no owner` duty and each term with other names, recommends the best, and splits them into small steps, each with the measure it moves.
-
-**Spec:**
-- Section **Candidates.** At least two candidates for each of: where duties are written down, which role owns each conflicting or ownerless duty, and how names stay one per thing. Seeds, not limits:
-  - **One duty per place:** each duty is stated once, in its owner's command file, and other files link to it; **Words** in `docs/production_format.md` defines each role by its duties in one line.
-  - **One term list:** one file holds the only definition of each term, and every other file links to it; `role_terms.toml` is made from that file, or is that file.
-  - **A name check in the merge gate:** `roles_audit.py check` fails when a live file uses an other name the term list marks `retired`.
-  - **Renames by kind:** retire `seat` for worker, `trunk` for merge branch and the `/unit:delegate` alias, each with a list of the files it changes.
-- Every candidate keeps the rules the user set: duty and name changes are questions (Decisions); a flat organization with sdlc, the chief designer and the chief reviewer as top-level peers (production doc, Production rules); the three gods and the decision economy (`decision_criteria.md`); the scope lines beside hierarchies-unit, guilds-unit, phases-unit and fix-rounds-unit. A candidate that changes the structure names hierarchies-unit as its owner and goes there.
-- Section **Comparison.** One table: each candidate scored on each Phase 1 measure (expected direction and size, with the reason) and each rule (kept or broken). A candidate that breaks a user rule is out.
-- Section **Recommendation.** The best set of candidates and why, in at most ten lines.
-- Section **Steps.** The change from today to the recommendation as numbered steps. Each step: what changes (files, duties and names), the measure it should move and by how much, how to undo it, and that it needs the user. Step 1 is the one with the largest expected effect per unit of work.
-- Before the gate, the unit director runs `/adversarial` on the recommendation against the runner-up and `/astra_review` on the doc, and folds their findings into the doc.
+#### As-built
+- **Candidates** holds P-A/P-B (where duties are written), O20/O22/O23/O32 (owners of conflicting or ownerless duties), T-A/T-B (where definitions live), N-A/N-B (scoped names or documented aliases) and G-A/G-B (merge-gate check for retired uses or a periodic review). **Comparison** scores each one on each measure and user rule in common words.
+- **Recommendation** picks N-A with G-A to stop drift. P-A and T-A win by a small margin; on reading they are near-ties. It keeps the any-time, stop-at-once rename and corrects PF.
+- **Steps** holds three phase-ready steps: 1 retires singular and plural worker-seat prose with its check (19 measured files plus 4 test files, expected reduction n=66, n=18 kept); 2 names the coordinator by its role; 3 corrects current command references and keeps compatibility. **Later work** holds the other candidates.
+- The duty matrix adds D53–D55 and corrects D17 and D26. The term table corrects the lease and gate meanings. Q9 asks about the phase-boundary rename alternative.
 
 **Files:**
-- `docs/plans/sdlc-roles-design.md` — new sections above
+- `docs/plans/sdlc-roles-design.md` — duty matrix (D01–D55), term table, baseline, friction, Q1–Q9, Candidates, Comparison, Recommendation, Steps, Later work and Next steps.
 
-**Workers:** `1 writer + 1 tester` — nothing splits: one doc. `impl` takes it.
-- `impl` — `docs/plans/sdlc-roles-design.md`
-- `test` — opens as impl — re-runs `roles_audit.py baseline` and checks each number the doc cites against it, and each Steps file list against the files the measure names; it writes no doc text
+**Binds later work:**
+- Step 1 is the first candidate for an approved step. Only a numbered phase-ready step becomes a build Work Order; a Later work item needs exact files, dependencies and before/target counts first.
+- Step 1's build phase first replays the plural-aware check over the commits after the seat retirement, before any rename. If the replay reverses the case for G-A, the phase stops and asks again.
+- Plural matching and per-file kept contexts are new code. Test files change but stay outside the count. The `direct.md` edit goes to phases-unit.
 
-**Constraints from prior phases:**
-- The duty matrix (D01–D52), the term table, the baseline, the friction (18 items) and the questions Q1–Q8 are in the design doc. The questions went to the showrunner on 2026-10-20 17:50 EDT. Do not wait for the answers: write each answer that has arrived into the doc, and mark each candidate that depends on an open question with its Q number.
-- The message log has no sender role, recipient role or request intent. `roles_audit.py baseline` prints sent contacts per recipient with intent `not recorded`. No candidate is scored on wrong-party asks: score it on sent contacts, or say that it needs role fields in message records first.
-- `roles_audit.py` counts Python names in their lexical scope only and does not follow helper call arguments; it does not count shell `cat >&2 <<EOF` stderr heredocs. Shell and Python counts are lower bounds; say so beside any number taken from them.
-- Run the measure with `~/.claude/scripts/lib/py scripts/production/roles_audit.py baseline` from the worktree root.
-- Phase 1 read hierarchies-unit's **Map** from its uncommitted draft. The committed Map is `git -C /home/natepiano/worktrees/claude-build-followups-hierarchies show d0b07aec:docs/plans/build-followups-hierarchies-design.md`, section **Map** (also on main as merge 83a0ad28). Check every duty matrix row that cites the Map against it and correct the row first. A later Map change arrives as a new pointer from the showrunner.
-- fix-rounds-unit checked the repair-round rows against `docs/production_format.md` <ProductionUnit/> item 7 (2026-10-20). Fold in before the new sections: D26's primary is "Top-level showrunner for the early landing call; Unit director when another unit waits on the phase". Add three rows, owner Unit director, source PF item 7: "A fix that fails twice" (find the cause, write it in the attempts log, then one pass with a new approach); "One batch per check" (each live check or shot set after a fix covers every changed view, and all its findings go to the next round together; also direct.md <UXReview/>, <FixDispatch/>); "Own change only" (the unit director sends a defect from before the phase to the showrunner, and the showrunner routes it to the owning unit). Rule changes stay with fix-rounds-unit.
+**Gotchas:**
+- `roles_audit.py` `name_pattern` matches the singular form only. The audit skips `test_` files, but tests pin user-visible text.
+- `banned_words_lib.py --diff` waits on stdin unless run with `</dev/null`.
 
-**Acceptance gate:** the doc has the four sections; each candidate has a score on every measure and rule; each step names its measure, its size and how to undo it; the adversarial and astra findings are folded in. At phase end the unit director sends the showrunner the Recommendation and Step 1 as one question for the user, with the answers it can build and the one it recommends.
+**Ruled out:**
+- O23-B (rename only at a phase boundary): it reverses the user's any-time rename rule unless Q9 changes it.
+- Claims of fewer wrong-party asks: message records have no sender or recipient roles.
+- D16 as a duplicate duty: it has one owner.
 
 ### Phase 3 — Build the first approved step  · status: todo
 **Depends on:** Phase 2, and the user's approval of Step 1
@@ -135,7 +124,12 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Workers:** filled from the approved step.
 
-**Constraints from prior phases:** the Steps section and the user's answer.
+**Constraints from prior phases:** the Steps section and the user's answer, plus these facts from Phase 2:
+- Step 1 (as committed in e02e6370) covers 19 measured files plus 4 test files that assert the changed text (`scripts/shutdown/test_restart.py`, `scripts/production/test_rename_unit.py`, `scripts/agents/test_mesh_runs.py`, `scripts/production/test_retire_unit.py`). The expected reduction is n=66 (singular and plural), with n=18 kept uses; re-run the classification before dispatch.
+- The match becomes plural-aware through explicit inflected forms in `role_terms.toml`; `roles_audit.py` today matches the singular only (`name_pattern`) and masks kept strings globally (`without_paths`), so per-file kept contexts are new code.
+- The phase's first task, before any rename, replays a plural-aware check prototype over `4ddd7b52..HEAD` (n=21 commits add the word after its retirement) and counts real flags against false failures and run time. If that reverses the case for the check, the phase stops and asks again through the showrunner.
+- The check runs as a test that `merge_gate --tests-only` discovers. A source-only scan of all n=546 files and n=36 terms took 10.5–10.8 s at load 50–54 on 32 cores (2026-10-20).
+- Memory prose that uses the retired word is director-owned cleanup with no count credit; quoted command output stays as recorded.
 
 **Acceptance gate:** the gates in Delegation Context green; the change is live on main per the production's rule for `~/.claude`; the Step log has the before measure, the command and its file set or window.
 

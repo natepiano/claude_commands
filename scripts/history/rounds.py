@@ -29,7 +29,7 @@ GATE_WORDS = ("test", "tests", "lint", "clippy", "basedpyright", "type check", "
 # Merge work includes conflict resolution and moving a change between branches.
 MERGE_WORDS = ("merge", "conflict", "port", "rebase")
 # These completed activities can cause a live repair for the next 30 minutes.
-LIVE_WORDS = ("live", "shot", "smoke")
+LIVE_WORDS = ("live", "shot", "smoke", "ux review")
 # Merge rounds more than one day apart belong to different merges.
 MERGE_SEPARATION_SECONDS = 24 * 3600
 CAUSES = ("review-ux", "review-code", "gate", "merge", "live", "other")
@@ -139,13 +139,13 @@ def _has_words(text: str, words: tuple[str, ...]) -> bool:
 
 
 def _rounds(events: list[dict[str, object]], passes: list[RepairPass]) -> list[Round]:
-    batches: dict[int, list[dict[str, object]]] = defaultdict(list)
+    batches: list[dict[str, object]] = []
     ux_findings: set[str] = set()
     live_finishes: list[float] = []
     for event in events:
         kind = _string(event.get("event_type"))
         if kind == "finding_batch_dispatched":
-            batches[_integer(event.get("round"))].append(event)
+            batches.append(event)
         elif kind == "finding_opened" and any("ux" in lens.lower() for lens in _strings(event.get("lens"))):
             ux_findings.add(_string(event.get("finding_id")))
         elif kind == "activity_finished" and _has_words(
@@ -165,12 +165,23 @@ def _rounds(events: list[dict[str, object]], passes: list[RepairPass]) -> list[R
         if repair["finished_at"]:
             open_until = max(open_until, repair["finished_at"])
 
+    group_batches: dict[int, list[dict[str, object]]] = defaultdict(list)
+    unmatched_batches: list[dict[str, object]] = []
+    # Each dispatch belongs to the first eligible pass, even within an open group.
+    for batch in sorted(batches, key=_stamp):
+        number = _integer(batch.get("round"))
+        dispatched = _stamp(batch)
+        for index, group in enumerate(groups):
+            if any(repair["fix_pass"] == number and repair["started_at"] >= dispatched for repair in group):
+                group_batches[index].append(batch)
+                break
+        else:
+            unmatched_batches.append(batch)
+
     result: list[Round] = []
-    matched: set[int] = set()
-    for group in groups:
+    for index, group in enumerate(groups):
+        ledger = group_batches[index]
         numbers = sorted({repair["fix_pass"] for repair in group})
-        ledger = [batch for number in numbers for batch in batches.get(number, [])]
-        matched.update(number for number in numbers if number in batches)
         covered = sorted({finding for batch in ledger for finding in _strings(batch.get("covered"))})
         activities = [repair["activity"] for repair in group]
         text = " ".join(activities)
@@ -192,14 +203,12 @@ def _rounds(events: list[dict[str, object]], passes: list[RepairPass]) -> list[R
             passes=len(group), fix_passes=numbers, activities=activities, covered=covered,
         ))
     # A recorded dispatch is work even when its worker events are absent.
-    for number, ledger in batches.items():
-        if number in matched:
-            continue
-        covered = sorted({finding for batch in ledger for finding in _strings(batch.get("covered"))})
+    for batch in unmatched_batches:
+        covered = sorted(set(_strings(batch.get("covered"))))
         result.append(Round(
-            round=0, started_at=min(_stamp(batch) for batch in ledger), finished_at=0.0,
+            round=0, started_at=_stamp(batch), finished_at=0.0,
             cause="review-ux" if ux_findings.intersection(covered) else "review-code",
-            fix_seconds=0.0, passes=0, fix_passes=[number], activities=[], covered=covered,
+            fix_seconds=0.0, passes=0, fix_passes=[_integer(batch.get("round"))], activities=[], covered=covered,
         ))
     result.sort(key=lambda repair: repair["started_at"])
     for number, repair in enumerate(result, 1):
