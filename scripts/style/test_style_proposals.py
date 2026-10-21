@@ -250,6 +250,19 @@ class StyleProposalsTests(unittest.TestCase):
             with closing(sqlite3.connect(ledger.database)) as connection:
                 self.assertEqual(connection.execute("SELECT verdict_detail FROM judgments").fetchall(), [("Keep these names",)])
 
+    def test_decline_and_its_stored_answer_record_the_user_actor(self) -> None:
+        with self.ledger() as ledger:
+            first = self.hold(ledger)
+            issue = self.file(ledger)[0]
+            style_proposals.decline(ledger, issue, "Keep these names")
+            self.assertEqual(ledger.named_held((first.finding_id,))[0].waive_actor, style_ledger.WaiveByPerson("user"))
+            later = self.hold(ledger, line=2)
+            self.assertEqual(self.file(ledger), ())
+            self.assertEqual(ledger.named_held((later.finding_id,))[0].waive_actor, style_ledger.WaiveByPerson("user"))
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                self.assertEqual(connection.execute("SELECT waive_provenance,waived_by FROM held_findings").fetchall(),
+                                 [("person", "user"), ("person", "user")])
+
     def test_file_prints_the_findings_that_a_declined_decision_waives(self) -> None:
         with self.ledger() as ledger:
             _ = self.hold(ledger)
@@ -635,7 +648,7 @@ class StyleProposalsTests(unittest.TestCase):
             _ = ledger.ticket_merge("names-unit-1")
             style_proposals.complete(ledger)
             self.assertEqual(frontmatter(issue)["status"], ["open"])
-            _ = ledger.decline_findings((second.finding_id,), "Keep the second")
+            _ = ledger.decline_findings((second.finding_id,), "Keep the second", style_ledger.WaiveByPerson("user"))
             style_proposals.complete(ledger)
             self.assertEqual(frontmatter(issue)["status"], ["closed"])
             self.assertIn("names-unit-1", frontmatter(issue)["reason"][0])
@@ -693,7 +706,7 @@ class StyleProposalsTests(unittest.TestCase):
                           input_scope=style_ledger.DeclaredInputScope.RULE)
             issue = self.file(ledger)[0]
             self.issue_command("approve", str(issue), "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
-            _ = ledger.decline_findings((finding.finding_id,), f"{finding.path} is not in synced commit")
+            _ = ledger.decline_findings((finding.finding_id,), f"{finding.path} is not in synced commit", style_ledger.WaiveByLedger())
             _ = self.git("rm", "-q", finding.path)
             _ = self.git("commit", "-qm", "Remove the file")
             self.tip = self.git("rev-parse", "HEAD")
@@ -843,7 +856,7 @@ class StyleProposalsTests(unittest.TestCase):
             first, second = self.hold(ledger), self.hold(ledger, line=2)
             issue = self.approved_decision(ledger, first, second)
             self.built_before_the_check(ledger, first)
-            _ = ledger.decline_findings((second.finding_id,), "No")
+            _ = ledger.decline_findings((second.finding_id,), "No", style_ledger.WaiveByPerson("user"))
             self.issue_command("close", str(issue), "--reason", "done by hand")
             later = self.hold(ledger, line=3)
             self.assertEqual(self.file(ledger), (issue,))
@@ -2092,8 +2105,8 @@ class StyleProposalsTests(unittest.TestCase):
     def test_decline_waits_for_both_findings_then_waives_the_same_cell_with_words(self) -> None:
         with self.ledger() as ledger:
             first, second = self.hold(ledger), self.hold(ledger, line=2)
-            self.assertIsInstance(ledger.decline_findings((first.finding_id,), "Keep names")[first.finding_id], style_ledger.CellStillHeld)
-            result = ledger.decline_findings((second.finding_id,), "Keep names")[second.finding_id]
+            self.assertIsInstance(ledger.decline_findings((first.finding_id,), "Keep names", style_ledger.WaiveByPerson("user"))[first.finding_id], style_ledger.CellStillHeld)
+            result = ledger.decline_findings((second.finding_id,), "Keep names", style_ledger.WaiveByPerson("user"))[second.finding_id]
             self.assertIsInstance(result, style_ledger.CellWaived)
             with closing(sqlite3.connect(ledger.database)) as connection:
                 row = cast(tuple[str, str, str, str], connection.execute(
@@ -2111,7 +2124,7 @@ class StyleProposalsTests(unittest.TestCase):
             declined = (*alpha, beta)
             with (mock.patch.object(rules, "load_rules", wraps=rules.load_rules) as load,
                   mock.patch.object(ledger, "held_findings", wraps=ledger.held_findings) as scans):
-                outcomes = ledger.decline_findings(tuple(item.finding_id for item in declined), "Keep names")
+                outcomes = ledger.decline_findings(tuple(item.finding_id for item in declined), "Keep names", style_ledger.WaiveByPerson("user"))
             self.assertEqual(load.call_count, 1)
             self.assertEqual(scans.call_count, 0)
             self.assertEqual(list(outcomes), [item.finding_id for item in declined])
@@ -2128,7 +2141,7 @@ class StyleProposalsTests(unittest.TestCase):
     def test_decline_structure_resolves_the_file_cell(self) -> None:
         with self.ledger() as ledger:
             finding = self.hold(ledger, rule=self.structure)
-            result = ledger.decline_findings((finding.finding_id,), "Keep structure")[finding.finding_id]
+            result = ledger.decline_findings((finding.finding_id,), "Keep structure", style_ledger.WaiveByPerson("user"))[finding.finding_id]
             self.assertIsInstance(result, style_ledger.CellWaived)
             if isinstance(result, style_ledger.CellWaived):
                 self.assertEqual(result.judgment.path, "alpha/src/lib.rs")
@@ -2138,13 +2151,13 @@ class StyleProposalsTests(unittest.TestCase):
     def test_decline_changed_input_and_missing_judgment_do_not_record_waived_cells(self) -> None:
         with self.ledger() as ledger:
             missing = self.hold(ledger, line=2, record=False)
-            self.assertIsInstance(ledger.decline_findings((missing.finding_id,), "No")[missing.finding_id], style_ledger.NoHeldJudgment)
+            self.assertIsInstance(ledger.decline_findings((missing.finding_id,), "No", style_ledger.WaiveByPerson("user"))[missing.finding_id], style_ledger.NoHeldJudgment)
             held = self.hold(ledger)
             self.write("alpha/src/lib.rs", "fn value() -> u32 { 2 }\n")
             _ = self.git("add", "--all")
             _ = self.git("commit", "-qm", "Input changed")
             ledger.set_tip(self.git("rev-parse", "HEAD"))
-            self.assertIsInstance(ledger.decline_findings((held.finding_id,), "No")[held.finding_id], style_ledger.InputChangedSinceJudged)
+            self.assertIsInstance(ledger.decline_findings((held.finding_id,), "No", style_ledger.WaiveByPerson("user"))[held.finding_id], style_ledger.InputChangedSinceJudged)
             with closing(sqlite3.connect(ledger.database)) as connection:
                 self.assertEqual(connection.execute("SELECT verdict FROM judgments").fetchall(), [("held",)])
 
@@ -2172,8 +2185,8 @@ class StyleProposalsTests(unittest.TestCase):
             self.issue_command("approve", str(issue), "--showrunner", "parent", "--unit", "names-unit", "--plan", "unit.md")
             waive = ledger.decline_findings
 
-            def stop_after_waive(finding_ids: tuple[str, ...], words: str) -> dict[str, style_ledger.DeclineOutcome]:
-                _ = waive(finding_ids, words)
+            def stop_after_waive(finding_ids: tuple[str, ...], words: str, actor: style_ledger.DeclineActor) -> dict[str, style_ledger.DeclineOutcome]:
+                _ = waive(finding_ids, words, actor)
                 raise OSError("after waive")
             with (mock.patch.object(ledger, "decline_findings", side_effect=stop_after_waive),
                   self.assertRaisesRegex(OSError, "after waive")):
@@ -2191,7 +2204,7 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             old = self.legacy_issue(ledger, "old", finding)
-            _ = ledger.decline_findings((finding.finding_id,), "Keep names")
+            _ = ledger.decline_findings((finding.finding_id,), "Keep names", style_ledger.WaiveByPerson("user"))
             self.assertFalse(style_proposals.close_finished_decision(ledger, old))
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)

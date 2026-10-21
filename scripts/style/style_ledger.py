@@ -292,6 +292,7 @@ class WaiveProvenance(StrEnum):
     UNRECORDED = "unrecorded"
     UNIT = "unit"
     PERSON = "person"
+    LEDGER = "ledger"
 
 
 @dataclass(frozen=True)
@@ -304,12 +305,32 @@ class WaiveByPerson:
     by: str
 
 
-WaiveActor = WaiveByUnit | WaiveByPerson
+@dataclass(frozen=True)
+class WaiveByLedger:
+    """The ledger waived a finding whose file or site is gone."""
+
+
+WaiveActor = WaiveByUnit | WaiveByPerson | WaiveByLedger
+DeclineActor = WaiveByPerson | WaiveByLedger
+
+
+def _waive_actor_record(actor: WaiveActor) -> tuple[WaiveProvenance, str]:
+    match actor:
+        case WaiveByUnit(ticket):
+            if not ticket.strip():
+                raise LedgerError("held waive --ticket requires a ticket")
+            return WaiveProvenance.UNIT, ticket
+        case WaiveByPerson(by):
+            if not by.strip():
+                raise LedgerError("held waive --person requires a name")
+            return WaiveProvenance.PERSON, by
+        case WaiveByLedger():
+            return WaiveProvenance.LEDGER, "ledger"
 
 
 @dataclass(frozen=True)
 class NoRecordedWaiveActor:
-    """An older waive or a decision decline has no caller name on the finding."""
+    """An older waive has no caller name on the finding."""
 
 
 def held_state_name(state: HeldState) -> HeldStateName:
@@ -2220,6 +2241,8 @@ class Ledger:
                 actor = WaiveByUnit(row[22])
             elif provenance == WaiveProvenance.PERSON:
                 actor = WaiveByPerson(row[22])
+            elif provenance == WaiveProvenance.LEDGER:
+                actor = WaiveByLedger()
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
                            ReadByPerson(row[14]) if row[14] else NotReadByPerson(), WaiveUndoneBy(row[16]) if row[16] else NoWaiveUndo(),
                            FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed(), provenance, actor)
@@ -2362,13 +2385,18 @@ class Ledger:
         ).fetchall())
         return tuple(RuleCandidate(*row) for row in rows)
 
-    def decline_findings(self, finding_ids: Iterable[str], words: str) -> dict[str, DeclineOutcome]:
+    def decline_findings(self, finding_ids: Iterable[str], words: str, actor: DeclineActor) -> dict[str, DeclineOutcome]:
         """Waive the findings, and with the words each judgment cell that no other finding holds.
 
         The catalog, the synced tip and each cell's decision come before the write lock; if the rows they
         rest on change before the lock, the decline starts again.
         """
         ids = tuple(dict.fromkeys(finding_ids))
+        match cast(object, actor):
+            case (WaiveByPerson() | WaiveByLedger()) as decline_actor:
+                provenance, by = _waive_actor_record(decline_actor)
+            case _:
+                raise LedgerError("decline requires a person or the ledger")
 
         def attempt() -> dict[str, DeclineOutcome]:
             findings = tuple(self._held(finding_id) for finding_id in ids)
@@ -2415,8 +2443,8 @@ class Ledger:
                         or any(self.newest_held_judgment(*cell) != read for cell, read in reads.items())):
                     raise ChangedBeforeLock("the findings or their judgments changed while they were declined; rerun")
                 now = _now()
-                _ = self._connection.executemany("UPDATE held_findings SET state='waived',waive_provenance='person',waived_by='',updated_at=? WHERE finding_id=?",
-                                                 [(now, finding.finding_id) for finding in findings])
+                _ = self._connection.executemany("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+                                                 [(provenance, by, now, finding.finding_id) for finding in findings])
                 for cell, read in reads.items():
                     if isinstance(read, NewestHeldJudgment) and isinstance(decisions[cell], CellWaived):
                         _ = self._connection.execute(
@@ -3859,6 +3887,8 @@ class Ledger:
             finding = self._held(finding_id)
             if not isinstance(finding.state, Waived):
                 raise LedgerError(f"{finding_id}: cannot replace a {held_state_name(finding.state)} finding")
+            if finding.waive_provenance == WaiveProvenance.LEDGER:
+                raise LedgerError(f"{finding_id}: cannot replace a ledger waive")
             if finding.waive_provenance == WaiveProvenance.PERSON:
                 raise LedgerError(f"{finding_id}: cannot replace a person's waived finding; use the person-attributed unwaive path")
             if isinstance(person, WaiveUndoneBy) and not person.by.strip():
@@ -3945,16 +3975,9 @@ class Ledger:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             finding = self._held(finding_id)
-            if isinstance(actor, WaiveByUnit):
-                if not actor.ticket.strip():
-                    raise LedgerError(f"{finding_id}: held waive --ticket requires a ticket")
-                if actor.ticket != finding.ticket:
-                    raise LedgerError(f"{finding_id}: ticket {actor.ticket} did not judge this finding; expected {finding.ticket}")
-                provenance, by = WaiveProvenance.UNIT, actor.ticket
-            else:
-                if not actor.by.strip():
-                    raise LedgerError(f"{finding_id}: held waive --person requires a name")
-                provenance, by = WaiveProvenance.PERSON, actor.by
+            provenance, by = _waive_actor_record(actor)
+            if isinstance(actor, WaiveByUnit) and actor.ticket != finding.ticket:
+                raise LedgerError(f"{finding_id}: ticket {actor.ticket} did not judge this finding; expected {finding.ticket}")
             # A unit cannot relabel an existing waive. A person's explicit waive protects it from replacement.
             if isinstance(finding.state, Withdrawn) or isinstance(finding.state, Waived) and isinstance(actor, WaiveByUnit):
                 return

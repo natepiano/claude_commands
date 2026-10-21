@@ -927,7 +927,7 @@ class StylePlanTests(unittest.TestCase):
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         held = ledger.hold(rule, self.sources[0], 1, "Split this module", "restructure", "before", "after", blob, "outside")
         waived = ledger.hold(rule, self.sources[0], 2, "Already waived", "restructure", "before", "after", blob, "outside")
-        _ = ledger.decline_findings((waived.finding_id,), "declined")[waived.finding_id]
+        _ = ledger.decline_findings((waived.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[waived.finding_id]
         outside = ledger.hold(rule, self.sources[2], 1, "Different batch", "restructure", "before", "after", blob, "outside")
         ledger.waive_held(outside.finding_id, style_ledger.WaiveByPerson("nate"))
         other_rule = self.rule("other-family")
@@ -2683,6 +2683,10 @@ class StylePlanTests(unittest.TestCase):
         ledger = self.ledger()
         self.assertIsInstance(next(finding.state for finding in ledger.proposal_findings(issue)
                                    if finding.finding_id == gone.finding_id), style_ledger.Waived)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT waive_provenance,waived_by FROM held_findings WHERE finding_id=?",
+                                                (gone.finding_id,)).fetchone(), ("ledger", "ledger"))
+        self.assertEqual(ledger.named_held((gone.finding_id,))[0].waive_actor, style_ledger.WaiveByLedger())
         ticket = ledger.ticket_open("names-unit")[0]
         self.assertEqual((ticket["kind"], ticket["files"]), ("proposal", [self.sources[0]]))
         ledger.ticket_checkpoint(ticket["id"], self.tip)

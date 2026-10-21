@@ -1663,7 +1663,7 @@ def _select_phase(
         # A finding in a removed file, or whose site a merge moved to another file, can never build at its
         # site, so it is waived and the decision can close.
         for words, finding_ids in sorted(gone.items()):
-            _ = ledger.decline_findings(finding_ids, words)
+            _ = ledger.decline_findings(finding_ids, words, style_ledger.WaiveByLedger())
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
         if (gone or withdrew or built) and style_proposals.close_finished_decision(ledger, issue.path):
             closed = True
