@@ -101,11 +101,17 @@ class AccountRefusalTests(unittest.TestCase):
         reading = self.reading(at=self.now, reset=self.now + timedelta(days=7))
         self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
 
-    def test_known_window_refusal_keeps_blocking_when_later_reading_has_same_reset(self) -> None:
+    def test_same_reset_with_usage_left_keeps_the_refusal_for_both_tools(self) -> None:
         reset = self.now + timedelta(hours=3)
-        refused = self.refusal(reset=refusals.KnownReset(reset))
-        reading = self.reading(at=self.now + timedelta(seconds=1), reset=reset)
-        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+        for tool in ("claude", "codex"):
+            for name in ("weekly", "five_hour"):
+                for left in (1, 100):
+                    with self.subTest(tool=tool, window=name, left=left):
+                        refused = self.refusal(tool=tool, window=refusals.KnownWindow(name),
+                                               reset=refusals.KnownReset(reset))
+                        reading = self.reading(at=self.now + timedelta(seconds=1), reset=reset,
+                                               weekly=left, five=left, tool=tool)
+                        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
 
     def test_unknown_window_resolves_only_after_both_windows_have_positive_later_readings(self) -> None:
         refused = self.refusal(window=refusals.UnknownWindow())
@@ -115,10 +121,10 @@ class AccountRefusalTests(unittest.TestCase):
                                        weekly=weekly, five=five)
                 self.assertEqual(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)), expected)
 
-    def test_unknown_reset_on_known_window_requires_both_windows_recovered(self) -> None:
+    def test_known_weekly_refusal_needs_only_its_own_window_to_recover(self) -> None:
         refused = self.refusal(window=refusals.KnownWindow("weekly"))
         reading = self.reading(at=self.now + timedelta(seconds=1), reset=self.now + timedelta(hours=3), five=0)
-        self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+        self.assertTrue(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
         reading = self.reading(at=self.now + timedelta(seconds=1), reset=self.now + timedelta(hours=3), five=1)
         self.assertTrue(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
 
@@ -147,7 +153,7 @@ class AccountRefusalTests(unittest.TestCase):
         refused = self.refusal(reset=refusals.KnownReset(reset))
         at = self.now + timedelta(seconds=1)
         reading = accounts.FreshReading(
-            accounts.ReadingWindow(80, refusals.KnownReset(reset), at),
+            accounts.ReadingWindow(0, refusals.KnownReset(reset), at),
             accounts.ReadingWindow(80, refusals.KnownReset(reset + timedelta(hours=5)), at), "0")
         self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
 
@@ -157,3 +163,17 @@ class AccountRefusalTests(unittest.TestCase):
         reading = accounts.FreshReading(accounts.ReadingWindow(80, reset, self.now + timedelta(seconds=1)),
             accounts.ReadingWindow(80, reset, self.now - timedelta(seconds=1)), "0")
         self.assertFalse(refusals.resolved(refused, reading, self.now + timedelta(minutes=2)))
+
+    def test_later_positive_refused_window_resolves_without_a_later_reset(self) -> None:
+        at = self.now + timedelta(seconds=1)
+        for name in ("weekly", "five_hour"):
+            refused = self.refusal(window=refusals.KnownWindow(name),
+                reset=refusals.KnownReset(self.now + timedelta(days=3)))
+            for reset in (refusals.NoResetKnown(), refusals.KnownReset(self.now + timedelta(hours=1))):
+                for left in (0, 100):
+                    with self.subTest(window=name, reset=reset, left=left):
+                        window = accounts.ReadingWindow(left, reset, at)
+                        other = accounts.ReadingWindow(0, refusals.NoResetKnown(), at)
+                        reading = accounts.FreshReading(window if name == "weekly" else other,
+                            window if name == "five_hour" else other, "0")
+                        self.assertEqual(refusals.resolved(refused, reading, at), left > 0)

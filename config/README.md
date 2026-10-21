@@ -139,8 +139,9 @@ roster.
 
 Colors for each role and account in the status line, plus usage-level colors
 and thresholds for context tokens used and quota percentages left. Role keys are
-`role.showrunner`, `role.unit-director`, `role.worker`, `role.unassigned`,
-`role.astra-designer` (pink) and `role.astra-reviewer` (bright-green). `counts.<type>`
+`role.showrunner` (purple), `role.unit-director` (yellow),
+`role.astra-designer` (pink) and `role.astra-reviewer` (bright-green). Workers and
+unassigned sessions have no key and show as plain text. `counts.<type>`
 colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,
 `proposals` and `projects`.
 `scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;

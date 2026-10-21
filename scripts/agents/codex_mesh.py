@@ -349,7 +349,11 @@ class RolelessThread:
 RosterRole = AssignedDelegateRole | RolelessThread
 
 
-class FollowableRecord(TypedDict):
+class WorkerTaskRecord(TypedDict):
+    task: NotRequired[str]
+
+
+class FollowableRecord(WorkerTaskRecord):
     paused_from: NotRequired[str]
     paused_turn: NotRequired[bool]
     thread_id: str
@@ -363,7 +367,7 @@ class FollowableRecord(TypedDict):
 
 # `port` is the app-server the worker's launcher is attached to. It stays the worker's way in while
 # that launcher lives, even after the run has moved to a newer server.
-class ActiveRecord(TypedDict):
+class ActiveRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["running"]
     revision: NotRequired[int]
@@ -376,7 +380,7 @@ class ActiveRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class StartingRecord(TypedDict):
+class StartingRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["starting"]
     previous_role: NotRequired[WorkerRole]
@@ -390,7 +394,7 @@ class StartingRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class WaitingCapacityRecord(TypedDict):
+class WaitingCapacityRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["waiting_capacity"]
     revision: NotRequired[int]
@@ -402,7 +406,7 @@ class WaitingCapacityRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class ExhaustedRecord(TypedDict):
+class ExhaustedRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["capacity_exhausted"]
     revision: NotRequired[int]
@@ -412,7 +416,7 @@ class ExhaustedRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class EndedRecord(TypedDict):
+class EndedRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["ended"]
     revision: NotRequired[int]
@@ -888,6 +892,9 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
     role = record.get("role", previous.get("role"))
     if isinstance(role, str) and role in WORKER_ROLES:
         stored["role"] = role
+    task = record.get("task", previous.get("task"))
+    if isinstance(task, str) and task:
+        stored["task"] = task
     instructions_file = record.get("instructions_file")
     if instructions_file is None and previous.get("thread_id") == record["thread_id"]:
         instructions_file = previous.get("instructions_file")
@@ -956,7 +963,7 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
         return True
 
 
-def _set_roster_role(session_dir: str, name: str, role: WorkerRole) -> None:
+def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: str) -> None:
     """Record the work assigned to an existing worker without changing its state."""
     path = _session_path(session_dir, ROSTER_FILE)
     with path.open("a+", encoding="utf-8") as handle:
@@ -966,6 +973,8 @@ def _set_roster_role(session_dir: str, name: str, role: WorkerRole) -> None:
         entry = _as_dict(roster.get(name))
         if entry:
             entry["role"] = role
+            if task:
+                entry["task"] = task
             _advance_roster_revision(entry)
             roster[name] = entry
             _ = handle.seek(0)
@@ -2401,8 +2410,8 @@ def command_follow(args: argparse.Namespace) -> int:
     ):
         print(f"codex_mesh: {name} was already claimed", file=sys.stderr)
         return 2
+    _set_roster_assignment(session_dir, name, role, _as_str(_attr(args, "task")))
     if claim_pid:
-        _set_roster_role(session_dir, name, role)
         _record_assignment(thread_id, role, _dispatch_lens(args), only_if_changed=True)
     owner_pid = claim_pid or os.getpid()
     opened = time.time()
@@ -2782,6 +2791,9 @@ def _attach_and_run(
             "port": port,
             "launcher_pid": os.getpid(),
         }
+        task = _as_str(_attr(args, "task"))
+        if task:
+            starting["task"] = task
         role = _roster_role(_attr(args, "role"))
         if isinstance(role, AssignedDelegateRole):
             starting["role"] = role.role
@@ -4079,6 +4091,35 @@ def _start_workers_turn(
         raise
 
 
+def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
+    """Resolve the current task's tier once for each turn, without a server cache."""
+    session_dir = _as_str(_attr(args, "session_dir")) or client.session_dir
+    name = _as_str(_attr(args, "to")) or _as_str(_attr(args, "name")) or client.name
+    log_file = _as_str(_attr(args, "log_file"))
+    try:
+        record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)) if session_dir else {}
+        task = _as_str(record.get("task"))
+        resolved = subprocess.run(
+            ["bash", "-c", 'AGENTS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
+             "codex-mesh-tier", str(Path(__file__).with_name("agents_config.sh")), task or "delegate"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if resolved.returncode:
+            raise ValueError(resolved.stderr.strip() or "agent tier resolver failed")
+        if resolved.stderr.strip():
+            raise ValueError(resolved.stderr.strip())
+        return _as_str(resolved.stdout).strip() or "default"
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        detail = f"[{_now_stamp()}] mesh: {name}: cannot resolve service tier: {error}\n"
+        try:
+            if log_file:
+                with Path(log_file).open("a", encoding="utf-8") as log:
+                    _ = log.write(detail)
+        except OSError:
+            print(detail, end="", file=sys.stderr)
+        return "default"
+
+
 def _start_turn(
     client: Client, args: argparse.Namespace, thread_id: str, seat_sandbox: str, message: str,
     pending: tuple[str, ...] = (),
@@ -4105,6 +4146,8 @@ def _start_turn(
     effort = _as_str(_attr(args, "effort"))
     if effort:
         params["effort"] = effort
+    service_tier = _turn_service_tier(client, args)
+    params["serviceTier"] = service_tier
     client.turn_submitted_at = time.time()
     result = _serving_request(client, "turn/start", params, submits_work=True)
     return _as_str(_as_dict(result.get("turn")).get("id"))
@@ -6449,10 +6492,14 @@ def command_prime(args: argparse.Namespace) -> int:
         if not thread_id:
             raise SystemExit("thread/start returned no thread id")
         _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
-        _update_roster(session_dir, name, {
+        record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review",
             "context_tokens": 0, "instructions_file": str(instructions_path),
-        })
+        }
+        task = _as_str(_attr(args, "task"))
+        if task:
+            record["task"] = task
+        _update_roster(session_dir, name, record)
         print(thread_id)
         return 0
     except (ConnectionError, OSError, UnicodeError, SystemExit) as exc:
@@ -6503,6 +6550,9 @@ def command_fork(args: argparse.Namespace) -> int:
         record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
         }
+        task = _as_str(source_record.get("task"))
+        if task:
+            record["task"] = task
         instructions_file = _as_str(source_record.get("instructions_file"))
         if instructions_file:
             record["instructions_file"] = instructions_file
@@ -6681,6 +6731,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--model", default="")
     _ = start.add_argument("--effort", default="")
     _ = start.add_argument("--service-tier", default="")
+    _ = start.add_argument("--task", default="")
     _ = start.add_argument("--sandbox", choices=SANDBOX_MODES, default=WORKER_SANDBOX)
     _ = start.add_argument("--timeout", type=float, default=86400.0)
     _ = start.add_argument(
@@ -6708,6 +6759,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = follow.add_argument("--model", default="")
     _ = follow.add_argument("--effort", default="")
     _ = follow.add_argument("--service-tier", default="")
+    _ = follow.add_argument("--task", default="")
     _ = follow.add_argument("--cwd", dest="turn_cwd", default="")
     _ = follow.add_argument("--read-only", action="store_true")
     _ = follow.add_argument("--image", action="append", default=[])
@@ -6721,6 +6773,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = prime.add_argument("--cwd", required=True)
     _ = prime.add_argument("--model", default="")
     _ = prime.add_argument("--service-tier", default="")
+    _ = prime.add_argument("--task", default="")
     prime.set_defaults(handler=command_prime)
 
     fork = subparsers.add_parser("fork", help="create a named read-only fork of a template")

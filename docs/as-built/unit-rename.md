@@ -6,8 +6,13 @@ with three actions: `plan`, `apply` and `verify`.
 
 ## Names
 
-- The unit id (`<stem>-unit`) is the key. The branch `<slug>-<stem>` and the worktree are built from
-  the stem.
+- The unit id (`<stem>-unit`) is the key. A stem already starting with `<slug>-` keeps that prefix
+  once in branch, worktree and host session names. When the new stem equals the old branch or
+  worktree folder name, that branch or worktree stays: `names-unit` → `cargo-liner-style-names-unit`
+  keeps branch and folder `cargo-liner-style-names`.
+- Branches and worktree folders made by the shared naming rule take the new stem through that
+  rule again. `cargo-liner-style-names-unit` → `cargo-liner-style-words-names-unit` gives branch
+  and folder `cargo-liner-style-words-names`. Other names keep the existing suffix replacement.
 - The Claude session always takes the new stem, and verify fails while the live session or a herdr pane label still has the old session name (user, 2026-10-19). `<old>` may be the session name; when the id already matches, only stop, record, relaunch and verify run.
 - Rule: store only what cannot be looked up, and never rewrite history.
   - Merge subjects, logs, transcripts and plan prose keep the old id.
@@ -53,16 +58,20 @@ steps:
    unit takes both merges at its own next merge of the merge branch (user, 2026-10-18: a rename
    works at any time, mid-phase too; the plan's refusals of an open phase and of a checkpoint not
    merged are gone).
-3. **Git.** The new branch is pushed and the worktree moved, which repairs it and copies
-   `cargoBerthTarget`.
-4. **Claude.** Transcript folders move, and the trust entry is copied in every config dir.
+3. **Git.** Changed branches are pushed and changed worktrees moved, repaired and switched to the
+   destination branch. Kept paths take no move.
+4. **Claude.** For a changed worktree, transcript folders move and the trust entry is copied in
+   every config dir.
 5. **Doc commit.** The commit edits:
    - the Unit, Worktree and Branch cells;
    - the Hub Owner and Other cells;
    - the Waiting and Waits-on cells of open Gates;
    - the `> **Production:**` header of the unit's live plans.
 
-   The journal records the commit's hash, so a retry only pushes it.
+   A `Kind: style` production reads the Plan cell under `docs/style-production/units/`, keeps the
+   filename, and updates the header in both the showrunner checkout and unit worktree. Its doc
+   and plans stay git-excluded; `--allow-empty` records the rename subject even without a tracked
+   change. The journal records the commit's hash, so a retry only pushes it.
 6. **Merge rename.** The unit branch takes the rename commit.
 7. **State.** These move to the new id:
    - the six showrunner state files (`rename_state.SCRATCH_FILES`) in `showrunners.session_state_dir(<slug>)`, or in the `--scratch` directory when one is given;
@@ -75,7 +84,12 @@ steps:
    - the newest run record and the recorder state;
    - this production's open proposal issues and phase notes (`phase_table.owned_notes`).
    - the herdr pane record drops the old unit's entries (`pane_record.forget_unit`), in each session's file. The relaunched unit records its new pane at SessionStart; an old entry would resume the old name.
-8. **Retire.** The old branch is deleted once origin holds the new tip.
+   Style productions also call `Ledger.rename_unit` with their Repository: queued, assigned and
+   checkpointed tickets and sync waits take the new unit id; ticket ids and closed rows stay.
+   Their open proposal issues follow the unit without a matching plan field only when the
+   `proposed_by` field belongs to this production's owners. This accepts the production slug or
+   `unit (production)` form and leaves another production's issues in a shared folder untouched.
+8. **Retire.** A changed branch is deleted once origin holds the new tip.
 9. **Restart record.** The fields that move:
    - `host.unit`;
    - the cwd, plan path and worker cwds under the worktree;
@@ -86,6 +100,8 @@ steps:
      there and not in the path its thread started in.
 
    `restart._unit_argv` still reads the plan from the Units row.
+   Old and new default herdr names use the shared prefix rule, so `names-unit` →
+   `cargo-liner-style-names-unit` keeps herdr session `cargo-liner-style-names`.
 10. **Relaunch.** `shutdown.py restart --only <session> --here` brings the unit back. apply then
     waits for the new id to carry a live Claude mark (`_await_live`, `LIVE_WAIT_SECONDS`,
     `RENAME_UNIT_LIVE_WAIT`, default 180), so verify does not run before the unit is up. The rename
@@ -112,5 +128,6 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the showrunner checkout and the new worktree, as git sees them;
   - the six showrunner state files.
 
-  The postmaster's replies are history. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
+  Kept branch and worktree names are excluded from the search. The style ledger folder is history;
+  current ledger rows are checked separately. The postmaster's replies are history. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   On natedev a sweep takes about 80 s.

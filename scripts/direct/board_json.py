@@ -339,6 +339,10 @@ def unit(cells: dict[str, str], clock: BoardClock, sources: set[Path]) -> dict[s
     standing = is_standing_plan(record.plan)
     tickets = unit_ticket_progress(worktree, unit_name, sources) if standing else UnitTicketProgress()
     ticket = tickets.open_ticket
+    if isinstance(ticket, TicketInProgress) and isinstance(current, phase_table.OpenPhase):
+        current = next((row for row in phase_table.build_run(record.plan, events).phases if isinstance(row, phase_table.OpenPhase)
+                        and (row.phase == ticket.id or re.match(
+                            rf"{re.escape(ticket.id)}(?=\s|$)", row.title))), current)
     current_phase: dict[str, object] | None = None
     if isinstance(current, phase_table.OpenPhase):
         if standing:

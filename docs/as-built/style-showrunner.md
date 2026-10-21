@@ -2,7 +2,7 @@
 
 ## What it is
 
-A style production is a standing child production named `<repo>-style`. A repo's main showrunner starts it with `/showrunner:add_style`. It has four family units (`names-unit`, `values-unit`, `types-unit`, `modules-unit`). They sweep the repo against every style rule in `~/rust/nate_style` and the repo's local rule folders. A per-repo sqlite ledger records which (rule, file or crate) cells are covered at the synced branch-point tip. Units apply mechanical fixes. They hold every other change as a finding, and the style showrunner files findings as style decisions. The style showrunner merges unit work into a style merge branch and hands each style-branch tip back to the parent, which merges it into the branch point. The style production replaced the old fix pipeline (`scripts/fix/`, `/fix`, `/style_eval`, `/style_fix_review`, `/style_usage`, `/nightly_weights`), which is deleted. The runtime procedure the style showrunner follows is `docs/style_production.md`. That doc takes precedence over `commands/showrunner/produce.md` for a `**Kind:** style` production.
+A style production is a standing child production named `<repo>-style`. A repo's main showrunner starts it with `/showrunner:add_style`. It has four family units (`<style slug>-names-unit`, `<style slug>-values-unit`, `<style slug>-types-unit`, `<style slug>-modules-unit`). They sweep the repo against every style rule in `~/rust/nate_style` and the repo's local rule folders. A per-repo sqlite ledger records which (rule, file or crate) cells are covered at the synced branch-point tip. Units apply mechanical fixes. They hold every other change as a finding, and the style showrunner files findings as style decisions. The style showrunner merges unit work into a style merge branch and hands each style-branch tip back to the parent, which merges it into the branch point. The style production replaced the old fix pipeline (`scripts/fix/`, `/fix`, `/style_eval`, `/style_fix_review`, `/style_usage`, `/nightly_weights`), which is deleted. The runtime procedure the style showrunner follows is `docs/style_production.md`. That doc takes precedence over `commands/showrunner/produce.md` for a `**Kind:** style` production.
 
 ## How it works
 
@@ -55,11 +55,11 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 
 **Location.** `~/.local/state/style/<repo>/ledger.sqlite`, where `<repo>` is the main checkout's basename through `--git-common-dir`, so every worktree shares one ledger. `STYLE_LEDGER_STATE_DIR` replaces the root. Only `style_ledger.py` writes it. `open_ledger(repo) -> Ledger` (context manager); `preview_ledger(repo)` migrates a temp copy and leaves the real file unchanged.
 
-**Schema.** `schema_version` drives numbered `MIGRATIONS` 1-17; a newer version than the script knows raises `CheckCouldNotRun`. Current tables:
+**Schema.** `schema_version` drives numbered `MIGRATIONS` 1-20; a newer version than the script knows raises `CheckCouldNotRun`. Current tables:
 
 | Table | Holds |
 | --- | --- |
-| `judgments` | rule, rule_blob, input_scope, input_fingerprint, path, commit, verdict, verdict_detail, ticket, worker, recorded_at, declared_scope; unique on (rule, path, commit, rule_blob, input_scope, input_fingerprint, ticket, worker) |
+| `judgments` | rule, rule_blob, input_scope, input_fingerprint, path, commit, verdict, verdict_detail, ticket, worker, recorded_at, declared_scope, read_files (`'null'` or a sorted JSON list of normalized paths); unique on (rule, path, commit, rule_blob, input_scope, input_fingerprint, ticket, worker) |
 | `lint_runs` | tip, tree, tool, scope (`workspace`), config_hash, passed, diagnostics_json, rule_blobs_json; unique on (tree, tool, scope, config_hash) |
 | `sync` | one row: tip, style_branch, synced_at |
 | `listed_rules`, `listed_sites` | one marker row per enumerated (rule, rule_blob, tip), and its sites (path, line, text); cascade delete |
@@ -67,7 +67,7 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 | `rule_texts` | blob → pinned rule bytes |
 | `handoffs` | checkpoint, state, merge_commit, sent_to, timestamps |
 | `processed_tips` | tips the sync finished |
-| `held_findings` | finding_id, rule, path, line, text, kind, before, after, rule_blob, ticket, state, proposal, build_ticket, moved_from, withdrawn_by, person_read_by, duplicate_of, unwaived_by, followed_from, followed_from_line, followed_at, declaration_gone_at, timestamps |
+| `held_findings` | finding_id, rule, path, line, text, kind, before, after, rule_blob, ticket, state, proposal, build_ticket, moved_from, withdrawn_by, person_read_by, duplicate_of, unwaived_by, followed_from, followed_from_line, followed_at, declaration_gone_at, waive_provenance, waived_by, timestamps |
 | `reconciliation` | one row: branch_point |
 | `sync_waits` | unit, since, token: units waiting for sync |
 | `ticket_yields` | (ticket, path) files a ticket gave up |
@@ -87,12 +87,16 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 
 **Declared input scope.** `record --input-scope file|rule`. A `clean`, `exception` or `held` verdict on a `crate` or `module` cell of an included Rust file must say which. `file` fingerprints that file alone, so the verdict stays current when other files change. `file` scope is refused for other verdicts and for manifest or crate cells.
 
-**Cell state** comes from the newest judgment rows (`ORDER BY recorded_at DESC, id DESC`) whose `rule_blob` equals the rule's current blob and whose declared scope equals the newest row's:
+**Read files.** `record --reads <path> [<path> ...]` names the other files a rule-scope verdict rests on. The ledger accepts it only with `--input-scope rule`, a verdict in `SCOPED_VERDICTS` (`clean`, `exception`, `held`), and a crate or module cell of an included Rust file. It normalizes each path like `--path`, then sorts the paths and removes duplicates; the cell's own path changes nothing. A judgment has one of two shapes: `ReadFiles(paths)` (an empty tuple is refused) or `NoReadFiles` (`NO_READ_FILES`). `Judgment` and `TicketJudgment` carry it in `reads`. `_read_fingerprint(tip, path, reads)` is SHA-256 over the sorted `(path, blob)` pairs of the cell file plus the read files, from `tip.blobs`. `record` stores this digest as the judgment's `input_fingerprint`, and refuses a path with no file at the commit (`<path>: no file at <commit>`). Without `--reads`, a rule-scope verdict uses the whole crate or module fingerprint, so the cell comes back after any change in its crate or module. The ticket text tells a unit to use `--input-scope rule --reads <files>`, and tells it that a cell without `--reads` comes back after any change in its crate or module.
+
+**Input comparison.** `_judgment_inputs_match(row, tip, scope, path)` is the one comparison of a judgment with a tip. A judgment with reads compares only by `_read_fingerprint` at the checked tip, and a read file that is missing at the tip is a mismatch. A judgment without reads compares its declared scope's fingerprint (`_comparison_scope`). Current state, awaiting merge, `_repeated_judgments`, `judged_at_base` and the decline cell check all go through it.
+
+**Cell state** comes from the newest judgment rows (`ORDER BY recorded_at DESC, id DESC`) whose `rule_blob` equals the rule's current blob and whose declared scope equals the newest row's. "The inputs match" below means `_judgment_inputs_match` is true:
 
 | State | Meaning |
 | --- | --- |
-| `current` | the row's commit is an ancestor of the synced tip and the fingerprint matches there |
-| `awaiting merge` | the commit is not in the synced tip, but is in the stored style branch's current tip and the fingerprint matches there |
+| `current` | the row's commit is an ancestor of the synced tip and the inputs match there |
+| `awaiting merge` | the commit is not in the synced tip, but is in the stored style branch's current tip and the inputs match there |
 | `stale` | some row exists, but none qualifies; with no stored style branch, unmerged rows read stale |
 | `open` | no row |
 
@@ -111,7 +115,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 
 **CLI** (`style_ledger.py`, every verb takes `--repo`; errors exit 2 as `style_ledger: <message>`; writes upsert on their natural key; a repeat of the current transition exits 0, a backward or skipped one exits 2 naming the state):
 
-- `record --rule ID --path P --commit C [--rule-blob B] --verdict V [--detail D] --ticket T --worker W [--input-scope file|rule]`. `ID` may be `<rule id>#uncovered` for a partial B rule. Refuses: an unknown or unclassified rule; tier A or E; a path outside reach; a tier B path with no listed site at the synced tip; a tier D path that is not a crate, included Rust file or listed-site path; a tier C path outside the universe; a cell outside the ticket's owned `cells`; a path the ticket yielded; a `--rule-blob` that differs from the ticket's pin; `held` when no `unfiled` or `filed` finding maps to the cell (the error lists the cell's waived, built and withdrawn findings).
+- `record --rule ID --path P --commit C [--rule-blob B] --verdict V [--detail D] --ticket T --worker W [--input-scope file|rule] [--reads P [P ...]]`. `ID` may be `<rule id>#uncovered` for a partial B rule. Refuses: an unknown or unclassified rule; tier A or E; a path outside reach; a tier B path with no listed site at the synced tip; a tier D path that is not a crate, included Rust file or listed-site path; a tier C path outside the universe; a cell outside the ticket's owned `cells`; a path the ticket yielded; a `--rule-blob` that differs from the ticket's pin; `held` when no `unfiled` or `filed` finding maps to the cell (the error lists the cell's waived, built and withdrawn findings); `--reads` without `--input-scope rule`, with another verdict, on another kind of cell, or naming a path with no file at the commit.
 - `lint-record --tip C --tool clippy|mend|rustfmt --passed 0|1 --diagnostics FILE.json` (object of path → nonnegative count).
 - `set-tip --tip C [--style-branch NAME]`: stores the tip and `refs/heads/NAME`; omitting the flag keeps the stored branch. Writes `synced_at` every time.
 - `status [--rule ID] [--crate K] [--json]`: `unclassified: <n> rules — pull nate_style` when n > 0, then `rule current stale open awaiting merge held done`. Under `--crate`, `done` is crate-scoped.
@@ -119,7 +123,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 - `ticket add|assign --branch B|checkpoint --commit C|merge|drop|yield --path P --id ID`, `ticket open --unit U`.
 - `handoff add|send --to SLUG|reroute --to SLUG|merged [--merge-commit M] --checkpoint C`, `handoff pending`.
 - `tip seen --tip C` (prints `new` or `seen`), `tip done --tip C`.
-- `held add ...` (prints the finding id), `held file --id F --proposal PATH`, `held waive --id F`, `held built --id F [--id F ...] [--commit <merge> [--by <who>]]`, `held list [--state S] [--json]`.
+- `held add ...` (prints the finding id), `held file --id F --proposal PATH`, `held waive --id F (--ticket T | --person NAME)`, `held replace --id F --after TEXT [--person NAME]`, `held built --id F [--id F ...] [--commit <merge> [--by <who>]]`, `held list [--state S] [--json]`.
 
 ### Tickets, hand-offs, processed tips, reconcile
 
@@ -128,7 +132,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 - `record --ticket` and `held add --ticket` take the pinned blob, so a judgment on a ticket whose rule changed stays stale against the new text.
 - `ticket checkpoint` refuses while any owned cell is unjudged. `ticket merge` needs state `checkpointed` and the checkpoint inside the stored style branch tip. It marks a proposal ticket's findings `built` in the same transaction (only on `AppliedInCode`), prints a `not built` line per other finding, and calls `style_sync.py wake-waiters`. `ticket merge` checks ancestry only against the style branch; `reconcile` merges tickets by containment.
 - `ticket yield --id T --path P` records a dropped file in `ticket_yields` and clears the ticket's verdicts and unfiled held findings on it.
-- Checkpoint restamp: a ticket checkpoint copies its family's verdicts onto files that only it changed (`checkpoint_restamps`), so its own edit does not stale them.
+- Checkpoint restamp: a ticket checkpoint copies its family's verdicts onto files that only it changed (`checkpoint_restamps`), so its own edit does not stale them. For a judgment with reads, the `rev-list` that finds changing commits runs over the cell file plus the read files, and the carried fingerprint is `_read_fingerprint` at the checkpoint.
 - **Hand-offs:** `pending` → `sent` → `merged`. `handoff send` to a second parent exits 2; `handoff reroute` moves a `sent` row to the new parent and keeps `checkpoint` and `created_at` (same parent: no-op; `pending`, `merged` or unknown: exit 2). `handoff merged` refuses `pending`, refuses before any `reconcile` stored the branch point, and needs the branch point to contain the checkpoint.
 - `reconcile --branch-point B --style-branch S`: stores `refs/heads/S` through `set_tip` only when it differs and never moves the synced tip; stores B; marks a hand-off `merged` when B contains it (`merge_commit` = first first-parent merge on B that contains it, else B's tip); merges a `checkpointed` ticket that S contains; drops an `assigned` ticket whose branch ref is gone; prints one line per change, plus `not built` lines.
 - Branch-point reads use `pushed_branch_point_tip`: `origin/<branch point>` when origin exists (a missing ref says `fetch origin first`), else the local branch. The local branch can hold a parent merge whose gate still runs, so it is never trusted when origin exists.
@@ -139,8 +143,8 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 - `_request` derives everything from the parent doc: main checkout through `--git-common-dir` on `**Repository:**`; slug `<repo>-style`; branch point = parent merge branch; style merge branch `style/<branch point with / as ->`; checkout `<repo parent>/<repo>-style`; doc `docs/<repo>-style-production.md`. A missing `**Proposals:**` refuses.
 - `standing_style_production(repo_dir) -> StandingStyleProduction | NoStyleProduction` (frozen; `checkout`, `doc`, `slug`, `branch_point`) is the one shared lookup. `style_plan.style_document`, `style_sync.notify` and `add_style` use it. A new caller that resolves from a repo folder must use it.
 - **Existing production** = doc present and slug in `showrunners.timer_slugs()`. `_attach` detaches from any old parent, attaches under the caller, rewrites `**Parent production:**` and `**Proposals:**`, then runs `style_sync.py resume`. A doc on another branch point raises `StyleBranchPointTaken` (exit 2) with no write. A doc with no timer is an interrupted bootstrap and reruns the create path, which also rewrites the two fields.
-- **Create path** (each step idempotent): branch from the branch-point tip and worktree; production doc with Units table `Unit | Plan | Worktree | Branch | Port | Owns` (Worktree `<repo parent>/<slug>-<family>`, Branch `<slug>-<family>`, Port `—`, Owns `none — takes what the board leaves free`); four standing plans `docs/style-production/units/<family>-unit.md` with a `**Family:**` snapshot of rule ids and tiers and an empty `## Phases`; `.git/info/exclude` entries for `/docs/style-production/`, the doc and the log; `set_tip(<stored synced tip, else the style branch commit>, style_branch)`; then `add_showrunner.py`. Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code. A live herdr session named `<slug>` with no timer is refused before any write.
-- `--pilot` (create path only; else exit 2 `--pilot applies only while creating <slug>`) lists only the named units in the Units table; all four plans are still written. `=<crates>` writes `- **Pilot scope:** <packages>` into that unit's showrunner-copy plan. `--check` prints seven steps and acts on nothing.
+- **Create path** (each step idempotent): branch from the branch-point tip and worktree; production doc with Units table `Unit | Plan | Worktree | Branch | Port | Owns` (Unit `<slug>-<family>-unit`, Worktree `<repo parent>/<slug>-<family>`, Branch `<slug>-<family>`, Port `—`, Owns `none — takes what the board leaves free`); four standing plans `docs/style-production/units/<slug>-<family>-unit.md` with a `**Family:**` snapshot of rule ids and tiers and an empty `## Phases`; `.git/info/exclude` entries for `/docs/style-production/`, the doc and the log; `set_tip(<stored synced tip, else the style branch commit>, style_branch)`; then `add_showrunner.py`. Launcher exit 1 or 3 prints `_open_session_guidance` and returns that code. A live herdr session named `<slug>` with no timer is refused before any write.
+- `--pilot` (create path only; else exit 2 `--pilot applies only while creating <slug>`) lists only the named units in the Units table; all four plans are still written. `=<crates>` writes `- **Pilot scope:** <packages>` into that unit's showrunner-copy plan. `--pilot` accepts a family, an old `<family>-unit` id or a full `<slug>-<family>-unit` id. `--check` prints seven steps with full ids and acts on nothing.
 - Format fields (`docs/production_format.md`): `**Kind:** style` (absent = product production), `**Branch point:**`, `**Parent production:**`; `**Proposals:**` required for style. Plan header (`docs/delegate_plan_format.md`): `> **Standing:** style_plan.py`. A standing plan never closes and is git-excluded.
 - `add_unit._is_excluded_standing_plan` accepts a plan absent on the merge branch when the showrunner copy is git-ignored and carries `> **Production:` and `> **Standing:**`. `ensure_worktree` copies it into the unit worktree only when the unit copy is missing. After first launch, the unit copy is the only one that counts.
 
@@ -152,14 +156,14 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 
 **`style_plan.py next-phase --unit U --plan P --repo R`** (`next_phase -> NextPhase`):
 
-1. Find the style doc and the unit's Units row. `--plan` must equal `<row Worktree>/docs/style-production/units/<unit>.md`, else exit 2.
+1. Find the style doc and the unit's Units row. `--plan` must equal `<row Worktree>/<Plan cell>`, else exit 2. A rename keeps the Plan cell path.
 2. A `### Phase` heading with `repair` and `status: todo` returns `repair first` before any write.
 3. Run `style_proposals.complete`. Discard each ticket phase whose state is `merged` or `dropped` (`discarded <id>: <state>`).
 4. An open ticket: `checkpointed` → exit 5; `assigned` → rebuild its phase, `resume <id>`. Neither reads the board.
 5. When the pushed branch-point tip is not in the synced tip, record a sync wait and exit 3.
 6. Read the board (unavailable → exit 4, no ticket). Run `_select_phase`. On no work, record a sync wait, read the board again and select once more, so a wake that arrives between the check and the wait is not lost.
 
-`_select_phase` order: the oldest queued ticket is assigned under its own id when its files are free and in scope, and every other queued ticket is dropped (`dropped <id>: files busy|outside pilot scope`). Then approved decisions for the unit: the declaration step runs once, waive lines print for gone or moved sites, and each decision gives one `proposal` ticket of free, in-scope files (structure limits when a restructure finding is present). Then coverage through `_tickets_from`. No candidate: exit 6 when a stored style branch would change left-out cells, else `waiting for structure` or `waiting for sync`.
+`_select_phase` order: the oldest queued ticket is assigned under its own id when its files are free and in scope, and every other queued ticket is dropped (`dropped <id>: files busy|outside pilot scope`). Then approved decisions for the unit: the declaration step runs once, findings whose file is gone or whose site moved to another file are waived with the actor `WaiveByLedger()` and print a waive line, and each decision gives one `proposal` ticket of free, in-scope files (structure limits when a restructure finding is present). Then coverage through `_tickets_from`. No candidate: exit 6 when a stored style branch would change left-out cells, else `waiting for structure` or `waiting for sync`.
 
 | Exit | Output |
 | --- | --- |
@@ -183,7 +187,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 
 **Plan settings** from the unit copy's Delegation Context: `**Pilot scope:**` (`AllCrates | PilotCrates`, workspace package names; more than one line or an unknown package refuses) and `**First files:**` (repo-relative paths; ranks, filters nothing).
 
-**Phase text.** `phase_text` builds `### Phase <n> — <unit>-<n>  · status: todo`, a Work Order with the plan's Delegation Context, each rule id with its pinned file `<plan>.parent.parent/rules/<blob>.md`, sites as sorted JSON, `uncovered:` lines, per-file read windows of at most 300 lines (the top-level test module apart), owned cells, already-held and waived findings, proposal cells and rename pairs, Workers, and the Acceptance gate. Workers: two blind judges for a names read ticket (not name-bindings); `2 writers` over 12 files; else `1 writer + 1 tester`. Inputs are the ticket record, pinned texts and Delegation Context only, so a rebuild is byte-identical. `write_phase` restores any pin file whose blob differs, then replaces the phase in place or appends under `## Phases`. All writes go through `atomic_write` (temp file, fsync, `os.replace`). `_waived_ticket_findings` reads tier and scope from the pinned rule texts, not the live catalog.
+**Phase text.** `phase_text` builds `### Phase <n> — <unit>-<n>  · status: todo`, a Work Order with the plan's Delegation Context, each rule id with its pinned file `<plan>.parent.parent/rules/<blob>.md`, sites as sorted JSON, `uncovered:` lines, per-file read windows of at most 300 lines (the top-level test module apart), owned cells, already-held and waived findings, proposal cells and rename pairs, the `--input-scope` and `--reads` lines, Workers, and the Acceptance gate. Workers: two blind judges for a names read ticket (not name-bindings); `2 writers` over 12 files; else `1 writer + 1 tester`. Inputs are the ticket record, pinned texts and Delegation Context only, so a rebuild is byte-identical. `write_phase` restores any pin file whose blob differs, then replaces the phase in place or appends under `## Phases`. All writes go through `atomic_write` (temp file, fsync, `os.replace`). `_waived_ticket_findings` reads tier and scope from the pinned rule texts, not the live catalog.
 
 **Gate.** `style_plan.py gate --repo . --ticket <id>` serves `<StandingPlanRefill>` and checkpoint step 6. Exit 0 permits, 1 returns to repair (`review:` or `unjudged: <rule> <path>`), 2 could not run (`error: <reason>`).
 - Coverage ticket (`SelectedByCoverage(base)`): refuse unjudged owned cells, then `style_footprint.py check --base <base> --worktree`. The base is the later of the stored `base` and the merge-base of `HEAD` with the style branch, so style-branch work the unit took in is never judged.
@@ -230,9 +234,14 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 
 **Model.** One decision per (rule, crate, rule blob). Its answer (approved, declined, unanswered) also covers later findings under the same rule text. The ledger keeps which decision holds each finding (`proposal`, `moved_from`). The issue path comes from the key (`batch_name`, a crate's `/` shown as `+`), not from the P number. Category `refactor`, tags `[issue, proposal, style]`, area `[[style]]` (`STYLE_AREA`), frontmatter `style_rule`, `style_crate`, `style_rule_blob`, `style_rules` links. Each decision shows counts and up to three examples from different files; `style_proposals.py sites --issue` gives the full list.
 
-**Held states.** `Unfiled | Filed(proposal) | Waived | Built(proposal) | Withdrawn(proposal | NoDecision, by)`, `WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone`. Side records: `build_ticket: NoBuildTicket | BuildTicket`, `reading: NotReadByPerson | ReadByPerson(by)`, `waive_undo: NoWaiveUndo | WaiveUndoneBy(by)`, `follow: NotFollowed | FollowedDeclaration(from_path, from_line, commit)`. `finding_id` is the first 16 hex of sha256 over (rule, path, line, text, rule_blob) and never changes after a follow.
+**Held states.** `Unfiled | Filed(proposal) | Waived | Built(proposal) | Withdrawn(proposal | NoDecision, by)`, `WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone`. Side records: `build_ticket: NoBuildTicket | BuildTicket`, `reading: NotReadByPerson | ReadByPerson(by)`, `waive_undo: NoWaiveUndo | WaiveUndoneBy(by)`, `follow: NotFollowed | FollowedDeclaration(from_path, from_line, commit)`, `waive_provenance: WaiveProvenance`, `waive_actor: WaiveActor | NoRecordedWaiveActor`. `finding_id` is the first 16 hex of sha256 over (rule, path, line, text, rule_blob) and never changes after a follow.
 
-**Approval and progress** (`proposal_issue.py`): `proposal_progress(issue) -> AwaitingApproval | InProgress`. Approved, or unanswered at `stage: active`, is `InProgress`; all else (open declined included) is `AwaitingApproval`. `approve`, `create` with inherited approval, and `reopen` of an approved decision write `stage: active` (`IN_PROGRESS_STAGE`). The footer counts `AwaitingApproval` only; `proposals_table` shows `waiting for your review` rows first, then `in progress by <unit>`. `move-approved <folder> [--dry-run]` moves approved `backlog` proposals to `active` by hand (exit 2 on a refused file). Every write holds `_issue_lock`, rereads under it and writes only on a byte change.
+**Waive actors.** Every waive records who made it. `WaiveActor = WaiveByUnit(ticket) | WaiveByPerson(by) | WaiveByLedger()`. `WaiveProvenance` is `unrecorded`, `unit`, `person` or `ledger`; the row stores it in `waive_provenance` (default `unrecorded`) and the name in `waived_by` (default empty). `_waive_actor_record(actor)` maps an actor to its stored `(provenance, waived_by)` pair: the ticket, the person's name, or `ledger`. It refuses an empty ticket or name. Every waive write goes through it, so every new waive row has a non-empty `waived_by`. Old rows stay `unrecorded`, and `_held` reads them as `NoRecordedWaiveActor`.
+- `held waive --id F` takes exactly one of `--ticket T` or `--person NAME` (an argparse group of exclusive options). `waive_held(finding_id, actor)` refuses a ticket that did not judge the finding. A unit's waive does not change a finding that is already waived, and no waive changes a withdrawn finding. A person's waive writes over a unit's waive.
+- `DeclineActor = WaiveByPerson | WaiveByLedger`. `decline_findings(finding_ids, words, actor)` refuses any other actor with `decline requires a person or the ledger` before any write. A decline over a unit's waive replaces that actor with the decline actor. `decline` and `apply_answer` in `style_proposals.py` pass `WaiveByPerson("user")`; the refill waive in `style_plan.py` for a gone file or a moved site passes `WaiveByLedger()`.
+- `held replace --id F --after TEXT [--person NAME]` (`Ledger.replace_held`) corrects a waived finding. It sets the new after text and keeps the id and judging ticket, sets the finding to unfiled, clears its proposal, build ticket and person reading, and sets a newest `waived` cell judgment back to `held` (`_restore_held_findings`, which `unwaive_held` also uses). It prints the id. It replaces only a unit's waive: it refuses a finding that is not waived, a ledger waive (`cannot replace a ledger waive`) and a person's waive. An unrecorded waive needs `--person`, and the ledger records that name in `unwaived_by`, as unwaive does. Plain `held add` keeps an existing waive, because it does nothing on an existing finding id.
+
+**Approval and progress** (`proposal_issue.py`): `proposal_progress(issue) -> AwaitingApproval | InProgress`. Approved, or unanswered at `stage: active`, is `InProgress`; all else (open declined included) is `AwaitingApproval`. `approve`, `create` with inherited approval, and `reopen` of an approved decision write `stage: active` (`IN_PROGRESS_STAGE`). The footer counts `AwaitingApproval` only; `proposals_table` shows `waiting for your review` rows first, then `in progress by <unit>`. `move-approved <folder> [--dry-run]` moves approved `backlog` proposals to `active` by hand (exit 2 on a refused file). Every write holds `_issue_lock`, rereads under it and writes only on a byte change. `_issue_lock` takes its lock file from the fixed folder `~/.local/state/proposal-issue/locks` (from `Path.home()`) and creates the folder on use. It reads no environment variable (`XDG_RUNTIME_DIR`, `TMPDIR`), so every run on the machine shares one lock per issue.
 
 **`style_proposals.py` verbs** (most take `--repo <style checkout>`; dry runs print the same lines and write nothing):
 
@@ -242,7 +251,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 | `follow --proposals [--dry-run]` | the declaration step alone; exit 1 on a left finding or skipped decision |
 | `withdraw --proposals [--dry-run]` | the withdrawal step alone |
 | `complete` | closes approved decisions whose findings are all built or waived (also with no merged ticket); renumbers |
-| `decline --issue <path> --words '<words>'` | stores the answer, waives filed findings in one transaction, closes with `declined: <words>` |
+| `decline --issue <path> --words '<words>'` | stores the answer, waives filed findings in one transaction with the actor `WaiveByPerson("user")`, closes with `declined: <words>` |
 | `unwaive --proposals --id <id>... --by <who>` | waived → unfiled; refuses a declined decision, changed rule text, open ticket, blank `--by` |
 | `reopen --issue <p> --parent <s> [--finding <id>... \| --applied <id>... --by <who>] [--dry-run]`, `reopen --all [--parent <s>]` | files built renames that are not in the code again; `cannot check` lines exit 1 |
 | `migrate --proposals --parent [--dry-run]` | moves old style issues into decisions; `skipped: off-rule <path>` for `/issue` filings |
@@ -253,7 +262,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 
 **Join action** (`join_action(ledger, issue) -> JoinAction`): declined → `WaiveWithAnswer` (`waived <n> findings in <decision>: declined: <words>`); open → `JoinOpenDecision`; closed and approved with nothing left (`left_to_build` keeps every state except `Built` and `Waived`) → `ReopenBuiltDecision`; closed unanswered reopens only when its reason starts with `built in ` or `nothing left to build: `. Refusals: `closed decision has no approval`, `closed decision has unbuilt findings` (open it with `proposal_issue.py reopen`).
 
-**Filing race.** `proposal_issue.create` reads the decision path through `_decision_path_state` before and again inside `_folder_lock`. `ALREADY_FILED` (same rule, crate, blob) returns False and writes nothing; a different key raises `Refusal("<path>: different decision key")`. The `.decision-*` temp file is always removed.
+**Filing race.** `proposal_issue.create` reads the decision path through `_decision_path_state` before and again inside `_folder_lock`. `ALREADY_FILED` (same rule, crate, blob) returns False and writes nothing; a different key raises `Refusal("<path>: different decision key")`. In `_create_numbered`, a `FileExistsError` from `os.link(temporary, path)` reads the path again through `_decision_path_state`: the same key returns False and keeps the other run's file, and a different key raises the same `Refusal`. The `.decision-*` temp file is always removed.
 
 **`area-style <folder> [--dry-run]`** sets `area: "[[style]]"` on issues with `style_rule` or `style_rules` whose area is missing or `[[unfiled]]` on the key's first line; it prints `area-style <name>: area [[style]]`; exit 2 on a folder or file error.
 
@@ -277,7 +286,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 
 ### Held-verdict refusal
 
-`record --verdict held` needs a live (`unfiled` or `filed`) finding at the cell (`_cell_findings` maps sites through `_finding_cell`, so a manifest rule maps to its crate). For a cell whose only findings are waived, record `waived`. Structure tickets list waived findings under `Waived by the user: do not hold these again. Record waived for a cell whose only findings are these.` A `waived` verdict expires with its inputs. `unwaive_held` turns a newest `waived` verdict back into `held` without going through `record`.
+`record --verdict held` needs a live (`unfiled` or `filed`) finding at the cell (`_cell_findings` maps sites through `_finding_cell`, so a manifest rule maps to its crate). For a cell whose only findings are waived, record `waived`. Structure tickets list waived findings under `Waived by the user: do not hold these again. Record waived for a cell whose only findings are these.` A `waived` verdict expires with its inputs. `unwaive_held` and `replace_held` turn a newest `waived` verdict back into `held` without going through `record` (`_restore_held_findings`).
 
 ## Invariants
 
@@ -289,6 +298,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - A fix applies without asking only when `style_footprint.py` calls it mechanical. Every other change is held and shown only when asked.
 - Any code that matches tiers handles `"unclassified"`. An unclassified rule has no cells or tickets and never counts as current or done.
 - `candidate_generators` returns every site. Any limit belongs to its callers.
+- `rules.style_family(unit)` maps old and full unit ids to `Family | NotStyleUnit`. Plan readers use the Units row's Plan cell relative to the unit worktree; rename keeps that path. `Ledger.rename_unit(old, new) -> UnitRenamed(tickets, waits)` and `unit rename --repo <checkout> --from <old> --to <new>` move current ticket owners and sync waits in one transaction. Ticket ids and history stay unchanged; reapplying moves zero rows. The target must own no current rows, and both ids must name the same family. New ticket numbers use only their own id prefix.
 - Every ledger row and `--rule` uses `Rule.rule_id`. Map a unit to its branch through the Units row, never by name derivation.
 - Every `set-tip` caller that expects awaiting-merge cells passes `--style-branch`. `reconcile` never moves the synced tip.
 - Read committed trees only through git objects (`ls-tree`, `cat-file --batch`), never `git archive`.
@@ -300,6 +310,8 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - Every reader of merge history handles `ChildHandoffEntry`.
 - No acknowledgment of a hand-off precedes a successful push.
 - `proposal_issue.create` keeps both `_decision_path_state` checks, before and inside the folder lock.
+- Every state reader compares a judgment with a tip through `_judgment_inputs_match`. A judgment with reads compares only by `_read_fingerprint`.
+- Every waive write picks a `WaiveActor` variant and passes it through `_waive_actor_record`. A new actor kind extends `WaiveActor` and `WaiveProvenance`, and `_held` maps it back from `waive_provenance` and `waived_by`. `decline_findings` takes only a `DeclineActor`. `replace_held` replaces only a unit's waive, and an unrecorded waive only with `--person`.
 - Readers count proposals by the approval record, not only the stage. Never write stages on read.
 - `style_footprint.tokens`, `closing` and `attribute_spans` keep their behavior; `declarations.py` and `style_ledger.py` use them.
 - A new `DeclarationLeft` outcome needs a refill case in `style_plan`.
@@ -326,6 +338,8 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 | 16 hex | `finding_id` length |
 | half | outside-rename body test: at least half the old non-blank lines remain |
 
+- A `--reads` judgment keeps declared scope `rule`, so the newest-declared-scope filter of cell state treats it as a rule-scope verdict.
+- Tests that file proposals must patch `Path.home`: the lock folder reads no environment variable, so a patched `XDG_RUNTIME_DIR` or `TMPDIR` does not move it.
 - cargo-berth exits 4 for an unconfigured repo and for an unreadable ledger; only the envelope status tells them apart.
 - Refill does not fetch. It reads the local `origin/<style branch>` and `origin/<branch point>` refs, so a stale tracking ref gives exit 3 until a fetch updates it. A branch point that is not pushed reads as missing.
 - `RepairFirst` returns before the discard, so finished phases stay until the repair clears. `board unavailable` records no ticket, but the discard may have already rewritten the plan.
@@ -381,6 +395,9 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - **No leaf-name trait match, no fallback past an unsupported import, no general name resolution:** each gave wrong follows. Resolving `extern crate` aliases gave two wrong follows live.
 - **No best-score pick among outside-rename candidates and no prose proof:** only a unique, body-checked destination is a proof.
 - **Decision path check before and inside the lock:** a check before the lock alone lets two same-key runs pass, and the second fails at `os.link`. `os.replace` would overwrite the other run's decision.
+- **`--reads` digest for rule-scope cells:** a rule-scope cell keyed on its crate or module fingerprint came back after any change there, and each repeat spent a Codex ticket on no work. A digest of only the files the verdict rests on brings it back only when one of them changes.
+- **Fixed lock folder:** a lock folder read from the environment can differ between two runs, so two `style_proposals.py file` runs held different locks on one issue and the second failed at `os.link` (Errno 17). A fixed folder gives every run one lock, and a same-key `FileExistsError` at the link ends the run without error.
+- **Replace takes only a unit's waive:** a person's waive is the user's decision, and a ledger waive marks a site that can no longer build; only a unit may correct its own finding's text. An old waive with no record needs a named person, as unwaive does.
 - **`active` stage for in progress:** the vault already ranks `active` as in progress, so no new stage value is needed.
 - **Wrap detaches style children last:** the style child must stay attached until the parent's close-out steps finish.
 - **Off-rule ideas become rule candidates:** an off-rule build ticket has no rule to judge; approved off-rule work builds as plain code phases.

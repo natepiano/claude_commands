@@ -605,6 +605,30 @@ class BoardJsonTests(unittest.TestCase):
         self.assertEqual(connect.call_args.args, (f"file:{database}?mode=ro",))
         self.assertEqual(connect.call_args.kwargs, {"uri": True, "timeout": 0})
 
+    def test_renamed_unit_selects_the_open_phase_by_its_unchanged_ledger_ticket_id(self) -> None:
+        fixture = self.production(unit_name="cargo-liner-style-names-unit")
+        self.standing_plan(fixture, phase_id="63", title="names-unit-63 — Fix names")
+        with fixture.plan.open("a", encoding="utf-8") as stream:
+            _ = stream.write("### Phase 64 — names-unit-64 — Later work · status: todo\n")
+        _ = self.write_run(fixture, [
+            self.event("phase_started", NOW - 120, phase="63", instance="ticket-63",
+                       phase_title="names-unit-63 — Fix names"),
+            self.event("phase_started", NOW - 60, phase="64", instance="ticket-64",
+                       phase_title="names-unit-64 — Later work"),
+        ])
+        database = self.ledger(fixture, tickets=(
+            ("names-unit-63", "cargo-liner-style-names-unit", "assigned", 63),
+        ))
+        before = database.read_bytes()
+
+        _, unit = self.unit(fixture)
+
+        self.assertEqual(unit["phase"], {
+            "kind": "ticket", "id": "names-unit-63", "title": "Fix names", "merged": 0,
+        })
+        self.assertEqual(unit["stage"], "Ticket names-unit-63 running")
+        self.assertEqual(database.read_bytes(), before)
+
     def test_ledger_ahead_of_the_run_uses_the_newest_assigned_or_checkpointed_ticket(self) -> None:
         fixture = self.production(unit_name="types-unit")
         self.standing_plan(fixture, phase_id="124", title="types-unit-124")

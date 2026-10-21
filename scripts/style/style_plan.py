@@ -37,7 +37,7 @@ import style_ledger
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
-from production_units import Refusal, production_field
+from production_units import Refusal, cell_value, production_field, unit_table
 from proposal_issue import ApprovedDecision, decision_answer
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 
@@ -119,17 +119,25 @@ class MissingUnitPlan:
     pass
 
 
+def _unit_plan(doc: Path, unit: str, worktree: Path) -> Path:
+    for row in unit_table(doc.read_text().splitlines()):
+        if cell_value(row["Unit"]) == unit:
+            return worktree / Path(cell_value(row["Plan"]))
+    raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
+
+
 def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
     """Read each style unit's own standing plan copy."""
     texts: dict[rules.Family, str | MissingUnitPlan] = {}
     for row in unit_worktrees(doc):
-        for family in FAMILIES:
-            if row.unit == family + "-unit":
-                plan = row.worktree / "docs/style-production/units" / (row.unit + ".md")
-                try:
-                    texts[family] = plan.read_text()
-                except FileNotFoundError:
-                    texts[family] = MissingUnitPlan()
+        family = rules.style_family(row.unit)
+        if isinstance(family, rules.NotStyleUnit):
+            continue
+        plan = _unit_plan(doc, row.unit, row.worktree)
+        try:
+            texts[family] = plan.read_text()
+        except FileNotFoundError:
+            texts[family] = MissingUnitPlan()
     return texts
 
 
@@ -138,7 +146,7 @@ def family_plan_settings(doc: Path, repo: Path, *, unit: str = "") -> Mapping[ru
     return {family: unit_plan_settings(text, repo) if isinstance(text, str)
             else UnitPlanSettings(AllCrates(), frozenset())
             for family, text in family_plan_texts(doc).items()
-            if not unit or unit == family + "-unit"}
+            if not unit or rules.style_family(unit) == family}
 
 
 def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
@@ -1432,7 +1440,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         *record_lines,
         "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
         "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
-        "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
+        "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
+        + "Without `--reads`, the cell comes back after any change in its crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/direct/verify.sh check <package>`",
@@ -1578,8 +1587,8 @@ def _select_phase(
         ledger.ticket_drop(ticket["id"])
         reason = "files busy" if in_scope else "outside pilot scope"
         print(f"dropped {ticket['id']}: {reason}")
-    family = unit.removesuffix("-unit")
-    if family not in FAMILIES:
+    family = rules.style_family(unit)
+    if isinstance(family, rules.NotStyleUnit):
         raise style_ledger.LedgerError(f"{unit}: unknown style family")
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
@@ -1662,7 +1671,7 @@ def _select_phase(
         # A finding in a removed file, or whose site a merge moved to another file, can never build at its
         # site, so it is waived and the decision can close.
         for words, finding_ids in sorted(gone.items()):
-            _ = ledger.decline_findings(finding_ids, words)
+            _ = ledger.decline_findings(finding_ids, words, style_ledger.WaiveByLedger())
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
         if (gone or withdrew or built) and style_proposals.close_finished_decision(ledger, issue.path):
             closed = True
@@ -1729,7 +1738,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
     if row is None:
         raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
-    expected = row.worktree.resolve() / "docs/style-production/units" / (unit + ".md")
+    expected = _unit_plan(doc, unit, row.worktree).resolve()
     if plan != expected:
         raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
     original = plan.read_text()
@@ -1823,13 +1832,13 @@ def main(argv: list[str]) -> int:
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
                 settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
-                branches = {row.unit: row.branch for row in unit_worktrees(doc)}
-                for family in FAMILIES:
-                    unit = family + "-unit"
-                    if args.unit and args.unit != unit:
+                for row in unit_worktrees(doc):
+                    unit = row.unit
+                    family = rules.style_family(unit)
+                    if isinstance(family, rules.NotStyleUnit) or (args.unit and args.unit != unit):
                         continue
                     first_files = settings[family].first_files if family in settings else _NO_FIRST_FILES
-                    base = unit_base(args.repo, branches[unit]) if unit in branches else NoUnitBranch()
+                    base = unit_base(args.repo, row.branch)
                     for ticket in candidate_tickets(args.repo, ledger, busy, family, scopes.get(family, _ALL_CRATES),
                                                     scopes, base=base, first_files=first_files):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")

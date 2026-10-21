@@ -17,6 +17,9 @@ Verbs:
              Write the run record, spawn its supervisor and return at once. Exit 3 when the
              caller is not a mesh worker, so the caller runs the command attached. NAME may be
              the seat's role, the last part of its roster name; the record keeps the roster name.
+             When the seat already has a live run of the same command in the same folder and the
+             files did not change since it started (same tree key), start starts nothing: it
+             names that run, whose result still arrives as the seat's next message.
   supervise  <record>
              Run the command, wait for it, deliver its result, then mark the record finished.
 
@@ -47,6 +50,7 @@ from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
+from scripts.buildlog import treekey
 from scripts.lib import unit_runs
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
@@ -85,6 +89,8 @@ class RunRecord(TypedDict):
     pid: int
     director_dir: str
     done_message_file: str
+    # The tree key of cwd at start, "" when unknown; records before 2026-10-21 have none.
+    tree_key: NotRequired[str]
     exit_code: NotRequired[int]
     finished_at: NotRequired[str]
     delivery: NotRequired[str]
@@ -168,6 +174,32 @@ def seat_name(session_dir: str, name: str) -> str:
     return matches[0] if len(matches) == 1 else name
 
 
+def _supervises(pid: int, record_path: Path) -> bool:
+    """Whether pid is the `supervise` process of this record, so a reused pid does not match."""
+    if pid <= 0:
+        return False
+    try:
+        parts = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+    except OSError:
+        return False
+    return "supervise" in parts and str(record_path) in parts and any(part.endswith("mesh_runs.py") for part in parts)
+
+
+def live_twin(runs: Path, worker: str, command: list[str], cwd: str, tree_key: str) -> RunRecord | None:
+    """A running record of the same seat, command, folder and tree key whose supervisor lives.
+    After an interrupt on 2026-10-21, hana_catalyst-inspectors started its lint run three times
+    on one tree; each run took memory, the cargo token and build time."""
+    if not tree_key:
+        return None
+    for path in sorted(runs.glob("*.json")):
+        raw = codex_mesh._read_json_object(path)  # pyright: ignore[reportPrivateUsage]
+        if (raw.get("status") == "running" and raw.get("worker") == worker and raw.get("command") == command
+                and raw.get("cwd") == cwd and raw.get("tree_key") == tree_key
+                and _supervises(codex_mesh._as_int(raw.get("pid")), path)):  # pyright: ignore[reportPrivateUsage]
+            return cast(RunRecord, cast(object, raw))
+    return None
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
@@ -193,21 +225,28 @@ def command_start(args: argparse.Namespace) -> int:
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
     runs = _runs_dir(session_dir)
     runs.mkdir(parents=True, exist_ok=True)
+    cwd = os.getcwd()
+    tree_key = treekey.tree_key(cwd) or ""
+    if twin := live_twin(runs, name, command, cwd, tree_key):
+        started = time.strftime("%H:%M:%S", time.localtime(twin["started_at"]))
+        print(f"run {twin['run_id']} is already running for {name} on these files (started {started}, "
+              + f"log {twin['log']}); started nothing; its result arrives as your next message")
+        return 0
     run_id = f"{time.strftime('%Y%m%dT%H%M%S')}-{os.getpid()}-{secrets.token_hex(2)}"
     record_path = runs / f"{run_id}.json"
     log_path = runs / f"{run_id}.log"
     record: RunRecord = {
         "run_id": run_id, "status": "running", "session_dir": session_dir, "worker": name,
-        "thread_id": thread_id, "label": label, "command": command, "cwd": os.getcwd(),
+        "thread_id": thread_id, "label": label, "command": command, "cwd": cwd,
         "log": str(log_path), "started_at": time.time(), "pid": 0,
-        "director_dir": director_dir, "done_message_file": done_file,
+        "director_dir": director_dir, "done_message_file": done_file, "tree_key": tree_key,
     }
     _write_record(record_path, record)
     with log_path.open("ab") as log:
         supervisor = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "supervise", str(record_path)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True, cwd=os.getcwd(),
+            start_new_session=True, cwd=cwd,
         )
     record["pid"] = supervisor.pid
     _write_record(record_path, record)
@@ -376,7 +415,7 @@ def command_supervise(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
-    start = verbs.add_parser("start", help="run a command detached for the calling worker")
+    start = verbs.add_parser("start", help="run a command detached for the calling worker, unless its same run is live")
     _ = start.add_argument("--session-dir", default="")
     _ = start.add_argument("--to", default="")
     _ = start.add_argument("--director-dir", default="", help="the run folder whose director hears results")
