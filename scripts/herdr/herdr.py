@@ -842,6 +842,141 @@ def herdr_binary() -> str:
     return binary
 
 
+# A tab or workspace gone from the shared session keeps its saved place this long, so a restart
+# puts it back where it was. A production retired for longer than this loses its place.
+LAYOUT_KEEP_SECONDS = 14 * 24 * 3600
+# A fresh server gets back each workspace seen this long before the last save: a restart cut short
+# by a second reboot still has the places of the sessions it did not reach.
+LAYOUT_RESTORE_SECONDS = 24 * 3600
+# The title of the shell tab a restart opens to hold a saved workspace's place until its first
+# session's tab arrives. herdr 0.9.5 cannot move a workspace, so creation order is the only order.
+LAYOUT_PLACEHOLDER = "restoring"
+
+
+class SavedName(TypedDict):
+    name: str
+    seen: float
+
+
+class SavedSpace(TypedDict):
+    name: str
+    seen: float
+    tabs: list[SavedName]
+
+
+class SavedLayout(TypedDict):
+    at: float
+    workspaces: list[SavedSpace]
+
+
+class _LiveSpace(NamedTuple):
+    workspace_id: str
+    label: str
+    tabs: list[str]
+
+
+def layout_path(session: str) -> Path:
+    """The shared session's saved workspace and tab order, under the state directory."""
+    _validate_session_name(session)
+    state = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(state) / "herdr" / f"layout-{session}.json"
+
+
+def saved_layout(session: str) -> SavedLayout:
+    """The last saved layout; an absent or unreadable file is an empty one."""
+    try:
+        data = cast(object, json.loads(layout_path(session).read_text(encoding="utf-8")))
+        root = json_object(data, "herdr layout")
+        at = root.get("at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            raise HerdrFailure("herdr layout at: expected a number")
+        spaces: list[SavedSpace] = []
+        for item in json_items(root.get("workspaces"), "herdr layout workspaces"):
+            space = json_object(item, "herdr layout workspace")
+            spaces.append(SavedSpace(name=json_text(space.get("name"), "herdr layout workspace name"),
+                                     seen=_seen(space.get("seen")),
+                                     tabs=[_saved_name(tab) for tab in json_items(space.get("tabs"), "herdr layout tabs")]))
+        return SavedLayout(at=float(at), workspaces=spaces)
+    except (OSError, ValueError, HerdrFailure):
+        return SavedLayout(at=0.0, workspaces=[])
+
+
+def _seen(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise HerdrFailure("herdr layout seen: expected a number")
+    return float(value)
+
+
+def _saved_name(value: object) -> SavedName:
+    item = json_object(value, "herdr layout tab")
+    return SavedName(name=json_text(item.get("name"), "herdr layout tab name"), seen=_seen(item.get("seen")))
+
+
+def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[SavedName]:
+    """Live names in live order, seen now; a saved name not live stays after the saved name before it.
+
+    A saved name unseen for longer than LAYOUT_KEEP_SECONDS is dropped.
+    """
+    result = [SavedName(name=name, seen=now) for name in live]
+    placed = set(live)
+    for index, entry in enumerate(saved):
+        if entry["name"] in placed or now - entry["seen"] > LAYOUT_KEEP_SECONDS:
+            continue
+        before = next((earlier["name"] for earlier in reversed(saved[:index]) if earlier["name"] in placed), None)
+        at = 0 if before is None else next(place for place, item in enumerate(result) if item["name"] == before) + 1
+        result.insert(at, SavedName(name=entry["name"], seen=entry["seen"]))
+        placed.add(entry["name"])
+    return result
+
+
+def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float) -> SavedLayout:
+    """The saved layout with the live one laid over it: live order wins, gone entries keep their places."""
+    tabs = {space["name"]: space["tabs"] for space in saved["workspaces"]}
+    live_tabs = {space.label: space.tabs for space in live}
+    order = merged_order([SavedName(name=space["name"], seen=space["seen"]) for space in saved["workspaces"]],
+                         [space.label for space in live], now)
+    return SavedLayout(at=now, workspaces=[
+        SavedSpace(name=entry["name"], seen=entry["seen"],
+                   tabs=merged_order(tabs.get(entry["name"], []), live_tabs.get(entry["name"], []), now))
+        for entry in order])
+
+
+def tab_order(space: str, titles: list[str], saved: list[SavedName]) -> list[int]:
+    """The indexes of `titles` in the order the workspace `space` shows them.
+
+    Saved tabs keep their saved order. A tab not saved goes by the A-Z rule: the showrunner's tab,
+    titled with the workspace's own name, first, else before the first saved tab that sorts after it.
+    """
+    def rule(title: str) -> tuple[bool, str]:
+        return (title != space, title)
+
+    places = {entry["name"]: place for place, entry in enumerate(saved)}
+    order = sorted((index for index, title in enumerate(titles) if title in places), key=lambda index: places[titles[index]])
+    for index in sorted((index for index, title in enumerate(titles) if title not in places), key=lambda index: rule(titles[index])):
+        # The first tab stays first: it is the showrunner's, also when its title is not the workspace's name.
+        start = 0 if titles[index] == space or not order else 1
+        at = next((place for place in range(start, len(order)) if rule(titles[order[place]]) > rule(titles[index])), len(order))
+        order.insert(at, index)
+    return order
+
+
+class _LayoutLock:
+    """One launcher at a time changes the shared session's workspaces and tab order."""
+
+    def __init__(self, session: str) -> None:
+        self.path: Path = layout_path(session).with_suffix(".lock")
+        self.handle: int = -1
+
+    def __enter__(self) -> None:
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.handle, fcntl.LOCK_EX)
+
+    def __exit__(self, *_: object) -> None:
+        os.close(self.handle)
+
+
 class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
@@ -917,25 +1052,98 @@ class Herdr:
         return pane
 
     def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
-        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first."""
+        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first.
+
+        A server that holds none of the saved workspaces gets them all first, in their saved order,
+        each holding a placeholder tab until its first session's tab arrives.
+        """
         options = ["--label", title, "--cwd", cwd]
         for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
+        with _LayoutLock(self.session):
+            saved = saved_layout(self.session)
+            workspace = self._workspace_named(space)
+            if workspace is None and self._place_saved_workspaces(saved):
+                workspace = self._workspace_named(space)
+            if workspace is not None:
+                result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
+            else:
+                options[1] = space
+                result = self.result("workspace", "create", *options, "--no-focus")
+                tab = json_text(json_object(result.get("tab"), "herdr workspace tab").get("tab_id"), "herdr tab id")
+                _ = self.run("tab", "rename", tab, title)
+            root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
+            pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
+            _ = self.run("pane", "rename", pane, title)
+            if workspace is not None:
+                self._close_placeholders(workspace)
+                pane = self.order_tabs(workspace, saved).get(pane, pane)
+            self.save_layout()
+            return pane
+
+    def _workspace_named(self, space: str) -> str | None:
         workspaces = [json_object(item, "herdr workspace") for item in json_items(
             self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
         found = [item for item in workspaces if item.get("label") == space]
-        workspace = json_text(found[0].get("workspace_id"), "herdr workspace id") if found else None
-        if workspace is not None:
-            result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
-        else:
-            options[1] = space
-            result = self.result("workspace", "create", *options, "--no-focus")
+        return json_text(found[0].get("workspace_id"), "herdr workspace id") if found else None
+
+    def _place_saved_workspaces(self, saved: SavedLayout) -> bool:
+        """Create the recently live workspaces in saved order, when the server holds none of them."""
+        wanted = [space["name"] for space in saved["workspaces"] if space["seen"] >= saved["at"] - LAYOUT_RESTORE_SECONDS]
+        if not wanted or {space.label for space in self.live_layout()} & set(wanted):
+            return False
+        home = str(Path.home())
+        for name in wanted:
+            result = self.result("workspace", "create", "--label", name, "--cwd", home, "--no-focus")
             tab = json_text(json_object(result.get("tab"), "herdr workspace tab").get("tab_id"), "herdr tab id")
-            _ = self.run("tab", "rename", tab, title)
-        root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
-        pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
-        _ = self.run("pane", "rename", pane, title)
-        return pane if workspace is None else self.order_tabs(workspace).get(pane, pane)
+            pane = json_text(json_object(result.get("root_pane"), "herdr workspace root pane").get("pane_id"),
+                             "herdr workspace root pane id")
+            _ = self.run("tab", "rename", tab, LAYOUT_PLACEHOLDER)
+            _ = self.run("pane", "rename", pane, LAYOUT_PLACEHOLDER)
+        return True
+
+    def _close_placeholders(self, workspace: str) -> None:
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
+        for tab in tabs:
+            if tab.get("label") == LAYOUT_PLACEHOLDER and tab.get("pane_count") == 1:
+                _ = self.run("tab", "close", json_text(tab.get("tab_id"), "herdr tab id"))
+
+    def live_layout(self) -> list[_LiveSpace]:
+        """The session's workspaces in order, each with its tab titles in order, placeholders left out."""
+        workspaces = [json_object(item, "herdr workspace") for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list").get("tabs"), "herdr tab list")]
+        spaces: list[_LiveSpace] = []
+        for workspace in workspaces:
+            ident = json_text(workspace.get("workspace_id"), "herdr workspace id")
+            label = workspace.get("label")
+            titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs if tab.get("workspace_id") == ident]
+            if isinstance(label, str) and label:
+                spaces.append(_LiveSpace(ident, label, titles))
+        return spaces
+
+    def save_layout(self) -> None:
+        """`record_layout`, where a failure is a line on stderr: the tab is open, and only its saved place waits."""
+        try:
+            self.record_layout()
+        except (HerdrFailure, OSError) as error:
+            print(f"herdr {self.session}: layout not saved: {error}", file=sys.stderr)
+
+    def record_layout(self) -> None:
+        """Save the live workspace and tab order over the saved one. A server with no session tab saves nothing."""
+        live = [space._replace(tabs=[title for title in space.tabs if title != LAYOUT_PLACEHOLDER])
+                for space in self.live_layout()]
+        live = [space for space in live if space.tabs]
+        if not live:
+            return
+        path = layout_path(self.session)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        _ = staged.write_text(json.dumps(merged_layout(saved_layout(self.session), live, time.time()), indent=1) + "\n",
+                              encoding="utf-8")
+        _ = staged.replace(path)
 
     def retitle(self, pane: str, title: str) -> bool:
         """Give the pane and its tab the name `title`, then order the workspace's tabs again.
@@ -958,13 +1166,15 @@ class Herdr:
             _ = self.run("pane", "rename", pane, title)
         if shown != title:
             _ = self.run("tab", "rename", tab, title)
-            _ = self.order_tabs(workspace)
+            with _LayoutLock(self.session):
+                _ = self.order_tabs(workspace, saved_layout(self.session))
+                self.save_layout()
         return True
 
-    def order_tabs(self, workspace: str) -> dict[str, str]:
-        """Put the workspace's showrunner tab first and its other tabs in alphabetical order.
+    def order_tabs(self, workspace: str, saved: SavedLayout) -> dict[str, str]:
+        """Put the workspace's tabs in their saved order, and each tab not saved in its A-Z place (`tab_order`).
 
-        The showrunner's tab carries the workspace's own name. herdr 0.9.5 cannot move a tab, but a
+        herdr 0.9.5 cannot move a tab, but a
         pane moved into a new tab puts that tab last: so every tab from the first one out of place
         moves, in order. Each pane keeps its process, and focus goes back where it was. A tab with
         several panes leaves the order as it is. Returns each moved pane's new id by its old one.
@@ -975,7 +1185,9 @@ class Herdr:
         tabs = [json_object(item, "herdr tab") for item in json_items(
             self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
         titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
-        order = sorted(range(len(tabs)), key=lambda index: (titles[index] != name, titles[index]))
+        unsaved: list[SavedName] = []
+        kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
+        order = tab_order(name if isinstance(name, str) else "", titles, kept)
         start = next((place for place, index in enumerate(order) if index != place), len(tabs))
         if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
             return {}
@@ -1909,6 +2121,18 @@ def shared_session() -> str:
 
 def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
     return Herdr(name).open_tab(space, title, cwd, environment)
+
+
+def save_shared_layout(running: set[str]) -> None:
+    """Save the shared session's workspace and tab order, when that session is among the `running` ones.
+
+    A tab the user renamed in herdr reaches the saved layout here; launchers save after each change.
+    """
+    name = shared_session()
+    if name in running:
+        client = Herdr(name)
+        with _LayoutLock(name):
+            client.save_layout()
 
 
 def close_agent(session: str, pane: str) -> None:
