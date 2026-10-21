@@ -51,6 +51,8 @@ class PushText:
     action: ActionTemplate | NoActionNeeded
     body: str
     examples: tuple[PushExample, ...]
+    # One line for /nate help: when the push goes out. Not part of the approval fingerprint.
+    purpose: str
     session: SessionTemplate | NoSessionLine = NO_SESSION_LINE
     # False: the phone shows the title and body exactly as rendered, with no
     # "No action needed." line. Only an entry with no action and no session can opt out.
@@ -121,6 +123,27 @@ def render(id: str, **values: str) -> RenderedPush:
         if entry.id == id:
             return render_entry(entry, values)
     raise ValueError(f"unknown push text id: {id}")
+
+
+def listing(entries: tuple[PushText, ...]) -> str:
+    """One line per entry, sorted by id: the id in one column, then its purpose."""
+    ordered = sorted(entries, key=lambda entry: entry.id)
+    width = max(len(entry.id) for entry in ordered)
+    return "\n".join(f"{entry.id:<{width}}  {entry.purpose}" for entry in ordered)
+
+
+def shown(entry: PushText) -> str:
+    """The entry's template with its placeholders, then its first example as the phone shows it."""
+    template = RenderedPush(entry.id, entry.sender, entry.need, entry.title,
+                            ActionRequired(entry.action.text) if isinstance(entry.action, ActionTemplate) else NoActionRequired(),
+                            entry.body, {},
+                            SessionLine(entry.session.text) if isinstance(entry.session, SessionTemplate) else NO_SESSION_LINE,
+                            entry.header)
+    example = entry.examples[0]
+    filled = render_entry(entry, example.values)
+    return (f"{entry.id}  {entry.purpose}\n\n"
+            + f"Template:\nTitle: {template.title}\n{template.message}\n\n"
+            + f"Example ({example.name}):\nTitle: {filled.title}\n{filled.message}")
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",

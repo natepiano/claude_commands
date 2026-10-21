@@ -1613,7 +1613,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         import push_texts
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
             push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
-            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+            (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
         with mock.patch.object(push_texts, "catalog", return_value=(entry,)), mock.patch.object(send, "run", return_value=(1, "", "offline")):
             result = send.send(local_options(["--to", "user", "--text-id", "test"]))
         self.assertIsInstance(result.failure, send.FailedPush)
