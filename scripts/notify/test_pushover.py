@@ -25,7 +25,8 @@ import push_texts
 import silence
 from test_review import FakeReviewer, verdict
 from user_action import (FIX, ActionAllowed, ActionRefused, ActionRequired, ActionUnstated,
-                         NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at)
+                         NoActionRequired, SessionLine, NO_SESSION_LINE, split_session, first_line, parse_user_action, refused_at,
+                         shown_session_names)
 
 REAL_REVIEW = review.review
 
@@ -127,6 +128,28 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(form["message"], ["Session: Owner\nAction: stop Owner\nReason: waiting."])
         self.assertIn('"session": "Owner"', output.getvalue())
+
+    def test_session_names_lose_the_unit_suffix_in_free_and_registered_pushes(self) -> None:
+        code, form = self.run_send(["--action", "open the herdr-unit pane", "messaging-unit stopped",
+                                    "Session: style-unit\nmessaging-unit waits. Path ~/worktrees/x-unit/y stays."])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], ["messaging stopped"])
+        self.assertEqual(form["message"], ["Session: style\nAction: open the herdr pane\nmessaging waits. Path ~/worktrees/x-unit/y stays."])
+        entry = push_texts.PushText("test", "shutdown", "decision", "{session} is blocked",
+            push_texts.ActionTemplate("stop {session}"), "Reason: {session} waits.",
+            (push_texts.PushExample("typical", {"session": "types-unit"}),), session=push_texts.SessionTemplate("{session}"))
+        pushover.LOG_FILE.unlink()
+        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()):
+            code, form = self.run_send(["--text-id", "test", "--value", "session=types-unit"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], ["types is blocked"])
+        self.assertEqual(form["message"], ["Session: types\nAction: stop types\nReason: types waits."])
+
+    def test_unit_suffix_rule_leaves_other_words_alone(self) -> None:
+        for text, shown in (("a unit", "a unit"), ("x-unit-test", "x-unit-test"), ("build-followups-messaging", "build-followups-messaging"),
+                            ("(herdr-unit).", "(herdr)."), ("/a/style-unit/b", "/a/style-unit/b")):
+            with self.subTest(text=text):
+                self.assertEqual(shown_session_names(text), shown)
 
     def test_session_header_counts_toward_the_post_limit_without_truncation(self) -> None:
         code, form = self.run_send(["--action", "stop Owner", "Owner is blocked", "Session: Owner\n" + "x" * 1200])

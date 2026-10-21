@@ -10,6 +10,8 @@ every message follows are /message (~/.claude/commands/message.md).
           (--text TEXT | --file PATH | stdin)
   send.py --to user --summary TITLE [--need note|decision|blocked]
           (--action TEXT | --no-action) ...                              the user
+  send.py --to user --text-id ID --value KEY=VALUE ...    a registered push; --help lists
+                                                          the ones a session sends
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
@@ -55,6 +57,8 @@ message text as one JSON line in STATE/log.jsonl:
   KEPT: why      the user's silence is on; posted when it ends    exit 0
   REFUSED: why   rejected before delivery; not kept              exit 2
   HELD: not sent, failed review; revise and resend, no fallback     exit 4
+        also a free-text push that reports an auto-mode refusal:
+        the detail gives the auto_mode.refused call to send instead
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -65,6 +69,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -106,6 +111,20 @@ USER_CHANNEL = Path(__file__).resolve().parent.parent / "notify" / "pushover.py"
 # On the remote host: its own interpreter shim and copy of this script.
 REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py"'
 MODEL = "sonnet"
+AUTO_MODE_TEXT = "auto_mode.refused"
+AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id auto_mode.refused'
+                  + ' --value session=<session> --value machine=<machine> --value count=<number of commands>'
+                  + ' --value "does=<what they do; the verb agrees with count>" --value "waits=<a sentence: what waits>"'
+                  + ' [--value "rule=<the allow rule>"]')
+# Registered pushes a session sends itself with --text-id; `send.py --help` lists them.
+SESSION_TEMPLATES = {
+    AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
+    "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
+}
+AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
+AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
+AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
+                  + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
 # One relay took 9 s when measured; quota_alert.py's budget is built on this.
 TIMEOUT = 40
@@ -1172,14 +1191,43 @@ def user_failure(message: Message, action: MessageUserAction, result: Result, ne
     return Result(result.outcome, result.detail, failed)
 
 
-def default_sender() -> str:
-    """send.py, and the Claude session it runs under when there is one."""
+def own_session_name() -> str:
+    """The name of the Claude session this runs under, or "" when there is none."""
     try:
         record = as_dict(loads((SESSIONS / f"{os.environ['CLAUDE_PID']}.json").read_text(encoding="utf-8")))
     except (KeyError, OSError):
-        return "send.py"
-    name = as_str(record.get("name"))
+        return ""
+    return as_str(record.get("name"))
+
+
+def default_sender() -> str:
+    """send.py, and the Claude session it runs under when there is one."""
+    name = own_session_name()
     return f"send.py in {name}" if name else "send.py"
+
+
+def auto_mode_values(values: dict[str, str], sender: str) -> dict[str, str]:
+    """The auto_mode.refused values: the session gives the facts, this fills the sender and the grammar."""
+    if not sender:
+        raise ValueError(AUTO_MODE_TEXT + " is sent by a Claude session: its sender is that session's name,"
+                         + " and this run has no session record")
+    given = set(values)
+    required = {"session", "machine", "count", "does", "waits"}
+    if not required <= given or not given <= required | {"rule"}:
+        raise ValueError(AUTO_MODE_TEXT + " takes --value session, machine, count, does, waits and an optional rule;"
+                         + f" missing {sorted(required - given)}; extra {sorted(given - required - {'rule'})}")
+    count = values["count"]
+    if not count.isdigit() or int(count) < 1:
+        raise ValueError(AUTO_MODE_TEXT + ": count is the number of refused commands, 1 or more")
+    one = int(count) == 1
+    rule = values.get("rule", "").strip()
+    return {"sender": sender, "session": values["session"], "machine": values["machine"], "count": str(int(count)),
+            "noun": "command" if one else "commands", "they": "It" if one else "They", "this": "this" if one else "these",
+            "does": values["does"], "waits": values["waits"], "rule_line": " The rule: " + rule if rule else ""}
+
+
+def reports_auto_mode_refusal(text: str) -> bool:
+    return AUTO_MODE_REPORT.search(text) is not None and AUTO_MODE_REFUSAL.search(text) is not None
 
 
 def attr(args: argparse.Namespace, name: str) -> object:
@@ -1201,7 +1249,10 @@ def parse(argv: list[str]) -> Options:
                                          "session:<id>, worker:<run id>/<worker name>, "
                                          "codex:<thread id>, or user."
                                      ),
-                                     epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]")
+                                     formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="Also: send.py ack KEY | reopen KEY | pending [NAME]\n\n"
+                                     + "Registered pushes a session sends with --text-id:\n"
+                                     + "\n".join(f"  {text_id}: {use}" for text_id, use in SESSION_TEMPLATES.items()))
     _ = parser.add_argument(
         "--to",
         required=True,
@@ -1246,6 +1297,11 @@ def parse(argv: list[str]) -> Options:
                 parser.error("--value needs distinct key=value pairs")
             values[key] = item
         try:
+            if text_id == AUTO_MODE_TEXT:
+                if attr(args, "sender") is not None or attr(args, "machine") is not None:
+                    parser.error(AUTO_MODE_TEXT + " takes no --from or --machine: it goes from this session's own name and machine")
+                values = auto_mode_values(values, own_session_name())
+                raw_values = [f"{key}={item}" for key, item in values.items()]
             rendered = push_texts.render(text_id, **values)
         except ValueError as error:
             parser.error(str(error))
@@ -1367,9 +1423,14 @@ def send(options: Options) -> Result:
     message = Message(destination, sender, summary, text, options.key)
     started = now()
     window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
-    skip = claim(message, window, started)
+    # Held before the claim, so the resend with the template is not skipped by --repeat-minutes.
+    wrong_template = (options.to == USER and options.text_id != AUTO_MODE_TEXT
+                      and reports_auto_mode_refusal(summary + "\n" + text))
+    skip = None if wrong_template else claim(message, window, started)
     log_route: Route = NO_CLAUDE_ROUTE
-    if skip is not None:
+    if wrong_template:
+        result = Result("held", AUTO_MODE_HELD)
+    elif skip is not None:
         result = Result("skipped", skip)
     elif isinstance(route, RecipientLookupFailed):
         result = Result("failed", route.reason)

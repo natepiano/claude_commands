@@ -109,6 +109,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 
   This logic lives in `user_action.py`: `parse_user_action`, `refused_at`, `FIX` and `REFUSED_BEFORE_SENDING`.
 - `user_action.py` also holds `SessionLine`, `NoSessionLine`, `NotificationSession`, `NO_SESSION_LINE`, `split_session`, `session_prefix` and `first_line(action, session)`. Every reader of the header keeps `Session: …` above `Action: …`.
+- `parse()` drops a trailing `-unit` from session names in the title, the Session line, the action and the body of every push, registered or free text (`user_action.shown_session_names`; user, 2026-10-21). A path part such as `/messaging-unit/` stays.
 - Review order: the hold lookup runs first (it is skipped for `--text-id`). Then `review.review()` runs, unless `review_off` exists, in which case the push goes out as written with detail `review: off`. A `Questions` outcome is treated as `Failed`.
 - `pushover: reviewed JSON: {title, action, body[, session, text_id, failed_rules, findings, held, sent_despite_failed_review, held_source, held_identity]}` is printed before any post. `send.py` reads it.
 - Failed or Withheld:
@@ -135,6 +136,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
 | `SENT: to the user, sent despite failed review: [rules]` | 0 | pushover 0 with `sent_despite_failed_review` |
 | `HELD: not sent, failed review: <why> This push was not sent because it failed review. Revise it and resend it with send.py; no fallback is allowed.` | 4 | pushover 6 |
 | `HELD: <pushover message>` | 4 | pushover 4 (no marker) |
+| `HELD: not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: <call>` | 4 | `send()`, before the claim and pushover (no marker) |
 | `REPLACED: a newer version replaced this push; nothing was sent` | 0 | pushover 5 (no marker) |
 | `REFUSED: <why>` | 2 | pushover 2 with `refused before sending:` (no marker) |
 | `FAILED: the user was not reached: <why> fallback text:` + one line, or `… <UNREVIEWED_FALLBACK>` | 3 | Any other failure: exit 1, keys missing, timeout |
@@ -145,6 +147,8 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
   - `text` is the fallback line: `<title> — <header>` with whitespace collapsed (the `Session:` line included when present), at most 200 characters, cut at a word boundary with `…`.
   - `reviewed` is true only when the text came from a `pushover: reviewed JSON:` line.
 - `user_failure()` writes the fallback marker `~/.local/state/notify/failed/<session_id>.json` under `failed/.lock`. It does this only when `$CLAUDE_PID` resolves a `sessionId` from `~/.claude/sessions/<pid>.json`, and never on a refusal. The marker holds `time`, `title`, `action`, `body`, `message`, `fallback`, `reviewed`, `need`, `held`, and optionally `held_source`, `held_identity` and `held_machine` (empty means local).
+- An auto-mode refusal goes only through `--text-id auto_mode.refused`. A push without it whose title or text has `auto mode` (or `auto-mode`) and `refused`, `denied` or `stopped` is held, before the claim, so a resend with the template is not skipped by `--repeat-minutes`.
+- `--text-id auto_mode.refused`: the session gives `session`, `machine`, `count`, `does`, `waits` and an optional `rule`. `auto_mode_values()` fills `sender` from the session's own record (`own_session_name()`), and `noun`, `they`, `this` and `rule_line` from `count` and `rule`. It refuses `--value sender`, `--from`, `--machine` and a run with no session record. `send.py --help` lists the templates a session sends (`SESSION_TEMPLATES`).
 - The wait for a user send is raised to at least `review.user_send_seconds()`.
 - `--answerable` is an internal flag, valid only with `--to user`. `send.py` sets it automatically when there is no `--from` and the default sender resolved a session name, and `remote()` forwards it. It is recorded in the `Draft` but no longer changes the outcome.
 - Remote (`--machine HOST`): `remote()` runs `CLAUDE_PID= send.py --here …` over `ssh -o BatchMode=yes -o ConnectTimeout=10`, so the far side never writes a marker:
@@ -190,6 +194,7 @@ The gate is a PreToolUse hook. Its `settings.json` entry has matcher `PushNotifi
   - `fingerprint(entry)` is the sha256 over the templates and every example's values and filled text.
   - `REVIEWED_FILE` and `catalog()`, which loads `push_catalog.ENTRIES` and checks for unique ids and named examples.
 - `scripts/notify/push_catalog.py` holds every fixed phone text, from scripts and from nixos, each with realistic examples. A comment says where the examples come from. Entry ids include `shutdown.*`, `quota.*`, `rust.*`, `sweep.disk_floor`, `codex.reset_ready` and `nixos.{disk_low,ups_battery,ups_shutdown}`.
+- `auto_mode.refused` (user approved 2026-10-21, need `decision`): title `{sender}: auto mode stopped {session}`, `Session: {session}`, Action `On {machine}, in the {session} pane, approve the prompt or add an allow rule`, then the refusal line and the `Approve:` and `Allow rule:` choice lines.
 - Shutdown holdout texts. `settle.HoldoutKind.from_reason` picks one of two entries:
   - `shutdown.holdout` when a form is shown.
   - `shutdown.holdout_unanswered` for any other hold.

@@ -1366,6 +1366,65 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def failure_marker(self) -> Path:
         return self.root / "notify/failed/writer-id.json"
 
+    def auto_mode_arguments(self, *extra: str, **changed: str) -> list[str]:
+        values = {"session": "types", "machine": "natedev", "count": "2", "does": "save and merge one finished ticket",
+                  "waits": "Three builds you approved wait for them"} | changed
+        return ["--to", "user", "--text-id", "auto_mode.refused",
+                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")), *extra]
+
+    def test_auto_mode_template_takes_its_sender_from_this_session_and_fills_the_grammar(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-style"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options(self.auto_mode_arguments())
+        self.assertEqual(options.summary, "cargo-liner-style: auto mode stopped types")
+        self.assertEqual(options.sender, "cargo-liner-style")
+        self.assertEqual(options.need, "decision")
+        self.assertIn("sender=cargo-liner-style", options.values)
+        self.assertIn("rule_line=", options.values)
+        self.assertIn("Auto mode refused 2 commands in types. They save", options.text or "")
+        one = local_options(self.auto_mode_arguments(count="1", does="pushes the work", waits="The merge waits for it",
+                                                     rule="Bash(git push:*)"))
+        self.assertIn("refused 1 command in types. It pushes the work.", one.text or "")
+        self.assertTrue((one.text or "").endswith("never stops on this command again. The rule: Bash(git push:*)"))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "auto_mode.refused")
+        self.assertIn("sender=cargo-liner-style", command)
+        for arguments in (self.auto_mode_arguments("--value", "sender=someone"), self.auto_mode_arguments("--from", "someone"),
+                          self.auto_mode_arguments("--machine", "mac"), self.auto_mode_arguments(count="0"),
+                          self.auto_mode_arguments(count="two"), self.auto_mode_arguments(colour="red")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.parse(arguments)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = send.parse(["--here", *self.auto_mode_arguments()])
+        self.assertIn("no session record", errors.getvalue())
+
+    def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
+        self.writer_session()
+        for title, text in (("types: auto mode stopped", "It waits."), ("Build stopped", "Auto-mode DENIED two commands in types.")):
+            with (self.subTest(title=title), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                                  "--action", "Approve in the types pane", "--key", "auto", "--repeat-minutes", "30",
+                                  "--text", text])
+            self.assertEqual(code, 4)
+            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push reports an auto-mode refusal."))
+            self.assertIn("--text-id auto_mode.refused --value session=<session>", output.getvalue())
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "held")
+        # The hold claims no repeat window: the resend with the template goes out.
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "types"}))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options([*self.auto_mode_arguments(), "--key", "auto", "--repeat-minutes", "30"])).outcome, "sent")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options(self.user_arguments("--key", "plain"))).outcome, "sent")
+
+    def test_help_lists_the_auto_mode_template_and_when_to_use_it(self) -> None:
+        with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
+            _ = send.parse(["--help"])
+        self.assertIn("auto_mode.refused: auto mode refused a command and the session waits for the user.", output.getvalue())
+
     def test_cancelled_user_revision_reports_replaced_locally_and_remotely_without_a_fallback(self) -> None:
         self.writer_session()
         reason = "a newer version replaced this push; nothing was sent"

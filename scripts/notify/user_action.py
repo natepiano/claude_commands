@@ -6,6 +6,7 @@ is reserved for an action the user must take now because work cannot continue.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 FIX = ('Say what the user does with --action "<what they do>", or pass '
@@ -13,6 +14,8 @@ FIX = ('Say what the user does with --action "<what they do>", or pass '
 REFUSED_BEFORE_SENDING = "refused before sending"
 
 _PLACEHOLDERS = frozenset(("none", "n/a", "nothing", "no action", "-"))
+# A session name such as "messaging-unit": the user sees it as "messaging". Path parts stay as written.
+_UNIT_SUFFIX = re.compile(r"(?<![\w/.-])([A-Za-z0-9][\w-]*?)-unit(?![\w/-])")
 
 
 @dataclass(frozen=True)
@@ -94,3 +97,8 @@ def first_line(action: UserAction, session: NotificationSession = NO_SESSION_LIN
     if isinstance(action, ActionRequired):
         return session_prefix(session) + f"Action: {action.text}"
     return session_prefix(session) + "No action needed."
+
+
+def shown_session_names(text: str) -> str:
+    """Drop the trailing "-unit" from each session name: pushes show the name the user knows."""
+    return _UNIT_SUFFIX.sub(r"\1", text)
