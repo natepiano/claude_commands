@@ -112,7 +112,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
   1. one `remove_workers.py` call with a `--session-dir` per held run
   2. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
   3. one `sweep --root <root of the first held run> --stop`
-  4. one `remove_run_scratch.py` call for every held run: it removes `verify_cache/` and every git checkout (a folder holding `.git`, a folder or a file) and cargo target (a folder holding `.rustc_info.json` or `CACHEDIR.TAG`) at any depth, without descending into what it removes or following a link; ledgers, logs, diffs, json and the run folder stay (2026-10-21: gate copies under `phases/`, exports under `scratch/` and builds such as `p62_bin` had filled run folders)
+  4. one `remove_run_scratch.py` call for every held run: it removes `verify_cache/` and every git checkout (a folder holding `.git`, a folder or a file) and cargo target (a folder holding `.rustc_info.json` or `CACHEDIR.TAG`) at any depth, without descending into what it removes or following a link; a linked worktree goes through `git worktree remove --force --force` in its source repo, or is deleted and its source pruned, so no stale entry keeps its branch "already checked out"; ledgers, logs, diffs, json and the run folder stay (2026-10-21: gate copies under `phases/`, exports under `scratch/` and builds such as `p62_bin` had filled run folders)
   5. removal of the marker run's notifier
   6. removal of the run-active marker
 

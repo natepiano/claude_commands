@@ -14,6 +14,11 @@ folder the ending director holds. In each one this removes:
   * every folder, at any depth, that holds .rustc_info.json or CACHEDIR.TAG: a
     cargo target.
 
+A checkout whose .git is a file is a linked worktree. It goes through its
+source repo (git worktree remove), so the source keeps no stale entry; a stale
+entry keeps the branch "already checked out" and the next git worktree add of
+it refuses. When that fails, the folder is deleted and the source pruned.
+
 It never descends into a folder it removes. A symbolic link is never followed:
 it is not a folder to this walk, and shutil.rmtree unlinks a link it finds, so
 nothing outside the run folder is reached. The run folder itself stays, with
@@ -25,6 +30,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import cast
@@ -59,6 +65,49 @@ def scratch_folders(run: Path) -> list[Path]:
     return found
 
 
+def worktree_source(folder: Path) -> Path | None:
+    """The common git folder of the repo folder is a linked worktree of, or None when folder is no
+    linked worktree. .git holds "gitdir: <common>/worktrees/<name>"; that folder names the common
+    one in its commondir file, which is read when present."""
+    dot_git = folder / ".git"
+    if dot_git.is_symlink() or not dot_git.is_file():
+        return None
+    try:
+        line = dot_git.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    gitdir = Path(line.removeprefix("gitdir:").strip())
+    if not gitdir.is_absolute():
+        gitdir = folder / gitdir
+    try:
+        common = (gitdir / (gitdir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+    except (OSError, UnicodeDecodeError):
+        common = gitdir.parent.parent
+    return common if common.is_dir() else None
+
+
+def git(common: Path, *arguments: str) -> bool:
+    try:
+        result = subprocess.run(["git", "--git-dir", str(common), "worktree", *arguments],
+                                check=False, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def remove(folder: Path) -> None:
+    """Remove one scratch folder; a linked worktree through its source repo, so no entry stays."""
+    source = worktree_source(folder)
+    # Twice --force also removes a locked worktree: the run that locked it has ended.
+    if source is not None and git(source, "remove", "--force", "--force", str(folder)):
+        return
+    shutil.rmtree(folder)
+    if source is not None:
+        _ = git(source, "prune")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0] if __doc__ else None)
     _ = parser.add_argument("runs", nargs="*", help="run folders whose scratch copies go")
@@ -68,7 +117,7 @@ def main() -> int:
         removed = 0
         for folder in scratch_folders(run):
             try:
-                shutil.rmtree(folder)
+                remove(folder)
             except OSError as error:
                 failed += 1
                 print(f"remove_run_scratch: could not remove {folder}: {error}", file=sys.stderr)

@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.direct import remove_run_scratch
 
@@ -78,6 +79,61 @@ class RemoveRunScratchTests(unittest.TestCase):
 
         self.assertEqual((result.returncode, result.stdout), (0, ""))
         self.assertTrue((run / "verify_cache").is_dir())
+
+    def worktree_run(self) -> tuple[Path, Path, Path]:
+        """A source repo, and a run folder holding a linked worktree of its branch copy."""
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        source, run = root / "source", root / "run"
+        def git(*arguments: str) -> None:
+            _ = subprocess.run(["git", "-C", str(source), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
+                               check=True, capture_output=True)
+        source.mkdir()
+        git("init", "-q", "-b", "main")
+        git("commit", "-q", "--allow-empty", "-m", "start")
+        git("branch", "copy")
+        run.mkdir()
+        git("worktree", "add", "-q", str(run / "phases" / "p4" / "gate"), "copy")
+        return source, run, run / "phases" / "p4" / "gate"
+
+    def worktrees(self, source: Path) -> list[str]:
+        listing = subprocess.run(["git", "-C", str(source), "worktree", "list", "--porcelain"],
+                                 check=True, capture_output=True, text=True).stdout
+        return [line.removeprefix("worktree ") for line in listing.splitlines() if line.startswith("worktree ")]
+
+    def test_a_worktree_copy_leaves_no_entry_in_its_source_repo(self) -> None:
+        # A stale entry keeps the branch "already checked out", so the next worktree add of it refuses.
+        source, run, gate = self.worktree_run()
+
+        result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(gate.exists())
+        self.assertEqual(self.worktrees(source), [str(source)])
+        _ = subprocess.run(["git", "-C", str(source), "worktree", "add", "-q", str(gate), "copy"],
+                           check=True, capture_output=True)
+
+    def test_a_worktree_the_source_cannot_remove_is_deleted_and_the_source_pruned(self) -> None:
+        source, _, gate = self.worktree_run()
+        real = remove_run_scratch.git
+        def refuse_remove(common: Path, *arguments: str) -> bool:
+            return False if arguments[0] == "remove" else real(common, *arguments)
+
+        with mock.patch.object(remove_run_scratch, "git", side_effect=refuse_remove) as git:
+            remove_run_scratch.remove(gate)
+
+        self.assertEqual([call.args[1] for call in git.call_args_list], ["remove", "prune"])
+        self.assertFalse(gate.exists())
+        self.assertEqual(self.worktrees(source), [str(source)])
+
+    def test_a_worktree_whose_source_is_gone_is_still_deleted(self) -> None:
+        source, run, gate = self.worktree_run()
+        _ = subprocess.run(["rm", "-rf", str(source)], check=True)
+        self.assertIsNone(remove_run_scratch.worktree_source(gate))
+
+        result = subprocess.run([sys.executable, str(SCRIPT), str(run)], check=False, capture_output=True, text=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(gate.exists())
 
 
 if __name__ == "__main__":
