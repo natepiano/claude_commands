@@ -983,30 +983,23 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Ruled out:** resolving `extern crate` aliases to compare argument paths (it gave two wrong follows); a manual follow command; picking the best score or first file among candidates; `before`/`after` prose as rename proof; ignoring changed doc-comment lines to raise a body score.
 
 ### Phase 36 — two filer runs at once never skip a decision  · status: done
-**Depends on:** none
 
-#### Work Order
-**Goal:** two `proposal_issue` runs filing decisions into the same issues folder at the same time both succeed; neither skips a decision or exits 1.
+#### As-built
 
-**Spec:**
-- Cause (read, not assumed): the issue path is fixed by the decision key, never by the P number. `style_proposals.DecisionWriter.create` (`scripts/style/style_proposals.py` ~:327) passes `proposals / batch_name(key)`, and later lookups find the decision by that name. `proposal_issue.create` (`scripts/production/proposal_issue.py` ~:473-490) checks `path.exists()` and the decision key **before** it takes `_folder_lock(path.parent)`. Two runs filing the same key both pass that check; the first takes the lock, links its file and releases; the second then takes the lock, and `_create_numbered`'s `os.link(temporary, path)` (~:519) raises `FileExistsError` (Errno 17, message names the `.decision-*` temp file). Seen in cargo-liner-style 2026-10-20: `proposal_issue: [Errno 17] File exists: hanadocs/issues/.decision-zt2xby3s`.
-- Fix: inside `_folder_lock(path.parent)`, read the path again before numbering. When it exists with the same `style_rule`, `style_crate` and `style_rule_blob`, return `False` (already filed, nothing written). When it exists with a different key, raise the same `Refusal(f"{path}: different decision key")`. Only when it is still absent, number and link as today. Keep the pre-lock check as the fast path, or fold both into one helper; one rule, one place.
-- Keep `_folder_lock`: it is what gives two different decisions two different P numbers. Never pick another file name, never `os.replace` onto an existing issue (that would overwrite the other run's decision), and add no retry loop.
-- The temp file is always removed, on success and on failure (the existing `finally` holds this; keep it).
-- `number()` (~:192) already reads the issue inside the folder lock; leave it.
+- `proposal_issue.create` reads the decision path two times through `_decision_path_state(path, keys)`. The first read is a fast path before `_folder_lock(path.parent)`. The second read is inside the lock, before `_create_numbered`.
+- `_decision_path_state` returns `DecisionPathState.AVAILABLE` when the path is absent. It returns `DecisionPathState.ALREADY_FILED` when the file holds the same `style_rule`, `style_crate` and `style_rule_blob`. A different key raises `Refusal(f"{path}: different decision key")`.
+- On `ALREADY_FILED`, `create` returns `False` and writes nothing. The file of the other run stays byte-identical. Only `AVAILABLE` inside the lock numbers the issue and links the temp file. The `finally` always removes the `.decision-*` temp file.
+- The decision key sets the issue path (`batch_name(key)`), not the P number. `_folder_lock` gives two different decisions two different P numbers. `number()` reads the issue inside the lock, as before.
 
 **Files:**
-- `scripts/production/proposal_issue.py`
-- `scripts/production/test_proposal_issue.py`
+- `scripts/production/proposal_issue.py` — decision filing; `DecisionPathState`, `_decision_path_state`, the path check before and inside the folder lock
+- `scripts/production/test_proposal_issue.py` — same-key and different-key races at the lock (a patched `_folder_lock` makes the other file), two decisions with distinct P numbers
 
-**Workers:** 1 writer + 1 tester. `impl`: proposal_issue.py. `test`: test_proposal_issue.py — (a) same key: the issue appears after the pre-lock check and before numbering (make the file inside a patched `_folder_lock` or `_highest_number`), and `create` returns `False`, writes nothing and leaves no `.decision-*` file; (b) different key at that moment: `create` raises the different-key refusal and leaves the other run's file byte-identical; (c) two different decisions filed one after the other get two different P numbers.
+**Binds later work:** a change to `create` keeps both `_decision_path_state` checks, before and inside the lock.
 
-**Constraints from prior phases:** none; the style ledger is not touched.
+**Gotchas:** a check before the lock alone lets two same-key runs both pass. The second run then fails at `os.link(temporary, path)` with `FileExistsError` (Errno 17), and the message names the `.decision-*` temp file, not the issue.
 
-**Acceptance gate:**
-- `env -C <worktree> PYTHONPATH=<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.production.test_proposal_issue` passes.
-- basedpyright on each changed .py file: 0 errors, 0 warnings.
-- The gate copy's `merge_gate.py --tests-only` passes.
+**Ruled out:** another file name for the second run; `os.replace` onto an existing issue (it overwrites the decision of the other run); a retry loop; removing `_folder_lock`.
 
 ### Phase 37 — a style decision files under area style, new and old  · status: todo
 **Depends on:** Phase 36
@@ -1017,8 +1010,9 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Spec:**
 - User request 2026-10-20: "when we create a new issue for a style proposal - we need to set the area to style … backpopulate the area field on the ones that were created for style but don't have this".
 - `scripts/production/proposal_issue.py` `_create_numbered` (~:515) fills the template `area: "[[{{AREA}}]]"` (`~/rust/hanadocs/.claude/templates/issue.yaml` line 2) with `"AREA": "unfiled"`. `create` is the style decision path (it requires `style_rule`, `style_crate`, `style_rule_blob`), so set `"AREA": "style"` there, one named constant.
-- New verb `proposal_issue.py area-style <folder> [--dry-run]`: for each issue in the folder whose frontmatter carries the style decision key (`style_rule`), and whose area is `[[unfiled]]` or missing, set `area: "[[style]]"` under the issue lock with `_write`, and print one line per issue changed (`--dry-run` prints and writes nothing). It never changes an issue with any other area, and never touches `date_modified` beyond what `set_fields` already does for an edit (state the choice in the report). A second run changes nothing.
-- On 2026-10-20 about 600 files named `style …` in `~/rust/hanadocs/issues` carry `area: "[[unfiled]]"`, but a plain `grep 'style_rule:'` finds only 96: read a few of those files (read only) to learn how `style_rule` is written, so the verb matches every style decision. The director runs the verb on the real folder; workers never write there.
+- New verb `proposal_issue.py area-style <folder> [--dry-run]`: for each issue in the folder whose frontmatter carries `style_rule` (a current decision) or `style_rules` (a closed legacy proposal, which also has `style_findings` and no singular `style_rule`), whatever its status, and whose area is `[[unfiled]]` or missing, set `area: "[[style]]"` and `date_modified` to today's vault date (as `edit` does at ~:251; `set_fields` changes only the fields it is given) under the issue lock with `_write`, and print one line per issue changed. `--dry-run` prints the same lines and writes nothing. A skipped file, a dry run and a second run leave every byte unchanged. It never changes an issue with any other area.
+- On 2026-10-20, 601 files named `style …` in `~/rust/hanadocs/issues` carry `area: "[[unfiled]]"`: 96 have `style_rule:`, all 601 have `style_rules:`. Read a few (read only) for both forms. The director runs the verb on the real folder; workers never write there.
+- Keep the literal `area: "[[style]]"` the user asked for, although `[[style]]` resolves in the vault to `showrunners/natedev/style.md` (the unit's phase note). Create, rename or move no vault note.
 - Update `commands/showrunner/proposal.md` or `docs/style_production.md` only where they state a style decision's area.
 
 **Files:**
@@ -1027,7 +1021,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `commands/showrunner/proposal.md`
 - `docs/style_production.md`
 
-**Workers:** 1 writer + 1 tester. `impl`: proposal_issue.py and the two docs. `test`: test_proposal_issue.py — a new decision has `area: "[[style]]"`; `area-style` sets it on an unfiled style decision and on one with no area, leaves a non-style issue and a style decision with another area byte-identical, `--dry-run` writes nothing, and a second run changes nothing.
+**Workers:** 1 writer + 1 tester. `impl`: proposal_issue.py and the two docs. `test`: test_proposal_issue.py — a new decision has `area: "[[style]]"`; `area-style` sets it (and today's `date_modified`, from an older date) on an unfiled style decision, on one with no area, and on a closed legacy proposal with only `style_rules`/`style_findings`; leaves a non-style issue and a style decision with another area byte-identical, `--dry-run` writes nothing, and a second run changes nothing.
 
 **Constraints from prior phases:** phase 36 re-checks the decision path inside `_folder_lock`; keep that.
 
@@ -1035,7 +1029,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `env -C <worktree> PYTHONPATH=<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.production.test_proposal_issue` passes.
 - basedpyright on each changed .py file: 0 errors, 0 warnings.
 - The gate copy's `merge_gate.py --tests-only` passes.
-- Director: `area-style ~/rust/hanadocs/issues --dry-run` lists every style decision still unfiled; the real run sets them; a second run prints nothing.
+- Director: `area-style ~/rust/hanadocs/issues --dry-run` lists all 601 unfiled style issues (count on the day); the real run sets them; a second run prints nothing.
 
 ### Phase 38 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: todo
 **Depends on:** none
