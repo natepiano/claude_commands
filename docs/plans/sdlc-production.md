@@ -109,7 +109,7 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | R1b | Session names apart from roles (the user, 2026-10-21) | Decided by the user's words. A session's name and its role are separate: many sessions can hold the designer role, and none needs to be called designer. Every session records its role apart from its name. The unit board and cargo-handler show the session name and the role as two columns, side by side, always easy to see. Later this allows more creative session names. roles-unit defines the role record; the unit board's owner and cargo-liner add the column. |
 | R2 | Q1 who owns the guild tips | Settled by G3b and G4: each guild head keeps its guild's tips in nate_style/guilds. |
 | R3 | Q5 head names versus per-design role names | Settled by G7: heads are named designers, reviewers, showrunners, units; astra-designer and astra-reviewer stay for the per-design threads; goddess names on hold. |
-| R4 | Q2 "gate" | |
+| R4 | Q2 "gate" | A "wait" is one unit waiting on another. A "gate" always means a check that must pass (verification). This replaces roles-unit's recommendation ("gate" for the wait, "verification gate" for the check). |
 | R5 | Q3 "reviewer" | |
 | R6 | Q4 "proposal", "add-on", "change" | |
 | R7 | Q6 "orchestrator" | |
