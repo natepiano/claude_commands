@@ -40,9 +40,8 @@ steps:
    <unit> is <progress>` on each change. It goes on when the record reads stopped, and refuses when
    the record asks for a restart, reads something else, or was never written (`RECORD_WAIT_SECONDS`,
    120 s). It exits 2 only past `STOP_WAIT_SECONDS` (`RENAME_UNIT_STOP_WAIT`, default 3600), and a
-   rerun resumes there. Before 2026-10-18 apply always exited 2 here and nothing reran it, so a
-   rename stopped its unit and stayed at step 0 until someone ran it again (user: "it is
-   unacceptable that it require my intervention"). Once the unit is stopped (or was not running),
+   rerun resumes there, so a rename never waits for a person (user: "it is unacceptable that it
+   require my intervention"). Once the unit is stopped (or was not running),
    `_stop_runs` ends what its runs leave in the worktree. First each run's live app-server (found
    by the run's `mesh_server.json`) stops with its seats through `codex_mesh.py stop`, as
    retire_unit does; a failed stop is printed and SIGTERM ends the server. Then SIGTERM goes to a
@@ -50,8 +49,9 @@ steps:
    of its session, an app-server's idle-stop watcher (found by the run folder in its arguments), and
    an app-server still alive with its children, such as `codex-code-mode-host`. Each leads its own
    session, so the shutdown path does not end it (2026-10-20: a lint run and a day-old watcher
-   refused the move; 2026-10-21: modules-unit's 8-hour app-server refused it). `retire_unit.run_processes` finds them and `retire_unit.terminate` stops them;
-   one alive after `TERM_WAIT_SECONDS` refuses, and a rerun resumes. Refused up front: the new id
+   refused the move; 2026-10-21: modules-unit's 8-hour app-server refused it).
+   `retire_unit.run_processes` finds them and `retire_unit.terminate` stops them; one alive after
+   `TERM_WAIT_SECONDS` refuses, and a rerun resumes. Refused up front: the new id
    already running, a Claude that cannot be read, and other processes inside the worktree of a unit
    with no Claude to stop.
 2. **Merge.** `origin/<merge branch>` is merged into the unit in the old worktree. While the unit's
@@ -88,9 +88,11 @@ steps:
    - this production's open proposal issues and phase notes (`phase_table.owned_notes`).
    - the herdr pane record drops the old unit's entries (`pane_record.forget_unit`), in each session's file. The relaunched unit records its new pane at SessionStart; an old entry would resume the old name.
    Style productions also call `Ledger.rename_unit` with their Repository: queued, assigned and
-   checkpointed tickets and sync waits take the new unit id; ticket ids and closed rows stay.
-   Their open proposal issues follow the unit without a matching plan field only when the
-   `proposed_by` field belongs to this production's owners. This accepts the production slug or
+   checkpointed tickets and sync waits take the new unit id; ticket ids and closed rows stay. It
+   refuses a target that owns current rows or maps to another family, and a repeat moves nothing.
+   `plan` runs the same move on a `preview_ledger` copy, so a refusal comes before any change.
+   Their open proposal issues move when the issue's `unit` is the old id and its `proposed_by`
+   field belongs to this production's owners; no plan field match is needed. This accepts the production slug or
    `unit (production)` form and leaves another production's issues in a shared folder untouched.
 8. **Retire.** A changed branch is deleted once origin holds the new tip.
 9. **Restart record.** The fields that move:
@@ -131,6 +133,8 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the showrunner checkout and the new worktree, as git sees them;
   - the six showrunner state files.
 
-  Kept branch and worktree names are excluded from the search. The style ledger folder is history;
-  current ledger rows are checked separately. The postmaster's replies are history. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
+  Kept branch and worktree names are excluded from the search. The style ledger folder
+  (`style/` in `unit_rename_sweep.STATE_HISTORY`) is history, because closed tickets keep the old
+  id. Live places read the ledger through `preview_ledger` and fail on a queued, assigned or
+  checkpointed ticket or a sync wait that still names the old id. The postmaster's replies are history. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   On natedev a sweep takes about 80 s.
