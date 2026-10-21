@@ -129,7 +129,7 @@ class StyleLedgerTests(unittest.TestCase):
         return next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == parent_id)
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
-        prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held") else 1
+        prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
         result = subprocess.run(
             [sys.executable, str(Path(style_ledger.__file__)), *arguments[:prefix],
              "--repo", str(self.repo), *arguments[prefix:]],
@@ -6287,6 +6287,173 @@ class StyleLedgerTests(unittest.TestCase):
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(ledger.ticket_base("names-unit-1"), self.initial_tip)
         self.assertEqual(self.git("for-each-ref", "refs/style-tickets"), "")
+
+    def test_unit_rename_moves_current_rows_and_keeps_ticket_ids_and_history(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        files = list(self.sources[:2])
+        for number in (8, 9, 1, 2):
+            ledger.ticket_add(f"names-unit-{number}", "names-unit", "read", "names", "crates/alpha", files, [rule])
+        ledger.ticket_assign("names-unit-8", "main")
+        for path in files:
+            self.record(rule, path, self.initial_tip, ticket="names-unit-8")
+        ledger.ticket_checkpoint("names-unit-8", self.initial_tip)
+        _ = ledger.ticket_merge("names-unit-8")
+        ledger.ticket_drop("names-unit-9")
+        ledger.ticket_assign("names-unit-2", "main")
+        _ = ledger.hold(rule, files[0], 1, "pub fn old() {}", "rename", "old", "new",
+                        self.blob(rule), "names-unit-2")
+        ledger.record_candidate("names-unit-2", files[0], 1, "Check names in public APIs.")
+        ledger.ticket_yield("names-unit-2", files[1])
+        ledger.wait_for_sync("names-unit")
+        ledger.wait_for_sync("types-unit")
+        tables = ("tickets", "sync_waits", "rule_candidates", "held_findings", "ticket_yields")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket='names-unit-2'")
+            connection.commit()
+            before = {table: cast(list[tuple[object, ...]], connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid").fetchall()) for table in tables}
+        new = "sample-style-names-unit"
+
+        self.assertEqual(ledger.rename_unit("names-unit", new), style_ledger.UnitRenamed(2, 1))
+
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            after = {table: cast(list[tuple[object, ...]], connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid").fetchall()) for table in tables}
+        expected = dict(before)
+        expected["tickets"] = [
+            (row[0], new, *row[2:]) if row[1] == "names-unit" and row[10] in ("queued", "assigned", "checkpointed") else row
+            for row in before["tickets"]
+        ]
+        expected["sync_waits"] = [(new, *row[1:]) if row[0] == "names-unit" else row
+                                  for row in before["sync_waits"]]
+        self.assertEqual(after, expected)
+        self.assertEqual([ticket["id"] for ticket in self.ledger().queued_tickets(new)], ["names-unit-1"])
+        self.assertEqual([ticket["id"] for ticket in self.ledger().ticket_open(new)], ["names-unit-2"])
+        self.assertEqual(ledger.ticket_open("names-unit"), ())
+
+    def test_unit_rename_moves_a_checkpointed_ticket_without_changing_its_merge_evidence(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.ticket_assign("names-unit-1", "main")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="names-unit-1")
+        ledger.ticket_checkpoint("names-unit-1", self.initial_tip)
+        before = ledger.ticket_open("names-unit")[0]
+
+        _ = ledger.rename_unit("names-unit", "sample-style-names-unit")
+
+        self.assertEqual(ledger.ticket_open("sample-style-names-unit")[0],
+                         {**before, "unit": "sample-style-names-unit"})
+        self.assertEqual(ledger.next_ticket_id("sample-style-names-unit"), "sample-style-names-unit-1")
+
+    def test_unit_rename_refuses_a_target_with_current_tickets_or_a_sync_wait(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.wait_for_sync("names-unit")
+        old_tickets, old_waits = ledger.queued_tickets("names-unit"), ledger.sync_waits()
+        for state in ("queued", "assigned", "checkpointed", "wait"):
+            with self.subTest(state=state):
+                target = f"{state}-style-names-unit"
+                if state == "wait":
+                    ledger.wait_for_sync(target)
+                else:
+                    ledger.ticket_add(f"{target}-1", target, "read", "names", "crates/alpha",
+                                      list(self.sources[:2]), [rule])
+                    with closing(sqlite3.connect(ledger.database)) as connection:
+                        _ = connection.execute("UPDATE tickets SET state=? WHERE unit=?", (state, target))
+                        connection.commit()
+                target_waits = ledger.sync_waits()
+                with self.assertRaises(style_ledger.LedgerError):
+                    _ = ledger.rename_unit("names-unit", target)
+                self.assertEqual(ledger.queued_tickets("names-unit"), old_tickets)
+                self.assertEqual(ledger.sync_waits(), target_waits)
+        self.assertTrue(all(wait in ledger.sync_waits() for wait in old_waits))
+
+    def test_unit_rename_refuses_other_families_and_nonstyle_ids_without_moving_rows(self) -> None:
+        ledger = self.ledger()
+        ledger.wait_for_sync("names-unit")
+        before = ledger.sync_waits()
+        for old, new in (("names-unit", "sample-style-types-unit"),
+                         ("names-unit", "feature-unit"), ("feature-unit", "names-unit")):
+            with self.subTest(old=old, new=new), self.assertRaises(style_ledger.LedgerError):
+                _ = ledger.rename_unit(old, new)
+            self.assertEqual(ledger.sync_waits(), before)
+
+    def test_unit_rename_rolls_back_ticket_updates_when_the_wait_move_fails(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.wait_for_sync("names-unit")
+        tickets, waits = ledger.queued_tickets("names-unit"), ledger.sync_waits()
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("CREATE TRIGGER reject_wait_move BEFORE UPDATE OF unit ON sync_waits "
+                                   + "BEGIN SELECT RAISE(ABORT, 'wait move rejected'); END")
+            connection.commit()
+        with self.assertRaises((sqlite3.Error, style_ledger.LedgerError)):
+            _ = ledger.rename_unit("names-unit", "sample-style-names-unit")
+        self.assertEqual(self.ledger().queued_tickets("names-unit"), tickets)
+        self.assertEqual(self.ledger().sync_waits(), waits)
+        self.assertEqual(ledger.queued_tickets("sample-style-names-unit"), ())
+
+    def test_moved_ticket_can_be_readded_but_new_ids_must_use_the_new_prefix(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        files = list(self.sources[:2])
+        ledger.ticket_add("names-unit-7", "names-unit", "read", "names", "crates/alpha", files, [rule])
+        _ = ledger.rename_unit("names-unit", "sample-style-names-unit")
+        before = ledger.queued_tickets("sample-style-names-unit")
+        ledger.ticket_add("names-unit-7", "sample-style-names-unit", "read", "names", "crates/alpha", files, [rule])
+        self.assertEqual(ledger.queued_tickets("sample-style-names-unit"), before)
+        with self.assertRaises(style_ledger.LedgerError):
+            ledger.ticket_add("names-unit-7", "sample-style-names-unit", "read", "names", "crates/beta", files, [rule])
+        with self.assertRaises(style_ledger.LedgerError):
+            ledger.ticket_add("names-unit-8", "sample-style-names-unit", "read", "names", "crates/alpha", files, [rule])
+        self.assertEqual(ledger.next_ticket_id("sample-style-names-unit"), "sample-style-names-unit-1")
+        ledger.ticket_add("sample-style-names-unit-1", "sample-style-names-unit", "read", "names",
+                          "crates/alpha", files, [rule])
+        self.assertEqual(self.ledger().next_ticket_id("sample-style-names-unit"), "sample-style-names-unit-2")
+        self.assertEqual(ledger.next_ticket_id("names-unit"), "names-unit-8")
+
+    def test_unit_rename_allows_target_history_and_moves_a_wait_without_tickets(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        target = "sample-style-names-unit"
+        ledger.ticket_add(f"{target}-4", target, "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.ticket_drop(f"{target}-4")
+        ledger.wait_for_sync("names-unit")
+        before = ledger.sync_waits()[0]
+
+        self.assertEqual(ledger.rename_unit("names-unit", target), style_ledger.UnitRenamed(0, 1))
+
+        after = self.ledger().sync_waits()[0]
+        self.assertEqual((after.unit, after.since, after.token), (target, before.since, before.token))
+        self.assertEqual(ledger.next_ticket_id(target), f"{target}-5")
+        self.assertEqual(ledger.rename_unit("names-unit", target), style_ledger.UnitRenamed(0, 0))
+
+    def test_unit_rename_cli_reports_counts_and_succeeds_again_without_moves(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.wait_for_sync("names-unit")
+        moved = self.cli("unit", "rename", "--from", "names-unit", "--to", "sample-style-names-unit")
+        self.assertRegex(moved.stdout, r"1 tickets?")
+        self.assertRegex(moved.stdout, r"1 (?:sync )?waits?")
+        repeated = self.cli("unit", "rename", "--from", "names-unit", "--to", "sample-style-names-unit")
+        self.assertRegex(repeated.stdout, r"0 tickets?")
+        self.assertRegex(repeated.stdout, r"0 (?:sync )?waits?")
+        self.assertEqual([ticket["id"] for ticket in self.ledger().queued_tickets("sample-style-names-unit")],
+                         ["names-unit-1"])
+        self.assertEqual([wait.unit for wait in self.ledger().sync_waits()], ["sample-style-names-unit"])
 
     def test_next_ticket_id_never_reuses_merged_or_dropped_numbers(self) -> None:
         rule = self.rule("read")

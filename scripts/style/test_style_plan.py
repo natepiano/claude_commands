@@ -186,6 +186,83 @@ class StylePlanTests(unittest.TestCase):
             rows = cast(list[tuple[int]], connection.execute("SELECT COUNT(*) FROM tickets").fetchall())
         return rows[0][0]
 
+    def test_style_family_accepts_exact_suffixes_and_returns_a_typed_nonstyle_result(self) -> None:
+        families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
+        for family in families:
+            for unit in (f"{family}-unit", f"sample-style-{family}-unit", f"types-style-{family}-unit"):
+                with self.subTest(unit=unit):
+                    self.assertEqual(rules.style_family(unit), family)
+        for unit in ("", "names", "feature-unit", "nonnames-unit", "names-units", "names-unit-extra"):
+            with self.subTest(unit=unit):
+                self.assertIsInstance(rules.style_family(unit), rules.NotStyleUnit)
+
+    def test_family_plans_use_each_units_plan_cell_for_old_and_full_ids(self) -> None:
+        expected: dict[rules.Family, str] = {}
+        rows: list[str] = []
+        families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
+        for index, family in enumerate(families):
+            unit = f"sample-style-{family}-unit" if index % 2 else f"{family}-unit"
+            worktree = self.root / f"plan-{family}"
+            relative = f"docs/style-production/units/retained-{family}.md"
+            plan = worktree / relative
+            plan.parent.mkdir(parents=True)
+            expected[family] = f"# {family} unit settings\n"
+            _ = plan.write_text(expected[family])
+            _ = (plan.parent / f"{unit}.md").write_text("Do not read this path.\n")
+            rows.append(f"| {unit} | {relative} | {worktree} | demo-style-{family} |")
+        rows.append(f"| feature-unit | missing.md | {self.root / 'feature'} | feature |")
+        prefix = self.doc.read_text().split("## Units", 1)[0]
+        _ = self.doc.write_text(prefix + "## Units\n\n| Unit | Plan | Worktree | Branch |\n"
+                                + "| --- | --- | --- | --- |\n" + "\n".join(rows) + "\n")
+
+        self.assertEqual(dict(style_plan.family_plan_texts(self.doc)), expected)
+
+    def test_next_phase_keeps_the_declared_plan_path_for_old_and_full_ids(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        original_doc = self.doc.read_text()
+        retained = self.plan.with_name("retained-names-plan.md")
+        _ = self.plan.rename(retained)
+        for unit in ("names-unit", "sample-style-names-unit"):
+            with self.subTest(unit=unit):
+                _ = self.doc.write_text(original_doc.replace("| names-unit |", f"| {unit} |")
+                                        .replace("units/names-unit.md", "units/retained-names-plan.md"))
+                _ = retained.write_text(self.plan_header().replace("`names-unit`", f"`{unit}`"))
+                result = style_plan.next_phase(unit, retained, self.repo)
+                self.assertEqual(result, style_plan.PhaseWritten(f"{unit}-1"))
+                ticket = self.ledger().ticket_open(unit)[0]
+                self.assertEqual(ticket["family"], "names")
+                self.assertEqual(ticket["files"], list(self.sources[:2]))
+                self.assertIn(f"{unit}-1", retained.read_text())
+                self.assertFalse(self.plan.exists())
+                self.assertEqual(style_plan.next_phase(unit, retained, self.repo),
+                                 style_plan.Resumed(f"{unit}-1"))
+                self.ledger().ticket_drop(f"{unit}-1")
+
+    def test_full_id_queue_reads_retained_plan_settings_and_only_declared_units(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        unit = "sample-style-names-unit"
+        retained = self.plan.with_name("retained-names-plan.md")
+        _ = self.plan.rename(retained)
+        first = self.sources[-1]
+        _ = retained.write_text(self.plan_header().replace("`names-unit`", f"`{unit}`").replace(
+            "## Phases", f"- **First files:** {first}\n\n## Phases"))
+        _ = self.doc.write_text(self.doc.read_text().replace("| names-unit |", f"| {unit} |")
+                                .replace("units/names-unit.md", "units/retained-names-plan.md"))
+        for selected in ([], ["--unit", unit]):
+            with self.subTest(selected=selected):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = style_plan.main(["queue", "--repo", str(self.repo), *selected])
+                self.assertEqual(code, 0)
+                lines = output.getvalue().splitlines()
+                self.assertTrue(lines)
+                self.assertTrue(all(line.startswith(f"{unit}: read ") for line in lines), lines)
+                self.assertEqual(lines[0].split(" files: ")[1], first)
+        self.assertEqual(self.count_tickets(), 0)
+
     def test_long_read_windows_balance_each_part_and_cover_the_test_module_separately(self) -> None:
         text = "//! Module docs\n" + "// production\n" * 759 + "#[cfg(test)]\nmod tests {\n" + "// test\n" * 599 + "}\n"
         windows = style_plan.read_windows(text)

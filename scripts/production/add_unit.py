@@ -698,7 +698,7 @@ def host_session_name(request: UnitLaunch) -> str:
         if recorded.startswith(f"{slug}-"):
             return recorded
     name = request.identity.session
-    return herdr.generated_session_name(name if name.startswith(f"{slug}-") else f"{slug}-{name}")
+    return herdr.generated_session_name(unit_names.branch(slug, name))
 
 
 def launch_session(
