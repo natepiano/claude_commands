@@ -285,6 +285,73 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(self.typed, [("destination:p1", text, 0)])
         self.assertEqual(self.enters, [])
 
+    PRODUCE = "/showrunner:produce /x/doc.md resume"
+
+    def write_rejection(self, command: str) -> None:
+        """Claude's answer to a command its list lacks, as session cbc14765 recorded it on 2026-10-21."""
+        at = (self.launched_at + timedelta(seconds=self.elapsed + 1)).isoformat()
+        with self.path.open("a") as stream:
+            for content in (f"Unknown command: {command}", "Args from unknown skill: /x/doc.md resume"):
+                _ = stream.write(json.dumps({"type": "system", "subtype": "informational", "content": content,
+                                             "isMeta": False, "level": "warning", "timestamp": at}) + "\n")
+
+    def submit_command(self, accept: Callable[[str, int], bool], timeout_ms: int = 90_000) -> herdr.PromptSubmitOutcome:
+        """Type into a session that answers `Unknown command` unless `accept(text, typing)` takes the text."""
+        def type_text(pane: str, text: str) -> None:
+            self.typed.append((pane, text, self.elapsed))
+            if accept(text, len(self.typed)):
+                self.write_turn(text, seconds_after_launch=self.elapsed + 1)
+            else:
+                self.write_rejection(text.split()[0])
+        with patch.object(self.client, "prompt", side_effect=type_text):
+            return self.submit(timeout_ms, text=self.PRODUCE)
+
+    def command_file(self) -> Path:
+        path = self.transcript.config_dir / "commands/showrunner/produce.md"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Produce\n")
+        return path
+
+    def test_an_unknown_command_is_typed_once_more_after_its_list_settles(self) -> None:
+        outcome = self.submit_command(lambda _text, typing: typing == 2)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE] * 2)
+        self.assertGreaterEqual(self.typed[1][2] - self.typed[0][2], herdr.PROMPT_SETTLE_SECONDS)
+        self.assertEqual(self.enters, [])
+
+    def test_a_command_unknown_twice_is_sent_as_its_file_in_a_plain_prompt(self) -> None:
+        path = self.command_file()
+        outcome = self.submit_command(lambda text, _typing: text.startswith("This session"))
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        fallback = (f"This session's command list does not have /showrunner:produce yet, so read {path.resolve()} "
+                    + "in full and follow it as /showrunner:produce with the arguments: /x/doc.md resume")
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE, self.PRODUCE, fallback])
+        self.assertLess(self.elapsed, 60)
+
+    def test_a_command_unknown_twice_with_no_file_reports_the_refusal(self) -> None:
+        outcome = self.submit_command(lambda _text, _typing: False)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        reason = cast(herdr.PromptNotSubmitted, outcome).reason
+        self.assertIn("Claude answered Unknown command: /showrunner:produce; prompt typed 2 times", reason)
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE] * 2)
+        self.assertFalse(cast(herdr.PromptNotSubmitted, outcome).never_typed)
+
+    def test_rejections_count_only_this_prompts_command(self) -> None:
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        for command in ("/showrunner:produce-x", "/showrunner:producer", "/showrunner:produce", "/compat. Did you mean /compact?"):
+            self.write_rejection(command)
+        self.assertEqual(cursor.command_rejections(self.PRODUCE), 1)
+        self.assertEqual(cursor.command_rejections("resume the saved work"), 0)
+
+    def test_a_fallback_needs_a_slash_command_with_a_file(self) -> None:
+        path = self.command_file()
+        self.assertIsNone(herdr.command_fallback("resume the saved work", self.transcript))
+        self.assertIsNone(herdr.command_fallback("/showrunner:missing x", self.transcript))
+        self.assertIsNone(herdr.command_fallback("/../showrunner:produce", self.transcript))
+        self.assertEqual(herdr.command_fallback("/showrunner:produce", self.transcript),
+                         f"This session's command list does not have /showrunner:produce yet, so read {path.resolve()} "
+                         + "in full and follow it as /showrunner:produce with no arguments")
+
     def test_slash_command_matching_requires_the_name_arguments_and_non_meta_user(self) -> None:
         for text, content, kind, meta, matches in (
             ("/check", "<command-name>/check</command-name>", "user", False, True),
