@@ -1041,7 +1041,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - When `token_spans` returns empty (an unsupported token), the original change is kept, so the answer stays review.
 - style_footprint must not import `approved_renames` or `declarations` (that is an import cycle). The erasure proof has its own parameter reading.
 
-### Phase 39 — a cell with no live held finding is never offered again as held work  · status: todo
+### Phase 39 — a cell with no live held finding is never offered again as held work  · status: done
 **Depends on:** none
 
 #### Work Order

@@ -2305,19 +2305,23 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/other.rs": APPLIED})
             finding = self.hold(ledger)
-            _ = self.newer_verdict(ledger, self.newer_rule_text(), "held", "alpha/src/other.rs")
+            newer = self.newer_rule_text()
+            support = self.hold(ledger, file="other.rs", before="Kind::Size", after="Kind::Length", record=False)
+            _ = self.newer_verdict(ledger, newer, "held", "alpha/src/other.rs")
             with redirect_stdout(io.StringIO()) as output:
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
             self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
             self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
-            unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
+            unchanged, = ledger.named_held((finding.finding_id,))
             self.assertEqual(unchanged.state, style_ledger.Unfiled())
+            self.assertIsInstance(ledger.named_held((support.finding_id,))[0].state, style_ledger.Filed)
 
     def test_an_unfiled_finding_judged_after_a_judgment_under_a_restored_rule_text_is_not_withdrawn(self) -> None:
         with self.ledger() as ledger:
             names = self.catalog / "names.md"
             original = names.read_text()
             newer = self.newer_rule_text()
+            support = self.hold(ledger, line=2, before="Kind::Size", after="Kind::Length", record=False)
             _ = self.newer_verdict(ledger, newer, "held")
             _ = names.write_text(original)
             finding = self.hold(ledger)
@@ -2326,8 +2330,9 @@ class StyleProposalsTests(unittest.TestCase):
                 _ = style_proposals.file_proposals(ledger, self.proposals, "parent")
             self.assertIn(f"skipped {finding.finding_id}: rule changed since judged", output.getvalue())
             self.assertIn("totals: withdraw 0, kept 0, close 0", output.getvalue())
-            unchanged, = ledger.held_findings(style_ledger.AllHeldFindings())
+            unchanged, = ledger.named_held((finding.finding_id,))
             self.assertEqual(unchanged.state, style_ledger.Unfiled())
+            self.assertIsInstance(ledger.named_held((support.finding_id,))[0].state, style_ledger.Filed)
 
     def test_an_unfiled_finding_of_an_open_ticket_is_not_withdrawn(self) -> None:
         with self.ledger() as ledger:

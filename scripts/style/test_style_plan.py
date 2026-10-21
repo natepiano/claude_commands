@@ -842,6 +842,45 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotIn(nested, batch.files)
         self.assertNotIn((structure, nested), batch.cells)
 
+    def test_a_waived_only_cell_stops_refilling_until_its_file_or_rule_changes(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        path = self.sources[0]
+        finding = ledger.hold(rule, path, 1, "Keep this name", "rename", "value", "amount", blob, "outside")
+        ledger.record(rule, path, self.tip, blob, "held", ticket="outside", input_scope=style_ledger.DeclaredInputScope.RULE)
+        result = subprocess.run([sys.executable, style_ledger.__file__, "held", "waive", "--repo", str(self.repo),
+                                 "--id", finding.finding_id], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.unit_takes_tip()
+        for other in self.sources[1:]:
+            self.record(rule, other, self.tip)
+        self.assertEqual([ticket.files for ticket in self.candidates()], [(path,)])
+        refused = subprocess.run([sys.executable, style_ledger.__file__, "record", "--repo", str(self.repo),
+                                  "--rule", rule, "--path", path, "--commit", self.tip, "--rule-blob", blob,
+                                  "--verdict", "held", "--ticket", "outside", "--worker", "test", "--input-scope", "rule"],
+                                 capture_output=True, text=True, check=False)
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        ledger.record(rule, path, self.tip, blob, "waived", ticket="outside")
+        self.write("README.md", "Unrelated sync\n")
+        self.tip = self.commit()
+        self.sync()
+        self.unit_takes_tip()
+        self.assertEqual(self.candidates(), ())
+        self.write(path, "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.unit_takes_tip()
+        self.assertIn(path, {file for ticket in self.candidates() for file in ticket.files})
+        ledger.record(rule, path, self.tip, blob, "waived", ticket="outside")
+        _ = (self.rule_dir / "read.md").write_text("---\ntier: C\nfamily: names\ninput_scope: crate\n---\nNew rule text.\n")
+        self.sync()
+        self.assertIn(path, {file for ticket in self.candidates() for file in ticket.files})
+
     def test_structure_work_order_shows_existing_holds_on_the_batch_files_only(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
@@ -851,6 +890,11 @@ class StylePlanTests(unittest.TestCase):
         waived = ledger.hold(rule, self.sources[0], 2, "Already waived", "restructure", "before", "after", blob, "outside")
         _ = ledger.decline_findings((waived.finding_id,), "declined")[waived.finding_id]
         outside = ledger.hold(rule, self.sources[2], 1, "Different batch", "restructure", "before", "after", blob, "outside")
+        ledger.waive_held(outside.finding_id)
+        other_rule = self.rule("other-family")
+        other_blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == other_rule)
+        other = ledger.hold(other_rule, self.sources[0], 3, "Other rule", "rename", "before", "after", other_blob, "outside")
+        ledger.waive_held(other.finding_id)
         worktree = self.root / "modules"
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
         plan = worktree / "docs/style-production/units/modules-unit.md"
@@ -860,9 +904,32 @@ class StylePlanTests(unittest.TestCase):
         text = plan.read_text()
         self.assertIn(f"{held.finding_id} · {rule} · {self.sources[0]}:1 · Split this module", text)
         self.assertIn("do not hold these again", text)
-        self.assertNotIn(waived.finding_id, text)
+        heading = "Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."
+        self.assertIn(heading, text)
+        held_section, _, waived_section = text.partition(heading)
+        self.assertNotIn(waived.finding_id, held_section)
+        self.assertIn(waived.finding_id, waived_section)
+        self.assertNotIn(other.finding_id, text)
+        self.assertIn(f"{waived.finding_id} · {rule} · {self.sources[0]}:2 · Already waived", text)
         self.assertNotIn(outside.finding_id, text)
         self.assertIn("Judge these 2 files of `crates/alpha`", text)
+
+    def test_structure_resume_keeps_waived_findings_after_the_pinned_rule_leaves_the_catalog(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        self.sync()
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        finding = ledger.hold(rule, self.sources[0], 1, "Keep this module", "restructure",
+                              "before", "after", blob, "outside")
+        ledger.waive_held(finding.finding_id)
+        plan = self.modules_unit()
+        self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+        expected = plan.read_bytes()
+        self.assertIn(f"{finding.finding_id} · {rule} · {self.sources[0]}:1 · Keep this module", expected.decode())
+        (self.rule_dir / "structure.md").unlink()
+        _ = plan.write_text(self.plan_header())
+        self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.Resumed)
+        self.assertEqual(plan.read_bytes(), expected)
 
     def test_first_files_get_a_separate_read_ticket_before_paths_that_sort_earlier(self) -> None:
         _ = self.rule("read")

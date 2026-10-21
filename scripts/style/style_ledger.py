@@ -2173,6 +2173,16 @@ class Ledger:
         rows = cast(list[tuple[str]], query.fetchall())
         return tuple(self._held(row[0]) for row in rows)
 
+    def _cell_findings(self, rule: str, path: str, commit: str) -> tuple[HeldFinding, ...]:
+        """Every finding whose site maps to this rule's cell at the commit, in any state."""
+        definition = self._component_rule(rule)
+        tip = self._tip(commit)
+        rows = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT finding_id,path FROM held_findings WHERE rule=? ORDER BY created_at,finding_id", (rule,),
+        ).fetchall())
+        return tuple(self._held(finding_id) for finding_id, site in rows
+                     if _finding_cell(definition, site, tip) == path)
+
     def proposal_findings(self, proposal: Path) -> tuple[HeldFinding, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT finding_id FROM held_findings WHERE proposal=? ORDER BY created_at,finding_id", (str(proposal),),
@@ -4097,6 +4107,14 @@ class Ledger:
         fingerprint = self._fingerprint(tip, scope, path)
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
+            if verdict == "held":
+                findings = self._cell_findings(rule, path, tip.commit)
+                if not any(isinstance(finding.state, (Unfiled, Filed)) for finding in findings):
+                    inactive = "".join(f"\n{finding.finding_id}: {held_state_name(finding.state)}" for finding in findings)
+                    raise LedgerError(
+                        f"{rule}: {path}: cannot record held without a live held finding.{inactive}\n"
+                        + "A waived finding is the user's decision and does not make a cell held; "
+                        + "hold a new finding with held add first, or record waived when only waived findings remain.")
             if ticket and self._connection.execute(
                 "SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket, path),
             ).fetchone():

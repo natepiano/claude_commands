@@ -202,6 +202,86 @@ class StyleLedgerTests(unittest.TestCase):
             identities.append(finding.finding_id)
         return rule, issue, tuple(identities)
 
+    def test_record_held_refuses_a_cell_with_no_findings(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        result = self.cli("record", "--rule", rule, "--path", self.sources[0], "--commit", self.initial_tip,
+                          "--rule-blob", self.blob(rule), "--verdict", "held", "--ticket", "outside", "--worker", "test", success=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(rule, result.stderr)
+        self.assertIn(self.sources[0], result.stderr)
+        self.assertIn("held add", result.stderr)
+        self.assertEqual(self.states(rule)[self.sources[0]], "open")
+
+    def test_record_held_names_inactive_findings_and_keeps_the_users_waiver(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        finding = self.hold_finding(rule, 1)
+        _ = self.cli("held", "waive", "--id", finding)
+        result = self.cli("record", "--rule", rule, "--path", self.sources[0], "--commit", self.initial_tip,
+                          "--rule-blob", self.blob(rule), "--verdict", "held", "--ticket", "outside", "--worker", "test", success=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        for words in (rule, self.sources[0], finding, "waived", "user's decision", "held add", "record waived"):
+            self.assertIn(words, result.stderr)
+        self.assertIsInstance(self.ledger().named_held((finding,))[0].state, style_ledger.Waived)
+        self.assertEqual(self.states(rule)[self.sources[0]], "open")
+
+    def test_record_held_accepts_unfiled_and_filed_findings_only_on_the_matching_cell(self) -> None:
+        rule = self.rule("read")
+        other = self.rule("other")
+        self.set_tip(self.initial_tip)
+        finding = self.hold_finding(rule, 1)
+        self.record(rule, self.sources[0], self.initial_tip, "held")
+        ledger = self.ledger()
+        ledger.file_held(finding, self.root / "decision.md")
+        self.record(rule, self.sources[0], self.initial_tip, "held", ticket="filed-judge")
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        for wrong_rule, wrong_path in ((rule, self.sources[1]), (other, self.sources[0])):
+            with self.subTest(rule=wrong_rule, path=wrong_path):
+                with self.assertRaises(style_ledger.LedgerError):
+                    ledger.record(wrong_rule, wrong_path, self.initial_tip, self.blob(wrong_rule), "held")
+
+    def test_record_held_reports_built_and_withdrawn_findings_without_counting_them_as_live(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        built, withdrawn = self.hold_finding(rule, 1), self.hold_finding(rule, 2)
+        ledger.file_held(built, self.root / "decision.md")
+        ledger.file_held(withdrawn, self.root / "decision.md")
+        self.record(rule, self.sources[0], self.initial_tip, "exception")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (built,))
+            _ = connection.execute("UPDATE held_findings SET state='withdrawn',withdrawn_by=(SELECT MAX(id) FROM judgments) "
+                                   + "WHERE finding_id=?", (withdrawn,))
+            connection.commit()
+        with self.assertRaises(style_ledger.LedgerError) as refused:
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "held")
+        for words in (built, "built", withdrawn, "withdrawn"):
+            self.assertIn(words, str(refused.exception))
+        self.assertEqual(ledger.latest_held_judgments(), {})
+
+    def test_record_held_maps_manifest_findings_to_their_crate_cell(self) -> None:
+        rule = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        _ = ledger.hold(rule, self.sources[0], 1, "Change manifest", "restructure", "before", "after", self.blob(rule), "outside")
+        ledger.record(rule, "crates/alpha", self.initial_tip, self.blob(rule), "held")
+        self.assertEqual(self.states(rule)["crates/alpha"], "current")
+        with self.assertRaises(style_ledger.LedgerError):
+            ledger.record(rule, "crates/beta", self.initial_tip, self.blob(rule), "held")
+
+    def test_unwaiving_a_finding_restores_a_worker_recorded_waived_verdict_to_held(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        finding = self.hold_finding(rule, 1)
+        _ = self.cli("held", "waive", "--id", finding)
+        self.record(rule, self.sources[0], self.initial_tip, "waived")
+        ledger = self.ledger()
+        self.assertIsInstance(ledger.newest_held_judgment(rule, self.sources[0]), style_ledger.NoHeldJudgment)
+        self.assertEqual(ledger.unwaive_held((finding,), style_ledger.WaiveUndoneBy("ana")), (finding,))
+        self.assertIsInstance(ledger.named_held((finding,))[0].state, style_ledger.Unfiled)
+        self.assertEqual(ledger.latest_held_judgments(), {(rule, self.sources[0]): self.initial_tip})
+
     def test_preview_ledger_migrates_and_changes_only_a_temporary_copy(self) -> None:
         rule = self.rule("preview")
         database = self.root / "state/sample/ledger.sqlite"
@@ -3193,6 +3273,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         recorded: list[tuple[str, str, str, str]] = []
         for rule, path in ((read, self.sources[0]), (structure, module_path)):
+            _ = ledger.hold(rule, path, 1, "Required change", "restructure", "before", "after", self.blob(rule), "outside")
             for verdict in style_ledger.SCOPED_VERDICTS:
                 for scope in style_ledger.DeclaredInputScope:
                     ledger.record(rule, path, base, self.blob(rule), verdict, ticket=f"{verdict}-{scope}",
@@ -3255,6 +3336,7 @@ class StyleLedgerTests(unittest.TestCase):
             (structure, "crates/alpha", "exception"),
             (crate_read, self.sources[0], "fixed"), (crate_read, self.sources[1], "waived"),
         )
+        _ = ledger.hold(manifest, "crates/alpha", 1, "Change manifest", "restructure", "before", "after", self.blob(manifest), "outside")
         for rule, path, verdict in cells:
             ledger.record(rule, path, self.initial_tip, self.blob(rule), verdict)
         with closing(sqlite3.connect(ledger.database)) as connection:
@@ -3417,6 +3499,9 @@ class StyleLedgerTests(unittest.TestCase):
     def test_latest_held_judgments_selects_each_cells_latest_commit_and_excludes_later_non_held_verdicts(self) -> None:
         rule = self.rule("read")
         other_rule = self.rule("other-read")
+        ledger = self.ledger()
+        for held_rule, path in ((rule, self.sources[0]), (rule, self.sources[1]), (other_rule, self.sources[0])):
+            _ = ledger.hold(held_rule, path, 1, "Required rename", "rename", "value", "amount", self.blob(held_rule), "outside")
         self.record(rule, self.sources[0], self.initial_tip, "held")
         self.record(rule, self.sources[1], self.initial_tip, "held")
         self.record(other_rule, self.sources[0], self.initial_tip, "held")
@@ -3539,11 +3624,11 @@ class StyleLedgerTests(unittest.TestCase):
         crate_rule = self.rule("structure", "tier: D\nfamily: modules\n")
         manifest_rule = self.rule("manifests", "tier: D\nfamily: modules\ninput_scope: manifest\n")
         self.set_tip(self.initial_tip)
-        self.record(crate_rule, "crates/alpha", self.initial_tip, "held")
-        self.record(manifest_rule, "crates/alpha", self.initial_tip)
         ledger = self.ledger()
         finding = ledger.hold(crate_rule, "crates/alpha", 1, "Split crate", "restructure",
                               "before", "after", self.blob(crate_rule), "outside")
+        self.record(crate_rule, "crates/alpha", self.initial_tip, "held")
+        self.record(manifest_rule, "crates/alpha", self.initial_tip)
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.set_tip(self.commit("Change crate source"))
         with closing(sqlite3.connect(ledger.database)) as connection:
@@ -3674,10 +3759,12 @@ class StyleLedgerTests(unittest.TestCase):
         process = self.rule("process", "tier: E\n")
         _ = self.rule("legacy", "mechanism: llm\n")
         self.set_tip(self.initial_tip)
+        _ = self.hold_finding(read, 1)
         self.record(read, self.sources[0], self.initial_tip, "held")
         self.record(read, self.sources[1], self.initial_tip)
         for path in self.sources:
             self.record(partial, path, self.initial_tip)
+        _ = self.hold_finding(partial + "#uncovered", 1)
         self.record(partial + "#uncovered", self.sources[0], self.initial_tip, "held")
         self.write(self.sources[1], "pub fn value() -> u32 { 2 }\n")
         main_tip = self.commit("Make judged inputs stale")
@@ -3685,6 +3772,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.git("checkout", "-qb", "style/main")
         self.write(self.sources[2], "pub fn corrected() {}\n")
         pending_tip = self.commit("Judge a pending style correction")
+        _ = self.ledger().hold(read, self.sources[2], 1, "Required rename", "rename", "corrected", "value", self.blob(read), "outside")
         self.record(read, self.sources[2], pending_tip, "held")
         ledger = self.ledger()
 
@@ -3801,6 +3889,7 @@ class StyleLedgerTests(unittest.TestCase):
             + "  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: other sites\n",
         )
         self.set_tip(self.initial_tip)
+        _ = self.hold_finding(partial + "#uncovered", 1)
         for path in self.sources:
             self.record(partial + "#uncovered", path, self.initial_tip,
                         "held" if path == self.sources[0] else "clean")
@@ -4261,6 +4350,7 @@ class StyleLedgerTests(unittest.TestCase):
     def test_exception_held_and_waived_expire_when_their_input_changes(self) -> None:
         rule_id = self.rule("read")
         self.set_tip(self.initial_tip)
+        _ = self.ledger().hold(rule_id, self.sources[1], 1, "Required rename", "rename", "value", "amount", self.blob(rule_id), "outside")
         for path, verdict in zip(self.sources, ("exception", "held", "waived")):
             self.record(rule_id, path, self.initial_tip, verdict, detail="Reviewed decision")
         self.assertEqual(self.states(rule_id), {
@@ -4359,6 +4449,7 @@ class StyleLedgerTests(unittest.TestCase):
     def test_rerecording_older_ticket_selects_its_newest_verdict(self) -> None:
         rule_id = self.rule("read")
         self.set_tip(self.initial_tip)
+        _ = self.hold_finding(rule_id, 1, ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "clean", ticket="B")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
@@ -4808,6 +4899,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(self.initial_tip, "main")
         ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha", [], [missing, first])
         ledger.ticket_assign("modules-unit-1", "main")
+        _ = ledger.hold(first, "crates/alpha", 1, "Split crate", "restructure", "before", "after", self.blob(first), "modules-unit-1")
         self.record(first, "crates/alpha", self.initial_tip, "held", ticket="modules-unit-1")
 
         refused = self.cli("ticket", "checkpoint", "--id", "modules-unit-1", "--commit", "HEAD", success=False)
@@ -4899,9 +4991,9 @@ class StyleLedgerTests(unittest.TestCase):
         self.add_ticket("other-1", [rule], unit="other")
         _ = self.cli("ticket", "assign", "--id", "read-1", "--branch", "main")
         self.record(rule, self.sources[0], self.initial_tip, "waived", ticket="other-1")
+        removed = self.hold_finding(rule, 1, ticket="read-1")
         self.record(rule, self.sources[0], self.initial_tip, "held", ticket="read-1")
         self.record(rule, self.sources[1], self.initial_tip, ticket="read-1")
-        removed = self.hold_finding(rule, 1, ticket="read-1")
         filed = self.hold_finding(rule, 2, ticket="read-1")
         waived = self.hold_finding(rule, 3, ticket="read-1")
         other = self.hold_finding(rule, 4, ticket="other-1")
