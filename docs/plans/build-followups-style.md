@@ -951,7 +951,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - `declaration_at(line)` picks the last item on a shared line. It is never proof of ownership alone. A line with several items is an unproved position.
 - A real built site often cites a member line with no qualifier token, so the site position falls back to the owning header.
 
-### Phase 35 — a finding follows a rename made outside the ledger  · status: todo
+### Phase 35 — a finding follows a rename made outside the ledger  · status: done
 
 **Depends on:** Phase 30, Phase 32, Phase 33, Phase 34
 

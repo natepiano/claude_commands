@@ -501,6 +501,21 @@ the finding stays as it is for a person to waive or fix in the code. No file:
   file in another crate, leave the finding as a move does. A finding whose own
   rename names its item keeps the rule above; a filed rename whose impl type a
   built rename renamed is built at the renamed type.
+- An item renamed outside the ledger can follow without a built decision.
+  Its old name must be absent from every declaration in its crate, including test items.
+  An independent source diff must map the site to its renamed item in the same file.
+  Alternatively, exactly one changed file in that crate must gain one matching destination.
+  The original file counts when checking for competing destinations. An existing twin grants no proof.
+  The keyword, owner and proved trait identity must agree.
+  At least half the old body's non-blank lines must remain, in order, after replacing only the renamed identifier.
+  Body source includes internal comments. It excludes signatures, attributes and outer braces.
+  Empty or unreadable bodies grant no proof. Changed literals, calls and indentation do not count as equal lines.
+  A child follows only through its proved renamed owner and its own retained name and lexical scope.
+  A use of a local name does not prove a binding. Duplicate or unsupported bindings grant no proof.
+  An outside follow keeps the finding's id, request, state and decision. It never marks it built.
+  A refused outside search keeps the row, even when its source file is gone.
+  Its `left` line names the mapped declaration, sorted candidate sites, body counts and failed checks.
+  Earlier ambiguous-move, cross-crate, open-ticket and uncertain-trait refusals still apply.
 - Another filed finding whose file is still there stays filed for a person. A
   person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
   puts the item back in the code.

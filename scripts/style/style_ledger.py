@@ -27,6 +27,7 @@ from typing import Literal, TypedDict, cast
 
 import rules as rule_catalog
 import style_footprint
+import declarations
 import style_rules
 from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
 from candidate_generators import enumerate_candidates
@@ -528,6 +529,113 @@ class Withdrawal:
     kept: tuple[KeptForBuild, ...]
 
 
+class OutsideFailure(StrEnum):
+    OLD_NAME_PRESENT = "old name still declared in crate"
+    NO_PASSING_FILES = "zero passing files"
+    SEVERAL_FILES = "several passing files"
+    AMBIGUOUS_ITEMS = "ambiguous destination items"
+    BODY_FAILED = "body check failed"
+    BODY_UNREADABLE = "body unreadable or empty"
+    WRONG_KEYWORD = "keyword differs"
+    WRONG_OWNER = "owner differs"
+    TRAIT_UNCERTAIN = "trait identity uncertain"
+    NOT_GAINED = "declaration not gained"
+    UNMAPPED = "mapped site not proved"
+    CHILD_UNPROVED = "child binding or scope not proved"
+
+
+@dataclass(frozen=True)
+class MappedSiteProof:
+    site: declarations.MappedDeclaration
+
+
+@dataclass(frozen=True)
+class GainedFileProof:
+    path: str
+    declaration: Declaration
+
+
+@dataclass(frozen=True)
+class OutsideCandidate:
+    path: str
+    declaration: Declaration
+    line: int
+    unchanged: int
+    old_nonblank_count: int
+    checks: tuple[OutsideFailure, ...]
+
+
+@dataclass(frozen=True)
+class NoOutsideCandidates:
+    """No changed file declared an examined target."""
+
+
+@dataclass(frozen=True)
+class OutsideCandidates:
+    items: tuple[OutsideCandidate, ...]
+
+    def __post_init__(self) -> None:
+        if not self.items:
+            raise ValueError("outside candidates must not be empty")
+
+
+@dataclass(frozen=True)
+class OutsideRenameNotProven:
+    mapped: declarations.MappedSite
+    candidates: NoOutsideCandidates | OutsideCandidates
+    reasons: tuple[OutsideFailure, ...]
+
+
+@dataclass(frozen=True)
+class OutsideRenameProven:
+    declaration: Declaration
+    path: str
+    line: int
+    proof: MappedSiteProof | GainedFileProof
+
+
+@dataclass(frozen=True)
+class NoOutsideEvidence:
+    """No outside-rename search read this outcome."""
+
+
+@dataclass(frozen=True)
+class OutsideRenameUnresolved:
+    """An outside rename was examined without proof; the finding keeps its state and decision."""
+
+    finding: HeldFinding
+    declaration: Declaration
+    evidence: OutsideRenameNotProven
+
+
+def outside_evidence_line(evidence: OutsideRenameNotProven) -> str:
+    """Name every examined target and each failed check in a stable order."""
+    candidates = "none"
+    if isinstance(evidence.candidates, OutsideCandidates):
+        candidates = ", ".join(
+            f"{item.path}:{item.line} {declarations.declaration_line(item.declaration)} "
+            + f"{item.unchanged}/{item.old_nonblank_count} body lines "
+            + ("passed" if not item.checks else "/".join(item.checks)) for item in evidence.candidates.items)
+    return (f"outside rename not proved: {', '.join(evidence.reasons)}; candidates: {candidates}; "
+            + mapped_evidence_line(evidence.mapped))
+
+
+def mapped_evidence_line(mapped: declarations.MappedSite) -> str:
+    match mapped:
+        case declarations.MappedDeclaration(path, line, declaration):
+            return f"mapped site {path}:{line} declares {declarations.declaration_line(declaration)}"
+        case declarations.MappedNoDeclaration(path, line):
+            return f"mapped site {path}:{line} declares no declaration"
+        case declarations.UnmappedSite(reason):
+            return f"mapped site unresolved: {reason}"
+
+
+def outside_evidence_suffix(evidence: OutsideRenameNotProven) -> str:
+    return ("; " + mapped_evidence_line(evidence.mapped)
+            + f"; outside rename not proved: {', '.join(evidence.reasons)}")
+
+
+
 @dataclass(frozen=True)
 class DeclarationNotRead:
     """The step does not read the finding: not a `.rs` path, no judged commit, a read commit outside the synced
@@ -546,7 +654,7 @@ class DeclarationInPlace:
 @dataclass(frozen=True)
 class DeclarationMoved:
     """One other file declares the finding's subject at the synced tip, or a built rename of an approved decision renamed
-    the subject or its impl or trait and one file gained the new declaration; the finding follows it to path and line."""
+    the subject or its impl or trait and one file gained the new declaration. A proved outside rename also follows to path and line."""
 
     finding: HeldFinding
     declaration: Declaration
@@ -560,6 +668,7 @@ class DeclarationRemoved:
 
     finding: HeldFinding
     declaration: Declaration
+    evidence: NoOutsideEvidence | OutsideRenameNotProven = NoOutsideEvidence()
 
 
 @dataclass(frozen=True)
@@ -569,6 +678,7 @@ class DeclaredInSeveralFiles:
     finding: HeldFinding
     declaration: Declaration
     paths: tuple[str, ...]
+    evidence: NoOutsideEvidence | OutsideRenameNotProven = NoOutsideEvidence()
 
 
 @dataclass(frozen=True)
@@ -595,6 +705,18 @@ class ResolvedTraitPath:
 @dataclass(frozen=True)
 class UnresolvedTraitPath:
     """An unsupported import or relative path prevents a trait identity proof."""
+
+
+@dataclass(frozen=True)
+class ResolvedTypeArguments:
+    """The implementing type's arguments with each supported type path rooted in its revision."""
+
+    words: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnresolvedTypeArguments:
+    """An argument cannot be proved to name the same type across revisions."""
 
 
 @dataclass(frozen=True)
@@ -629,6 +751,7 @@ class DeclaredInAnotherCrate:
     finding: HeldFinding
     declaration: Declaration
     path: str
+    evidence: NoOutsideEvidence | OutsideRenameNotProven = NoOutsideEvidence()
 
 
 @dataclass(frozen=True)
@@ -659,6 +782,7 @@ class DeclarationGoneFromFile:
 
     finding: HeldFinding
     declaration: Declaration
+    evidence: NoOutsideEvidence | OutsideRenameNotProven = NoOutsideEvidence()
 
 
 @dataclass(frozen=True)
@@ -765,7 +889,12 @@ class NoBuiltRename:
     """No built rename of an approved decision gives the finding's item or its impl or trait a new name."""
 
 
-BuiltRenaming = RenamedByBuilds | NoBuiltRename | TraitIdentityUncertain
+@dataclass(frozen=True)
+class RefusedBuiltRename:
+    """The built-rename reader examined this crate's subject but could not authorize its follow."""
+
+
+BuiltRenaming = RenamedByBuilds | NoBuiltRename | RefusedBuiltRename | TraitIdentityUncertain
 
 
 def _module_name(path: str) -> str:
@@ -825,9 +954,9 @@ class KeptForOpenBuild:
 
 DeclarationOutcome = (DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved
                       | DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationRenamed | RenameAwaitingApproval
-                      | DeclarationGoneFromFile | KeptForOpenBuild | TraitIdentityUncertain)
+                      | DeclarationGoneFromFile | KeptForOpenBuild | TraitIdentityUncertain | OutsideRenameUnresolved)
 # The outcomes that leave a finding as it is for a person to waive or fix in the code.
-DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain
+DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain | OutsideRenameUnresolved
 
 
 @dataclass(frozen=True)
@@ -1330,6 +1459,10 @@ class Ledger:
         self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
+        self._outside_diffs: dict[tuple[str, str, str, str], str] = {}
+        self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
+        self._crate_names: dict[tuple[str, str, str], bool] = {}
+        self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
         try:
@@ -2638,8 +2771,413 @@ class Ledger:
                 matches.append(item)
         return tuple(matches)
 
+    def _outside_mapping(self, read: str, tip: str, path: str, line: int) -> declarations.MappedSite:
+        key = (read, tip, path, path)
+        new = self._declared_file(tip, path)
+        if key not in self._outside_diffs:
+            self._outside_diffs[key] = _git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
+                                            "--diff-algorithm=myers", "--no-indent-heuristic", "--unified=0", read, tip, "--", path)
+        return declarations.mapped_site(self._outside_diffs[key], path, line, new)
+
+    def _crate_declares(self, tip: RepositoryTip, crate: str, name: str) -> bool:
+        key = (tip.commit, crate, name)
+        if key not in self._crate_names:
+            self._crate_names[key] = any(item.declaration.name == name
+                                         for path in tip.rust_files if tip.crate(path) == crate
+                                         for item in self._declared_file(tip.commit, path).declared_items)
+        return self._crate_names[key]
+
+    def _outside_body_check(self, read: str, old_path: str, old: DeclaredItem, commit: str, path: str,
+                            item: DeclaredItem) -> tuple[int, int, tuple[OutsideFailure, ...]]:
+        key = (read, old_path, commit, old, path, item)
+        if key not in self._outside_bodies:
+            old_body = declarations.item_body(self._declared_file(read, old_path), old)
+            body = declarations.item_body(self._declared_file(commit, path), item)
+            count = len(old_body.lines) if isinstance(old_body, declarations.ReadableBody) else 0
+            unchanged = 0
+            failures: tuple[OutsideFailure, ...] = ()
+            if not count or not isinstance(body, declarations.ReadableBody) or not body.lines:
+                failures = (OutsideFailure.BODY_UNREADABLE,)
+            elif isinstance(old_body, declarations.ReadableBody):
+                unchanged = declarations.preserved_body(old_body, body, old.declaration.name, item.declaration.name)
+                if 2 * unchanged < count:
+                    failures = (OutsideFailure.BODY_FAILED,)
+            self._outside_bodies[key] = (unchanged, count, failures)
+        return self._outside_bodies[key]
+
+    def _outside_extern_names(self, commit: str, path: str) -> frozenset[str] | UnresolvedTypeArguments:
+        """Read extern names only to refuse argument proof, never to resolve an alias."""
+        key = (commit, path)
+        if key in self._extern_names:
+            return self._extern_names[key]
+        tip = self._tip(commit)
+        crate = PurePosixPath(tip.crate(path))
+        files = {path, *(str(crate / "src" / root) for root in ("lib.rs", "main.rs"))}
+        names: set[str] = set()
+        for file in sorted(files & tip.blobs.keys()):
+            content = self._commit_file(commit, file)
+            if not isinstance(content, bytes):
+                self._extern_names[key] = UnresolvedTypeArguments()
+                return self._extern_names[key]
+            tokens = tuple(token.value for token in style_footprint.tokens(content.decode(errors="replace")))
+            attribute_ends = {end for _, end in style_footprint.attribute_spans(tokens)}
+            depth = 0
+            for cursor, token in enumerate(tokens):
+                if tokens[cursor:cursor + 2] == ("extern", "crate"):
+                    end = next((stop for stop in range(cursor + 2, len(tokens)) if tokens[stop] == ";"), len(tokens))
+                    body = tokens[cursor + 2:end]
+                    match body:
+                        case (crate_name,):
+                            name = crate_name
+                        case (crate_name, "as", name):
+                            pass
+                        case _:
+                            self._extern_names[key] = UnresolvedTypeArguments()
+                            return self._extern_names[key]
+                    start = cursor - 1 if cursor and tokens[cursor - 1] == "pub" else cursor
+                    if (depth or start in attribute_ends or start > 0 and tokens[start - 1] not in (";", "}")
+                            or end == len(tokens)
+                            or not all(style_footprint.IDENTIFIER.fullmatch(part) for part in (crate_name, name))):
+                        self._extern_names[key] = UnresolvedTypeArguments()
+                        return self._extern_names[key]
+                    names.update((crate_name, name))
+                depth += (token in ("{", "(", "[")) - (token in ("}", ")", "]"))
+        self._extern_names[key] = frozenset(names)
+        return self._extern_names[key]
+
+    def _outside_type_arguments(self, commit: str, path: str, arguments: tuple[str, ...],
+                                position: ImplPosition, contexts: tuple[tuple[str, str], ...],
+                                ) -> ResolvedTypeArguments | UnresolvedTypeArguments:
+        """Resolve argument paths with the header's imports; unsupported arguments grant no owner proof."""
+        words: list[str] = []
+        index = 0
+        primitives = {"bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize",
+                      "i8", "i16", "i32", "i64", "i128", "isize", "f32", "f64"}
+        while index < len(arguments):
+            word = arguments[index]
+            if word in ("<", ">", ","):
+                words.append(word)
+                index += 1
+                continue
+            if not style_footprint.IDENTIFIER.fullmatch(word):
+                return UnresolvedTypeArguments()
+            parts = [word]
+            index += 1
+            while index + 1 < len(arguments) and arguments[index] == "::":
+                if not style_footprint.IDENTIFIER.fullmatch(arguments[index + 1]):
+                    return UnresolvedTypeArguments()
+                parts.append(arguments[index + 1])
+                index += 2
+            resolved = self._trait_import_path(commit, path, tuple(parts), position)
+            if isinstance(resolved, UnresolvedTraitPath):
+                return UnresolvedTypeArguments()
+            rooted = resolved.path
+            if rooted == (word,) and word in primitives:
+                words.append(word)
+                continue
+            if rooted[0] != "crate":
+                for revision, file in contexts:
+                    extern_names = self._outside_extern_names(revision, file)
+                    if isinstance(extern_names, UnresolvedTypeArguments) or word in extern_names or rooted[0] in extern_names:
+                        return UnresolvedTypeArguments()
+                module = self._file_module(commit, path)
+                if not isinstance(position, FileLevelImpl) or isinstance(module, UnreadableFileModule):
+                    return UnresolvedTypeArguments()
+                declared = self._declared_file(commit, path)
+                local = [item for item in declared.declared_items
+                         if item.declaration.name == rooted[0]
+                         and item.declaration.keyword in ("mod", "struct", "enum", "union", "type")
+                         and isinstance(item.import_position, FileLevelImpl)]
+                if len(local) > 1:
+                    return UnresolvedTypeArguments()
+                for item in local:
+                    header = tuple(token.value for token in style_footprint.tokens("\n".join(
+                        declared.source_lines[item.first_line - 1:item.keyword_line])))
+                    if any(header[span[0] + 2:span[0] + 3] in (("cfg",), ("cfg_attr",))
+                           for span in style_footprint.attribute_spans(header)):
+                        return UnresolvedTypeArguments()
+                # Only a proved local root receives the file module; other paths stay external.
+                if local:
+                    rooted = (*module.path, *rooted)
+                elif len(rooted) == 1:
+                    return UnresolvedTypeArguments()
+            for part in rooted:
+                words.extend((part, "::"))
+            _ = words.pop()
+        return ResolvedTypeArguments(tuple(words))
+
+    def _outside_type_identity(self, left: DeclaredItem, read: str, source: str,
+                               right: DeclaredItem, commit: str, destination: str) -> TraitIdentity:
+        """Prove the complete implementing type, without reducing paths to their last name."""
+        before, after = left.implemented_type, right.implemented_type
+        if isinstance(before, declarations.UnreadableImplementedType) or isinstance(after, declarations.UnreadableImplementedType):
+            return TraitIdentity.UNCERTAIN
+        if isinstance(before, declarations.NoImplementedType) or isinstance(after, declarations.NoImplementedType):
+            return TraitIdentity.SAME if before == after else TraitIdentity.DIFFERENT
+        first = self._trait_import_path(read, source, before.path, before.position)
+        second = self._trait_import_path(commit, destination, after.path, after.position)
+        if isinstance(first, UnresolvedTraitPath) or isinstance(second, UnresolvedTraitPath):
+            return TraitIdentity.UNCERTAIN
+        contexts = ((read, source), (read, destination), (commit, source), (commit, destination))
+        before_arguments = self._outside_type_arguments(read, source, before.arguments, before.position, contexts)
+        after_arguments = self._outside_type_arguments(commit, destination, after.arguments, after.position, contexts)
+        if isinstance(before_arguments, UnresolvedTypeArguments) or isinstance(after_arguments, UnresolvedTypeArguments):
+            return TraitIdentity.UNCERTAIN
+        if before_arguments != after_arguments:
+            return TraitIdentity.DIFFERENT
+        if first.path[0] == second.path[0] == "crate":
+            return TraitIdentity.SAME if first.path == second.path else TraitIdentity.DIFFERENT
+        first_module, second_module = self._file_module(read, source), self._file_module(commit, destination)
+        if isinstance(first_module, UnreadableFileModule) or isinstance(second_module, UnreadableFileModule):
+            return TraitIdentity.UNCERTAIN
+        if not isinstance(before.position, FileLevelImpl) or not isinstance(after.position, FileLevelImpl):
+            return TraitIdentity.UNCERTAIN
+        first_path = first.path if first.path[0] == "crate" else (*first_module.path, *first.path)
+        second_path = second.path if second.path[0] == "crate" else (*second_module.path, *second.path)
+        return TraitIdentity.SAME if first_path == second_path else TraitIdentity.DIFFERENT
+
+    def _outside_search(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
+                        tip: RepositoryTip, changed: frozenset[str], *, line: int, target: Declaration,
+                        ) -> OutsideRenameProven | OutsideRenameNotProven:
+        """Prove one item rename without a ledger pair; every refused search retains its evidence."""
+        mapped = self._outside_mapping(read, tip.commit, finding.path, line)
+        crate = tip.crate(finding.path)
+        if self._crate_declares(tip, crate, old.declaration.name):
+            return OutsideRenameNotProven(mapped, NoOutsideCandidates(), (OutsideFailure.OLD_NAME_PRESENT,))
+        examined: list[OutsideCandidate] = []
+        passing: list[tuple[str, DeclaredItem]] = []
+        requirement = _trait_requirement(old, read, finding.path)
+        for path in sorted(set(tip.rust_files) & changed):
+            if tip.crate(path) != crate:
+                continue
+            destination = self._declared_file(tip.commit, path)
+            for item in destination.declared_items:
+                if item.declaration.name == old.declaration.name:
+                    continue
+                checks: list[OutsideFailure] = []
+                if item.declaration.keyword != target.keyword:
+                    checks.append(OutsideFailure.WRONG_KEYWORD)
+                if item.declaration.owner != target.owner:
+                    checks.append(OutsideFailure.WRONG_OWNER)
+                if not checks and target.owner == old.declaration.owner:
+                    owner_identity = self._outside_type_identity(old, read, finding.path, item, tip.commit, path)
+                    if owner_identity != TraitIdentity.SAME:
+                        checks.append(OutsideFailure.WRONG_OWNER)
+                if not checks:
+                    identity = self._matches_declaration(item, replace(target, name=item.declaration.name),
+                                                         requirement, tip.commit, path)
+                    if identity == TraitIdentity.UNCERTAIN:
+                        checks.append(OutsideFailure.TRAIT_UNCERTAIN)
+                    elif identity == TraitIdentity.DIFFERENT:
+                        checks.append(OutsideFailure.WRONG_OWNER)
+                prior = self._declared_file(read, path)
+                if any(other.declaration == item.declaration for other in prior.declared_items):
+                    checks.append(OutsideFailure.NOT_GAINED)
+                unchanged, count, body_checks = self._outside_body_check(read, finding.path, old, tip.commit, path, item)
+                checks.extend(body_checks)
+                examined.append(OutsideCandidate(path, item.declaration, item.keyword_line, unchanged, count, tuple(checks)))
+                if not checks:
+                    passing.append((path, item))
+        examined.sort(key=lambda item: (item.path, item.declaration.keyword, item.declaration.name, item.line))
+        candidates: NoOutsideCandidates | OutsideCandidates = (OutsideCandidates(tuple(examined)) if examined
+                                                               else NoOutsideCandidates())
+        paths = {entry[0] for entry in passing}
+        if len(paths) > 1:
+            return OutsideRenameNotProven(mapped, candidates, (OutsideFailure.SEVERAL_FILES,))
+        if len(passing) > 1:
+            return OutsideRenameNotProven(mapped, candidates, (OutsideFailure.AMBIGUOUS_ITEMS,))
+        if not passing:
+            failures = tuple(dict.fromkeys(check for candidate in examined for check in candidate.checks))
+            return OutsideRenameNotProven(mapped, candidates, (OutsideFailure.NO_PASSING_FILES, *failures))
+        path, item = passing[0]
+        proof: MappedSiteProof | GainedFileProof
+        if path == finding.path:
+            if (not isinstance(mapped, declarations.MappedDeclaration) or mapped.declaration != item.declaration
+                    or not item.first_line <= mapped.line <= item.last_line):
+                return OutsideRenameNotProven(mapped, candidates, (OutsideFailure.UNMAPPED,))
+            proof = MappedSiteProof(mapped)
+        else:
+            proof = GainedFileProof(path, item.declaration)
+        destination = self._declared_file(tip.commit, path)
+        key = (read, tip.commit, finding.path, path)
+        if key not in self._outside_diffs:
+            self._outside_diffs[key] = declarations.source_diff("\n".join(old_file.source_lines) + "\n",
+                                                               "\n".join(destination.source_lines) + "\n")
+        located = declarations.mapped_site(self._outside_diffs[key], path, line, destination)
+        site_line = moved_site_line(old_file, line, old, destination, item)
+        if (isinstance(located, declarations.MappedDeclaration) and located.declaration == item.declaration
+                and item.first_line <= located.line <= item.last_line):
+            site_line = located.line
+        return OutsideRenameProven(item.declaration, path, site_line, proof)
+
+    def _outside_refusal_evidence(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
+                                  tip: RepositoryTip, changed: frozenset[str]) -> OutsideRenameNotProven:
+        evidence = self._outside_rename(finding, read, old_file, old, tip, changed)
+        if isinstance(evidence, OutsideRenameNotProven):
+            return evidence
+        return OutsideRenameNotProven(self._outside_mapping(read, tip.commit, finding.path, finding.line),
+                                     NoOutsideCandidates(), (OutsideFailure.UNMAPPED,))
+
+    def _outside_trait_rename(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
+                               tip: RepositoryTip, changed: frozenset[str],
+                               ) -> OutsideRenameProven | OutsideRenameNotProven:
+        """Prove the implemented trait's rename before an unchanged member inherits it."""
+        membership = old.implemented_trait
+        mapped = self._outside_mapping(read, tip.commit, finding.path, finding.line)
+        failed = OutsideRenameNotProven(mapped, NoOutsideCandidates(), (OutsideFailure.CHILD_UNPROVED,))
+        if not isinstance(membership, ImplementedTrait):
+            return failed
+        crate = tip.crate(finding.path)
+        owners = [(path, item) for path in self._files_naming(read, membership.path[-1])
+                  if self._tip(read).crate(path) == crate
+                  for item in self._declared_file(read, path).declared_items
+                  if item.declaration.keyword == "trait" and item.declaration.name == membership.path[-1]
+                  and self._trait_identity(membership, read, finding.path,
+                                           ImplementedTrait((item.declaration.name,), membership.arguments, item.import_position),
+                                           read, path) == TraitIdentity.SAME]
+        if len(owners) != 1:
+            return failed
+        owner_path, owner = owners[0]
+        owner_file = self._declared_file(read, owner_path)
+        proof = self._outside_search(replace(finding, path=owner_path), read, owner_file, owner, tip, changed,
+                                     line=owner.keyword_line, target=owner.declaration)
+        if isinstance(proof, OutsideRenameNotProven):
+            return proof
+        destination = self._declared_file(tip.commit, proof.path)
+        renamed_owner = [item for item in destination.declared_items if item.declaration == proof.declaration]
+        if len(renamed_owner) != 1:
+            return failed
+        trait = ImplementedTrait((proof.declaration.name,), membership.arguments, renamed_owner[0].import_position)
+        children = [(path, item) for path in sorted(set(tip.rust_files) & changed) if tip.crate(path) == crate
+                    for item in self._declared_file(tip.commit, path).declared_items
+                    if item.declaration == old.declaration
+                    and self._outside_type_identity(old, read, finding.path, item, tip.commit, path) == TraitIdentity.SAME
+                    and self._trait_identity(trait, tip.commit, proof.path, item.implemented_trait,
+                                             tip.commit, path) == TraitIdentity.SAME]
+        if len(children) != 1:
+            return failed
+        path, child = children[0]
+        return OutsideRenameProven(child.declaration, path,
+                                   moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), child),
+                                   proof.proof)
+
+    def _outside_owner_rename(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
+                        tip: RepositoryTip, changed: frozenset[str],
+                        ) -> OutsideRenameProven | OutsideRenameNotProven:
+        """A child follows only inside its proved renamed owner, with its own binding retained."""
+        declaration = old.declaration
+        if (isinstance(old.implemented_trait, ImplementedTrait)
+                and not self._crate_declares(tip, tip.crate(finding.path), old.implemented_trait.path[-1])):
+            return self._outside_trait_rename(finding, read, old_file, old, tip, changed)
+        owner: DeclaredItem | declarations.NoDeclarationAtLine = declarations.NoDeclarationAtLine()
+        if isinstance(declaration.owner, ImplOrTraitItem):
+            owners = [item for item in old_file.declared_items
+                      if item.declaration.name == declaration.owner.name
+                      and item.declaration.keyword in ("struct", "enum", "union", "trait")]
+            if len(owners) == 1 and not self._crate_declares(tip, tip.crate(finding.path), declaration.owner.name):
+                owner = owners[0]
+        if not isinstance(owner, DeclaredItem):
+            parent = declarations.lexical_parent(old_file, old)
+            if isinstance(parent, DeclaredItem) and parent.declaration.keyword == "fn":
+                owner = parent
+        if isinstance(owner, DeclaredItem):
+            proof = self._outside_search(finding, read, old_file, owner, tip, changed, line=owner.keyword_line, target=owner.declaration)
+            if isinstance(proof, OutsideRenameNotProven):
+                return proof
+            destination = self._declared_file(tip.commit, proof.path)
+            expected = replace(declaration, owner=ImplOrTraitItem(proof.declaration.name))
+            required_type = old.implemented_type
+            owner_items = [item for item in destination.declared_items if item.declaration == proof.declaration]
+            if isinstance(required_type, declarations.ImplementedType) and len(owner_items) == 1:
+                required_type = declarations.ImplementedType((proof.declaration.name,), required_type.arguments,
+                                                            owner_items[0].import_position)
+            required_member = replace(old, implemented_type=required_type)
+            children = [item for item in destination.declared_items if item.declaration == expected
+                        and self._outside_type_identity(required_member, tip.commit, proof.path,
+                                                        item, tip.commit, proof.path) == TraitIdentity.SAME]
+            if len(children) == 1:
+                child = children[0]
+                identity = self._trait_identity(old.implemented_trait, read, finding.path,
+                                                child.implemented_trait, tip.commit, proof.path)
+                if identity == TraitIdentity.SAME:
+                    return OutsideRenameProven(child.declaration, proof.path,
+                                               moved_site_line(old_file, finding.line, old, destination, child), proof.proof)
+            if not children:
+                child_proof = self._outside_search(finding, read, old_file, old, tip, changed,
+                                                   line=finding.line, target=expected)
+                if isinstance(child_proof, OutsideRenameProven) and child_proof.path == proof.path:
+                    candidates = [item for item in destination.declared_items if item.declaration == child_proof.declaration]
+                    if (len(candidates) == 1 and self._outside_type_identity(
+                            required_member, tip.commit, proof.path, candidates[0], tip.commit, proof.path) == TraitIdentity.SAME):
+                        return child_proof
+                if isinstance(child_proof, OutsideRenameNotProven):
+                    return child_proof
+            return OutsideRenameNotProven(self._outside_mapping(read, tip.commit, finding.path, finding.line),
+                                         NoOutsideCandidates(), (OutsideFailure.CHILD_UNPROVED,))
+        proof = self._outside_search(finding, read, old_file, old, tip, changed, line=finding.line, target=declaration)
+        if isinstance(proof, OutsideRenameNotProven):
+            return proof
+        return proof
+
+    def _outside_rename(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
+                        tip: RepositoryTip, changed: frozenset[str],
+                        ) -> OutsideRenameProven | OutsideRenameNotProven:
+        """An owner proof carries only its own header or a proved retained child site."""
+        proof = self._outside_owner_rename(finding, read, old_file, old, tip, changed)
+        if isinstance(proof, OutsideRenameNotProven):
+            return proof
+        binding = declarations.binding_at(old_file, old, finding.line)
+        if isinstance(binding, declarations.UnreadableLocalBinding):
+            return OutsideRenameNotProven(self._outside_mapping(read, tip.commit, finding.path, finding.line),
+                                         NoOutsideCandidates(), (OutsideFailure.CHILD_UNPROVED,))
+        if isinstance(binding, declarations.LocalBinding):
+            destination = self._declared_file(tip.commit, proof.path)
+            owners = [item for item in destination.declared_items if item.declaration == proof.declaration]
+            bindings = [child for item in owners for child in declarations.local_bindings(destination, item)
+                        if child.name == binding.name]
+            if (len(bindings) != 1 or len(owners) != 1 or bindings[0].closure != binding.closure
+                    or len(bindings[0].scope) != len(binding.scope)
+                    or old_file.binding_scope(old, binding) != destination.binding_scope(owners[0], bindings[0])):
+                return OutsideRenameNotProven(self._outside_mapping(read, tip.commit, finding.path, finding.line),
+                                             NoOutsideCandidates(), (OutsideFailure.CHILD_UNPROVED,))
+            return replace(proof, line=bindings[0].line)
+        site_kind = old_file.site_kind(old, finding.line)
+        if site_kind == declarations.DeclarationSite.HEADER:
+            return proof
+        destination = self._declared_file(tip.commit, proof.path)
+        owners = [item for item in destination.declared_items if item.declaration == proof.declaration]
+        text = old_file.source_lines[finding.line - 1].strip()
+        if len(owners) == 1 and text:
+            item = owners[0]
+            source_sites = [number for number in range(old.keyword_line + 1, old.last_line)
+                            if old_file.source_lines[number - 1].strip() == text]
+            target_sites = [number for number in range(item.keyword_line + 1, item.last_line)
+                            if destination.source_lines[number - 1].strip() == text]
+            # The owner's proof cannot replace a changed child or a statement that is no longer unique.
+            if source_sites == [finding.line] and len(target_sites) == 1:
+                target_line = target_sites[0]
+                if (site_kind == declarations.DeclarationSite.STATEMENT
+                        and destination.site_kind(item, target_line) == declarations.DeclarationSite.STATEMENT):
+                    return replace(proof, line=target_line)
+                # A simple named field or parameter keeps its name, complete text and position.
+                child = re.fullmatch(r"(?:pub(?:\([^)]*\))?\s+)?([A-Za-z_][A-Za-z_0-9]*)\s*:[^;]+,?", text)
+                if (site_kind == declarations.DeclarationSite.UNSUPPORTED_CHILD and child
+                        and destination.site_kind(item, target_line) == declarations.DeclarationSite.UNSUPPORTED_CHILD
+                        and target_line - item.keyword_line == finding.line - old.keyword_line):
+                    name = child[1]
+                    named = re.compile(rf"(?:pub(?:\([^)]*\))?\s+)?{re.escape(name)}\s*:")
+                    source_names = [number for number in range(old.keyword_line + 1, old.last_line)
+                                    if named.match(old_file.source_lines[number - 1].strip())]
+                    target_names = [number for number in range(item.keyword_line + 1, item.last_line)
+                                    if named.match(destination.source_lines[number - 1].strip())]
+                    if source_names == [finding.line] and target_names == [target_line]:
+                        return replace(proof, line=target_line)
+        return OutsideRenameNotProven(self._outside_mapping(read, tip.commit, finding.path, finding.line),
+                                     NoOutsideCandidates(), (OutsideFailure.CHILD_UNPROVED,))
+
     def _declaration_outcome(self, finding: HeldFinding, tip: RepositoryTip, rust_files: frozenset[str],
-                             approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...]) -> DeclarationOutcome:
+                             approved: Callable[[Path], bool], renames: tuple[BuiltRename, ...],
+                             built_findings: tuple[HeldFinding, ...]) -> DeclarationOutcome:
         if not isinstance(finding.state, (Unfiled, Filed)) or PurePosixPath(finding.path).suffix != ".rs":
             return DeclarationNotRead(finding)
         if isinstance(finding.state, Unfiled):
@@ -2687,10 +3225,12 @@ class Ledger:
             if items and not prior:
                 found[path] = items
         if len(found) > 1 or any(len(items) != 1 for items in found.values()):
-            return DeclaredInSeveralFiles(finding, declaration, tuple(sorted(found)))
+            return DeclaredInSeveralFiles(finding, declaration, tuple(sorted(found)),
+                                          self._outside_refusal_evidence(finding, read, old_file, old, tip, changed))
         for path in found:
             if isinstance(finding.state, Filed) and tip.crate(path) != tip.crate(finding.path):
-                return DeclaredInAnotherCrate(finding, declaration, path)
+                return DeclaredInAnotherCrate(finding, declaration, path,
+                                              self._outside_refusal_evidence(finding, read, old_file, old, tip, changed))
         # The open build holds the finding whatever the rename check would find, so the check does not run.
         if isinstance(finding.build_ticket, BuildTicket):
             ticket = self._ticket(finding.build_ticket.ticket)
@@ -2711,14 +3251,58 @@ class Ledger:
             followed = self._followed_rename(finding, read, old_file, old, after_builds, tip, rust_files, changed)
             if not isinstance(followed, NoRenamedSite):
                 return followed
-        if isinstance(finding.state, Filed) and finding.path in tip.blobs:
+        if isinstance(finding.state, Filed) and finding.path in tip.blobs and finding.path not in rust_files:
             return DeclarationGoneFromFile(finding, declaration)
-        return DeclarationRemoved(finding, declaration)
+        # A refused subject question keeps the established transition, without a ledger-wide name veto.
+        invalid_type = any(built.path == finding.path and built.kind == "type"
+                           and not isinstance(_item_rename(built.kind, built.before, built.after), ItemRename)
+                           and (head := _ITEM_HEAD.fullmatch(built.before.strip()))
+                           and (head[1], head[2]) == (declaration.keyword, declaration.name) for built in built_findings)
+        if isinstance(after_builds, (RenamedByBuilds, RefusedBuiltRename)) or invalid_type:
+            if isinstance(finding.state, Filed) and finding.path in tip.blobs:
+                return DeclarationGoneFromFile(finding, declaration)
+            return DeclarationRemoved(finding, declaration)
+        outside = self._outside_rename(finding, read, old_file, old, tip, changed)
+        # Search first. A scoped built pair that also names a gained candidate keeps the prior filed refusal.
+        # This is no authority to follow or withdraw an unfiled row, and an old spelling alone is insufficient.
+        if isinstance(finding.state, Filed) and finding.path in tip.blobs:
+            targets = ((outside.declaration,) if isinstance(outside, OutsideRenameProven) else
+                       tuple(item.declaration for item in outside.candidates.items
+                             if OutsideFailure.NOT_GAINED not in item.checks)
+                       if isinstance(outside.candidates, OutsideCandidates) else ())
+            if any(tip.crate(built.path) == tip.crate(finding.path)
+                   and isinstance(built.rename.scope, (ModuleQualified, TypeQualified))
+                   and built.rename.old == declaration.name and approved(built.proposal)
+                   and any(target.keyword == declaration.keyword and target.owner == declaration.owner
+                           and target.name == built.rename.new for target in targets) for built in renames):
+                return DeclarationGoneFromFile(finding, declaration)
+        if isinstance(outside, OutsideRenameProven):
+            # An exact competing built pair keeps a filed decision at its original site. A name alone cannot
+            # block the search, and an outside-crate decision cannot withdraw an unfiled finding.
+            if isinstance(finding.state, Filed) and finding.path in tip.blobs:
+                for built in renames:
+                    if (tip.crate(built.path) == tip.crate(finding.path) or not approved(built.proposal)
+                            or (built.rename.old, built.rename.new) != (declaration.name, outside.declaration.name)):
+                        continue
+                    scope = built.rename.scope
+                    owner = declaration.owner
+                    if (isinstance(scope, UnqualifiedName)
+                            or isinstance(scope, ModuleQualified) and scope.module == _module_name(finding.path)
+                            or isinstance(scope, TypeQualified) and isinstance(owner, ImplOrTraitItem)
+                            and (scope.type_name == owner.name or isinstance(old.implemented_trait, ImplementedTrait)
+                                 and scope.type_name == old.implemented_trait.path[-1])):
+                        return DeclarationGoneFromFile(finding, declaration)
+            return DeclarationMoved(finding, outside.declaration, outside.path, outside.line)
+        if OutsideFailure.OLD_NAME_PRESENT not in outside.reasons:
+            return OutsideRenameUnresolved(finding, declaration, outside)
+        if isinstance(finding.state, Filed) and finding.path in tip.blobs:
+            return DeclarationGoneFromFile(finding, declaration, outside)
+        return DeclarationRemoved(finding, declaration, outside)
 
     def _renamed_site(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
                       after_builds: BuiltRenaming, tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],
                       approved: Callable[[Path], bool],
-                      ) -> DeclarationRenamed | RenameAwaitingApproval | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite | TraitIdentityUncertain:
+                      ) -> DeclarationRenamed | RenameAwaitingApproval | DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | NoRenamedSite | TraitIdentityUncertain:
         """Where a filed rename's after name is declared at the tip with the keyword and owner of its gone declaration,
         else with the owner that the built renames gave it.
 
@@ -2759,7 +3343,7 @@ class Ledger:
             return DeclaredInAnotherCrate(finding, renamed, path)
         if isinstance(applied_check(finding.kind, finding.before, finding.after, path,
                                     lambda read_path: self._commit_file(tip.commit, read_path)), RenameNotApplied):
-            return NoRenamedSite()
+            return DeclarationGoneFromFile(finding, declaration)
         if not approved(state.proposal):
             return RenameAwaitingApproval(finding)
         return DeclarationRenamed(finding, declaration, renamed, path,
@@ -2785,18 +3369,25 @@ class Ledger:
         in_crate = tuple(built_rename for built_rename in renames if tip.crate(built_rename.path) == crate)
 
         uncertain_traits: list[BuiltRename] = []
+        examined: set[BuiltRename] = set()
 
         def renamed(name: str, holds_item: Callable[[BuiltRename], bool]) -> tuple[str, ...]:
             """name, then each new name the renames gave it in turn, up to a name with two new names or a name the chain
             already holds; name alone when the finding's own rename names it."""
             names = (name,)
+            questions = tuple(built for built in in_crate if built.rename.old == name)
+            questions = tuple(built for built in questions if holds_item(built))
+            examined.update(questions)
             if isinstance(own, ItemRename) and own.old == name:
                 return names
-            while new := {built_rename.rename.new for built_rename in in_crate if built_rename.rename.old == names[-1]
-                          and approved(built_rename.proposal) and holds_item(built_rename)}:
-                if len(new) > 1 or not new.isdisjoint(names):
+            while questions:
+                new = {built.rename.new for built in questions if approved(built.proposal)}
+                if not new or len(new) > 1 or not new.isdisjoint(names):
                     return names
                 names = (*names, *new)
+                questions = tuple(built for built in in_crate if built.rename.old == names[-1])
+                questions = tuple(built for built in questions if holds_item(built))
+                examined.update(questions)
             return names
 
         def module_item(built: BuiltRename) -> bool:
@@ -2807,7 +3398,7 @@ class Ledger:
         if not isinstance(owner, ImplOrTraitItem):
             names = renamed(declaration.name, module_item)
             if len(names) == 1:
-                return NoBuiltRename()
+                return RefusedBuiltRename() if examined else NoBuiltRename()
             return RenamedByBuilds(Declaration(declaration.keyword, names[-1], owner), requirement)
         # The impl's type and its implemented trait have separate name histories.
         def owner_item(built: BuiltRename) -> bool:
@@ -2893,8 +3484,10 @@ class Ledger:
                 if self._gaining_files(finding, read, candidate, UnrestrictedTraitMembership(), tip,
                                        frozenset(tip.rust_files), self._changed_since(read, tip.commit)):
                     return TraitIdentityUncertain(finding, declaration)
+            # No renamed destination exists. Keep the established plain-deletion result for this trait question.
+            return RefusedBuiltRename()
         if len(names) == 1 and len(owners) == 1 and len(traits) <= 1:
-            return NoBuiltRename()
+            return RefusedBuiltRename() if examined else NoBuiltRename()
         return RenamedByBuilds(Declaration(declaration.keyword, names[-1], ImplOrTraitItem(owners[-1])), requirement)
 
     def _followed_rename(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
@@ -2943,7 +3536,8 @@ class Ledger:
                              approved: Callable[[Path], bool]) -> DeclarationReading:
         rust_files = frozenset(tip.rust_files)
         built_renames: list[BuiltRename] = []
-        for finding in self.held_findings(HeldFindingsInState("built")):
+        built_findings = self.held_findings(HeldFindingsInState("built"))
+        for finding in built_findings:
             rename = _item_rename(finding.kind, finding.before, finding.after)
             if isinstance(finding.state, Built) and isinstance(rename, ItemRename):
                 judged = self.judged_commit(finding)
@@ -2962,7 +3556,8 @@ class Ledger:
                     self._trait_site_position(judged.commit, before_path, before_line, finding.before),
                     self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
         renames = tuple(built_renames)
-        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames)
+        return DeclarationReading(tip.commit, tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames,
+                                                                                   built_findings)
                                                     for finding_id in finding_ids))
 
     def declaration_reading(self, finding_ids: Iterable[str], approved: Callable[[Path], bool]) -> DeclarationReading:

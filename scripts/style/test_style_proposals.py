@@ -2784,7 +2784,6 @@ class StyleProposalsTests(unittest.TestCase):
                 self.assertEqual(renumber.call_count, 1)
             self.assertEqual({frontmatter(issue)["status"][0] for issue in issues}, {"closed"})
 
-
     def commit_tip(self, ledger: style_ledger.Ledger, files: dict[str, str | None]) -> str:
         """Write each file, or remove it for None, commit on main and sync the ledger there."""
         for path, text in files.items():
@@ -2821,6 +2820,70 @@ class StyleProposalsTests(unittest.TestCase):
               redirect_stdout(io.StringIO()) as output):
             style_ledger.main()
         return output.getvalue()
+
+    def test_follow_and_file_keep_the_decision_after_an_outside_rename(self) -> None:
+        path, destination = "alpha/src/a.rs", "alpha/src/b.rs"
+        source = "fn original() {\n    first();\n    second();\n    third();\n    fourth();\n}\n"
+        with self.ledger() as ledger:
+            _ = self.commit_tip(ledger, {path: source})
+            finding, = self.judge(ledger, ((path, 2, "first();"),), kind="restructure", before="retain this request", after="use a type")
+            issue, = self.file(ledger)
+            self.approve(issue)
+            target = "// relocated\n" + source.replace("original", "renamed").replace("third();", "changed();").replace("fourth();", "other();")
+            tip = self.commit_tip(ledger, {path: "// removed\n", destination: target})
+            expected = (0, f"follow {finding.finding_id} {self.rename} {path}:2 -> {destination}:3: fn renamed\n"
+                        + "totals: follow 1, built 0, withdraw 0, left 0, kept 0, close 0\n")
+            before = self.written(ledger)
+            self.assertEqual(self.follow("--dry-run"), expected)
+            self.assertEqual(self.written(ledger), before)
+            self.assertEqual(self.follow(), expected)
+            row, = ledger.proposal_findings(issue)
+            self.assertEqual((row.finding_id, row.path, row.line, row.state, row.before, row.after, row.follow),
+                             (finding.finding_id, destination, 3, style_ledger.Filed(issue), finding.before, finding.after,
+                              style_ledger.FollowedDeclaration(path, 2, tip)))
+            self.assertIn(f"Site: {destination}:3", issue.read_text())
+            self.assertIn(f"followed from {path}:2 at {tip[:7]}", self.held_list())
+            self.assertEqual(self.follow(), (0, "totals: follow 0, built 0, withdraw 0, left 0, kept 0, close 0\n"))
+            # Filing also runs follow before it considers withdrawal or a new batch.
+            _ = self.commit_tip(ledger, {destination: target.replace("renamed", "renamed_again")})
+            with redirect_stdout(io.StringIO()) as output:
+                result = style_proposals.file_proposals(ledger, self.proposals, "parent")
+            self.assertEqual(result.filed, ())
+            self.assertIn(f"follow {finding.finding_id}", output.getvalue())
+            self.assertEqual(ledger.proposal_findings(issue)[0].state, style_ledger.Filed(issue))
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            self.assertEqual(self.file(ledger), ())
+
+        for index, two_files in enumerate((False, True)):
+            with self.subTest(two_files=two_files):
+                with self.ledger() as ledger:
+                    other_source = source.replace("original", f"original_{index}")
+                    _ = self.commit_tip(ledger, {path: other_source, destination: "// empty\n", "alpha/src/c.rs": "// empty\n"})
+                    finding, = self.judge(ledger, ((path, 1, other_source.splitlines()[0]),), kind="restructure")
+                    issue, = self.file(ledger)
+                    target = other_source.replace(f"original_{index}", f"candidate_{index}")
+                    if not two_files:
+                        target = target.replace("second();", "different();").replace("third();", "changed();").replace("fourth();", "other();")
+                    changes: dict[str, str | None] = {path: target, destination: target}
+                    if two_files:
+                        changes["alpha/src/c.rs"] = target
+                    _ = self.commit_tip(ledger, changes)
+                    before = self.written(ledger)
+                    dry_code, dry_output = self.follow("--dry-run")
+                    self.assertEqual(dry_code, 1)
+                    self.assertIn(f"left {finding.finding_id}", dry_output)
+                    self.assertIn("outside rename not proved", dry_output)
+                    self.assertIn(f"mapped site {path}:1 declares fn candidate_{index}", dry_output)
+                    self.assertIn(destination, dry_output)
+                    if two_files:
+                        self.assertIn("alpha/src/c.rs", dry_output)
+                    else:
+                        self.assertIn("1/4", dry_output)
+                    self.assertIn("follow 0, built 0, withdraw 0, left", dry_output)
+                    self.assertEqual(self.written(ledger), before)
+                    self.assertEqual(self.follow(), (dry_code, dry_output))
+                    self.assertEqual(self.written(ledger), before)
+                    self.assertEqual(frontmatter(issue)["status"], ["open"])
 
     def test_follow_of_a_trait_method_prints_the_same_action_in_dry_run_and_keeps_its_decision(self) -> None:
         with self.ledger() as ledger:
@@ -2994,7 +3057,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(ledger.proposal_findings(issue), (followed,))
             self.assertEqual(followed.finding_id, finding.finding_id)
 
-    def test_follow_withdraws_findings_whose_file_is_gone_and_closes_their_decision(self) -> None:
+    def test_follow_keeps_a_deleted_files_decision_when_a_gained_struct_preserves_half_its_body(self) -> None:
         info = "pub struct CratesIoInfo {\n    pub version: String,\n    pub downloads: u64,\n}\n"
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/ci_cache.rs": info})
@@ -3002,32 +3065,43 @@ class StyleProposalsTests(unittest.TestCase):
                                            ("alpha/src/ci_cache.rs", 3, "pub downloads: u64,")),
                                   kind="restructure", before="one struct", after="two structs")
             issue = self.approved_decision(ledger, *findings)
+            original_rows = {row.finding_id: row for row in ledger.proposal_findings(issue)}
             tip = self.commit_tip(ledger, {"alpha/src/ci_cache.rs": None,
                                            "alpha/src/release.rs": "pub struct CratesIoRelease {\n    pub version: String,\n}\n"})
             code, output = self.follow()
-            self.assertEqual(code, 0)
-            for finding in findings:
-                self.assertIn(f"withdraw {finding.finding_id} {self.rename} alpha/src/ci_cache.rs:{finding.line}: "
-                              + f"struct CratesIoInfo declaration gone at {tip[:7]}\n", output)
-            self.assertEqual({finding.state for finding in ledger.proposal_findings(issue)},
-                             {style_ledger.Withdrawn(issue, style_ledger.DeclarationGone(tip))})
-            reason = "nothing left to build: withdrawn: " + ", ".join(
-                f"{finding_id} (declaration gone at {tip[:7]})" for finding_id in sorted(finding.finding_id for finding in findings))
-            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["reason"]), (["closed"], [reason]))
-            self.assertIn(f"close {issue}: {reason}\ntotals: follow 0, built 0, withdraw 2, left 0, kept 0, close 1\n", output)
+            self.assertEqual(code, 1)
+            header, removed_field = findings
+            self.assertIn(f"follow {header.finding_id} {self.rename} alpha/src/ci_cache.rs:1 -> "
+                          + "alpha/src/release.rs:1: struct CratesIoRelease\n", output)
+            self.assertIn(f"left {removed_field.finding_id}", output)
+            self.assertIn("child binding or scope not proved", output)
+            rows = {row.finding_id: row for row in ledger.proposal_findings(issue)}
+            self.assertEqual(rows[removed_field.finding_id], original_rows[removed_field.finding_id])
+            self.assertEqual((rows[header.finding_id].path, rows[header.finding_id].state, rows[header.finding_id].follow),
+                             ("alpha/src/release.rs", style_ledger.Filed(issue),
+                              style_ledger.FollowedDeclaration("alpha/src/ci_cache.rs", 1, tip)))
+            self.assertEqual(frontmatter(issue)["status"], ["open"])
+            self.assertIn("totals: follow 1, built 0, withdraw 0, left 1, kept 0, close 0\n", output)
 
-    def test_an_unfiled_finding_whose_declaration_is_gone_is_withdrawn_with_no_decision_and_never_filed(self) -> None:
+    def test_an_unfiled_finding_with_no_proved_outside_rename_is_retained_and_can_be_filed(self) -> None:
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT})
             finding, = self.judge(ledger, (("alpha/src/a.rs", 2, "old: u32,"),))
-            tip = self.commit_tip(ledger, {"alpha/src/a.rs": "pub fn other() {}\n"})
-            self.assertEqual(self.follow(), (0, f"withdraw {finding.finding_id} {self.rename} alpha/src/a.rs:2: struct Parent "
-                                                + f"declaration gone at {tip[:7]}\ntotals: follow 0, built 0, withdraw 1, left 0, kept 0, close 0\n"))
-            self.assertEqual(self.file(ledger), ())
-            withdrawn, = ledger.held_findings(style_ledger.AllHeldFindings())
-            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.DeclarationGone(tip)))
+            _ = self.commit_tip(ledger, {"alpha/src/a.rs": "pub fn other() {}\n"})
+            before = self.written(ledger)
+            code, output = self.follow()
+            self.assertEqual(code, 1)
+            self.assertIn(f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: outside rename not proved:", output)
+            self.assertIn("mapped site alpha/src/a.rs:1 declares fn other", output)
+            self.assertIn("totals: follow 0, built 0, withdraw 0, left 1, kept 0, close 0\n", output)
+            self.assertEqual(self.written(ledger), before)
+            retained, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(retained.state, style_ledger.Unfiled())
+            issue, = self.file(ledger)
+            filed, = ledger.proposal_findings(issue)
+            self.assertEqual((filed.finding_id, filed.state), (finding.finding_id, style_ledger.Filed(issue)))
             listed, = cast(list[dict[str, object]], json.loads(self.held_list("--json")))
-            self.assertEqual((listed["state"], listed["proposal"], listed["declaration_gone_at"]), ("withdrawn", "", tip))
+            self.assertEqual((listed["state"], listed["proposal"], listed["declaration_gone_at"]), ("filed", str(issue), ""))
 
     def renamed_parent(self, ledger: style_ledger.Ledger) -> tuple[style_ledger.HeldFinding, Path]:
         """A filed rename of struct Parent to Renamed in a.rs, judged at its keyword line, and its decision."""
@@ -3093,35 +3167,42 @@ class StyleProposalsTests(unittest.TestCase):
 
     def test_follow_leaves_a_filed_finding_whose_declaration_is_gone_from_its_kept_file_and_exits_one(self) -> None:
         finding, code, line = self.left_lines({})
-        self.assertEqual((code, line), (1, f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: struct Parent "
-                                           + "declaration gone; waive it or declare it again"))
+        self.assertEqual(code, 1)
+        self.assertTrue(line.startswith(f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: outside rename not proved:"))
+        self.assertIn("candidates: alpha/src/a.rs:1 fn other 0/1 body lines", line)
+        self.assertIn("mapped site alpha/src/a.rs:1 declares fn other", line)
 
-    def test_an_unfiled_finding_whose_item_was_renamed_is_withdrawn_with_no_decision(self) -> None:
+    def test_an_unfiled_finding_follows_a_proved_outside_rename_with_no_decision(self) -> None:
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT})
             finding, = self.judge(ledger, (("alpha/src/a.rs", 1, "pub struct Parent {"),), before="Parent", after="Renamed")
             tip = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT.replace("Parent", "Renamed")})
-            self.assertEqual(self.follow(), (0, f"withdraw {finding.finding_id} {self.rename} alpha/src/a.rs:1: struct Parent "
-                                                + f"declaration gone at {tip[:7]}\n"
-                                                + "totals: follow 0, built 0, withdraw 1, left 0, kept 0, close 0\n"))
-            withdrawn, = ledger.held_findings(style_ledger.AllHeldFindings())
-            self.assertEqual(withdrawn.state, style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.DeclarationGone(tip)))
+            self.assertEqual(self.follow(), (0, f"follow {finding.finding_id} {self.rename} alpha/src/a.rs:1 -> alpha/src/a.rs:1: "
+                                                + "struct Renamed\ntotals: follow 1, built 0, withdraw 0, left 0, kept 0, close 0\n"))
+            followed, = ledger.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual((followed.state, followed.follow),
+                             (style_ledger.Unfiled(), style_ledger.FollowedDeclaration("alpha/src/a.rs", 1, tip)))
 
     def test_follow_dry_run_prints_the_same_built_and_left_lines_and_writes_nothing(self) -> None:
-        gone = "pub struct Gone {\n    old: u32,\n}\n"
+        gone = "pub struct Gone {\n    different: u64,\n}\n"
         with self.ledger() as ledger:
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT, "alpha/src/b.rs": gone})
             renamed, = self.judge(ledger, (("alpha/src/a.rs", 1, "pub struct Parent {"),), before="Parent", after="Renamed")
-            left, = self.judge(ledger, (("alpha/src/b.rs", 2, "old: u32,"),), before="Gone::old", after="Gone::new")
+            left, = self.judge(ledger, (("alpha/src/b.rs", 2, "different: u64,"),), before="Gone::different", after="Gone::new")
             issue = self.approved_decision(ledger, renamed, left)
             _ = self.commit_tip(ledger, {"alpha/src/a.rs": PARENT.replace("Parent", "Renamed"), "alpha/src/b.rs": "pub fn other() {}\n"})
             before = self.written(ledger)
             dry = self.follow("--dry-run")
             self.assertEqual(self.written(ledger), before)
-            self.assertEqual((dry[0], sorted(dry[1].splitlines())), (1, sorted([
-                f"built {renamed.finding_id} {self.rename} alpha/src/a.rs:1: struct Parent renamed to Renamed in alpha/src/a.rs:1",
-                f"left {left.finding_id} {self.rename} alpha/src/b.rs:2: struct Gone declaration gone; waive it or declare it again",
-                "totals: follow 0, built 1, withdraw 0, left 1, kept 0, close 0"])))
+            self.assertEqual(dry[0], 1)
+            lines = dry[1].splitlines()
+            self.assertIn(f"built {renamed.finding_id} {self.rename} alpha/src/a.rs:1: struct Parent renamed to Renamed in alpha/src/a.rs:1", lines)
+            left_line, = [line for line in lines if line.startswith(f"left {left.finding_id} ")]
+            self.assertIn("outside rename not proved:", left_line)
+            self.assertIn("body check failed", left_line)
+            self.assertIn("mapped site alpha/src/b.rs:1 declares fn other", left_line)
+            self.assertIn("totals: follow 0, built 1, withdraw 0, left 1, kept 0, close 0", lines)
+            self.assertEqual(len(lines), 3)
             self.assertEqual(self.follow(), dry)
             self.assertEqual({finding.finding_id: finding.state for finding in ledger.proposal_findings(issue)},
                              {renamed.finding_id: style_ledger.Built(issue), left.finding_id: style_ledger.Filed(issue)})
@@ -3157,12 +3238,14 @@ class StyleProposalsTests(unittest.TestCase):
     def test_a_declaration_in_two_other_files_is_left_for_a_person_and_follow_exits_one(self) -> None:
         finding, code, line = self.left_lines({"alpha/src/b.rs": PARENT, "alpha/src/c.rs": PARENT})
         self.assertEqual((code, line), (1, f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: struct Parent "
-                                           + "declared in alpha/src/b.rs, alpha/src/c.rs"))
+                                           + "declared in alpha/src/b.rs, alpha/src/c.rs; mapped site alpha/src/a.rs:1 declares fn other; "
+                                           + "outside rename not proved: old name still declared in crate"))
 
     def test_a_filed_finding_whose_declaration_moved_to_another_crate_is_left(self) -> None:
         finding, code, line = self.left_lines({"beta/src/b.rs": PARENT})
         self.assertEqual((code, line), (1, f"left {finding.finding_id} {self.rename} alpha/src/a.rs:2: struct Parent "
-                                           + "declared in another crate: beta/src/b.rs"))
+                                           + "declared in another crate: beta/src/b.rs; mapped site alpha/src/a.rs:1 declares fn other; "
+                                           + "outside rename not proved: zero passing files, keyword differs, body unreadable or empty"))
 
     def test_a_finding_that_an_assigned_build_ticket_holds_is_kept(self) -> None:
         with self.ledger() as ledger:
