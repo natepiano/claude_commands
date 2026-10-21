@@ -729,6 +729,52 @@ exec "$TEST_REAL_SLEEP" "$@"
                         self.end_group(process.pid)
                     _ = process.wait(timeout=300)
 
+    def test_a_token_wait_does_not_start_a_new_memory_wait_limit(self) -> None:
+        # On 2026-10-21 a step waited 15 min for memory, 24 min for the token,
+        # then 15 min for memory again. The forced start counts the step's
+        # whole memory wait, so the pass after the token wait gets only what
+        # is left of the limit: here nothing, so it starts with no poll sleep.
+        # The board wrapper makes the step's one try for the token fail, and
+        # logs each other acquire next to the sleep calls.
+        home = self.root / "busy-home"
+        delegate = home / ".claude/scripts/direct"
+        delegate.mkdir(parents=True)
+        for source in VERIFY.parent.parent.iterdir():
+            if source.name != "direct":
+                (delegate.parent / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        for source in VERIFY.parent.iterdir():
+            if source.name != "board.sh":
+                (delegate / source.name).symlink_to(source, target_is_directory=source.is_dir())
+        _ = (delegate / "board.sh").write_text(
+            '#!/bin/bash\n'
+            + 'if [[ "$1" == acquire && " $* " == *" --wait 0 "* ]]; then exit 1; fi\n'
+            + 'if [[ "$1" == acquire ]]; then printf "token\\n" >> "$TEST_SLEEP_LOG"; fi\n'
+            + 'exec bash "$TEST_REAL_BOARD" "$@"\n')
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the memory wait test needs sleep on PATH")
+        sleep = self.root / "stubs" / "sleep"
+        _ = sleep.write_text('#!/bin/sh\nprintf "sleep %s\\n" "$*" >> "$TEST_SLEEP_LOG"\n'
+                             + 'exec "$TEST_REAL_SLEEP" "$@"\n')
+        sleep.chmod(0o755)
+        _ = Path(self.environment["BUILDLOG_MEMINFO"]).write_text("MemAvailable: 0 kB\n")
+        log = self.root / "sleep-log"
+        environment = {**self.environment, "HOME": str(home),
+                       "PLAN_DELEGATE_BOARD_DIR": str(self.root / "board"),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "TEST_REAL_BOARD": str(BOARD),
+                       "TEST_REAL_SLEEP": real_sleep, "TEST_SLEEP_LOG": str(log),
+                       "BUILDLOG_MEM_POLL_S": "1", "BUILDLOG_MEM_WAIT_LIMIT_S": "2"}
+        result = self.verify(environment)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertEqual(output.count("memory wait limit reached"), 2, output)
+        lines = log.read_text().splitlines()
+        self.assertIn("token", lines)
+        # The step's acquire after its failed try is the last one in the log.
+        last_token = len(lines) - 1 - lines[::-1].index("token")
+        self.assertIn("sleep 1", lines[:last_token], "the first memory wait polls until its limit")
+        self.assertNotIn("sleep 1", lines[last_token:], "the pass after the token wait started a new limit")
+
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
         """A held natedev for the step's hold wait only.
 
