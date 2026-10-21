@@ -1875,7 +1875,7 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertIn("Recommended answer:", body)
             self.assertTrue(body.split("---", 2)[2].lstrip().startswith("Proposed ranking:"))
             fields = frontmatter(shared)
-            self.assertEqual(fields["area"], ["unfiled"])
+            self.assertEqual(fields["area"], ["style"])
             self.assertEqual(fields["project"], ["alpha"])
             self.assertEqual(fields["proposed_by"], ["sample-style"])
             self.assertEqual(set(fields["tags"]), {"issue", "proposal", "style"})

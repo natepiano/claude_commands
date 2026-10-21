@@ -113,7 +113,8 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertEqual(fields["tags"], ["issue", "proposal", "style"])
         self.assertNotIn("style_findings", fields)
         self.assertEqual(fields["style_count"], ["3"])
-        self.assertEqual(fields["area"], ["unfiled"])
+        self.assertEqual(fields["area"], ["style"])
+        self.assertIn('area: "[[style]]"\n', issue.read_text())
         self.assertEqual(fields["category"], ["refactor"])
         self.assertEqual(fields["backlog_goal"], [])
         self.assertEqual(fields["project"], ["alpha"])
@@ -124,6 +125,94 @@ class ProposalIssueTests(unittest.TestCase):
         arguments[arguments.index("--rule-blob") + 1] = "c"
         self.assertEqual(self.run_cli(*arguments)[0], 2)
         self.assertEqual(issue.read_bytes(), original)
+
+    def test_area_style_sets_the_area_and_vault_date_on_current_and_closed_legacy_issues(self) -> None:
+        forms = (
+            ("decision", 'area: "[[unfiled]]"\n', 'style_rule: "global:rust/names.md"\n', "open"),
+            ("missing area", "", 'style_rule: "global:rust/names.md"\n', "closed"),
+            ("legacy", 'area: "[[unfiled]]"\n',
+             'style_rules: ["https://example.test/names.md"]\nstyle_findings: ["held-1"]\n', "closed"),
+        )
+        for name, area, metadata, status in forms:
+            with self.subTest(form=name):
+                folder = self.root / name
+                folder.mkdir()
+                issue = folder / "proposal.md"
+                original = (f'---\n{area}date_modified: "[[2000-01-01]]"\nstatus: {status}\n'
+                            + 'unit: "names-unit"\nplan: "unit.md"\n' + metadata
+                            + 'tags: ["issue", "proposal", "style"]\n---\nUser notes stay.\n')
+                _ = issue.write_text(original)
+                code, out, err = self.run_cli("area-style", str(folder))
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(len(out.splitlines()), 1)
+                self.assertIn(issue.name, out)
+                updated = issue.read_text()
+                self.assertIn('area: "[[style]]"\n', updated)
+                self.assertIn(f"date_modified: {self.today()}\n", updated)
+                self.assertEqual(updated.replace('area: "[[style]]"\n', ""),
+                                 original.replace(area, "", 1).replace('"[[2000-01-01]]"', self.today()))
+
+    def test_area_style_keeps_comments_after_the_area_line_when_it_updates_the_issue(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue = folder / "decision.md"
+        for newline in (b"\n", b"\r\n"):
+            with self.subTest(newline=newline):
+                original = (b'---\narea: "[[unfiled]]"\n# Keep this comment and its spacing.  \n\n'
+                            b'date_modified: "[[2000-01-01]]"\nstyle_rule: "global:rust/names.md"\n'
+                            b'status: open\n---\nUser notes stay.\n').replace(b"\n", newline)
+                _ = issue.write_bytes(original)
+                expected = original.replace(b'area: "[[unfiled]]"', b'area: "[[style]]"').replace(
+                    b'"[[2000-01-01]]"', self.today().encode())
+                action = (0, f"area-style {issue.name}: area [[style]]\n", "")
+                self.assertEqual(self.run_cli("area-style", str(folder), "--dry-run"), action)
+                self.assertEqual(issue.read_bytes(), original)
+                self.assertEqual(self.run_cli("area-style", str(folder)), action)
+                self.assertEqual(issue.read_bytes(), expected)
+                self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+                self.assertEqual(issue.read_bytes(), expected)
+
+    def test_area_style_keeps_non_style_issues_and_other_areas_byte_identical(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        originals: dict[Path, bytes] = {}
+        for name, metadata, area in (
+            ("plain", "", '"[[unfiled]]"'),
+            ("other area", 'style_rule: "global:rust/names.md"\n', '"[[tooling]]"'),
+            ("already style", 'style_rules: ["https://example.test/names.md"]\n', '"[[style]]"'),
+        ):
+            path = folder / (name + ".md")
+            original = (f'---\narea: {area}\ndate_modified: "[[2000-01-01]]"\n{metadata}'
+                        + 'status: open\n---\nstyle_rule: body text is not metadata\n').encode()
+            _ = path.write_bytes(original)
+            originals[path] = original
+        stamps = {path: path.stat().st_mtime_ns for path in originals}
+        self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        self.assertEqual({path: path.stat().st_mtime_ns for path in originals}, stamps)
+
+    def test_area_style_dry_run_and_second_run_write_nothing(self) -> None:
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue = folder / "decision.md"
+        original = (b'---\narea: "[[unfiled]]"\ndate_modified: "[[2000-01-01]]"\n'
+                    b'style_rule: "global:rust/names.md"\nstatus: open\n---\nKeep notes.\n')
+        _ = issue.write_bytes(original)
+        stamp = issue.stat().st_mtime_ns
+        dry = self.run_cli("area-style", str(folder), "--dry-run")
+        self.assertEqual((dry[0], dry[2]), (0, ""))
+        self.assertEqual(len(dry[1].splitlines()), 1)
+        self.assertIn(issue.name, dry[1])
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        self.assertEqual(list(folder.iterdir()), [issue])
+        self.assertEqual(self.run_cli("area-style", str(folder)), dry)
+        updated, stamp = issue.read_bytes(), issue.stat().st_mtime_ns
+        self.assertNotEqual(updated, original)
+        self.assertEqual(self.run_cli("area-style", str(folder)), (0, "", ""))
+        self.assertEqual(issue.read_bytes(), updated)
+        self.assertEqual(issue.stat().st_mtime_ns, stamp)
+        self.assertEqual(list(folder.iterdir()), [issue])
 
     def test_number_gives_each_proposal_the_next_free_number_oldest_first(self) -> None:
         folder = self.root / "issues"

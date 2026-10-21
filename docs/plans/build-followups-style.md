@@ -1001,7 +1001,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** another file name for the second run; `os.replace` onto an existing issue (it overwrites the decision of the other run); a retry loop; removing `_folder_lock`.
 
-### Phase 37 — a style decision files under area style, new and old  · status: todo
+### Phase 37 — a style decision files under area style, new and old  · status: done
 **Depends on:** Phase 36
 
 #### Work Order
