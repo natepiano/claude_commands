@@ -78,6 +78,7 @@ class StyleProposalsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
         self.catalog = self.root / "nate_style/rust"
         self.proposals = self.root / "vault/issues"
@@ -86,9 +87,9 @@ class StyleProposalsTests(unittest.TestCase):
         self.catalog.mkdir(parents=True)
         _ = self.template.write_text(TEMPLATE)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
-            "XDG_RUNTIME_DIR": str(self.root / "runtime"),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.catalog.parent))
         _ = self.git("init", "-q", "--initial-branch=main")
@@ -263,7 +264,7 @@ class StyleProposalsTests(unittest.TestCase):
         with self.ledger() as ledger:
             finding = self.hold(ledger)
             issue = self.file(ledger)[0]
-            ledger.waive_held(finding.finding_id)
+            ledger.waive_held(finding.finding_id, style_ledger.WaiveByPerson("nate"))
         with redirect_stdout(io.StringIO()) as output:
             code = style_proposals.main(["unwaive", "--repo", str(self.repo), "--proposals", str(self.proposals),
                                          "--id", finding.finding_id[:8], "--by", " nate "])
@@ -281,7 +282,7 @@ class StyleProposalsTests(unittest.TestCase):
             style_proposals.decline(ledger, issue, "Keep these names")
             waived = self.hold(ledger, crate="beta")
             _ = self.file(ledger)
-            ledger.waive_held(waived.finding_id)
+            ledger.waive_held(waived.finding_id, style_ledger.WaiveByPerson("nate"))
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             code = style_proposals.main(["unwaive", "--repo", str(self.repo), "--proposals", str(self.proposals),
                                          "--id", waived.finding_id, "--id", declined.finding_id, "--by", "nate"])
@@ -446,10 +447,10 @@ class StyleProposalsTests(unittest.TestCase):
                                                        f"style_findings: [{owned.finding_id}, {elsewhere.finding_id}, {waived.finding_id}]"))
             other = self.proposals / "other.md"
             ledger.file_held(elsewhere.finding_id, other)
-            ledger.waive_held(waived.finding_id)
+            ledger.waive_held(waived.finding_id, style_ledger.WaiveByPerson("nate"))
             empty = self.legacy_issue(ledger, "empty", self.hold(ledger, crate="beta"))
             beta = ledger.proposal_findings(empty)[0]
-            ledger.waive_held(beta.finding_id)
+            ledger.waive_held(beta.finding_id, style_ledger.WaiveByPerson("nate"))
             decision = self.proposals / style_proposals.batch_name(style_proposals.decision_key(owned, ("alpha", "beta")))
             expected = [
                 f"kept {beta.finding_id}: waived, not filed to {empty}",
@@ -2603,7 +2604,7 @@ class StyleProposalsTests(unittest.TestCase):
     def test_drop_duplicates_leaves_a_waived_bare_row_alone_in_the_dry_run_and_the_run(self) -> None:
         with self.ledger() as ledger:
             issue, _, bare = self.bare_duplicate_decision(ledger)
-            ledger.waive_held(bare.finding_id)
+            ledger.waive_held(bare.finding_id, style_ledger.WaiveByPerson("nate"))
             before = self.written(ledger)
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run), redirect_stdout(io.StringIO()) as output:

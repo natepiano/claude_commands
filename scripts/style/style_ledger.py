@@ -86,6 +86,25 @@ class LedgerError(ValueError):
     """A ledger operation cannot represent the requested check."""
 
 
+@dataclass(frozen=True)
+class NoReadFiles:
+    """The judgment uses its declared file or rule scope."""
+
+
+NO_READ_FILES = NoReadFiles()
+
+
+@dataclass(frozen=True)
+class ReadFiles:
+    """The judgment rests on its cell file and these named files."""
+
+    paths: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.paths:
+            raise LedgerError("--reads requires at least one file")
+
+
 class CheckCouldNotRun(LedgerError):
     """A git command failed or the ledger schema is newer than this script; the request is not at fault."""
 
@@ -269,6 +288,30 @@ class Withdrawn:
 HeldState = Unfiled | Filed | Waived | Built | Withdrawn
 
 
+class WaiveProvenance(StrEnum):
+    UNRECORDED = "unrecorded"
+    UNIT = "unit"
+    PERSON = "person"
+
+
+@dataclass(frozen=True)
+class WaiveByUnit:
+    ticket: str
+
+
+@dataclass(frozen=True)
+class WaiveByPerson:
+    by: str
+
+
+WaiveActor = WaiveByUnit | WaiveByPerson
+
+
+@dataclass(frozen=True)
+class NoRecordedWaiveActor:
+    """An older waive or a decision decline has no caller name on the finding."""
+
+
 def held_state_name(state: HeldState) -> HeldStateName:
     match state:
         case Unfiled():
@@ -417,6 +460,7 @@ class WaiveUndoneBy:
 
 
 WaiveUndo = NoWaiveUndo | WaiveUndoneBy
+NO_WAIVE_UNDO = NoWaiveUndo()
 
 
 @dataclass(frozen=True)
@@ -467,6 +511,8 @@ class HeldFinding:
     reading: PersonReading
     waive_undo: WaiveUndo
     follow: FollowState
+    waive_provenance: WaiveProvenance
+    waive_actor: WaiveActor | NoRecordedWaiveActor
 
 
 def rule_changed_since_judged(finding: HeldFinding, definitions: Mapping[str, Rule]) -> bool:
@@ -998,6 +1044,7 @@ class TicketJudgment:
     path: str
     commit: str
     declared_scope: DeclaredInputScope
+    reads: ReadFiles | NoReadFiles = NO_READ_FILES
 
 
 @dataclass(frozen=True)
@@ -1162,6 +1209,7 @@ class Judgment:
     verdict: Verdict
     input_scope: CellInputScope
     declared_scope: DeclaredInputScope
+    reads: ReadFiles | NoReadFiles = NO_READ_FILES
 
 
 @dataclass(frozen=True)
@@ -1310,6 +1358,22 @@ def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: st
     return blob
 
 
+def _read_files(serialized: str) -> ReadFiles | NoReadFiles:
+    if serialized == "null":
+        return NO_READ_FILES
+    return ReadFiles(tuple(cast(list[str], json.loads(serialized))))
+
+
+def _read_fingerprint(tip: RepositoryTip, path: str, reads: ReadFiles) -> str:
+    inputs: list[tuple[str, str]] = []
+    for name in sorted({path, *reads.paths}):
+        blob = tip.blobs.get(name)
+        if blob is None:
+            raise LedgerError(f"{name}: no file at {tip.commit}")
+        inputs.append((name, blob))
+    return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
+
+
 def _config_hash(repo: Path, tip: RepositoryTip, tool: LintTool) -> str:
     names = {
         "clippy": ("clippy.toml", ".clippy.toml"),
@@ -1438,6 +1502,9 @@ MIGRATIONS = {
         ALTER TABLE held_findings ADD COLUMN followed_at TEXT NOT NULL DEFAULT '';
         ALTER TABLE held_findings ADD COLUMN declaration_gone_at TEXT NOT NULL DEFAULT '';
     """,
+    18: "ALTER TABLE judgments ADD COLUMN read_files TEXT NOT NULL DEFAULT 'null';",
+    19: "ALTER TABLE held_findings ADD COLUMN waive_provenance TEXT NOT NULL DEFAULT 'unrecorded';",
+    20: "ALTER TABLE held_findings ADD COLUMN waived_by TEXT NOT NULL DEFAULT '';",
 }
 
 
@@ -1518,6 +1585,11 @@ class Ledger:
         return self._fingerprints[key]
 
     def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str) -> bool:
+        if isinstance(row.reads, ReadFiles):
+            try:
+                return row.input_fingerprint == _read_fingerprint(tip, path, row.reads)
+            except LedgerError:
+                return False
         scope = _comparison_scope(row.declared_scope, scope)
         try:
             previous = (row.input_fingerprint if row.input_scope == scope
@@ -1813,8 +1885,8 @@ class Ledger:
                 if isinstance(restamps, CheckpointRestamps):
                     for verdict in restamps.carried:
                         _ = self._connection.execute(
-                            'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope) '
-                            + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,?,declared_scope FROM judgments WHERE id=? '
+                            'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files) '
+                            + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,?,declared_scope,read_files FROM judgments WHERE id=? '
                             + 'ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) DO NOTHING',
                             (verdict.scope, verdict.fingerprint, checkpoint, datetime.now(timezone.utc).isoformat(), verdict.judgment_id),
                         )
@@ -1876,14 +1948,14 @@ class Ledger:
         _ = self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
 
     def latest_ticket_judgments(self, ticket_id: str) -> tuple[TicketJudgment, ...]:
-        rows = cast(list[tuple[int, str, str, str, str]], self._connection.execute(
-            'SELECT j.id,j.rule,j.path,j."commit",j.declared_scope FROM judgments j WHERE j.ticket=? '
+        rows = cast(list[tuple[int, str, str, str, str, str]], self._connection.execute(
+            'SELECT j.id,j.rule,j.path,j."commit",j.declared_scope,j.read_files FROM judgments j WHERE j.ticket=? '
             + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.ticket=j.ticket '
             + 'AND latest.rule=j.rule AND latest.path=j.path ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
             (ticket_id,),
         ).fetchall())
-        return tuple(TicketJudgment(judgment_id, rule, path, commit, DeclaredInputScope(declared))
-                     for judgment_id, rule, path, commit, declared in rows)
+        return tuple(TicketJudgment(judgment_id, rule, path, commit, DeclaredInputScope(declared), _read_files(reads))
+                     for judgment_id, rule, path, commit, declared, reads in rows)
 
     def filed_build_findings(self, ticket_id: str) -> tuple[HeldFinding, ...]:
         """The filed findings this ticket holds for its build."""
@@ -1910,12 +1982,14 @@ class Ledger:
                     continue
                 if not self._is_ancestor(judgment.commit, checkpoint):
                     continue
+                paths = (judgment.path, *judgment.reads.paths) if isinstance(judgment.reads, ReadFiles) else (judgment.path,)
                 changed_commits = set(_git(self.repo, "rev-list", "--full-history", checkpoint,
-                                          "^" + judgment.commit, "--", judgment.path).splitlines())
+                                          "^" + judgment.commit, "--", *paths).splitlines())
                 if not changed_commits <= own_commits:
                     continue
                 scope = _comparison_scope(judgment.declared_scope, _cell_scope(definition, judgment.path, tip))
-                fingerprint = self._fingerprint(tip, scope, judgment.path)
+                fingerprint = (_read_fingerprint(tip, judgment.path, judgment.reads) if isinstance(judgment.reads, ReadFiles)
+                               else self._fingerprint(tip, scope, judgment.path))
             except LedgerError:
                 continue
             carried.append(CarriedVerdict(judgment.judgment_id, scope, fingerprint))
@@ -2118,9 +2192,9 @@ class Ledger:
         return self._held(finding_id)
 
     def _held(self, finding_id: str) -> HeldFinding:
-        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str, str, int, str, str]], self._connection.execute(
+        rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str, str, int, str, str, str, str]], self._connection.execute(
             "SELECT finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,build_ticket,withdrawn_by,person_read_by,duplicate_of,unwaived_by,"
-            + "followed_from,followed_from_line,followed_at,declaration_gone_at FROM held_findings WHERE finding_id=?", (finding_id,),
+            + "followed_from,followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by FROM held_findings WHERE finding_id=?", (finding_id,),
         ).fetchall())
         if not rows:
             raise LedgerError(f"unknown held finding {finding_id}")
@@ -2139,9 +2213,16 @@ class Ledger:
                                   else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
             case "unfiled":
                 state = Unfiled()
+        provenance = WaiveProvenance(row[21])
+        actor: WaiveActor | NoRecordedWaiveActor = NoRecordedWaiveActor()
+        if row[22]:
+            if provenance == WaiveProvenance.UNIT:
+                actor = WaiveByUnit(row[22])
+            elif provenance == WaiveProvenance.PERSON:
+                actor = WaiveByPerson(row[22])
         return HeldFinding(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8], row[9], state, BuildTicket(row[12]) if row[12] else NoBuildTicket(),
                            ReadByPerson(row[14]) if row[14] else NotReadByPerson(), WaiveUndoneBy(row[16]) if row[16] else NoWaiveUndo(),
-                           FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed())
+                           FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed(), provenance, actor)
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
         rows = cast(list[tuple[str, str]], self._connection.execute(
@@ -2334,7 +2415,7 @@ class Ledger:
                         or any(self.newest_held_judgment(*cell) != read for cell, read in reads.items())):
                     raise ChangedBeforeLock("the findings or their judgments changed while they were declined; rerun")
                 now = _now()
-                _ = self._connection.executemany("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?",
+                _ = self._connection.executemany("UPDATE held_findings SET state='waived',waive_provenance='person',waived_by='',updated_at=? WHERE finding_id=?",
                                                  [(now, finding.finding_id) for finding in findings])
                 for cell, read in reads.items():
                     if isinstance(read, NewestHeldJudgment) and isinstance(decisions[cell], CellWaived):
@@ -2350,8 +2431,8 @@ class Ledger:
         return retry_on_change(attempt)
 
     def newest_held_judgment(self, rule: str, path: str) -> NewestHeldJudgment | NoHeldJudgment:
-        rows = cast(list[tuple[int, str, str, str, str, str, str, str, str, str]], self._connection.execute(
-            'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint,declared_scope FROM judgments '
+        rows = cast(list[tuple[int, str, str, str, str, str, str, str, str, str, str]], self._connection.execute(
+            'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint,declared_scope,read_files FROM judgments '
             + "WHERE rule=? AND path=? AND verdict='held' ORDER BY recorded_at DESC,id DESC LIMIT 1",
             (rule, path),
         ).fetchall())
@@ -2362,7 +2443,7 @@ class Ledger:
             "SELECT id FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
             (rule, path),
         ).fetchone())[0]
-        inputs = Judgment(row[6], row[8], row[3], "held", CellInputScope(row[7]), DeclaredInputScope(row[9]))
+        inputs = Judgment(row[6], row[8], row[3], "held", CellInputScope(row[7]), DeclaredInputScope(row[9]), _read_files(row[10]))
         return NewestHeldJudgment(row[0], HeldJudgment(*row[1:7]), inputs, newest)
 
     def decline_outcome(self, held: NewestHeldJudgment | NoHeldJudgment, path: str, definition: Rule, tip: RepositoryTip,
@@ -3754,6 +3835,45 @@ class Ledger:
         findings = {finding.finding_id: finding for finding in (self._named_finding(name, identities) for name in names)}
         return tuple(findings[finding_id] for finding_id in sorted(findings))
 
+    def _restore_held_findings(self, findings: tuple[HeldFinding, ...], detail: str) -> None:
+        """Restore findings and newest waived cell judgments under the caller's write lock."""
+        tip = self._synced_tip()
+        cells = {(finding.rule, _finding_cell(self._component_rule(finding.rule), finding.path, tip)) for finding in findings}
+        now = _now()
+        _ = self._connection.executemany(
+            "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',updated_at=? WHERE finding_id=?",
+            [(now, finding.finding_id) for finding in findings],
+        )
+        for rule, path in sorted(cells):
+            newest = cast(list[tuple[int, Verdict]], self._connection.execute(
+                "SELECT id,verdict FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1", (rule, path),
+            ).fetchall())
+            if newest and newest[0][1] == "waived":
+                _ = self._connection.execute("UPDATE judgments SET verdict='held',verdict_detail=?,recorded_at=? WHERE id=?",
+                                             (detail, now, newest[0][0]))
+
+    def replace_held(self, finding_id: str, after: str, person: WaiveUndo = NO_WAIVE_UNDO) -> HeldFinding:
+        """Correct a waived finding and hold it again, with its id and judging ticket."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            finding = self._held(finding_id)
+            if not isinstance(finding.state, Waived):
+                raise LedgerError(f"{finding_id}: cannot replace a {held_state_name(finding.state)} finding")
+            if finding.waive_provenance == WaiveProvenance.PERSON:
+                raise LedgerError(f"{finding_id}: cannot replace a person's waived finding; use the person-attributed unwaive path")
+            if isinstance(person, WaiveUndoneBy) and not person.by.strip():
+                raise LedgerError(f"{finding_id}: held replace --person requires a name")
+            if finding.waive_provenance == WaiveProvenance.UNRECORDED and isinstance(person, NoWaiveUndo):
+                raise LedgerError(f"{finding_id}: unrecorded waive requires held replace --person <name>")
+            detail = f"replaced waived finding {finding_id}"
+            if isinstance(person, WaiveUndoneBy):
+                detail += f"; unwaived by {person.by}"
+            self._restore_held_findings((finding,), detail)
+            _ = self._connection.execute("UPDATE held_findings SET after=?,person_read_by='' WHERE finding_id=?", (after, finding_id))
+            if isinstance(person, WaiveUndoneBy):
+                _ = self._connection.execute("UPDATE held_findings SET unwaived_by=? WHERE finding_id=?", (person.by, finding_id))
+        return self._held(finding_id)
+
     def unwaive_held(self, names: tuple[str, ...], person: WaiveUndoneBy) -> tuple[str, ...]:
         """Set waived findings back to unfiled, with no decision and no build ticket, and record who did it.
 
@@ -3780,20 +3900,11 @@ class Ledger:
                 ).fetchall())
                 if judging:
                     raise LedgerError(f"{finding.finding_id}: {judging[0][0]} ticket {finding.ticket} still holds the finding")
-            tip = self._synced_tip()
-            cells = {(finding.rule, _finding_cell(self._component_rule(finding.rule), finding.path, tip)) for finding in findings}
-            now = _now()
+            self._restore_held_findings(findings, f"unwaived by {person.by}")
             _ = self._connection.executemany(
-                "UPDATE held_findings SET state='unfiled',proposal='',build_ticket='',moved_from='',unwaived_by=?,updated_at=? WHERE finding_id=?",
-                [(person.by, now, finding.finding_id) for finding in findings],
+                "UPDATE held_findings SET unwaived_by=? WHERE finding_id=?",
+                [(person.by, finding.finding_id) for finding in findings],
             )
-            for rule, path in sorted(cells):
-                newest = cast(list[tuple[int, Verdict]], self._connection.execute(
-                    "SELECT id,verdict FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1", (rule, path),
-                ).fetchall())
-                if newest and newest[0][1] == "waived":
-                    _ = self._connection.execute("UPDATE judgments SET verdict='held',verdict_detail=?,recorded_at=? WHERE id=?",
-                                                 (f"unwaived by {person.by}", now, newest[0][0]))
         return tuple(finding.finding_id for finding in findings)
 
     def return_to_filed(self, refilings: Mapping[str, PersonReading]) -> None:
@@ -3830,15 +3941,25 @@ class Ledger:
                     (readings[finding_id].by, now, finding_id),
                 )
 
-    def waive_held(self, finding_id: str) -> None:
+    def waive_held(self, finding_id: str, actor: WaiveActor) -> None:
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             finding = self._held(finding_id)
-            # A withdrawn finding keeps the verdict that withdrew it.
-            if isinstance(finding.state, (Waived, Withdrawn)):
+            if isinstance(actor, WaiveByUnit):
+                if not actor.ticket.strip():
+                    raise LedgerError(f"{finding_id}: held waive --ticket requires a ticket")
+                if actor.ticket != finding.ticket:
+                    raise LedgerError(f"{finding_id}: ticket {actor.ticket} did not judge this finding; expected {finding.ticket}")
+                provenance, by = WaiveProvenance.UNIT, actor.ticket
+            else:
+                if not actor.by.strip():
+                    raise LedgerError(f"{finding_id}: held waive --person requires a name")
+                provenance, by = WaiveProvenance.PERSON, actor.by
+            # A unit cannot relabel an existing waive. A person's explicit waive protects it from replacement.
+            if isinstance(finding.state, Withdrawn) or isinstance(finding.state, Waived) and isinstance(actor, WaiveByUnit):
                 return
-            _ = self._connection.execute("UPDATE held_findings SET state='waived',updated_at=? WHERE finding_id=?",
-                                         (_now(), finding_id))
+            _ = self._connection.execute("UPDATE held_findings SET state='waived',waive_provenance=?,waived_by=?,updated_at=? WHERE finding_id=?",
+                                         (provenance, by, _now(), finding_id))
 
     def reconcile(self, branch_point: str, style_branch: str) -> tuple[str, ...]:
         branch_tip = pushed_branch_point_tip(self.repo, branch_point)
@@ -4073,6 +4194,7 @@ class Ledger:
         self, rule: str, path: str, commit: str, rule_blob: str, verdict: Verdict,
         detail: str = "", ticket: str = "", worker: str = "", *,
         input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE,
+        reads: Iterable[str] | NoReadFiles = NO_READ_FILES,
     ) -> None:
         if input_scope == DeclaredInputScope.FILE and verdict not in SCOPED_VERDICTS:
             raise LedgerError(f"{verdict}: file input scope requires clean, exception or held")
@@ -4090,6 +4212,15 @@ class Ledger:
         if definition.tier == "B" and not path.endswith(".rs"):
             scope = CellInputScope.FILE
         file_scope_allowed = scope in (CellInputScope.CRATE, CellInputScope.MODULE) and path in tip.rust_files
+        read_files: ReadFiles | NoReadFiles = NO_READ_FILES
+        if not isinstance(reads, NoReadFiles):
+            if input_scope != DeclaredInputScope.RULE:
+                raise LedgerError("--reads requires --input-scope rule")
+            if verdict not in SCOPED_VERDICTS:
+                raise LedgerError(f"{verdict}: --reads requires clean, exception or held")
+            if not file_scope_allowed:
+                raise LedgerError(f"{rule}: {path}: --reads requires a crate or module cell of an included Rust file")
+            read_files = ReadFiles(tuple(sorted({self._path(name) for name in reads})))
         if isinstance(input_scope, UndeclaredInputScope):
             if file_scope_allowed and verdict in SCOPED_VERDICTS:
                 raise LedgerError(
@@ -4104,7 +4235,8 @@ class Ledger:
                 raise LedgerError(f"{rule}: {path}: file input scope requires an included Rust file, not a manifest or crate cell")
             else:
                 scope = _comparison_scope(input_scope, scope)
-        fingerprint = self._fingerprint(tip, scope, path)
+        fingerprint = (_read_fingerprint(tip, path, read_files) if isinstance(read_files, ReadFiles)
+                       else self._fingerprint(tip, scope, path))
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             if verdict == "held":
@@ -4120,11 +4252,12 @@ class Ledger:
             ).fetchone():
                 raise LedgerError(f"{ticket}: {path} was yielded")
             _ = self._connection.execute(
-                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope) '
-                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
-                + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at,declared_scope=excluded.declared_scope',
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
+                + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at,declared_scope=excluded.declared_scope,read_files=excluded.read_files',
                 (rule, rule_blob, scope, fingerprint, path, tip.commit, verdict, detail, ticket, worker,
-                 datetime.now(timezone.utc).isoformat(), input_scope),
+                 datetime.now(timezone.utc).isoformat(), input_scope,
+                 json.dumps(read_files.paths if isinstance(read_files, ReadFiles) else None)),
             )
 
     def latest_held_judgments(self) -> dict[tuple[str, str], str]:
@@ -4154,11 +4287,11 @@ class Ledger:
             )
 
     def _judgments(self, rule: str, path: str) -> tuple[Judgment, ...]:
-        rows = cast(list[tuple[str, str, str, Verdict, str, str]], self._connection.execute(
-            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
+        rows = cast(list[tuple[str, str, str, Verdict, str, str, str]], self._connection.execute(
+            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope,read_files FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
         ).fetchall())
-        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared))
-                     for blob, fingerprint, commit, verdict, scope, declared in rows)
+        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads))
+                     for blob, fingerprint, commit, verdict, scope, declared, reads in rows)
 
     def _judgment_state(self, rule: Rule, path: str, tip: RepositoryTip) -> tuple[CellState, str]:
         rows = self._judgments(rule.rule_id, path)
@@ -4404,6 +4537,7 @@ class LedgerArguments(argparse.Namespace):
     rule_blob: str = ""
     verdict: Verdict = "clean"
     input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE
+    reads: list[str] | NoReadFiles = NO_READ_FILES
     detail: str = ""
     ticket: str = ""
     worker: str = ""
@@ -4441,6 +4575,7 @@ class LedgerArguments(argparse.Namespace):
     ids: list[str] = []
     merge: str | None = None
     by: str | None = None
+    person: str | None = None
 
 
 def _json_strings(serialized: str) -> list[str]:
@@ -4520,6 +4655,7 @@ def main() -> None:
     _ = record.add_argument("--verdict", choices=("clean", "fixed", "exception", "held", "waived"), required=True)
     _ = record.add_argument("--detail", default="")
     _ = record.add_argument("--input-scope", choices=tuple(DeclaredInputScope), type=DeclaredInputScope, default=UNDECLARED_INPUT_SCOPE)
+    _ = record.add_argument("--reads", nargs="+", default=NO_READ_FILES)
     candidate = commands.add_parser("candidate")
     for field in ("ticket", "site", "idea"):
         _ = candidate.add_argument(f"--{field}", required=True)
@@ -4546,7 +4682,7 @@ def main() -> None:
         ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open", "yield")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
-        ("held", ("add", "file", "waive", "built", "list")),
+        ("held", ("add", "replace", "file", "waive", "built", "list")),
     ):
         group = commands.add_parser(name)
         _ = group.add_argument("--repo", default=argparse.SUPPRESS)
@@ -4599,6 +4735,13 @@ def main() -> None:
                 _ = command.add_argument("--id", required=True)
                 if action == "file":
                     _ = command.add_argument("--proposal", required=True)
+                elif action == "replace":
+                    _ = command.add_argument("--after", required=True)
+                    _ = command.add_argument("--person", default=None)
+                elif action == "waive":
+                    actor = command.add_mutually_exclusive_group(required=True)
+                    _ = actor.add_argument("--ticket", default="")
+                    _ = actor.add_argument("--person", default=None)
     args = parser.parse_args(namespace=LedgerArguments())
     if not args.repo:
         parser.error("--repo is required")
@@ -4618,7 +4761,7 @@ def main() -> None:
                 ledger.set_tip(args.tip, args.style_branch)
             elif args.command == "record":
                 ledger.record(args.rule, args.path, args.commit, args.rule_blob, args.verdict, args.detail, args.ticket, args.worker,
-                              input_scope=args.input_scope)
+                              input_scope=args.input_scope, reads=args.reads)
             elif args.command == "candidate":
                 path, separator, line = args.site.rpartition(":")
                 if not separator or not path or not line.isdecimal():
@@ -4701,10 +4844,14 @@ def main() -> None:
                             if isinstance(check, RenameNotApplied):
                                 print(f"built, but not in the code at {tip[:7]}: run style_proposals.py reopen --all "
                                       + f"(issue {finding.state.proposal})", file=sys.stderr)
+                elif args.action == "replace":
+                    person: WaiveUndo = WaiveUndoneBy(args.person.strip()) if args.person is not None else NoWaiveUndo()
+                    print(ledger.replace_held(args.id, args.after, person).finding_id)
                 elif args.action == "file":
                     ledger.file_held(args.id, Path(args.proposal))
                 elif args.action == "waive":
-                    ledger.waive_held(args.id)
+                    waive_actor: WaiveActor = WaiveByPerson(args.person.strip()) if args.person is not None else WaiveByUnit(args.ticket.strip())
+                    ledger.waive_held(args.id, waive_actor)
                 elif args.action == "built":
                     if args.merge is None:
                         ledger.mark_built(args.ids[0])

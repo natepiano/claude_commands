@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import io
 import threading
 import time
@@ -57,7 +58,9 @@ class ProposalIssueTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.issue = self.root / "a proposal.md"
         _ = self.issue.write_text(ISSUE, encoding="utf-8")
-        self.runtime = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.runtime = home / ".local/state/proposal-issue/locks"
+        _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
 
     def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
@@ -245,6 +248,82 @@ class ProposalIssueTests(unittest.TestCase):
                                       "abc", "--count", "1", "--body-file", str(body), "--template", str(template))
         self.assertEqual((code, out), (0, "create decision.md: created\n"), err)
         self.assertIn('proposal_id: "P1"\n', issue.read_text())
+
+    def test_folder_lock_uses_one_fixed_path_across_runtime_environments(self) -> None:
+        runtime = self.root / "runtime"
+        first_tmp, second_tmp = self.root / "tmp-a", self.root / "tmp-b"
+        for folder in (runtime, first_tmp, second_tmp):
+            folder.mkdir()
+        digest = hashlib.sha256(str((self.root / ".proposal-numbers").resolve()).encode()).hexdigest()[:32]
+        lock_path = self.runtime / f"proposal-issue-{digest}.lock"
+        self.assertFalse(self.runtime.exists())
+        for use_runtime, temporary in ((True, first_tmp), (False, first_tmp), (False, second_tmp)):
+            with self.subTest(runtime=use_runtime, temporary=temporary):
+                with (mock.patch.dict(os.environ, {"TMPDIR": str(temporary)}),
+                      mock.patch.object(tempfile, "tempdir", None)):
+                    if use_runtime:
+                        os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+                    else:
+                        _ = os.environ.pop("XDG_RUNTIME_DIR", None)
+                    with proposal_issue._folder_lock(self.root):  # pyright: ignore[reportPrivateUsage]
+                        self.assertEqual(list(self.runtime.glob("*.lock")), [lock_path])
+                        with lock_path.open("a") as other:
+                            with self.assertRaises(BlockingIOError):
+                                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.assertEqual(list(self.runtime.glob("*")), [lock_path])
+        for folder in (runtime, first_tmp, second_tmp):
+            self.assertEqual(list(folder.iterdir()), [])
+
+    def test_create_keeps_a_same_key_decision_that_appears_at_the_link(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
+                    b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
+                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+        link = os.link
+        stamps: list[int] = []
+
+        def competing_create(temporary: Path, path: Path) -> None:
+            self.assertEqual(path, issue)
+            self.assertTrue(temporary.is_file())
+            _ = path.write_bytes(original)
+            stamps.append(path.stat().st_mtime_ns)
+            link(temporary, path)
+
+        with mock.patch.object(os, "link", side_effect=competing_create):
+            self.assertFalse(proposal_issue.create(
+                issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                "# New examples\n", template, date(2026, 10, 20), initial_fields={}))
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(stamps, [issue.stat().st_mtime_ns])
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
+
+    def test_create_refuses_a_different_key_decision_that_appears_at_the_link(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\nstyle_rule: "global:rust/names.md"\nstyle_crate: "alpha"\n'
+                    b'style_rule_blob: "other-blob"\nproposal_id: "P47"\n---\nOther decision.\n')
+        link = os.link
+        stamps: list[int] = []
+
+        def competing_create(temporary: Path, path: Path) -> None:
+            self.assertEqual(path, issue)
+            self.assertTrue(temporary.is_file())
+            _ = path.write_bytes(original)
+            stamps.append(path.stat().st_mtime_ns)
+            link(temporary, path)
+
+        with mock.patch.object(os, "link", side_effect=competing_create):
+            with self.assertRaises(proposal_issue.Refusal) as refusal:
+                _ = proposal_issue.create(
+                    issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                    "# New examples\n", template, date(2026, 10, 20), initial_fields={})
+        self.assertEqual(str(refusal.exception), f"{issue}: different decision key")
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(stamps, [issue.stat().st_mtime_ns])
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
 
     def test_create_keeps_a_same_key_decision_that_appears_before_the_folder_lock(self) -> None:
         template = self.root / "template.yaml"

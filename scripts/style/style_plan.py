@@ -1432,7 +1432,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         *record_lines,
         "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
         "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
-        "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
+        "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
+        + "Without `--reads`, the cell comes back after any change in its crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/direct/verify.sh check <package>`",

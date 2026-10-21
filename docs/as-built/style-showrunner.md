@@ -119,7 +119,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 - `ticket add|assign --branch B|checkpoint --commit C|merge|drop|yield --path P --id ID`, `ticket open --unit U`.
 - `handoff add|send --to SLUG|reroute --to SLUG|merged [--merge-commit M] --checkpoint C`, `handoff pending`.
 - `tip seen --tip C` (prints `new` or `seen`), `tip done --tip C`.
-- `held add ...` (prints the finding id), `held file --id F --proposal PATH`, `held waive --id F`, `held built --id F [--id F ...] [--commit <merge> [--by <who>]]`, `held list [--state S] [--json]`.
+- `held add ...` (prints the finding id), `held file --id F --proposal PATH`, `held waive --id F (--ticket T | --person NAME)`, `held replace --id F --after TEXT [--person NAME]`, `held built --id F [--id F ...] [--commit <merge> [--by <who>]]`, `held list [--state S] [--json]`.
 
 ### Tickets, hand-offs, processed tips, reconcile
 
