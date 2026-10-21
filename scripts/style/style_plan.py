@@ -1602,15 +1602,21 @@ def _select_phase(
         for finding_id, outcome in left.items():
             match outcome:
                 case style_ledger.DeclaredInSeveralFiles():
-                    where = f"declared in {len(outcome.paths)} files"
+                    where = f"declared in {len(outcome.paths)} files: {', '.join(sorted(outcome.paths))}"
                 case style_ledger.DeclaredInAnotherCrate():
                     where = f"declared in another crate: {outcome.path}"
                 case style_ledger.DeclarationGoneFromFile():
                     where = "declaration gone"
                 case style_ledger.TraitIdentityUncertain():
                     where = "trait identity uncertain"
+                case style_ledger.OutsideRenameUnresolved():
+                    where = style_ledger.outside_evidence_line(outcome.evidence)
                 case _:
                     assert_never(outcome)
+            if (isinstance(outcome, (style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate,
+                                     style_ledger.DeclarationGoneFromFile))
+                    and isinstance(outcome.evidence, style_ledger.OutsideRenameNotProven)):
+                where += "; " + style_ledger.outside_evidence_line(outcome.evidence)
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)

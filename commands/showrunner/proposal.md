@@ -122,6 +122,12 @@ filed rename built when its new name is declared, leaves a filed finding whose
 item is gone from its file, and withdraws the rest; run that step alone with `style_proposals.py
 follow --repo <style checkout> --proposals <folder>`, and add `--dry-run` to see
 the lines first.
+An outside rename can also follow automatically. Its old name must be absent from declarations throughout its crate.
+The source diff must map the renamed item, or exactly one changed file in that crate must gain it.
+At least half its non-blank body lines must remain after replacing only the renamed identifier.
+A child needs a proved owner rename and its own retained binding or member name.
+A refused search keeps the finding and decision, even when the source file is gone.
+Read its `left` line for the mapped declaration, candidate files, body counts and failed checks.
 Drop the bare duplicates of qualified renames from every open decision with
 `style_proposals.py drop-duplicates --repo <style checkout>`; add `--dry-run`
 to see the lines first. When a plain merge, not a ticket, built filed findings,
