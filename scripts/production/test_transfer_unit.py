@@ -214,6 +214,30 @@ class UnitTransferTests(unittest.TestCase):
         self.assertNotIn("alpha-unit", pool)
         self.assert_ok(self.transfer("verify"))
 
+    def test_work_in_progress_stays_and_only_the_header_is_committed(self) -> None:
+        # showrunner, 2026-10-21: hierarchies-unit had its plan and other files edited, not committed.
+        plan = self.unit / "docs/plans/alpha.md"
+        self.write(plan, plan.read_text(encoding="utf-8") + "A new step, not committed.\n")
+        self.write(self.unit / "measure.py", "staged = True\n")
+        _ = self.git("add", "measure.py", cwd=self.unit)
+        tip = self.git("rev-parse", "demo-alpha")
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(self.git("rev-parse", "demo-alpha^"), tip)
+        self.assertEqual(self.git("diff", "--name-only", "demo-alpha^", "demo-alpha"), "docs/plans/alpha.md")
+        committed = self.git("show", "demo-alpha:docs/plans/alpha.md")
+        self.assertIn("> **Production: other**", committed)
+        self.assertNotIn("A new step", committed)
+        text = plan.read_text(encoding="utf-8")
+        self.assertIn("> **Production: other**", text)
+        self.assertIn("A new step, not committed.", text)
+        self.assertEqual(self.git("status", "--porcelain", cwd=self.unit), "M docs/plans/alpha.md\nA  measure.py")
+        self.assertEqual(self.git("diff", "--cached", "--name-only", cwd=self.unit), "measure.py")
+
+    def test_plan_refuses_a_receiving_doc_with_uncommitted_changes_before_any_stop(self) -> None:
+        doc = self.receiving / "docs/plans/other-production.md"
+        self.write(doc, doc.read_text(encoding="utf-8") + "edited\n")
+        self.assert_refused(self.transfer("plan"), "other-production.md has uncommitted changes")
+
     def test_a_merge_in_progress_is_refused(self) -> None:
         self.write(self.unit / "NOTES.md", "unit side\n")
         _ = self.git("add", "NOTES.md", cwd=self.unit)

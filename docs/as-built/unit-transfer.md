@@ -13,7 +13,9 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
   doc's own columns, and a column the giving row lacks gets `—`. The row is not marked retired.
 - The plan's `> **Production:**` header names the receiving production and doc. The unit reads its
   production from that header, so the header commit goes on the unit branch, and the branch is
-  pushed. The plan's prose is history and does not change.
+  pushed. The plan's prose is history and does not change. Work in progress stays: the commit is
+  built from HEAD's plan in a temporary index (`commit-tree`, then `update-ref`), and the same header
+  change then goes into the real index and the worktree file (showrunner, 2026-10-21).
 - The stall-watch stretch and its prompt file move to the receiving slug. This pool's reviewers of
   the unit retire (`review_pool.py retire`), so the receiving pool leases its own. The old pane
   entry is forgotten, because the relaunch records a new pane.
@@ -36,6 +38,9 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
   branch does not have (`foreign_commits`): they would move with the unit.
 - A reserved or retired unit, a unit already in the receiving table, and an unfinished rename or
   transfer in either production.
+- `plan`, and a fresh `apply` before its stop, also refuse what a later step refuses: a checkout off
+  its merge branch or with doc edits, what the stop step cannot settle, and an origin unit branch
+  the push would not fast-forward. A refused transfer never stops the unit.
 
 ## apply
 

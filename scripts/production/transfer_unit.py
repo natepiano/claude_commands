@@ -20,8 +20,10 @@ or a receiving production in another repository, is refused, since its worktree 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
@@ -211,6 +213,18 @@ def _check_doc(checkout: Path, merge_branch: str, doc: Path) -> None:
         raise RenameRefused(f"{doc} has uncommitted changes")
 
 
+def _check_ready(transfer: UnitTransfer) -> None:
+    """What a later step refuses, checked before the stop, so a refused transfer never stops the unit."""
+    _check_doc(Path(transfer.to_checkout), transfer.to_merge_branch, Path(transfer.to_doc))
+    _check_doc(Path(transfer.from_checkout), transfer.from_merge_branch, Path(transfer.from_doc))
+    rename_unit.check_stoppable(transfer)
+    worktree = transfer.worktree()
+    remote = unit_move.remote_tip(worktree, transfer.branch)
+    if remote and subprocess.run(["git", "-C", str(worktree), "merge-base", "--is-ancestor", remote, transfer.tip],
+                                 capture_output=True, check=False).returncode:
+        raise RenameRefused(f"origin {transfer.branch} has commits the local branch lacks; the push would fail")
+
+
 def _commit_only(directory: Path, paths: list[Path], message: str) -> str:
     """Commit only `paths`, or adopt the commit an earlier run made before its journal recorded it."""
     if git(directory, "show", "-s", "--format=%s", "HEAD") == message:
@@ -243,22 +257,85 @@ def _plan_text(transfer: UnitTransfer, text: str) -> str:
                    for line in text.splitlines(keepends=True))
 
 
-def _commit_plans(transfer: UnitTransfer, save: Callable[[], None]) -> None:
-    """The unit reads its production from its plan's header, so the header moves on the unit branch."""
+def _git_input(directory: Path, text: str, *arguments: str, index: Path | None = None) -> str:
+    """Run git with `text` on stdin, and with its own index file when one is given."""
+    environment = {**os.environ, **({"GIT_INDEX_FILE": str(index)} if index else {})}
+    result = subprocess.run(["git", "-C", str(directory), *arguments], input=text, capture_output=True, text=True,
+                            env=environment, check=False)
+    if result.returncode:
+        raise RenameRefused(f"git {' '.join(arguments)} failed: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
+def _blob_text(directory: Path, blob: str) -> str:
+    """A blob's exact text, its last newline included."""
+    result = subprocess.run(["git", "-C", str(directory), "cat-file", "blob", blob], capture_output=True, check=False)
+    if result.returncode:
+        raise RenameRefused(f"git cat-file {blob} failed: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout.decode("utf-8")
+
+
+def _blob(directory: Path, text: str) -> str:
+    return _git_input(directory, text, "hash-object", "-w", "--stdin")
+
+
+def _header_commit(transfer: UnitTransfer) -> str:
+    """Commit the header change to HEAD's plan files through a temporary index, so that the
+    worktree's edits and the real index are not part of it. Returns HEAD when no header changes."""
     worktree = transfer.worktree()
-    if not transfer.plan_commit:
-        changed: list[Path] = []
+    head = git(worktree, "rev-parse", "HEAD")
+    changed = False
+    with tempfile.TemporaryDirectory() as folder:
+        index = Path(folder) / "index"
+        _ = _git_input(worktree, "", "read-tree", head, index=index)
         for path in _plans(transfer):
-            text = path.read_text(encoding="utf-8")
+            relative = str(path.relative_to(worktree))
+            listed = git(worktree, "ls-tree", head, "--", relative).split()
+            if not listed:
+                continue
+            text = _blob_text(worktree, listed[2])
             if (updated := _plan_text(transfer, text)) == text:
                 continue
-            if git(worktree, "status", "--porcelain", "--", str(path)):
-                raise RenameRefused(f"{path} has uncommitted changes; commit them first")
-            write_text(path, updated)
-            changed.append(path)
-        transfer.plan_commit = (_commit_only(worktree, changed, transfer.plan_message) if changed
-                                else git(worktree, "rev-parse", "HEAD"))
+            _ = _git_input(worktree, "", "update-index", "--cacheinfo",
+                           f"{listed[0]},{_blob(worktree, updated)},{relative}", index=index)
+            changed = True
+        if not changed:
+            return head
+        tree = _git_input(worktree, "", "write-tree", index=index)
+    commit = _git_input(worktree, transfer.plan_message + "\n", "commit-tree", tree, "-p", head)
+    _ = git(worktree, "update-ref", "-m", transfer.plan_message, f"refs/heads/{transfer.branch}", commit, head)
+    return commit
+
+
+def _carry_header(transfer: UnitTransfer) -> None:
+    """Give the real index and the worktree file the same header change, so the unit's own edits
+    stay and nothing shows as undoing the header commit."""
+    worktree = transfer.worktree()
+    for path in _plans(transfer):
+        relative = str(path.relative_to(worktree))
+        staged = git(worktree, "ls-files", "-s", "--", relative).split()
+        if staged:
+            text = _blob_text(worktree, staged[1])
+            if (updated := _plan_text(transfer, text)) != text:
+                _ = git(worktree, "update-index", "--cacheinfo", f"{staged[0]},{_blob(worktree, updated)},{relative}")
+        if path.exists():
+            text = path.read_text(encoding="utf-8")
+            if (updated := _plan_text(transfer, text)) != text:
+                write_text(path, updated)
+
+
+def _commit_plans(transfer: UnitTransfer, save: Callable[[], None]) -> None:
+    """The unit reads its production from its plan's header, so the header moves on the unit branch.
+    Work in progress stays as it is: the commit is made apart from the worktree (showrunner,
+    2026-10-21: hierarchies-unit had a phase open with its plan edited)."""
+    worktree = transfer.worktree()
+    if not transfer.plan_commit:
+        # A commit made before the journal recorded it is adopted by its subject.
+        transfer.plan_commit = (git(worktree, "rev-parse", "HEAD")
+                                if git(worktree, "show", "-s", "--format=%s", "HEAD") == transfer.plan_message
+                                else _header_commit(transfer))
         save()
+    _carry_header(transfer)
     unit_move.check_tip(worktree, transfer.branch, transfer.plan_commit)
     _ = git(worktree, "push", "origin", f"{transfer.branch}:refs/heads/{transfer.branch}")
 
@@ -519,6 +596,7 @@ def plan(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer
     transfer = build(from_slug, unit, to_doc, scratch)
     _check_journals(transfer)
     preflight(transfer)
+    _check_ready(transfer)
     return transfer
 
 
@@ -532,6 +610,7 @@ def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfe
             _check_journals(transfer)
             with _merge_locks(transfer):
                 preflight(transfer)
+                _check_ready(transfer)
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, transfer)
         for number in range(transfer.step + 1, len(STEPS) + 1):
