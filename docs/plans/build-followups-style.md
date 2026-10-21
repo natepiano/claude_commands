@@ -1002,34 +1002,24 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Ruled out:** another file name for the second run; `os.replace` onto an existing issue (it overwrites the decision of the other run); a retry loop; removing `_folder_lock`.
 
 ### Phase 37 — a style decision files under area style, new and old  · status: done
-**Depends on:** Phase 36
 
-#### Work Order
-**Goal:** every style decision issue has `area: "[[style]]"`: `proposal_issue create` writes it for each new one, and one command sets it on the ones already filed under `"[[unfiled]]"`.
+#### As-built
 
-**Spec:**
-- User request 2026-10-20: "when we create a new issue for a style proposal - we need to set the area to style … backpopulate the area field on the ones that were created for style but don't have this".
-- `scripts/production/proposal_issue.py` `_create_numbered` (~:515) fills the template `area: "[[{{AREA}}]]"` (`~/rust/hanadocs/.claude/templates/issue.yaml` line 2) with `"AREA": "unfiled"`. `create` is the style decision path (it requires `style_rule`, `style_crate`, `style_rule_blob`), so set `"AREA": "style"` there, one named constant.
-- New verb `proposal_issue.py area-style <folder> [--dry-run]`: for each issue in the folder whose frontmatter carries `style_rule` (a current decision) or `style_rules` (a closed legacy proposal, which also has `style_findings` and no singular `style_rule`), whatever its status, and whose area is `[[unfiled]]` or missing, set `area: "[[style]]"` and `date_modified` to today's vault date (as `edit` does at ~:251; `set_fields` changes only the fields it is given) under the issue lock with `_write`, and print one line per issue changed. `--dry-run` prints the same lines and writes nothing. A skipped file, a dry run and a second run leave every byte unchanged. It never changes an issue with any other area.
-- On 2026-10-20, 601 files named `style …` in `~/rust/hanadocs/issues` carry `area: "[[unfiled]]"`: 96 have `style_rule:`, all 601 have `style_rules:`. Read a few (read only) for both forms. The director runs the verb on the real folder; workers never write there.
-- Keep the literal `area: "[[style]]"` the user asked for, although `[[style]]` resolves in the vault to `showrunners/natedev/style.md` (the unit's phase note). Create, rename or move no vault note.
-- Update `commands/showrunner/proposal.md` or `docs/style_production.md` only where they state a style decision's area.
+- `proposal_issue.create` writes `area: "[[style]]"` for each new style decision. `_create_numbered` fills the template `{{AREA}}` from the constant `STYLE_AREA = "style"`, in place of `"unfiled"`.
+- `proposal_issue.py area-style <issues folder> [--dry-run]` (`area_style(folder, today, *, dry_run)`) sets the area on old style issues. It selects each `*.md` issue whose frontmatter has `style_rule` (a current decision) or `style_rules` (a closed legacy proposal), at any status. It changes the issue only when the area is missing or the `area` line alone is `[[unfiled]]` (double-quoted, single-quoted or bare). It sets `area: "[[style]]"` and `date_modified` to today's vault date under `_issue_lock`, and writes with `_write`. The lines after the `area` line stay byte-identical.
+- It prints `area-style <name>: area [[style]]` for each changed issue. `--dry-run` prints the same lines and writes nothing. An issue with a different area, a non-style issue and a second run stay byte-identical. A missing folder, or a read or write error, prints `proposal_issue: <error>` and exits 2.
+- Live (`~/rust/hanadocs/issues`, 2026-10-20): the run set 601 unfiled style issues to `[[style]]`. All 601 have `style_rules`, and 96 of them also have `style_rule`. A second run changed nothing. One unfiled non-style issue stays unfiled.
 
 **Files:**
-- `scripts/production/proposal_issue.py`
-- `scripts/production/test_proposal_issue.py`
-- `commands/showrunner/proposal.md`
-- `docs/style_production.md`
+- `scripts/production/proposal_issue.py` — `STYLE_AREA`, the area of a new decision, the `area-style` verb and `area_style`
+- `scripts/production/test_proposal_issue.py` — area of a new decision; `area-style` on current, missing-area and closed legacy issues; a comment after the `area` line; non-style and other-area issues byte-identical; dry run and second run write nothing
+- `scripts/style/test_style_proposals.py` — a filed decision expects area `style`
 
-**Workers:** 1 writer + 1 tester. `impl`: proposal_issue.py and the two docs. `test`: test_proposal_issue.py — a new decision has `area: "[[style]]"`; `area-style` sets it (and today's `date_modified`, from an older date) on an unfiled style decision, on one with no area, and on a closed legacy proposal with only `style_rules`/`style_findings`; leaves a non-style issue and a style decision with another area byte-identical, `--dry-run` writes nothing, and a second run changes nothing.
+**Gotchas:**
+- `_key_span` includes the comment lines that follow a key. Match the `area` value on the key's first line only. A match on the full span skips an unfiled issue that has a comment after `area`.
+- `[[style]]` resolves in the vault to `showrunners/natedev/style.md` (the unit's phase note). The literal `area: "[[style]]"` is the user's request.
 
-**Constraints from prior phases:** phase 36 re-checks the decision path inside `_folder_lock`; keep that.
-
-**Acceptance gate:**
-- `env -C <worktree> PYTHONPATH=<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.production.test_proposal_issue` passes.
-- basedpyright on each changed .py file: 0 errors, 0 warnings.
-- The gate copy's `merge_gate.py --tests-only` passes.
-- Director: `area-style ~/rust/hanadocs/issues --dry-run` lists all 601 unfiled style issues (count on the day); the real run sets them; a second run prints nothing.
+**Ruled out:** creating, renaming or moving a vault note so that `[[style]]` resolves to a different page; changing an issue with any area other than `[[unfiled]]` or none.
 
 ### Phase 38 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: todo
 **Depends on:** none
@@ -1055,5 +1045,51 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Acceptance gate:**
 - `env -C <worktree> PYTHONPATH=<worktree>/scripts/style:<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_footprint scripts.style.test_style_ledger` passes.
+- basedpyright on each changed .py file: 0 errors, 0 warnings.
+- The gate copy's `merge_gate.py --tests-only` passes.
+
+### Phase 39 — a cell with no live held finding is never offered again as held work  · status: todo
+**Depends on:** none
+
+#### Work Order
+**Goal:** a cell whose held findings the user waived stops coming back as held work: the ledger refuses `record --verdict held` when the cell has no live held finding, and the worker records `waived` for a cell whose only findings are waived.
+
+**Spec:**
+- cargo-liner-style 2026-10-20: cargo-port `project/git/checkout.rs`, rule lens `tests-live`, has the newest verdict `held` and 0 live held rows (its rows were waived on ticket 107). Refill offered it again after each sync (tickets 155, 176, 181). This is a wrong result.
+- Live held rows are `state` `unfiled` or `filed` in `held_findings`. Rows are keyed by `(rule, site path)`. `style_ledger._finding_cell(definition, path, tip)` (~:171) maps a site to its cell.
+- How the state comes about:
+  - `waive_held` (~:3823) and `decline_findings` (~:2274) waive rows. When `decline_outcome` (~:2358) answers `InputChangedSinceJudged` or `CellStillHeld`, the judgment stays `held`.
+  - A worker on the next ticket is not told about waived rows: `style_plan.py` ~:1471 leaves Waived, Built and Withdrawn out of "Already-held findings" (~:1296). The worker holds the same defect again. `hold` (~:2090) answers with the existing waived row (`ON CONFLICT(finding_id) DO NOTHING`), and the worker records `held` again with 0 live rows.
+- Ledger: `Ledger.record` (~:4062) refuses verdict `held` when no live held row maps to that rule/cell.
+  - The refusal is a `LedgerError` naming the rule and path. It names each waived, built or withdrawn finding on the cell, with its id and state.
+  - The refusal text says: a waived finding is the user's decision and does not make a cell held; hold a new finding with `held add` first, or record `waived` when only waived findings remain.
+  - `waived` is the ledger's verdict for a declined change (`decline_findings` ~:2332). `unwaive_held` (~:3784) turns a newest `waived` verdict back into `held`, so `waived`, not `clean`, keeps that path. A `waived` verdict already expires when its inputs change (rule text, file, or crate/module context; `test_exception_held_and_waived_expire_when_their_input_changes`), so the cell is judged again then.
+  - `unwaive_held` (~:3747) and the checkpoint restamp copy (~:1814) do not go through `record` and keep their behavior.
+- Refill (`_refill_cells`, `style_plan.py` ~:1071) does not change. Its skip compares only the file blob, and rule text or crate context can change while the blob stays the same, so a new skip for waived rows could hide a cell that needs judging. A held cell with 0 live rows is offered once more; the worker records `waived`; the cell is then current and is not offered until its inputs change.
+- Worker text: for a per-file structure ticket, list the waived findings on the ticket's cells under their own line, `Waived by the user: do not hold these again. Record waived for a cell whose only findings are these.`, with the same fields as the held list.
+- `docs/style_production.md` (~:114) describes refill's waived exclusion: add the `record held` refusal and the `waived` instruction there.
+- Existing tests that record `held` with no held row must hold a finding first. Update their fixtures; never weaken the refusal or skip it in tests.
+
+**Files:**
+- `scripts/style/style_ledger.py`
+- `scripts/style/style_plan.py`
+- `docs/style_production.md`
+- `scripts/style/test_style_ledger.py`
+- `scripts/style/test_style_plan.py`
+- `scripts/style/test_style_proposals.py`
+- `scripts/style/test_standing_checkpoint.py`
+- `scripts/style/test_coverage_report.py`
+
+**Workers:** 1 writer + 1 tester. `impl`: style_ledger.py, style_plan.py and docs/style_production.md. `test`: the five test files. Tests to write:
+- `record --verdict held` is refused for a cell whose only rows are waived, and for a cell with no rows; it passes with an unfiled or a filed row.
+- The waived-rows case end to end: hold, `held waive`, record `held` again (refused), record `waived`; after a sync that leaves the cell's inputs unchanged, refill does not offer it; after its file or rule text changes, refill offers it.
+- `unwaive_held` after that `waived` verdict makes the cell held again.
+- The worker text lists a waived finding under its own line.
+- Fixtures that record `held` without a row hold a finding first.
+
+**Constraints from prior phases:** phase 36 made decision filing safe for two runs at once; keep its lock order. Phase 38 does not touch these files.
+
+**Acceptance gate:**
+- `env -C <worktree> PYTHONPATH=<worktree>/scripts/style:<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_plan scripts.style.test_style_proposals scripts.style.test_standing_checkpoint scripts.style.test_coverage_report` passes.
 - basedpyright on each changed .py file: 0 errors, 0 warnings.
 - The gate copy's `merge_gate.py --tests-only` passes.
