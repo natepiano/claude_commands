@@ -6,7 +6,7 @@ Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunne
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
 `<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, stops
 the unit and its Codex seats at once through the shutdown path (`down`, then `now`), sends SIGTERM to
-what its runs leave in its worktree (a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
+what its runs leave in its worktree (an app-server and its seats, a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
 worktree (unit_move), commits `chore(<slug>): rename unit <old> to <new>` on the merge branch, which
 merge_branch_history follows, merges that commit into the unit, moves the unit's state, retires the
 old branch, points the unit's shutdown record at the new names (each paused Codex seat's launcher
@@ -588,10 +588,18 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
 
 
 def _stop_runs(rename: StopTarget) -> None:
-    """SIGTERM what the unit's runs leave in its worktree once the unit has stopped: a detached
-    run's supervisor with its command, and an app-server's idle-stop watcher. Each leads its own
-    session, so the shutdown path does not end it, and nothing starts it again."""
+    """End what the unit's runs leave in its worktree once the unit has stopped: each run's
+    app-server with its seats (`codex_mesh.py stop`, as retire_unit does), then by SIGTERM a
+    detached run's supervisor with its command, an app-server's idle-stop watcher, and an
+    app-server that did not stop. Each leads its own session, so the shutdown path does not end
+    it, and nothing starts it again."""
     worktree = rename.worktree()
+    for item in retire_unit.mesh_runs(retire_unit.runs_of(worktree)):
+        result = retire_unit.run([sys.executable, str(retire_unit.MESH), "stop", "--session-dir", str(item.run)])
+        if result.returncode:
+            print(f"{retire_unit.describe_run(item)}: {retire_unit.failure(result)}; SIGTERM instead")
+        else:
+            print(f"stopped: {retire_unit.describe_run(item)}")
     inside = unit_move.processes_inside(worktree) if unit_move.exists(worktree) else []
     runs = retire_unit.run_processes(worktree, inside) if inside else {}
     left = retire_unit.terminate(sorted(runs), runs, RUN_STOP_WAIT_SECONDS)
@@ -907,7 +915,7 @@ class Step(NamedTuple):
 
 def _describe_stop(r: UnitRename) -> str:
     return (f"stop {r.old} and its Codex seats at once through the shutdown path; its record carries the relaunch; "
-            + "then SIGTERM its runs' supervisors and app-server watchers left in the worktree")
+            + "then stop its runs' app-servers and SIGTERM their supervisors and app-server watchers left in the worktree")
 
 
 def _describe_merge(r: UnitRename) -> str:

@@ -933,6 +933,41 @@ class RunProcessTests(unittest.TestCase):
         with self.assertRaisesRegex(RenameRefused, r"of lint in run run-a: still runs after SIGTERM"):
             _ = self.stop()
 
+    def serve(self, code: int) -> list[list[str]]:
+        """Run run-a's app-server 501 with its code-mode host 502; `codex_mesh.py stop` exits `code`
+        and, when it is 0, ends them. The calls come back."""
+        folder = self.root / "runs" / "run-a"
+        _ = (folder / "mesh_server.json").write_text(json.dumps({"pid": 501, "port": 51101}))
+        self.processes = {501: FakeProcess(self.worktree, 501, ["codex", "app-server", "--listen", "ws://x"]),
+                          502: FakeProcess(self.worktree, 501, ["codex-code-mode-host"])}
+        calls: list[list[str]] = []
+
+        def mesh(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            del cwd
+            calls.append(argv)
+            if not code:
+                self.processes.clear()
+            return subprocess.CompletedProcess(argv, code, "", "" if not code else "no server")
+
+        _ = self.enterContext(mock.patch.object(retire_unit, "run", mesh))
+        return calls
+
+    def test_the_stop_ends_the_runs_app_server_and_its_seats(self) -> None:
+        """The real case: modules-unit's 8-hour app-server and its code-mode host refused step 1."""
+        calls = self.serve(0)
+        rename_unit.check_stoppable(self.rename())
+        printed = self.stop()
+        self.assertEqual([call[2:] for call in calls], [["stop", "--session-dir", str(self.root / "runs" / "run-a")]])
+        self.assertIn("stopped: app-server pid 501 of run run-a", printed)
+        rename_unit._check_stopped(self.rename())  # pyright: ignore[reportPrivateUsage]
+
+    def test_an_app_server_its_stop_misses_gets_sigterm_with_its_children(self) -> None:
+        _ = self.serve(1)
+        printed = self.stop()
+        self.assertEqual(sorted(self.signalled), [501, 502])
+        self.assertIn("no server; SIGTERM instead", printed)
+        self.assertIn("of the app-server 501 of run run-a", printed)
+
     def test_a_resumed_rename_ends_a_run_left_under_the_former_root(self) -> None:
         """The real case: the journal was past its stop step before the stop ended runs, and the
         run started under /tmp/claude/delegate, before the rename to /tmp/claude/unit."""
