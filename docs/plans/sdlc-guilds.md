@@ -168,7 +168,7 @@ Read 2026-10-21 by the plan author:
 
 **Ruled out:** `design-guild` / `review-guild`, `scripts/guilds/guilds.py` publication, `broadcast.py --guild`, manifests, receipts, delivery marks and a `docs/guilds` copy; a separate guild member list; a rename registry; a review-result ID in the findings ledger.
 
-### Phase 4 — Each guild has a tip folder and views, and each starting skill carries the guild block  · status: todo
+### Phase 4 — Each guild has a tip folder and views, and each starting skill carries the guild block  · status: done
 **Depends on:** Phase 3
 
 **Settled 2026-10-21 (showrunner): this unit edits all four starting-skill files** — `commands/showrunner/produce.md`, `commands/unit/direct.md`, `commands/astra_review.md` with `scripts/astra/astra_review.py`, and the new `config/guilds/designer.md`. The guild block goes in as one self-contained section per file and nothing else in the file changes; roles-unit and phases-unit are paused, and the showrunner tells them what was added.
