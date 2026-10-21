@@ -791,7 +791,8 @@ crate views include the oldest open ticket. Proposals are shown only when asked.
 
 The script is `scripts/style/coverage_report.py --repo <style checkout>
 [--rule <id or unique stem> | --crate <directory or package name>]`. It reads
-`style_ledger.Ledger`; its header uses `summary()`. Unclassified rules are listed
+`style_ledger.Ledger`. It reads `rule_counts(WholeRepository())` once, and its
+header uses `summary_of` over those rows, so the header and the table share one count. Unclassified rules are listed
 as a count with `pull nate_style`, and awaiting-merge cells count separately
 from current coverage. The comparison snapshot is `last_report.json` beside
 the ledger, including under `STYLE_LEDGER_STATE_DIR`.
