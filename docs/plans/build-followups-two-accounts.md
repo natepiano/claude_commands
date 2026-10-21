@@ -2210,36 +2210,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - One pool review and two closure reviews found 8 issues (delegate launches ignored the route, the Mac could not see it, friends took it, a failed read-back undid it, lost state kept it, a rollback error escaped, a doc example used a wrong CLI name). Each fix has a test.
 - `test_codex_mesh` `test_follow_cli_accepts_each_new_flag_independently` failed once under gate load and passed 3 of 3 alone.
 
-### Phase 82 — A follow turn carries the speed tier  · status: done
+### Phase 82 — Every worker turn takes its speed from /agent  · status: done
 
-**Depends on:** Phase 81
+#### As-built
 
-#### Work Order
-
-**Goal:** The user wants fast mode off in every running Codex worker (2026-10-21). `/agent default` sets the registry tier, so new threads start on default. A running thread keeps the tier it started with, because a follow turn never sends the tier. The showrunner gave this fix to accounts-unit (2026-10-21). After it, the next follow-up to each worker moves its thread to the registry tier, and the thread stays there.
-
-**Constraints from prior phases:**
-- `follow` already takes `--service-tier` (`codex_mesh.py` ~6710). `implement.sh` (~504) and `review.sh` (~739, ~746) pass `"${AGENT_SERVICE_TIER:-}"`, which `agents_config.sh` (~362–370) resolves to `''`, `fast`, `flex` or `default` (`pace` resolves to the pacer's choice).
-- Thread start sets `serviceTier` only when the value is not empty (`codex_mesh.py` ~2736–2741, and prime ~6441–6443). An empty value inherits `service_tier` from `~/.codex/config.toml`.
-- `_start_turn` (~4082) sends `model` and `effort` when set, and never `serviceTier`.
-- Codex 0.163.0 `TurnStartParams.serviceTier`: "Override the service tier for this turn and subsequent turns." (`serviceTierForTurn` is one turn only; do not use it.)
-- `test_follow_cli_accepts_each_new_flag_independently` (`test_codex_mesh.py` ~1856) failed once under gate load and passed 3 of 3 alone.
-
-**Spec:**
-1. In `_start_turn`, when `service_tier` is not empty, add `params["serviceTier"] = service_tier`, beside `model` and `effort`. An empty value sends no key, so the thread keeps its tier.
-2. Tests in `test_codex_mesh.py`: a follow with `--service-tier default` sends `"serviceTier": "default"` on `turn/start`.
-3. **Every turn sends the tier** (showrunner, 2026-10-21). Turns that are not implement.sh/review.sh follows (build-result wake-ups, held results, capacity and context continuations, account moves) pass no tier, so with item 1 alone they keep a thread's old `priority` tier. Wake-ups were 54% of worker turns in 24 h. Every `_start_turn` sends a tier: the caller's when given, else the tier the registry and Codex config resolve at that turn (read each turn, never cached when the server started) for that worker's task, with the same rules as `agents_config.sh` `_agents_resolve_service_tier` (row key beats function key; `pace` → the pacer's current choice, default when stale; empty → `default`). The tier comes only from `agents.conf`, never from `~/.codex/config.toml`: a `/fast` typed in any Codex window writes that file, which `~/.codex1` and `~/.codex2` link to, and it put every worker on fast for 14 hours on 10-20 (showrunner, 2026-10-21). Use one source of truth; do not copy the rules into a second parser that can drift. Every turn sends a key. A registry error never fails the turn: the turn runs, and the error goes to the seat's log.
-3a. **The task is named, not found** (closure review, 2026-10-21). Each launcher that starts or follows a thread (`implement.sh`, `review.sh`, `launch_friend.sh`) passes the task it resolved (`--task <function.subtask>`) to `codex_mesh.py` start/follow/prime, and the roster entry stores it. Every turn resolves the tier from the registry for the roster's task, also when the caller passed `--service-tier`: that value came from the same registry moments before, and a later automatic turn must not reuse it. `--service-tier` stays only for thread start. Do not derive the task from log file names. An old entry with no task uses its function's tier (`delegate` when the function is unknown) until its next follow records one.
-4. A test drives one turn that is not a follow (for example a build-result wake-up) with the registry tier `default` and no caller tier, and checks that `turn/start` carries `"serviceTier": "default"`. A second test sets the scratch Codex config to `fast` and the scratch registry to `default`, and checks that the turn carries `"default"`. Tests use a scratch registry and a scratch Codex config, never the real ones.
+- Every `turn/start` on a worker thread sends `serviceTier`, read at that turn from the `/agent` registry (`agents.conf`) for the worker's task: a follow, a build-result wake-up, a held result, a continuation or an account-move resume (`codex_mesh._turn_service_tier`). The task's row beats its function; `pace` takes the pacer's current choice. An empty registry tier sends `default`. The Codex config tier (`~/.codex/config.toml`) never reaches a worker turn, so a `/fast` typed in a Codex window no longer changes the workers (it put every worker on fast for 14 hours on 10-20).
+- The rules live once, in `agents_config.sh` (`agents_turn_service_tier`, which reuses `_agents_resolve_service_tier`); `codex_mesh` calls it through bash on each turn with `AGENTS_CONFIG_TIER_ONLY=1`, which skips the catalog sync. A resolver error goes to the seat log and the turn sends `default`.
+- `implement.sh`, `review.sh` and `launch_friend.sh` pass `--task <function.subtask>` to `codex_mesh` start and follow (prime takes it too); the roster entry keeps it. `--service-tier` now applies only at thread start. An old entry with no task uses the `delegate` function tier until its next follow records one.
 
 **Files:**
-- `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`, `scripts/agents/agents_config.sh`, `scripts/agents/test_agents_config.sh`
-- `scripts/direct/implement.sh`, `scripts/direct/review.sh`, `scripts/ask_a_friend/launch_friend.sh` and their tests
+- `scripts/agents/codex_mesh.py`, `scripts/agents/agents_config.sh` — the per-turn tier and the task record.
+- `scripts/direct/implement.sh`, `scripts/direct/review.sh`, `scripts/ask_a_friend/launch_friend.sh` — pass `--task`.
+- `scripts/agents/test_codex_mesh.py`, `scripts/agents/test_agents_config.sh`, `scripts/agents/test_launcher_tasks.sh`, `scripts/direct/test_implement_launcher.py`, `scripts/direct/test_review_launcher.py` — tests.
 
-**Workers:** 1 writer. impl owns all files.
-
-**Verification:** `python3 -m unittest scripts.agents.test_codex_mesh` with a scratch HOME; basedpyright 0/0 on both files.
-
-**Acceptance gate:**
-- **Tier sent:** every turn carries the configured tier: the caller's tier, else the registry tier resolved at the turn.
-- **Suites:** pass, basedpyright 0/0, merge gate on natedev passes.
+**Gotchas:**
+- A thread resumed on a server started before a config change keeps that server's tier until its next turn; from this phase on, the next turn corrects it.
+- Two closure rounds: automatic turns first reused the launch tier from `stream.args`, and a task found by log file name missed review and friend threads.
