@@ -15,7 +15,8 @@ Verbs:
   start      [--session-dir D --to NAME] [--director-dir D] [--label L]
              [--done-message-file F] -- command...
              Write the run record, spawn its supervisor and return at once. Exit 3 when the
-             caller is not a mesh worker, so the caller runs the command attached.
+             caller is not a mesh worker, so the caller runs the command attached. NAME may be
+             the seat's role, the last part of its roster name; the record keeps the roster name.
   supervise  <record>
              Run the command, wait for it, deliver its result, then mark the record finished.
 
@@ -155,6 +156,18 @@ def _read_record(path: Path) -> RunRecord:
     return cast(RunRecord, cast(object, raw))
 
 
+def seat_name(session_dir: str, name: str) -> str:
+    """The roster's name for the seat `--to` names. A seat may call itself by its role, the last
+    part of its roster name: on 2026-10-20 tool-based-ui-trunk-box started five runs with `--to box`,
+    no roster entry matched at delivery, and each result was lost. A name the roster does not hold,
+    such as a reviewer that registers after its run starts, stays as given."""
+    roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+    if name in roster:
+        return name
+    matches = [seat for seat in roster if seat.endswith(f"-{name}")]
+    return matches[0] if len(matches) == 1 else name
+
+
 def command_start(args: argparse.Namespace) -> int:
     command = [str(part) for part in cast(list[object], getattr(args, "command", []) or [])]
     if command and command[0] == "--":
@@ -173,6 +186,8 @@ def command_start(args: argparse.Namespace) -> int:
         if isinstance(caller, NotMeshWorker):
             return NOT_A_MESH_WORKER
         session_dir, name, thread_id = caller.session_dir, caller.name, caller.thread_id
+    else:
+        name = seat_name(session_dir, name)
     label = str(getattr(args, "label", "") or "") or " ".join(command)
     done_file = str(getattr(args, "done_message_file", "") or "")
     director_dir = str(getattr(args, "director_dir", "") or "") or session_dir
@@ -254,7 +269,13 @@ def send_to_director(session_id: str, summary: str, text: str) -> bool:
 
 
 def _director_sessions(record: RunRecord) -> list[str]:
-    return codex_mesh._marker_sessions(RUN_ROOTS, Path(record["director_dir"]))  # pyright: ignore[reportPrivateUsage]
+    """The sessions whose run marker names the run folder, then the director the folder records.
+    A director that runs two folders has one marker, naming the other folder, so only the
+    recorded director finds it (trunk's phase 140 folder, 2026-10-20)."""
+    folder = Path(record["director_dir"])
+    marked = codex_mesh._marker_sessions(RUN_ROOTS, folder)  # pyright: ignore[reportPrivateUsage]
+    recorded = unit_runs.director(folder)
+    return [*marked, recorded] if recorded and recorded not in marked else marked
 
 
 def deliver(record: RunRecord, exit_code: int) -> str:

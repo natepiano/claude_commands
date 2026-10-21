@@ -219,6 +219,32 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(self.pending(), {})
         self.assertIn("sent to director", record.get("delivery", ""))
 
+    def test_a_run_started_for_the_seats_role_reaches_the_seat(self) -> None:
+        # tool-based-ui-trunk-box started its runs with `--to box` (2026-10-20): each was lost.
+        popen = MagicMock(return_value=SimpleNamespace(pid=4321))
+        with patch.object(subprocess, "Popen", popen), contextlib.redirect_stdout(io.StringIO()):
+            code = mesh_runs.main(["start", "--session-dir", str(self.session), "--to", "impl", "--", "true"])
+        self.assertEqual(code, 0)
+        path = next((self.session / codex_mesh.DETACHED_RUNS_DIR).glob("*.json"))
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))["worker"], WORKER)
+        record = self.supervise(path)
+        self.assertIn(f"held for {WORKER}'s attached launcher", record.get("delivery", ""))
+        self.assertEqual(len(cast(list[str], self.pending()["messages"])), 1)
+        # A name the roster does not hold yet stays as given.
+        self.assertEqual(mesh_runs.seat_name(str(self.session), "reviewer-1"), "reviewer-1")
+
+    def test_a_director_whose_marker_names_another_run_still_hears_the_result(self) -> None:
+        active = self.root / "unit" / "active"
+        active.mkdir()
+        other = self.root / "unit" / "run-2"
+        other.mkdir()
+        _ = (active / "director-session").write_text(f"{other}\n", encoding="utf-8")
+        _ = (self.session / "director").write_text("director-session\n", encoding="utf-8")
+        self.write_roster("thread-1", "done", DEAD_PID, port=4100)
+        record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(100)"]))
+        self.assertEqual([notice.session_id for notice in self.sent], ["director-session"])
+        self.assertEqual(record.get("delivery"), "sent to director director-session")
+
     def test_closed_inbox_goes_to_the_director(self) -> None:
         active = self.root / "unit" / "active"
         active.mkdir()
