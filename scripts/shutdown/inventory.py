@@ -1640,6 +1640,7 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
         timers = _snapshot_timers()
         units = _snapshot_units(timers)
         native, presentation = _snapshot_native_hosts()
+        herdr.save_shared_layout(set(presentation))
         desktops = _snapshot_desktops(refresh=False)
         processes = reader.paths()
         # Socket ownership also distinguishes a replacement with the same session name.
