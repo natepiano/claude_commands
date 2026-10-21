@@ -4,7 +4,7 @@
 
 > **As-built disposition: create** — `docs/as-built/guilds.md`
 
-> **Production: sdlc** — unit `guilds-unit`; production doc `docs/plans/sdlc-production.md`
+> **Production: sdlc** — unit `guild-process-unit`; production doc `docs/plans/sdlc-production.md`
 
 ## Source
 

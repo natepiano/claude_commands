@@ -23,7 +23,7 @@
 
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
-| guilds-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guilds` | `sdlc-guilds` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/plans/sdlc-guilds-design.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py` |
+| guild-process-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/plans/sdlc-guilds-design.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py` |
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
@@ -47,9 +47,9 @@ The user, via the showrunner, 2026-10-20: "I like goddesses of wisdom and judgem
 
 | File | Owner unit | Other units that touch it |
 | --- | --- | --- |
-| `commands/unit/direct.md` | phases-unit | guilds-unit (the designer and reviewer roles); fix-rounds-unit (the repair round rules) |
-| `docs/production_format.md` | roles-unit | guilds-unit (role names); fix-rounds-unit (<ProductionUnit/> item 7) |
-| `commands/showrunner/produce.md` | roles-unit | guilds-unit (the designer and reviewer roles under a showrunner) |
+| `commands/unit/direct.md` | phases-unit | guild-process-unit (the designer and reviewer roles); fix-rounds-unit (the repair round rules) |
+| `docs/production_format.md` | roles-unit | guild-process-unit (role names); fix-rounds-unit (<ProductionUnit/> item 7) |
+| `commands/showrunner/produce.md` | roles-unit | guild-process-unit (the designer and reviewer roles under a showrunner) |
 
 These three files are also hub files in build-followups. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the build-followups owner.
 
@@ -77,3 +77,26 @@ No gates yet. The plans are not written. When a plan needs another unit's checkp
   - experiments-unit (cargo-liner) starts with a hand-resumed Astra thread and `/astra_review`. guilds-unit reads what it learns before it writes the reviewer role.
 - **No CI on this repo** (natedev, 2026-10-04, for `~/.claude`). `~/.claude` has no workflows, so the Merge tests replace `verify.sh test`, and <CIPoint/>, the smoke launch, the Mac run and `validate_and_push.sh` do not apply.
 - **Each merged phase goes to main at once** (natedev, 2026-10-04, for `~/.claude`), because `~/.claude` main is the live configuration. After a merge's tests pass: merge `main` into `sdlc` if main moved, push `sdlc`, fast-forward `~/.claude` main to it (`git -C ~/.claude merge --ff-only <sha>`; other sessions' uncommitted files there stay untouched), and push main only when `origin/main..main` held no other session's commits before the fast-forward. Then the Mac pulls: `ssh mac 'cd ~/.claude && git pull --ff-only natedev:/home/natepiano/.claude main'`.
+
+## Review decisions
+
+The user's review with the showrunner, 2026-10-21, one item at a time. Each unit gets its answers by message and writes them into its own plan.
+
+### guilds-unit
+
+Model, in the user's words (2026-10-21): the goal of a guild is to help guild members do their jobs better. Showrunners and unit directors share behavior and get guild functionality too, not only designers and reviewers. Heads do not read every member turn: that costs too much. Set events make members write to their guild or head. The user sends all guild feedback through the head. Each skill that starts a member role carries short guidance on how to work with the guild and its head.
+
+| # | Item | Decision |
+| --- | --- | --- |
+| G1 | Which jobs get a guild (showrunners, unit directors, designers, reviewers; workers?) | Four guilds: showrunners, unit directors, designers, reviewers. Workers have no guild; they get better guidance through their unit director's work orders. |
+| G1b | The head's form | Each head is a unit director, one per guild, under one lasting top-level guilds showrunner (not sdlc). In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
+| G2 | What heads watch, since they do not read every turn | Events plus records: a head reads turns when an event fires (G3), and once a day reads the records already kept (repair rounds, time per phase step, review findings); it reads turns only where a record looks bad. |
+| G3 | The events that make a member write to its guild or head | The member sends one short message to its head only, never to the whole guild, when: the user corrects it; a phase reaches repair round 4; the same review finding comes back twice; it works around a tool fault or a rule that slowed it; it finds a way that saved real time. The head decides what goes to the whole guild. |
+| G3b | Where the heads keep the guild tips | In ~/rust/nate_style: one folder per guild plus one shared folder, one tip per markdown file like the rust rules, and a base folder per guild with Obsidian views by tag like rust_base. The head adds and edits tip files. A member loads its guild's tips when its skill starts. Tips reach both machines through git; the design's copy step and receipts go. Replaces docs/guilds in ~/.claude. |
+| G4 | The user's guild feedback goes through the head | Decided by the user's words. The user types in the head's tab in the guilds space, or tells any showrunner, which passes it on. The head writes it as a tip file. |
+| G5 | Short guild guidance in each skill that starts a member role | Decided by the user's words. /showrunner:produce, /unit:direct and the designer and reviewer start prompts each carry a short block: who your head is, load your guild's tips, the G3 events, and how to write to the head. |
+| G6 | Where the heads live | Settled by G1b: the guilds space in herdr on natedev (showrunner's call: the guild records and the other showrunners are on natedev). |
+| G7 | Guild names (was question B) | The top level is named guilds (the showrunner and its herdr space). The four guilds and their head units are named designers, reviewers, showrunners and units (herdr tab order after the guilds showrunner: designers, reviewers, showrunners, units). Goddess names are on hold. Showrunner's call: the tip folders are ~/rust/nate_style/guilds/<guild>/, with the shared tips in ~/rust/nate_style/guilds/common/. |
+| G8 | Done work: phase 1 (roles in the tree), phase 2 (design doc) | Revise: keep phase 1; guilds-unit updates the design doc with these decisions. Its lasting-role half stays; its guild half changes. |
+| G9 | Next phases: redesign for the new scope, then build | OK: 3 revise the design doc; 4 tip folders and views in nate_style/guilds plus the guild block and G3 events in each starting skill; 5 the guilds production doc, then the top-level guilds showrunner and its four head units, each with its daily record read; 6 lasting designer and reviewer threads. The user's model: sdlc's guild-process unit director owns the guild process; the guilds showrunner runs each guild by that process. The two need different session names. Showrunner's call: sdlc's guilds-unit becomes guild-process-unit (session guild-process). |
+| G10 | Where hierarchies-unit's work goes | Move hierarchies-unit into sdlc as its own unit, beside guild-process, with /showrunner:transfer_unit once natedev finishes that command. It keeps its session and reviewed work; guild-process reads its findings. |
