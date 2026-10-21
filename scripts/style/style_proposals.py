@@ -433,7 +433,7 @@ def apply_answer(ledger: style_ledger.Ledger, issue: Path, action: JoinAction, f
     if not finding_ids:
         return
     if isinstance(action, WaiveWithAnswer):
-        _ = ledger.decline_findings(finding_ids, action.words)
+        _ = ledger.decline_findings(finding_ids, action.words, style_ledger.WaiveByPerson("user"))
     elif isinstance(action, ReopenBuiltDecision):
         proposal_command("reopen", str(issue))
 
@@ -638,7 +638,7 @@ def decline(ledger: style_ledger.Ledger, issue: Path, words: str) -> None:
         proposal_command("decline-answer", str(issue), "--words", words)
     filed = tuple(finding.finding_id for finding in issue_findings(ledger, issue)
                   if isinstance(finding.state, style_ledger.Filed))
-    for finding_id, outcome in ledger.decline_findings(filed, words).items():
+    for finding_id, outcome in ledger.decline_findings(filed, words, style_ledger.WaiveByPerson("user")).items():
         if isinstance(outcome, style_ledger.InputChangedSinceJudged):
             print(f"not re-recorded {finding_id}: input changed since judged")
     if frontmatter(issue).get("status") != ["closed"]:

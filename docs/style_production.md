@@ -409,8 +409,8 @@ To correct the after text of a waived finding, use `style_ledger.py held replace
 judging ticket, returns the finding to unfiled, and restores a newest waived
 cell judgment to held. For an old waive with no recorded source, add
 `--person <name>`; the ledger records who undid it, as `unwaive` does. A person's
-waive is always refused by `replace`. When there is no waived cell judgment,
-record `held` for the cell after replacement. Plain `held add` keeps an existing
+waive and a ledger waive are always refused by `replace`. When there is no
+waived cell judgment, record `held` for the cell after replacement. Plain `held add` keeps an existing
 waive.
 
 Run from the unit worktree, using the ticket's recorded start commit:
@@ -571,7 +571,7 @@ followed finding, and `--json` adds `followed_from`, `followed_at` and
 
 One style decision covers one rule and crate under one rule blob. An answer
 also covers later findings under that rule text: a declined decision waives
-them with its stored words, and `file` prints
+them with its stored words and records the person actor `user`; `file` prints
 `waived <n> findings in <decision>: declined: <words>`. An approved decision
 that is closed opens again with its approval for a later finding when each of
 its findings is built, waived or withdrawn. The ledger decides this, not the
@@ -611,10 +611,10 @@ changes during the refill gets `waiting <decision>: no longer approved`. A decis
 that the step skips gets `waiting <decision>: skipped by the declaration step`,
 and refill writes none of its findings. For a finding
 that the step cannot read, refill waives it when its file is not in the synced
-commit, and prints the file and the commit. It also waives a finding whose one-line site text left its
-file and moved into exactly one file that gained the line since the finding was
-judged, and prints both files and the commit. When no finding of the decision
-is left to build, refill closes it. Refill does not assign a queued proposal ticket that was
+commit, records the actor `ledger`, and prints the file and the commit. It also
+waives a finding whose one-line site text left its file and moved into exactly one file that gained the line since the finding was
+judged, records the actor `ledger`, and prints both files and the commit. When
+no finding of the decision is left to build, refill closes it. Refill does not assign a queued proposal ticket that was
 made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
 then run migrate.
 
@@ -748,8 +748,8 @@ After each merge and at startup, run `style_proposals.py complete --repo
 findings are built or waived. It also closes an approved decision with no merged
 ticket when no finding is left to build. Decline only with `style_proposals.py decline --repo <style checkout>
 --issue <issue> --words '<the user's words>'`. It stores the answer and waives
-the findings still filed to the decision. Built findings stay built. Later
-findings are waived with the same words. Changed inputs stay stale.
+the findings still filed to the decision with the person actor `user`. Built
+findings stay built. Later findings are waived with the same words. Changed inputs stay stale.
 A general reason becomes a repo-local rule through `/local_style`.
 
 Record off-rule ideas as candidates, never held proposals. The showrunner

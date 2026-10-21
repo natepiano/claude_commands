@@ -511,6 +511,58 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stderr.strip(), "style_ledger: unknown held finding missing")
 
+    def test_decline_keeps_a_nonempty_actor_when_it_overrides_a_unit_waive(self) -> None:
+        rule = self.rule("decline-actor")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        finding, = ledger.named_held((finding_id,))
+        ledger.waive_held(finding_id, style_ledger.WaiveByUnit(finding.ticket))
+        _ = ledger.decline_findings((finding_id,), "Keep this name", style_ledger.WaiveByPerson("user"))
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT waive_provenance,waived_by FROM held_findings WHERE finding_id=?",
+                                                (finding_id,)).fetchone(), ("person", "user"))
+        self.assertEqual(ledger.named_held((finding_id,))[0].waive_actor, style_ledger.WaiveByPerson("user"))
+
+    def test_decline_rejects_a_unit_and_keeps_person_and_ledger_waives_protected(self) -> None:
+        rule = self.rule("decline-protection")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        for line, actor in enumerate((style_ledger.WaiveByPerson("ana"), style_ledger.WaiveByLedger()), 1):
+            with self.subTest(actor=actor):
+                finding_id = self.hold_finding(rule, line)
+                finding, = ledger.named_held((finding_id,))
+                ledger.waive_held(finding_id, actor)
+                before = ledger.database.read_bytes()
+                invalid_actor = cast(style_ledger.WaiveByPerson | style_ledger.WaiveByLedger,
+                                     cast(object, style_ledger.WaiveByUnit(finding.ticket)))
+                with self.assertRaisesRegex(style_ledger.LedgerError, "decline requires a person or the ledger"):
+                    _ = ledger.decline_findings((finding_id,), "Keep this name", invalid_actor)
+                self.assertEqual(ledger.database.read_bytes(), before)
+                _ = ledger.decline_findings((finding_id,), "Keep this name", actor)
+                self.assertEqual(ledger.named_held((finding_id,))[0].waive_actor, actor)
+                before = ledger.database.read_bytes()
+                with self.assertRaisesRegex(style_ledger.LedgerError, finding_id):
+                    _ = ledger.replace_held(finding_id, "corrected")
+                self.assertEqual(ledger.database.read_bytes(), before)
+
+    def test_held_replace_refuses_a_ledger_waive_without_writing(self) -> None:
+        rule = self.rule("ledger-waive")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='waived',waive_provenance='ledger',waived_by='ledger' WHERE finding_id=?",
+                                   (finding_id,))
+        for person in ((), ("--person", "ana")):
+            with self.subTest(person=person):
+                before = ledger.database.read_bytes()
+                result = self.cli("held", "replace", "--id", finding_id, "--after", "corrected", *person, success=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(finding_id, result.stderr)
+                self.assertIn("ledger", result.stderr)
+                self.assertEqual(ledger.database.read_bytes(), before)
+
     def test_held_replace_preserves_person_waives_and_replaces_only_a_unit_waive(self) -> None:
         rule = self.rule("waive-origin")
         self.set_tip(self.initial_tip)
@@ -521,10 +573,10 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE held_findings SET person_read_by='ana' WHERE finding_id=?", (person_id,))
         self.record(rule, self.sources[0], self.initial_tip, "held")
-        _ = ledger.decline_findings((person_id,), "Keep the old name")
+        _ = ledger.decline_findings((person_id,), "Keep the old name", style_ledger.WaiveByPerson("user"))
         # A declined decision can also waive a new, unfiled finding before any judgment exists.
         unfiled_id = self.hold_finding(rule, 2)
-        _ = ledger.decline_findings((unfiled_id,), "Keep this name too")
+        _ = ledger.decline_findings((unfiled_id,), "Keep this name too", style_ledger.WaiveByPerson("user"))
         for finding_id in (person_id, unfiled_id):
             with self.subTest(finding_id=finding_id):
                 before = ledger.database.read_bytes()
@@ -876,12 +928,12 @@ class StyleLedgerTests(unittest.TestCase):
         for path in self.sources[:2]:
             self.record(rule, path, self.initial_tip, "held")
         ledger = self.ledger()
-        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name")[ids[0]], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name", style_ledger.WaiveByPerson("user"))[ids[0]], style_ledger.CellWaived)
         self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule).held, 1)
         _ = ledger.unwaive_held(ids[:1], style_ledger.WaiveUndoneBy("nate"))
         self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule).held, 2)
         self.assertIn((rule, self.sources[0]), ledger.latest_held_judgments())
-        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name")[ids[0]], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name", style_ledger.WaiveByPerson("user"))[ids[0]], style_ledger.CellWaived)
         # The new waive keeps the record of who undid the old one.
         waived, = ledger.held_findings(style_ledger.HeldFindingsInState("waived"))
         self.assertEqual((waived.finding_id, waived.waive_undo), (ids[0], style_ledger.WaiveUndoneBy("nate")))
@@ -3516,7 +3568,7 @@ class StyleLedgerTests(unittest.TestCase):
                          {self.sources[0]: "current", self.sources[1]: "stale"})
         self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository())
                               if row.rule_id == rule).held, 1)
-        outcomes = ledger.decline_findings((finding.finding_id for finding in findings.values()), "declined")
+        outcomes = ledger.decline_findings((finding.finding_id for finding in findings.values()), "declined", style_ledger.WaiveByPerson("user"))
         self.assertIsInstance(outcomes[findings[self.sources[0]].finding_id], style_ledger.CellWaived)
         self.assertIsInstance(outcomes[findings[self.sources[1]].finding_id], style_ledger.InputChangedSinceJudged)
 
@@ -4012,7 +4064,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.insert_legacy_structure_judgment(rule, path, base, "held")
         self.write("crates/alpha/src/unrelated/item.rs", "pub fn unrelated() {}\n")
         self.set_tip(self.commit("Change outside held module"))
-        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined")[finding.finding_id], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[finding.finding_id], style_ledger.CellWaived)
         self.assertEqual(self.states(rule)[path], "current")
 
     def test_structure_row_with_an_unresolvable_commit_counts_as_changed(self) -> None:
@@ -4026,7 +4078,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute('UPDATE judgments SET "commit"=?', ("0" * 40,))
             connection.commit()
         self.assertEqual(self.states(rule)[path], "stale")
-        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined")[finding.finding_id], style_ledger.InputChangedSinceJudged)
+        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[finding.finding_id], style_ledger.InputChangedSinceJudged)
 
     def test_structure_crate_and_manifest_cells_retain_their_original_keys(self) -> None:
         crate_rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -4045,7 +4097,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(stored[0], (crate_rule, "crate", self.git("rev-parse", f"{self.initial_tip}:crates/alpha")))
         self.assertEqual(stored[1][1], "manifest")
         self.assertEqual(self.states(manifest_rule)["crates/alpha"], "current")
-        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined")[finding.finding_id], style_ledger.InputChangedSinceJudged)
+        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[finding.finding_id], style_ledger.InputChangedSinceJudged)
         self.write("crates/alpha/Cargo.toml", (self.repo / "crates/alpha/Cargo.toml").read_text() + "\n[features]\nextra = []\n")
         self.set_tip(self.commit("Change workspace manifest"))
         self.assertEqual(self.states(manifest_rule)["crates/alpha"], "stale")
@@ -4111,7 +4163,7 @@ class StyleLedgerTests(unittest.TestCase):
                  for path in self.sources[:2]]
         for path in self.sources[:2]:
             self.record(rule, path, self.initial_tip, "held")
-        self.assertIsInstance(ledger.decline_findings((holds[0].finding_id,), "declined")[holds[0].finding_id], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings((holds[0].finding_id,), "declined", style_ledger.WaiveByPerson("user"))[holds[0].finding_id], style_ledger.CellWaived)
         progress = next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule)
         self.assertEqual((progress.current, progress.held), (2, 1))
         self.write(self.sources[0], "pub fn changed() {}\n")
@@ -5188,7 +5240,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         finding = ledger.hold(rule, path, 1, "Rename value", "rename", "value", "amount", self.blob(rule), "outside")
         ledger.record(rule, path, self.initial_tip, self.blob(rule), "held", ticket="outside")
-        self.record_while_stalled("_fingerprint", lambda writer: writer.decline_findings((finding.finding_id,), "declined"))
+        self.record_while_stalled("_fingerprint", lambda writer: writer.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user")))
         self.assertIsInstance(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Waived)
         self.assertIsInstance(ledger.newest_held_judgment(rule, path), style_ledger.NoHeldJudgment)
 

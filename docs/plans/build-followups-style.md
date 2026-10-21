@@ -76,7 +76,7 @@ Then (02:3x EDT), item (e): `held add` keys on rule, path and text, so after a w
 - `decline_findings` writes `waive_provenance='person'` with an empty `waived_by`. It does this for a person's decline and also for the file-gone waive from `style_plan.py`, and it erases any earlier actor name. `_held` reads such a row as `NoRecordedWaiveActor`, and `replace` refuses it as a person's waive.
 - A `--reads` judgment keeps declared scope `rule`. The newest declared scope filter still treats it as a rule-scope verdict.
 
-### Phase 41 — every waive names who made it, declines and file-gone waives included  · status: todo
+### Phase 41 — every waive names who made it, declines and file-gone waives included  · status: done
 
 **Depends on:** Phase 40
 
