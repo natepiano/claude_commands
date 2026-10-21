@@ -300,11 +300,12 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
     """The processes inside the worktree that its runs leave behind once their sessions stop, each named.
 
     A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
-    supervisor's pid and is in the supervisor's arguments; an app-server's idle-stop watcher by the
-    run folder in its arguments. Each leads its own session, so its children go with it.
+    supervisor's pid and is in the supervisor's arguments; an app-server by its run's
+    mesh_server.json; an app-server's idle-stop watcher by the run folder in its arguments. Each
+    leads its own session, so its children go with it.
     """
     runs = runs_of(worktree)
-    leaders: dict[int, str] = {}
+    leaders = {item.pid: f"app-server {item.pid} of run {item.run.name}" for item in mesh_runs(runs)}
     for folder in runs:
         for path in sorted((folder / DETACHED_RUNS).glob("*.json")):
             record = _json(path)

@@ -29,7 +29,8 @@ The script lives at
    unit to stop (up to an hour), for a merge gate that is running, and for the relaunched unit to come
    up. It journals each step, so a rerun after a refusal resumes from the step that stopped. The steps are:
    1. stop the unit and its Codex seats at once through the shutdown path (`down`, then `now`), then
-      SIGTERM its runs' supervisors and app-server watchers left in the worktree;
+      stop its runs' app-servers (`codex_mesh.py stop`) and SIGTERM their supervisors and app-server
+      watchers left in the worktree;
    2. merge the merge branch into the unit, except while its work is in progress (an open phase or
       uncommitted work): then the branch keeps its tip, steps 2 and 6 merge nothing, and the unit
       takes the merge branch and the rename commit at its own next merge;
