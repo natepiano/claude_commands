@@ -1042,47 +1042,21 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - style_footprint must not import `approved_renames` or `declarations` (that is an import cycle). The erasure proof has its own parameter reading.
 
 ### Phase 39 — a cell with no live held finding is never offered again as held work  · status: done
-**Depends on:** none
 
-#### Work Order
-**Goal:** a cell whose held findings the user waived stops coming back as held work: the ledger refuses `record --verdict held` when the cell has no live held finding, and the worker records `waived` for a cell whose only findings are waived.
+#### As-built
 
-**Spec:**
-- cargo-liner-style 2026-10-20: cargo-port `project/git/checkout.rs`, rule lens `tests-live`, has the newest verdict `held` and 0 live held rows (its rows were waived on ticket 107). Refill offered it again after each sync (tickets 155, 176, 181). This is a wrong result.
-- Live held rows are `state` `unfiled` or `filed` in `held_findings`. Rows are keyed by `(rule, site path)`. `style_ledger._finding_cell(definition, path, tip)` (~:171) maps a site to its cell.
-- How the state comes about:
-  - `waive_held` (~:3823) and `decline_findings` (~:2274) waive rows. When `decline_outcome` (~:2358) answers `InputChangedSinceJudged` or `CellStillHeld`, the judgment stays `held`.
-  - A worker on the next ticket is not told about waived rows: `style_plan.py` ~:1471 leaves Waived, Built and Withdrawn out of "Already-held findings" (~:1296). The worker holds the same defect again. `hold` (~:2090) answers with the existing waived row (`ON CONFLICT(finding_id) DO NOTHING`), and the worker records `held` again with 0 live rows.
-- Ledger: `Ledger.record` (~:4062) refuses verdict `held` when no live held row maps to that rule/cell.
-  - The refusal is a `LedgerError` naming the rule and path. It names each waived, built or withdrawn finding on the cell, with its id and state.
-  - The refusal text says: a waived finding is the user's decision and does not make a cell held; hold a new finding with `held add` first, or record `waived` when only waived findings remain.
-  - `waived` is the ledger's verdict for a declined change (`decline_findings` ~:2332). `unwaive_held` (~:3784) turns a newest `waived` verdict back into `held`, so `waived`, not `clean`, keeps that path. A `waived` verdict already expires when its inputs change (rule text, file, or crate/module context; `test_exception_held_and_waived_expire_when_their_input_changes`), so the cell is judged again then.
-  - `unwaive_held` (~:3747) and the checkpoint restamp copy (~:1814) do not go through `record` and keep their behavior.
-- Refill (`_refill_cells`, `style_plan.py` ~:1071) does not change. Its skip compares only the file blob, and rule text or crate context can change while the blob stays the same, so a new skip for waived rows could hide a cell that needs judging. A held cell with 0 live rows is offered once more; the worker records `waived`; the cell is then current and is not offered until its inputs change.
-- Worker text: for a per-file structure ticket, list the waived findings on the ticket's cells under their own line, `Waived by the user: do not hold these again. Record waived for a cell whose only findings are these.`, with the same fields as the held list.
-- `docs/style_production.md` (~:114) describes refill's waived exclusion: add the `record held` refusal and the `waived` instruction there.
-- Existing tests that record `held` with no held row must hold a finding first. Update their fixtures; never weaken the refusal or skip it in tests.
+- `Ledger.record` refuses verdict `held` when no `unfiled` or `filed` finding maps to the cell. `Ledger._cell_findings(rule, path, commit)` maps each finding site to its cell with `_finding_cell`, so a manifest structure rule maps a site to its crate.
+- The refusal is a `LedgerError` that names the rule and path, and each waived, built or withdrawn finding on the cell with its id and state. It says to hold a new finding with `held add` first, or to record `waived` when only waived findings remain.
+- `unwaive_held` and the checkpoint restamp copy do not go through `record`. A newest `waived` verdict still turns back into `held` through `unwaive_held`.
+- `write_phase` builds the structure ticket's waived list with the private `_waived_ticket_findings`. It reads `tier` and `input_scope` from the ticket's restored pinned rule files, and maps manifest sites with `coverage_report.workspace` at the ticket base.
+- `phase_text` takes `waived_findings` and prints them under `Waived by the user: do not hold these again. Record waived for a cell whose only findings are these.`, with the same fields as the held list.
+- Refill (`_refill_cells`) does not change. A held cell with no live finding is offered once more, the worker records `waived`, and the cell then stays current until its rule text, file or context changes.
 
 **Files:**
-- `scripts/style/style_ledger.py`
-- `scripts/style/style_plan.py`
-- `docs/style_production.md`
-- `scripts/style/test_style_ledger.py`
-- `scripts/style/test_style_plan.py`
-- `scripts/style/test_style_proposals.py`
-- `scripts/style/test_standing_checkpoint.py`
-- `scripts/style/test_coverage_report.py`
+- `scripts/style/style_ledger.py` — `Ledger._cell_findings` and the held refusal in `Ledger.record`.
+- `scripts/style/style_plan.py` — `_waived_ticket_findings`, `write_phase` and the `waived_findings` parameter of `phase_text`.
+- `docs/style_production.md` — the `record held` refusal, the `waived` instruction and the waived expiry.
 
-**Workers:** 1 writer + 1 tester. `impl`: style_ledger.py, style_plan.py and docs/style_production.md. `test`: the five test files. Tests to write:
-- `record --verdict held` is refused for a cell whose only rows are waived, and for a cell with no rows; it passes with an unfiled or a filed row.
-- The waived-rows case end to end: hold, `held waive`, record `held` again (refused), record `waived`; after a sync that leaves the cell's inputs unchanged, refill does not offer it; after its file or rule text changes, refill offers it.
-- `unwaive_held` after that `waived` verdict makes the cell held again.
-- The worker text lists a waived finding under its own line.
-- Fixtures that record `held` without a row hold a finding first.
+**Gotchas:** for a cell whose only findings are waived, record `waived`, never `held` or `clean`; `waived` keeps the `unwaive_held` path. The waived list must come from the ticket's pinned rule text, not the live catalog, or resume breaks after a rule removal. A test fixture that records `held` must hold a finding first.
 
-**Constraints from prior phases:** phase 36 made decision filing safe for two runs at once; keep its lock order. Phase 38 does not touch these files.
-
-**Acceptance gate:**
-- `env -C <worktree> PYTHONPATH=<worktree>/scripts/style:<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_plan scripts.style.test_style_proposals scripts.style.test_standing_checkpoint scripts.style.test_coverage_report` passes.
-- basedpyright on each changed .py file: 0 errors, 0 warnings.
-- The gate copy's `merge_gate.py --tests-only` passes.
+**Ruled out:** a refill skip keyed on waived findings, because refill compares only the file blob and the skip can hide a cell whose rule text or context changed.
