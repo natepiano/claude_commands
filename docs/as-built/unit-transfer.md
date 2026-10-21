@@ -1,0 +1,57 @@
+# Unit transfer (as built)
+
+`/showrunner:transfer_unit <unit> <to production doc>` (`commands/showrunner/transfer_unit.md`)
+moves one natedev unit director from one production to another. The giving showrunner runs it. The
+script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `apply` and `verify`
+(user, 2026-10-21: "yes i want this"). The first use is hierarchies-unit from build-followups to sdlc.
+
+## What stays and what moves
+
+- The unit keeps its id, its Claude session and conversation, its worktree, its branch and its
+  unmerged commits.
+- The Units row moves from the giving doc to the receiving doc. It is written under the receiving
+  doc's own columns, and a column the giving row lacks gets `—`. The row is not marked retired.
+- The plan's `> **Production:**` header names the receiving production and doc. The unit reads its
+  production from that header, so the header commit goes on the unit branch, and the branch is
+  pushed. The plan's prose is history and does not change.
+- The stall-watch stretch and its prompt file move to the receiving slug. This pool's reviewers of
+  the unit retire (`review_pool.py retire`), so the receiving pool leases its own. The old pane
+  entry is forgotten, because the relaunch records a new pane.
+- The shutdown record's host takes the receiving `production` and `doc`. A herdr session name of
+  the form `<giving slug>-<stem>` takes `<receiving slug>-<stem>`. Its `renamed` field holds the
+  moved note, which `restart.restart_note` puts first in the relaunched session's prompt. The note
+  names the new production doc, merge branch and showrunner address command.
+- The relaunch runs `add_unit.py` with the record's doc, so the unit's marks
+  (`SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID`) name the receiving production. Status, dailies, panes and
+  merges find the unit there.
+- The phase note follows at the unit's next refresh. The giving showrunner's report state keeps its
+  rows as history.
+
+## Refusals (version one)
+
+- A unit on the Mac, or a receiving production in another repository (another git common dir):
+  the worktree could not be kept.
+- A merge in progress (`MERGE_HEAD`) in the unit worktree or in either showrunner checkout.
+- Commits on the unit branch that come from the giving merge branch and that the receiving merge
+  branch does not have (`foreign_commits`): they would move with the unit.
+- A reserved or retired unit, a unit already in the receiving table, and an unfinished rename or
+  transfer in either production.
+
+## apply
+
+apply works under the production lock in `unit_move` and saves the journal `transfer_unit.json` in
+the giving production's state folder before it changes anything. A rerun resumes at the step that
+refused. Each step except stop, relaunch and verify runs under both merge locks, taken in slug order,
+and runs the preflight again first. Stop is `rename_unit.stop_unit` through the shared
+`rename_unit.StopTarget` protocol: a transfer keeps the id, so the old and new ids are the same.
+
+The doc commits use `git commit --only` on the doc, and an earlier run's commit is adopted by its
+subject. They are not pushed: each goes out with its showrunner's next merge push, as add_unit's
+row commit does (user, 2026-10-08). The unit takes the receiving merge branch at its own next merge.
+
+## verify
+
+verify fails when the receiving doc has no row, the giving doc still has one, a plan header does
+not name the receiving production, the stretch is still under the giving slug, the shutdown record
+does not name the receiving production, the unit is not live under the receiving slug, a session
+still carries the giving marks, or a giving reviewer is still leased to the unit.

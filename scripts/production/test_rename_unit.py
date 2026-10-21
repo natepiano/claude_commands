@@ -736,7 +736,7 @@ class RunProcessTests(unittest.TestCase):
     def stop(self) -> str:
         output = io.StringIO()
         with redirect_stdout(output):
-            rename_unit._stop(self.rename(), lambda: None)  # pyright: ignore[reportPrivateUsage]
+            rename_unit.stop_unit(self.rename(), lambda: None)
         return output.getvalue()
 
     def test_the_stop_ends_the_runs_supervisor_and_watcher_and_leaves_the_rest(self) -> None:
