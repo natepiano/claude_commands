@@ -438,6 +438,21 @@ class UnitRenameTests(unittest.TestCase):
         self.assertNotIn("nightly-review", result.stderr)
         self.assertNotIn("names.json", result.stderr)
 
+    def test_the_live_lists_take_the_new_name_and_verify_passes(self) -> None:
+        # sdlc, 2026-10-21: verify called the showrunner's own `next` text unclassified after a rename.
+        self.write(self.root / "scratch/showrunner_state.json", json.dumps({
+            "units": [{"unit": "alpha-unit"}], "next": ["merge alpha-unit from demo-alpha", "keep the per-unit gate"],
+            "open_for_user": [{"text": "alpha-unit asks", "question": "Does alpha-unit ship?"}]}))
+        outstanding = self.state / "outstanding/demo.json"
+        self.write(outstanding, json.dumps([{"since": "2026-10-21T09:00", "text": "alpha-unit asks",
+                                             "question": "Does alpha-unit ship?"}]))
+        self.assert_ok(self.rename("apply"))
+        state = cast(dict[str, object], json.loads((self.root / "scratch/showrunner_state.json").read_text()))
+        self.assertEqual(state["next"], ["merge gamma-unit from demo-gamma", "keep the per-unit gate"])
+        self.assertEqual(state["open_for_user"], [{"text": "gamma-unit asks", "question": "Does gamma-unit ship?"}])
+        self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text()))[0]["text"], "gamma-unit asks")
+        self.assert_ok(self.rename("verify"))
+
     def test_mul_add_naming_keeps_the_underscore_id(self) -> None:
         self.assert_ok(self.rename("apply", "mul_add-unit", "fma"))
         self.assertIn(f"| fma-unit | docs/plans/mul-add.md | `{self.rust / 'claude-demo-fma'}` | demo-fma |",

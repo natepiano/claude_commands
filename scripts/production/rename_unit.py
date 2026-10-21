@@ -452,7 +452,10 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
-    _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch))
+    # Free text in the live lists names the branch and the worktree too.
+    paths = ((rename.old_branch, rename.new_branch), (rename.old_worktree, rename.new_worktree))
+    _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch), paths)
+    _ = rename_state.rename_outstanding(rename.slug, ((rename.old, rename.new), *paths))
     # The relaunched unit records its new pane at SessionStart; its old pane's entry would resume the old name.
     _ = pane_record.forget_unit(rename.old)
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),

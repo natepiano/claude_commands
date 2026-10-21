@@ -66,6 +66,10 @@ steps:
 6. **Merge rename.** The unit branch takes the rename commit.
 7. **State.** These move to the new id:
    - the six showrunner state files (`rename_state.SCRATCH_FILES`) in `showrunners.session_state_dir(<slug>)`, or in the `--scratch` directory when one is given;
+   - the free text of the live lists in `showrunner_state.json`, `next` and `open_for_user` (text and question),
+     and the same items in OUTSTANDING (`outstanding/<slug>.json`): the old id, branch and worktree each take
+     the new one as a whole token, so `per-unit` stays. OUTSTANDING then holds the same texts, so the next
+     `questions` run finds each item stored and asks no new review (sdlc, 2026-10-21);
    - the stall-watch stretch;
    - the reviewer leases and memory;
    - the newest run record and the recorder state;
