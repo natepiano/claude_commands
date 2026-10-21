@@ -20,9 +20,12 @@ A phase is open while its directory holds a state file; the checkpoint deletes i
 open phase every edited path is that phase's. With several, a path is the phase's whose `files`
 list covers it: one repository-relative path per line, a trailing `/` covering the tree below.
 
-Only `enrolled_awaiting_first_touch` is ever replaced. Every other state is left as it is:
-`Active` already names its reservation, and the checkpoint's own states belong to
-<CheckpointCommit/>.
+`enrolled_awaiting_first_touch` turns `Active`, and an `Active` record follows a new
+reservation of its own phase: once cargo-berth releases the recorded one, as a shrink's
+checkpoint does, the phase's next edit acquires another, and drift must name that one
+(cargo-liner, 2026-10-21). `record-active` on an `Active` record reads the recorded reservation
+on berth's board, and a released one takes the phase's live reservation. Every other state is
+left as it is: the checkpoint's own states belong to <CheckpointCommit/>.
 """
 from __future__ import annotations
 
@@ -279,11 +282,26 @@ def refusal_reason(phases: list[OpenPhase], refused: list[str]) -> str:
             + f"add each path to exactly one {PHASES_DIR}/<phase>/{FILES_FILE}.")
 
 
+def _recorded(state: dict[str, object]) -> str:
+    """The reservation an `Active` record names; empty for every other state."""
+    held = _object(state.get("active_phase_reservation"))
+    return _string(held.get("reservation_id")) if _string(state.get("kind")) == ACTIVE else ""
+
+
 def record_active(phase_dir: Path, acquisition: Acquisition) -> bool:
-    """Replace `enrolled_awaiting_first_touch` with `Active` for its phase; True when written."""
+    """Write `Active` for the phase from its own reservation; True when written.
+
+    `enrolled_awaiting_first_touch` turns `Active`, and an `Active` record that names another
+    reservation takes this one: a phase holds one live reservation at a time."""
     state = _read_state(phase_dir)
-    phase = _string(state.get("phase"))
-    if _string(state.get("kind")) != AWAITING_FIRST_TOUCH or not phase:
+    kind = _string(state.get("kind"))
+    if kind == AWAITING_FIRST_TOUCH:
+        phase = _string(state.get("phase"))
+    elif kind == ACTIVE and _recorded(state) != acquisition.reservation_id:
+        phase = _string(_object(state.get("active_phase_reservation")).get("phase"))
+    else:
+        phase = ""
+    if not phase:
         return False
     active = {"kind": ACTIVE, "active_phase_reservation": {
         "reservation_id": acquisition.reservation_id,
@@ -301,6 +319,19 @@ def record_active(phase_dir: Path, acquisition: Acquisition) -> bool:
         if os.path.exists(temporary):
             os.unlink(temporary)
     return True
+
+
+def lifecycle(root: Path, reservation_id: str) -> str:
+    """The reservation's lifecycle status on berth's live board, such as `active`; empty when the
+    board cannot be read."""
+    try:
+        result = subprocess.run(["cargo-berth", "board", "--reservation", reservation_id, "--json"], cwd=root,
+                                capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
+                                timeout=CHECK_TIMEOUT_SECONDS)
+        envelope = _object(cast(object, json.loads(result.stdout)))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return ""
+    return _string(_object(_object(_object(envelope.get("payload")).get("data")).get("lifecycle")).get("status"))
 
 
 def changed_since_baseline(root: Path, baseline: str) -> list[str]:
@@ -321,17 +352,28 @@ def _record_active_command(args: argparse.Namespace) -> int:
     directory = phase_directory(session_dir, cast(str, args.phase))
     phase = next((open_phase for open_phase in phases if open_phase.directory == directory), None)
     state = _read_state(phase.directory) if phase is not None else {}
-    if phase is None or _string(state.get("kind")) != AWAITING_FIRST_TOUCH:
+    recorded = _recorded(state)
+    if phase is None or (_string(state.get("kind")) != AWAITING_FIRST_TOUCH and not recorded):
         print(f"phase reservation: {_string(state.get('kind')) or 'no state'}; nothing to record")
         return 0
     root = repository_root(Path(cast(str, args.repo)))
+    status = lifecycle(root, recorded) if recorded and root is not None else ""
+    if recorded and status in ("active", ""):
+        # A board that cannot be read leaves the record to drift, which names the failure.
+        print(f"phase reservation: Active, reservation {recorded} is {status or 'unread'} on the board")
+        return 0
     baseline_file = phase.directory / BASELINE_FILE
     baseline = baseline_file.read_text(encoding="utf-8").strip() if baseline_file.is_file() else ""
     if root is None or not baseline:
         raise SystemExit("phase reservation: no repository or no phase baseline to compare against")
     # Paths a sibling phase owns, or no phase owns, are that phase's or the director's to answer.
     scopes = attribute(phases, changed_since_baseline(root, baseline)).by_phase.get(phase, [])
+    stale = f"reservation {recorded} is {status} on the board"
     if not scopes:
+        if recorded:
+            print(f"phase reservation: {stale}, and nothing of this phase changed since its baseline",
+                  file=sys.stderr)
+            return 1
         print("phase reservation: nothing of this phase changed since its baseline; still awaiting first touch")
         return 0
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -340,11 +382,15 @@ def _record_active_command(args: argparse.Namespace) -> int:
         print(f"phase reservation: cargo-berth check answered {answer.status}: {answer.message}", file=sys.stderr)
         return 1
     acquisition = own_acquisition(answer, root, phases, session_id)
-    if acquisition is None:
+    if acquisition is None or acquisition.reservation_id == recorded:
+        if recorded:
+            print(f"phase reservation: {stale}, and no live reservation of this phase replaces it", file=sys.stderr)
+            return 1
         print("phase reservation: a sibling phase's reservation holds every changed path; still awaiting first touch")
         return 0
     _ = record_active(phase.directory, acquisition)
-    print(f"phase reservation: Active, reservation {acquisition.reservation_id}")
+    print(f"phase reservation: Active, reservation {acquisition.reservation_id}"
+          + (f"; {stale}" if recorded else ""))
     return 0
 
 

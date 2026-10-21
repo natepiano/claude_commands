@@ -768,7 +768,7 @@ on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
 
 These are
