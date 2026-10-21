@@ -87,7 +87,7 @@ case "${AGENT_FAMILY}" in
       --log-file "${LOG_FILE}" \
       --model "${AGENT_MODEL}" \
       --effort "${AGENT_EFFORT}" \
-      --service-tier "${AGENT_SERVICE_TIER:-}"; then
+      --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}"; then
       echo "ended" > "${STATUS_FILE}"
     else
       EXIT_CODE=$?
