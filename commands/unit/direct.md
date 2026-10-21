@@ -51,6 +51,27 @@ overwrite. A holder passes both `--run-directory` and `--phase` to each phase
 to their worker, and relay its guild report unchanged.
 </Guild>
 
+<GuildHeadStanding>
+A plan headed `> **Standing:** guild-head` uses its event/daily loop instead
+of ticket dispatch. This branch takes precedence at startup, restart,
+compaction, phase selection in <NextPhase/>, and entry to <StandingPlanRefill/>.
+Read the plan and its production row, then process a member report or user
+feedback: check the cited evidence, publish an owned tip with
+`tips.py publish --head <guild> --from <folder>`, and reply with the tip path
+and pushed commit or a reason to decline. At a daily check-in, read only the
+uncovered interval on natedev and once on the Mac as the plan directs; record
+host coverage, and read turns only for flagged rows. Duplicate check-ins do
+no second read; cover a downtime gap once and state its length.
+
+Run no `style_plan.py` refill, ticket dispatch, phase, worker, checkpoint,
+shrink, FinalGate or RunSummary for this loop. The head writes its tips
+directly under the publish contract and routes process proposals through
+guilds to sdlc for guild-process-unit. Keep the session for its next report
+or timer. It remains a units guild member under <Guild/>; this section changes
+no other standing plan. An idle head ends each turn with
+`— holding: waiting on the next guild report or daily check-in`.
+</GuildHeadStanding>
+
 At startup or restart, a header `**Standing:** style_plan.py` runs
 <StandingPlanRefill/> before choosing a phase; repeat after compaction.
 
