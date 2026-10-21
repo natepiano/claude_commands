@@ -2,11 +2,11 @@
 """Set a hanadocs issue's proposal fields: approve, start, close or stars.
 
 Each verb edits one issue file's frontmatter in place and reads nothing else, but number and create
-read the folder for the highest P number, and move-approved reads the folder and edits each open
-approved proposal in it. Every verb also sets
+read the folder for the highest P number, move-approved edits each open approved proposal in it,
+and area-style sets the area on current and legacy style proposals. Every verb also sets
 date_modified to today in the user's zone, written "[[YYYY-MM-DD]]" as the vault writes dates.
 Each verb holds an exclusive lock on the issue for its whole read, change and write. The lock
-file is in the user's runtime folder, never in the issue folder.
+file is in the user's state folder, never in the issue folder.
 
 Usage:
   proposal_issue.py approve <issue> --showrunner S --unit U --plan P
@@ -18,6 +18,7 @@ Usage:
   proposal_issue.py mark-important <issue>
   proposal_issue.py number <issue>...
   proposal_issue.py move-approved <issues folder> [--dry-run]
+  proposal_issue.py area-style <issues folder> [--dry-run]
 
 `number` gives each proposal without one the next `proposal_id`, P1 up, as change rows are C1 up;
 `create` numbers a new decision the same way. `urgency` sets where the proposal goes among the ones
@@ -64,6 +65,7 @@ NUMBER_FIELD = "proposal_id"
 NUMBER = re.compile(r'^proposal_id:\s*"?P(\d+)"?\s*$', re.MULTILINE)
 # The vault keeps closed issues under archive/ beside the issues folder; their numbers stay taken.
 ARCHIVE = "archive"
+STYLE_AREA = "style"
 
 
 class Refusal(ValueError):
@@ -153,7 +155,7 @@ def set_list_fields(text: str, fields: dict[str, list[str]], path: Path) -> tupl
 @contextmanager
 def _issue_lock(path: Path) -> Generator[None]:
     """Hold an exclusive lock on the issue. The lock file is named from the issue's resolved path."""
-    folder = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    folder = Path.home() / ".local/state/proposal-issue/locks"
     folder.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:32]
     with (folder / f"proposal-issue-{digest}.lock").open("a") as lock:
@@ -426,6 +428,38 @@ def move_approved(folder: Path, today: date, *, dry_run: bool) -> Iterator[MoveO
             yield _move_one(issue.path, today, dry_run=dry_run)
 
 
+def area_style(folder: Path, today: date, *, dry_run: bool) -> Iterator[Path]:
+    """Set the style area on current and legacy style issues with no area or the unfiled area."""
+    if not folder.is_dir():
+        raise Refusal(f"{folder} is not a folder")
+    for path in sorted(folder.glob("*.md")):
+        if not path.is_file():
+            continue
+        with _issue_lock(path):
+            fields = frontmatter(path)
+            if not ({"style_rule", "style_rules"} & fields.keys()):
+                continue
+            text = _read(path)
+            lines = text.splitlines(keepends=True)
+            span = _key_span(lines, _closing_fence(lines, path), "area")
+            if span is not None and re.fullmatch(
+                r"area:\s*(?:\"\[\[unfiled\]\]\"|'\[\[unfiled\]\]'|\[\[unfiled\]\])\s*",
+                lines[span[0]],
+            ) is None:
+                continue
+            if span is None:
+                text, _ = set_fields(text, {"area": f"[[{STYLE_AREA}]]"}, path)
+            else:
+                start = span[0]
+                newline = lines[start][len(lines[start].rstrip("\r\n")):] or "\n"
+                lines[start] = _value_line("area", f"[[{STYLE_AREA}]]")[:-1] + newline
+                text = "".join(lines)
+            text, _ = set_fields(text, {"date_modified": _vault_date(today)}, path)
+            if not dry_run:
+                _write(path, text)
+        yield path
+
+
 def _generated_span(text: str, path: Path) -> tuple[int, int]:
     start, end = text.find(GENERATED_START), text.find(GENERATED_END)
     if start < 0 or end < start:
@@ -512,7 +546,7 @@ def _create_numbered(path: Path, template: Path, project: str, short: str, propo
     """Write the new decision once, with the next free P number."""
     text = template.expanduser().read_text(encoding="utf-8")
     values = {
-        "AREA": "unfiled", "PROJECT": project, "SHORT": short, "PROPOSED_BY": proposed_by,
+        "AREA": STYLE_AREA, "PROJECT": project, "SHORT": short, "PROPOSED_BY": proposed_by,
         "DATE": today.isoformat(), "CATEGORY": "refactor", "DEPENDS_ON": "[]",
     }
     text = re.sub(r"\{\{([A-Z_]+)\}\}", lambda match: values.get(match[1], ""), text)
@@ -532,7 +566,12 @@ def _create_numbered(path: Path, template: Path, project: str, short: str, propo
         try:
             _ = stream.write(text)
             stream.flush()
-            os.link(temporary, path)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if _decision_path_state(path, keys) is DecisionPathState.ALREADY_FILED:
+                    return False
+                raise
         finally:
             temporary.unlink(missing_ok=True)
     return True
@@ -598,6 +637,9 @@ def main(argv: list[str]) -> int:
     moving = verbs.add_parser("move-approved", help="move each open approved proposal at backlog to stage active")
     _ = moving.add_argument("folder", type=Path)
     _ = moving.add_argument("--dry-run", action="store_true", help="print the moves and write nothing")
+    styling = verbs.add_parser("area-style", help="set the area on unfiled current and legacy style issues")
+    _ = styling.add_argument("folder", type=Path)
+    _ = styling.add_argument("--dry-run", action="store_true", help="print the changes and write nothing")
     answer = verbs.add_parser("decline-answer", help="store a decision's declined answer")
     _ = answer.add_argument("--words", required=True)
     linking = verbs.add_parser("rules", help="set the rule links")
@@ -626,6 +668,14 @@ def main(argv: list[str]) -> int:
         return 0
     if verb == "move-approved":
         return _main_move_approved(cast(Path, args.folder).expanduser(), today, dry_run=cast(bool, args.dry_run))
+    if verb == "area-style":
+        try:
+            for changed_path in area_style(cast(Path, args.folder).expanduser(), today, dry_run=cast(bool, args.dry_run)):
+                print(f"area-style {changed_path.name}: area [[{STYLE_AREA}]]", flush=True)
+        except (ValueError, OSError, UnicodeError) as error:
+            print(f"proposal_issue: {error}", file=sys.stderr)
+            return 2
+        return 0
     # A plan's Issues line writes `~/rust/hanadocs/issues/<name>.md`, quoted since names hold spaces.
     path = cast(Path, args.issue).expanduser()
     try:

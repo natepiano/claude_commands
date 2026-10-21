@@ -1704,9 +1704,10 @@ def codex_destination_uses_credits(chosen: PickedAccount, now: datetime) -> bool
     """A destination needs paid credits when either included window cannot serve work."""
     for reason in chosen.reasons:
         if reason.label == chosen.label:
-            return not all(isinstance(window, ReadingWindow) and window.left > 0
-                           and isinstance(window.reset, KnownReset) and window.reset.at > now
-                           for window in (reason.weekly, reason.five_hour))
+            if not isinstance(reason.weekly, ReadingWindow):
+                return True
+            return not _codex_reading_can_work(
+                FreshReading(reason.weekly, reason.five_hour, "0"), now, agent_accounts.CreditsOff())
     return chosen.weekly_left <= 0
 
 
@@ -3342,7 +3343,9 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
 
 
 def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
-                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> WorkersSwapOutcome:
+                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
+                  included_only: bool = False) -> WorkersSwapOutcome:
+    """Check the live allowance before changing the workers account."""
     refuse_default(label)
     try:
         workers_home = _workers_home()
@@ -3361,9 +3364,11 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
     if (not report.email or report.email.casefold() != target.login.casefold()
             or _codex_home_login(target_home).casefold() != target.login.casefold()):
         raise AccountsError(f"accounts: cannot read {account_label} ({_codex_folder(target_home)}); check its sign-in and try again")
-    credits = agent_accounts.codex_credits_setting(account_label)
+    credits = agent_accounts.CreditsOff() if included_only else agent_accounts.codex_credits_setting(account_label)
     readiness = agent_accounts.codex_can_work(report, datetime.now(timezone.utc), credits)
     if isinstance(readiness, agent_accounts.CodexWorkExhausted):
+        if included_only:
+            raise AccountsError(f"accounts: {account_label} ({_codex_folder(target_home)}) has no included usage left; choose another account or wait for reset")
         reason = "and set not to use credits" if isinstance(credits, agent_accounts.CreditsOff) else "with no credits"
         raise AccountsError(f"accounts: {account_label} ({_codex_folder(target_home)}) is used up {reason}; choose another account or wait for reset")
     if isinstance(readiness, agent_accounts.CodexWorkUnknown):
@@ -3385,11 +3390,12 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
 
 
 def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
-         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> SwapOutcome | WorkersSwapOutcome:
-    """Select the new unit account only after every old-account session can move."""
+         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
+         included_only: bool = False) -> SwapOutcome | WorkersSwapOutcome:
+    """Move workers; included_only requires room without paid credits at the live check."""
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause, included_only=included_only)
     raise AccountsError(UNIT_ROLE_GONE)
 
 

@@ -885,6 +885,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(add_unit.host_session_name(hana), "hana-review")
         named = dataclasses.replace(request, identity=add_unit.UnitIdentity("review-unit", "build-followups-review"))
         self.assertEqual(add_unit.host_session_name(named), "build-followups-review")
+        style = dataclasses.replace(request, production=production._replace(slug="cargo-liner-style"),
+                                    identity=add_unit.UnitIdentity("cargo-liner-style-names-unit", "cargo-liner-style-names"))
+        self.assertEqual(add_unit.host_session_name(style), "cargo-liner-style-names")
         restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "build-followups-review")
         self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)),
                          "build-followups-review")

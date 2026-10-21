@@ -2209,3 +2209,36 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Subagents inside a Claude session always use that session's account; a route cannot move them.
 - One pool review and two closure reviews found 8 issues (delegate launches ignored the route, the Mac could not see it, friends took it, a failed read-back undid it, lost state kept it, a rollback error escaped, a doc example used a wrong CLI name). Each fix has a test.
 - `test_codex_mesh` `test_follow_cli_accepts_each_new_flag_independently` failed once under gate load and passed 3 of 3 alone.
+
+### Phase 82 — Every worker turn takes its speed from /agent  · status: done
+
+#### As-built
+
+- Every `turn/start` on a worker thread sends `serviceTier`, read at that turn from the `/agent` registry (`agents.conf`) for the worker's task: a follow, a build-result wake-up, a held result, a continuation or an account-move resume (`codex_mesh._turn_service_tier`). The task's row beats its function; `pace` takes the pacer's current choice. An empty registry tier sends `default`. The Codex config tier (`~/.codex/config.toml`) never reaches a worker turn, so a `/fast` typed in a Codex window no longer changes the workers (it put every worker on fast for 14 hours on 10-20).
+- The rules live once, in `agents_config.sh` (`agents_turn_service_tier`, which reuses `_agents_resolve_service_tier`); `codex_mesh` calls it through bash on each turn with `AGENTS_CONFIG_TIER_ONLY=1`, which skips the catalog sync. A resolver error goes to the seat log and the turn sends `default`.
+- `implement.sh`, `review.sh` and `launch_friend.sh` pass `--task <function.subtask>` to `codex_mesh` start and follow (prime takes it too); the roster entry keeps it. `--service-tier` now applies only at thread start. An old entry with no task uses the `delegate` function tier until its next follow records one.
+
+**Files:**
+- `scripts/agents/codex_mesh.py`, `scripts/agents/agents_config.sh` — the per-turn tier and the task record.
+- `scripts/direct/implement.sh`, `scripts/direct/review.sh`, `scripts/ask_a_friend/launch_friend.sh` — pass `--task`.
+- `scripts/agents/test_codex_mesh.py`, `scripts/agents/test_agents_config.sh`, `scripts/agents/test_launcher_tasks.sh`, `scripts/direct/test_implement_launcher.py`, `scripts/direct/test_review_launcher.py` — tests.
+
+**Gotchas:**
+- A thread resumed on a server started before a config change keeps that server's tier until its next turn; from this phase on, the next turn corrects it.
+- Two closure rounds: automatic turns first reused the launch tier from `stream.args`, and a task found by log file name missed review and friend threads.
+
+### Phase 83 — Workers move to a Codex account with room before paid credits  · status: done
+
+#### As-built
+
+- A refusal clears on a fresh reading taken after it that shows usage left in a new window: reset unknown, earlier or later than the refused reset. A reading with the same reset (rounding, lag) keeps it (`refusals.resolved`).
+- A weekly window with usage left and no reset is room (`codex_can_work`, `codex_destination_uses_credits`).
+- At 0% with credits on, workers move silently to a Codex account with included usage left (`_zero_open_notice`, `accounts.swap(..., included_only=True)` checks the live reading too). Each pass of an open episode looks again, with the current use_credits setting. Queued moves and open Claude fallbacks keep control. An account with only paid credits is never a credits-on destination, so two exhausted accounts never swap.
+- With no account with included room, workers spend credits and the user gets `quota.paid_credits` once (`send.py --text-id quota.paid_credits --from quota_alert --value sender/account/machine/credits/refill/next_reset`). The old ids `quota.codex_on_credits(_last)` remain only as a fallback.
+- The user's rule (2026-10-21) replaces design C37.
+
+**Files:**
+- `scripts/accounts/refusals.py`, `scripts/accounts/accounts.py`, `scripts/whoami/agent_accounts.py`, `scripts/whoami/quota_alert.py`; their tests; `docs/accounts.md`, `docs/quota_alerts.md`.
+
+**Gotchas:**
+- Pool review and three closure rounds: a swap loop between two 0% accounts, room that appeared later, credits turned on during a queued wait, a paid-only live reading at swap time, and the template's `sender` value.

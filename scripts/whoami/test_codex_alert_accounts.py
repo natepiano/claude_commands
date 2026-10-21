@@ -87,6 +87,21 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.sent.append(push.body)
         return quota_alert.PushSent()
 
+    def test_fresh_room_after_a_weekly_refusal_is_picked_without_a_later_reset(self) -> None:
+        target, source = self.account(1), self.account(2)
+        refused_at = self.now - timedelta(days=1)
+        refusals.write_refusal(refusals.AccountRefusal("codex", target.login,
+            refusals.KnownWindow("weekly"), refusals.KnownReset(self.now + timedelta(days=3)), refused_at))
+        for reset in (None, self.now + timedelta(hours=1)):
+            with self.subTest(reset=reset):
+                report = self.report(target, 100)
+                report.quotas = [Quota("Weekly", 0, reset)]
+                usage_store.save([report], self.now)
+                chosen = accounts.pick("codex", self.now, exclude=frozenset({source.label}))
+                assert isinstance(chosen, accounts.PickedAccount)
+                self.assertEqual(chosen.label, target.label)
+                self.assertFalse(accounts.codex_destination_uses_credits(chosen, self.now))
+
     def test_next_move_reminder_uses_the_real_default_destination_and_credits_permission(self) -> None:
         source, target, later = self.account(1), self.account(2), self.account(3)
         # The low account's stored allowance must never make it its own fallback.
@@ -115,7 +130,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                         self.assertLessEqual(len(rendered.title), 45)
                         self.assertLess(len(rendered.body), 500)
                         self.assertLess(len(rendered.message), 500)
-                        if credits == "on":
+                        if credits == "on" and fallback == "Claude":
                             title = "codex1 Codex workers will use paid credits"
                             body = (f"codex1 has {left}% of its weekly usage left, and no move is set up for its workers. "
                                     + f"When it runs out, they spend its paid credits, then move to {fallback}. Nothing is needed.")
@@ -984,7 +999,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                                  refusals.UnknownWindow())
                 self.assertEqual(agent_accounts.workers_home(), target.home)
 
-    def test_no_room_falls_back_and_positive_allowance_cannot_restore_unresolved_refusal(self) -> None:
+    def test_no_room_fallback_waits_for_a_changed_reset_before_using_positive_usage(self) -> None:
         old, target = self.account(1), self.account(2)
         self.save_room(old, 0)
         self.save_room(target, 0)
@@ -1010,17 +1025,41 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["no room", "room again"])
 
-    def test_low_reading_never_moves_workers_or_writes_a_move_transition(self) -> None:
+    def test_zero_reading_moves_workers_to_room_before_spending_credits(self) -> None:
         old, target = self.account(1), self.account(2)
         self.save_room(old, 0)
         self.save_room(target, 1)
         readings = self.readings(old, self.report(old, 0), self.report(target, 1))
         with patch.object(accounts, "swap", wraps=accounts.swap) as swap:
             _ = quota_alert.alert([self.note(1, "active", 0)], self.now, codex_readings=readings)
-        swap.assert_not_called()
-        self.assertEqual(agent_accounts.workers_home(), old.home)
+        swap.assert_called_once()
+        self.assertEqual(agent_accounts.workers_home(), target.home)
         self.assertIn("delegate=codex", quota_alert.REGISTRY.read_text())
-        self.assertEqual(moves.read_moves(), [])
+        self.assertTrue(any(entry["kind"] == "requested" for entry in moves.read_moves()))
+        self.assertEqual(self.pushes, [])
+
+    def test_live_paid_only_destination_keeps_workers_on_source_credits_and_alerts_once(self) -> None:
+        source, target = self.account(1), self.account(2)
+        for number in (1, 2):
+            note = self.note(number, "active" if number == 1 else "inactive", 0, "6370")
+            _ = note.path.write_text(note.path.read_text().replace("credit_balance:",
+                "use_credits: on\ncredit_balance:"))
+        readings = self.readings(source, self.report(source, 0, "6370"), self.report(target, 1, "6370"))
+        with (patch.object(accounts, "_codex_live", return_value=self.report(target, 0, "6370")) as live,
+              patch.object(accounts, "_retire_workers_servers") as retire):
+            for minute in (0, 2):
+                _ = quota_alert.alert([], self.now + timedelta(minutes=minute), codex_readings=readings)
+            self.assertGreater(live.call_count, 0)
+            retire.assert_not_called()
+        self.assertEqual(agent_accounts.workers_home(), source.home)
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn(self.pushes[0].id, ("quota.codex_on_credits_last", "quota.paid_credits"))
+        self.assertEqual(self.pushes[0].values["account"], source.label)
+        failures = [entry for entry in moves.read_moves() if entry["kind"] == "failed"]
+        self.assertTrue(failures)
+        self.assertTrue(all("no included usage left" in entry["reason"] for entry in failures))
+        with quota_alert.state_file() as state:
+            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
 
     def test_failed_workers_swap_records_failure_with_request_id_and_never_confirms(self) -> None:
         old, target = self.account(1), self.account(2)
@@ -1309,7 +1348,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             return self.report(a if home == a.home else b, 1 if home == a.home else 80)
         with patch.object(quota_alert, "codex_live", side_effect=live):
             _ = quota_alert.alert([note])
-            self.assertEqual([push.title for push in self.pushes], ["codex1 Codex workers will use paid credits"])
+            self.assertEqual([push.title for push in self.pushes], ["codex1 Codex workers will move to codex2"])
             self.assertEqual(self.relayed, [])
             quota_alert.STATE.unlink(missing_ok=True)
             self.sent.clear()

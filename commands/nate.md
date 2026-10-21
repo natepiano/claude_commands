@@ -1,12 +1,33 @@
 ---
-description: Send the user a targeted update from a named template, now or after a delay; the agent fills in the details. `silence` keeps pushes until it ends.
-argument-hint: "adhoc|silence [delay] <instructions>"
+description: Send the user a targeted update from a named template, now or after a delay; the agent fills in the details. `silence` keeps pushes until it ends; `show` prints a phone push template.
+argument-hint: "adhoc|silence [delay] <instructions> | show <template>"
 ---
 
 # Nate
 
-**Usage:** `/nate <template> [delay] <instructions>`. Templates: `adhoc`, `silence` (instructions optional).
-Any other template, or `adhoc` with no instructions: print the usage line and stop.
+**Usage:** `/nate <template> [delay] <instructions>`. Templates: `adhoc`, `silence` (instructions optional), `show`.
+
+## help
+
+A bare `/nate`, `help`, `usage`, any other template, or `adhoc` with no instructions: print this text, then
+the output of `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/review.py" list` as is, all in one
+text block, and stop:
+
+```text
+Usage: /nate <template> [delay] <instructions>
+adhoc            Send you an update that the agent writes from your instructions.
+silence          Keep pushes until silence ends. Blocked pushes still go through.
+show <template>  Show a push template with its placeholders and one example.
+
+Phone push templates:
+```
+
+## show
+
+`/nate show <id>`: run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/notify/review.py" show <id>`
+and print its output as is, in a text block. An unknown id prints a short message and the list.
+
+## delay
 
 A delay comes after the template name, in the user's plain words: `in ten minutes`, `in an hour`,
 `at 3pm`, `tomorrow at 9`. No delay: now. Delayed commands go through

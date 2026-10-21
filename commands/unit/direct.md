@@ -204,7 +204,9 @@ The closed list:
   question being asked.
 - **blocked** — a hard stop this command defines: a structural check that blocks
   checkpoint, a refused tool call, a launch failure that survived
-  <DelegateLaunchFailure/>'s retry.
+  <DelegateLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
+  refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (`send.py --help`),
+  and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
 - **done** — <RunSummary/> has been emitted.
 
 Nothing else authorizes a turn end, however complete it feels:
@@ -1481,10 +1483,11 @@ overtake an unconfirmed release. An unsuccessful recovery stops refill.
 Then run:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <unit-worktree>
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/<Plan cell> --repo <unit-worktree>
 ```
 
-Use the unit worktree's own plan: `add_unit.py` copies the showrunner template
+Read the Plan cell from the unit's Units row, relative to its worktree; a rename
+keeps that path. `add_unit.py` copies the showrunner template
 only at first launch. Exit 0 continues with the todo phase; a todo repair
 always runs first. The ledger resumes assigned work, rebuilds a missing phase,
 recovers interrupted assignment, and discards merged or dropped ticket phases;

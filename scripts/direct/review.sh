@@ -745,14 +745,14 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
     --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
     --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
-    --service-tier "${AGENT_SERVICE_TIER:-}" &
+    --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 elif [[ -n "${NEW_SLOT}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
     --session-dir "${SESSION_DIR}" --name "${REVIEW_WORKER}" --role review "${LENS_ARGS[@]}" \
     --cwd "${WORKING_DIR}" --prompt-file "${PROMPT_FILE}" \
     --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" --model "${AGENT_MODEL}" \
-    --effort "${AGENT_EFFORT:-}" --service-tier "${AGENT_SERVICE_TIER:-}" &
+    --effort "${AGENT_EFFORT:-}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
     "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
