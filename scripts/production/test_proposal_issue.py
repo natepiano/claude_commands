@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from collections.abc import Generator
 from datetime import date, datetime
 from pathlib import Path
 from typing import final, override
@@ -155,6 +156,74 @@ class ProposalIssueTests(unittest.TestCase):
                                       "abc", "--count", "1", "--body-file", str(body), "--template", str(template))
         self.assertEqual((code, out), (0, "create decision.md: created\n"), err)
         self.assertIn('proposal_id: "P1"\n', issue.read_text())
+
+    def test_create_keeps_a_same_key_decision_that_appears_before_the_folder_lock(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\r\nstyle_rule: "global:rust/names.md"\r\nstyle_crate: "alpha"\r\n'
+                    b'style_rule_blob: "abc"\r\nproposal_id: "P47"\r\nstyle_count: "9"\r\n'
+                    b'unit: "names-unit"\r\nplan: "unit.md"\r\n---\r\nUser notes.\r\n')
+
+        @contextlib.contextmanager
+        def competing_create(folder: Path) -> Generator[None]:
+            self.assertEqual(folder, self.root)
+            _ = issue.write_bytes(original)
+            stamp = issue.stat().st_mtime_ns
+            yield
+            self.assertEqual(issue.stat().st_mtime_ns, stamp)
+
+        with mock.patch.object(proposal_issue, "_folder_lock", side_effect=competing_create):
+            self.assertFalse(proposal_issue.create(
+                issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                "# New examples\n", template, date(2026, 10, 20), initial_fields={}))
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
+        self.assertEqual({path.name for path in self.root.iterdir()},
+                         {"a proposal.md", "template.yaml", "decision.md"})
+
+    def test_create_refuses_a_different_key_decision_that_appears_before_the_folder_lock(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        issue = self.root / "decision.md"
+        original = (b'---\nstyle_rule: "global:rust/names.md"\nstyle_crate: "alpha"\n'
+                    b'style_rule_blob: "other-blob"\nproposal_id: "P47"\n---\nOther decision.\n')
+
+        @contextlib.contextmanager
+        def competing_create(folder: Path) -> Generator[None]:
+            self.assertEqual(folder, self.root)
+            _ = issue.write_bytes(original)
+            stamp = issue.stat().st_mtime_ns
+            try:
+                yield
+            finally:
+                self.assertEqual(issue.stat().st_mtime_ns, stamp)
+
+        with mock.patch.object(proposal_issue, "_folder_lock", side_effect=competing_create):
+            with self.assertRaises(proposal_issue.Refusal) as refusal:
+                _ = proposal_issue.create(
+                    issue, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+                    "# New examples\n", template, date(2026, 10, 20), initial_fields={})
+        self.assertEqual(str(refusal.exception), f"{issue}: different decision key")
+        self.assertEqual(issue.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
+
+    def test_create_gives_two_different_decisions_distinct_proposal_numbers(self) -> None:
+        template = self.root / "template.yaml"
+        _ = template.write_text("---\nstatus: open\n---\n")
+        first, second = self.root / "alpha.md", self.root / "beta.md"
+        self.assertTrue(proposal_issue.create(
+            first, "alpha", "a", "style", ["style"], "global:rust/names.md", "alpha", "abc", 1,
+            "# Alpha examples\n", template, date(2026, 10, 20), initial_fields={}))
+        original = first.read_bytes()
+        self.assertTrue(proposal_issue.create(
+            second, "alpha", "a", "style", ["style"], "global:rust/names.md", "beta", "abc", 1,
+            "# Beta examples\n", template, date(2026, 10, 20), initial_fields={}))
+        from issues import frontmatter
+        self.assertEqual((frontmatter(first)["proposal_id"], frontmatter(second)["proposal_id"]),
+                         (["P1"], ["P2"]))
+        self.assertEqual(first.read_bytes(), original)
+        self.assertEqual(list(self.root.glob(".decision-*")), [])
 
     def test_create_with_rules_preserves_existing_decision_and_answer(self) -> None:
         template = self.root / "template.yaml"

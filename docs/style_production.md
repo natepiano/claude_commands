@@ -482,11 +482,40 @@ the finding stays as it is for a person to waive or fix in the code. No file:
   impl items of a type declared there; `crate::` names the crate root. A rename
   qualified by a type names only the impl or trait items of that type under any
   of its names, and a `Self` path names the type of its own impl or trait. A
-  trait path does not reach the items of the trait's impls, and a `self::` or
-  `super::` path names no item. Two or more gaining files, or a filed finding's
+  trait path also names direct members of its readable trait impls. The member
+  keeps its implementing type, including that type's approved new name. The
+  destination must implement the same trait with the same generic arguments.
+  Equal paths with equal arguments name the same trait. A bare name can match
+  a qualified path through one declared trait or a plain file import, including
+  an `as` alias. A block import or glob affects only impls inside that block.
+  Conditional file imports, file globs, and re-exports block proofs for names they can bind.
+  File-level `self::` and `super::` paths resolve through plain file-level `mod` declarations.
+  Only `src/lib.rs` and `src/main.rs` name the crate root.
+  Files under `src/bin`, custom target paths, conditional links, and `#[path]` modules grant no layout proof.
+  Relative paths inside blocks or above the crate root grant no proof.
+  The module path must match the trait's declared module. Built renames must name that
+  trait at their own sites. A qualified path on the cited line uses that path's scope.
+  A member declaration without that path uses its owning trait or impl header's scope.
+  An uncertain trait identity keeps the finding
+  unchanged. Ambiguous members grant no follow. Two or more gaining files, or a filed finding's
   file in another crate, leave the finding as a move does. A finding whose own
   rename names its item keeps the rule above; a filed rename whose impl type a
   built rename renamed is built at the renamed type.
+- An item renamed outside the ledger can follow without a built decision.
+  Its old name must be absent from every declaration in its crate, including test items.
+  An independent source diff must map the site to its renamed item in the same file.
+  Alternatively, exactly one changed file in that crate must gain one matching destination.
+  The original file counts when checking for competing destinations. An existing twin grants no proof.
+  The keyword, owner and proved trait identity must agree.
+  At least half the old body's non-blank lines must remain, in order, after replacing only the renamed identifier.
+  Body source includes internal comments. It excludes signatures, attributes and outer braces.
+  Empty or unreadable bodies grant no proof. Changed literals, calls and indentation do not count as equal lines.
+  A child follows only through its proved renamed owner and its own retained name and lexical scope.
+  A use of a local name does not prove a binding. Duplicate or unsupported bindings grant no proof.
+  An outside follow keeps the finding's id, request, state and decision. It never marks it built.
+  A refused outside search keeps the row, even when its source file is gone.
+  Its `left` line names the mapped declaration, sorted candidate sites, body counts and failed checks.
+  Earlier ambiguous-move, cross-crate, open-ticket and uncertain-trait refusals still apply.
 - Another filed finding whose file is still there stays filed for a person. A
   person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
   puts the item back in the code.

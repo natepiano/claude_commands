@@ -88,7 +88,8 @@ if name == "verify.sh":
 if (state / ("fail-" + name)).exists():
     raise SystemExit(1)
 if name == "basedpyright":
-    print("0 errors, 0 warnings, 0 notes")
+    print("0 errors, 0 warnings, 0 notes", flush=True)
+    print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
     raise SystemExit(3)
 '''
 
@@ -959,6 +960,22 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertNotIn("unblocks: G1", result.process.stdout)
         self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
 
+    def test_shrink_after_criss_cross_merge_scopes_only_its_doc(self) -> None:
+        code = self.checkpoint()
+        self.write(self.checkout, "src/beta.txt", "beta on the merge branch\n")
+        _ = self.git("commit", "-am", "beta lands first")
+        _ = self.git("push", "origin", "production")
+        _ = self.git("merge", "--no-ff", "-m", "merge production", "production", cwd=self.unit)
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        first = self.run_checkpoint(code)
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        shrink = self.checkpoint("docs/plans/alpha.md", "short as built\n", subject="shrink")
+        bases = self.git("merge-base", "--all", "production", shrink).splitlines()
+        self.assertEqual(len(bases), 2, bases)
+        result = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths are allowed", result.process.stdout)
+
     def test_promote_none_merges_and_records_without_promotion(self) -> None:
         self.promotions = "none"
         self.production_doc()
@@ -1615,6 +1632,50 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertFalse(history.has_code_merge("old-unit", "style hand-off"))
         self.assertEqual(history.last_handoff_for_child("old-unit"), history.entries[0])
         self.assertEqual(history.last_handoff_for_child("new-unit"), NoMerge())
+
+
+@final
+class TestPassedTests(unittest.TestCase):
+    VENV = "venv .venv subdirectory not found in venv path /checkout.\n"
+
+    def judge(self, status: int, stdout: str, stderr: str = "") -> bool:
+        result = subprocess.CompletedProcess(["basedpyright"], status, stdout, stderr)
+        return merge_checkpoint.test_passed(["/nix/bin/basedpyright", "scripts/buildlog"], result)
+
+    def test_clean_basedpyright_passes_with_trailing_venv_line_on_stderr(self) -> None:
+        self.assertTrue(self.judge(3, "0 errors, 0 warnings, 0 notes\n", self.VENV))
+
+    def test_basedpyright_with_errors_fails(self) -> None:
+        self.assertFalse(self.judge(1, "/checkout/a.py:1:1 - error: x\n2 errors, 0 warnings, 0 notes\n", self.VENV))
+        self.assertFalse(self.judge(3, "2 errors, 0 warnings, 0 notes\n", self.VENV))
+
+    def test_other_commands_pass_only_on_status_zero(self) -> None:
+        result = subprocess.CompletedProcess(["python3"], 3, "0 errors, 0 warnings, 0 notes\n", "")
+        self.assertFalse(merge_checkpoint.test_passed(["python3", "-m", "unittest"], result))
+        self.assertTrue(merge_checkpoint.test_passed(["python3"], subprocess.CompletedProcess(["python3"], 0, "", "")))
+
+
+@final
+class MacPromotionPathTests(unittest.TestCase):
+    def remote_command(self, promote_line: str) -> str:
+        promotion = merge_checkpoint.promotion_from_doc([f"- **Promote:** {promote_line}"])
+        assert isinstance(promotion, merge_checkpoint.PromoteTo)
+        assert isinstance(promotion.mac, merge_checkpoint.MacCheckout)
+        done = subprocess.CompletedProcess(["ssh"], 0, "rc=0\n", "")
+        with mock.patch("merge_checkpoint.subprocess.run", return_value=done) as run:
+            merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))
+        argv = cast(list[str], run.call_args.args[0])
+        self.assertEqual(argv[:2], ["ssh", "mac"])
+        return argv[2]
+
+    def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
+        remote = self.remote_command("mac `~/.claude`")
+        self.assertTrue(remote.startswith('cd "$HOME"/.claude && git pull'), remote)
+        self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
+
+    def test_absolute_mac_path_is_kept(self) -> None:
+        remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
+        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && git pull"), remote)
 
 
 if __name__ == "__main__":

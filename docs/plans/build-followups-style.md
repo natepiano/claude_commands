@@ -896,222 +896,164 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** ticket-wide original-judgment guards; timestamp comparisons against commit-valued `followed_at`; a verdict-column migration for withdrawal reasons already distinguished by decision presence.
 
-### Phase 33 — a trait-qualified rename follows to the trait's impl methods  · status: todo
+### Phase 33 — a trait-qualified rename follows to the trait's impl methods  · status: done
 
-**Depends on:** Phase 30, Phase 32. Run after Phase 32 to avoid concurrent ownership of `style_ledger.py` and its tests.
+#### As-built
 
-#### Work Order
-
-**Goal:** A finding on a method renamed by a built, approved `Trait::old` → `Trait::new` finding follows the corresponding method of each implementing type. It keeps its id and existing filed or unfiled state, and records its follow location.
-
-**Spec:**
-
-All references below are at HEAD `e7a45401`; use the named functions after intervening phases move their lines.
-
-1. **Read the implemented trait without replacing the implementing type.**
-
-   `scripts/style/declarations.py` currently represents both inherent and trait-implementation members as `ImplOrTraitItem(type_name)` (:25-31). `_impl_name` (:106-126) identifies a top-level `for`, but discards the preceding trait path; `read_declarations` (:170-202) consequently records no implemented-trait relationship.
-
-   Add immutable declaration metadata with explicit states:
-
-   - `ImplementedTrait(path: tuple[str, ...])`: the readable, nonempty trait path of the enclosing trait implementation.
-   - `NoImplementedTrait`: the item is not directly owned by a trait implementation.
-   - `UnreadableImplementedTrait`: an enclosing trait implementation exists, but its trait path cannot be read safely.
-
-   Store this metadata on `DeclaredItem` (:51-57), separately from `Declaration.owner`. Preserve `Declaration("fn", "method", ImplOrTraitItem("Type"))`, `declaration_line`, and existing output formats.
-
-   Factor the header splitting used by `_impl_name` so the same parse identifies the implementing type and implemented trait. Skip leading impl generic parameters; distinguish the trait/type separator from `for<'a>`; use `approved_renames.type_path` (:235-242) for readable paths. `approved_renames.impl_blocks` (:269-312) demonstrates this distinction, but is an applied-rename scan with additional constraints, not a replacement declaration reader.
-
-   Attach metadata only to directly owned members. A nested function inside a method must not inherit the implementation’s membership. Preserve current behavior for unreadable implementing types.
-
-2. **Match trait-qualified built renames to implementation members.**
-
-   Keep `_item_rename` (`style_ledger.py:689-717`) and the existing `RenameScope` forms. `Trait::old` remains `TypeQualified("Trait")`; the declaration reader supplies the relationship needed to interpret it.
-
-   Change `_built_renaming` (:2370-2432) to receive the original `DeclaredItem`, rather than only its `Declaration`; update its caller at :2315. In addition to the current owner-name match, permit a type-qualified member rename when its qualifier matches the member’s readable implemented trait.
-
-   Keep the destination owner as the implementing type, including any name Phase 30’s owner-rename chain gave that type. A `Trait::old` rename must not turn `ImplOrTraitItem("Type")` into `ImplOrTraitItem("Trait")`.
-
-   Preserve the existing approved-decision and same-crate filters, own-rename exclusion, chain traversal, fork stopping and cycle stopping. If an approved built rename also renamed the trait, follow its readable name history using the existing scope restrictions; do not infer a trait relationship from unrelated occurrences of its name.
-
-3. **Carry the relationship through declaration searches.**
-
-   `_declaration_outcome` currently tests in-place and moved declarations by keyword/name/owner (:2290-2304). `_gaining_files` (:2451-2472) uses that same identity and selects the first matching item. Merely adding a branch to `_built_renaming` would therefore be insufficient.
-
-   For trait-implementation members, use the recorded implemented trait when checking the old declaration and identifying a renamed destination. An inherent method or another trait’s method on the same type is not the same declaration.
-
-   Carry any renamed-trait requirement through `RenamedByBuilds`, `_followed_rename` (:2434-2449), and the relevant `_renamed_site` searches (:2327-2368). Represent unrestricted versus required trait membership with named variants, not `None`, an empty string, or a boolean.
-
-   Preserve own-file preference only among matching implementation members. Keep the existing gained-since-read check, changed-file restriction, crate checks and ambiguity handling; never resolve an ambiguous implementation match by taking the first item. Unsupported or ambiguous trait identification grants no new automatic follow.
-
-4. **Preserve collection, transitions and output.**
-
-   Keep built-rename collection in `_declaration_reading` (:2474-2492), including resolution of `SelfQualified` at the built finding’s read or follow commit. `Self::` in an inherent implementation must not become a rename across every implementation of a trait.
-
-   A dependent finding uses `DeclarationMoved` and remains filed or unfiled. A filed finding describing its own completed rename still uses `_renamed_site` and `DeclarationRenamed`, subject to its existing approval and applied checks.
-
-   Retain open-ticket protection, planning before `BEGIN IMMEDIATE`, rechecking decisions and rows under the lock, synced-tip refusal, caching and idempotence. No schema migration is needed.
-
-   Existing consumers observe the result through `follow` and `file`, using `follow_line` (`style_proposals.py:1331-1351` at HEAD), and through `held list` follow metadata. Preserve their exit-code and line contracts.
-
-5. **Document the changed limit.**
-
-   Replace the statement at `docs/style_production.md:478` that a trait path does not reach implementation items with the supported trait-qualified behavior and its conservative parsing limits. Retain the separate `self::`/`super::` limitation.
-
-   Phase 30’s successful-follow outcome already has an external surface and tests; this phase extends that outcome rather than adding another command. Unresolved paths remain subject to the existing declaration outcomes and person-facing recovery instructions.
+- `DeclaredItem.implemented_trait` separates `ImplementedTrait(path, arguments)`, `NoImplementedTrait` and `UnreadableImplementedTrait` from the declaration's owner. `_impl_header` skips impl generics and higher-ranked `for` bounds; trait arguments retain their token text, ignoring whitespace. Only direct impl members carry membership; nested functions do not inherit it. Existing declaration text and unreadable-type behavior stay intact.
+- `_built_renaming` extends approved built `Trait::old` → `Trait::new` renames to matching impl members. `RequiredTraitMembership` and `UnrestrictedTraitMembership` carry the destination requirement through in-place, moved and renamed searches. Each dependent finding uses `DeclarationMoved`, retains its id, filed or unfiled state and implementing type, and records its new path, line and follow commit. Implementing-type and trait rename chains remain separate; own-file preference applies only to matching members, and ambiguous members grant no follow.
+- `BuiltRename` stores `before_path` and `before_commit` beside its build `path` and `commit`. Trait qualifiers resolve at the built finding's own before site; the after name resolves at its build site. Existing same-crate authority, approval, own-rename exclusion, chain fork/cycle stopping, open-ticket protection, locked rechecks and idempotence remain. A filed finding's own approved, applied rename still uses `DeclarationRenamed`; no schema migration or new command is needed.
+- `TraitIdentity` distinguishes `SAME`, `DIFFERENT` and `UNCERTAIN`. `TraitIdentityUncertain(finding, declaration)` keeps the row unchanged and joins `DeclarationLeft`. `follow_line` prints `left <id> <rule> <path>:<line>: <declaration> trait identity uncertain`, including dry runs and filing; refill prints the same reason in its waiting line and makes no ticket for that finding. Tests cover parsing, independent impls, collisions, rename chains, uncertainty, output and persisted state.
 
 **Files:**
 
-- `scripts/style/declarations.py` — implemented-trait metadata and header reading.
-- `scripts/style/style_ledger.py` — trait-aware rename matching and declaration searches.
-- `scripts/style/test_declarations.py` — parser and ownership tests.
-- `scripts/style/test_style_ledger.py` — follow, isolation and transition tests.
-- `scripts/style/test_style_proposals.py` — observable dry-run and real-run behavior.
-- `docs/style_production.md` — replace the trait-path limitation.
+- `scripts/style/declarations.py` — direct-member trait metadata, generic arguments and impl-header parsing
+- `scripts/style/style_ledger.py` — trait identity, import resolution, before/build contexts and trait-aware declaration searches
+- `scripts/style/style_plan.py` — uncertainty waiting reason and exhaustive `DeclarationLeft` match
+- `scripts/style/style_proposals.py` — uncertainty left line
+- `scripts/style/test_declarations.py` — trait membership, arguments, header and nested-ownership cases
+- `scripts/style/test_style_ledger.py` — trait-follow transitions, identity isolation, aliases and bounded-cycle regression
+- `scripts/style/test_style_plan.py` — refill waits on uncertain trait identity
+- `scripts/style/test_style_proposals.py` — follow actions, preserved decisions, dry runs and uncertainty output
+- `docs/style_production.md` — supported trait-qualified follows and identity limits
 
-**Workers:** `1 writer + 1 tester`.
+**Binds later work:** An uncertain trait identity keeps the row: no follow and no withdrawal. After supported imports expand, equal paths with equal arguments prove identity; different final names or arguments prove difference. Otherwise, full rooted module paths must resolve to declared traits: different modules prove difference, while the same module proves equality only with one declaration of that trait name in the crate. Plain unconditional file imports, including `as` aliases, can prove paths; conditional or block imports, globs, re-exports and unresolved `self::`/`super::` paths block affected proofs. Built rename authority must prove the trait at its own site and commit. `style_plan`'s `DeclarationLeft` match is exhaustive through `assert_never`; every new left outcome needs a refill case.
 
-- `impl` — `declarations.py`, `style_ledger.py`, `docs/style_production.md`; hubs: `declarations.py` owns the metadata types, and `style_ledger.py` owns their matching semantics.
-- `test` — `test_declarations.py`, `test_style_ledger.py`, `test_style_proposals.py`, from the Spec. Keep all preceding phases’ tests.
+**Gotchas:**
 
-**Constraints from prior phases:**
+- Path spelling, a shared trait leaf name and omitted generic arguments cannot substitute for identity. Qualification-only edits must keep an existing method in place; `Trait<u8>` and `Trait<u16>` are distinct memberships.
+- Alias resolution precedes name comparison, and skipped imports block declaration fallback. A new left outcome also reaches refill. The old trait name belongs to the before commit, not the build commit. Uncertain rename authority holds a deleted item only when a plausible gained destination exists; an unrelated uncertain rename must not prevent ordinary deletion withdrawal.
+- An expanded alias retains every rooted module segment; equal final module names do not prove identity. Alias cycles are detected by visited `(file, binding)` pairs, with a 32-binding expansion limit returning `UnresolvedTraitPath`.
+- A child Python process does not inherit the parent's modified `sys.path`. The cycle regression passes `PYTHONPATH` from `sys.path` and uses a five-second subprocess timeout so it works under the test gate as well as direct unittest runs.
 
-- Phase 30’s `RenameScope`, `ItemRename`, `BuiltRename`, `RenamedByBuilds` and `NoBuiltRename` remain semantic states. Extend them only where the new relationship needs to travel.
-- Do not replace an implementation’s owner with its trait, or broadly change `Declaration` equality to achieve the new match.
-- Preserve Phase 31’s in-progress proposal changes and Phase 32’s withdrawal changes. Neither phase is redundant or invalidated by Phase 30.
-- Phase 32 (done, `d0a3f9ec`) renamed `SupersedingException` to `SupersedingJudgment` (it carries the verdict) and added `JudgedAgain`. `_superseded` withdraws an unfiled finding on any newer verdict at its current cell and a filed one only on an exception, and the judgment must be newer than the finding's `created_at`; for a followed finding (`followed_at` set; it holds a commit) it must also be newer than the row's `updated_at`. A follow that this phase adds writes `updated_at` in the same update, which keeps that bound correct; keep it.
-- `file` runs declaration following before withdrawal and batching. Refill runs declaration following only; preserve that ordering.
-- `style_ledger.py` must not import `style_proposals`.
-- No compiler, dependency resolution or general Rust name-resolution service is introduced. Unsupported aliases and ambiguous paths must not establish trait membership.
-- The next-items entries remain separate, unsatisfied work; none requires amendment because of Phase 30 or this phase.
+**Ruled out:** leaf-name-only trait matching; identity fallback past unsupported imports; comparing an old trait name only at its build commit; cycle detection by expanded path alone; general Rust name resolution. Retained limit: a relative trait path `a::Trait` inside a nested module is read from the crate root.
 
-**Acceptance gate:**
+### Phase 34 — a test-module or relative import no longer blocks trait identity  · status: done
 
-Write behavior tests first, using temporary repositories and isolated ledgers. Reuse `commit_tip` (:861), `hold_parent` (:872), `judge_parent` (:887), `follow_approved` (:896) and `built_finding` (:1192) in `test_style_ledger.py`.
+#### As-built
 
-Required cases:
-
-1. The declaration reader distinguishes inherent members, trait-body members and trait-implementation members while preserving existing owner declarations. Include qualified trait paths, generic impl headers, higher-ranked bounds and nested functions.
-2. A filed restructure finding inside `impl Trait for Type` follows `Trait::old` → `Trait::new`, keeps its id and decision, and records the exact follow commit and line.
-3. Two implementing types follow independently, including implementations in different files of the same crate.
-4. An unfiled dependent finding follows without being withdrawn; a second run changes nothing.
-5. A matching inherent method and another trait’s same-named method neither conceal the source’s removal nor receive the destination finding. Test both source and destination collisions.
-6. A renamed implementing type, and a readable renamed trait, compose with the method rename.
-7. A destination that already existed at the read commit is not treated as newly gained. Ambiguous destinations are not selected arbitrarily.
-8. Unapproved built findings, built findings from another crate, forks, cycles and open build tickets preserve their existing protections. Losing approval before the lock prevents the write.
-9. `follow --dry-run` prints the expected `follow … fn Type::new` line and writes nothing; the real run prints that action and persists it. A rerun is idempotent.
-10. Existing filed-own-rename behavior still builds only an approved, applied rename.
-
-The new successful trait-follow tests must fail on `e7a45401` because the finding does not follow. Collision tests must exercise competing declarations, rather than merely checking an absent match.
-
-From the worktree root `<W>`:
-
-```bash
-env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_declarations
-env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_proposals scripts.style.test_style_plan scripts.style.test_style_ledger
-basedpyright scripts/style
-```
-
-Both unittest commands pass; basedpyright reports `0 errors, 0 warnings`. All verification uses temporary fixtures and touches no live repository, proposal store or ledger.
-
-### Phase 34 — a finding follows a rename made outside the ledger  · status: todo
-
-**Depends on:** Phase 30, Phase 32, Phase 33
-
-#### Work Order
-
-**Goal:** The declaration step follows a filed or unfiled finding through a proved item or owner rename made outside the ledger. It keeps the finding and its decision. A same-crate cross-file rename may also follow through one newly gaining file. An uncertain match leaves the row and names the mapped declaration and candidates.
-
-**Spec:**
-
-The showrunner ruled this current on 2026-10-20, after Phase 33. A wrong follow puts a decision on code it was not made for. A missed follow only leaves the row. No manual command is added. Read the working tree after the dependencies; references below may move while Phase 32 workers edit it. The current ruling includes a rename into another file of the same crate. The separate cross-crate phase was dropped; it gives this phase no cross-crate authority.
-
-1. **Prove an outside rename in the declaration step.** Extend `Ledger._declaration_outcome` in `scripts/style/style_ledger.py` (:2292 in the researched tree). Use the finding's last follow commit, else `judged_commit`, as today. When its old declaration is gone, permit a rename without a built decision only when all these checks hold:
-   - (a) The old name is declared nowhere in the finding's crate at the synced tip. Search declarations, not name occurrences in calls, comments or strings. Read all tracked Rust files in that crate, including test items and other modules. A same-named declaration elsewhere prevents this proof; do not narrow this check to the original module or owner. The current `RepositoryTip.crate` supplies the crate boundary. A declaration in another crate does not, by itself, fail this check.
-   - (b) For a rename in the same file, the line to which the source diff maps the finding's site holds a declaration with the same keyword and owner, under a different name. Keep Phase 33's implemented-trait identity as well. Establish this mapping before choosing the renamed declaration; `moved_site_line` cannot itself prove a target selected in advance. A rename into another file instead uses the gained-file proof below; a Git hunk mapping into that other file is not required.
-   - (c) At least half of the old body's non-blank lines are unchanged after its old name is replaced by its new name. Count preserved lines once, in order, with their multiplicity. A repeated brace or line must not credit several old lines against one new line. The threshold is inclusive: `2 * unchanged >= old_nonblank_count`.
-   - **Cross-file proof in the same crate:** When the mapped-site proof does not clear the row, inspect every changed tracked Rust file in the finding's crate. A target must have a new name, the same keyword and owner kind, a body that passes (c), and a declaration identity that its file did not have at the judged/last-follow commit. The target file must therefore have gained that declaration, rather than merely editing a pre-existing twin. Include the original file in the whole-crate count; give it no priority. A `GainedFileProof` must name a path different from the source path, exactly one file may qualify, and its destination declaration/child site must be unambiguous. Counting the original file can expose ambiguity; it cannot bypass the mapped-site requirement for a rename that stays there. Two passing declarations in one file also need a unique proved item; file cardinality alone cannot pick one.
-   - For impl or trait members, matching the owner kind is only the first filter. Keep an unchanged owner identity and Phase 33 trait metadata, or prove the changed owner by the owner rule below. Never treat two impl types as one merely because both are impl owners.
-   - Count files after the keyword, owner, gain and body checks. Keep examined candidates and their failed checks for diagnostics too. With zero or two or more passing files, a failed body check or uncertain evidence, leave the row and name the candidates; never choose the best score or first file. No candidate in another crate can qualify through this new rule. Do not use `before`/`after` prose as rename proof.
-
-2. **Define the site and body evidence.** Put reusable Rust source reading and line mapping in `scripts/style/declarations.py`, beside `read_declarations` and `moved_site_line`; ledger state stays in `style_ledger.py`.
-   - Read a deterministic zero-context source diff from the read commit to the synced tip. Map an unchanged source line by the hunk offsets. A replacement hunk may supply a bounded candidate line for inspection; it does not establish item identity on its own. A deletion supplies only a diagnostic boundary, not a destination proof. If the mapping has several plausible owning declarations, is outside the destination, or is unreadable, leave it unresolved. A uniquely mapped file rename may supply a path. The independent same-crate gained-file proof may also supply one. This phase gives no new cross-crate authority; retain prior cross-crate and approved-move rules.
-   - `moved_site_line` currently needs both items before it runs and then searches equal stripped site text, else returns the new keyword line. It is a final site locator, not an independent rename detector. Use it only after the mapped-site or unique gained-file proof, to carry a finding inside the proved destination; a child still needs its own binding/owner proof. A row on an attribute or item line may use the corresponding first-owned/keyword line. Share an independent mapping helper where needed.
-   - For this draft, body means the source inside the item's own delimiters. Exclude its attributes, docs before the item, signature and outer opening/closing braces. Count comments inside the body, nested source and ordinary whitespace exactly; discard only blank lines and line-ending differences. Replace the old identifier by the new identifier at identifier boundaries before comparing. Do not normalize changed literals, callees, other names or indentation into equal lines. In particular, a one-line function's header and closing brace cannot turn a changed sole body line into a passing score. Keep source fragments for a body on its header line, rather than treating it as empty.
-   - An empty body, a declaration with no readable body, an unsupported binding or an ambiguous owner supplies no proof. For a constant/type alias with only an initializer or a semicolon, do not infer a braced body from a nearby function. These are conservative limits chosen here to implement the ruling's doubt rule.
-   - Use named immutable states: `OutsideRenameProven` carries the new declaration, path, site line and `MappedSiteProof | GainedFileProof`; `OutsideRenameNotProven` carries mapped-site evidence, candidate evidence and failed or uncertain checks. Use `NoOutsideCandidates | OutsideCandidates` for the candidate set; the latter holds a non-empty, sorted set of paths/items, gain evidence and body counts. Distinguish zero passing files, several passing files, a failed body and ambiguous items with named reasons. Represent mapped-site evidence as `MappedDeclaration(path, line, declaration) | MappedNoDeclaration(path, line) | UnmappedSite(reason)`. Failure reasons form a closed named set. Do not encode these outcomes with a bool, `None`, an empty string or an optional field whose absence has domain meaning.
-
-3. **Follow a child only through a proved owner.** A child row is a method, associated item or local binding inside a function. Its own unchanged name must still name that child inside the renamed owner. Apply the body test to the owner that was renamed, not to the local binding's line.
-   - Extend declaration metadata with the lexical owner relationship and readable body spans needed for this proof, while keeping `Declaration.owner` and Phase 33's trait metadata intact. The reader currently returns a containing function for a parameter, `let` or closure-parameter line; it does not return local bindings. Add a narrow binding read sufficient to confirm a child's own name and scope, including the `let rows` and `move |answers|` forms in the live evidence. A token use or a field projection is not a binding declaration. Leave unsupported patterns unresolved.
-   - A function owner must pass (a), (c), and either the independent mapped-site proof or the unique same-crate gained-file proof under its new name. The owner may move to another file; resolve retained children inside that proved destination, not in an arbitrary matching file. A renamed impl type or trait must pass its own proof before a member can inherit that owner change. An old owner type that still exists is not renamed just because a method now sits under another type. If both owner and member change names, prove both links; apply the relevant body check at each renamed owner/item. Resolve an unchanged child by its own name within the proved new owner and its mapped lexical scope. Duplicate or shadowed names do not permit an arbitrary first match.
-   - Local bindings do not become ordinary entries in the existing declared-item identity search. Preserve existing `declaration_at` behavior used by moves, Phase 30 and Phase 33. Keep the additional binding/lexical data separate. Do not start reading previously unread module comments, `use` items or impl headers as new findings.
-
-4. **Preserve the established transitions.** Same-identity moves, an approved applied filed finding's own completed rename, and Phase 30/33 approved built-rename follows retain their existing precedence. `_renamed_site` still uses `DeclarationRenamed` to mark an approved applied own rename built. Its approval wait is not an approval from this new proof. An outside follow itself never marks a finding built, approves a decision or rewrites its requested change.
-   - After those existing paths find no authoritative result, an `OutsideRenameProven` becomes `DeclarationMoved` with the new declaration and site. No new public successful outcome is needed; expand that type's docstring to name the outside proof. Keep the finding id, rule/blob, kind, text, before/after, ticket, proposal, state and person-reading history. Write path, line and the existing `followed_from`, `followed_from_line`, `followed_at` fields. No migration or stored crate column is needed.
-   - An open judging ticket still prevents reading an unfiled finding. An open build ticket still keeps the row. Do not use outside proof to bypass an existing ambiguous-move or cross-crate refusal. Attach mapped-site and candidate diagnostics to that left outcome without changing its precedence. Preserve an existing several-files or cross-crate refusal even if a new outside candidate looks attractive.
-   - The widened ruling says that a refused cross-file rename leaves the row. After old-name absence is established and the outside search is attempted, zero/multiple candidates or a failed/uncertain body must therefore return a new `OutsideRenameUnresolved(finding, declaration, evidence)` left outcome. Keep its filed or unfiled state even if its source file disappeared. This explicitly replaces today's `DeclarationRemoved` fallthrough for these search refusals; do not withdraw them or let refill waive them. For paths not entering this new search, preserve current declaration-removal transitions. Add the new type to `DeclarationOutcome`, `DeclarationLeft` and every consumer union/match. Keep `DeclaredInSeveralFiles` and `DeclaredInAnotherCrate` where they already apply, and keep the existing filed `DeclarationGoneFromFile` outcome when the outside proof is blocked before the gained-file search. Carry mapped/candidate evidence on existing left/removal outcomes where the outside check read them. Do not overload `NoRenamedSite`, whose existing meaning is a filed-own-rename check. The new type names a refused outside rename, not a completed rename or a built finding.
-   - Keep planning before `BEGIN IMMEDIATE`, the fresh row/decision recheck under the lock, synced-tip refusal, `retry_on_change` and Git-error refusal before any write. Cache parsed sources, source diffs and crate-name scans by the read/tip/path or tip/crate/name they use, so many findings in one owner do not repeat those scans. Reruns read a followed row at its follow commit and change nothing.
-
-5. **Expose the proof and the reason it failed through existing consumers.** A successful mapped-site or same-crate cross-file outside rename uses the existing `follow <id> <rule> <old path>:<old line> -> <path>:<line>: <keyword> <new name>` line and increments `follow`, not `built`. `held list` uses existing follow provenance. Retain exit codes and totals.
-   - Append `; mapped site <path>:<line> declares <keyword> <qualified name>; outside rename not proved: <checks>` to an existing `left` line when it has a mapped declaration. Name no declaration or an unresolved mapping explicitly for the other evidence variants. Preserve the existing reason and recovery instruction before that suffix. The two `draw` rows must still name their several gaining files and also the mapped `fn draw_sorted`.
-   - `OutsideRenameUnresolved` prints `left <id> <rule> <path>:<line>: outside rename not proved: <reason>; candidates: <sorted candidate paths/declarations and unchanged/old body counts>`, followed by mapped-site evidence when available. With no examined target print `candidates: none`; do not omit a zero-candidate result. Distinguish examined-but-failed candidates from passing candidates. List every candidate file deterministically and name each failed check. These outcomes increment `left`, never `withdrawn` or `built`. A removal outside this new search keeps its existing withdrawal line/state, with mapped evidence if read. An existing approval-wait outcome retains its silent wait.
-   - Update `follow_line` in `scripts/style/style_proposals.py` and the waiting lines in `scripts/style/style_plan.py` so refill names the mapped declaration and candidate files too. Extend `DeclarationChange`, `DeclarationLeft`, `follow_totals`, close/refill filtering and their exhaustive matches for `OutsideRenameUnresolved`; unresolved rows must not close a decision or enter fallback site-text waives. `run_follow` already validates open decisions, refreshes followed members and respects stored proposal membership; reuse it. No new command, approval source or decision file is added. `file` still follows before withdrawal and batching; refill follows before ticket selection.
-   - Update the declaration-follow section of `docs/style_production.md` and the filing procedure in `commands/showrunner/proposal.md` with both proofs, the child rule, gained-file cardinality, refusal retention and candidate lines. Retain Phase 32's withdrawal text and Phase 33's trait support and path limits.
-
-6. **Use the verified result for all 22 live rows, not the rename descriptions.** At synced tip `19da700c6ff026c7be79b9cff9d638543a50b0dc`, this rule newly follows exactly `5855309d6998e256` and `e4c8fa3ac1ae2891`, both in `crates/cargo-handler/src/census/schedule.rs`, to lines 1427 and 1439. They remain filed to the same `style prefer-type-named-fields-and-bindings crates+cargo-handler d00b0104.md` decision. Their owner changes from `uncached_completed_rows_arrive_before_hierarchy_discovery_is_released` to `uncached_first_publication_respects_its_budget_and_holds_claude_rows`; the child names `rows` and `answers` remain. The old owner's body retains 43 of 52 non-blank lines.
-   - The other 17 original rows must not follow under this rule. In particular, `renders_primary_marker` was removed and its logic absorbed into an already-existing `worktree_entry_label`; `device_line` changed its sole body line; the CPU test retains only 3 of 8 body lines; the account names remain elsewhere in the crate; and `LocalAnswers` still exists. The research table below names each check and mapped site.
-   - The three added modules rows also do not follow at this tip: `fff079fb7af8cf21` and `72fc92aca6fc9706` have one relevant gained struct, `CratesIoRelease` in `crates/cargo-port/src/project/cargo/crates_io_release.rs:4`, but only 3/7 old non-blank body lines remain. All three field lines match; all four old internal doc-comment lines changed. Do not silently ignore those lines to turn 3/7 into 3/3. `62ca205b24b40dc6` has a mapped `enum CratesIoSection` in `crates/cargo-port/src/tui/panes/pane_data/detail_data.rs:484`, which changes keyword and preserves 0/9 body lines; no gained struct passes instead. These are body/identity limits, not proof of a cross-crate move.
-   - Repeat the read-only audit after Phases 32/33 and at the current synced tip before declaring the live gate met. Report any changed result by id and evidence. Do not apply a live follow as a test of this phase.
+- `declarations.py` holds the closed state `ImplPosition = FileLevelImpl | BlockScopedImpl(header_word) | UnprovedImplPosition`. `ImplementedTrait(path, arguments, position)` carries the impl header's position. `DeclaredItem.import_position` holds the owning header's scope for a member, else the item's own scope.
+- `Ledger._trait_import_path(commit, path, trait, position)` reads only the imports visible at the header: file-level imports, plus imports in the blocks that enclose a `BlockScopedImpl` header. A block-level `use` or glob does not bind or block a file-level impl. A visible glob, a visible attributed or block-level import of the name, and an `UnprovedImplPosition` give `UnresolvedTraitPath`.
+- `Ledger._file_module(commit, path) -> RootedFileModule | UnreadableFileModule` is the one module-chain proof for imports and `_trait_module`. The chain starts at `src/lib.rs` or `src/main.rs` and follows plain file-level `mod name;` links. A `#[path]` mod, a Cargo target with `path`, a file reached by two chains, `src/bin`, and a file outside `src/` give no chain.
+- `Ledger._relative_trait_path(commit, path, trait, position)` resolves a file-level `self::`/`super::` path to a rooted `crate::…` path. Each `super` removes one segment. A path above `crate`, an unproved chain, or a `BlockScopedImpl` header stays unresolved. The alias loop and its 32-expansion bound run on the result.
+- `Ledger._trait_site_position(commit, path, line, spelling) -> ImplPosition` gives a built rename site its position. The qualifier tokens on the cited line in one scope decide it. If the tokens are absent, the one item on that line gives its owning header's `import_position`. Several items on the line, or tokens in several scopes, give `UnprovedImplPosition`. `BuiltRename` carries `before_position` (at `before_path`/`before_commit`) and `position` (at `path`/`commit`).
+- Comparison and output do not change. Anything not proved stays `TraitIdentityUncertain`. An impl inside a block whose glob (`use super::*`) can bind the trait name stays uncertain; live, 3 `GitStatusTrace` rows of that shape stay uncertain.
 
 **Files:**
+- `scripts/style/declarations.py` — `ImplPosition` and its three states, `ImplementedTrait.position`, `DeclaredItem.import_position`, header scope recovery.
+- `scripts/style/style_ledger.py` — `RootedFileModule`, `UnreadableFileModule`, `_file_module`, `_relative_trait_path`, position-aware `_trait_import_path`, `_trait_site_position`, `BuiltRename` positions.
+- `scripts/style/test_style_ledger.py` — block-glob, block-import, relative-import and limit tests.
+- `docs/style_production.md` — trait identity rule: block imports affect only impls in their block; file-level `self::`/`super::` resolves from the file's module.
 
-- `scripts/style/declarations.py` — independent line-mapping evidence, lexical owner/binding reads and readable body spans; preserve Phase 33 metadata.
-- `scripts/style/style_ledger.py` — mapped-site and gained-file proofs, crate-wide name scan, explicit unresolved outcome, candidate diagnostics and follow persistence.
-- `scripts/style/style_proposals.py` — follow/left unions, candidate lines and left totals; preserve proposal refresh and close behavior for unresolved rows.
-- `scripts/style/style_plan.py` — mapped-declaration waiting text and existing refill integration.
-- `scripts/style/test_declarations.py` — mapping, body and lexical child tests.
-- `scripts/style/test_style_ledger.py` — mapped/cross-file proof, gained-file uniqueness, owner follow, conservative refusal retention and persistence tests in temporary two-crate repositories.
-- `scripts/style/test_style_proposals.py` — dry/real follow and file output, decision preservation and refresh tests.
-- `scripts/style/test_style_plan.py` — refill observes the followed site and waits with mapped evidence on a failed proof.
-- `scripts/style/approved_renames.py` — read existing item/header helpers; no new applied-rename authority is added here.
-- `scripts/style/style_footprint.py` — read tokenizer, token lines and brace matching used by the declaration reader; change only if the source-span defect is in that shared helper.
-- `docs/style_production.md` — outside-rename rule, child proof, conservative limits and output suffix.
-- `commands/showrunner/proposal.md` — filing's automatic outside-rename follow and unresolved-site output.
+**Binds later work:** the `ImplPosition` model, the `_file_module` chain proof and the `_trait_site_position` rule. Every trait identity consumer (in-place check, `_matching_items`, gained-file search, `_trait_rename_identity`, locked recheck) reads `_trait_import_path` with a position.
 
-**Workers:** `1 writer + 1 tester`. One writer owns the declaration model and its ledger/CLI consumers; the tester writes behavior tests from this Spec in separate files.
+**Gotchas:**
+- `declaration_at(line)` picks the last item on a shared line. It is never proof of ownership alone. A line with several items is an unproved position.
+- A real built site often cites a member line with no qualifier token, so the site position falls back to the owning header.
 
-- `impl` — `scripts/style/declarations.py`, `scripts/style/style_ledger.py`, `scripts/style/style_proposals.py`, `scripts/style/style_plan.py`, `docs/style_production.md`, `commands/showrunner/proposal.md`; also the named shared helper files if the span fix belongs there. Hubs: `scripts/style/declarations.py` owns source/proof metadata; `scripts/style/style_ledger.py` owns outcome transitions. Each has one writer.
-- `test` — `scripts/style/test_declarations.py`, `scripts/style/test_style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_plan.py`. Reuse `commit_tip`, `hold_parent`, `judge_parent`, `follow_approved`, `built_finding` and the existing two-crate fixtures in ledger tests; `judge`, `follow`, `held_list` in proposal tests; `judged_findings` and `refill_decisions` in plan tests. Test names below state the behavior. Keep dependency coverage; change old assertions only where the new successful follows or the widened refusal-retention rule explicitly change that behavior. Name those changed expectations in the implementation summary.
+### Phase 35 — a finding follows a rename made outside the ledger  · status: done
 
-**Constraints from prior phases:**
+#### As-built
 
-- Phase 30 separates rename resolution from destination search with `_built_renaming`, `_renamed_site`, `_followed_rename` and `_gaining_files`. Its built rename pairs, scope checks, approval checks, chains, fork/cycle stops and gained-since-read checks keep their meaning. The new proof has no built pair and must not manufacture one.
-- Phase 33 keeps an impl member's owner as the implementing type and stores implemented-trait metadata separately. Preserve this distinction in source and destination matching. Its unsupported and ambiguous trait paths grant no proof. `self::`/`super::` module resolution is not added here.
-- Phase 32's current-text judgment withdrawal remains separate and runs after declaration follow during filing. Phase 31's decision membership, unfinished-findings test and close/reopen rules remain unchanged. An outside follow is neither completion nor a new decision.
-- The showrunner requires no manual command and conservative proof. Its latest widening permits newly gained destinations inside the same crate only, and explicitly keeps rows when that search fails. The dropped cross-crate phase supplies no authority. Phase 30's `_gaining_files` requires a known target identity and gives the original file priority; the new discovery search must neither require a known after name nor reuse that priority to hide a second passing file. Keep old approved-rename callers unchanged.
-- The Type Design Contract requires closed named outcomes. Keep source mapping, proof failure and readable/unreadable body or owner states explicit; do not add an optional domain field or bool that a reader must interpret. `style_ledger.py` must not import `style_proposals`.
-- All implementation verification uses isolated temporary repositories, ledgers and decision stores. No live repository, proposal, ledger, rule store or style session is edited by these gates.
+- `Ledger._declaration_outcome` follows a filed or unfiled finding to a declaration renamed outside the ledger only on proof. It reads at the last follow commit, else `judged_commit`. The proof needs all of these:
+  - (a) The old name is declared nowhere in the finding's crate at the synced tip. The scan reads declarations in all tracked Rust files of the crate (`RepositoryTip.crate`). A declaration in another crate does not block it.
+  - (b) Same file: a `MappedSiteProof`. A zero-context source diff maps the site line to a declaration with the same keyword, owner and implemented-trait identity, under a new name. Cross-file: a `GainedFileProof`. Exactly one changed tracked Rust file in the same crate gained a new-name declaration with the same keyword and owner kind, and that declaration passes (c). The original file counts in the crate-wide count and gets no priority. Two passing items in one file are ambiguous.
+  - (c) Body: `2 * unchanged >= old_nonblank_count`. The body is the source inside the item's own delimiters, without attributes, docs, signature or outer braces. A body on the header line counts. Lines count once, in order, with multiplicity, after the old identifier becomes the new one at identifier boundaries. An empty or unreadable body gives no proof.
+- A child (a method, an associated item, a `let` binding or a closure parameter) follows only through a proved owner. The body test applies to the owner. The child's own name must stay inside the proved owner and its lexical scope. A closure matches by its context: `ClosureCallArgument(callee, argument)`, `ClosureInitializer(binding)` or `UnprovedClosureContext`. A context repeated in one block is unproved. A typed `let x: T = |..|` reads past the type to `=`. Local bindings (`binding_at`, `binding_scope`, `OwningClosure`) stay apart from the declared-item search, and `declaration_at` is unchanged.
+- Impl owners compare the implementing type with its generic arguments read in each revision (`_outside_type_arguments`). Only a proved local first segment gets the file module prefix: file-level, a unique mod/struct/enum/union/type, no `cfg`/`cfg_attr`. A root bound by `extern crate` (name or alias) gives `UnresolvedTypeArguments` (`_outside_extern_names`). The scan reads the source file, the destination file and the crate root (`src/lib.rs`, `src/main.rs`), in the read and the commit revision. An unbound external path compares by spelling.
+- `OutsideRenameProven` (new declaration, path, site line, `MappedSiteProof | GainedFileProof`) becomes `DeclarationMoved`. It keeps the finding id, state, decision and history, and it writes `followed_from`, `followed_from_line` and `followed_at`. It never marks a finding built and never approves a decision. A search that fails after (a) returns the left outcome `OutsideRenameUnresolved(finding, declaration, evidence)`, in place of `DeclarationRemoved`. It keeps the filed or unfiled state, also when the source file is gone. It is never withdrawn, waived or used to close a decision. Evidence is `MappedDeclaration | MappedNoDeclaration | UnmappedSite` plus `NoOutsideCandidates | OutsideCandidates`, with named reasons.
+- Precedence is unchanged. `TraitIdentityUncertain`, same-identity moves, an approved own rename, built-rename follows, ambiguous-move and cross-crate refusals, and open tickets all come first. The lock recheck, synced-tip refusal and `retry_on_change` apply before any write. Sources, diffs and crate scans are cached.
+- Output: a success prints the existing `follow` line and counts `follow`. A `left` line with mapped evidence ends with `; mapped site <path>:<line> declares <keyword> <name>; outside rename not proved: <checks>`. `OutsideRenameUnresolved` prints `left <id> <rule> <path>:<line>: outside rename not proved: <reasons>; candidates: <paths and body counts | none>`. `follow_line` in `style_proposals.py` and the refill waiting lines in `style_plan.py` print the same evidence.
+- Live (cargo-liner, tip `19da700c`): `5855309d6998e256` and `e4c8fa3ac1ae2891` follow from `crates/cargo-handler/src/census/schedule.rs:818`/`:825` to `:1427`/`:1439` under their decision (owner body keeps 43/52 lines). 3 rows are left and 0 are withdrawn.
+
+**Files:**
+- `scripts/style/declarations.py` — site mapping, body spans, closure contexts, `OwningClosure`, `binding_at`, `binding_scope`
+- `scripts/style/style_ledger.py` — outside-rename proof, crate name scan, `_outside_extern_names`, `_outside_type_arguments`, `OutsideRenameUnresolved` and its evidence lines
+- `scripts/style/style_proposals.py`, `scripts/style/style_plan.py` — follow, left and refill wait lines for the new evidence
+- `docs/style_production.md`, `commands/showrunner/proposal.md` — the outside-rename rule, child rule and unresolved output
+- `scripts/style/test_declarations.py`, `scripts/style/test_style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_plan.py` — one regression test per proof rule
+
+**Binds later work:** `style_footprint.tokens`, `closing` and `attribute_spans` must keep their behavior; `declarations.py` and `style_ledger.py` use them.
+
+**Gotchas:**
+- Each proof rule is a token-level reading of Rust, and a narrow rule tends to miss a nearby syntax form. Widen refusal; never resolve more.
+- Build live-shape fixtures from the real Git source. A hand-made closure fixture did not match the real form.
+- Import direction is `declarations → approved_renames → style_footprint`; `style_footprint` imports neither upper module. `style_ledger.py` does not import `style_proposals`.
+
+**Ruled out:** resolving `extern crate` aliases to compare argument paths (it gave two wrong follows); a manual follow command; picking the best score or first file among candidates; `before`/`after` prose as rename proof; ignoring changed doc-comment lines to raise a body score.
+
+### Phase 36 — two filer runs at once never skip a decision  · status: done
+
+#### As-built
+
+- `proposal_issue.create` reads the decision path two times through `_decision_path_state(path, keys)`. The first read is a fast path before `_folder_lock(path.parent)`. The second read is inside the lock, before `_create_numbered`.
+- `_decision_path_state` returns `DecisionPathState.AVAILABLE` when the path is absent. It returns `DecisionPathState.ALREADY_FILED` when the file holds the same `style_rule`, `style_crate` and `style_rule_blob`. A different key raises `Refusal(f"{path}: different decision key")`.
+- On `ALREADY_FILED`, `create` returns `False` and writes nothing. The file of the other run stays byte-identical. Only `AVAILABLE` inside the lock numbers the issue and links the temp file. The `finally` always removes the `.decision-*` temp file.
+- The decision key sets the issue path (`batch_name(key)`), not the P number. `_folder_lock` gives two different decisions two different P numbers. `number()` reads the issue inside the lock, as before.
+
+**Files:**
+- `scripts/production/proposal_issue.py` — decision filing; `DecisionPathState`, `_decision_path_state`, the path check before and inside the folder lock
+- `scripts/production/test_proposal_issue.py` — same-key and different-key races at the lock (a patched `_folder_lock` makes the other file), two decisions with distinct P numbers
+
+**Binds later work:** a change to `create` keeps both `_decision_path_state` checks, before and inside the lock.
+
+**Gotchas:** a check before the lock alone lets two same-key runs both pass. The second run then fails at `os.link(temporary, path)` with `FileExistsError` (Errno 17), and the message names the `.decision-*` temp file, not the issue.
+
+**Ruled out:** another file name for the second run; `os.replace` onto an existing issue (it overwrites the decision of the other run); a retry loop; removing `_folder_lock`.
+
+### Phase 37 — a style decision files under area style, new and old  · status: todo
+**Depends on:** Phase 36
+
+#### Work Order
+**Goal:** every style decision issue has `area: "[[style]]"`: `proposal_issue create` writes it for each new one, and one command sets it on the ones already filed under `"[[unfiled]]"`.
+
+**Spec:**
+- User request 2026-10-20: "when we create a new issue for a style proposal - we need to set the area to style … backpopulate the area field on the ones that were created for style but don't have this".
+- `scripts/production/proposal_issue.py` `_create_numbered` (~:515) fills the template `area: "[[{{AREA}}]]"` (`~/rust/hanadocs/.claude/templates/issue.yaml` line 2) with `"AREA": "unfiled"`. `create` is the style decision path (it requires `style_rule`, `style_crate`, `style_rule_blob`), so set `"AREA": "style"` there, one named constant.
+- New verb `proposal_issue.py area-style <folder> [--dry-run]`: for each issue in the folder whose frontmatter carries `style_rule` (a current decision) or `style_rules` (a closed legacy proposal, which also has `style_findings` and no singular `style_rule`), whatever its status, and whose area is `[[unfiled]]` or missing, set `area: "[[style]]"` and `date_modified` to today's vault date (as `edit` does at ~:251; `set_fields` changes only the fields it is given) under the issue lock with `_write`, and print one line per issue changed. `--dry-run` prints the same lines and writes nothing. A skipped file, a dry run and a second run leave every byte unchanged. It never changes an issue with any other area.
+- On 2026-10-20, 601 files named `style …` in `~/rust/hanadocs/issues` carry `area: "[[unfiled]]"`: 96 have `style_rule:`, all 601 have `style_rules:`. Read a few (read only) for both forms. The director runs the verb on the real folder; workers never write there.
+- Keep the literal `area: "[[style]]"` the user asked for, although `[[style]]` resolves in the vault to `showrunners/natedev/style.md` (the unit's phase note). Create, rename or move no vault note.
+- Update `commands/showrunner/proposal.md` or `docs/style_production.md` only where they state a style decision's area.
+
+**Files:**
+- `scripts/production/proposal_issue.py`
+- `scripts/production/test_proposal_issue.py`
+- `commands/showrunner/proposal.md`
+- `docs/style_production.md`
+
+**Workers:** 1 writer + 1 tester. `impl`: proposal_issue.py and the two docs. `test`: test_proposal_issue.py — a new decision has `area: "[[style]]"`; `area-style` sets it (and today's `date_modified`, from an older date) on an unfiled style decision, on one with no area, and on a closed legacy proposal with only `style_rules`/`style_findings`; leaves a non-style issue and a style decision with another area byte-identical, `--dry-run` writes nothing, and a second run changes nothing.
+
+**Constraints from prior phases:** phase 36 re-checks the decision path inside `_folder_lock`; keep that.
 
 **Acceptance gate:**
+- `env -C <worktree> PYTHONPATH=<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.production.test_proposal_issue` passes.
+- basedpyright on each changed .py file: 0 errors, 0 warnings.
+- The gate copy's `merge_gate.py --tests-only` passes.
+- Director: `area-style ~/rust/hanadocs/issues --dry-run` lists all 601 unfiled style issues (count on the day); the real run sets them; a second run prints nothing.
 
-Write these eight behavior tests (subtests may cover the named cases). A new positive test must fail before this change; a retained negative case is a limit, not evidence that the feature was already present.
+### Phase 38 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: todo
+**Depends on:** none
 
-1. `test_outside_rename_source_evidence_excludes_headers_and_reads_local_children` (`test_declarations.py`) — map unchanged and replaced site lines independently of a chosen target; read function/type/trait owners, `let rows` and closure parameter `answers`; extract real bodies, including a body on a signature line. Header/attribute/outer-brace matches must not inflate a 0-of-1 body. Deleted, ambiguous and unsupported sites return named unresolved states. This exercises the source metadata used by the follow, not imports or class names.
-2. `test_a_filed_and_an_unfiled_finding_follow_a_proven_outside_rename` (`test_style_ledger.py`) — no built rename rows; subtests for a same-file mapped rename and a rename into one newly gaining file of the same crate, each with exactly half of four old body lines preserved, follow both states. Include a second file that already had a twin at the read commit; it is not gained and must not create ambiguity. Check exact id, path, site, state, decision, before/after and follow commit after reopening the isolated database. A rerun writes nothing. Include a source-line replacement so this does not pass only for unchanged site text.
-3. `test_an_outside_rename_needs_every_check_and_reports_its_mapped_declaration` (`test_style_ledger.py`, proof and limit cases) — subtests for old name still declared elsewhere in the same crate, old name only used but not declared, changed keyword, wrong owner/implemented trait, 1-of-3 body lines, empty/unreadable body, repeated-line overcount, deleted site and ambiguous mapping. The name in a different crate alone must not block a proved same-crate destination. Add cross-file cases with zero passing files, two passing files, two plausible items in one file, an unchanged pre-existing destination, and a destination gained only in another crate. After old-name absence permits this search, assert `OutsideRenameUnresolved`, unchanged filed/unfiled state (also when the source file is deleted), candidate paths/body counts and unchanged database rows. Keep existing earlier ambiguous-move outcomes. A refused search must not fall through to withdrawal. Assert mapped/candidate evidence, not merely a non-follow.
-4. `test_children_follow_only_when_their_renamed_owner_is_proven` (`test_style_ledger.py`) — a method and associated item under a renamed impl type/trait, and `let`/closure children under a renamed function, including an owner newly gained in another file, follow only through proved owners and retained child names. Use a real passing owner body. Limits: owner type still declared, child gone or renamed, and competing same-name child scopes. Include the two schedule-test binding forms and exact site relocation. Do not claim a call-use token is a retained binding.
-5. `test_outside_follow_preserves_existing_follow_authority_and_write_rechecks` (`test_style_ledger.py`, mixed success/limits) — retain approved applied own-rename builds and approval waits, built-rename/trait-qualified follows, ambiguous moves, open judging/build tickets and cross-crate limits. Put the new outside proof through the existing synced-tip and changed-before-lock tests; a row or source-tip change must prevent a stale follow. Reuse those existing tests where that avoids duplicating their setup.
-6. `test_follow_and_file_keep_the_decision_after_an_outside_rename` (`test_style_proposals.py`) — real temporary-repository rename; `follow --dry-run` prints the same follow as the real run but writes nothing. The real run keeps the proposal, refreshes its example site, counts follow rather than built, and `held list` shows provenance. Check the mapped-declaration/candidate line for a failed body check and for two passing files; both leave rows and decisions open, count `left` and retain existing totals/exit codes. `file` performs the same follow before its other steps; a rerun is idempotent.
-7. `test_refill_uses_an_outside_follow_and_names_an_unproved_mapped_declaration` (`test_style_plan.py`) — a successful proof tickets the current site and original finding id under its original decision; a failed cross-file proof waits with mapped declaration/candidate paths and is not withdrawn, waived by the fallback site-text heuristic, or treated as a reason to close its decision. Exercise both through real fixture commits.
-8. `test_live_outside_rename_examples_follow_only_the_two_retained_children` (`test_style_ledger.py`) — small faithful source fixtures for the live classes of evidence: the schedule owner retaining 43/52 body lines with `rows`/`answers`; the account names still declared elsewhere; retained `LocalAnswers`; deleted `renders_primary_marker` beside pre-existing `worktree_entry_label`; `Device` to `Total` with 0/1; changed CPU-test assertions with 3/8; `CratesIoInfo -> CratesIoRelease` in a gained file with unchanged fields but 3/7 source body lines; and `CratesIoFields -> CratesIoSection` with a changed keyword and 0/9. Expect only the two child follows, with others' mapped-site diagnostics. Do not mock the proof or copy its implementation into the assertions.
+#### Work Order
+**Goal:** `style_footprint` answers `mechanical` for `_name: T` → `_: T` on a function or trait-method parameter when the body never reads `_name`; it still answers review when the body reads it.
 
-Run from worktree `<W>` without changing directories:
+**Spec:**
+- Today the edit answers `review: check 3 … check 6` (cargo-liner-style 2026-10-20: never-prefix-unused, tui_pane, 24 sites held). `scripts/style/style_footprint.py` ~:1704-1726 builds the check reasons.
+- A name with a leading underscore is still a usable binding, so the edit is mechanical only when no token in the item's body (or default body for a trait method) names `_name`, and the parameter's type and position are unchanged. A trait method declaration with no body (`fn f(&self, _name: T);`) has nothing to read and is mechanical.
+- Any other change in the same hunk keeps the existing checks. Reads of `_name` in a macro body count as reads (review).
+- Never weaken check 3 or check 6 for any other edit shape.
+- An implicit format capture is a read: a string literal that holds `{_name}` or `{_name:…}`, raw strings included, keeps review. The tokenizer keeps a literal as one token, so a token scan alone misses it; reuse the capture test the local-binding proof already uses (~:1418, `re.compile(r"\{" + re.escape(old_name) + r"(?=[}:])")` over literal tokens).
+- Check 2 (~:1705) compares the unnormalized public shapes, so `_name` → `_` on an externally reachable `pub fn` or a public trait method changes them even when unused. A proved parameter erasure must also pass check 2; any other change to the public shape in the same item still keeps check 2.
 
-```bash
-env -C <W> PYTHONPATH=<W>/scripts/style:<W>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_proposals scripts.style.test_style_plan scripts.style.test_declarations
-env -C <W> basedpyright scripts/style
-```
+**Files:**
+- `scripts/style/style_footprint.py`
+- `scripts/style/test_style_footprint.py`
 
-The suites pass and basedpyright reports `0 errors, 0 warnings`. The known missing-venv exit status does not replace that diagnostic requirement.
+**Workers:** 1 writer + 1 tester. `impl`: style_footprint.py. `test`: test_style_footprint.py — mechanical for a required trait parameter, a trait declaration without body, and a function whose body never reads `_name`; review when the body reads `_name`, when a macro names it, when a format string captures `{_name}` (plain and raw), and when the type also changes; mechanical for an externally reachable `pub fn` and a public trait method with a proved erasure, and check 2 still raised when that item's public shape also changes in another way.
 
-Observable live result at the researched synced tip: newly follow exactly `5855309d6998e256` from `crates/cargo-handler/src/census/schedule.rs:818` to `:1427`, and `e4c8fa3ac1ae2891` from the same file `:825` to `:1439`, retaining their filed state and decision. There are no other newly eligible live rows at this snapshot. The other 20 evidence rows do not follow. Keep existing early refusal outcomes; rows that enter and fail the new cross-file search use `OutsideRenameUnresolved` and remain filed. In particular, do not report the two `CratesIoInfo` rows as successes under this body definition. A read-only audit after dependencies must show these exact ids/destinations or name changes in tip, source or state that explain a different result. Do not run a writing live command to meet this gate.
+**Constraints from prior phases:** phase 35 does not touch style_footprint.py; it uses `style_footprint.tokens`, `closing` and `attribute_spans`, which must keep their behavior. Phase 35 fixed the import direction `declarations → approved_renames → style_footprint`: style_footprint must not import either upper module (that is a cycle), so the erasure proof lives in style_footprint with its own reading.
+
+**Acceptance gate:**
+- `env -C <worktree> PYTHONPATH=<worktree>/scripts/style:<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_footprint scripts.style.test_style_ledger` passes.
+- basedpyright on each changed .py file: 0 errors, 0 warnings.
+- The gate copy's `merge_gate.py --tests-only` passes.

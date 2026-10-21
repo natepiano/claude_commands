@@ -37,6 +37,8 @@ PARENT = "pub struct Parent {\n    old: u32,\n}\n"
 # The same declaration as PARENT: an inline module is not part of it.
 TWIN = "#[cfg(test)]\nmod tests {\n    struct Parent {\n        old: u32,\n    }\n}\n"
 
+TRAIT_METHOD = "pub trait Trait {\n    fn old(&self) -> u32;\n}\npub struct Type;\nimpl Trait for Type {\n    fn old(&self) -> u32 {\n        7\n    }\n}\n"
+
 
 class StatusCell(TypedDict):
     rule: str
@@ -96,7 +98,8 @@ class StyleLedgerTests(unittest.TestCase):
                 f'[package]\nname = "{member}"\nversion = "0.1.0"\nedition = "2021"\n',
             )
         for source in self.sources:
-            self.write(source, "pub fn value() -> u32 { 1 }\n")
+            self.write(source, "pub fn value() -> u32 { 1 }\n" +
+                       ("mod a; mod b; mod c; mod other;\n" if source.endswith("src/lib.rs") else ""))
         self.write("vendor/third-party/src/lib.rs", "pub fn external() {}\n")
         self.write("crates/alpha/vendor/embedded.rs", "pub fn embedded() {}\n")
         self.write("README.md", "A sample workspace\n")
@@ -1032,41 +1035,43 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(built.state, style_ledger.Built(self.root / "decision.md"))
         self.assertEqual(ledger.applied_check(built, tip), AppliedInCode())
 
-    def test_a_filed_finding_whose_item_was_renamed_otherwise_is_left_and_nothing_is_written(self) -> None:
+    def test_a_filed_finding_follows_a_proved_outside_name_without_changing_its_request(self) -> None:
         ledger = self.ledger()
         finding_id = self.renamed_parent(ledger)
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Other")})
+        followed, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(followed, style_ledger.DeclarationMoved)
+        finding, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((finding.finding_id, finding.before, finding.after, finding.state),
+                         (finding_id, "Parent", "Renamed", style_ledger.Filed(self.root / "decision.md")))
         before = self.held_rows(ledger.database)
-        left, = self.follow_approved(ledger, [finding_id])
-        self.assertEqual((type(left), left.finding.finding_id), (style_ledger.DeclarationGoneFromFile, finding_id))
-        self.assertIsInstance(left, style_ledger.DeclarationLeft)
+        again, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(again, style_ledger.DeclarationInPlace)
         self.assertEqual(self.held_rows(ledger.database), before)
 
-    def test_a_filed_finding_whose_file_is_gone_is_withdrawn(self) -> None:
+    def test_a_filed_finding_with_no_proved_destination_stays_filed_after_its_file_is_deleted(self) -> None:
         ledger = self.ledger()
         finding_id = self.renamed_parent(ledger)
-        # While the file is there, the finding stays filed.
-        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
-        left, = self.follow_approved(ledger, [finding_id])
-        self.assertEqual(type(left), style_ledger.DeclarationGoneFromFile)
-        tip = self.commit_tip(ledger, {PARENT_FILE: None})
-        removed, = self.follow_approved(ledger, [finding_id])
-        self.assertIsInstance(removed, style_ledger.DeclarationRemoved)
-        finding, = ledger.held_findings(style_ledger.AllHeldFindings())
-        self.assertEqual(finding.state, style_ledger.Withdrawn(self.root / "decision.md", style_ledger.DeclarationGone(tip)))
+        for contents in ("pub fn other() {}\n", None):
+            with self.subTest(contents=contents):
+                _ = self.commit_tip(ledger, {PARENT_FILE: contents})
+                before = self.held_rows(ledger.database)
+                left, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+                self.assertEqual(self.held_rows(ledger.database), before)
+                finding, = ledger.held_findings(style_ledger.AllHeldFindings())
+                self.assertEqual(finding.state, style_ledger.Filed(self.root / "decision.md"))
 
-    def test_an_unfiled_rename_whose_after_name_is_declared_is_withdrawn(self) -> None:
+    def test_an_unfiled_rename_follows_outside_code_while_its_approved_twin_is_built(self) -> None:
         ledger = self.ledger()
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
-        # The same rename judged at the field line reads as struct Parent too; only that one is filed.
         _, (unfiled, filed) = self.hold_parent(ledger, ((1, "pub struct Parent {"), (2, "old: u32,")), before="Parent", after="Renamed")
         ledger.file_held(filed, self.root / "decision.md")
-        tip = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
         outcomes = self.follow_approved(ledger, [unfiled, filed])
-        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationRemoved, style_ledger.DeclarationRenamed])
+        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved, style_ledger.DeclarationRenamed])
         states = {finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
-        self.assertEqual(states, {unfiled: style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.DeclarationGone(tip)),
-                                  filed: style_ledger.Built(self.root / "decision.md")})
+        self.assertEqual(states, {unfiled: style_ledger.Unfiled(), filed: style_ledger.Built(self.root / "decision.md")})
 
     def test_a_renamed_finding_that_an_open_build_ticket_holds_is_kept(self) -> None:
         ledger = self.ledger()
@@ -1097,17 +1102,21 @@ class StyleLedgerTests(unittest.TestCase):
         _, (finding_id,) = self.judge_parent(ledger, ((1, "pub struct Parent {"),), before="Parent", after="Renamed")
         # Parent is deleted and Renamed stays where it was, so the rename was never applied.
         _ = self.commit_tip(ledger, {PARENT_FILE: "pub struct Renamed;\n"})
-        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
-        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
-            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem())))
+        before = self.held_rows(ledger.database)
+        left, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn("declaration not gained", repr(left))
 
     def test_a_filed_rename_whose_after_name_is_declared_with_another_keyword_is_left(self) -> None:
         ledger = self.ledger()
         finding_id = self.renamed_parent(ledger)
         _ = self.commit_tip(ledger, {PARENT_FILE: "pub enum Renamed {\n    Old,\n}\n"})
-        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
-        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
-            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem())))
+        before = self.held_rows(ledger.database)
+        left, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn("keyword differs", repr(left))
 
     def test_a_filed_rename_whose_after_name_one_file_in_another_crate_gained_is_left(self) -> None:
         ledger = self.ledger()
@@ -1205,6 +1214,14 @@ class StyleLedgerTests(unittest.TestCase):
     def built_finding(self, ledger: style_ledger.Ledger, path: str, before: str, after: str, *,
                       kind: style_ledger.FindingKind = "rename", line: int = 1) -> str:
         """A finding at path that its own dropped read ticket judged, filed to built.md and built."""
+        if kind == "rename" and (self.repo / path).is_file():
+            source = (self.repo / path).read_text().splitlines(keepends=True)
+            for spelling in (before, after):
+                if spelling not in source[line - 1]:
+                    source[line - 1] = source[line - 1].rstrip("\n") + f" const _: () = {{ {spelling}(); }};\n"
+            updated = "".join(source)
+            if updated != (self.repo / path).read_text():
+                _ = self.commit_tip(ledger, {path: updated})
         rule = self.rule("names")
         ticket = f"built-{len(ledger.held_findings(style_ledger.AllHeldFindings()))}"
         ledger.ticket_add(ticket, "built", "read", "names", "/".join(path.split("/")[:2]), [path], [rule])
@@ -1216,6 +1233,1424 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (finding_id,))
         return finding_id
+
+    def trait_method_finding(self, ledger: style_ledger.Ledger, *, filed: bool = True) -> tuple[str, str]:
+        """A finding on the body of Type's implementation of Trait::old."""
+        source = TRAIT_METHOD
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        judge = self.judge_parent if filed else self.hold_parent
+        _, (finding_id,) = judge(ledger, ((7, "7"),), kind="restructure")
+        return finding_id, source
+
+    def test_a_trait_qualified_built_rename_follows_a_filed_impl_method_and_keeps_its_type_owner(self) -> None:
+        ledger = self.ledger()
+        finding_id, source = self.trait_method_finding(ledger)
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
+        filed = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// moved down\n" + source.replace("fn old", "fn new")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(outcome, style_ledger.DeclarationMoved(
+            filed, declarations.Declaration("fn", "new", declarations.ImplOrTraitItem("Type")), PARENT_FILE, 8))
+        with style_ledger.Ledger(self.repo, ledger.database) as reopened:
+            followed = next(row for row in reopened.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+            self.assertEqual((followed.finding_id, followed.path, followed.line, followed.state, followed.follow),
+                             (finding_id, PARENT_FILE, 8, style_ledger.Filed(self.root / "decision.md"),
+                              style_ledger.FollowedDeclaration(PARENT_FILE, 7, tip)))
+            self.assertEqual((followed.before, followed.after), (filed.before, filed.after))
+
+    def test_trait_qualified_renames_follow_two_impl_types_in_separate_files_and_leave_unfiled_findings_unfiled(self) -> None:
+        ledger = self.ledger()
+        source = "pub struct Type;\nimpl Trait for Type {\n    fn old(&self) -> u32 {\n        7\n    }\n}\n"
+        other = source.replace("Type", "Other")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: other, TWIN_FILE: "pub trait Trait { fn old(&self) -> u32; }\n"})
+        _, (filed,) = self.judge_parent(ledger, ((4, "7"),), kind="restructure")
+        _, (unfiled,) = self.hold_parent(ledger, ((4, "7"),), kind="restructure", path=MOVED_FILE)
+        _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new")
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new"),
+                                       MOVED_FILE: other.replace("fn old", "fn new"),
+                                       TWIN_FILE: "pub trait Trait { fn new(&self) -> u32; }\n"})
+        outcomes = self.follow_approved(ledger, [filed, unfiled])
+        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved] * 2)
+        rows = {row.finding_id: row for row in ledger.held_findings(style_ledger.AllHeldFindings())}
+        for finding_id, path, state in ((filed, PARENT_FILE, style_ledger.Filed(self.root / "decision.md")),
+                                        (unfiled, MOVED_FILE, style_ledger.Unfiled())):
+            row = rows[finding_id]
+            self.assertEqual((row.path, row.line, row.state, row.follow),
+                             (path, 4, state, style_ledger.FollowedDeclaration(path, 4, tip)))
+        before = self.held_rows(ledger.database)
+        self.assertEqual([type(outcome) for outcome in self.follow_approved(ledger, [filed, unfiled])],
+                         [style_ledger.DeclarationInPlace] * 2)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def assert_trait_source_collision(self, owner: str) -> None:
+        ledger = self.ledger()
+        finding_id, source = self.trait_method_finding(ledger)
+        twin = owner + " {\n    fn old(&self) -> u32 { 9 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source + twin})
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new") + twin})
+        moved, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(moved, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.line), (PARENT_FILE, 7))
+
+    def test_inherent_source_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_source_collision('impl Type')
+
+    def test_other_trait_source_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_source_collision('impl OtherTrait for Type')
+
+    def assert_trait_destination_collision(self, owner: str) -> None:
+        ledger = self.ledger()
+        finding_id, source = self.trait_method_finding(ledger)
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
+        twin = owner + " {\n    fn new(&self) -> u32 { 9 }\n}\n"
+        destination = "// gained trait implementation\n" + source.replace("fn old", "fn new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: twin, MOVED_FILE: destination})
+        moved, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(moved, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.line), (MOVED_FILE, 8))
+
+    def test_inherent_destination_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_destination_collision('impl Type')
+
+    def test_other_trait_destination_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_destination_collision('impl OtherTrait for Type')
+
+    def test_trait_method_follow_composes_with_built_type_and_trait_renames(self) -> None:
+        ledger = self.ledger()
+        finding_id, source = self.trait_method_finding(ledger)
+        _ = self.built_finding(ledger, PARENT_FILE, "Type", "RenamedType", line=4)
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait", "RenamedTrait", line=1)
+        _ = self.built_finding(ledger, PARENT_FILE, "RenamedTrait::old", "RenamedTrait::new", line=2)
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("Type", "RenamedType").replace("Trait", "RenamedTrait").replace("fn old", "fn new")})
+        filed = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        moved, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(moved, style_ledger.DeclarationMoved(
+            filed, declarations.Declaration("fn", "new", declarations.ImplOrTraitItem("RenamedType")), PARENT_FILE, 7))
+
+    def assert_trait_destination_limit(self, case: str) -> None:
+        ledger = self.ledger()
+        source = TRAIT_METHOD
+        renamed = source.replace("fn old", "fn new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: renamed if case == "preexisting" else "pub fn helper() {}\n"})
+        # Read after the twin was committed so the gain check has real prior evidence.
+        _, (finding_id,) = self.judge_parent(ledger, ((7, "7"),), kind="restructure", before=case, after="change")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
+        files: dict[str, str | None] = {PARENT_FILE: "pub fn helper() {}\n", MOVED_FILE: renamed}
+        if case == "two files":
+            files[TWIN_FILE] = renamed
+        elif case == "two items":
+            files[MOVED_FILE] = renamed + "\n" + renamed
+        _ = self.commit_tip(ledger, files)
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_preexisting_destination_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_destination_limit('preexisting')
+
+    def test_two_destination_files_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_destination_limit('two files')
+
+    def test_two_destination_items_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_destination_limit('two items')
+
+    def assert_trait_follow_limit(self, case: str) -> None:
+        ledger = self.ledger()
+        finding_id, source = self.trait_method_finding(ledger)
+        built_path = "crates/beta/src/other.rs" if case == "other crate" else PARENT_FILE
+        _ = self.built_finding(ledger, built_path, "Trait::old", "Trait::new")
+        if case == "fork":
+            _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::other")
+        if case == "open build":
+            ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [PARENT_FILE], [self.rule("names")],
+                              proposal=str(self.root / "decision.md"), finding_ids=(finding_id,))
+            ledger.ticket_assign("names-1", "main")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        answers = iter((True,))
+        def approved(path: Path) -> bool:
+            if case == "unapproved":
+                return path != self.root / "built.md"
+            return next(answers, False) if case == "lost approval" and path == self.root / "built.md" else True
+        outcome, = ledger.follow_declarations([finding_id], ledger.synced_commit(), approved).outcomes
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        if case == "open build":
+            ledger.ticket_drop("names-1")
+
+    def test_unapproved_trait_rename_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_follow_limit('unapproved')
+
+    def test_trait_rename_from_another_crate_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_follow_limit('other crate')
+
+    def test_forked_trait_rename_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_follow_limit('fork')
+
+    def test_open_trait_build_ticket_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_follow_limit('open build')
+
+    def test_trait_rename_losing_approval_before_lock_keeps_trait_follow_identity(self) -> None:
+        self.assert_trait_follow_limit('lost approval')
+
+    def test_trait_method_rename_chains_stop_before_returning_to_the_original_name(self) -> None:
+        ledger = self.ledger()
+        finding_id, source = self.trait_method_finding(ledger)
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::middle", line=2)
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::middle", "Trait::old", line=2)
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn middle")})
+        filed = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(outcome, style_ledger.DeclarationMoved(
+            filed, declarations.Declaration("fn", "middle", declarations.ImplOrTraitItem("Type")), PARENT_FILE, 7))
+
+    def test_an_open_judging_ticket_keeps_its_trait_method_finding_at_the_read_site(self) -> None:
+        ledger = self.ledger()
+        source = TRAIT_METHOD
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        rule = self.rule("names")
+        ledger.ticket_add("judge-1", "judge", "read", "names", "crates/alpha", [PARENT_FILE], [rule])
+        ledger.ticket_assign("judge-1", "main")
+        _ = ledger.ticket_base("judge-1")
+        finding = ledger.hold(rule, PARENT_FILE, 7, "7", "restructure", "body", "new body", self.blob(rule), "judge-1")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new", line=2)
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding.finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationNotRead)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_readable_qualified_trait_path_follows_its_method_rename(self) -> None:
+        ledger = self.ledger()
+        source = "pub struct Type;\nimpl crate::traits::Trait for Type {\n    fn old(&self) -> u32 {\n        7\n    }\n}\n"
+        source += "use crate::traits::Trait;\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        filed = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(outcome, style_ledger.DeclarationMoved(
+            filed, declarations.Declaration("fn", "new", declarations.ImplOrTraitItem("Type")), PARENT_FILE, 4))
+
+    def assert_changed_trait_membership_is_left(self, before_header: str, after_header: str) -> None:
+        ledger = self.ledger()
+        body = " {\n    fn old(&self) -> u32 {\n        7\n    }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: before_header + body})
+        _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: after_header + body.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_an_unreadable_implemented_trait_grants_no_method_follow(self) -> None:
+        self.assert_changed_trait_membership_is_left("impl <Type as Family>::Trait for Type",
+                                                     "impl <Type as Family>::Trait for Type")
+
+    def test_matching_trait_leaf_names_do_not_hide_different_qualified_trait_paths(self) -> None:
+        self.assert_changed_trait_membership_is_left("impl crate::first::Trait for Type",
+                                                     "impl crate::second::Trait for Type")
+
+    def test_an_aliased_trait_name_does_not_establish_a_trait_qualified_follow(self) -> None:
+        ledger = self.ledger()
+        source = "use crate::Trait as Alias;\npub struct Type;\nimpl Alias for Type {\n    fn old(&self) -> u32 {\n        7\n    }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((5, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_an_inherent_self_rename_does_not_rename_a_traits_other_implementations(self) -> None:
+        ledger = self.ledger()
+        finding_id, source = self.trait_method_finding(ledger)
+        inherent = "pub struct Other;\nimpl Other {\n    fn old() {}\n    fn caller() { Self::old(); }\n}\n"
+        _ = self.commit_tip(ledger, {MOVED_FILE: inherent})
+        _ = self.built_finding(ledger, MOVED_FILE, "Self::old", "Self::new", line=4)
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new"), MOVED_FILE: inherent.replace("old", "new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_qualifying_the_same_trait_keeps_an_unfiled_method_in_place(self) -> None:
+        ledger = self.ledger()
+        source = TRAIT_METHOD
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((7, "7"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl Trait", "impl crate::a::Trait")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_an_import_proves_trait_identity_when_other_modules_declare_the_same_name(self) -> None:
+        ledger = self.ledger()
+        source = "use crate::b::Trait;\npub struct Type;\nimpl Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n", TWIN_FILE: "pub trait Trait {}\n"})
+        _, (finding_id,) = self.hold_parent(ledger, ((4, "7"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl Trait", "impl crate::b::Trait")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_an_uncertain_trait_qualification_keeps_the_unfiled_row_unchanged(self) -> None:
+        ledger = self.ledger()
+        source = "impl Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl Trait", "impl external::Trait")})
+        before = self.held_rows(ledger.database)
+        planned, = ledger.declaration_reading([finding_id], lambda _: True).outcomes
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(type(outcome).__name__, "TraitIdentityUncertain")
+        self.assertEqual(outcome, planned)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_an_unresolved_built_trait_qualifier_cannot_rename_another_modules_impl(self) -> None:
+        ledger = self.ledger()
+        source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait { fn old() {} fn new() {} }\n",
+                                       TWIN_FILE: "pub trait Trait { fn old() {} fn new() {} }\n"})
+        _, (finding_id,) = self.hold_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(type(outcome).__name__, "TraitIdentityUncertain")
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_module_trait_rename_cannot_change_a_different_modules_trait(self) -> None:
+        ledger = self.ledger()
+        source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n", TWIN_FILE: "pub trait Trait {}\n"})
+        _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, TWIN_FILE, "c::Trait", "c::NewTrait")
+        _ = self.built_finding(ledger, TWIN_FILE, "NewTrait::old", "NewTrait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("b::Trait", "b::NewTrait").replace("fn old", "fn new"),
+                                       TWIN_FILE: "pub trait NewTrait {}\n"})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_method_rename_does_not_follow_between_different_trait_arguments(self) -> None:
+        ledger = self.ledger()
+        source = "pub trait Trait<T> { fn old() {} fn new() {} }\nimpl Trait<u8> for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("Trait<u8>", "Trait<u16>").replace("fn old(&self)", "fn new(&self)")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_trait_method_follows_to_a_proved_equal_qualified_destination(self) -> None:
+        ledger = self.ledger()
+        source = "impl Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, TWIN_FILE: "pub trait Trait { fn old() {} }\n"})
+        _, (finding_id,) = self.hold_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn helper() {}\n",
+                                       MOVED_FILE: source.replace("impl Trait", "impl crate::c::Trait").replace("fn old", "fn new"),
+                                       TWIN_FILE: "pub trait Trait { fn new() {} }\n"})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.line, row.state), (MOVED_FILE, 2, style_ledger.Unfiled()))
+
+    def test_unreadable_trait_arguments_keep_the_finding_instead_of_withdrawing_it(self) -> None:
+        ledger = self.ledger()
+        source = "impl Trait<u8>::Assoc for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(type(outcome).__name__, "TraitIdentityUncertain")
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_built_method_rename_in_another_traits_module_grants_no_follow(self) -> None:
+        ledger = self.ledger()
+        source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source,
+                                       MOVED_FILE: "pub trait Trait { fn old() {} fn new() {} }\n",
+                                       TWIN_FILE: "pub trait Trait { fn old() {} fn new() {} }\n"})
+        _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_plain_trait_alias_keeps_the_same_qualified_impl_in_place(self) -> None:
+        ledger = self.ledger()
+        source = "use crate::b::Trait as Alias;\nimpl Alias for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n"})
+        _, (finding_id,) = self.hold_parent(ledger, ((3, "7"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl Alias", "impl crate::b::Trait")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_an_expanded_trait_alias_does_not_match_another_nested_modules_reexport(self) -> None:
+        ledger = self.ledger()
+        source = "use crate::one::nested::Trait as Alias;\nimpl Alias for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {
+            PARENT_FILE: source,
+            "crates/alpha/src/lib.rs": "mod a; mod b; mod other; mod one; mod two;\n",
+            "crates/alpha/src/one.rs": "mod nested;\n",
+            "crates/alpha/src/two.rs": "mod nested;\n",
+            "crates/alpha/src/one/nested.rs": "pub trait Trait { fn old() {} fn new() {} }\n",
+            "crates/alpha/src/two/nested.rs": "pub use crate::other::Other as Trait;\n",
+            "crates/alpha/src/other.rs": "pub trait Other { fn old() {} fn new() {} }\n",
+        })
+        _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Alias::old", "Alias::new", line=3)
+        _ = self.commit_tip(ledger, {
+            PARENT_FILE: "use crate::one::nested::Trait as Alias;\n",
+            MOVED_FILE: "impl crate::two::nested::Trait for Type {\n    fn new(&self) { 7 }\n}\n",
+        })
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        _ = self.commit_tip(ledger, {
+            MOVED_FILE: None,
+            "crates/alpha/src/one/nested.rs": (
+                "pub trait Trait { fn old() {} fn new() {} }\n"
+                "impl Trait for Type {\n    fn new(&self) { 7 }\n}\n"
+            ),
+        })
+        proved, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(proved, style_ledger.DeclarationMoved)
+        self.assertEqual(cast(style_ledger.DeclarationMoved, proved).path, "crates/alpha/src/one/nested.rs")
+
+    def test_growing_trait_alias_cycles_stop_without_following_or_withdrawing(self) -> None:
+        ledger = self.ledger()
+        source = "use b::a;\nuse a::b;\nimpl a::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((4, "7"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl a::Trait", "impl crate::b::Trait")})
+        before = self.held_rows(ledger.database)
+        # The child must finish within five seconds, even if expansion keeps growing its path.
+        program = (
+            "from pathlib import Path; import style_ledger; import sys; "
+            "ledger = style_ledger.Ledger(Path(sys.argv[1]), Path(sys.argv[2])); "
+            "outcome, = ledger.follow_declarations([sys.argv[3]], ledger.synced_commit(), approved=lambda path: True).outcomes; "
+            "print(type(outcome).__name__); ledger.close()"
+        )
+        result = subprocess.run([sys.executable, "-c", program, str(self.repo), str(ledger.database), finding_id],
+                                capture_output=True, text=True, check=True, timeout=5,
+                                env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)})
+        self.assertEqual(result.stdout.strip(), "TraitIdentityUncertain")
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_unsupported_alias_sources_keep_trait_identity_uncertain(self) -> None:
+        for index, (prefix, trait) in enumerate((
+            ("#[cfg(test)] use crate::b::Trait as Alias;\n", "Alias"),
+            ("mod imports { use crate::b::Trait as Alias;\n", "Alias"),
+            ("pub use crate::b::Trait as Alias;\n", "Alias"),
+            ("use external::*;\n", "Alias"),
+            ("mod nested {\n", "self::Alias"),
+            ("mod nested {\n", "super::Alias"),
+        )):
+            with self.subTest(prefix=prefix, trait=trait):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"aliases-{index}.db")
+                self.addCleanup(ledger.close)
+                source = prefix + f"impl {trait} for Type {{\n    fn old(&self) {{ 7 }}\n}}\n"
+                if prefix.startswith(("mod imports", "mod nested")):
+                    source += "}\n"
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n"})
+                _, (finding_id,) = self.hold_parent(ledger, ((len(prefix.splitlines()) + 2, "7"),),
+                                                     kind="restructure", before=prefix + trait)
+                _ = self.commit_tip(ledger, {PARENT_FILE: source.replace(f"impl {trait}", "impl crate::b::Trait")})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_built_trait_alias_cannot_authorize_a_different_traits_method(self) -> None:
+        ledger = self.ledger()
+        source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        built_site = "use crate::other::Other as Trait;\npub fn caller() { Trait::old(); }\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n", TWIN_FILE: built_site,
+                                   "crates/alpha/src/other.rs": "pub trait Other {}\n"})
+        _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new", line=2)
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationGoneFromFile)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_unsupported_imports_block_built_trait_declaration_fallback(self) -> None:
+        for index, imported in enumerate(("#[cfg(test)] use crate::other::Other as Trait;",
+                         "mod imports { use crate::other::Other as Trait;",
+                         "use external::*;", "pub use crate::other::Other as Trait;")):
+            with self.subTest(imported=imported):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"blocked-{index}.db")
+                self.addCleanup(ledger.close)
+                source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+                built_site = imported + "\npub fn caller() { Trait::old(); }\n"
+                if imported.startswith("mod imports"):
+                    built_site += "}\n"
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n",
+                                           TWIN_FILE: built_site})
+                _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), kind="restructure", before=imported)
+                _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new", line=2)
+                _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_real_built_trait_rename_follows_its_dependent_impl_method(self) -> None:
+        ledger = self.ledger()
+        source = "pub trait Trait {\n    fn old() {}\n}\nimpl Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (method,) = self.judge_parent(ledger, ((5, "7"),), kind="restructure")
+        _, (rename,) = self.judge_parent(ledger, ((1, "pub trait Trait"),), before="Trait", after="RenamedTrait")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("Trait", "RenamedTrait")})
+        renamed, = self.follow_approved(ledger, [rename])
+        self.assertIsInstance(renamed, style_ledger.DeclarationRenamed)
+        followed, = self.follow_approved(ledger, [method])
+        self.assertIsInstance(followed, style_ledger.DeclarationMoved)
+        self.assertEqual(cast(style_ledger.DeclarationMoved, followed).declaration,
+                         declarations.Declaration("fn", "old", declarations.ImplOrTraitItem("Type")))
+        again, = self.follow_approved(ledger, [method])
+        self.assertIsInstance(again, style_ledger.DeclarationInPlace)
+
+    def test_an_uncertain_built_rename_without_a_gained_destination_does_not_keep_a_deleted_method(self) -> None:
+        ledger = self.ledger()
+        source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n", TWIN_FILE: "pub trait Trait {}\n"})
+        _, (finding_id,) = self.hold_parent(ledger, ((2, "7"),), kind="restructure")
+        _ = self.built_finding(ledger, PARENT_FILE, "Trait::old", "Trait::new")
+        _ = self.commit_tip(ledger, {PARENT_FILE: "impl crate::b::Trait for Type {}\n"})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationRemoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertIsInstance(row.state, style_ledger.Withdrawn)
+
+    def test_an_unrelated_built_name_in_another_crate_does_not_withdraw_an_outside_rename(self) -> None:
+        ledger = self.ledger()
+        source = "fn original() {\n    first();\n    second();\n}\n"
+        other = "crates/beta/src/other.rs"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, other: source.replace("original", "unrelated")})
+        _, (finding_id,) = self.hold_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+        _ = self.built_finding(ledger, other, "original", "elsewhere")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("original", "renamed")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Unfiled()))
+        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_a_built_rename_in_another_module_does_not_withdraw_an_outside_rename(self) -> None:
+        ledger = self.ledger()
+        source = "fn original() {\n    first();\n    second();\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "fn elsewhere() {}\n"})
+        _, (finding_id,) = self.hold_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+        _ = self.built_finding(ledger, MOVED_FILE, "b::original", "b::elsewhere")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("original", "renamed")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Unfiled()))
+        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_outside_method_renames_require_the_same_resolved_generic_argument(self) -> None:
+        for changed in (False, True):
+            with self.subTest(argument_changed=changed):
+                with style_ledger.Ledger(self.repo, self.root / f"generic-owner-{changed}.db") as ledger:
+                    source = ("use crate::a::one::Arg as A;\nmod one { pub struct Arg; }\n"
+                              + "mod two { pub struct Arg; }\nstruct Holder<T>(T);\n"
+                              + "impl crate::a::Holder<A> {\n    fn original(&self) -> u32 {\n        1\n    }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((6, "fn original(&self) -> u32 {"),), kind="restructure")
+                    target = source.replace("fn original", "fn renamed")
+                    if changed:
+                        target = target.replace("use crate::a::one::Arg", "use crate::a::two::Arg")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if changed:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+                        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Filed(self.root / "decision.md")))
+
+    def test_outside_method_renames_distinguish_external_arguments_from_local_paths(self) -> None:
+        for argument, local in (("crate::a::std::string::String", True),
+                                ("std::string::String", True), ("std::string::String", False)):
+            with self.subTest(argument=argument, local_root_added=local):
+                with style_ledger.Ledger(self.repo, self.root / f"external-owner-{local}-{argument.count('::')}.db") as ledger:
+                    source = ("struct Holder<T>(T);\nimpl Holder<std::string::String> {\n"
+                              + "    fn original(&self) -> u32 {\n        1\n    }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((3, "fn original(&self) -> u32 {"),), kind="restructure")
+                    target = source.replace("fn original", "fn renamed").replace("std::string::String", argument)
+                    if local:
+                        target += "mod std { pub mod string { pub struct String; } }\n"
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if local:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+                        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Filed(self.root / "decision.md")))
+                        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_outside_method_renames_require_the_same_external_crate_binding(self) -> None:
+        for binding in ("std", "beta"):
+            with self.subTest(destination_crate=binding):
+                with style_ledger.Ledger(self.repo, self.root / f"external-binding-{binding}.db") as ledger:
+                    source = ("extern crate std as external;\npub struct Holder<T>(T);\n"
+                              + "impl crate::a::Holder<external::string::String> {\n"
+                              + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+                    target = (f"extern crate {binding} as external;\n"
+                              + "impl crate::a::Holder<external::string::String> {\n"
+                              + "    fn renamed(&self) -> u32 {\n        7\n    }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "// empty\n",
+                                                 "crates/beta/src/lib.rs": "pub mod string { pub struct String; }\n"})
+                    _, (finding_id,) = self.judge_parent(ledger, ((4, "fn original(&self) -> u32 {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: "pub struct Holder<T>(T);\n", MOVED_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                    self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_crate_root_extern_aliases_do_not_prove_an_outside_method_rename(self) -> None:
+        ledger = self.ledger()
+        source = ("extern crate beta as external;\npub struct Holder<T>(T);\n"
+                  + "impl crate::a::Holder<external::string::String> {\n"
+                  + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+        target = ("impl crate::a::Holder<beta::string::String> {\n"
+                  + "    fn renamed(&self) -> u32 {\n        7\n    }\n}\n")
+        _ = self.commit_tip(ledger, {
+            PARENT_FILE: source, MOVED_FILE: "// empty\n",
+            "crates/alpha/src/lib.rs": "extern crate std as beta;\nmod a; mod b; mod c; mod other;\n",
+            "crates/alpha/Cargo.toml": '[package]\nname="alpha"\nversion="0.1.0"\nedition="2021"\n'
+                + '[dependencies]\nbeta={path="../beta"}\n',
+            "crates/beta/src/lib.rs": "pub mod string { pub struct String; }\n",
+        })
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "fn original(&self) -> u32 {"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub struct Holder<T>(T);\n", MOVED_FILE: target})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_extern_bindings_in_either_revision_keep_outside_method_findings_unchanged(self) -> None:
+        root = "crates/alpha/src/lib.rs"
+        for file in (PARENT_FILE, MOVED_FILE, root):
+            for revision in ("before", "after"):
+                with self.subTest(file=file, revision=revision):
+                    with style_ledger.Ledger(self.repo, self.root / f"extern-{Path(file).stem}-{revision}.db") as ledger:
+                        source = ("pub struct Holder<T>(T);\nimpl crate::a::Holder<std::string::String> {\n"
+                                  + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+                        target = ("impl crate::a::Holder<std::string::String> {\n"
+                                  + "    fn renamed(&self) -> u32 {\n        7\n    }\n}\n")
+                        before_files: dict[str, str | None] = {
+                            PARENT_FILE: source, MOVED_FILE: "// empty\n", root: "mod a; mod b; mod c; mod other;\n",
+                        }
+                        after_files: dict[str, str | None] = {
+                            PARENT_FILE: "pub struct Holder<T>(T);\n", MOVED_FILE: target,
+                            root: "mod a; mod b; mod c; mod other;\n",
+                        }
+                        files = before_files if revision == "before" else after_files
+                        files[file] = "extern crate std as external;\n" + str(files[file])
+                        _ = self.commit_tip(ledger, before_files)
+                        line = 4 if file == PARENT_FILE and revision == "before" else 3
+                        _, (finding_id,) = self.judge_parent(ledger, ((line, "fn original(&self) -> u32 {"),), kind="restructure")
+                        _ = self.commit_tip(ledger, after_files)
+                        before = self.held_rows(ledger.database)
+                        outcome, = self.follow_approved(ledger, [finding_id])
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_local_argument_attributes_only_block_conditional_identity(self) -> None:
+        for attribute in ("#[derive(Clone)]", "#[derive(Clone)]\n", "#[cfg(test)]", "#[cfg_attr(test, derive(Clone))]"):
+            with self.subTest(attribute=attribute):
+                with style_ledger.Ledger(self.repo, self.root / f"argument-attribute-{len(attribute)}.db") as ledger:
+                    source = (f"{attribute} struct Arg;\nstruct Holder<T>(T);\n"
+                              + "impl crate::a::Holder<Arg> {\n"
+                              + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+                    line = source.splitlines().index("    fn original(&self) -> u32 {") + 1
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((line, "fn original(&self) -> u32 {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn original", "fn renamed")})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if "cfg" in attribute:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+                        self.assertEqual((row.path, row.line, row.state),
+                                         (PARENT_FILE, line, style_ledger.Filed(self.root / "decision.md")))
+
+    def test_a_typed_closures_retained_parameter_follows_its_renamed_function_under_lock(self) -> None:
+        ledger = self.ledger()
+        source = ("fn original() {\n    common_one();\n    common_two();\n"
+                  + "    let handler: fn(u32) =\n        move |answers| {\n"
+                  + "            consume(answers);\n        };\n    common_three();\n    common_four();\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((5, "move |answers| {"),), kind="restructure")
+        original, = ledger.held_findings(style_ledger.AllHeldFindings())
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn original", "fn renamed")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((row.finding_id, row.path, row.line, row.state, row.text, row.before, row.after),
+                         (original.finding_id, PARENT_FILE, 5, original.state, original.text, original.before, original.after))
+        self.assertEqual(row.follow, style_ledger.FollowedDeclaration(PARENT_FILE, 5, tip))
+        before = self.held_rows(ledger.database)
+        _ = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_retained_children_follow_a_renamed_function_with_changed_closure_call_arguments(self) -> None:
+        source = """    fn uncached_completed_rows_arrive_before_hierarchy_discovery_is_released() {
+        struct GatedHierarchy {
+            entered: Sender<()>,
+            release: Mutex<Receiver<()>>,
+        }
+        impl HierarchyRunner for GatedHierarchy {
+            fn run(&self, _: &str, _: Duration) -> Result<HierarchyEdges, HierarchyError> {
+                self.entered.send(()).expect("signal discovery");
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("release discovery");
+                Err(HierarchyError::TimedOut)
+            }
+        }
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let expected = vec![session_row("worker", 2)];
+        let rows = expected.clone();
+        let updates = spawn_with_test_source(
+            HierarchyCommand::new(HierarchySource::Command("fixture".to_string())),
+            Arc::new(GatedHierarchy {
+                entered,
+                release: Mutex::new(released),
+            }),
+            move |answers| {
+                answers
+                    .publish(ScanStage::Completed, rows.clone())
+                    .expect("publish completion");
+            },
+        );
+        waiting
+            .recv_timeout(Duration::from_millis(200))
+            .expect("discovery starts");
+        let early = updates.try_recv();
+        release
+            .send(())
+            .expect("release discovery before assertions");
+        assert_eq!(
+            early.expect("uncached completed rows precede discovery"),
+            CensusUpdate::Local {
+                rows:      expected.clone(),
+                hierarchy: HierarchyEdges::default().into(),
+                stage:     ScanStage::Classified,
+            }
+        );
+        assert_eq!(
+            updates
+                .recv_timeout(Duration::from_millis(200))
+                .expect("failed discovery answers"),
+            noted(expected, HierarchyNotice::Failed(HierarchyError::TimedOut))
+        );
+    }
+"""
+        target = """    fn uncached_first_publication_respects_its_budget_and_holds_claude_rows() {
+        struct GatedHierarchy {
+            entered: Sender<()>,
+            release: Mutex<Receiver<()>>,
+        }
+        impl HierarchyRunner for GatedHierarchy {
+            fn run(&self, _: &str, _: Duration) -> Result<HierarchyEdges, HierarchyError> {
+                self.entered.send(()).expect("signal discovery");
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("release discovery");
+                Err(HierarchyError::TimedOut)
+            }
+        }
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let expected = vec![session_row("worker", 2)];
+        let rows = expected.clone();
+        let budget = HIERARCHY_FIRST_PUBLISH_BUDGET / 100;
+        let deadline = budget + HIERARCHY_FIRST_PUBLISH_BUDGET / 5;
+        let (finish, details) = mpsc::channel();
+        let started = Instant::now();
+        let updates = spawn_with_test_source_and_budget(
+            HierarchyCommand::new(HierarchySource::Command("fixture".to_string())),
+            Arc::new(GatedHierarchy {
+                entered,
+                release: Mutex::new(released),
+            }),
+            budget,
+            move |answers| {
+                answers
+                    .publish(ScanStage::Completed, rows.clone())
+                    .expect("publish completion");
+                details
+                    .recv()
+                    .expect("keep the scan open for the late answer");
+            },
+        );
+        waiting
+            .recv_timeout(Duration::from_millis(200))
+            .expect("discovery starts");
+        let early = updates.recv_timeout(deadline);
+        let elapsed = started.elapsed();
+        eprintln!("bounded first publication: {} ms", elapsed.as_millis());
+        release
+            .send(())
+            .expect("release discovery before assertions");
+        assert!(elapsed < deadline, "first publication took {elapsed:?}");
+        assert_eq!(
+            early.expect("safe rows publish inside the startup budget"),
+            CensusUpdate::Local {
+                rows:      Vec::new(),
+                hierarchy: HierarchySnapshot::default(),
+                stage:     ScanStage::Completed,
+            }
+        );
+        let late = updates.recv_timeout(deadline);
+        finish.send(()).expect("release details before assertions");
+        assert_eq!(
+            late.expect("failed discovery answers during detail reads"),
+            noted(expected, HierarchyNotice::Failed(HierarchyError::TimedOut))
+        );
+    }
+"""
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, findings = self.judge_parent(ledger, ((19, "let rows = expected.clone();"), (27, "move |answers| {")), kind="restructure")
+        before = {row.finding_id: row for row in ledger.held_findings(style_ledger.AllHeldFindings())}
+        _ = self.commit_tip(ledger, {PARENT_FILE: target})
+        outcomes = self.follow_approved(ledger, list(findings))
+        self.assertEqual(len(outcomes), 2)
+        for outcome, line in zip(outcomes, (19, 32), strict=True):
+            self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+            moved = cast(style_ledger.DeclarationMoved, outcome)
+            self.assertEqual((moved.path, moved.line), (PARENT_FILE, line))
+            row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == moved.finding.finding_id)
+            original = before[row.finding_id]
+            self.assertEqual((row.state, row.before, row.after, row.text, row.ticket),
+                             (original.state, original.before, original.after, original.text, original.ticket))
+            self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+        again = self.follow_approved(ledger, list(findings))
+        self.assertTrue(all(isinstance(outcome, style_ledger.DeclarationInPlace) for outcome in again))
+
+    def test_an_impl_member_inherits_only_a_proven_outside_trait_rename(self) -> None:
+        for fails in (False, True):
+            with self.subTest(body_fails=fails):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-trait-{fails}.db") as ledger:
+                    source = ("pub struct Type;\ntrait OldTrait {\n    fn child(&self);\n    const ONE: u32 = 1;\n"
+                              + "    const TWO: u32 = 2;\n}\nimpl OldTrait for Type {\n    fn child(&self) { 7 }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((8, "7"),), kind="restructure")
+                    target = source.replace("OldTrait", "NewTrait")
+                    if fails:
+                        target = target.replace("const ONE: u32 = 1", "const THREE: u32 = 3").replace("const TWO: u32 = 2", "const FOUR: u32 = 4")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if fails:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                        self.assertIn(style_ledger.OutsideFailure.BODY_FAILED, repr(outcome))
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row, = ledger.held_findings(style_ledger.AllHeldFindings())
+                        self.assertEqual((row.line, row.state), (8, style_ledger.Filed(self.root / "decision.md")))
+                        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_different_qualified_impl_types_do_not_share_an_outside_method_rename(self) -> None:
+        ledger = self.ledger()
+        source = ("mod one { pub struct Type; }\nmod two { pub struct Type; }\nimpl one::Type {\n"
+                  + "    fn original(&self) -> u32 {\n        1\n    }\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "fn original(&self) -> u32 {"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl one::Type", "impl two::Type").replace("fn original", "fn renamed")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+
+    def test_removed_parameters_and_fields_do_not_inherit_an_outside_owner_rename(self) -> None:
+        cases = (
+            ("fn original(\n    input: u32,\n) -> u32 {\n    let retained = 1;\n    input + retained\n}\n",
+             "fn renamed(\n    replacement: u32,\n) -> u32 {\n    let retained = 1;\n    replacement + retained\n}\n"),
+            ("struct Original {\n    selected: u32,\n    common_one: u32,\n    common_two: u32,\n}\n",
+             "struct Renamed {\n    replacement: u64,\n    common_one: u32,\n    common_two: u32,\n}\n"),
+        )
+        for index, (source, target) in enumerate(cases):
+            with self.subTest(source=source):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-removed-child-{index}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((2, source.splitlines()[1]),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                    self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
+
+    def test_a_closure_parameter_does_not_follow_into_a_different_closure_under_lock(self) -> None:
+        ledger = self.ledger()
+        source = ("fn original() {\n    common_one();\n    common_two();\n    consume(move |answers| {\n"
+                  + "        first(answers);\n    });\n    consume(move |other| {\n        second(other);\n"
+                  + "    });\n    common_three();\n    common_four();\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "consume(move |answers| {"),), kind="restructure")
+        target = (source.replace("fn original", "fn renamed").replace("|answers|", "|removed|")
+                  .replace("first(answers)", "first(removed)").replace("|other|", "|answers|")
+                  .replace("second(other)", "second(answers)"))
+        _ = self.commit_tip(ledger, {PARENT_FILE: target})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
+
+    def test_a_deleted_closures_parameter_does_not_follow_into_the_surviving_call_under_lock(self) -> None:
+        ledger = self.ledger()
+        source = ("fn original() {\n    common_one();\n    common_two();\n    first(move |answers| {\n"
+                  + "        consume(answers);\n    });\n    second(move |other| {\n        consume(other);\n"
+                  + "    });\n    common_three();\n    common_four();\n}\n")
+        target = ("fn renamed() {\n    common_one();\n    common_two();\n    second(move |answers| {\n"
+                  + "        consume(answers);\n    });\n    common_three();\n    common_four();\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "first(move |answers| {"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: target})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_filed_and_an_unfiled_finding_follow_a_proven_outside_rename(self) -> None:
+        for index, (filed, destination) in enumerate((
+            (False, PARENT_FILE), (True, PARENT_FILE), (False, MOVED_FILE), (True, MOVED_FILE),
+        )):
+            with self.subTest(filed=filed, destination=destination):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"outside-{index}.db")
+                source = "fn original() {\n    first();\n    second();\n    third();\n    fourth();\n}\n"
+                target = source.replace("original", "renamed").replace("third();", "changed_third();").replace("fourth();", "changed_fourth();")
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "// empty\n", TWIN_FILE: target})
+                hold = self.judge_parent if filed else self.hold_parent
+                _, (finding_id,) = hold(ledger, ((1, "fn original() {"),), kind="restructure", before="keep this request", after="use a type")
+                original, = ledger.held_findings(style_ledger.AllHeldFindings())
+                changes: dict[str, str | None] = {PARENT_FILE: "// owner moved\n", destination: target,
+                                                   TWIN_FILE: target + "// changed pre-existing twin\n"}
+                tip = self.commit_tip(ledger, changes)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                database = ledger.database
+                ledger.close()
+                with style_ledger.Ledger(self.repo, database) as reopened:
+                    row, = reopened.held_findings(style_ledger.AllHeldFindings())
+                    self.assertEqual((row.finding_id, row.path, row.line, row.state, row.before, row.after,
+                                      row.rule_blob, row.kind, row.text, row.ticket, row.reading, row.follow),
+                                     (finding_id, destination, 1, original.state, original.before, original.after,
+                                      original.rule_blob, original.kind, original.text, original.ticket, original.reading,
+                                      style_ledger.FollowedDeclaration(PARENT_FILE, 1, tip)))
+                    before = self.held_rows(database)
+                    again, = self.follow_approved(reopened, [finding_id])
+                    self.assertIsInstance(again, style_ledger.DeclarationInPlace)
+                    self.assertEqual(self.held_rows(database), before)
+
+    def test_an_outside_rename_needs_every_check_and_reports_its_mapped_declaration(self) -> None:
+        source = "fn original() {\n    first();\n    second();\n    third();\n}\n"
+        good = source.replace("original", "renamed")
+        cases: tuple[tuple[str, str, dict[str, str | None], bool], ...] = (
+            ("only call uses the old name", source, {PARENT_FILE: good + "fn caller() { original(); }\n"}, True),
+            ("old declaration only in another crate", source, {PARENT_FILE: good, self.sources[2]: source}, True),
+            ("one of three", source, {PARENT_FILE: good.replace("second();", "different();").replace("third();", "other();")}, False),
+            ("changed keyword", "struct Original {\n    first: u32,\n    second: u32,\n}\n", {PARENT_FILE: "enum Renamed {\n    First,\n    Second,\n}\n"}, False),
+            ("wrong impl owner", "impl Type {\n    fn original() {\n        first();\n        second();\n    }\n}\n", {PARENT_FILE: "impl Other {\n    fn renamed() {\n        first();\n        second();\n    }\n}\n"}, False),
+            ("wrong implemented trait", "impl crate::First for Type {\n    fn original() {\n        first();\n        second();\n    }\n}\n", {PARENT_FILE: "impl crate::Second for Type {\n    fn renamed() {\n        first();\n        second();\n    }\n}\n"}, False),
+            ("ambiguous mapped line", source, {PARENT_FILE: "fn renamed() { first(); second(); third(); } fn another() { first(); second(); third(); }\n"}, False),
+            ("empty", "fn original() {}\n", {PARENT_FILE: "fn renamed() {}\n"}, False),
+            ("semicolon has no body", "type Original = u32;\nfn nearby() { first(); }\n", {PARENT_FILE: "type Renamed = u32;\nfn nearby() { first(); }\n"}, False),
+            ("one-line body changed", "fn original() { first(); }\n", {PARENT_FILE: "fn renamed() { other(); }\n"}, False),
+            ("repeated lines count once", "fn original() {\n    same();\n    same();\n    same();\n}\n", {PARENT_FILE: "fn renamed() {\n    same();\n    other();\n    last();\n}\n"}, False),
+            ("deleted site and zero targets", source, {PARENT_FILE: None}, False),
+            ("two passing files", source, {PARENT_FILE: "// removed\n", MOVED_FILE: good, TWIN_FILE: good}, False),
+            ("two items in one gained file", source, {PARENT_FILE: "// removed\n", MOVED_FILE: good + good.replace("renamed", "another")}, False),
+            ("different crate only", source, {PARENT_FILE: "// removed\n", self.sources[2]: good}, False),
+            ("original file counts beside gained file", source, {PARENT_FILE: "// mapped away\nfn unrelated() {}\n" + good, MOVED_FILE: good}, False),
+        )
+        for index, (name, old, changes, follows) in enumerate(cases):
+            with self.subTest(case=name):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-limit-{index}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: old, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n",
+                                               self.sources[2]: source if name == "old declaration only in another crate" else "// empty\n"})
+                    site_line = 2 if name.startswith("wrong ") else 1
+                    _, (finding_id,) = self.hold_parent(ledger, ((site_line, old.splitlines()[site_line - 1]),), kind="restructure")
+                    _ = self.commit_tip(ledger, changes)
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if follows:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        if isinstance(outcome, style_ledger.DeclarationMoved):
+                            self.assertEqual(outcome.path, PARENT_FILE)
+                    else:
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Unfiled())
+                        if isinstance(outcome, style_ledger.OutsideRenameUnresolved):
+                            evidence = outcome.evidence
+                            if name == "deleted site and zero targets":
+                                self.assertIsInstance(evidence.mapped, declarations.UnmappedSite)
+                                self.assertIsInstance(evidence.candidates, style_ledger.NoOutsideCandidates)
+                            elif name == "ambiguous mapped line":
+                                self.assertEqual(evidence.mapped, declarations.UnmappedSite(declarations.MappingFailure.AMBIGUOUS))
+                            elif PARENT_FILE in changes and changes[PARENT_FILE] != "// removed\n":
+                                self.assertIsInstance(evidence.mapped, declarations.MappedDeclaration)
+                            if isinstance(evidence.candidates, style_ledger.OutsideCandidates):
+                                paths = [item.path for item in evidence.candidates.items]
+                                self.assertEqual(paths, sorted(paths))
+                                if MOVED_FILE in changes:
+                                    self.assertIn(MOVED_FILE, paths)
+                                if name == "one of three":
+                                    candidate, = evidence.candidates.items
+                                    self.assertEqual((candidate.unchanged, candidate.old_nonblank_count), (1, 3))
+                                    self.assertIn(style_ledger.OutsideFailure.BODY_FAILED, candidate.checks)
+                                if name == "two passing files":
+                                    self.assertEqual({item.path for item in evidence.candidates.items if not item.checks},
+                                                     {MOVED_FILE, TWIN_FILE})
+        for index, old_elsewhere in enumerate((source, "#[cfg(test)] mod tests {\n" + source + "}\n")):
+            with self.subTest(old_elsewhere=old_elsewhere):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-old-{index}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: old_elsewhere, TWIN_FILE: "// empty\n"})
+                    _, (finding_id,) = self.judge_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: good})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+
+        for filed in (False, True):
+            with self.subTest(preexisting_destination=True, filed=filed):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-preexisting-{filed}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: good, TWIN_FILE: "// empty\n"})
+                    hold = self.judge_parent if filed else self.hold_parent
+                    _, (finding_id,) = hold(ledger, ((1, "fn original() {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: None, MOVED_FILE: good + "// edited twin\n"})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                    self.assertIn(MOVED_FILE, repr(outcome))
+                    self.assertIn("declaration not gained", repr(outcome))
+
+    def test_children_follow_only_when_their_renamed_owner_is_proven(self) -> None:
+        cases = (
+            ("let", "fn original() {\n    let rows = collect();\n    publish(rows);\n    finish();\n}\n", 2, "rows", True),
+            ("closure", "fn original() {\n    serve(move |answers| {\n        publish(answers);\n    });\n    finish();\n}\n", 2, "answers", True),
+            ("method", "struct Original {\n    value: u32,\n}\nimpl Original {\n    fn child(&self) {\n        first();\n        second();\n    }\n}\n", 5, "child", True),
+            ("trait associated item", "trait Original {\n    const CHILD: u32 = 7;\n    fn child() { first(); }\n}\n", 2, "CHILD", True),
+            ("child renamed", "fn original() {\n    let rows = collect();\n    publish(rows);\n    finish();\n}\n", 2, "rows", False),
+            ("owner still declared", "struct Original {\n    value: u32,\n}\nimpl Original {\n    fn child(&self) { first(); }\n}\n", 5, "child", False),
+            ("call belongs to function", "fn original() {\n    rows();\n    finish();\n}\n", 2, "rows", True),
+            ("shadowed binding", "fn original() {\n    let rows = collect();\n    { let rows = other(); publish(rows); }\n    finish();\n}\n", 2, "rows", False),
+        )
+        for index, (name, source, line, child, follows) in enumerate(cases):
+            for moved in (False, True):
+                with self.subTest(case=name, moved=moved):
+                    with style_ledger.Ledger(self.repo, self.root / f"outside-child-{index}-{moved}.db") as ledger:
+                        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n"})
+                        _, (finding_id,) = self.judge_parent(ledger, ((line, source.splitlines()[line - 1].strip()),),
+                                                           before=child, after="a better name", kind="restructure")
+                        target = source.replace("original", "renamed").replace("Original", "Renamed")
+                        if name == "child renamed":
+                            target = target.replace("rows", "entries")
+                        if name == "owner still declared":
+                            target += "struct Original;\n"
+                        destination = MOVED_FILE if moved else PARENT_FILE
+                        changes: dict[str, str | None] = {PARENT_FILE: "// owner moved\n", destination: target}
+                        tip = self.commit_tip(ledger, changes)
+                        before = self.held_rows(ledger.database)
+                        outcome, = self.follow_approved(ledger, [finding_id])
+                        if follows:
+                            self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                            row, = ledger.held_findings(style_ledger.AllHeldFindings())
+                            self.assertEqual((row.path, row.line, row.state, row.follow),
+                                             (destination, line, style_ledger.Filed(self.root / "decision.md"),
+                                              style_ledger.FollowedDeclaration(PARENT_FILE, line, tip)))
+                        else:
+                            self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+                            self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_outside_follow_preserves_existing_follow_authority_and_write_rechecks(self) -> None:
+        ledger = self.ledger()
+        source = "fn original() {\n    first();\n    second();\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+        read = ledger.synced_commit()
+        planned = self.commit_tip(ledger, {PARENT_FILE: source.replace("original", "renamed")})
+        before = self.held_rows(ledger.database)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "synced tip moved"):
+            _ = ledger.follow_declarations([finding_id], read, lambda _: True)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        original_read = declarations.read_declarations
+        changed = False
+
+        def read_during_sync(text: str) -> declarations.DeclaredFile:
+            nonlocal changed
+            if not changed:
+                changed = True
+                _ = self.commit_tip(ledger, {MOVED_FILE: "fn helper() {}\n"})
+            return original_read(text)
+
+        with (mock.patch.object(style_ledger, "read_declarations", read_during_sync),
+              self.assertRaisesRegex(style_ledger.LedgerError, "synced tip moved")):
+            _ = ledger.follow_declarations([finding_id], planned, lambda _: True)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+
+        with style_ledger.Ledger(self.repo, self.root / "outside-row-recheck.db") as other:
+            _ = self.commit_tip(other, {PARENT_FILE: source, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n"})
+            _, (finding_id,) = self.hold_parent(other, ((1, "fn original() {"),), kind="restructure")
+            _ = self.commit_tip(other, {PARENT_FILE: source.replace("original", "renamed")})
+            judged = style_ledger.Ledger.judged_commit
+            wrote = False
+
+            def read_during_row_change(reader: style_ledger.Ledger, finding: style_ledger.HeldFinding) -> style_ledger.JudgedCommit | style_ledger.NoJudgedCommit:
+                nonlocal wrote
+                if not wrote:
+                    wrote = True
+                    with closing(sqlite3.connect(other.database)) as connection, connection:
+                        _ = connection.execute("UPDATE held_findings SET text='fresh request' WHERE finding_id=?", (finding_id,))
+                return judged(reader, finding)
+
+            with mock.patch.object(style_ledger.Ledger, "judged_commit", read_during_row_change):
+                outcome, = self.follow_approved(other, [finding_id])
+            self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+            row, = other.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(row.text, "fresh request")
+
+    def test_live_outside_rename_examples_follow_only_the_two_retained_children(self) -> None:
+        ledger = self.ledger()
+        old_body = ["    let rows = collect();", "    serve(move |answers| publish(answers));"]
+        old_body.extend(f"    step_{index}();" for index in range(50))
+        new_body = old_body[:43] + [f"    replacement_{index}();" for index in range(9)]
+        old_name = "uncached_completed_rows_arrive_before_hierarchy_discovery_is_released"
+        new_name = "uncached_first_publication_respects_its_budget_and_holds_claude_rows"
+        source = f"fn {old_name}() {{\n" + "\n".join(old_body) + "\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, ids = self.judge_parent(ledger, ((2, old_body[0].strip()), (3, old_body[1].strip())), kind="restructure")
+        target = f"fn {new_name}() {{\n" + "\n".join(new_body) + "\n}\n"
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// relocated\n" + target})
+        outcomes = self.follow_approved(ledger, list(ids))
+        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved] * 2)
+        rows = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual([(row.finding_id, row.line, row.state, row.follow) for row in rows],
+                         [(finding_id, line + 1, style_ledger.Filed(self.root / "decision.md"),
+                           style_ledger.FollowedDeclaration(PARENT_FILE, line, tip)) for finding_id, line in zip(ids, (2, 3))])
+        cases = (
+            ("device", "fn device_line() { Device::new() }\n", "fn total_line() { Total::new() }\n"),
+            ("CPU test", "fn original() {\n" + "\n".join(f"    check_{i}();" for i in range(8)) + "\n}\n",
+             "fn renamed() {\n" + "\n".join([f"    check_{i}();" for i in range(3)] + [f"    changed_{i}();" for i in range(5)]) + "\n}\n"),
+            ("internal docs count", "struct CratesIoInfo {\n    /// old one\n    a: u32,\n    /// old two\n    b: u32,\n    /// old three\n    /// old four\n    c: u32,\n}\n",
+             "struct CratesIoRelease {\n    /// new one\n    a: u32,\n    /// new two\n    b: u32,\n    /// new three\n    /// new four\n    c: u32,\n}\n"),
+            ("changed keyword", "struct CratesIoFields {\n" + "\n".join(f"    field_{i}: u32," for i in range(9)) + "\n}\n",
+             "enum CratesIoSection {\n    Value,\n}\n"),
+        )
+        for index, (name, old, after) in enumerate(cases):
+            with self.subTest(case=name):
+                with style_ledger.Ledger(self.repo, self.root / f"live-limit-{index}.db") as other:
+                    _ = self.commit_tip(other, {PARENT_FILE: old, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n"})
+                    _, (finding_id,) = self.judge_parent(other, ((1, old.splitlines()[0]),), kind="restructure")
+                    destination = PARENT_FILE if name == "changed keyword" else MOVED_FILE
+                    changes: dict[str, str | None] = {PARENT_FILE: after} if destination == PARENT_FILE else {PARENT_FILE: "// removed\n", MOVED_FILE: after}
+                    _ = self.commit_tip(other, changes)
+                    before = self.held_rows(other.database)
+                    outcome, = self.follow_approved(other, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertEqual(self.held_rows(other.database), before)
+                    self.assertIn(destination, repr(outcome))
+                    if isinstance(outcome, style_ledger.OutsideRenameUnresolved):
+                        if name == "changed keyword":
+                            self.assertEqual(outcome.evidence.mapped, declarations.MappedDeclaration(
+                                PARENT_FILE, 1, declarations.Declaration("enum", "CratesIoSection", declarations.ModuleItem()),
+                            ))
+                        candidates = outcome.evidence.candidates
+                        if isinstance(candidates, style_ledger.OutsideCandidates):
+                            counts = {(item.unchanged, item.old_nonblank_count) for item in candidates.items if item.path == destination}
+                            if name == "changed keyword":
+                                self.assertIn((0, 9), counts)
+                            elif name == "internal docs count":
+                                self.assertIn((3, 7), counts)
+                            elif name == "CPU test":
+                                self.assertIn((3, 8), counts)
+                            elif name == "device":
+                                self.assertIn((0, 1), counts)
+
+        for index, name in enumerate(("account name", "LocalAnswers", "renders_primary_marker")):
+            with self.subTest(case=name):
+                with style_ledger.Ledger(self.repo, self.root / f"live-existing-{index}.db") as other:
+                    if name == "renders_primary_marker":
+                        old = "fn renders_primary_marker() {\n    primary();\n    label();\n}\n"
+                        existing = old.replace("renders_primary_marker", "worktree_entry_label")
+                        target = existing + "// absorbed into the old label function\n"
+                    else:
+                        old = f"struct {name.replace(' ', '_')} {{\n    value: u32,\n}}\n"
+                        existing = old
+                        target = old.replace(name.replace(" ", "_"), "Different")
+                    _ = self.commit_tip(other, {PARENT_FILE: old, MOVED_FILE: existing, TWIN_FILE: "// empty\n"})
+                    _, (finding_id,) = self.judge_parent(other, ((1, old.splitlines()[0]),), kind="restructure")
+                    _ = self.commit_tip(other, {PARENT_FILE: target if name != "renders_primary_marker" else "// removed\n",
+                                              MOVED_FILE: target if name == "renders_primary_marker" else existing})
+                    before = self.held_rows(other.database)
+                    outcome, = self.follow_approved(other, [finding_id])
+                    self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+                    self.assertEqual(self.held_rows(other.database), before)
+
+    def test_a_test_module_glob_does_not_block_a_file_level_trait_impl(self) -> None:
+        for index, destination in enumerate((PARENT_FILE, MOVED_FILE)):
+            with self.subTest(destination=destination):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"module-glob-{index}.db")
+                self.addCleanup(ledger.close)
+                source = (
+                    "use crate::c::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n"
+                    "#[cfg(test)]\nmod tests { use super::*; }\n"
+                )
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub fn helper() {}\n",
+                                           TWIN_FILE: "pub trait Trait { fn method(&self); }\n"})
+                _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), kind="restructure")
+                changes: dict[str, str | None]
+                if destination == PARENT_FILE:
+                    changes = {PARENT_FILE: source + "pub fn unrelated() {}\n"}
+                else:
+                    changes = {PARENT_FILE: "pub fn unrelated() {}\n", MOVED_FILE: source}
+                tip = self.commit_tip(ledger, changes)
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                if destination == PARENT_FILE:
+                    self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                else:
+                    self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                    row, = ledger.held_findings(style_ledger.HeldFindingsInState("filed"))
+                    self.assertEqual((row.finding_id, row.path, row.line, row.state, row.follow),
+                                     (finding_id, destination, 3, style_ledger.Filed(self.root / "decision.md"),
+                                      style_ledger.FollowedDeclaration(PARENT_FILE, 3, tip)))
+
+    def test_a_block_import_of_the_trait_name_does_not_block_the_file_level_impl(self) -> None:
+        ledger = self.ledger()
+        source = (
+            "use other::Hittable;\nimpl Hittable<Target> for Pane {\n    fn method(&self) { 7 }\n}\n"
+            "#[cfg(test)]\nmod tests { use other::Hittable; }\n"
+        )
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((3, "7"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source + "pub fn unrelated() {}\n"})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_relative_trait_import_resolves_from_the_file_module(self) -> None:
+        cases = (
+            ("crates/alpha/src/nested/a.rs", "use super::Trait;", "crate::nested::Trait", "same file"),
+            ("crates/alpha/src/nested/a.rs", "use self::inner::Trait;", "crate::nested::a::inner::Trait", "same file"),
+            ("crates/alpha/src/nested/deeper/a.rs", "use super::super::Trait;", "crate::nested::Trait", "same file"),
+            ("crates/alpha/src/nested/mod.rs", "use self::Trait;", "crate::nested::Trait", "same file"),
+            ("crates/alpha/src/nested/a.rs", "use super::Trait;", "crate::nested::Trait", "move"),
+            ("crates/alpha/src/nested/a.rs", "use super::Trait;", "crate::different::Trait", "different trait"),
+            ("crates/alpha/src/nested/a.rs", "", "self::inner::Trait", "direct header"),
+            ("crates/alpha/src/nested/a.rs", "", "super::Trait", "direct header"),
+        )
+        for index, (path, imported, rooted, action) in enumerate(cases):
+            with self.subTest(path=path, imported=imported, action=action, rooted=rooted):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"relative-trait-{index}.db")
+                self.addCleanup(ledger.close)
+                trait = rooted if action == "direct header" else "Trait"
+                source = f"{imported}\nimpl {trait} for Type {{\n    fn method(&self) {{ 7 }}\n}}\n"
+                parents: dict[str, str | None] = {
+                    "crates/alpha/src/lib.rs": "mod nested;\n",
+                    "crates/alpha/src/nested/mod.rs": "mod a; mod b; mod deeper;\n",
+                    "crates/alpha/src/nested/deeper/mod.rs": "mod a;\n",
+                }
+                parents[path] = source
+                _ = self.commit_tip(ledger, parents)
+                _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), path=path, kind="restructure")
+                if action == "direct header":
+                    absolute = "crate::nested::a::inner::Trait" if rooted.startswith("self") else "crate::nested::Trait"
+                    after = source.replace(rooted, absolute)
+                else:
+                    after = source.replace(imported, f"use {rooted};")
+                destination = "crates/alpha/src/nested/b.rs" if action == "move" else path
+                changes: dict[str, str | None] = {destination: after}
+                if destination != path:
+                    changes[path] = "pub fn unrelated() {}\n"
+                tip = self.commit_tip(ledger, changes)
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                if action == "different trait":
+                    self.assertIsInstance(outcome, (style_ledger.TraitIdentityUncertain, style_ledger.DeclarationGoneFromFile))
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                elif action == "move":
+                    self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                    row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings())
+                               if row.finding_id == finding_id)
+                    self.assertEqual((row.path, row.line, row.state, row.follow),
+                                     (destination, 3, style_ledger.Filed(self.root / "decision.md"),
+                                      style_ledger.FollowedDeclaration(path, 3, tip)))
+                else:
+                    self.assertIsInstance(outcome, style_ledger.DeclarationInPlace)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_block_and_relative_import_limits_keep_the_finding(self) -> None:
+        cases = (
+            (PARENT_FILE, "#[cfg(test)]\nmod tests {\nuse super::*;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 5),
+            (PARENT_FILE, "use crate::c::*;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            (PARENT_FILE, "#[cfg(test)] use crate::c::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            (PARENT_FILE, "use super::super::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            ("crates/alpha/examples/a.rs", "use self::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n", 3),
+            (PARENT_FILE, "mod tests {\nuse crate::c::Trait;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 4),
+            (PARENT_FILE, "mod tests {\nimpl self::Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 3),
+            (PARENT_FILE, "fn container() {\nuse crate::c::*;\nimpl Trait for Type {\n    fn method(&self) { 7 }\n}\n}\n", 4),
+        )
+        for index, (path, source, line) in enumerate(cases):
+            with self.subTest(path=path, source=source):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"trait-import-limit-{index}.db")
+                self.addCleanup(ledger.close)
+                _ = self.commit_tip(ledger, {path: source, TWIN_FILE: "pub trait Trait {}\n"})
+                _, (finding_id,) = self.hold_parent(ledger, ((line, "7"),), path=path, kind="restructure")
+                _ = self.commit_tip(ledger, {path: source + "pub fn unrelated() {}\n"})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_same_line_built_qualifiers_keep_enclosing_aliases_uncertain(self) -> None:
+        sites = (
+            "mod imports { use crate::other::Other as Trait; pub fn caller() { Trait::old(); } }",
+            "pub fn caller() { use crate::other::Other as Trait; Trait::old(); }",
+            "pub fn caller() { Trait::old(); } mod imports { use crate::other::Other as Trait; pub fn caller() { Trait::old(); } }",
+        )
+        for index, site in enumerate(sites):
+            with self.subTest(site=site):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"same-line-{index}.db")
+                self.addCleanup(ledger.close)
+                source = "impl crate::b::Trait for Type {\n    fn old(&self) { 7 }\n}\n"
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "pub trait Trait {}\n",
+                                           TWIN_FILE: site + "\n"})
+                _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), kind="restructure")
+                _ = self.built_finding(ledger, TWIN_FILE, "Trait::old", "Trait::new")
+                _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn old", "fn new")})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_unproved_module_layouts_keep_relative_trait_findings_unchanged(self) -> None:
+        root = "crates/alpha/src/"
+        cases: tuple[tuple[str, str, dict[str, str]], ...] = (
+            ("nested/main.rs", "crate::nested::Trait", {"lib.rs": "mod nested;", "nested/mod.rs": "pub mod main;"}),
+            ("nested/lib.rs", "crate::nested::Trait", {"lib.rs": "mod nested;", "nested/mod.rs": "pub mod lib;"}),
+            ("bin/tool.rs", "crate::bin::tool::Trait", {}),
+            ("actual.rs", "crate::actual::Trait", {"lib.rs": '#[path="actual.rs"] mod renamed;'}),
+            ("missing/a.rs", "crate::missing::a::Trait", {}),
+            ("guarded.rs", "crate::guarded::Trait", {"lib.rs": "#[cfg(test)] mod guarded;"}),
+            ("custom.rs", "crate::custom::Trait", {"lib.rs": "mod custom;"}),
+        )
+        for index, (relative, rooted, parents) in enumerate(cases):
+            with self.subTest(relative=relative):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"layout-{index}.db")
+                self.addCleanup(ledger.close)
+                source = "impl self::Trait for Type {\n    fn method(&self) { 7 }\n}\n"
+                path = root + relative
+                files: dict[str, str | None] = {root + name: text + "\n" for name, text in parents.items()}
+                files[path] = source
+                if relative == "custom.rs":
+                    files["crates/alpha/Cargo.toml"] = ('[package]\nname="alpha"\nversion="0.1.0"\n'
+                                                       '[lib]\npath="src/custom.rs"\n')
+                _ = self.commit_tip(ledger, files)
+                _, (finding_id,) = self.hold_parent(ledger, ((2, "7"),), path=path, kind="restructure")
+                _ = self.commit_tip(ledger, {path: source.replace("self::Trait", rooted)})
+                before = self.held_rows(ledger.database)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_nested_main_module_does_not_move_a_finding_to_its_parent_trait(self) -> None:
+        ledger = self.ledger()
+        root = "crates/alpha/src/"
+        path = root + "nested/main.rs"
+        destination = root + "destination.rs"
+        source = "impl self::Trait for Type {\n    fn method(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {root + "lib.rs": "mod nested; mod destination;\n",
+                                   root + "nested/mod.rs": "pub mod main;\n", path: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((2, "7"),), path=path, kind="restructure")
+        _ = self.commit_tip(ledger, {path: "pub fn unrelated() {}\n",
+                                   destination: source.replace("self::Trait", "crate::nested::Trait")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.TraitIdentityUncertain)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_plain_main_module_chain_keeps_relative_shortcuts_identity(self) -> None:
+        ledger = self.ledger()
+        root = "crates/alpha/src/"
+        path = root + "tui/keys/output.rs"
+        destination = root + "tui/keys/other.rs"
+        source = "use super::Shortcuts;\nimpl Shortcuts for Pane {\n    fn method(&self) { 7 }\n}\n"
+        _ = self.commit_tip(ledger, {
+            root + "lib.rs": None,
+            root + "main.rs": "mod tui;\n",
+            root + "tui/mod.rs": "mod keys;\n",
+            root + "tui/keys.rs": "mod output; mod other; pub trait Shortcuts {}\n",
+            path: source,
+            destination: "pub fn unrelated() {}\n",
+        })
+        _, (finding_id,) = self.judge_parent(ledger, ((3, "7"),), path=path, kind="restructure")
+        _ = self.commit_tip(ledger, {path: "pub fn unrelated() {}\n", destination: source.replace(
+            "super::Shortcuts", "crate::tui::keys::Shortcuts")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.line, row.state), (destination, 3, style_ledger.Filed(self.root / "decision.md")))
 
     def restructured_parent(self, ledger: style_ledger.Ledger) -> str:
         """A filed restructure finding on the field line of struct Parent in a.rs."""
@@ -1593,8 +3028,11 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         finding_id = self.restructured_parent(ledger)
         _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
+        before = self.held_rows(ledger.database)
         with mock.patch.object(ledger, "_followed_rename", side_effect=AssertionError("no built rename to follow")):
-            self.assert_left(ledger, finding_id, declarations.Declaration("struct", "Parent", declarations.ModuleItem()))
+            left, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
 
     def test_withdraw_duplicates_is_idempotent_refuses_an_open_ticket_and_the_held_list_names_the_duplicate(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -2183,7 +3621,6 @@ class StyleLedgerTests(unittest.TestCase):
         self.write(self.sources[0], "pub fn changed() {}\n")
         self.set_tip(self.commit("Change a crate input"))
         self.assertEqual(self.states(rule), {**dict.fromkeys(self.sources[:2], "stale"), **dict.fromkeys(self.sources[2:], "open")})
-
 
     def test_structure_file_scope_keys_rust_modules_and_preserves_non_rust_site_fingerprints(self) -> None:
         rule = self.rule("structure-sites", "tier: D\nfamily: modules\ninput_scope: file\ncandidates:\n"
@@ -3133,7 +4570,6 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual({(cell["rule"], cell["path"]) for cell in filtered["cells"]}, {
             (local_id, path) for path in self.sources[:2]
         })
-
 
     def test_checkpoint_restamps_own_family_verdicts_after_only_ticket_edits_and_refill_does_not_reissue(self) -> None:
         rule = self.rule("read")
@@ -4204,7 +5640,6 @@ class StyleLedgerTests(unittest.TestCase):
                 self.assertIn(invalid, refused.stderr)
         self.assertEqual(len(self.ledger().held_findings(style_ledger.AllHeldFindings())), 1)
 
-
     def test_pinned_rule_bytes_survive_edits_reopen_and_pseudo_rules_share_the_parent(self) -> None:
         partial = self.rule(
             "partial", "tier: B\nfamily: names\ncandidates:\n  kind: regex\n  pattern: value\n"
@@ -4400,7 +5835,6 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
         self.assertEqual(versions, [(17,)])
-
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
         ledger = self.ledger()

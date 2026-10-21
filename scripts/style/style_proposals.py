@@ -1342,28 +1342,36 @@ def follow_totals(run: FollowRun) -> str:
 # The outcomes that print a line: each one changes the finding, or names why the step leaves it.
 DeclarationChange = (style_ledger.DeclarationMoved | style_ledger.DeclarationRemoved | style_ledger.DeclaredInSeveralFiles
                      | style_ledger.DeclaredInAnotherCrate | style_ledger.DeclarationRenamed | style_ledger.DeclarationGoneFromFile
-                     | style_ledger.KeptForOpenBuild)
+                     | style_ledger.KeptForOpenBuild | style_ledger.TraitIdentityUncertain | style_ledger.OutsideRenameUnresolved)
 
 
 def follow_line(outcome: DeclarationChange, tip: str) -> str:
     """The line that names what the step does to the finding."""
     finding = outcome.finding
     site = f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}"
+    suffix = (style_ledger.outside_evidence_suffix(outcome.evidence)
+              if isinstance(outcome, (style_ledger.DeclarationRemoved, style_ledger.DeclarationGoneFromFile,
+                                      style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate))
+              and isinstance(outcome.evidence, style_ledger.OutsideRenameNotProven) else "")
     match outcome:
+        case style_ledger.OutsideRenameUnresolved():
+            return f"left {site}: {style_ledger.outside_evidence_line(outcome.evidence)}"
         case style_ledger.DeclarationMoved():
             return f"follow {site} -> {outcome.path}:{outcome.line}: {declaration_line(outcome.declaration)}"
         case style_ledger.DeclarationRemoved():
             return (f"withdraw {site}: {declaration_line(outcome.declaration)} "
-                    + style_ledger.withdrawn_line(style_ledger.DeclarationGone(tip)))
+                    + style_ledger.withdrawn_line(style_ledger.DeclarationGone(tip)) + suffix)
         case style_ledger.DeclaredInSeveralFiles():
-            return f"left {site}: {declaration_line(outcome.declaration)} declared in {', '.join(outcome.paths)}"
+            return f"left {site}: {declaration_line(outcome.declaration)} declared in {', '.join(outcome.paths)}" + suffix
+        case style_ledger.TraitIdentityUncertain():
+            return f"left {site}: {declaration_line(outcome.declaration)} trait identity uncertain"
         case style_ledger.DeclaredInAnotherCrate():
-            return f"left {site}: {declaration_line(outcome.declaration)} declared in another crate: {outcome.path}"
+            return f"left {site}: {declaration_line(outcome.declaration)} declared in another crate: {outcome.path}" + suffix
         case style_ledger.DeclarationRenamed():
             return (f"built {site}: {declaration_line(outcome.declaration)} renamed to {outcome.renamed.name} "
                     + f"in {outcome.path}:{outcome.line}")
         case style_ledger.DeclarationGoneFromFile():
-            return f"left {site}: {declaration_line(outcome.declaration)} declaration gone; waive it or declare it again"
+            return f"left {site}: {declaration_line(outcome.declaration)} declaration gone; waive it or declare it again" + suffix
         case style_ledger.KeptForOpenBuild():
             return f"kept {site}: open ticket {outcome.ticket} builds it"
 

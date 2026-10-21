@@ -3263,6 +3263,45 @@ print('two homes isolated; recorder lock retained; caller restored')
             )
             assert_trial_counts(ux_findings, code_findings, started_at + offset + 1)
 
+    def test_review_trial_counts_the_findings_the_reviewers_raised(self) -> None:
+        """A pool reviewer's findings count though the director opened none of them."""
+        self.write_full_config()
+        started_at = 71_500
+        session_dir = self.start_run("raised-findings", started_at)
+        self.start_phase(session_dir, started_at + 10)
+        state = cast(dict[str, object], json.loads(
+            (session_dir / "progress_history_state.json").read_text(encoding="utf-8")))
+        instance_id = cast(str, cast(dict[str, object], state["phase"])["instance_id"])
+        _ = self.run_findings(
+            session_dir, "open", "--severity", "minor", "--title", "opened by the director",
+            "--caught-by", "delegate", "--lens", "contract", at=started_at + 20,
+        )
+
+        def trial() -> str:
+            return self.run_command("review-trial", "--session-dir", str(session_dir), at=started_at + 40)
+
+        # No turn record: the director's opened finding is the count.
+        self.assertIn("code 1 findings", trial())
+        records = self.history_dir / "review_turns" / session_dir.name
+        records.mkdir(parents=True)
+        for name, instance, kind, status, raised in (
+            ("adversary", instance_id, "broad", "reviewed", 3),
+            ("contract", instance_id, "broad", "reviewed", 2),
+            ("closure", instance_id, "closure", "reviewed", 1),
+            ("failed", instance_id, "broad", "error", 7),
+            ("ux", instance_id, "ux", "reviewed", 4),
+            ("other-phase", "another-instance", "broad", "reviewed", 9),
+        ):
+            _ = (records / f"{name}.json").write_text(json.dumps({
+                "phase_instance_id": instance, "kind": kind, "status": status, "raised": raised,
+            }), encoding="utf-8")
+        _ = (records / "torn.json").write_text("{", encoding="utf-8")
+        self.assertEqual(
+            trial(),
+            "review trial: ux 0 findings, code 6 findings, review-worker minutes 0, "
+            + "ux check minutes 0, ux repair minutes 0",
+        )
+
     def test_review_trial_reports_the_screenshot_check_and_its_repair_minutes(self) -> None:
         """The check's own minutes, and only the fix rounds that covered a ux finding."""
         self.write_full_config()
