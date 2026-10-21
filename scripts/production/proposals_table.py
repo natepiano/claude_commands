@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Print every proposal still open for the user as one Markdown table.
 
-Usage: proposals_table.py [--production <production doc>]
+Usage: proposals_table.py [--production <production doc>] [--next]
 
 Without `--production`, the doc is the one held by the update timer of the calling session
 (`CLAUDE_CODE_SESSION_ID`). Three sources, in this order:
@@ -13,15 +13,20 @@ Without `--production`, the doc is the one held by the update timer of the calli
      or drop.
 
 Each row says what the change is and what the user can do about it, or for an add-on who decides
-it. It reads only, and writes nothing.
+it. The rows waiting for the user's review come first, in urgency.py's order: an issue's level is
+its optional `review_urgency` (`review_due` with soon, `review_marked` with user), its value the
+score of its proposed stars, its prerequisite the first of its `depends_on`. The table reads only.
+`--next` prints the one proposal /next shows and pins it until it leaves the waiting rows.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
-from datetime import datetime
+from dataclasses import replace
+from datetime import date, datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
@@ -29,7 +34,7 @@ import showrunners
 from production_units import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from proposals_folder import open_proposals
+from proposals_folder import open_proposals, slug_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -37,7 +42,11 @@ from scripts.direct import plan_history
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import unit_runs
+import urgency
 from user_zone import user_zone
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "prioritize"))
+from scripts.prioritize import renumber
 
 BACKLOG_DIR = Path(os.environ.get("PLAN_BACKLOG_DIR") or Path.home() / ".local/state/plan-backlog")
 # A run keeps its pending add-ons in a directory named by its run id, under either run-folder name.
@@ -71,6 +80,11 @@ ACTION_WORDS = frozenset({"add", "change", "remove"})
 # Where an entry with no title finds its words, in this order.
 DESCRIBING_FIELDS = ("proposed", "need", "why needed", "why")
 SENTENCE_END = re.compile(r"(?<=[.!?])\s")
+# The stars a proposal's writer proposes, on its `Proposed ranking:` line until the user confirms them.
+RANKING_LINE = re.compile(r"^Proposed ranking:(?P<values>.*)$", re.MULTILINE)
+RANKING_GOAL = re.compile(r"\bgoal (?P<ordinal>\d+) - ")
+STAR_FIELDS = ("alignment", "impact", "urgency", "effort")
+UNSCORED = -math.inf
 
 
 class Row(NamedTuple):
@@ -121,27 +135,92 @@ def issue_state(issue: Issue, progress: ProposalProgress) -> str:
 
 
 class IssueRow(NamedTuple):
-    """A proposal issue's row and the progress it was built from."""
+    """A proposal issue's row, the progress it was built from, and what orders it while it waits."""
     progress: ProposalProgress
-    row: Row
+    entry: urgency.Entry[Row]
 
-    def order(self) -> tuple[bool, str, str]:
-        """The waiting rows first, then the ones in progress, each oldest first."""
-        in_progress = isinstance(self.progress, InProgress)
-        return in_progress, self.row.date, self.row.proposal
+    def order(self) -> tuple[str, str]:
+        """Oldest first."""
+        return self.entry.item.date, self.entry.item.proposal
+
+
+def stars(text: str) -> int:
+    return text.count(renumber.STAR)
+
+
+def proposal_score(issue: Issue) -> float:
+    """The score the vault's ranking gives the issue's stars, from its frontmatter once confirmed, else
+    from its `Proposed ranking:` line; UNSCORED when either lacks a value.
+
+    The goal's bonus counts down from the first goal, so it differs from the vault's by one amount
+    for every proposal and keeps their order.
+    """
+    goal_text = issue.value("backlog_goal")
+    values = {name: stars(issue.value(f"backlog_{name}")) for name in STAR_FIELDS}
+    if not goal_text or not all(values.values()):
+        line = RANKING_LINE.search(read_body(issue.path))
+        parts = {part.strip().split(" ", 1)[0]: part.strip() for part in (line["values"] if line else "").split("·")}
+        goal_text = parts.get("goal", "").removeprefix("goal ")
+        values = {name: stars(parts.get(name, "")) for name in STAR_FIELDS}
+    ordinal = re.match(r"(\d+) - ", goal_text)
+    if ordinal is None or not all(1 <= count <= len(renumber.URGENCY_BONUSES) for count in values.values()):
+        return UNSCORED
+    goal = renumber.Goal(value=goal_text, ordinal=int(ordinal[1]), bonus=-2 * int(ordinal[1]))
+    return renumber.calculate_score(goal, {f"backlog_{name}": count for name, count in values.items()})
+
+
+def read_body(path: Path) -> str:
+    text = "\n".join(read_lines(path))
+    parts = text.split("\n---", 2) if text.startswith("---") else ["", "", text]
+    return parts[-1]
+
+
+def day(text: str) -> datetime | None:
+    try:
+        moment = date.fromisoformat(text)
+    except ValueError:
+        return None
+    return datetime(moment.year, moment.month, moment.day)
+
+
+def issue_urgency(issue: Issue) -> urgency.Urgency:
+    """The issue's `review_urgency`, `review_due` and `review_marked`; a value it cannot read is normal."""
+    try:
+        return urgency.from_fields({key: issue.value(f"review_{key}") for key in ("urgency", "due", "marked")})
+    except urgency.UrgencyError as error:
+        print(f"proposals_table: {issue.path.name}: {error}; read as normal", file=sys.stderr)
+        return urgency.Urgency()
 
 
 def issue_row(issue: Issue) -> IssueRow:
     """The issue's row, its title the P number and the file's name, with its progress read once."""
     progress = proposal_progress(issue)
-    return IssueRow(progress, Row(issue.value("proposed_by") or NONE,
-                                  f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
-                                  issue.value("date_created") or NONE, issue_state(issue, progress)))
+    level = issue_urgency(issue) if isinstance(progress, AwaitingApproval) else urgency.Urgency()
+    shown = urgency.cell(level)
+    row = Row(issue.value("proposed_by") or NONE, f"{issue.value('proposal_id')} {issue.path.stem}".lstrip(),
+              issue.value("date_created") or NONE,
+              issue_state(issue, progress) + (f" · {shown}" if shown else ""))
+    waits = isinstance(progress, AwaitingApproval)
+    entry = urgency.Entry(str(issue.path), row, level, day(row.date),
+                          (proposal_score(issue) if waits else UNSCORED,),
+                          next(iter(issue.fields.get("depends_on", [])), ""))
+    return IssueRow(progress, entry)
+
+
+def issue_entries(found: list[Issue]) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+    """The waiting issues, to be ordered, and the rows of the ones in progress, oldest first."""
+    rows = sorted(map(issue_row, found), key=IssueRow.order)
+    folder = {issue.path.stem: str(issue.path) for issue in found}
+    # `depends_on` names an issue by its file name; an entry's prerequisite is its key, the path.
+    waiting = [replace(row.entry, after=folder.get(row.entry.after, ""))
+               for row in rows if isinstance(row.progress, AwaitingApproval)]
+    return waiting, [row.entry.item for row in rows if isinstance(row.progress, InProgress)]
 
 
 def issue_rows(found: list[Issue]) -> list[Row]:
-    """One row per open proposal issue: the waiting ones, then the ones in progress, each oldest first."""
-    return [found_row.row for found_row in sorted(map(issue_row, found), key=IssueRow.order)]
+    """One row per open proposal issue: the waiting ones in urgency.py's order, then the ones in progress."""
+    waiting, in_progress = issue_entries(found)
+    return [entry.item for entry in urgency.order(waiting)] + in_progress
 
 
 def file_date(path: Path) -> str:
@@ -227,17 +306,45 @@ def table(rows: list[Row]) -> str:
     return "\n".join(lines)
 
 
+def queue(doc: Path) -> str:
+    """The name urgency.py pins the proposal /next showed under."""
+    return f"proposal-{slug_of(doc)}"
+
+
+def waiting_entries(doc: Path) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+    """The proposals waiting for the user's review, to be ordered, then the other issue and backlog rows."""
+    waiting, in_progress = issue_entries(open_proposals(doc))
+    rest = list(in_progress)
+    for row in backlog_rows(BACKLOG_DIR):
+        if row.state == REVIEW_STATE:
+            waiting.append(urgency.Entry(f"backlog: {row.proposal}", row, since=day(row.date), value=(UNSCORED,)))
+        else:
+            rest.append(row)
+    return waiting, rest
+
+
 def open_rows(doc: Path, records: dict[str, object]) -> list[Row]:
-    plans = unit_plan_paths(records)
-    rows = issue_rows(open_proposals(doc))
-    rows += backlog_rows(BACKLOG_DIR)
-    for unit, plan in plans.items():
+    """The waiting proposals, the one /next shows first; then the rest; then the add-ons."""
+    waiting, rows = waiting_entries(doc)
+    rows = [entry.item for entry in urgency.order(waiting, urgency.pinned(queue(doc)))] + rows
+    for unit, plan in unit_plan_paths(records).items():
         rows.extend(unit_add_on_rows(unit, plan))
     return rows
 
 
+def next_proposal(doc: Path) -> str:
+    """The proposal /next shows, and the file to read: the one shown last while it waits, else the first."""
+    waiting, _ = waiting_entries(doc)
+    shown = urgency.top(waiting, queue(doc))
+    if shown is None:
+        return "no proposal is waiting for your review"
+    where = BACKLOG_DIR / "ledger.md" if shown.key.startswith("backlog: ") else Path(shown.key)
+    return f"{shown.item.proposal}\n{where}"
+
+
 def main(arguments: list[str]) -> int:
-    match arguments:
+    one = "--next" in arguments
+    match [argument for argument in arguments if argument != "--next"]:
         case ["--production", doc_text]:
             doc: Path | None = Path(doc_text)
         case []:
@@ -247,8 +354,11 @@ def main(arguments: list[str]) -> int:
                       file=sys.stderr)
                 return 1
         case _:
-            print("usage: proposals_table.py [--production <production doc>]", file=sys.stderr)
+            print("usage: proposals_table.py [--production <production doc>] [--next]", file=sys.stderr)
             return 2
+    if one:
+        print(next_proposal(doc.expanduser().resolve()))
+        return 0
     try:
         records = cast(dict[str, object], json.loads(phase_table.show_production(doc)))
     except (OSError, ValueError, Refusal) as error:

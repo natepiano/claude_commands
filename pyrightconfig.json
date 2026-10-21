@@ -10,6 +10,10 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/hierarchies",
+      "extraPaths": [".", "scripts/hierarchies", "scripts/lib", "scripts/production", "scripts/message", "scripts/direct", "scripts/nightly_review"]
+    },
+    {
       "root": "scripts/herdr",
       "extraPaths": [
         ".",
@@ -155,7 +159,8 @@
     {
       "root": "scripts/notify",
       "extraPaths": [
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/lib"
       ]
     },
     {

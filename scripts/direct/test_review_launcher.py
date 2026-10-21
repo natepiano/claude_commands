@@ -66,6 +66,7 @@ if verb == 'start':
         'turn_id': 'turn-1',
         'status': 'running',
         'role': option('--role'),
+        'task': option('--task'),
         'context_tokens': 12000,
     }
     (session / 'follow_message.txt').write_text(
@@ -115,6 +116,7 @@ elif verb == 'follow':
         sys.exit(1)
     entry['status'] = 'running'
     entry['role'] = option('--role')
+    entry['task'] = option('--task')
     pathlib.Path(session / 'follow_message.txt').write_text(
         pathlib.Path(option('--message-file')).read_text()
     )
@@ -859,6 +861,25 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
         self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
 
+    def test_a_pool_review_naming_an_older_open_phase_records_its_turn_in_that_phase(self) -> None:
+        session = self.start_implementation("named-phase-turn")
+        self.finish_implementation(session)
+        older = cast("dict[str, object]", json.loads(
+            (session / "progress_history_state.json").read_text(encoding="utf-8"))["phase"])
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Next phase")
+        environment = self.pool_fixture()
+        environment["STUB_FINDINGS"] = "1. First finding\n2. Second finding\n"
+        command = self.pool_command(session)
+        command[2:2] = ["--phase", "3"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record, = self.turn_records(session)
+        current = cast("dict[str, object]", json.loads(
+            (session / "progress_history_state.json").read_text(encoding="utf-8"))["phase"])
+        self.assertNotEqual(older["instance_id"], current["instance_id"])
+        self.assertEqual(record["phase_instance_id"], older["instance_id"])
+        self.assertEqual(record["raised"], 2)
+
     def test_a_review_naming_its_phase_writes_its_files_in_that_phase_directory(self) -> None:
         # Two phases reviewing at once each pass their own id, so neither reads the other's findings.
         session = self.start_implementation("phase-directory-files")
@@ -1452,6 +1473,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             json.loads((session_dir / "mesh_roster.json").read_text(encoding="utf-8")),
         )
         self.assertEqual(roster[worker]["role"], "review")
+        self.assertEqual(roster[worker]["task"], "delegate.review")
         reviews = [
             event for event in self.pass_events("assigned")
             if event.get("pass_kind") == "review"
@@ -1486,6 +1508,7 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
         worker = "project-review2"
         self.assertEqual(roster[worker]["status"], "done")
         self.assertEqual(roster[worker]["role"], "review")
+        self.assertEqual(roster[worker]["task"], "delegate.review")
         self.assertEqual(
             (session_dir / "review_findings_1.txt").read_text(encoding="utf-8"),
             "No findings.\n",

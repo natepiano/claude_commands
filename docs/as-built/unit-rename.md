@@ -37,8 +37,15 @@ steps:
    120 s). It exits 2 only past `STOP_WAIT_SECONDS` (`RENAME_UNIT_STOP_WAIT`, default 3600), and a
    rerun resumes there. Before 2026-10-18 apply always exited 2 here and nothing reran it, so a
    rename stopped its unit and stayed at step 0 until someone ran it again (user: "it is
-   unacceptable that it require my intervention"). Refused up front: the new id already running, a Claude that cannot be read, and
-   processes inside the worktree of a unit with no Claude to stop.
+   unacceptable that it require my intervention"). Once the unit is stopped (or was not running),
+   `_stop_runs` sends SIGTERM to what its runs leave in the worktree: a detached run's supervisor
+   (`mesh_runs.py supervise`, found by its run record) with every process of its session, and an
+   app-server's idle-stop watcher (found by the run folder in its arguments). Each leads its own
+   session, so the shutdown path does not end it (2026-10-20: a lint run and a day-old watcher
+   refused the move). `retire_unit.run_processes` finds them and `retire_unit.terminate` stops them;
+   one alive after `TERM_WAIT_SECONDS` refuses, and a rerun resumes. Refused up front: the new id
+   already running, a Claude that cannot be read, and other processes inside the worktree of a unit
+   with no Claude to stop.
 2. **Merge.** `origin/<merge branch>` is merged into the unit in the old worktree. While the unit's
    work is in progress (`_in_progress`: an open phase in its run record, or `git status --porcelain`
    output), nothing is merged: a failed merge's `--abort` can lose uncommitted work. The journal's

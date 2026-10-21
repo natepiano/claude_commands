@@ -105,6 +105,16 @@ def setUpModule() -> None:
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
+    # Tier tests never read the caller's registry, config, or pacer choice.
+    tier_files = {
+        "AGENTS_CONFIG_FILE": str(Path(home.name) / "agents.conf"),
+        "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
+        "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
+    }
+    for path in tier_files.values():
+        _ = Path(path).write_text("", encoding="utf-8")
+    for key, value in tier_files.items():
+        unittest.addModuleCleanup(set_environment(key, value))
     authority = patch.object(role_map, "is_role_map_host", return_value=True)
     _ = authority.start()
     unittest.addModuleCleanup(authority.stop)
@@ -1098,7 +1108,7 @@ class MeshCommandTests(unittest.TestCase):
                          + '{"message": "invented release refusal"}\n')
 
     def test_prime_creates_and_names_a_read_only_review_template_without_a_turn(self) -> None:
-        arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast")
+        arguments = self.prime_cli("--model", "gpt-test", "--service-tier", "fast", "--task", "delegate.review")
         instructions = (self.session_dir / "review-instructions.txt").read_text(encoding="utf-8")
         self.write_pool_roster({"other": {"thread_id": "other-thread", "status": "done"}})
 
@@ -1118,6 +1128,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assert_review_record("template", THREAD_ID)
         self.assertEqual(self.roster()["other"], {"thread_id": "other-thread", "status": "done"})
         self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
+        self.assertEqual(_as_test_dict(self.roster()["template"]).get("task"), "delegate.review")
         self.assertEqual(self.methods("turn/start"), [])
 
     def test_prime_accepts_omitted_model_and_service_tier(self) -> None:
@@ -1651,7 +1662,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(self.methods("turn/start")[0]["params"], {
             "threadId": THREAD_ID,
             "input": [{"type": "text", "text": "Original delegate task"}],
-            "model": "gpt-test", "effort": "high", "sandboxPolicy": WRITE_POLICY,
+            "model": "gpt-test", "effort": "high", "sandboxPolicy": WRITE_POLICY, "serviceTier": "default",
         })
 
     def test_follow_cwd_is_parsed_into_the_turn_cwd_destination(self) -> None:
@@ -1829,6 +1840,7 @@ class MeshCommandTests(unittest.TestCase):
             ],
             "model": "gpt-test", "effort": "high", "cwd": str(worktree),
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+            "serviceTier": "default",
         })
 
     def test_follow_cli_without_new_flags_sends_the_seat_write_policy(self) -> None:
@@ -1850,8 +1862,110 @@ class MeshCommandTests(unittest.TestCase):
                     "threadId": THREAD_ID,
                     "input": [{"type": "text", "text": "Review the second worktree"}],
                     "sandboxPolicy": WRITE_POLICY,
+                    "serviceTier": "default",
                     **overrides,
                 })
+
+    def test_follow_turn_sets_the_default_service_tier(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
+
+        code, _output, errors = self.run_mesh(self.follow_cli("--service-tier", "default"))
+
+        self.assertEqual((code, errors), (0, ""))
+        starts = self.methods("turn/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["params"], {
+            "threadId": THREAD_ID,
+            "input": [{"type": "text", "text": "Review the second worktree"}],
+            "sandboxPolicy": WRITE_POLICY,
+            "serviceTier": "default",
+        })
+
+    def tier_environment(self, registry: str, config: str = "") -> dict[str, str]:
+        registry_file = self.session_dir / "agents.conf"
+        config_file = self.session_dir / "codex.toml"
+        _ = registry_file.write_text(registry, encoding="utf-8")
+        _ = config_file.write_text(config, encoding="utf-8")
+        return {"AGENTS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
+                "CODEX_PACER_TIER_FILE": str(self.session_dir / "pacer-tier")}
+
+    def test_finished_run_wake_uses_the_recorded_task_and_not_the_launch_tier(self) -> None:
+        for task, follow in (("delegate.review", True), ("ask_a_friend.consultation", False)):
+            with self.subTest(task=task):
+                function, row = task.split(".")
+                environment = self.tier_environment(
+                    f"[delegate.options]\ncodex_service_tier=flex\n"
+                    + f"[{function}.options]\ncodex_service_tier.{row}=fast\n")
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
+                self.server.requests.clear()
+                read = codex_mesh.Client.next_frame
+                delivered = False
+
+                def wake(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+                    nonlocal delivered
+                    frame = read(client, deadline)
+                    if frame and frame.get("method") == "turn/completed" and not delivered:
+                        delivered = True
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.assertEqual(codex_mesh.command_send(argparse.Namespace(
+                                session_dir=str(self.session_dir), to="worker",
+                                message="Run finished: fixture build passed", message_file="")), 0)
+                        _ = Path(environment["AGENTS_CONFIG_FILE"]).write_text(
+                            "[delegate.options]\ncodex_service_tier=flex\n"
+                            + f"[{function}.options]\ncodex_service_tier.{row}=default\n")
+                    return frame
+
+                with patch.dict(os.environ, environment), patch.object(codex_mesh.Client, "next_frame", wake):
+                    if follow:
+                        code, _output, errors = self.run_mesh(
+                            self.follow_cli("--task", task, "--service-tier", "fast"))
+                    else:
+                        code, _output, errors = self.run_mesh([
+                            "start", "--name", "worker", "--cwd", str(self.session_dir),
+                            "--prompt-file", str(self.session_dir / "prompt.txt"),
+                            "--summary-file", str(self.session_dir / "summary.txt"),
+                            "--log-file", str(self.session_dir / "agent.log"),
+                            "--task", task, "--service-tier", "fast", "--timeout", "5",
+                        ])
+                self.assertEqual((code, errors), (0, ""))
+                params = [_as_test_dict(start["params"]) for start in self.methods("turn/start")]
+                self.assertEqual([item.get("serviceTier") for item in params], ["fast", "default"])
+                self.assertEqual(self.turn_inputs[-1], "Run finished: fixture build passed")
+                self.assertEqual(self.worker_record().get("task"), task)
+
+    def test_follow_resolves_registry_and_paced_tiers_instead_of_the_launch_tier(self) -> None:
+        cases = [
+            ("[delegate.options]\ncodex_service_tier=fast\ncodex_service_tier.review=default\n", "", "", "default"),
+            ("", 'service_tier = "fast"\n', "", "default"),
+            ("[delegate.options]\ncodex_service_tier=default\n", 'service_tier = "fast"\n', "", "default"),
+            ("[delegate.options]\ncodex_service_tier=pace\n", "", "", "default"),
+            ("[delegate.options]\ncodex_service_tier=fast\n", "", "default", "fast"),
+        ]
+        for registry, config, supplied, expected in cases:
+            with self.subTest(registry=registry, supplied=supplied):
+                environment = self.tier_environment(registry, config)
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done",
+                    "role": "review", "task": "delegate.review"}})
+                self.server.requests.clear()
+                with patch.dict(os.environ, environment):
+                    code, _output, errors = self.run_mesh(self.follow_cli("--service-tier", supplied))
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(_as_test_dict(self.methods("turn/start")[0]["params"])["serviceTier"], expected)
+
+    def test_unknown_task_uses_the_function_tier_and_registry_errors_do_not_stop_a_turn(self) -> None:
+        for registry in ("[delegate.options]\ncodex_service_tier=default\n",
+                         "[delegate.options]\ncodex_service_tier=broken\n"):
+            with self.subTest(registry=registry):
+                environment = self.tier_environment(registry)
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
+                self.server.requests.clear()
+                with patch.dict(os.environ, environment):
+                    code, _output, errors = self.run_mesh(self.follow_cli())
+                self.assertEqual((code, errors), (0, ""))
+                self.assertEqual(_as_test_dict(self.methods("turn/start")[0]["params"])["serviceTier"], "default")
+                if "broken" in registry:
+                    self.assertIn("cannot resolve service tier", (self.session_dir / "worker.log").read_text())
+                    self.assertIn("broken", (self.session_dir / "worker.log").read_text())
 
     def test_follow_cli_accepts_each_new_flag_independently(self) -> None:
         image = self.session_dir / "review.png"
@@ -1878,6 +1992,7 @@ class MeshCommandTests(unittest.TestCase):
                     "threadId": THREAD_ID,
                     "input": [{"type": "text", "text": "Review the second worktree"}],
                     "sandboxPolicy": WRITE_POLICY,
+                    "serviceTier": "default",
                     **overrides,
                 })
 
@@ -2921,6 +3036,9 @@ class MeshCommandTests(unittest.TestCase):
             return original(request)
 
         def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "bash":
+                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
+                return subprocess.CompletedProcess(command, 0, "default", "")
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             commands.append(command)
             # The quota handler has routed the refusal; its short wait has now expired.
@@ -3000,6 +3118,9 @@ class MeshCommandTests(unittest.TestCase):
             return original(request)
 
         def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "bash":
+                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
+                return subprocess.CompletedProcess(command, 0, "default", "")
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             commands.append(command)
             now = datetime.now(timezone.utc)
@@ -3069,6 +3190,9 @@ class MeshCommandTests(unittest.TestCase):
                     "accepting_messages": True}))
 
         def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "bash":
+                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
+                return subprocess.CompletedProcess(command, 0, "default", "")
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             commands.append(command)
             now = datetime.now(timezone.utc)
@@ -3105,6 +3229,9 @@ class MeshCommandTests(unittest.TestCase):
         commands: list[list[str]] = []
 
         def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "bash":
+                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
+                return subprocess.CompletedProcess(command, 0, "default", "")
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             self.save_unresolved_refusal(source)
             commands.append(command)
@@ -3142,6 +3269,9 @@ class MeshCommandTests(unittest.TestCase):
             self.next_thread_id = "replacement-thread"
 
         def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "bash":
+                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
+                return subprocess.CompletedProcess(command, 0, "default", "")
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             self.assertEqual(Path(command[3]), target)
             self.save_unresolved_refusal(agent_accounts.KnownCodexAccount(target, command[4], command[5]))
@@ -3186,6 +3316,9 @@ class MeshCommandTests(unittest.TestCase):
             return pid in table
 
         def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            if command[0] == "bash":
+                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
+                return subprocess.CompletedProcess(command, 0, "default", "")
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             self.save_unresolved_refusal(source)
             if "--stopped" in command:

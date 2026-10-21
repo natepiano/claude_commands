@@ -5,7 +5,8 @@ Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunne
 
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
 `<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, stops
-the unit and its Codex seats at once through the shutdown path (`down`, then `now`), merges the merge branch into the unit, moves the branch and
+the unit and its Codex seats at once through the shutdown path (`down`, then `now`), sends SIGTERM to
+what its runs leave in its worktree (a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
 worktree (unit_move), commits `chore(<slug>): rename unit <old> to <new>` on the merge branch, which
 merge_branch_history follows, merges that commit into the unit, moves the unit's state, retires the
 old branch, points the unit's shutdown record at the new names (each paused Codex seat's launcher
@@ -45,6 +46,7 @@ import phase_table  # noqa: E402
 import production_units  # noqa: E402
 import proposal_issue  # noqa: E402
 import proposals_folder  # noqa: E402
+import retire_unit  # noqa: E402
 import pane_record  # noqa: E402
 import rename_state  # noqa: E402
 import review_pool  # noqa: E402
@@ -80,6 +82,9 @@ STOP_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_STOP_WAIT") or 3600)
 LIVE_WAIT_SECONDS = float(os.environ.get("RENAME_UNIT_LIVE_WAIT") or 180)
 # A stop request that has written no shutdown record by then has failed.
 RECORD_WAIT_SECONDS = 120.0
+# A run supervisor passes SIGTERM to its command and exits when that ends: a lint seen
+# 2026-10-20 took longer than retire_unit's 10 s.
+RUN_STOP_WAIT_SECONDS = 120.0
 POLL_SECONDS = 1.0
 
 
@@ -224,7 +229,10 @@ def _session_name(slug: str, unit: str) -> str:
 
 
 def _check_stopped(rename: UnitRename) -> None:
-    """The unit runs no Claude under either id, and nothing works inside its worktree."""
+    """The unit runs no Claude under either id, and nothing works inside its worktree.
+
+    Its runs' leftovers are ended here too: a rename resumed past its stop step never ran that
+    step's `_stop_runs`, such as one stopped before the stop ended runs."""
     try:
         marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
@@ -235,6 +243,7 @@ def _check_stopped(rename: UnitRename) -> None:
             raise RenameRefused(f"{unit} has a live Claude; stop it first")
         if found and isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {found.claude.reason}")
+    _stop_runs(rename)
     pids = unit_move.processes_inside(rename.worktree())
     if pids:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
@@ -254,7 +263,9 @@ def _check_stoppable(rename: UnitRename) -> None:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {old.claude.reason}")
     if old and isinstance(old.claude, unit_lookup.LiveClaude):
         return
-    pids = unit_move.processes_inside(rename.worktree())
+    inside = unit_move.processes_inside(rename.worktree())
+    runs = retire_unit.run_processes(rename.worktree(), inside) if inside else {}
+    pids = [pid for pid in inside if pid not in runs]
     if pids:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
 
@@ -489,12 +500,26 @@ def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
         except OSError as error:
             raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
         if found is None or isinstance(found.claude, unit_lookup.ClaudeNotRunning):
+            _stop_runs(rename)
             return
         if isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
         _shutdown("down", "--only", found.claude.session_id)
     saved = _await_stopped(rename)
     rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
+    _stop_runs(rename)
+
+
+def _stop_runs(rename: UnitRename) -> None:
+    """SIGTERM what the unit's runs leave in its worktree once the unit has stopped: a detached
+    run's supervisor with its command, and an app-server's idle-stop watcher. Each leads its own
+    session, so the shutdown path does not end it, and nothing starts it again."""
+    worktree = rename.worktree()
+    inside = unit_move.processes_inside(worktree) if unit_move.exists(worktree) else []
+    runs = retire_unit.run_processes(worktree, inside) if inside else {}
+    left = retire_unit.terminate(sorted(runs), runs, RUN_STOP_WAIT_SECONDS)
+    if left:
+        raise RenameRefused("; ".join(left) + "; rerun apply once they stop")
 
 
 def _await_stopped(rename: UnitRename) -> SessionShutdown:
@@ -789,7 +814,8 @@ class Step(NamedTuple):
 
 
 def _describe_stop(r: UnitRename) -> str:
-    return f"stop {r.old} and its Codex seats at once through the shutdown path; its record carries the relaunch"
+    return (f"stop {r.old} and its Codex seats at once through the shutdown path; its record carries the relaunch; "
+            + "then SIGTERM its runs' supervisors and app-server watchers left in the worktree")
 
 
 def _describe_merge(r: UnitRename) -> str:

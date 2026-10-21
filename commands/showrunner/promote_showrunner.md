@@ -53,4 +53,6 @@ What it does:
 The last line says whether the account changed: `moved from <unit account> to
 the showrunner account`, or `same account, no move`. If the restart fails after
 the stop, the output gives the one command that brings the session back as the
-unit it was, and the Units row is unchanged.
+unit it was, and the Units row is unchanged. If the session opens but its
+prompt is not proven to have run, the Units row is retired all the same, and
+the output names the prompt to type into it.

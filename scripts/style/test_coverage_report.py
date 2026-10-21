@@ -169,12 +169,12 @@ class CoverageReportTests(unittest.TestCase):
         self.sync()
         with style_ledger.open_ledger(self.repo) as ledger:
             ledger.lint_record(self.tip, "clippy", True, {})
+        _ = self.held(read)
         for path in self.sources:
             self.record(listed, path)
             self.record(read, path, "held" if path == self.sources[0] else "waived")
         for path in self.sources:
             self.record(structure, path)
-        _ = self.held(read)
 
         output = self.report().stdout
         rows = self.rows(output)
