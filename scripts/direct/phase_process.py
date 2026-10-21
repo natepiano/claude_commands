@@ -49,7 +49,6 @@ class Window:
     def contains(self, at: float) -> bool:
         return self.since <= at < self.until
 
-    @cache
     def label(self) -> str:
         return f"[{stamp(self.since)}, {stamp(self.until)})"
 
@@ -212,7 +211,6 @@ class SourceReference:
     relative_to_plan: bool
 
 
-@cache
 def report_zone() -> ZoneInfo:
     """One report uses one zone setting, read through the shared zone module."""
     return user_zone()
