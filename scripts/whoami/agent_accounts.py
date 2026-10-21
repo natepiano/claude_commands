@@ -645,7 +645,7 @@ def codex_report_in_use(report: Report, workers_home: Path | NoWorkersHome) -> b
 
 @dataclass(frozen=True)
 class CodexWorkAvailable:
-    """Both allowance windows have room, or credits can pay for work."""
+    """Every reported allowance window has room, or credits can pay for work."""
 
 
 @dataclass(frozen=True)
@@ -677,7 +677,9 @@ def codex_can_work(report: Report, now: datetime, credits: CodexCreditsSetting) 
     if isinstance(credits, CreditsOn) and math.isfinite(balance) and balance > 0:
         return CodexWorkAvailable()
     weekly = next((quota for quota in report.quotas if quota.label == "Weekly"), None)
-    windows = (report.five_hour, weekly)
+    # Codex returns a 5-hour window only once the account has used it, so a
+    # missing 5-hour window means no use in it yet: all of it is left.
+    windows = (weekly,) if report.five_hour is None else (weekly, report.five_hour)
     for window in windows:
         if (window is None or window.remaining_percent is None or window.resets_at is None
                 or window.resets_at.tzinfo is None or window.resets_at <= now):
