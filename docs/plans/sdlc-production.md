@@ -23,7 +23,7 @@
 
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
-| guilds-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guilds` | `sdlc-guilds` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/plans/sdlc-guilds-design.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py` |
+| guild-process-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/plans/sdlc-guilds-design.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py` |
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
@@ -47,9 +47,9 @@ The user, via the showrunner, 2026-10-20: "I like goddesses of wisdom and judgem
 
 | File | Owner unit | Other units that touch it |
 | --- | --- | --- |
-| `commands/unit/direct.md` | phases-unit | guilds-unit (the designer and reviewer roles); fix-rounds-unit (the repair round rules) |
-| `docs/production_format.md` | roles-unit | guilds-unit (role names); fix-rounds-unit (<ProductionUnit/> item 7) |
-| `commands/showrunner/produce.md` | roles-unit | guilds-unit (the designer and reviewer roles under a showrunner) |
+| `commands/unit/direct.md` | phases-unit | guild-process-unit (the designer and reviewer roles); fix-rounds-unit (the repair round rules) |
+| `docs/production_format.md` | roles-unit | guild-process-unit (role names); fix-rounds-unit (<ProductionUnit/> item 7) |
+| `commands/showrunner/produce.md` | roles-unit | guild-process-unit (the designer and reviewer roles under a showrunner) |
 
 These three files are also hub files in build-followups. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the build-followups owner.
 
@@ -99,4 +99,4 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | G7 | Guild names (was question B) | The top level is named guilds (the showrunner and its herdr space). The four guilds and their head units are named designers, reviewers, showrunners and units (herdr tab order after the guilds showrunner: designers, reviewers, showrunners, units). Goddess names are on hold. Showrunner's call: the tip folders are ~/rust/nate_style/guilds/<guild>/, with the shared tips in ~/rust/nate_style/guilds/common/. |
 | G8 | Done work: phase 1 (roles in the tree), phase 2 (design doc) | Revise: keep phase 1; guilds-unit updates the design doc with these decisions. Its lasting-role half stays; its guild half changes. |
 | G9 | Next phases: redesign for the new scope, then build | OK: 3 revise the design doc; 4 tip folders and views in nate_style/guilds plus the guild block and G3 events in each starting skill; 5 the guilds production doc, then the top-level guilds showrunner and its four head units, each with its daily record read; 6 lasting designer and reviewer threads. The user's model: sdlc's guild-process unit director owns the guild process; the guilds showrunner runs each guild by that process. The two need different session names. Showrunner's call: sdlc's guilds-unit becomes guild-process-unit (session guild-process). |
-| G10 | Where hierarchies-unit's work goes | |
+| G10 | Where hierarchies-unit's work goes | Move hierarchies-unit into sdlc as its own unit, beside guild-process, with /showrunner:transfer_unit once natedev finishes that command. It keeps its session and reviewed work; guild-process reads its findings. |
