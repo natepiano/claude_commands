@@ -80,35 +80,21 @@ Then (02:3x EDT), item (e): `held add` keys on rule, path and text, so after a w
 
 **Depends on:** Phase 40
 
-Decided by the showrunner (natedev, 2026-10-21): "A decline is always the user's verdict, so it stores the actor `user`. A file-gone waive stores the actor `ledger`. Replace refuses both, as it refuses a person's waive." No new flag on `decline`.
+#### As-built
 
-#### Work Order
-
-**Goal:** No waive is stored without its actor: a decline names the person who declined, and a waive the ledger makes itself says so.
-
-**Spec:**
-
-- Today `decline_findings` (`scripts/style/style_ledger.py` :2365, the update near :2418) sets `waive_provenance='person', waived_by=''`, and erases an earlier actor name. Its callers are `style_proposals.py` `apply_answer` :436 and `decline` :641 (a person's answer) and `style_plan.py` :1666 (findings whose file or site is gone at the synced tip; no person).
-- `decline_findings` takes the actor as a `WaiveActor` value (phase 40's sum type). A decline (`apply_answer`, `decline`) records the actor `user` as a person's waive; the file-gone waive in `style_plan.py` records the actor `ledger` (a new variant, not a person). No new CLI flag.
-- `held replace` refuses a `ledger` waive as it refuses a person's.
-- `held replace` keeps its phase 40 rule: only a unit's waive is replaced; an unrecorded one needs `--person`.
+- `WaiveProvenance` has the value `LEDGER = "ledger"`. The new frozen dataclass `WaiveByLedger` has no fields. `WaiveActor` is now `WaiveByUnit | WaiveByPerson | WaiveByLedger`. `_held` reads a `ledger` row back as `WaiveByLedger()`.
+- `_waive_actor_record(actor)` maps each actor to its stored `(provenance, waived_by)` pair. A `WaiveByLedger` stores `waived_by='ledger'`. It refuses an empty ticket or an empty person name. `held waive` and `decline_findings` both use it.
+- `DeclineActor = WaiveByPerson | WaiveByLedger`. `decline_findings(finding_ids, words, actor)` refuses any other actor with `LedgerError("decline requires a person or the ledger")` before a write. It stores the actor's provenance and name, and no longer writes an empty name. A decline over a unit's waive replaces that actor with the decline actor.
+- `decline` and `apply_answer` in `style_proposals.py` store `WaiveByPerson("user")`. The waive in `style_plan.py` for a finding whose file is gone, or whose site moved to another file, stores `WaiveByLedger()`.
+- `held replace` refuses a ledger waive (`cannot replace a ledger waive`) and a person's waive. It replaces only a unit's waive, and an unrecorded waive still needs `--person`. There is no new CLI flag and no migration. Old rows do not change.
 
 **Files:**
-- `scripts/style/style_ledger.py` — `decline_findings`, the actor type, `held replace`'s refusal of the new actor.
-- `scripts/style/style_proposals.py` — the decline actor through `apply_answer` and `decline`.
-- `scripts/style/style_plan.py` — the file-gone waive's actor.
-- `scripts/style/test_style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_plan.py` — tests.
-- `docs/style_production.md` — the decline and file-gone waive lines.
+- `scripts/style/style_ledger.py` — `WaiveProvenance.LEDGER`, `WaiveByLedger`, `DeclineActor`, `_waive_actor_record`, the actor argument of `decline_findings`, and the refusal of a ledger waive in `held replace`.
+- `scripts/style/style_proposals.py` — `decline` and `apply_answer` pass `WaiveByPerson("user")`.
+- `scripts/style/style_plan.py` — the gone-file and moved-site waive passes `WaiveByLedger()`.
+- `scripts/style/test_style_ledger.py` — tests for the decline actors, the refusal of a unit actor with no write, and the refusal of a ledger waive in `held replace`.
+- `scripts/style/test_style_proposals.py` — tests that a decline and a later finding under the stored answer store the actor `user`.
+- `scripts/style/test_style_plan.py` — tests that a gone-file waive stores the actor `ledger`.
+- `docs/style_production.md` — the decline, refill waive and `held replace` lines name the actor.
 
-**Workers:**
-1 writer; the `decline_findings` signature change breaks callers in all three test files, so one worker holds code and tests.
-- `impl` — every file above. hub: `style_ledger.py`.
-
-**Constraints from prior phases:**
-- Phase 40: `WaiveByUnit(ticket)` / `WaiveByPerson(name)` and `WaiveProvenance` (migration 19, `waived_by` migration 20); `held waive` requires exactly one of `--ticket` and `--person`; `held replace` refuses a person's waive and needs `--person` for an unrecorded one.
-
-**Acceptance gate:**
-- A decline stores the actor `user` and never an empty name; a file-gone waive stores the actor `ledger`; `held replace` refuses both.
-- `env -C /home/natepiano/worktrees/claude-build-followups-style PYTHONPATH=/home/natepiano/worktrees/claude-build-followups-style/scripts/style:/home/natepiano/worktrees/claude-build-followups-style/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_proposals scripts.style.test_style_plan`
-- `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` from the worktree root.
-- `basedpyright -p /home/natepiano/worktrees/claude-build-followups-style` on every changed Python file: `0 errors, 0 warnings`.
+**Binds later work:** Every waive row has a provenance and a non-empty `waived_by`, except old `unrecorded` rows. A new waive path picks a `WaiveActor` variant and passes it through `_waive_actor_record`. `decline_findings` takes only a `DeclineActor`. Only a unit's waive can be replaced.
