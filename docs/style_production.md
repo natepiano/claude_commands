@@ -127,6 +127,15 @@ branch is stored, the unit tip is in the pushed style tip
 tip changes the inputs of at least one such cell. Otherwise it returns 3,
 `waiting for sync`: the next sync or style merge changes the cell.
 
+`record --verdict held` requires an unfiled or filed finding on that rule's cell.
+Without one, the ledger refuses the verdict and names the cell's waived, built
+and withdrawn findings. A waived finding is the user's decision and does not
+make the cell held. Structure tickets list waived findings separately: do not
+hold them again. Record `waived` for a cell whose only findings are waived,
+or hold a new finding with `held add` before recording `held`. A `waived` verdict
+expires when the cell's rule text, file or context changes. Refill can then
+offer the cell again; it adds no skip based on waived findings alone.
+
 The ticket stores its rule text. Workers read the pinned files under the unit
 worktree's `docs/style-production/rules/`, including after an interruption;
 later rule edits cannot change an assigned ticket's Work Order. A queued ticket
