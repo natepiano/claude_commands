@@ -2226,3 +2226,38 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - A thread resumed on a server started before a config change keeps that server's tier until its next turn; from this phase on, the next turn corrects it.
 - Two closure rounds: automatic turns first reused the launch tier from `stream.args`, and a task found by log file name missed review and friend threads.
+
+### Phase 83 — Workers move to a Codex account with room before paid credits  · status: done
+
+**Depends on:** Phase 82
+
+#### Work Order
+
+**Goal:** At 00:07:59 EDT 2026-10-21 the user got "Codex workers now spend paid credits" (`quota.codex_on_credits_last`) for codex2 at 0%, while codex1 read 100%. The user (via natedev, 2026-10-21 08:1x EDT) ruled: `use_credits` on means paid credits are used only when no other Codex account has room; workers move to an account with room first, with no alert. This replaces design C37 ("on = staying on a 0% account and spending credits is wanted"). The user approves what accounts-unit and messaging-unit decide. messaging-unit owns the new template `quota.paid_credits`.
+
+**Constraints from prior phases (diagnosis, 2026-10-21):**
+- `refusals.json` held a codex1 weekly refusal from 10-19 05:47Z (reset 10-24T20:40:37Z). codex1 reset early on 10-20 06:32Z to 100%; its new window started at first use (10-21 04:27Z). `accounts.py` ~1650 skips an account whose `refusals.resolved()` is false. `refusals.resolved` (~189–197) clears a known-window refusal only when the fresh reading's reset is a known time later than the refused reset; usage left is never checked.
+- `agent_accounts.codex_can_work` (~666–686) treats a weekly window with `resetsAt` null as unknown, which means no room, unlike the missing 5-hour window (~680).
+- `quota_alert._zero_destination` (~1396) then returned `NoAccountWithRoom`, and `_zero_open_notice` (~1473–1525) sent the `_last` text. With credits on, `_zero_open_notice` never swaps workers even when another account has room; the credits-off branch calls `accounts.swap` when the pick is a `PickedAccount` with room and sends `codex_workers_moved`.
+- Readings: 04:07:38Z codex1 100.0, codex2 0.0 with credits.
+
+**Spec:**
+1. `refusals.resolved`: a fresh reading taken after the refusal that shows usage left (> 0) in the refused window resolves it, also when its reset is unknown or earlier than the refused reset.
+2. `codex_can_work`: a weekly window with usage left and `resetsAt` null is available, as a missing 5-hour window is.
+3. `_zero_open_notice` with credits on: when another Codex account has room (`_zero_destination` gives a `PickedAccount`), swap the workers there as the credits-off branch does, and send no paid-credits alert and no move note. Only when no Codex account has room do the workers stay and spend credits, with the paid-credits alert. The same rule holds for the low-quota (not yet 0%) path that announces "spend its paid credits, then move to Claude": it names the Codex account with room when one exists.
+4. The no-room alert: if `quota.paid_credits` exists in `scripts/notify/push_catalog.py` / send.py templates when this phase runs, send it with `send.py --to user --template quota.paid_credits --set account=… --set machine=… --set credits=… --set refill=… --set next_reset=…`; otherwise keep today's push. Find the existing call by name.
+5. Tests: a held weekly refusal plus a fresh 100% reading with no reset, and one with an earlier reset, resolves it; `pick("codex", exclude={codex2})` picks codex1; the zero pass with credits on and codex1 with room swaps to codex1 and sends no paid-credits push; with no account with room it sends the alert once. Scratch HOME only.
+
+**Files:**
+- `scripts/accounts/refusals.py`, `scripts/whoami/agent_accounts.py`, `scripts/whoami/quota_alert.py`, `scripts/accounts/accounts.py` (only if the pick needs it)
+- `scripts/accounts/test_refusals.py`, `scripts/whoami/test_agent_accounts.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`
+- `docs/accounts.md`, `docs/quota_alerts.md` — the credits-on rule text
+
+**Workers:** 1 writer. impl owns all files.
+
+**Verification:** `scripts.accounts.test_refusals scripts.accounts.test_accounts scripts.whoami.test_agent_accounts scripts.whoami.test_quota_alert scripts.whoami.test_codex_alert_accounts` (those that exist) with a scratch HOME; basedpyright 0/0 on changed Python files.
+
+**Acceptance gate:**
+- **Room first:** with credits on and another Codex account with room, a 0% account moves the workers and sends no alert.
+- **Stale refusal:** a refusal ends when a fresh reading shows room, whatever its reset.
+- **Suites:** pass, basedpyright 0/0, merge gate passes.
