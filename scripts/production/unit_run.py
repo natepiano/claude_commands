@@ -75,7 +75,7 @@ def local_run(root: Path, worktree: str) -> RunFound | NoMatchingRun:
 def remote_command(root: str, worktree: str) -> str:
     script = '''import json, os, sys
 from pathlib import Path
-root = Path(sys.argv[1] or os.environ.get('PLAN_DELEGATE_HISTORY_DIR') or '~/.local/state/plan-delegate').expanduser()
+root = Path(sys.argv[1] or os.environ.get('UNIT_HISTORY_DIR') or '~/.local/state/plan-delegate').expanduser()
 wanted = os.path.normpath(sys.argv[2])
 for path in sorted(root.glob('runs/*.jsonl')):
  try:
@@ -144,7 +144,7 @@ def main(arguments: list[str]) -> int:
         return 1
     worktree = cell_value(row.get("Worktree", ""))
     root_argument = cast(str, args.root)
-    root = Path(root_argument or os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    root = Path(root_argument or os.environ.get("UNIT_HISTORY_DIR")
                 or "~/.local/state/plan-delegate").expanduser()
     found = local_run(root, worktree)
     machine: Literal["natedev", "mac"] = "natedev"

@@ -95,9 +95,9 @@ class BoardJsonTests(unittest.TestCase):
             **os.environ,
             "HOME": str(self.root),
             "USER_ZONE": "UTC",
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.history),
-            "PLAN_DELEGATE_NOW_EPOCH": str(NOW),
-            "PLAN_DELEGATE_SYNC_WRITES": "0",
+            "UNIT_HISTORY_DIR": str(self.history),
+            "UNIT_NOW_EPOCH": str(NOW),
+            "UNIT_SYNC_WRITES": "0",
             "PHASE_TABLE_VAULT": str(self.root / "vault"),
             "NOTIFIER_STATE_DIR": str(self.notifier),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
@@ -1052,7 +1052,7 @@ class BoardJsonTests(unittest.TestCase):
         trail = array_items(eta["trail"])
         self.assertEqual(len(trail), 3)
         self.assertNotIn(NOW, [object_fields(array_items(item)[0])["at"] for item in trail])
-        self.environment["PLAN_DELEGATE_NOW_EPOCH"] = str(NOW + 60)
+        self.environment["UNIT_NOW_EPOCH"] = str(NOW + 60)
         _, refreshed = self.unit(fixture)
         later_eta = object_fields(refreshed["eta"])
         self.assertEqual(later_eta["trail"], trail)

@@ -173,7 +173,7 @@ class WorkerAssignment:
 
 @dataclass(frozen=True)
 class NotAWorker:
-    """This session is not assigned to a delegate worker."""
+    """This session is not assigned to a worker."""
 
 
 Assignment = WorkerAssignment | NotAWorker
@@ -775,7 +775,7 @@ def _live_runs(
             if now - heartbeat.stat().st_mtime < unit_runs.LIVE_HEARTBEAT_SECS:
                 _ = by_path.setdefault(heartbeat.parent.resolve(), _NoRunningDirector())
         except OSError as error:
-            _problem(problems, f"delegate heartbeat {heartbeat}", error)
+            _problem(problems, f"worker heartbeat {heartbeat}", error)
     return [
         _LiveRun(path, director)
         for path, director in sorted(by_path.items(), key=lambda item: item[0])
@@ -1147,7 +1147,7 @@ def _review_workers(
     return entries
 
 
-def _delegate_workers(
+def _unit_workers(
     machine: str, runs: list[_LiveRun], claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
     problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
@@ -1248,7 +1248,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     details = _raw_session_details(records, problems)
     registered = _registered_showrunners(environment, problems)
     runner_ids = _showrunner_ids(records, registered)
-    roots = unit_runs.run_roots(environment.get("ROSTER_DELEGATE_ROOT"))
+    roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
     production_places = _production_places(
@@ -1257,7 +1257,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     claude = _claude_entries(
         machine, records, details, runner_ids, production_places, runs, workers, home_state=home_state
     )
-    delegate_workers, worker_threads = _delegate_workers(
+    unit_workers, worker_threads = _unit_workers(
         machine, runs, claude, production_places, problems, home_state=home_state
     )
     daemon_socket = codex_daemon.daemon_socket(environment)
@@ -1287,7 +1287,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
         ]
     interactive = _herdr_codex_panes(machine)
     problems.extend(interactive.problems)
-    entries = [*claude.values(), *delegate_workers, *codex_sessions, *interactive.entries]
+    entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
     return Roster(entries, problems)
 
 

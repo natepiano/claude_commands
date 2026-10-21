@@ -785,7 +785,7 @@ def known_sessions(db: sqlite3.Connection, machine: str, paths: Iterable[Path]) 
 
 
 def history_root() -> Path:
-    configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    configured = os.environ.get("UNIT_HISTORY_DIR")
     return Path(configured).expanduser() if configured else Path.home() / ".local/state/plan-delegate"
 
 

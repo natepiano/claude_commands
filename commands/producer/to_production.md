@@ -1,16 +1,16 @@
 ---
-description: Split greenlit phased plans into one delegate-ready plan per unit plus a production doc, so /showrunner:produce can launch the unit directors.
+description: Split greenlit phased plans into one direct-ready plan per unit plus a production doc, so /showrunner:produce can launch the unit directors.
 ---
 
 # To Production
 
 **Purpose:** turn plans that `/producer:greenlight` judged a production into:
-- one delegate-ready plan per unit;
+- one direct-ready plan per unit;
 - the production doc that `/showrunner:produce` runs from.
 
 The words and both formats are defined in:
 - `~/.claude/docs/production_format.md`;
-- `~/.claude/docs/delegate_plan_format.md`.
+- `~/.claude/docs/direct_plan_format.md`.
 
 Read both first.
 
@@ -69,8 +69,8 @@ and merged units.
    phases never renumber.
 2. **Every other unit gets a new plan** beside the source, named
    `<source-stem>-<area>.md`, for example `tool-based-ui-widget.md`. It uses the
-   delegate plan format:
-   - title `# <source title> — <unit>`, the delegate-ready status line, and the
+   worker plan format:
+   - title `# <source title> — <unit>`, the direct-ready status line, and the
      source's `As-built disposition` line when it has one;
    - the **Production line** from the production format;
    - the source's **Issues** line when it has one, naming only the issues whose
@@ -172,6 +172,6 @@ Then stop.
 - Plan docs only; no code, commits, branches or worktrees.
 - Never rewrite a `done` phase and never renumber one.
 - A Work Order moves whole. The only edits are cross-unit references and gate
-  lines. Its Spec stays verbatim (delegate plan format rule 3).
+  lines. Its Spec stays verbatim (worker plan format rule 3).
 - Splitting is packaging under `<DecisionEconomy/>`: decide it and state it.
   The user decides anything that changes what ships.

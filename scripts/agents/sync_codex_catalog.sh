@@ -49,7 +49,7 @@ config_file_mode() {
 
 # One writer at a time. The sync is triggered implicitly by anything that sources
 # agents_config.sh, so a stale freshness gate fires it once per caller -- and a
-# delegate phase sources it three times at once. `mv` is atomic, so no reader
+# worker phase sources it three times at once. `mv` is atomic, so no reader
 # ever sees a torn file, but concurrent syncs still do identical work three times
 # over, and the last to finish writes a copy it read before the others started:
 # a row changed by `/agent` inside that window is silently reverted.

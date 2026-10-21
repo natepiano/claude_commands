@@ -37,7 +37,7 @@ rather than enforced:
   * one worker had a review canceled more than `MAX_REVIEW_CANCELLATIONS` times
   * a runaway backstop at `RUNAWAY_ROUNDS` rounds
 
-Every one of those limits is set in `~/.claude/config/delegate.conf`, which is
+Every one of those limits is set in `~/.claude/config/direct.conf`, which is
 authoritative: no limit has a compiled default, and a missing or unusable value
 stops the run before any command executes. The limits decide when an advisory
 is worth printing; none of them decides whether a round runs.
@@ -93,19 +93,19 @@ STATE_IN_FLIGHT = "repair_in_flight"
 STATE_PENDING = "fixed_pending_review"
 STATE_ACCEPTED = "accepted"
 
-# Every convergence limit is set in `~/.claude/config/delegate.conf` and nowhere
+# Every convergence limit is set in `~/.claude/config/direct.conf` and nowhere
 # else -- there are no compiled defaults, so a missing key or an unusable value
 # stops the run instead of quietly substituting a limit nobody chose. Problems
 # accumulate and are reported together, so one run fixes the whole file rather
-# than one key per attempt. `PLAN_DELEGATE_CONFIG` overrides the path so the
+# than one key per attempt. `UNIT_CONFIG` overrides the path so the
 # tests read a fixture rather than the machine's live settings.
-DEFAULT_CONFIG_PATH = Path("~/.claude/config/delegate.conf").expanduser()
+DEFAULT_CONFIG_PATH = Path("~/.claude/config/direct.conf").expanduser()
 
 _CONFIG_PROBLEMS: list[str] = []
 
 
 def _config_path() -> Path:
-    configured = os.environ.get("PLAN_DELEGATE_CONFIG")
+    configured = os.environ.get("UNIT_CONFIG")
     return Path(configured) if configured else DEFAULT_CONFIG_PATH
 
 
@@ -166,7 +166,7 @@ def _require_usable_config() -> None:
     """Exit before any command runs when the configuration cannot be trusted."""
     if not _CONFIG_PROBLEMS:
         return
-    print(f"delegate.conf ({_config_path()}) is not usable:", file=sys.stderr)
+    print(f"direct.conf ({_config_path()}) is not usable:", file=sys.stderr)
     for problem in _CONFIG_PROBLEMS:
         print(f"  - {problem}", file=sys.stderr)
     print("Every convergence limit must be set; there are no defaults.", file=sys.stderr)
@@ -201,7 +201,7 @@ _require_usable_config()
 
 
 def _now_epoch() -> float:
-    configured = os.environ.get("PLAN_DELEGATE_NOW_EPOCH")
+    configured = os.environ.get("UNIT_NOW_EPOCH")
     if configured:
         return float(configured)
     return time.time()
@@ -416,7 +416,7 @@ def _append_event(session_dir: Path, state: dict[str, object], event: dict[str, 
         _ = handle.write(line)
         handle.flush()
         # Disposable fixtures may omit disk durability; production syncs by default.
-        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+        if os.environ.get("UNIT_SYNC_WRITES", "1") != "0":
             os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -493,7 +493,7 @@ def _live_rounds(state: dict[str, object]) -> list[dict[str, object]]:
 
 
 def _history_root() -> Path:
-    configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    configured = os.environ.get("UNIT_HISTORY_DIR")
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".local" / "state" / "plan-delegate"
@@ -1130,7 +1130,7 @@ def _lens_list(value: str) -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Track plan-delegate review findings and bound the fix loop by convergence."
+        description="Track unit review findings and bound the fix loop by convergence."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

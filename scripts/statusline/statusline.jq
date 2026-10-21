@@ -75,7 +75,7 @@ def commas: tostring | explode | reverse | to_entries
 # The part this session plays, from the signals the production scripts use
 # (shutdown's session kinds, docs/as-built/shutdown-and-restart.md), first match wins.
 # showrunner:    its session id is one a showrunner update timer targets.
-# worker:        agent_bg.sh hands a delegate worker PLAN_DELEGATE_TEAM_ROLE through
+# worker:        agent_bg.sh hands a worker UNIT_TEAM_ROLE through
 #                --settings. It comes before unit director because a background
 #                session inherits the daemon's environment, and a daemon a unit
 #                director started carries SHOWRUNNER_UNIT.
@@ -83,7 +83,7 @@ def commas: tostring | explode | reverse | to_entries
 def role:
   (.session_id // "") as $id
   | if $id != "" and ($ARGS.named.showrunners // "" | split(" ") | any(. == $id)) then "showrunner"
-    elif ($ENV.PLAN_DELEGATE_TEAM_ROLE // "") != "" then "worker"
+    elif ($ENV.UNIT_TEAM_ROLE // "") != "" then "worker"
     elif ($ENV.SHOWRUNNER_UNIT // "") != "" then "unit director"
     else "unassigned"
     end;

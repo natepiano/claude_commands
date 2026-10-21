@@ -167,9 +167,9 @@ def caller(tty: bool) -> str:
 
 def who() -> dict[str, str | None]:
     env = os.environ
-    board = env.get("PLAN_DELEGATE_BOARD_DIR") or env.get("PLAN_DELEGATE_SESSION_DIR")
+    board = env.get("UNIT_RUN_DIR") or env.get("UNIT_SESSION_DIR")
     return {
-        "worker": env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
+        "worker": env.get("UNIT_TEAM_ROLE") or None,
         "delegate_session": Path(board.rstrip("/")).name if board else None,
         "session": env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None,
     }

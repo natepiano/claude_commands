@@ -82,7 +82,7 @@ class MarkedProductions(NamedTuple):
 
 def runs_dir() -> Path:
     """Where /unit:direct keeps one record per run. Read at each call, as the recorder reads it."""
-    root = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    root = os.environ.get("UNIT_HISTORY_DIR")
     return (Path(root).expanduser() if root else Path.home() / ".local/state/plan-delegate") / "runs"
 
 

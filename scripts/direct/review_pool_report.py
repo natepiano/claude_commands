@@ -407,7 +407,7 @@ def remote_command(root: str, quality: bool) -> str:
     # Codex usage comes from the store; SSH carries review records and quality events.
     script = '''import json, os, sys
 from pathlib import Path
-root = Path(sys.argv[1] or os.environ.get('PLAN_DELEGATE_HISTORY_DIR', '~/.local/state/plan-delegate')).expanduser()
+root = Path(sys.argv[1] or os.environ.get('UNIT_HISTORY_DIR', '~/.local/state/plan-delegate')).expanduser()
 quality = sys.argv[2] == '1'
 histories = set()
 def emit(kind, path):
@@ -677,7 +677,7 @@ def main() -> int:
         parser.error("--since is required unless --shadow is used")
     try:
         configured_root = cast(str | None, args.root)
-        root = Path(configured_root or os.environ.get("PLAN_DELEGATE_HISTORY_DIR", "~/.local/state/plan-delegate")).expanduser()
+        root = Path(configured_root or os.environ.get("UNIT_HISTORY_DIR", "~/.local/state/plan-delegate")).expanduser()
         if shadow:
             print(render_shadow(root))
             return 0

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# verify.sh — The only build/test/lint commands a delegate may run.
+# verify.sh — The only build/test/lint commands a worker may run.
 #
-# Work Orders list exact invocations of this script; the delegate composes no
+# Work Orders list exact invocations of this script; the worker composes no
 # cargo flags and makes no scope choices. `check` pins lib and bin targets;
 # `test` selects the package's test targets, including examples with test = true.
 # `lint` runs clippy with --all-targets --all-features to match CI, and mend
 # also uses --all-targets. It checks TOML formatting with taplo at the workspace
 # root. `example` runs clippy on one named example while
 # iterating. `final` is the plan-final full gate, run by the unit director,
-# never by a phase delegate.
+# never by a phase worker.
 #
 # Package selection is always --workspace. Commands use default features unless
 # the Work Order supplies --features; `lint`'s clippy always uses all features.
@@ -26,7 +26,7 @@
 # when the package has a lib.
 #
 # rustdoc is the exception: `lint` documents only the members that differ from
-# HEAD, found here rather than named by the delegate (CHANGED_MEMBERS_PY). A
+# HEAD, found here rather than named by the worker (CHANGED_MEMBERS_PY). A
 # workspace rustdoc starts one process per member at 1 to 5 GB each, and
 # overlapping runs ran natedev out of memory on 2026-09-30. Each distinct member
 # set pays its own dependency compile for that; the push gate still documents
@@ -34,7 +34,7 @@
 #
 # The lint stages — mend, fmt, clippy fix, fmt, clippy judgment, doc — use
 # config/lint.conf (edit it with /lint_config). One switch controls a check in
-# the lint CLI and every delegate phase. `lint` also always runs taplo fmt --check at the
+# the lint CLI and every worker phase. `lint` also always runs taplo fmt --check at the
 # workspace root, using its taplo.toml. A phase runs all five; its unit director
 # runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
@@ -42,8 +42,8 @@
 # correctness and cache constraints, not preferences. cargo check and cargo
 # nextest are never gated — a phase that compiles nothing has verified nothing.
 #
-# A delegate session remembers passes. With PLAN_DELEGATE_BOARD_DIR or
-# PLAN_DELEGATE_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
+# A worker session remembers passes. With UNIT_RUN_DIR or
+# UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
 # <session>/verify_cache/, keyed by the working tree its verdict was judged on,
 # the arguments, rustc -vV, lint.conf, verify.sh, invoke.sh and the
 # RUST*/CARGO_*/NEXTEST_* environment. A plain `lint <package>` leaves the package out of the key:
@@ -67,12 +67,12 @@
 # for clippy judgment and rustdoc. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
 # landed while it ran, and its verdict belongs to neither tree.
-# A run outside a delegate session is never cached.
+# A run outside a worker session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
 # Each record carries what a repeat would cost: the run's wall time minus
 # cargo's own "Finished … in" build times, since a repeat on the same tree
-# builds nothing. Every call, of every verb, in a delegate session or not,
+# builds nothing. Every call, of every verb, in a worker session or not,
 # leaves one call record in the build log (~/.local/state/buildlog; `buildlog
 # schema` lists its fields): ran, failed, interrupted, reused (a pass) or
 # replayed (a lint failure), with the seconds saved and the repo, worktree,
@@ -94,7 +94,7 @@
 #                                          under its own words, so it never
 #                                          answers `test <package>`. Repeat
 #                                          --filter to run a change's tests in
-#                                          one call; in a delegate session the
+#                                          one call; in a worker session the
 #                                          same names, in any order, on an
 #                                          unchanged tree print one line and
 #                                          build nothing
@@ -130,13 +130,13 @@
 #                                          phase changed that example)
 #   verify.sh final                        full workspace gate; refuse examples
 #                                          that hold a test (unit director only)
-#   verify.sh --session-dir <dir> …        any of the above inside a delegate
+#   verify.sh --session-dir <dir> …        any of the above inside a worker
 #                                          session; same as setting
-#                                          PLAN_DELEGATE_SESSION_DIR=<dir>
+#                                          UNIT_SESSION_DIR=<dir>
 #
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
-# single bottom layer, sourced below. This file adds only delegate scope rules
+# single bottom layer, sourced below. This file adds only worker scope rules
 # on top. Shell aliases, validate_ci and release checks use the lint CLI in that
 # directory instead of this script.
 #
@@ -595,7 +595,7 @@ qualify_features() {
 }
 
 # Optional trailing `--features <list>` on check, test, and lint. The Work Order
-# names the exact list; the delegate still composes no flags of its own. Any
+# names the exact list; the worker still composes no flags of its own. Any
 # other leftover argument is a usage error rather than something to pass through.
 # The caller sets PKG before calling this.
 FEATURE_FLAGS=()
@@ -679,7 +679,7 @@ VERIFY_ORIGINAL_ARGS=("$@")
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
 if [[ "${1:-}" == "--session-dir" ]]; then
-    export PLAN_DELEGATE_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
+    export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
 fi
 
@@ -688,9 +688,9 @@ fi
 # runs this same call under a supervisor outside the worker's process group,
 # returns at once, and sends the result to the worker as its next message.
 # Exit 3 means the caller is not a mesh worker; this call then runs attached.
-# The detached run sets PLAN_DELEGATE_DETACHED_RUN, so it does not detach again.
+# The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
 MESH_RUNS_SCRIPT="${VERIFY_MESH_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/mesh_runs.py}"
-if [[ -z "${PLAN_DELEGATE_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
+if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
     "$PY" "$MESH_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
@@ -804,9 +804,9 @@ finish_hold_wait() {
 }
 
 # Pass records (see the header): on for `test` and `lint` in a
-# delegate session. --no-cache turns off the lookup; its result is still
+# worker session. --no-cache turns off the lookup; its result is still
 # recorded, so a flake hunt that passes clears a recorded lint failure.
-CACHE_SESSION_DIR="${PLAN_DELEGATE_BOARD_DIR:-${PLAN_DELEGATE_SESSION_DIR:-}}"
+CACHE_SESSION_DIR="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
 CACHE_DIR=""
 if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
@@ -1389,7 +1389,7 @@ cache_record() {
     {
         printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
             "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
-            "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
+            "${UNIT_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
         if [[ "${host}" == mac ]]; then
             printf 'host=mac\n'
         fi
@@ -1513,31 +1513,31 @@ if ! build_hold_nothing_held; then
 fi
 trap - INT TERM HUP
 
-# Open a progress window for the duration of this run when a delegate session is
+# Open a progress window for the duration of this run when a worker session is
 # in scope. This is what the unit director's progress header reports against
 # while it runs verification itself: an activity, not a pass, so findings.py
 # never counts it toward convergence. The launcher-owns-its-own-pass
 # rule applies here too — the thing that runs the work opens the window.
 PROGRESS_HISTORY="${HOME}/.claude/scripts/direct/progress_history.py"
-ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
+ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
 
-# A phase runs two delegates against one target/ directory and one Cargo lock,
+# A phase runs two workers against one target/ directory and one Cargo lock,
 # so every cargo run below has to be serialized against its peers. Taking the
-# token here rather than asking each delegate's prompt to take it is deliberate:
+# token here rather than asking each worker's prompt to take it is deliberate:
 # a rule that lives only in a prompt is a rule an agent can drop, and dropping
 # this one blocks the whole team behind a lock nobody announced.
 #
-# PLAN_DELEGATE_BOARD_DIR is deliberately not PLAN_DELEGATE_SESSION_DIR: that
+# UNIT_RUN_DIR is deliberately not UNIT_SESSION_DIR: that
 # variable also opens a progress activity window, and concurrent windows
 # would collide in a recorder that keeps one.
 BOARD_HELPER="${HOME}/.claude/scripts/direct/board.sh"
-BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
-BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
+BOARD_DIR="${UNIT_RUN_DIR:-}"
+BOARD_SLOT="${UNIT_TEAM_ROLE:-}"
 # The unit director's own run (a session dir, no board, no team role) takes the
 # token too, as slot `director` on the session's board, so it queues with the
 # workers' detached runs instead of building beside them.
-if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${PLAN_DELEGATE_SESSION_DIR:-}" ]]; then
-    BOARD_DIR="${PLAN_DELEGATE_SESSION_DIR}"
+if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${UNIT_SESSION_DIR:-}" ]]; then
+    BOARD_DIR="${UNIT_SESSION_DIR}"
     BOARD_SLOT=director
 fi
 # TOKEN_USED: this run takes the token. TOKEN_HELD: it holds the token now. The
@@ -1548,8 +1548,8 @@ TOKEN_WAITER_PID=""
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
     # the real board. Normal calls retain Bash's elapsed-seconds clock.
-    if [[ -n "${PLAN_DELEGATE_TOKEN_CLOCK_FILE:-}" ]]; then
-        read -r TOKEN_CLOCK_NOW < "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+    if [[ -n "${UNIT_TOKEN_CLOCK_FILE:-}" ]]; then
+        read -r TOKEN_CLOCK_NOW < "$UNIT_TOKEN_CLOCK_FILE"
     else
         TOKEN_CLOCK_NOW=$SECONDS
     fi

@@ -4,7 +4,7 @@ description: Turn shipped work into an as-built doc — an overview of the featu
 
 # Plan → As-Built
 
-**Purpose:** Once every phase of a delegate-ready plan is implemented, convert the
+**Purpose:** Once every phase of a direct-ready plan is implemented, convert the
 plan into an **as-built doc**: a standalone overview of the feature as it actually
 exists, written for the next implementer who has to touch this code — not a
 process record. Then move it into the repo's as-built directory.
@@ -158,7 +158,7 @@ Determine the repo flavor and choose the as-built directory:
   `docs/as-built/`.
 
 In practice the as-built dir is `as-built/` as a sibling of the plan doc's
-location (matching how delegate-ready plans already link `as-built/…`). Examine
+location (matching how direct-ready plans already link `as-built/…`). Examine
 the repo to confirm which flavor applies.
 
 Choose the filename, then state in one line the doc to create and, in `plan`

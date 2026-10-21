@@ -19,7 +19,7 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 
 **Source.** `calls` rows with `tool = 'verify.sh'`, plus `steps.tree_key` joined through `steps.call_id`. `calls` has no tree key of its own.
 
-**Workers.** A worker is `coalesce(nullif(delegate_session,''), nullif(session,''))`. Several delegate workers can share one session, so the delegate session wins. A call with neither is skipped. `record.py` sets `session` from `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, so a Codex worker keeps its own identity even when it inherits its director's Claude id; existing rows retain their recorded identities.
+**Workers.** A worker is `coalesce(nullif(delegate_session,''), nullif(session,''))`. Several workers can share one session, so the worker session wins. A call with neither is skipped. `record.py` sets `session` from `CODEX_THREAD_ID` before `CLAUDE_CODE_SESSION_ID`, so a Codex worker keeps its own identity even when it inherits its director's Claude id; existing rows retain their recorded identities.
 
 **Trees per call.** `call_trees(connection, end_day) -> dict[str, KnownCallTrees]` gives each verify call the first and last known `tree_key` among its steps, in step order. A call with no keyed step is absent from the map.
 

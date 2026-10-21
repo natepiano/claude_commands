@@ -5254,7 +5254,7 @@ class PickerTests(unittest.TestCase):
         moves.append_move(request)
         stamp = self.now.isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", cause="credits off", why="credits off", moved=["delegate", "fix"]))
+            fallback_at=stamp, owner="codex1", cause="credits off", why="credits off", moved=["direct", "fix"]))
         with patch.object(accounts, "datetime", PickerTime):
             text = accounts.status_report(detail=True)
         self.assertIn("by hand", text)
@@ -5262,22 +5262,22 @@ class PickerTests(unittest.TestCase):
         routing = text.split("Codex work routing:", 1)[1]
         self.assertIn("routed to claude", routing)
         self.assertIn("credits off", routing)
-        self.assertIn("delegate", routing)
+        self.assertIn("direct", routing)
         self.assertIn("— open", routing)
         self.assertNotIn("routed to claude", text.split("Codex work routing:", 1)[0])
         moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", restored=["delegate"], kept=["fix"]))
+            fallback_at=stamp, owner="codex1", restored=["direct"], kept=["fix"]))
         failed_at = (self.now + timedelta(minutes=1)).isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=failed_at, tool="codex",
-            fallback_at=failed_at, owner="unknown", cause="refusal", why="Codex refused work for quota", moved=["delegate"]))
+            fallback_at=failed_at, owner="unknown", cause="refusal", why="Codex refused work for quota", moved=["direct"]))
         moves.append_routing(moves.RoutingNotRestored(kind="routing not restored", at=failed_at, tool="codex",
-            fallback_at=failed_at, owner="unknown", outcome="failed", restored=[], kept=[], failed=["delegate (unreadable)"]))
+            fallback_at=failed_at, owner="unknown", outcome="failed", restored=[], kept=[], failed=["worker (unreadable)"]))
         with patch.object(accounts, "datetime", PickerTime):
             routing = accounts.status_report(detail=True).split("Codex work routing:", 1)[1]
         self.assertEqual(routing.count("routed to claude"), 2)
         self.assertIn("— routed back", routing)
         self.assertIn("— not restored (failed)", routing)
-        self.assertIn("delegate (unreadable)", routing)
+        self.assertIn("worker (unreadable)", routing)
         self.assertIn("owner unknown", routing)
         self.assertNotIn("— open", routing)
 
@@ -5285,13 +5285,13 @@ class PickerTests(unittest.TestCase):
         self.codex("default", "worker@example.invalid")
         stamp = self.now.isoformat()
         moves.append_routing(moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
-            fallback_at=stamp, owner="codex1", cause="auto", why="auto: workers-once", moved=["delegate"]))
+            fallback_at=stamp, owner="codex1", cause="auto", why="auto: workers-once", moved=["direct"]))
         with patch.object(accounts, "datetime", PickerTime):
             text = accounts.status_report(detail=True)
         routing = text.split("Codex work routing:", 1)[1]
         self.assertIn("auto", routing)
         self.assertIn("routed to claude", routing)
-        self.assertIn("delegate", routing)
+        self.assertIn("direct", routing)
         self.assertIn("— open", routing)
 
     def test_default_input_is_refused_before_any_session_or_home_matcher(self) -> None:

@@ -47,7 +47,7 @@ build_hold_mark() {
     local call_id=""
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then
         call_id=$BUILDLOG_CALL_ID
-    elif [[ -z "${CLAUDE_CODE_SESSION_ID:-}${PLAN_DELEGATE_BOARD_DIR:-}${PLAN_DELEGATE_SESSION_DIR:-}" ]]; then
+    elif [[ -z "${CLAUDE_CODE_SESSION_ID:-}${UNIT_RUN_DIR:-}${UNIT_SESSION_DIR:-}" ]]; then
         call_id="${BUILDLOG_HOLD_CALL_ID:-}"
     fi
     if [[ -n "$call_id" ]]; then

@@ -177,7 +177,7 @@ class LocalAdmissionWait(Protocol):
     def __exit__(self, *_arguments: object) -> None: ...
 
 
-# This CLI's import root excludes delegate; keep the runtime import at a typed
+# This CLI's import root excludes worker; keep the runtime import at a typed
 # provider boundary rather than expanding the shared checker configuration.
 release_waiter = cast(Callable[[Path, Path], LocalAdmissionWait], getattr(
     importlib.import_module("scripts.direct.local_release_wait"), "local_release_waiter"))

@@ -48,7 +48,7 @@ __all__ = [
 
 SPINE_VERSION = 1
 
-# Delegate pass kinds and activity labels onto the stage vocabulary the spine
+# Worker pass kinds and activity labels onto the stage vocabulary the spine
 # defines. Any label not listed is `other` rather than being forced into a
 # stage: an unrecognised activity is unclassified data, not a final step.
 PASS_STAGE: dict[str, str] = {
@@ -403,7 +403,7 @@ def _normalize(
         task = _clean_task(_string(event.get("called_task")))
         result = _string(event.get("activity_result"))
     elif event_type == "stage_finished":
-        # The spine's own event, for skills instrumented after delegate. It
+        # The spine's own event, for skills instrumented after /unit:direct. It
         # arrives unvalidated, so every field is coerced the way the branches
         # above build theirs.
         label = _string(event.get("label")).strip().lower()

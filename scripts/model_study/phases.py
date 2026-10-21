@@ -1,4 +1,4 @@
-"""Join director requests to completed plan-delegate phases."""
+"""Join director requests to completed unit phases."""
 
 from __future__ import annotations
 
@@ -279,7 +279,7 @@ def work_order_size_text(value: int | None) -> str:
 
 
 def markdown(report: PhaseReport) -> str:
-    lines = ["## Plan-delegate phases", "", "### Every completed phase", "",
+    lines = ["## Unit phases", "", "### Every completed phase", "",
              "| Director | Plan | Phase | Title | Arm | Requests | Director s | Cost USD | Output | Repair rounds | Findings | Abandoned batches | Elapsed s | Work Order words / lines | Requests / 1k words | Seconds / 1k words | Cost / 1k words |",
              "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for row in report["phases"]:

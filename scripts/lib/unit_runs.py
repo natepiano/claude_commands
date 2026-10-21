@@ -3,7 +3,7 @@
 
 A /unit:direct run keeps its files in `/tmp/claude/unit/<run id>/` and marks its Claude session
 in `/tmp/claude/unit/active/<session id>`.
-Runs started before 2026-10-15 used `delegate` in both places and keep their folders
+Runs started before 2026-10-15 used `worker` in both places and keep their folders
 until they end, so every reader takes both names. The former name is read until a removal
 step, on or after 2026-10-22, drops it; that step runs only while `unit_runs.py removal-check`
 passes, since a run started before the rename may stay open past that date.

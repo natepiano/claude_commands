@@ -17,8 +17,8 @@ Each production has its own pool of long-lived, read-only Codex reviewers. A uni
 | `config/review_pool/code.md` | Standing instructions of the code reviewer |
 | `config/review_pool/ui.md` | Standing instructions of the UI reviewer |
 | `commands/unit/direct.md` | The unit director's side: pool form of each review launch, <UXReview/> |
-| `docs/delegate/dual_review.md` | Pool prompt opening, pool launch call, cancel through the slot file |
-| `docs/delegate/phase_end.md` | States that a pooled reviewer belongs to the unit and stays at phase end |
+| `docs/direct/dual_review.md` | Pool prompt opening, pool launch call, cancel through the slot file |
+| `docs/direct/phase_end.md` | States that a pooled reviewer belongs to the unit and stays at phase end |
 | `docs/production_format.md` | Words, the `**Review pool:**` line, `retire` before a unit is marked retired, <ProductionUnit/> items 3 and 16 |
 | `commands/showrunner/produce.md` | `retire` for a retired unit, `stop` at wrap |
 
@@ -28,7 +28,7 @@ A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug
 
 | Path | Holds |
 | --- | --- |
-| `pool.json` | Templates, reviewers, leases, the generation. Written through a temporary file, `fsync` (skipped when `PLAN_DELEGATE_SYNC_WRITES=0`, for test fixtures) and `os.replace` |
+| `pool.json` | Templates, reviewers, leases, the generation. Written through a temporary file, `fsync` (skipped when `UNIT_SYNC_WRITES=0`, for test fixtures) and `os.replace` |
 | `pool.lock` | One `fcntl.flock` around every read-modify-write of `pool.json` |
 | `prime/<sha256>.md` | Copies of standing prompts, named by content hash |
 | `cwd/` | The templates' working directory, empty |
@@ -49,7 +49,7 @@ A pool belongs to one production. Its state is `~/.local/state/review-pool/<slug
 
 A new file starts with `generation: 0`. `stopping` is present only while a stop is unfinished. A file without `next_index` reads each counter as 1. A file written before reviewers became permanent may still hold `split`, a lease `phase` or a reviewer's `served`; they load and the next write drops them. Types are `code` and `ui`; reviewer names are `<type><n>` (`code1`, `ui2`); a template is named `<type>-template-<hash8>`. In code a lease is `Unleased` or `UnitLease(unit, ordinal)`, and a reviewer's ownership is `IdleReviewer` or `ClaimedReviewer`; `null` appears only where `pool.json` is read and written. A lease's `ordinal` counts the reviews the reviewer has carried on its current thread.
 
-`<history root>` is `PLAN_DELEGATE_HISTORY_DIR`, or `~/.local/state/plan-delegate`. Review turn records and UI verdict pairs live in its `review_turns/<session dir name>/`.
+`<history root>` is `UNIT_HISTORY_DIR`, or `~/.local/state/plan-delegate`. Review turn records and UI verdict pairs live in its `review_turns/<session dir name>/`.
 
 ### `review_pool.py` verbs
 
@@ -109,16 +109,16 @@ Lens `ux` with no pool is accepted. From there the launcher:
 2. Resolves the review agent and requires the Codex family with the mesh; otherwise `ERROR: --pool requires the Codex mesh.`, exit 2.
 3. For `ui`, reads `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, one path per line, into `--image` arguments. An unreadable file (`ERROR: UI shots file is unreadable: <path>.`) or one with no paths (`ERROR: UI shots file has no paths: <path>.`) exits 1 before allocation.
 4. Runs `review_pool.py allocate --production <slug> --type <type> --unit <unit> --phase <phase> --pass <pass_index> [--lens L] --pid $$`. A failure prints `ERROR: pool allocation failed: <the pool's last stderr line>; see <log>.` and exits 1 with no turn; the log is `review_agent_<N>[_<lens>]-pool.log`.
-5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `PLAN_DELEGATE_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
-7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (100000 in `config/delegate.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
-8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path; it checks for the file every `PLAN_DELEGATE_EARLY_POLL_SECS` (default 5 s; tests set it small).
+5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `UNIT_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
+7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `UNIT_COMPACT_ABOVE_TOKENS` (100000 in `config/direct.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
+8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path; it checks for the file every `UNIT_EARLY_POLL_SECS` (default 5 s; tests set it small).
 9. Runs `codex_mesh.py follow --session-dir <mesh_dir> --to <reviewer> --claim-pid $$ --role review [--lens L] --cwd "${WORKING_DIR}" --read-only [--image …] --message-file … --summary-file <findings> --reply-file … --log-file … --model … --effort … --service-tier …` with the review model, effort and tier.
 10. After the turn, checks that the working tree is unchanged, counts the findings, writes `reviewed` or `error` to the status file and closes the pass (`finish-pass --status completed` or `error`).
 11. On every exit: writes `error` to the status file when the exit code is not 0, reads the reviewer's thread id from the mesh roster, writes the turn record, releases the mesh claim, runs `review_pool.py release --production <slug> --reviewer R --pid $$ --thread-id <id>` and removes the temporary prompt file. A record that cannot be written prints `ERROR: unable to write review turn record.` and makes the exit 1.
 
 A pool launcher stopped by TERM, INT or HUP stops its child and its heartbeat watcher, marks the record `canceled` and exits 143, 130 or 129. It leaves its pass open. The unit director closes that pass with `finish-pass --status canceled --orphaned-launcher` under the slot it reads from the slot file (`review_slot_adversary` for a pass-1 early review, `review_slot_<lens>` for a lens, `review_slot` for a closure); a missing file means no pass to close. A `--to` launcher marks its record `canceled` on the same signals and exits with the same codes.
 
-A pool `error` falls back to `review.sh --to <worker>` for that review under <DelegateLaunchFailure/>.
+A pool `error` falls back to `review.sh --to <worker>` for that review under <WorkerLaunchFailure/>.
 
 ### Turn record
 
@@ -194,7 +194,7 @@ Only a `reviewed` record is a completed review: reviews, medians, means and `rai
 
 A `cost incomplete` reason is the first that applies: `usage store unavailable` (the store is absent or unreadable), `missing rollout` (the store was read and holds no such thread), `no request in its window`, `a compaction after its first request`; a request whose model has no weights gives `unweighted model <model>`.
 
-**Quality.** `--quality` adds `Code review quality`: `| Phases | Raised | Confirmed | Precision | Escapes per phase |`, one row. It covers code reviews only: records of kind `ux` and findings with lens `ux` are left out, because shadow turns double the raised count for one check. Records are joined by phase instance (machine, `history_file`, `phase_instance_id`); a record with no `phase_instance_id` is a phase of its own. Raised sums `raised` over `reviewed` records. Confirmed counts `finding_opened` events in the phase's `history_file` with `caught_by` `delegate` or `both`. Escapes count `caught_by` `main` events plus the `holds` of matching `review_regime.py` ledger rows, from the same machine as the phase.
+**Quality.** `--quality` adds `Code review quality`: `| Phases | Raised | Confirmed | Precision | Escapes per phase |`, one row. It covers code reviews only: records of kind `ux` and findings with lens `ux` are left out, because shadow turns double the raised count for one check. Records are joined by phase instance (machine, `history_file`, `phase_instance_id`); a record with no `phase_instance_id` is a phase of its own. Raised sums `raised` over `reviewed` records. Confirmed counts `finding_opened` events in the phase's `history_file` with `caught_by` `worker` or `both`. Escapes count `caught_by` `main` events plus the `holds` of matching `review_regime.py` ledger rows, from the same machine as the phase.
 
 Merge holds are matched by plan as well as unit and phase, because a unit that runs a second plan starts again at phase 1. `quality_lines` reads the ledger's raw JSON rows through `read_events`, not `review_regime.read_rows()`, so it sees each row's `plan`. Neither the turn record nor `ReviewRecord` carries a plan: `review_plan(record, sources) -> PlanKnown(path) | PlanUnavailable(reason)` takes `plan_doc` and `working_dir` from the first `run_started` event of the record's `history_file`. `normalize_plan(path, working_dir="")` makes an absolute path under `working_dir` relative to it, then applies `os.path.normpath`; a ledger plan is normalized with no `working_dir`, so `docs/plans/alpha.md`, `./docs/plans/alpha.md` and `<working_dir>/docs/plans/alpha.md` are one plan. A row matches by:
 
@@ -263,7 +263,7 @@ A rule stated with its mechanism above is not repeated here.
 
 - `codex_mesh.py stop` marks every roster name `ended`; `idle-stop` and `sweep --stop` do not. `review_pool.py stop` therefore empties the pool. Real `codex_mesh.py stop` on an empty session directory exits 0.
 - The mesh's idle watcher may stop the app-server after 30 minutes without use; reviewers stay followable and the next mesh call restarts it, so the sweep was not changed to protect pooled threads.
-- A long-lived thread's context grows. The launcher compacts it above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, and Codex compaction keeps the thread and its standing instructions. A compaction writes zero input and output counters, so a compaction turn has no readable cost.
+- A long-lived thread's context grows. The launcher compacts it above `UNIT_COMPACT_ABOVE_TOKENS`, and Codex compaction keeps the thread and its standing instructions. A compaction writes zero input and output counters, so a compaction turn has no readable cost.
 - A fork taken while its source's turn is still running gets the state before that turn.
 
 **Pool**
@@ -285,7 +285,7 @@ A rule stated with its mechanism above is not repeated here.
 - The hourly `usage-collect` job on natedev builds the store for both machines; the Mac has no store of its own. The report runs on natedev, and its tables carry costs only once the store exists. An empty cost cell means unavailable, never zero.
 - The collector keys a Codex request by `<session file name>:<byte offset>` (`collect.codex_key`), so a new rollout file under the same thread id (a replaced thread, or a revert from before reviewers became permanent) keeps every request of its own. Two files of one thread with the same last path component would still share keys (`docs/as-built/usage-ledger.md`).
 - `read_events` returns `[]` for a missing file, so `local_sources` stores a history only when `is_file()` holds: an absent entry in `sources.histories` is what tells a missing history (`history file unavailable`) apart from an empty one (`no run_started event`). Symlinks in plan paths are not resolved.
-- A live check of the UI pool belongs in a scratch `REVIEW_POOL_STATE` and a scratch `PLAN_DELEGATE_HISTORY_DIR`; the real pool state and history then hold no record of it.
+- A live check of the UI pool belongs in a scratch `REVIEW_POOL_STATE` and a scratch `UNIT_HISTORY_DIR`; the real pool state and history then hold no record of it.
 
 - `--shadow` reads only this machine's verdict pairs. Reading a second machine's pairs waits until a unit on the Mac runs design checks.
 
@@ -315,7 +315,7 @@ A reason given beside its mechanism above is not repeated here.
 | Standing context cost per request | Prefix tokens are re-billed on every request. Standing prompts are capped (7 KB code), the launcher compacts a thread above the configured limit, and the report's cost tables and lease-ordinal rows show what a review costs as a thread ages. |
 | One unit's details in another unit's review | A reviewer belongs to one unit for good and never serves another. Its thread holds only that unit's reviews. |
 | Stale context | The prompt says to re-read the tree each review and checks the head hash first. A changed prompt re-points every reviewer. |
-| One point of failure | The request path is the unit's own `review.sh` plus one app-server. A dead server is restarted on the next call, and its threads resume. If the pool cannot open a thread at all, `review.sh --pool` exits `error`, and the unit director retries on its own worker with `--to` under <DelegateLaunchFailure/>. |
+| One point of failure | The request path is the unit's own `review.sh` plus one app-server. A dead server is restarted on the next call, and its threads resume. If the pool cannot open a thread at all, `review.sh --pool` exits `error`, and the unit director retries on its own worker with `--to` under <WorkerLaunchFailure/>. |
 | Sandbox reads of every worktree | Codex `readOnly` reads the whole filesystem, so it needs no grant per worktree. It also cannot stop a reviewer reading a sibling unit's tree. All trees are the user's own, so this is a correctness risk, not a privacy one. The prompt names the worktree and head hash. |
 | Writer independence | A pool reviewer never wrote what it reads. |
 

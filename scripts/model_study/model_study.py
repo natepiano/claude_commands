@@ -199,7 +199,7 @@ def main() -> None:
     _ = extract_parser.add_argument("--now", type=datetime.fromisoformat)
     compare_parser = subcommands.add_parser("compare", help="compare Opus and Sonnet requests")
     _ = compare_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
-    phases_parser = subcommands.add_parser("phases", help="compare completed plan-delegate phases")
+    phases_parser = subcommands.add_parser("phases", help="compare completed unit phases")
     _ = phases_parser.add_argument("--state-dir", type=Path, default=Path(os.environ.get("MODEL_STUDY_STATE", DEFAULT_STATE)))
     _ = phases_parser.add_argument("--runs-dir", type=Path, default=Path.home() / ".local/state/plan-delegate/runs")
     _ = phases_parser.add_argument("--registry-dir", type=Path, default=Path.home() / ".claude/sessions")

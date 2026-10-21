@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove delegate workers that no later step will message.
+"""Remove workers that no later step will message.
 
 A claude worker launches as a named background session (agents/agent_bg.sh) and
 is left alive when its turn ends, so a peer can still ask it a question. That
@@ -251,10 +251,10 @@ def main() -> int:
     _ = parser.add_argument(
         "--session-dir", action="append", default=[], help="a run of the caller's; all its workers go (repeatable)"
     )
-    _ = parser.add_argument("--delegate-root", help="one run root in place of both run-folder names")
+    _ = parser.add_argument("--run-root", help="one run root in place of both run-folder names")
     args = parser.parse_args()
     session_dirs = cast("list[str]", args.session_dir)
-    given = cast("str | None", args.delegate_root)
+    given = cast("str | None", args.run_root)
     roots = (Path(given),) if given else DEFAULT_ROOTS
     own_runs = {Path(session_dir).resolve() for session_dir in session_dirs if session_dir}
 

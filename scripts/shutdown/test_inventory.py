@@ -162,13 +162,13 @@ class InventoryTests(ShutdownTestCase):
         for name in ("unit", "delegate"):
             (self.root / name / "active").mkdir(parents=True, exist_ok=True)
             _ = (self.root / name / "active" / f"{name}-director").write_text(f"/runs/{name}\n", encoding="utf-8")
-        environment = {key: value for key, value in os.environ.items() if key != "SHUTDOWN_DELEGATE_ROOT"}
+        environment = {key: value for key, value in os.environ.items() if key != "SHUTDOWN_RUN_ROOT"}
         with patch.dict(os.environ, environment, clear=True), \
                 patch.object(unit_runs, "RUN_ROOT", self.root / "unit"), \
                 patch.object(unit_runs, "FORMER_RUN_ROOT", self.root / "delegate"):
             found = inventory._active_run_directories()  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(
-            (found.get("unit-director"), found.get("delegate-director")),
+            (found.get("unit-director"), found.get("worker-director")),
             ([Path("/runs/unit")], [Path("/runs/delegate")]),
         )
 
@@ -364,7 +364,7 @@ class InventoryTests(ShutdownTestCase):
         self.records = Path()
         self.notifier = Path()
         self.history = Path()
-        self.delegate = Path()
+        self.runs = Path()
         self.checkout = Path()
         self.origin = Path()
         self.bin = Path()
@@ -386,7 +386,7 @@ class InventoryTests(ShutdownTestCase):
         self.records = self.root / "sessions"
         self.notifier = self.root / "notifier"
         self.history = self.root / "history"
-        self.delegate = self.root / "delegate"
+        self.runs = self.root / "runs"
         self.checkout = self.root / "checkout"
         self.origin = self.root / "origin.git"
         self.bin = self.root / "bin"
@@ -402,7 +402,7 @@ class InventoryTests(ShutdownTestCase):
             self.records,
             self.notifier,
             self.history / "runs",
-            self.delegate / "active",
+            self.runs / "active",
             self.bin,
             self.checkout,
             self.target_config,
@@ -417,8 +417,8 @@ class InventoryTests(ShutdownTestCase):
             "AGENT_NOTES_DIR": str(self.notes),
             "NOTIFIER_SESSIONS_DIR": str(self.records),
             "NOTIFIER_STATE_DIR": str(self.notifier),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.history),
-            "SHUTDOWN_DELEGATE_ROOT": str(self.delegate),
+            "UNIT_HISTORY_DIR": str(self.history),
+            "SHUTDOWN_RUN_ROOT": str(self.runs),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr" / "fake_herdr.py"),
             "HERDR_PROC": str(self.proc),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
@@ -492,7 +492,7 @@ class InventoryTests(ShutdownTestCase):
         for config_dir in (self.target_config, self.other_config):
             (config_dir / "projects").symlink_to(self.home / ".claude/projects", target_is_directory=True)
         self.make_production_state()
-        self.make_delegate_state()
+        self.make_worker_state()
         self.make_snapshot()
 
     def write_account(self, config_dir: Path, login: str) -> None:
@@ -724,10 +724,10 @@ elif "comm=" in joined:
                 json.dumps(event) + "\n", encoding="utf-8"
             )
 
-    def make_delegate_state(self) -> None:
-        run_dir = self.delegate / "phase-two"
+    def make_worker_state(self) -> None:
+        run_dir = self.runs / "phase-two"
         run_dir.mkdir()
-        _ = (self.delegate / "active" / DIRECTOR_ID).write_text(
+        _ = (self.runs / "active" / DIRECTOR_ID).write_text(
             str(run_dir) + "\n", encoding="utf-8"
         )
         _ = (run_dir / "workers").write_text("aaaaaaaa\treview-worker\n", encoding="utf-8")
@@ -819,12 +819,12 @@ elif "comm=" in joined:
         self.assertEqual(
             director["doc"], str(self.root / "build-followups-production.md")
         )
-        self.assertEqual(director["run_dirs"], [str(self.delegate / "phase-two")])
+        self.assertEqual(director["run_dirs"], [str(self.runs / "phase-two")])
         self.assertEqual(
             director["codex_servers"],
             [
                 {
-                    "run_dir": str(self.delegate / "phase-two"),
+                    "run_dir": str(self.runs / "phase-two"),
                     "pid": os.getpid(),
                     "busy_workers": ["busy-codex", "busy-without-launcher"],
                 }
@@ -1120,7 +1120,7 @@ elif "comm=" in joined:
 
     def test_inventory_reads_shared_worker_ledger_and_later_old_path_appends(self) -> None:
         self.write_session(DESKTOP_PID, DESKTOP_ID, "late-worker", self.root / "plain", kind="bg")
-        current = self.delegate / "phase-two" / "workers"
+        current = self.runs / "phase-two" / "workers"
         previous = current.with_name("seats")
         modified = current.stat().st_mtime_ns
         _ = current.replace(previous)
@@ -1173,7 +1173,7 @@ elif "comm=" in joined:
     def test_absent_values_are_explicit_variants(self) -> None:
         for path in (self.history / "runs").glob("*.jsonl"):
             path.unlink()
-        (self.delegate / "phase-two" / "workers").unlink()
+        (self.runs / "phase-two" / "workers").unlink()
         transcript = (
             self.home / ".claude" / "projects" / "fixture" / f"{DESKTOP_ID}.jsonl"
         )
@@ -1465,8 +1465,8 @@ class RecoveryInventoryTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root), "HERDR_PROC": str(self.proc), "NOTIFIER_SESSIONS_DIR": str(self.registry),
             "NOTIFIER_STATE_DIR": str(self.notifier), "AGENT_NOTES_DIR": str(self.root / "notes"),
-            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "SHUTDOWN_DELEGATE_ROOT": str(self.root / "runs"),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"), "SHUTDOWN_RUN_ROOT": str(self.root / "runs"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
             "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "pauses"),
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "FAKE_HERDR_RESPONSES": str(fake_responses), "FAKE_HERDR_LOG": str(self.root / "herdr-log"),

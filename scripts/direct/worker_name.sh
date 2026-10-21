@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# worker_name.sh — Print the mesh name a delegate worker launches under.
+# worker_name.sh — Print the mesh name a worker launches under.
 #
 # Usage: worker_name.sh <working_dir> <slot> <kind> [prefix]
 #   prefix — replaces the project name; implement.sh passes its 10th argument

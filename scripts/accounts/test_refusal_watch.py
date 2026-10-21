@@ -453,7 +453,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.groups()
         unit = self.hold_rule("units", minutes=30)
         runner = next_moves.ClaudeGroupMove("runners", "showrunners", 1, 30, "claude2", NOW)
-        worker = next_moves.WorkersMove("workers", 1, next_moves.DelegateToClaude(), NOW)
+        worker = next_moves.WorkersMove("workers", 1, next_moves.WorkersToClaude(), NOW)
         self.next_entries(unit, runner, worker)
         duration = next_moves.ResolvedHold(30, next_moves.FixedHold(30))
         refusal_watch._save_state(refusal_watch.WatchState(sessions={}, notices={},  # pyright: ignore[reportPrivateUsage]
@@ -684,9 +684,9 @@ class RefusalWatchTests(unittest.TestCase):
                 with self.subTest(group=group, edit=edit):
                     if group == "workers":
                         head: next_moves.NextMove = next_moves.WorkersMove("old-worker-head", 1,
-                            next_moves.DelegateToClaude(), NOW)
+                            next_moves.WorkersToClaude(), NOW)
                         later: next_moves.NextMove = next_moves.WorkersMove("next-worker-head", 1,
-                            next_moves.DelegateToClaude(), NOW)
+                            next_moves.WorkersToClaude(), NOW)
                     else:
                         head = self.low_rule("old-head", group=group)
                         later = self.low_rule("next-head", group=group, target="claude3")
@@ -1979,7 +1979,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = other.write_text(json.dumps({"uuid": "unrelated", "timestamp": NOW.isoformat(),
             "window": "weekly", "reset": ""}))
         routing: moves.RoutedToClaude = {"kind": "routed to claude", "at": NOW.isoformat(),
-            "tool": "codex", "fallback_at": NOW.isoformat(), "owner": "codex1", "cause": "refusal", "why": "Codex refused work for quota", "moved": ["delegate"]}
+            "tool": "codex", "fallback_at": NOW.isoformat(), "owner": "codex1", "cause": "refusal", "why": "Codex refused work for quota", "moved": ["direct"]}
         moves.append_routing(routing)
         WatchTime.at = NOW + timedelta(minutes=19)
         # Other is not live on the continuation tick; its proof file must survive.

@@ -33,7 +33,7 @@ EXPECTED_VARIABLES = (
     "BUILD_TARGETS_SCRIPT",
     "BUILD_TARGETS_CONFIG",
     "BUILD_TARGETS_NOW",
-    "PLAN_DELEGATE_ACTIVE_DIR",
+    "UNIT_ACTIVE_DIR",
 )
 SHELL_CALL = 'source "$1"; build_override_refusal "$2" "$3" "$4"'
 READ_ONLY_HOME_LINE = (

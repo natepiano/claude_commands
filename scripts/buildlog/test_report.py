@@ -789,8 +789,8 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T12:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/alpha", worker="impl", delegate_session="delegate-a"),
-            token_holder("holder", "2026-10-02T12:00:00Z", "2026-10-02T12:10:00Z", "impl", "delegate-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/alpha", worker="impl", delegate_session="unit-a"),
+            token_holder("holder", "2026-10-02T12:00:00Z", "2026-10-02T12:10:00Z", "impl", "unit-a"),
         )
 
         rows = self.waiting_rows()
@@ -806,8 +806,8 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T13:08:00Z",
-                 wait_s=420, token_wait_s=420, worktree="/r/beta", worker="impl", delegate_session="delegate-a"),
-            token_holder("holder", "2026-10-02T13:00:00Z", "2026-10-02T13:07:00Z", "test", "delegate-a"),
+                 wait_s=420, token_wait_s=420, worktree="/r/beta", worker="impl", delegate_session="unit-a"),
+            token_holder("holder", "2026-10-02T13:00:00Z", "2026-10-02T13:07:00Z", "test", "unit-a"),
         )
 
         rows = self.waiting_rows()
@@ -823,9 +823,9 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T14:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/gamma", worker="impl", delegate_session="delegate-a"),
-            token_holder("own", "2026-10-02T14:00:00Z", "2026-10-02T14:04:00Z", "impl", "delegate-a"),
-            token_holder("other", "2026-10-02T14:04:00Z", "2026-10-02T14:10:00Z", "test", "delegate-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/gamma", worker="impl", delegate_session="unit-a"),
+            token_holder("own", "2026-10-02T14:00:00Z", "2026-10-02T14:04:00Z", "impl", "unit-a"),
+            token_holder("other", "2026-10-02T14:04:00Z", "2026-10-02T14:10:00Z", "test", "unit-a"),
         )
 
         rows = self.waiting_rows()
@@ -839,9 +839,9 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T15:11:00Z",
-                 wait_s=600, token_wait_s=600, worktree="/r/delta", worker="impl", delegate_session="delegate-a"),
-            token_holder("own", "2026-10-02T15:00:00Z", "2026-10-02T15:02:00Z", "impl", "delegate-a"),
-            token_holder("other", "2026-10-02T15:02:00Z", "2026-10-02T15:05:00Z", "test", "delegate-a"),
+                 wait_s=600, token_wait_s=600, worktree="/r/delta", worker="impl", delegate_session="unit-a"),
+            token_holder("own", "2026-10-02T15:00:00Z", "2026-10-02T15:02:00Z", "impl", "unit-a"),
+            token_holder("other", "2026-10-02T15:02:00Z", "2026-10-02T15:05:00Z", "test", "unit-a"),
         )
 
         rows = self.waiting_rows()
@@ -865,9 +865,9 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T18:06:00Z",
-                 wait_s=300, token_wait_s=300, worktree="/r/eta", worker="impl", delegate_session="delegate-a"),
+                 wait_s=300, token_wait_s=300, worktree="/r/eta", worker="impl", delegate_session="unit-a"),
             call("lint", tool="port-lint", started_at=at, ended_at="2026-10-02T18:05:00Z",
-                 worktree="/r/eta", worker="impl", delegate_session="delegate-a"),
+                 worktree="/r/eta", worker="impl", delegate_session="unit-a"),
         )
 
         rows = self.waiting_rows()
@@ -880,8 +880,8 @@ class ReportTests(unittest.TestCase):
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call("waiter", started_at=at, ended_at="2026-10-02T17:06:00Z",
-                 wait_s=300, token_wait_s=300, worktree="/r/zeta", worker="impl", delegate_session="delegate-a"),
-            token_holder("unrelated", "2026-10-02T17:00:00Z", "2026-10-02T17:05:00Z", "impl", "delegate-b"),
+                 wait_s=300, token_wait_s=300, worktree="/r/zeta", worker="impl", delegate_session="unit-a"),
+            token_holder("unrelated", "2026-10-02T17:00:00Z", "2026-10-02T17:05:00Z", "impl", "unit-b"),
         )
 
         rows = self.waiting_rows()
@@ -1975,9 +1975,9 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(self.cell(ratios, "2026-10-02", "Edits"), "1")
 
     def test_delegate_session_then_session_identifies_independent_workers(self) -> None:
-        self.verify_call(0, "tree-a", worker="delegate-a", session="shared")
-        self.verify_call(1, "tree-b", worker="delegate-b", session="shared")
-        self.verify_call(2, "tree-b", worker="delegate-a", session="shared")
+        self.verify_call(0, "tree-a", worker="unit-a", session="shared")
+        self.verify_call(1, "tree-b", worker="unit-b", session="shared")
+        self.verify_call(2, "tree-b", worker="unit-a", session="shared")
         self.verify_call(3, "tree-c", worker=None, session="fallback")
         self.verify_call(4, "tree-d", worker=None, session="fallback")
         ratios, _ = self.per_edit_tables()

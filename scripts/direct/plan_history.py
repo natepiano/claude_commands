@@ -19,7 +19,7 @@ DEFAULT_PERCENT_SPREAD = 10.0
 # the work is half as far along as it says, at best twice.
 RATE_FACTOR_LIMIT = 2.0
 STATE_FILENAME = "progress_history_state.json"
-# Every phase heading in a delegate plan, in all three forms it takes over a
+# Every phase heading in a worker plan, in all three forms it takes over a
 # plan's life. `· status: todo` and `· status: done` are the live-zone forms;
 # a shrunk or as-built phase drops the status marker and usually carries a
 # commit annotation instead. Counting on the status marker alone silently
@@ -63,14 +63,14 @@ class EtaProjectionUnavailable(NamedTuple):
 
 
 def history_root() -> Path:
-    configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
+    configured = os.environ.get("UNIT_HISTORY_DIR")
     if configured:
         return Path(configured).expanduser()
     return Path.home() / ".local" / "state" / "plan-delegate"
 
 
 def now_epoch() -> float:
-    configured = os.environ.get("PLAN_DELEGATE_NOW_EPOCH")
+    configured = os.environ.get("UNIT_NOW_EPOCH")
     if configured:
         return float(configured)
     return time.time()

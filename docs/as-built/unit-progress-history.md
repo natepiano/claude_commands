@@ -1,4 +1,4 @@
-# Plan-delegate progress history
+# Unit progress history
 
 `scripts/direct/progress_history.py` is the shared progress recorder for
 Claude and Codex implementations of `/unit:direct`. It writes append-only
@@ -31,7 +31,7 @@ kind and fix count, main-agent identity, and called-agent identity. Only the
 window that is *open* stamps an event with its identity. A finished pass stays
 in the session state so the next launcher can be told what it replaced, and
 stamping it unconditionally attributed every activity — and every progress
-report made during one — to whichever delegate happened to run before it. Progress
+report made during one — to whichever worker happened to run before it. Progress
 events add the current activity, separate project and phase percentages, each
 assessment's unchanged duration, the phase's raw, suggested, and reported
 percentages, decision source, override reason, each elapsed clock, and the
@@ -88,7 +88,7 @@ called task, family, model, and effort after resolving `config/agents.conf`.
 
 Each recorder command takes a session lock around its state transition. Each
 append also takes an exclusive history-file lock, flushes, and calls `fsync`
-(`PLAN_DELEGATE_SYNC_WRITES=0` skips the `fsync` for disposable test fixtures; the
+(`UNIT_SYNC_WRITES=0` skips the `fsync` for disposable test fixtures; the
 default is `1`, and `findings.py` and `review_pool.py` read the same switch);
 aggregate reads take a shared history-file lock. Different runs have different
 files, while multiple processes participating in one run share its locked
@@ -218,7 +218,7 @@ round; the user watches the run and stops it themselves when it warrants.
 
 The repair budget is the first round's gating count times
 `REPAIR_ROUNDS_PER_FINDING`, never below `MIN_REPAIR_BUDGET`. All of these
-limits are set in `~/.claude/config/delegate.conf`, read at startup by
+limits are set in `~/.claude/config/direct.conf`, read at startup by
 `findings.py` and required there — an absent or unusable value exits 2 rather
 than falling back. They now decide when an advisory is worth printing rather than
 when a phase stops, so the shipped values set where a phase starts being reported
@@ -290,7 +290,7 @@ no `--phase-id`. `/unit:eta` and `/unit:eta_breakdown` pass no `TZ=`; the
 process `TZ` is not read.
 
 `implement.sh` and `review.sh` own pass lifecycle: they set
-`PLAN_DELEGATE_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
+`UNIT_PASS_OWNER=launcher` on their own `start-pass` / `finish-pass`
 calls, per invocation so the agent subprocess never inherits it. The recorder
 rejects an unowned call, because a hand-written pass forges one that never ran
 and `findings.py gate` counts passes to decide whether a phase is converging.
@@ -419,18 +419,18 @@ how long.
 
 Because the recorder places board roles on a timeline built from its own
 events, `board.sh` and the recorder read the same clock: both honour
-`PLAN_DELEGATE_NOW_EPOCH`, so a board stamped from the wall clock can never sit
+`UNIT_NOW_EPOCH`, so a board stamped from the wall clock can never sit
 outside a ledger stamped from an override and drop every role change out of
 every round.
 
 Every report carries one line per worker. In the short report it reads
 `- **Agent 1** (impl) fix 11m running · <model> <effort> · 3m ago · rerunning
 the scoped test`: slot, role, elapsed and state from `_current_worker_cells`,
-the delegate, and the last thing that worker said on the board, with its age.
+the worker, and the last thing that worker said on the board, with its age.
 `_current_worker_windows` picks each slot's live window, else its most recent
 finished one, so the line holds when the unit director opens an activity of its
 own. Under `--tables` the line drops the role cell, which the round table
-carries, and names the delegate only for a window still open:
+carries, and names the worker only for a window still open:
 `- **Agent 1** (impl) <model> <effort> · 3m ago · rerunning the scoped test`.
 It is one answer per phase rather than per row, so a column repeating the same
 values down every row would crowd out the roles for nothing. The words are the worker's own: the
@@ -474,7 +474,7 @@ the pass whose diff it reads rather than for its own ordinal — `Impl Review`,
 activity between them is transparent, so verification does not break the pair. A
 review with no unclaimed pass behind it, the closure review after verification,
 keeps the ordinal `Review 3`. An
-activity's name is its `--label`, and its `Delegate` cell is empty: the unit
+activity's name is its `--label`, and its `Worker` cell is empty: the unit
 director ran that window itself. Both identity columns are read per window rather
 than per run, and `start-pass` and `start-activity` re-detect the unit director
 as they open, so a unit director that changes model or effort part way through

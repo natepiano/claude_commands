@@ -198,7 +198,7 @@ class DailiesInputTests(unittest.TestCase):
                     "DAILIES_PHASE_TABLE_JSON": str(self.phase_table_json),
                     "DAILIES_PHASE_TABLE_EVENTS": str(self.phase_table_events),
                     "PHASE_TABLE_VAULT": str(self.root / "vault"),
-                    "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+                    "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
                     "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
                     "STYLE_LEDGER_STATE_DIR": str(self.root / "style-state"),
@@ -408,7 +408,7 @@ class DailiesInputTests(unittest.TestCase):
         return result.stdout + result.stderr
 
     def finished_run(self, worktree: Path) -> None:
-        """Record a /unit:delegate run in `worktree` that has finished, as the recorder would."""
+        """Record a /unit:direct run in `worktree` that has finished, as the recorder would."""
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
         events: list[dict[str, object]] = [
@@ -416,7 +416,7 @@ class DailiesInputTests(unittest.TestCase):
             {"event_type": "run_finished"}]
         _ = (runs / f"{worktree.name}.jsonl").write_text(
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
-        self.env["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
+        self.env["UNIT_HISTORY_DIR"] = str(self.root / "history")
 
     def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:
         self.production_doc(beta=True)
@@ -533,7 +533,7 @@ class DailiesInputTests(unittest.TestCase):
         del cast(list[dict[str, object]], fields["units"])[0]["started"]
         _ = self.judgment.write_text(json.dumps(fields), encoding="utf-8")
         _ = self.env.pop("DAILIES_PHASE_TABLE")
-        self.env["PLAN_DELEGATE_NOW_EPOCH"] = str(epoch(23, 35))
+        self.env["UNIT_NOW_EPOCH"] = str(epoch(23, 35))
 
         built = self.run_builder()
 

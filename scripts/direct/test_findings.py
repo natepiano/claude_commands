@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for the plan-delegate findings ledger."""
+"""Integration tests for the unit findings ledger."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from unittest.mock import patch
 from pathlib import Path
 from typing import cast, override
 from collections.abc import Callable
-from scripts.direct import findings
+# findings.py reads its limits at import; read them from this checkout, never the live config.
+os.environ["UNIT_CONFIG"] = str(Path(__file__).resolve().parents[2] / "config" / "direct.conf")
+from scripts.direct import findings  # noqa: E402
 
 
 SCRIPT = Path(__file__).with_name("findings.py")
@@ -41,13 +43,13 @@ class FindingsLedgerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
+        self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.session_dir = self.root / "session"
         self.session_dir.mkdir()
         self.history_file = self.root / "history" / "run.jsonl"
-        self.config_file = self.root / "delegate.conf"
+        self.config_file = self.root / "direct.conf"
         self.write_config("")
 
     @override
@@ -55,15 +57,15 @@ class FindingsLedgerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def environment(self, at: int) -> dict[str, str]:
-        """Pin the clock and the config so a machine's own delegate.conf cannot move a limit."""
+        """Pin the clock and the config so a machine's own direct.conf cannot move a limit."""
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_NOW_EPOCH"] = str(at)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         # The gate reads pass events from the durable stream under this root.
         # Left unset it resolves to the machine's own history, where a phase id
         # this fixture invented would be answered by whatever happens to live
         # there.
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
+        environment["UNIT_HISTORY_DIR"] = str(self.root / "history")
         return environment
 
     def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
@@ -77,9 +79,9 @@ class FindingsLedgerTests(unittest.TestCase):
         for durable in (True, False):
             with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
                 if durable:
-                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                    _ = os.environ.pop("UNIT_SYNC_WRITES", None)
                 else:
-                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                    os.environ["UNIT_SYNC_WRITES"] = "0"
                 append(self.session_dir, {}, {"event_type": "probe"})
                 self.assertEqual(sync.call_count, int(durable))
                 self.assertEqual(self.events()[0]["event_type"], "probe")
@@ -497,7 +499,7 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertIn("3 fix rounds have run for 2 original findings", str(payload["advisory"]))
 
     def test_the_repair_budget_floor_is_configurable(self) -> None:
-        """delegate.conf raises the floor, and the extra round is authorized."""
+        """direct.conf raises the floor, and the extra round is authorized."""
         self.write_config("MIN_REPAIR_BUDGET=4\n")
         for index in range(3):
             batch: list[str] = []

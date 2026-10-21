@@ -35,12 +35,12 @@ REAL_OWNS = ("`docs/plans/build-followups-enh-showrunner.md`; `scripts/productio
              "`commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, "
              "`scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests "
              "(hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): "
-             "`commands/unit/delegate.md`, `commands/unit/checkpoint.md`, "
-             "`docs/delegate/run_phase_review.md`, `docs/production_format.md`, "
+             "`commands/unit/direct.md`, `commands/unit/checkpoint.md`, "
+             "`docs/direct/run_phase_review.md`, `docs/production_format.md`, "
              "`commands/unit/add_ons.md`, `commands/plan/shrink.md`, "
-             "`commands/plan/phase_review.md`, `docs/delegate/phase_end.md`, "
-             "`docs/delegate_plan_format.md`, `commands/unit/eta_breakdown.md`, "
-             "`docs/delegate/final_gate_commit.md`")
+             "`commands/plan/phase_review.md`, `docs/direct/phase_end.md`, "
+             "`docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, "
+             "`docs/direct/final_gate_commit.md`")
 SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
                     "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
@@ -342,8 +342,8 @@ class MergeCheckpointTests(unittest.TestCase):
     def test_real_owns_cell_still_reads_a_bare_name_as_a_root_file(self) -> None:
         self.assert_real_owns_path_allowed("merge_checkpoint.py")
 
-    def test_real_owns_cell_allows_delegate_path_in_last_group(self) -> None:
-        self.assert_real_owns_path_allowed("commands/unit/delegate.md")
+    def test_real_owns_cell_allows_a_path_in_the_last_group(self) -> None:
+        self.assert_real_owns_path_allowed("commands/unit/direct.md")
 
     def test_real_owns_cell_holds_an_outside_path(self) -> None:
         self.production_doc(owns_cell=REAL_OWNS, hub_files=False)

@@ -350,8 +350,8 @@ class WaitLocalTests(IsolatedTargetTest):
         self.sleeps = 0
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
-            "PLAN_DELEGATE_BOARD_DIR": "", "PLAN_DELEGATE_SESSION_DIR": "",
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
             "BUILD_TARGETS_POLL_S": "0.01",
             "BUILDLOG_HOLD_WAIT_FILE": str(self.root / "wait-seconds"),
             "BUILDLOG_HOLD_ADMISSION_FILE": str(self.root / "admission"),
@@ -586,9 +586,9 @@ class WaitLocalTests(IsolatedTargetTest):
         self.begin_hold()
         active = self.root / "active"
         active.mkdir()
-        run = self.root / "delegate-run"
+        run = self.root / "unit-run"
         _ = (active / "owner").write_text(str(run) + "\n")
-        with mock.patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(run), "CLAUDE_CODE_SESSION_ID": "stale"}):
+        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(run), "CLAUDE_CODE_SESSION_ID": "stale"}):
             with mock.patch.object(build_targets, "wait_sleep", side_effect=self.release_turn):
                 self.assertEqual(self.wait()[0], 0)
         cycle = build_hold.read_cycle()
@@ -826,8 +826,8 @@ class WaitLocalTests(IsolatedTargetTest):
     def test_registration_outlives_helper_and_is_owned_by_waiting_process(self) -> None:
         self.begin_hold()
         environment = dict(os.environ)
-        environment.update({"CLAUDE_CODE_SESSION_ID": "", "PLAN_DELEGATE_BOARD_DIR": "",
-                            "PLAN_DELEGATE_SESSION_DIR": ""})
+        environment.update({"CLAUDE_CODE_SESSION_ID": "", "UNIT_RUN_DIR": "",
+                            "UNIT_SESSION_DIR": ""})
         # Restore only this subprocess boundary: the CLI must leave its parent's live PID in the record.
         with mock.patch.object(subprocess, "run", wraps=REAL_SUBPROCESS_RUN), \
              mock.patch.object(subprocess, "Popen", wraps=REAL_SUBPROCESS_POPEN):

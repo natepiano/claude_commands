@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for the durable plan-delegate progress history."""
+"""Integration tests for the durable unit progress history."""
 
 from __future__ import annotations
 
@@ -68,16 +68,16 @@ class ProgressHistoryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
+        self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "bevy_hana_rubric"
         self.working_dir.mkdir()
         # Pin the report interval and the timezone: without both, the clock line
-        # renders from the machine's own delegate.conf and local offset, and the
+        # renders from the machine's own direct.conf and local offset, and the
         # expected header would differ per machine.
-        self.config_file = self.root / "delegate.conf"
+        self.config_file = self.root / "direct.conf"
         self.write_interval(180)
         # The temporary home's registry path. Named so the digest hashes a file
         # the test controls rather than the machine's own agents.conf, which
@@ -110,9 +110,9 @@ class ProgressHistoryTests(unittest.TestCase):
         for durable in (True, False):
             with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
                 if durable:
-                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                    _ = os.environ.pop("UNIT_SYNC_WRITES", None)
                 else:
-                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                    os.environ["UNIT_SYNC_WRITES"] = "0"
                 append({"history_file": str(history)}, {"event_type": "probe"})
                 self.assertEqual(sync.call_count, int(durable))
                 self.assertEqual(json.loads(history.read_text()), {"event_type": "probe"})
@@ -120,7 +120,7 @@ class ProgressHistoryTests(unittest.TestCase):
 
     def write_interval(self, seconds: object) -> None:
         _ = self.config_file.write_text(
-            f"PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={seconds}\n",
+            f"UNIT_PROGRESS_INTERVAL_SECONDS={seconds}\n",
             encoding="utf-8",
         )
 
@@ -145,14 +145,14 @@ for number in (1, 2):
     home = root / str(number)
     config = home / '.claude/config'
     config.mkdir(parents=True)
-    settings = config / 'delegate.conf'
+    settings = config / 'direct.conf'
     registry = config / 'agents.conf'
-    settings.write_text(f'PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
+    settings.write_text(f'UNIT_PROGRESS_INTERVAL_SECONDS={number * 60}\n')
     registry.write_text(f'registry-{number}\n')
     environment = {**os.environ, 'HOME': str(home), 'USER_ZONE': 'UTC',
-                   'PLAN_DELEGATE_SYNC_WRITES': '0', 'PLAN_DELEGATE_PASS_OWNER': 'launcher',
-                   'PLAN_DELEGATE_NOW_EPOCH': '1000'}
-    for key in ('PLAN_DELEGATE_CONFIG', 'AGENTS_CONFIG_FILE', 'PLAN_DELEGATE_HISTORY_DIR',
+                   'UNIT_SYNC_WRITES': '0', 'UNIT_PASS_OWNER': 'launcher',
+                   'UNIT_NOW_EPOCH': '1000'}
+    for key in ('UNIT_CONFIG', 'AGENTS_CONFIG_FILE', 'UNIT_HISTORY_DIR',
                 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         environment.pop(key, None)
     session = home / 'session'
@@ -161,7 +161,7 @@ for number in (1, 2):
          '--plan-doc', str(plan), '--main-model', 'fixture-model'],
         ['start-phase', '--session-dir', str(session), '--phase-id', '1', '--phase-title', 'First'],
         ['start-pass', '--session-dir', str(session), '--pass-kind', 'impl', '--activity', 'writing',
-         '--called-task', 'delegate.implementation', '--called-family', 'codex',
+         '--called-task', 'direct.implementation', '--called-family', 'codex',
          '--called-model', 'fixture-model'],
     )
     for arguments in commands:
@@ -218,20 +218,20 @@ print('two homes isolated; recorder lock retained; caller restored')
         zone: str = "UTC",
     ) -> str:
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
-        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        environment["UNIT_NOW_EPOCH"] = str(at)
+        environment["UNIT_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
         # environment, so a developer running with a worker exported would
         # otherwise see it stamped on every pass these tests record.
         if self.team_slot:
-            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
+            environment["UNIT_TEAM_ROLE"] = self.team_slot
         else:
-            _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
+            _ = environment.pop("UNIT_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         if claude_session:
@@ -246,20 +246,20 @@ print('two homes isolated; recorder lock retained; caller restored')
         self, *arguments: str, at: int, zone: str = "UTC"
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = zone
         environment["USER_ZONE"] = zone
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
-        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        environment["UNIT_NOW_EPOCH"] = str(at)
+        environment["UNIT_PASS_OWNER"] = "launcher"
         # Popped rather than left alone: the suite copies the ambient
         # environment, so a developer running with a worker exported would
         # otherwise see it stamped on every pass these tests record.
         if self.team_slot:
-            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
+            environment["UNIT_TEAM_ROLE"] = self.team_slot
         else:
-            _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
+            _ = environment.pop("UNIT_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         return invoke_recorder(arguments, environment, Path.cwd())
@@ -272,11 +272,11 @@ print('two homes isolated; recorder lock retained; caller restored')
         refresh_result: subprocess.CompletedProcess[str] | BaseException,
     ) -> tuple[None, str, str]:
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
-        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        environment["UNIT_NOW_EPOCH"] = str(at)
+        environment["UNIT_PASS_OWNER"] = "launcher"
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         self.isolate_recorder_roots(environment)
@@ -370,7 +370,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "correcting retry recovery",
             "--called-task",
-            "delegate.escalation",
+            "direct.escalation",
             "--called-family",
             "codex",
             "--called-model",
@@ -1522,9 +1522,9 @@ print('two homes isolated; recorder lock retained; caller restored')
             [
                 "git",
                 "-c",
-                "user.name=Plan Delegate Test",
+                "user.name=Plan Worker Test",
                 "-c",
-                "user.email=plan-delegate@example.invalid",
+                "user.email=unit@example.invalid",
                 "commit",
                 "-m",
                 "checkpoint(derived): phase 1",
@@ -1701,17 +1701,17 @@ print('two homes isolated; recorder lock retained; caller restored')
     ) -> subprocess.CompletedProcess[str]:
         """Invoke the recorder the way a caller outside a launcher would."""
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.agents_config_file)
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
-        _ = environment.pop("PLAN_DELEGATE_PASS_OWNER", None)
+        environment["UNIT_NOW_EPOCH"] = str(at)
+        _ = environment.pop("UNIT_PASS_OWNER", None)
         if self.team_slot:
-            environment["PLAN_DELEGATE_TEAM_ROLE"] = self.team_slot
+            environment["UNIT_TEAM_ROLE"] = self.team_slot
         else:
-            _ = environment.pop("PLAN_DELEGATE_TEAM_ROLE", None)
+            _ = environment.pop("UNIT_TEAM_ROLE", None)
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         return invoke_recorder(arguments, environment, Path.cwd())
@@ -1737,7 +1737,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "reviewing by hand",
             "--called-task",
-            "delegate.review",
+            "direct.review",
             "--called-family",
             "codex",
             "--called-model",
@@ -1801,7 +1801,7 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
         _ = self.agents_config_file.write_text(
-            "[delegate.implementation.codex]\nagent = gpt-called\n", encoding="utf-8"
+            "[direct.implementation.codex]\nagent = gpt-called\n", encoding="utf-8"
         )
         session_dir = self.start_run("digest", 20_000)
         self.start_phase_and_pass(session_dir, 20_010)
@@ -1824,7 +1824,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "reviewing the retry path",
             "--called-task",
-            "delegate.review",
+            "direct.review",
             "--called-family",
             "codex",
             "--called-model",
@@ -1906,7 +1906,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         """Drive board.sh on the test's clock, so its stamps and the recorder's
         events sit on one timeline instead of the board landing in the present."""
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        environment["UNIT_NOW_EPOCH"] = str(at)
         _ = subprocess.run(
             ["bash", str(BOARD), arguments[0], str(session_dir), *arguments[1:]],
             check=True,
@@ -1937,7 +1937,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             f"{slot or 'unslotted'} work",
             "--called-task",
-            "delegate.implementation",
+            "direct.implementation",
             "--called-family",
             "codex",
             "--called-model",
@@ -2307,7 +2307,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 "Agent 1 → review, Agent 2 → review; running",
             ],
         )
-        # Which delegate is in which worker sits under the table, once, and the
+        # Which worker is in which worker sits under the table, once, and the
         # unit director is left out of it -- the reader is the unit director. Each
         # worker carries its last board line and that line's age, because a role
         # alone -- and an open pass window, which grows either way -- cannot say
@@ -2732,7 +2732,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         _ = self.config_file.write_text(
             "\n".join(
                 (
-                    "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=180",
+                    "UNIT_PROGRESS_INTERVAL_SECONDS=180",
                     "MIN_REPAIR_BUDGET=3",
                     "REPAIR_ROUNDS_PER_FINDING=0.5",
                     "RUNAWAY_ROUNDS=5",
@@ -2749,11 +2749,11 @@ print('two homes isolated; recorder lock retained; caller restored')
 
     def run_findings(self, session_dir: Path, *arguments: str, at: int) -> str:
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
+        environment["UNIT_NOW_EPOCH"] = str(at)
         result = subprocess.run(
             ["python3", str(FINDINGS), *arguments, "--session-dir", str(session_dir)],
             check=True,
@@ -2783,7 +2783,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             activity,
             "--called-task",
-            "delegate.implementation",
+            "direct.implementation",
             "--called-family",
             "codex",
             "--called-model",
@@ -3348,7 +3348,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         """A handoff is a role change; prose there is a movement the table never shows."""
         session_dir = self.start_run("barehandoff", 65_000)
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = "65001"
+        environment["UNIT_NOW_EPOCH"] = "65001"
         refused = subprocess.run(
             ["bash", str(BOARD), "post", str(session_dir), "test", "handoff", "round 8 done"],
             capture_output=True,
@@ -3390,7 +3390,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "working",
             "--called-task",
-            "delegate.implementation",
+            "direct.implementation",
             "--called-family",
             "codex",
             "--called-model",
@@ -3486,7 +3486,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "repairing the budget",
             "--called-task",
-            "delegate.implementation",
+            "direct.implementation",
             "--called-family",
             "codex",
             "--called-model",
@@ -3635,7 +3635,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "checking the remaining plan against what shipped",
             "--called-task",
-            "delegate.review",
+            "direct.review",
             "--called-family",
             "codex",
             "--called-model",
@@ -3692,7 +3692,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         self.assertIn("▸ **Review 3 - checking the remaining plan against what shipped**", header)
         # Which agent ran each window is the `timeline` view's question, and the
-        # unit director ran verification itself, so that row has no delegate there.
+        # unit director ran verification itself, so that row has no worker there.
         stage_rows = self.table_rows(
             self.run_command(
                 "timeline",
@@ -3700,7 +3700,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 str(session_dir),
                 at=started_at + 700,
             ),
-            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+            ["Stage", "Main", "Worker", "Start", "Elapsed", "Result"],
         )
         self.assertEqual((stage_rows[4][1], stage_rows[4][2]), ("gpt-main xhigh", ""))
         self.assertEqual(stage_rows[0][1], "gpt-main xhigh")
@@ -3712,9 +3712,9 @@ print('two homes isolated; recorder lock retained; caller restored')
             "\n".join(
                 (
                     "[assignments]",
-                    "delegate=codex",
+                    "direct=codex",
                     "",
-                    "[delegate.codex]",
+                    "[direct.codex]",
                     "implementation=gpt-called:xhigh",
                     "review=gpt-blind:max",
                     "",
@@ -3735,7 +3735,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "reviewing the diff the writer is still producing",
             "--called-task",
-            "delegate.review",
+            "direct.review",
             at=at,
         )
 
@@ -3824,7 +3824,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "reviewing the finished diff",
             "--called-task",
-            "delegate.review",
+            "direct.review",
             "--called-family",
             "codex",
             "--called-model",
@@ -3841,7 +3841,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         stage_rows = self.table_rows(
             rendered,
-            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+            ["Stage", "Main", "Worker", "Start", "Elapsed", "Result"],
         )
         self.assertEqual(
             [(row[0], row[5]) for row in stage_rows],
@@ -3874,7 +3874,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         stage_rows = self.table_rows(
             rendered,
-            ["Stage", "Main", "Delegate", "Start", "Elapsed", "Result"],
+            ["Stage", "Main", "Worker", "Start", "Elapsed", "Result"],
         )
         self.assertEqual([row[0] for row in stage_rows], ["Fix 2"])
 
@@ -4053,7 +4053,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "writing the retry path",
             "--called-task",
-            "delegate.implementation",
+            "direct.implementation",
             "--called-family",
             "codex",
             "--called-model",
@@ -4149,7 +4149,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.isolate_recorder_roots(environment)
         self.isolate_identity(environment)
         environment.update({"CODEX_THREAD_ID": "codex-session", "CLAUDE_CODE_SESSION_ID": "claude-session",
-                            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir), "PLAN_DELEGATE_NOW_EPOCH": "1000"})
+                            "UNIT_HISTORY_DIR": str(self.history_dir), "UNIT_NOW_EPOCH": "1000"})
         for family, model in (("codex", "codex-model"), ("claude", "claude-model"), ("unknown", "unknown")):
             with self.subTest(family=family):
                 session = self.root / f"identity-{family}"
@@ -4192,7 +4192,7 @@ print('two homes isolated; recorder lock retained; caller restored')
             "--activity",
             "writing the retry path",
             "--called-task",
-            "delegate.implementation",
+            "direct.implementation",
             "--called-family",
             "codex",
             "--called-model",
@@ -4435,7 +4435,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         _ = self.run_command(
             "start-pass", "--session-dir", str(session_dir), "--pass-kind", "impl",
-            "--activity", "building the delivery", "--called-task", "delegate.implementation",
+            "--activity", "building the delivery", "--called-task", "direct.implementation",
             "--called-family", "codex", "--called-model", "fixture-model", at=at(16, 30),
         )
         _ = self.run_command(
@@ -4683,8 +4683,8 @@ print('two homes isolated; recorder lock retained; caller restored')
             with self.subTest(gate=gate):
                 session_dir = self.short_report_fixture(f"short-own-{name}", gate=gate)
                 with patch.dict(os.environ, {
-                    "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                    "PLAN_DELEGATE_NOW_EPOCH": str(self.report_time(16)), "USER_ZONE": "UTC",
+                    "UNIT_HISTORY_DIR": str(self.history_dir),
+                    "UNIT_NOW_EPOCH": str(self.report_time(16)), "USER_ZONE": "UTC",
                 }):
                     self.assertEqual(eta_line(session_dir, "4"), expected)
 
@@ -4712,8 +4712,8 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(cells[1:4], ["38", "02:00:00", "today 18:54"])
         self.assertEqual(cells[-2:], ["today 18:44 (-00:10)", "today 19:14 (+00:20)"])
         with patch.dict(os.environ, {
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-            "PLAN_DELEGATE_NOW_EPOCH": str(int(datetime(2026, 10, 16, 18, tzinfo=UTC).timestamp())),
+            "UNIT_HISTORY_DIR": str(self.history_dir),
+            "UNIT_NOW_EPOCH": str(int(datetime(2026, 10, 16, 18, tzinfo=UTC).timestamp())),
             "USER_ZONE": "UTC",
         }):
             record = phase_table.build(session_dir)
@@ -5243,7 +5243,7 @@ print('two homes isolated; recorder lock retained; caller restored')
                 os.environ,
                 {
                     "PHASE_TABLE_VAULT": str(self.root / "vault"),
-                    "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
+                    "UNIT_HISTORY_DIR": str(self.history_dir),
                 },
             ),
             patch("scripts.direct.progress_history.subprocess.run") as run,
@@ -5629,7 +5629,7 @@ class PhaseCountTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
+        self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
 
@@ -5719,13 +5719,13 @@ class PublicPhaseHelperTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
+        self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
     def test_recorder_helpers_use_public_names_without_private_aliases(self) -> None:
-        with patch.dict(os.environ, {"PLAN_DELEGATE_NOW_EPOCH": "123.5"}):
+        with patch.dict(os.environ, {"UNIT_NOW_EPOCH": "123.5"}):
             self.assertEqual(plan_history.now_epoch(), 123.5)
         self.assertEqual(
             plan_history.resolve_plan_path(self.root, "docs/plan.md"),
@@ -5860,7 +5860,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
+            {"UNIT_HISTORY_DIR": str(self.root / "history")},
         ):
             self.assertEqual(plan_history.plan_runs(plan), [older, newer])
 
@@ -5885,7 +5885,7 @@ class PublicPhaseHelperTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history")},
+            {"UNIT_HISTORY_DIR": str(self.root / "history")},
         ):
             self.assertEqual(plan_history.plan_runs(plan), [])
 

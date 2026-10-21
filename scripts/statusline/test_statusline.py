@@ -103,14 +103,14 @@ class ColorTests(unittest.TestCase):
         cases: tuple[tuple[str, str, dict[str, str]], ...] = (
             ("\x1b[95mshowrunner\x1b[0m", "session-id", {}),
             ("\x1b[94munit\x1b[0m", "", {"SHOWRUNNER_UNIT": "unit"}),
-            ("\x1b[96mworker\x1b[0m", "", {"PLAN_DELEGATE_TEAM_ROLE": "impl", "SHOWRUNNER_UNIT": "unit"}),
+            ("\x1b[96mworker\x1b[0m", "", {"UNIT_TEAM_ROLE": "impl", "SHOWRUNNER_UNIT": "unit"}),
             ("\x1b[38;5;141munassigned\x1b[0m", "", {}),
         )
         for expected, showrunners, marks in cases:
             with self.subTest(role=expected):
                 line = status_lines({"session_id": "session-id"}, colors=SHIPPED_COLORS,
                                     showrunners=showrunners,
-                                    PLAN_DELEGATE_TEAM_ROLE=marks.get("PLAN_DELEGATE_TEAM_ROLE", ""),
+                                    UNIT_TEAM_ROLE=marks.get("UNIT_TEAM_ROLE", ""),
                                     SHOWRUNNER_UNIT=marks.get("SHOWRUNNER_UNIT", ""))[0]
                 self.assertEqual(line.split(" | ")[0], expected)
 
@@ -492,7 +492,7 @@ class RoleTests(unittest.TestCase):
         for shell in SHELLS:
             with self.subTest(shell=shell):
                 role = self.command_lines({}, shell=shell, SHOWRUNNER_UNIT="show",
-                                          PLAN_DELEGATE_TEAM_ROLE="impl")[0].split(" | ")[0]
+                                          UNIT_TEAM_ROLE="impl")[0].split(" | ")[0]
                 self.assertEqual(role, "\x1b[96mworker\x1b[0m")
 
     def test_unit_director_finds_a_showrunner_on_another_account_through_shared_session_links(self) -> None:
@@ -548,7 +548,7 @@ class RoleTests(unittest.TestCase):
         command = f'statusline="{scripts}"; . "$statusline/statusline.sh"'
         payload = {**limits({"used_percentage": 95}, {"used_percentage": 90}),
                    "context_window": ContextWindow(total_input_tokens=90_000, context_window_size=100_000)}
-        self.assertEqual(self.command_lines(payload, command=command, PLAN_DELEGATE_TEAM_ROLE="impl"), [
+        self.assertEqual(self.command_lines(payload, command=command, UNIT_TEAM_ROLE="impl"), [
             "worker | ~",
             "90,000 | 5-hour 5% left | weekly 10% left",
         ])
@@ -573,7 +573,7 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(self.role(), "unassigned")
 
     def test_a_timer_that_is_not_a_showrunner_s_does_not_make_one(self) -> None:
-        self.timer("delegate-aaaa-1111", "session:aaaa-1111")
+        self.timer("worker-aaaa-1111", "session:aaaa-1111")
         self.assertEqual(self.role(), "unassigned")
 
     def test_an_empty_target_does_not_match_an_empty_session_id(self) -> None:
@@ -593,10 +593,10 @@ class RoleTests(unittest.TestCase):
         self.assertEqual(self.role(SHOWRUNNER_UNIT=""), "unassigned")
 
     def test_a_worker_under_a_daemon_a_unit_started_is_a_worker(self) -> None:
-        self.assertEqual(self.role(PLAN_DELEGATE_TEAM_ROLE="impl", SHOWRUNNER_UNIT="show"), "worker")
+        self.assertEqual(self.role(UNIT_TEAM_ROLE="impl", SHOWRUNNER_UNIT="show"), "worker")
 
     def test_the_empty_team_role_agent_bg_hands_a_friend_is_unassigned(self) -> None:
-        self.assertEqual(self.role(PLAN_DELEGATE_TEAM_ROLE=""), "unassigned")
+        self.assertEqual(self.role(UNIT_TEAM_ROLE=""), "unassigned")
 
     def test_the_account_label_follows_the_role(self) -> None:
         config = self.home / "config"

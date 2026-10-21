@@ -189,7 +189,7 @@ def _review_lens(run: Path, name: str) -> Lens | None:
 
 
 def _run_assignments(run: Path) -> Iterator[tuple[str, Assignment]]:
-    # The remote reader loads this module without a delegate checkout.
+    # The remote reader loads this module without a worker checkout.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.direct.worker_state import worker_ledger
 

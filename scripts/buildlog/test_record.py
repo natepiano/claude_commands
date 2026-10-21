@@ -32,7 +32,7 @@ CALL_ID = "natedev-20261002T120000-abcdef"
 SWEEP = ["/home/u/.claude/scripts/lib/py", "/home/u/.claude/scripts/lint/sweep.py"]
 NEXTEST = ["cargo", "nextest", "run", "--workspace", "--retries", "2"]
 # What the ambient session would otherwise stamp on every record: the caller,
-# the delegate worker, the session and the call id all come from these.
+# the worker, the session and the call id all come from these.
 AMBIENT = (
     "BUILDLOG_CALLER",
     "BUILDLOG_CALL_ID",
@@ -103,12 +103,12 @@ class RecordTests(unittest.TestCase):
         environment = {
             name: value
             for name, value in os.environ.items()
-            if name not in AMBIENT and not name.startswith("PLAN_DELEGATE_")
+            if name not in AMBIENT and not name.startswith("UNIT_")
         }
         environment["BUILDLOG_DIR"] = str(self.root)
         environment["BUILD_HOLD_DIR"] = str(self.base / "holders")
         environment["BUILD_HOLD_RELEASE_DIR"] = str(self.base / "release")
-        environment["PLAN_DELEGATE_ACTIVE_DIR"] = str(self.base / "active")
+        environment["UNIT_ACTIVE_DIR"] = str(self.base / "active")
         environment["BUILDLOG_CALL_ID"] = environment["BUILDLOG_CALLER"] = ""
         environment["BUILDLOG_HOLD_WAIT_FILE"] = environment["BUILDLOG_HOLD_ADMISSION_FILE"] = ""
         environment["BUILDLOG_HOLD_STARTED_FILE"] = environment["BUILDLOG_HOLD_WAITER_FILE"] = ""
@@ -635,7 +635,7 @@ class RecordTests(unittest.TestCase):
         self.assertEqual([record[key] for key in ("repo_path", "worktree", "branch", "sha")], [None] * 4)
 
     def test_call_record_fields(self) -> None:
-        board = {"PLAN_DELEGATE_TEAM_ROLE": "impl2", "PLAN_DELEGATE_BOARD_DIR": "/x/boards/run-7/"}
+        board = {"UNIT_TEAM_ROLE": "impl2", "UNIT_RUN_DIR": "/x/boards/run-7/"}
         result = self.record(
             "call",
             *("reused", "0", "1", "3", "0", "", "42", "5", "test", "hana"),
