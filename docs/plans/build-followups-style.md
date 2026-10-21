@@ -47,66 +47,34 @@ Then (02:3x EDT), item (e): `held add` keys on rule, path and text, so after a w
 
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** Refill offers a rule-scope cell again only when its own file or a file its verdict names changes, not after every change in its crate; two `style_proposals.py file` runs never fail with Errno 17 on the same decision; and a unit can correct the text of a held finding it waived.
-
-**Spec:**
-
-Part 1 — the refill key (style ledger).
-
-- Today a `clean`, `exception` or `held` verdict recorded with `--input-scope rule` on a crate cell takes the crate scope fingerprint: `_fingerprint(..., CellInputScope.CRATE, ...)` is the Git tree hash of the crate directory. Any change anywhere in the crate turns the cell stale, and refill offers it again. Measured on the cargo-liner ledger (2026-10-21): 10,963 judgments are `input_scope crate, declared_scope rule`; `local:docs/cargo-port/style/vim-mode-reserves-hjkl.md` at `crates/cargo-port/src/tui/keymap_ui/controller.rs` and `mod.rs` was judged `clean` 21 times from 2026-10-19 to 2026-10-21 while the keymap files did not change.
-- `record` takes a new option `--reads <path> [<path> ...]`: the other files the verdict rests on. It is allowed only with `--input-scope rule`, a verdict in `SCOPED_VERDICTS`, and a cell where `--input-scope file` is allowed (a crate or module cell of an included Rust file, the `file_scope_allowed` condition in `Ledger.record`). Each path is normalized like `--path` and must exist at `--commit`; refuse otherwise with a `LedgerError` that names the path or the reason. Duplicate paths and the cell's own path are allowed and change nothing.
-- A judgment recorded with `--reads` stores its read files (a new column; add migration 18) and its fingerprint is the digest of the sorted `(path, blob)` pairs of the cell's own path plus the read files at the commit. Name this a new `CellInputScope` value or a separate field — follow the Type Design Contract: no empty list that means "no reads"; a judgment without reads and one with reads are two shapes.
-- `_judgment_inputs_match` compares a judgment with reads by the same digest at the checked tip; a read file missing at the tip is a mismatch. Judgments without reads keep today's comparison byte for byte. Every caller (`_judgment_state` current and awaiting merge, `_repeated_judgments`, `judged_at_base`) gets the new key through that one function.
-- The newest declared scope filter (`row.declared_scope != rows[0].declared_scope`) stays as it is. A judgment with reads counts as declared scope `rule`.
-- Ticket text (`style_plan.py` :1432-1435): replace the `--input-scope rule` line with: "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. Without `--reads`, the cell comes back after any change in its crate or module." Keep the other two lines.
-- `docs/style_production.md` :216-226: add that `--reads` keys the cell on its file plus the named files, and that a verdict without it keys on the whole crate or module.
-- Speed: a `cells()` read must not load a full tree for each judgment. Read blobs for the read files at the tip from the tip already loaded; compute the stored digest once at record time. Name any cost you add.
-
-Part 2 — the filer lock (proposal issues).
-
-- `_issue_lock` takes its lock folder from `XDG_RUNTIME_DIR` or `tempfile.gettempdir()`. Two runs whose environments differ (a sandboxed run with another `TMPDIR`, or a run without `XDG_RUNTIME_DIR`) take different lock files, so `_folder_lock` does not exclude them. Both then pass the check inside the lock, and the second `os.link(temporary, path)` fails with `FileExistsError` (Errno 17), which names the `.decision-*` temp file.
-- Put the lock files in one fixed folder that does not read the environment: `Path.home() / ".local/state/proposal-issue/locks"`, created on use. Lock file names stay `proposal-issue-<digest>.lock` from the resolved path.
-- In `_create_numbered`, a `FileExistsError` from `os.link` reads the path again through `_decision_path_state`: the same key returns `False` (already filed, nothing written, the other run's file byte-identical); a different key raises the existing `Refusal(f"{path}: different decision key")`. The temp file is removed in every case, as now.
-- Keep both `_decision_path_state` checks in `create`, before and inside the lock (phase 36 binds this).
-
-Part 3 — held replace (style ledger).
-
-- `held replace --id <waived id> --after <text>` reopens a waived held finding with the new after text and keeps its id. Plain `held add` is unchanged.
-- Each waive records who made it (migration 19, `WaiveProvenance`): a unit's waive by its `--ticket`, a person's by `--person <name>`; `held waive` requires exactly one. A decline records the person. Waives from before the migration read as unrecorded.
-- Replace accepts a unit's waive. A person's waive is refused. An unrecorded waive needs `--person <name>`, the same rule `unwaive` uses.
+- `style_ledger.py record --reads <path> [<path> ...]` names the other files a verdict rests on. The ledger accepts it only with `--input-scope rule`, a verdict in `SCOPED_VERDICTS`, and a crate or module cell of an included Rust file. It normalizes each path like `--path`, then sorts the paths and removes duplicates. The cell's own path changes nothing. A path with no file at the commit is refused with `LedgerError` "<path>: no file at <commit>".
+- Migration 18 adds `judgments.read_files` (JSON list, default `'null'`). A judgment has one of two shapes: `ReadFiles(paths)`, which refuses an empty tuple, or `NoReadFiles` (`NO_READ_FILES`). `Judgment` and `TicketJudgment` carry the shape in `reads`. `_read_fingerprint(tip, path, reads)` is the SHA-256 digest of the sorted `(path, blob)` pairs of the cell file plus the read files, read from `tip.blobs`. `record` stores this digest once. The checkpoint carry uses it too, and runs its `rev-list` over the cell file plus the read files.
+- `_judgment_inputs_match` compares a judgment with reads by `_read_fingerprint` at the checked tip. A read file that is missing at the tip is a mismatch. Judgments without reads keep the earlier comparison. Current state, awaiting merge, `_repeated_judgments` and `judged_at_base` all go through this one function. The ticket text in `style_plan.py` tells a unit to use `--input-scope rule --reads <files>`, and says that without `--reads` the cell comes back after any change in its crate or module. On the cargo-liner ledger copy, `cells()` ran in 20.9 s against 27.5 s before the change, with the same states.
+- `proposal_issue._issue_lock` takes its lock file from the fixed folder `~/.local/state/proposal-issue/locks` (`Path.home()`) and creates the folder on use. It does not read `XDG_RUNTIME_DIR` or `TMPDIR`. In `_create_numbered`, a `FileExistsError` from `os.link` reads the path again through `_decision_path_state`. The same key returns `False` and leaves the other run's file as it is. A different key raises the earlier `Refusal`. The temp file is removed in every case.
+- `held waive --id F` requires exactly one of `--ticket T` or `--person NAME` (an argparse group of exclusive options). `waive_held(finding_id, actor)` takes a `WaiveActor` = `WaiveByUnit(ticket)` | `WaiveByPerson(by)`. It refuses a blank name and a ticket that did not judge the finding. Migration 19 adds `held_findings.waive_provenance` (`WaiveProvenance`: `unrecorded`, `unit`, `person`; default `unrecorded`). Migration 20 adds `waived_by`. `HeldFinding` carries `waive_provenance` and `waive_actor` (`WaiveActor | NoRecordedWaiveActor`). A unit's waive does not change a finding that is already waived. A person's waive writes over a unit's waive.
+- `held replace --id F --after TEXT [--person NAME]` (`Ledger.replace_held`) reopens a waived finding with the new after text and keeps its id and judging ticket. It prints the id. It sets the finding to unfiled and clears its proposal, build ticket and person reading. It also sets a newest `waived` cell judgment back to `held` (`_restore_held_findings`, which `unwaive_held` also uses). It refuses a finding that is not waived, and a person's waive. An unrecorded waive needs `--person`, and the ledger records that name in `unwaived_by`, as `unwaive` does. Plain `held add` keeps an existing waive.
 
 **Files:**
-- `scripts/style/style_ledger.py` — `--reads` on `record`, migration 18, the read-files judgment shape, its fingerprint and `_judgment_inputs_match`; Part 3's `held replace`, waive provenance and migration 19.
-- `scripts/style/style_plan.py` — the ticket text's input-scope line.
-- `docs/style_production.md` — the `--reads` paragraph and the `held waive` / `held replace` lines.
-- `scripts/style/test_style_ledger.py` — tests for Parts 1 and 3.
-- `scripts/style/test_style_plan.py` — the refill test and the ticket text.
-- `scripts/production/proposal_issue.py` — the fixed lock folder and the `FileExistsError` path in `_create_numbered`.
-- `scripts/production/test_proposal_issue.py` — tests for Part 2.
+- `scripts/style/style_ledger.py` — `ReadFiles`/`NoReadFiles`, `_read_files`, `_read_fingerprint`, migrations 18-20, `record --reads`, the reads branch of `_judgment_inputs_match` and of the checkpoint carry, `WaiveProvenance`/`WaiveActor`, `waive_held(actor)`, `replace_held`, `_restore_held_findings`, the `held replace` and `held waive` options.
+- `scripts/style/style_plan.py` — the ticket text's `--input-scope rule --reads <files>` line.
+- `scripts/production/proposal_issue.py` — the fixed lock folder and the `FileExistsError` path at the decision link.
+- `docs/style_production.md` — the `--reads` paragraph, `held waive` with `--ticket` or `--person`, and the `held replace` paragraph.
+- `docs/as-built/style-showrunner.md` — the `held waive` and `held replace` command lines.
+- `commands/unit/checkpoint.md` — the person's `held waive` command names `--person <name>`.
+- `scripts/style/test_style_ledger.py` — tests for `--reads` (state, awaiting merge, base, checkpoint, refusals, normalization, migration from schema 17) and for waive actors and `held replace`.
+- `scripts/style/test_style_plan.py` — the refill test with and without `--reads`, and the ticket text test.
+- `scripts/production/test_proposal_issue.py` — the fixed lock folder test and the same-key and different-key link tests.
+- `scripts/production/test_footer_counts.py` — patches `Path.home` in place of `XDG_RUNTIME_DIR`.
+- `scripts/style/test_style_proposals.py` — patches `Path.home` and `HOME`, and passes `WaiveByPerson` to `waive_held`.
+- `scripts/style/test_coverage_report.py` — passes `WaiveByPerson` to `waive_held`.
 
-**Workers:**
-2 writers + 1 tester; the parts touch disjoint files.
-- `impl2` — Part 1: `scripts/style/style_ledger.py`, `scripts/style/style_plan.py`, `docs/style_production.md`. hub: `style_ledger.py` (migration).
-- `impl` — Part 2: `scripts/production/proposal_issue.py`, `scripts/production/test_proposal_issue.py`.
-- `test` — Part 1 tests from the Spec: `scripts/style/test_style_ledger.py`, `scripts/style/test_style_plan.py`.
+**Binds later work:** `judgments.read_files` is `'null'` or a sorted JSON list of normalized paths. A judgment with reads compares only by `_read_fingerprint`, and every state reader goes through `_judgment_inputs_match`. `waive_held` needs a `WaiveActor`. A new kind of waive actor extends `WaiveActor` and `WaiveProvenance`, and `_held` must map it back from `waive_provenance` and `waived_by`. `replace_held` refuses every waive except a unit's waive and an unrecorded waive that has `--person`. Tests that file proposals patch `Path.home`, because the lock folder no longer reads the environment.
 
-**Constraints from prior phases:**
-- Phase 25: `judged_at_base` and `_repeated_judgments` decide which stale cells a ticket at the unit tip cannot change; they read inputs only through `_judgment_inputs_match`.
-- Phase 36: `create` checks the decision path before and inside `_folder_lock`; a change keeps both checks.
-- Phase 39: `record` refuses `held` with no live finding on the cell; `--reads` does not change that check.
-
-**Acceptance gate:**
-- Refill test (`test_style_plan.py`): a crate cell recorded `clean --input-scope rule --reads <b.rs>` at commit 1; commit 2 changes another file in the same crate and the synced tip moves to it; refill offers the cell no second time. Commit 3 changes `b.rs`; refill offers it again. The same cell recorded without `--reads` is offered again at commit 2 (today's behavior).
-- Ledger tests (`test_style_ledger.py`): the cell reads `current` after an unrelated crate change and `stale` after a change to its own file or a read file, or when a read file is deleted; `awaiting merge` and `judged_at_base` follow the same key; `--reads` is refused with `--input-scope file`, without `--input-scope`, with `fixed` or `waived`, on a file-scope or manifest cell, and with a path missing at the commit; a ledger at schema 17 migrates and its old crate judgments keep their state.
-- Ticket text test: the new `--reads` line is in the ticket text.
-- Held replace tests (`test_style_ledger.py`): a unit's waive is replaced and keeps its id; a person's waive is refused; an unrecorded waive is refused without `--person` and replaced with it; `held waive` refuses neither and both actor flags.
-- Filer tests (`test_proposal_issue.py`): the lock folder is the same with `XDG_RUNTIME_DIR` unset and `TMPDIR` changed; a `FileExistsError` at the link with the same key returns `False` and leaves the other file byte-identical; with a different key it raises `Refusal`; the temp file is gone in both cases.
-- Live check, read only: on a copy of `~/.local/state/style/cargo-liner/ledger.sqlite`, `cells()` at the copy's synced tip runs in no more than 10% more time than before the change (time both).
-- `env -C /home/natepiano/worktrees/claude-build-followups-style PYTHONPATH=/home/natepiano/worktrees/claude-build-followups-style/scripts/style:/home/natepiano/worktrees/claude-build-followups-style/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_ledger scripts.style.test_style_plan scripts.production.test_proposal_issue`
-- `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` from the worktree root.
-- `basedpyright -p /home/natepiano/worktrees/claude-build-followups-style` on every changed Python file: `0 errors, 0 warnings`.
+**Gotchas:**
+- `decline_findings` writes `waive_provenance='person'` with an empty `waived_by`. It does this for a person's decline and also for the file-gone waive from `style_plan.py`, and it erases any earlier actor name. `_held` reads such a row as `NoRecordedWaiveActor`, and `replace` refuses it as a person's waive.
+- A `--reads` judgment keeps declared scope `rule`. The newest declared scope filter still treats it as a rule-scope verdict.
 
 ### Phase 41 — every waive names who made it, declines and file-gone waives included  · status: todo
 
@@ -133,9 +101,8 @@ Decided by the showrunner (natedev, 2026-10-21): "A decline is always the user's
 - `docs/style_production.md` — the decline and file-gone waive lines.
 
 **Workers:**
-1 writer + 1 tester; the tests sit in their own files.
-- `impl` — `scripts/style/style_ledger.py`, `scripts/style/style_proposals.py`, `scripts/style/style_plan.py`, `docs/style_production.md`. hub: `style_ledger.py`.
-- `test` — `scripts/style/test_style_ledger.py`, `scripts/style/test_style_proposals.py`, `scripts/style/test_style_plan.py`.
+1 writer; the `decline_findings` signature change breaks callers in all three test files, so one worker holds code and tests.
+- `impl` — every file above. hub: `style_ledger.py`.
 
 **Constraints from prior phases:**
 - Phase 40: `WaiveByUnit(ticket)` / `WaiveByPerson(name)` and `WaiveProvenance` (migration 19, `waived_by` migration 20); `held waive` requires exactly one of `--ticket` and `--person`; `held replace` refuses a person's waive and needs `--person` for an unrecorded one.
