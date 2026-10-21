@@ -128,12 +128,20 @@ ENTRIES = (
         + "Adding credits lets Codex accept jobs again.",
         (PushExample("typical", {"account": "codex1"}),
          PushExample("long_account", {"account": "codex999"}))),
+    # sweep.py sends this only when no idle build output is left and no Claude session holds a busy
+    # target; {paths} lists, largest first, the busy targets and then the largest measured folders.
+    # Sizes follow the 2026-10-21 disk check on natedev (HANDOFF-builds-unit.md, 00:45 EDT): 26 GiB held in
+    # cargo-liner-berth's target, about 86 GiB of scratch clones under /tmp.
     PushText("sweep.disk_floor", "sweep", "note", "Builds need more disk space",
-        ActionTemplate("In a terminal on natedev, delete {shortfall} of personal files you no longer need."),
-        "The natedev computer has {free} free; builds need {floor}. Build cache cleanup freed {removed}. "
-        + "Builds may fail until you free more space.",
-        (PushExample("typical", {"shortfall": "10.0 GiB", "free": "290.0 GiB", "floor": "300.0 GiB", "removed": "2.0 GiB"}),
-         PushExample("no_free_space", {"shortfall": "300.0 GiB", "free": "0.0 GiB", "floor": "300.0 GiB", "removed": "0.0 GiB"}))),
+        ActionTemplate("In the Claude session named natedev, name the paths below that it may remove."),
+        "The natedev computer has {free} free. Builds need {floor}. They may fail until {shortfall} more is free. "
+        + "Build cache cleanup freed {removed} and has no idle build output left.\n\n{paths}\n\n"
+        + "The session removes only the paths you name.",
+        (PushExample("typical", {"shortfall": "10.0 GiB", "free": "290.0 GiB", "floor": "300.0 GiB", "removed": "2.0 GiB",
+            "paths": "/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\n"
+            + "/tmp/claude-1000/scratch: frees 86.0 GiB."}),
+         PushExample("no_free_space", {"shortfall": "300.0 GiB", "free": "0.0 GiB", "floor": "300.0 GiB", "removed": "0.0 GiB",
+            "paths": "/tmp/claude-1000/scratch: frees 86.0 GiB.\n\n/home/natepiano/.local/share/Trash: frees 40.0 GiB."}))),
     PushText("rust.passed", "rust_release", "decision", "Hana can use the new Rust compiler",
         ActionTemplate("In the Claude session named natedev, reply upgrade or wait."),
         "Hana, the editor project, passed its compiler check on Rust {version}: no errors. "
