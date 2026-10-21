@@ -3,7 +3,8 @@
 
 Claude Code edits reach `cargo-berth hook pre-tool-use` through `berth_pre_edit.sh`; a Codex
 seat's `apply_patch` had no berth check at all, so its first touch never turned the phase's
-`enrolled_awaiting_first_touch` state `Active`. This hook runs for Codex `PreToolUse` on
+`enrolled_awaiting_first_touch` state `Active`, and an `Active` record never followed a new
+reservation of its phase. This hook runs for Codex `PreToolUse` on
 `apply_patch`. It acts only for a seat of a running unit: the app-server a unit director starts
 carries the director's `CLAUDE_CODE_SESSION_ID` and, when codex_mesh started it for a run, that run
 as `PLAN_DELEGATE_BOARD_DIR`. The run named there is the session directory; when it is unset or

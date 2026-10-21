@@ -23,6 +23,9 @@ STATE_HISTORY = (
     "buildlog/", "mul-add-hook/", "fn-length-hook/", "claude/feature-log/", "review-pool/", "verify/", "zsh/",
     # Rebuilt from its sources on the next board refresh.
     "unit-board/",
+    # Copies of queued prompt texts, which the pause hook matches exactly against each prompt that
+    # comes in; the session's next stop rebuilds them from its wakeups. A rewrite breaks the match.
+    "conversation-pause/scheduled-prompts/",
 )
 # Under a production's own state folder.
 PRODUCTION_HISTORY = ("log-backups/", "dailies_last.json", "rename_unit.json", "rename.json")

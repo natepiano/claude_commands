@@ -583,6 +583,8 @@ class UnitRenameTests(unittest.TestCase):
         self.write(self.root / "state/other/names.json", '{"unit": "claude-demo-alphabet"}\n')
         self.write(self.root / "state/other/__pycache__/names.cpython-313.pyc", "alpha-unit\n")
         self.write(self.root / "state/other/names.pyc", "alpha-unit\n")
+        self.write(self.root / "state/conversation-pause/scheduled-prompts/sid.json",
+                   '["Renamed from alpha-unit to gamma-unit."]\n')
         self.assert_ok(self.rename("verify"))
         stale = self.root / "state/other/cache.json"
         self.write(stale, '{"unit": "alpha-unit"}\n')
@@ -606,6 +608,32 @@ class UnitRenameTests(unittest.TestCase):
         self.assertEqual(state["next"], ["merge gamma-unit from demo-gamma", "keep the per-unit gate"])
         self.assertEqual(state["open_for_user"], [{"text": "gamma-unit asks", "question": "Does gamma-unit ship?"}])
         self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text()))[0]["text"], "gamma-unit asks")
+        self.assert_ok(self.rename("verify"))
+
+    def test_other_showrunners_lists_take_the_new_name_unless_their_production_has_the_id(self) -> None:
+        """cargo-liner-style, 2026-10-21: the parent production's showrunner state named the unit."""
+        states: dict[str, Path] = {}
+        for slug, row in (("parent", "| other-unit | p.md | `/x` | other |"), ("twin", "| alpha-unit | t.md | `/y` | alpha |"),
+                          ("orphan", "")):
+            doc = self.root / f"{slug}/docs/{slug}-production.md"
+            self.write(doc, f"# {slug}\n\n## Units\n\n| Unit | Plan | Worktree | Branch |\n|---|---|---|---|\n{row}\n")
+            if slug != "orphan":
+                self.write(self.root / f"state/notifier/showrunner-{slug}/conf",
+                           "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
+                           + shlex.join(["zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
+            states[slug] = self.state / slug / "session/showrunner_state.json"
+            self.write(states[slug], json.dumps({"next": ["wait for alpha-unit"],
+                                                 "open_for_user": [{"text": "alpha-unit asks", "question": "Q?"}]}))
+        outstanding = self.state / "outstanding/parent.json"
+        self.write(outstanding, json.dumps([{"since": "2026-10-21T09:00", "text": "alpha-unit asks", "question": "Q?"}]))
+        self.assert_ok(self.rename("apply"))
+        parent = cast(dict[str, object], json.loads(states["parent"].read_text()))
+        self.assertEqual(parent["next"], ["wait for gamma-unit"])
+        self.assertEqual(parent["open_for_user"], [{"text": "gamma-unit asks", "question": "Q?"}])
+        self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text()))[0]["text"], "gamma-unit asks")
+        # twin has its own alpha-unit, and orphan's production cannot be read: both keep their text.
+        for slug in ("twin", "orphan"):
+            self.assertIn("wait for alpha-unit", states[slug].read_text())
         self.assert_ok(self.rename("verify"))
 
     def test_mul_add_naming_keeps_the_underscore_id(self) -> None:
