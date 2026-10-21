@@ -464,6 +464,31 @@
       "time": "2026-10-21T07:51:44.021181-04:00"
     }
   },
+  "quota.paid_credits_queued": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "quota_alert: codex2 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "To stop it, set use_credits: off",
+          "rule": "first-150-stand-alone"
+        },
+        {
+          "quote": "codex2 has 25,345 paid credits left.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "workers spend these credits until your queued move runs",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: user 2026-10-21: approved whatever messaging and accounts decide on paid credits; text agreed with accounts-unit; reviewer: opus",
+      "sha256": "5ea0c1dd6ea4e5c01c8436fdb2344b7f9801ab24af834edda4bd55d63b505500",
+      "time": "2026-10-21T18:19:20.767262-04:00"
+    }
+  },
   "rust.errors": {
     "many_errors": {
       "reviewer": "opus",
