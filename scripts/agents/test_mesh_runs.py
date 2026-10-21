@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -41,7 +42,7 @@ class MeshRunsTests(unittest.TestCase):
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
-        self.stack.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(self.root / "pool")}))
+        self.stack.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(self.root / "pool"), "BUILDLOG_SCOPE": "0"}))
         self.sent = []
 
         def send_to_director(session_id: str, summary: str, text: str) -> bool:
@@ -135,6 +136,39 @@ class MeshRunsTests(unittest.TestCase):
         self.assertIn("Run finished: verify.sh check\nResult: PASS (exit 0)", messages[0])
         self.assertIn("lint clean impl", messages[0])
         self.assertEqual(self.sent, [])
+
+    def test_scope_prefix_needs_a_user_manager_and_honours_the_off_switch(self) -> None:
+        runtime = self.root / "runtime"
+        (runtime / "systemd").mkdir(parents=True)
+        marker = self.root / "r1.scope"
+        on = {"XDG_RUNTIME_DIR": str(runtime)}
+        with patch("shutil.which", return_value="/bin/systemd-run"):
+            self.assertEqual(mesh_runs.scope_prefix(marker, on), [])
+            with socket.socket(socket.AF_UNIX) as manager:
+                manager.bind(str(runtime / "systemd" / "private"))
+                prefix = mesh_runs.scope_prefix(marker, on)
+                self.assertEqual(mesh_runs.scope_prefix(marker, {**on, "BUILDLOG_SCOPE": "0"}), [])
+        self.assertEqual(prefix[:2], ["systemd-run", "--user"])
+        self.assertIn("--slice=builds.slice", prefix)
+        self.assertEqual(prefix[-4:], ["/bin/sh", "-c", mesh_runs.SCOPE_SCRIPT, str(marker)])
+        with patch("shutil.which", return_value=None):
+            self.assertEqual(mesh_runs.scope_prefix(marker, on), [])
+
+    def test_a_scope_runs_the_command_once_and_a_failed_scope_runs_it_plainly(self) -> None:
+        count = self.root / "count"
+        command = ["/bin/sh", "-c", f'echo run >> "{count}"']
+        scope = self.session / codex_mesh.DETACHED_RUNS_DIR / "r1.scope"
+        # A scope without systemd-run: the same script, so the marker proves the command started.
+        with patch.object(mesh_runs, "scope_prefix", return_value=["/bin/sh", "-c", mesh_runs.SCOPE_SCRIPT, str(scope)]):
+            record = self.supervise(self.record(command))
+        self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
+        self.assertFalse(scope.exists())
+        count.unlink()
+        (self.session / f"{WORKER}.pending.json").unlink()
+        # A scope that fails before the command starts leaves no marker.
+        with patch.object(mesh_runs, "scope_prefix", return_value=["/bin/sh", "-c", "exit 1", "scope"]):
+            record = self.supervise(self.record(command))
+        self.assertEqual((record.get("exit_code"), count.read_text(encoding="utf-8")), (0, "run\n"))
 
     def test_failure_and_done_message_rules(self) -> None:
         path = self.record([sys.executable, "-c", "raise SystemExit(4)"])

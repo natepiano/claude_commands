@@ -32,6 +32,7 @@ import contextlib
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -60,6 +61,13 @@ RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
 SEND_TIMEOUT_SECS = 120
 FORWARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# On natedev the command runs in a scope in builds.slice, beside the steps scripts/lint/invoke.sh
+# places there, so its compiles take the builds' memory limit and CPU weight, below the sessions.
+# Worker cargo builds ran at the panes' weight in herdr-agents.service (2026-10-20). The scope
+# writes the marker just before the command starts; a marker missing after the scope exits proves
+# the scope never ran it (no user manager, a systemd that rejects an option), so the command runs
+# plainly. BUILDLOG_SCOPE=0 turns the scope off, as it does for invoke.sh.
+SCOPE_SCRIPT = ': > "$0" || exit 125; exec "$@"'
 
 
 class RunRecord(TypedDict):
@@ -286,6 +294,36 @@ def deliver(record: RunRecord, exit_code: int) -> str:
     return f"held for {name}'s next dispatch: no director was found"
 
 
+def scope_prefix(marker: Path, environment: dict[str, str]) -> list[str]:
+    """The argv that runs a command in a builds.slice scope, or nothing where no scope is possible."""
+    runtime = environment.get("XDG_RUNTIME_DIR", "")
+    if (environment.get("BUILDLOG_SCOPE", "1") == "0" or not runtime
+            or not Path(runtime, "systemd", "private").is_socket() or shutil.which("systemd-run") is None):
+        return []
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--expand-environment=no",
+            "--slice=builds.slice", "--", "/bin/sh", "-c", SCOPE_SCRIPT, str(marker)]
+
+
+def _run(command: list[str], cwd: str, environment: dict[str, str], log: Path) -> int:
+    """Run the command with its output appended to the log, forward signals to it, and return its status."""
+    try:
+        with log.open("ab") as output:
+            child = subprocess.Popen(command, cwd=cwd or None, env=environment,
+                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+    except OSError as exc:
+        with log.open("a", encoding="utf-8") as output:
+            _ = output.write(f"mesh_runs: command did not start: {exc}\n")
+        return 127
+
+    def forward(signum: int, _frame: FrameType | None) -> None:
+        with contextlib.suppress(OSError):
+            child.send_signal(signum)
+
+    for forwarded in FORWARDED_SIGNALS:
+        _ = signal.signal(forwarded, forward)
+    return _exit_status(child.wait())
+
+
 def command_supervise(args: argparse.Namespace) -> int:
     record_path = Path(str(getattr(args, "record", "")))
     record = _read_record(record_path)
@@ -296,22 +334,12 @@ def command_supervise(args: argparse.Namespace) -> int:
         "PLAN_DELEGATE_TEAM_ROLE": record["worker"].rsplit("-", 1)[-1],
     })
     log = Path(record["log"])
-    try:
-        with log.open("ab") as output:
-            child = subprocess.Popen(record["command"], cwd=record["cwd"] or None, env=environment,
-                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
-    except OSError as exc:
-        with log.open("a", encoding="utf-8") as output:
-            _ = output.write(f"mesh_runs: command did not start: {exc}\n")
-        exit_code = 127
-    else:
-        def forward(signum: int, _frame: FrameType | None) -> None:
-            with contextlib.suppress(OSError):
-                child.send_signal(signum)
-
-        for forwarded in FORWARDED_SIGNALS:
-            _ = signal.signal(forwarded, forward)
-        exit_code = _exit_status(child.wait())
+    marker = log.with_suffix(".scope")
+    prefix = scope_prefix(marker, environment)
+    exit_code = _run(prefix + record["command"], record["cwd"], environment, log)
+    if prefix and not marker.exists():
+        exit_code = _run(record["command"], record["cwd"], environment, log)
+    marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
     delivery = deliver(record, exit_code)
