@@ -1483,10 +1483,11 @@ overtake an unconfirmed release. An unsuccessful recovery stops refill.
 Then run:
 
 ```sh
-~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <unit-worktree>
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/<Plan cell> --repo <unit-worktree>
 ```
 
-Use the unit worktree's own plan: `add_unit.py` copies the showrunner template
+Read the Plan cell from the unit's Units row, relative to its worktree; a rename
+keeps that path. `add_unit.py` copies the showrunner template
 only at first launch. Exit 0 continues with the todo phase; a todo repair
 always runs first. The ledger resumes assigned work, rebuilds a missing phase,
 recovers interrupted assignment, and discards merged or dropped ticket phases;

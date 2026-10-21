@@ -8,16 +8,19 @@ import io
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from collections.abc import Callable
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast, final, override
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_showrunner
 import fake_unit_host
@@ -29,8 +32,10 @@ import unit_runs
 from rename_state import RenameRefused
 
 if TYPE_CHECKING:
+    from scripts.style import style_ledger
     from scripts.shutdown import record as shutdown_record
 else:
+    import style_ledger
     # rename_unit puts the shutdown folder on the path.
     import record as shutdown_record
 
@@ -231,6 +236,123 @@ class UnitRenameTests(unittest.TestCase):
                       + str(self.rust / "claude-demo-gamma"), result.stdout)
         self.assertIn("'chore(demo): rename unit alpha-unit to gamma-unit'", result.stdout)
 
+    def style_production(self) -> tuple[Path, Path, Path]:
+        worktree = self.rust / "demo-names"
+        _ = self.git("worktree", "add", "-b", "demo-names", str(worktree), SLUG)
+        _ = self.git("push", "origin", "demo-names")
+        _ = self.git("rm", str(self.doc.relative_to(self.checkout)))
+        _ = self.git("commit", "-m", "style production excludes its control files")
+        _ = self.git("push", "origin", SLUG)
+        plan = Path("docs/style-production/units/names-unit.md")
+        self.write(self.checkout / ".git/info/exclude", "docs/plans/demo-production.md\ndocs/style-production/\n")
+        text = self.production_doc().replace(
+            "- **Log:**", f"- **Kind:** style\n- **Repository:** `{self.checkout}`\n- **Log:**")
+        text = text.replace(
+            f"| alpha-unit | docs/plans/alpha.md | `{self.rust / 'claude-demo-alpha'}` | demo-alpha |",
+            f"| names-unit | `{plan}` | `{worktree}` | demo-names |")
+        self.write(self.doc, text)
+        for directory in (self.checkout, worktree):
+            self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
+                       + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")
+        self.write(self.root / "issues/style.md", "---\nstatus: open\ntags: [proposal, style]\n"
+                   + "proposed_by: demo\nunit: names-unit\ndecision: approved\n"
+                   + "date_modified: 2026-10-01\n---\nA style proposal.\n")
+        self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "state/style")
+        database = self.root / "state/style" / self.checkout.name / "ledger.sqlite"
+        with mock.patch.dict(os.environ, self.env):
+            with style_ledger.Ledger(self.checkout, database) as ledger:
+                ledger.wait_for_sync("names-unit")
+        with closing(sqlite3.connect(database)) as connection, connection:
+            _ = connection.executemany(
+                "INSERT INTO tickets(id,unit,kind,family,rule,crate,files,sites,rules,rule_blobs,state,"
+                + "branch,checkpoint,created_at,updated_at) VALUES (?,?,'read','names','','.','[]','[]','[]','{}',?,"
+                + "'demo-names','','2026-10-01','2026-10-01')",
+                [("names-unit-1", "names-unit", "merged"), ("names-unit-2", "names-unit", "assigned"),
+                 ("names-unit-3", "names-unit", "queued")],
+            )
+        return worktree, plan, database
+
+    def test_style_rename_keeps_git_paths_plan_names_and_ticket_ids(self) -> None:
+        worktree, plan, database = self.style_production()
+        before = self.snapshot()
+        result = self.rename("plan", "names-unit", "demo-names-unit")
+        self.assert_ok(result)
+        self.assertEqual(self.snapshot(), before)
+        self.assertIn(f"git: keep branch demo-names; keep worktree {worktree}", result.stdout)
+        self.assertNotIn(" -> ", next(line for line in result.stdout.splitlines() if "git:" in line))
+
+        self.assert_ok(self.rename("apply", "names-unit", "demo-names-unit"))
+        self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "demo-names")
+        self.assertEqual(self.git("show", "--format=%s", "--stat", "HEAD"),
+                         "chore(demo): rename unit names-unit to demo-names-unit")
+        self.assertIn(f"| demo-names-unit | `{plan}` | `{worktree}` | demo-names |", self.doc.read_text())
+        self.assertEqual(self.git("ls-files", "--", str(self.doc)), "")
+        for directory in (self.checkout, worktree):
+            self.assertIn("> **Production:** demo (demo-names-unit)", (directory / plan).read_text())
+            self.assertIn("names-unit history stays.", (directory / plan).read_text())
+            self.assertFalse((directory / plan.with_name("demo-names-unit.md")).exists())
+        self.assertIn('unit: "demo-names-unit"', (self.root / "issues/style.md").read_text())
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT id,unit FROM tickets ORDER BY id").fetchall(), [
+                ("names-unit-1", "names-unit"), ("names-unit-2", "demo-names-unit"),
+                ("names-unit-3", "demo-names-unit"),
+            ])
+            self.assertEqual(connection.execute("SELECT unit FROM sync_waits").fetchall(), [("demo-names-unit",)])
+        self.assert_ok(self.rename("verify", "names-unit", "demo-names-unit"))
+
+    def test_style_rename_moves_only_its_productions_proposals(self) -> None:
+        _ = self.style_production()
+        other_doc = self.root / "other/docs/other-style-production.md"
+        self.write(other_doc, "# Other style production\n\n- **Kind:** style\n"
+                   + f"- **Proposals:** `{self.root / 'issues'}`\n\n## Units\n\n"
+                   + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+                   + "| names-unit | docs/style-production/units/names-unit.md | /other/names | other-names |\n")
+        owned = self.root / "issues/style.md"
+        other = self.root / "issues/other-style.md"
+        self.write(other, owned.read_text().replace("proposed_by: demo", "proposed_by: other-style"))
+        other_before = other.read_bytes()
+        unit_proposal = self.root / "issues/style-unit.md"
+        self.write(unit_proposal, owned.read_text().replace("proposed_by: demo", "proposed_by: names-unit (demo)"))
+
+        self.assert_ok(self.rename("apply", "names-unit", "demo-names-unit"))
+
+        for issue in (owned, unit_proposal):
+            self.assertIn('unit: "demo-names-unit"', issue.read_text())
+        self.assertEqual(other.read_bytes(), other_before)
+
+    def test_full_style_id_can_be_renamed_to_another_full_id(self) -> None:
+        slug = "demo-style"
+        checkout = self.rust / slug
+        worktree = self.rust / f"{slug}-names"
+        _ = self.git("worktree", "add", "-b", slug, str(checkout), SLUG)
+        _ = self.git("worktree", "add", "-b", f"{slug}-names", str(worktree), SLUG)
+        doc = checkout / f"docs/{slug}-production.md"
+        plan = "docs/style-production/units/names-unit.md"
+        self.write(doc, f"# Production — {slug}\n\n- **Kind:** style\n- **Repository:** `{self.checkout}`\n"
+                   + f"- **Merge branch:** `{slug}`\n- **Showrunner checkout:** `{checkout}`\n"
+                   + "- **Log:** production.log\n\n## Units\n\n"
+                   + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+                   + f"| {slug}-names-unit | {plan} | `{worktree}` | {slug}-names |\n")
+        self.write(checkout / plan, f"# Names\n\n> **Production:** {slug} ({slug}-names-unit)\n")
+        _ = self.git("add", "docs", cwd=checkout)
+        _ = self.git("commit", "-m", "full style unit fixture", cwd=checkout)
+        _ = self.git("push", "origin", slug, f"{slug}-names")
+        self.write(self.root / f"state/notifier/showrunner-{slug}/conf",
+                   "EVERY=15\nTARGET=session:test-showrunner\nCHECK="
+                   + shlex.join(["zsh", "/scripts/production_check.sh", str(doc)]) + "\n")
+        self.env["STYLE_LEDGER_STATE_DIR"] = str(self.root / "state/style")
+        before = self.snapshot()
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "plan", slug, f"{slug}-names-unit", f"{slug}-words-names-unit",
+             "--scratch", str(self.root / "scratch")], cwd=checkout, env=self.env,
+            capture_output=True, text=True, check=False, timeout=120)
+
+        self.assert_ok(result)
+        self.assertIn(f"branch {slug}-names -> {slug}-words-names; worktree {worktree} -> "
+                      + str(self.rust / f"{slug}-words-names"), result.stdout)
+        self.assertEqual(self.snapshot(), before)
+
     def test_apply_moves_every_place(self) -> None:
         records = self.home / ".local/state/herdr-panes"
         for session, panes in (("agents", {"w1:p2": "alpha-unit", "w1:p3": "beta-unit"}),
@@ -281,7 +403,8 @@ class UnitRenameTests(unittest.TestCase):
         self.assertIn("unit: alpha-unit", (self.root / "vault/showrunners/other-sr/alpha-unit.md").read_text())
         self.assertIs(self.journal()["done"], True)
 
-    def seed_record(self, progress: str = "stopped", name: str = "alpha", host_session: str = "demo-alpha") -> Path:
+    def seed_record(self, progress: str = "stopped", name: str = "alpha", host_session: str = "demo-alpha", *,
+                    unit: str = "alpha-unit", slug: str = SLUG) -> Path:
         """A stopped unit's shutdown record, as `shutdown.py down` leaves it."""
         old = self.rust / "claude-demo-alpha"
         session: dict[str, object] = {
@@ -291,7 +414,7 @@ class UnitRenameTests(unittest.TestCase):
             "checkout": {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "demo-alpha"},
                          "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
             "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit", "doc": str(self.doc),
+            "host": {"kind": "unit", "production": slug, "unit": unit, "doc": str(self.doc),
                      "session_name": host_session, "session_host": "herdr",
                      "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha.md"}}}
         saved: dict[str, object] = {
@@ -323,6 +446,38 @@ class UnitRenameTests(unittest.TestCase):
     def record(self) -> dict[str, object]:
         directory = self.home / ".local/state/shutdown/owner@example.com/sessions"
         return cast(dict[str, object], json.loads((directory / "sid-alpha.json").read_text()))
+
+    def test_restart_record_keeps_one_prefix_for_a_full_style_id(self) -> None:
+        slug = "cargo-liner-style"
+        _ = self.seed_record(name="names", host_session=f"{slug}-names", unit="names-unit", slug=slug)
+        self.write(self.doc, self.doc.read_text().replace("| alpha-unit |", "| names-unit |"))
+        worktree = str(self.rust / "claude-demo-alpha")
+        rename = rename_unit.UnitRename(
+            slug, "names-unit", f"{slug}-names-unit", str(self.doc), str(self.checkout), SLUG,
+            f"{slug}-names", f"{slug}-names", worktree, worktree, "", str(self.root / "scratch"),
+            account="owner@example.com", session_id="sid-alpha")
+
+        with mock.patch.dict(os.environ, self.env):
+            rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
+
+        session = cast(dict[str, object], self.record()["session"])
+        host = cast(dict[str, object], session["host"])
+        self.assertEqual(host["session_name"], "cargo-liner-style-names")
+        self.assertEqual((host["unit"], session["name"]), ("cargo-liner-style-names-unit", "cargo-liner-style-names"))
+
+    def test_restart_record_moves_a_feature_host_to_its_new_stem(self) -> None:
+        _ = self.seed_record()
+        rename = rename_unit.UnitRename(
+            SLUG, "alpha-unit", "beta-unit", str(self.doc), str(self.checkout), SLUG,
+            "demo-alpha", "demo-beta", str(self.rust / "claude-demo-alpha"),
+            str(self.rust / "claude-demo-beta"), "", str(self.root / "scratch"),
+            account="owner@example.com", session_id="sid-alpha")
+
+        with mock.patch.dict(os.environ, self.env):
+            rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
+
+        session = cast(dict[str, object], self.record()["session"])
+        self.assertEqual(cast(dict[str, object], session["host"])["session_name"], "demo-beta")
 
     def test_a_stopped_unit_relaunches_from_its_rewritten_record(self) -> None:
         log = self.seed_record()
