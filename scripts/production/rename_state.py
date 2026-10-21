@@ -150,15 +150,29 @@ def _reword_items(items: object, fields: tuple[str, ...], words: Words) -> bool:
     return changed
 
 
+def _reword_lists(value: object, words: Words) -> bool:
+    """The live lists `next` and `open_for_user` take the new names in their text: they are what the
+    showrunner still has to do, not history."""
+    if not isinstance(value, dict):
+        return False
+    state = cast(JsonObject, value)
+    changed = _reword_items(state.get("next"), (), words)
+    return _reword_items(state.get("open_for_user"), ("text", "question"), words) | changed
+
+
 def _rename_showrunner_state(value: object, words: Words) -> bool:
-    """The unit rows take the new id, and the live lists `next` and `open_for_user` the new names in
-    their text: they are what the showrunner still has to do, not history."""
+    """The unit rows take the new id, and the live lists the new names."""
     changed = bool(words) and _rename_unit_rows(value, words[0][0], words[0][1])
-    if isinstance(value, dict):
-        state = cast(JsonObject, value)
-        changed = _reword_items(state.get("next"), (), words) | changed
-        changed = _reword_items(state.get("open_for_user"), ("text", "question"), words) | changed
-    return changed
+    return _reword_lists(value, words) | changed
+
+
+def reword_showrunner_lists(path: Path, words: Words) -> bool:
+    """Another production's showrunner state, such as the parent's: the unit is not one of its rows,
+    but its live lists can name the unit."""
+    try:
+        return _rename_json(path, lambda value: _reword_lists(value, words))
+    except (OSError, ValueError) as error:
+        raise RenameRefused(str(error)) from error
 
 
 def rename_outstanding(slug: str, words: Words) -> bool:

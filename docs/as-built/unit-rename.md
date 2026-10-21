@@ -82,6 +82,10 @@ steps:
      and the same items in OUTSTANDING (`outstanding/<slug>.json`): the old id, branch and worktree each take
      the new one as a whole token, so `per-unit` stays. OUTSTANDING then holds the same texts, so the next
      `questions` run finds each item stored and asks no new review (sdlc, 2026-10-21);
+   - the same live-list text and OUTSTANDING items of every other production's showrunner, such as
+     the parent (`showrunners.SHOWRUNNER_STATE_DIR/<slug>/session/showrunner_state.json`); their unit
+     rows stay. A production whose Units table has its own unit of the old id, or whose doc cannot
+     be read, keeps its text, and verify counts its file as history (cargo-liner-style, 2026-10-21);
    - the stall-watch stretch;
    - the reviewer leases and memory;
    - the newest run record and the recorder state;
@@ -136,5 +140,8 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   Kept branch and worktree names are excluded from the search. The style ledger folder
   (`style/` in `unit_rename_sweep.STATE_HISTORY`) is history, because closed tickets keep the old
   id. Live places read the ledger through `preview_ledger` and fail on a queued, assigned or
-  checkpointed ticket or a sync wait that still names the old id. The postmaster's replies are history. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
+  checkpointed ticket or a sync wait that still names the old id. The postmaster's replies are history.
+  So are the pause hook's scheduled prompts (`conversation-pause/scheduled-prompts/`): they are copies
+  of queued prompt texts, such as the relaunch prompt with its rename note, and the hook matches each
+  incoming prompt to them exactly, so a rewrite would break the match. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   On natedev a sweep takes about 80 s.

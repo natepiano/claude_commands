@@ -511,6 +511,11 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     paths = ((rename.old_branch, rename.new_branch), (rename.old_worktree, rename.new_worktree))
     _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch), paths)
     _ = rename_state.rename_outstanding(rename.slug, ((rename.old, rename.new), *paths))
+    # Other productions' showrunners, such as the parent, can have the unit in their lists too.
+    reworded, _ = _other_showrunner_states(rename)
+    for path in reworded:
+        _ = rename_state.reword_showrunner_lists(path, ((rename.old, rename.new), *paths))
+        _ = rename_state.rename_outstanding(path.parent.parent.name, ((rename.old, rename.new), *paths))
     # The relaunched unit records its new pane at SessionStart; its old pane's entry would resume the old name.
     _ = pane_record.forget_unit(rename.old)
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
@@ -527,6 +532,28 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     for issue in _unit_proposals(rename, rename.old):
         _ = proposal_issue.edit(issue.path, {"unit": rename.new}, today)
     _ = phase_table.rename_unit(rename.slug, rename.old, rename.new)
+
+
+def _other_showrunner_states(rename: UnitRename) -> tuple[list[Path], list[Path]]:
+    """Each other production's showrunner_state.json: those whose lists take the new names, and those
+    kept because their own production has a unit of the old id, or none can be read, so the old id
+    in their text can name another unit."""
+    docs = showrunners.timer_docs()
+    reworded: list[Path] = []
+    kept: list[Path] = []
+    for path in sorted(showrunners.SHOWRUNNER_STATE_DIR.glob("*/session/showrunner_state.json")):
+        slug = path.parent.parent.name
+        if slug != rename.slug:
+            (kept if _may_hold_unit(docs.get(slug), rename.old) else reworded).append(path)
+    return reworded, kept
+
+
+def _may_hold_unit(doc: Path | None, unit: str) -> bool:
+    try:
+        cells = production_units.unit_table(doc.read_text(encoding="utf-8").splitlines()) if doc else None
+    except (OSError, production_units.Refusal):
+        cells = None
+    return cells is None or any(production_units.cell_value(row.get("Unit", "")) == unit for row in cells)
 
 
 def _retire(rename: UnitRename, _save: Callable[[], None]) -> None:
@@ -874,12 +901,13 @@ def _control_failures(rename: UnitRename) -> list[str]:
 def _sweep_roots(rename: UnitRename) -> unit_rename_sweep.Roots:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
     scratch = Path(rename.scratch)
+    reworded, kept = _other_showrunner_states(rename)
     return unit_rename_sweep.Roots(
         state=state, production_state=rename_state.unit_journal(rename.slug).parent,
         configs=tuple(directory for directory in unit_move.config_dirs() if not directory.name.endswith(".lock")),
         checkouts=(Path(rename.checkout), Path(rename.new_worktree)),
-        live_files=tuple(scratch / name for name in rename_state.SCRATCH_FILES),
-        history_prefixes=(str(Path(rename.checkout) / "docs/plans" / f"{rename.slug}-log"),))
+        live_files=(*(scratch / name for name in rename_state.SCRATCH_FILES), *reworded),
+        history_prefixes=(str(Path(rename.checkout) / "docs/plans" / f"{rename.slug}-log"), *map(str, kept)))
 
 
 def verify_failures(rename: UnitRename) -> list[str]:
