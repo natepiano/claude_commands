@@ -739,28 +739,36 @@
     "edit": {
       "objections": [
         {
-          "quote": "Yes: the session does that and goes on with its work.",
-          "rule": "every-choice-says-what-it-does"
+          "quote": "herdr-panes needs your answer",
+          "rule": "title-names-the-stake"
         },
         {
           "quote": "wants to edit panes.py",
           "rule": "reader-starts-cold"
         }
       ],
-      "reviewer": "user-spec: user via showrunner 2026-10-18: approved the permission-prompt alert text; reviewer: opus",
-      "sha256": "969f4008989a19b2b93283ace5682db37713c612e9a5f97979c90c326464adc0",
-      "time": "2026-10-18T22:42:23.375991-04:00"
+      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
+      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
+      "time": "2026-10-21T18:07:26.466772-04:00"
     },
     "typical": {
       "objections": [
         {
+          "quote": "cargo-liner-style-types needs your answer",
+          "rule": "title-names-the-stake"
+        },
+        {
           "quote": "Yes: the session does that and goes on with its work.",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Session: cargo-liner-style-types\nAction: On natedev, open the cargo-liner-style-types herdr tab and answer its prompt\nThe Claude coding session cargo-liner-style-types on natedev wants to delete its own saved tool output, b1e4yc8b9.txt. The file is outside its allowed folders, so it needs your permission. It has waited since 10:54 EDT and does no work until you answer.\n\nYes (recommended): the session deletes its own file and goes on with its work.\n\nNo: the session keeps the file and asks you what to do instead.",
+          "rule": "push-body-under-500"
         }
       ],
-      "reviewer": "user-spec: user via showrunner 2026-10-18: approved the permission-prompt alert text; reviewer: opus",
-      "sha256": "969f4008989a19b2b93283ace5682db37713c612e9a5f97979c90c326464adc0",
-      "time": "2026-10-18T22:42:01.171501-04:00"
+      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
+      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
+      "time": "2026-10-21T18:07:13.543700-04:00"
     }
   },
   "sweep.disk_floor": {
