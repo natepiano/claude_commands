@@ -65,7 +65,7 @@ if verb == 'follow':
 if verb == 'start':
     name = option('--name')
     roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
-                    'status': 'done', 'role': option('--role')}
+                    'status': 'done', 'role': option('--role'), 'task': option('--task')}
     pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
 elif verb == 'compact':
     name = option('--to')
@@ -123,6 +123,7 @@ elif verb == 'follow':
     if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
         signal.pause()
     roster[name]['role'] = option('--role')
+    roster[name]['task'] = option('--task')
     (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
     if os.environ.get('STUB_FOLLOW_FAIL') == '1':
         roster[name]['status'] = 'failed'
@@ -1093,6 +1094,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         ))
         name = next(iter(roster))
         self.assertEqual(roster[name]["role"], "impl")
+        self.assertEqual(roster[name]["task"], "delegate.impl")
 
         followed = self.mesh_launch(
             session_dir, to=name, kind="review", subtask="impl"
@@ -1103,6 +1105,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             roster_path.read_text(encoding="utf-8")
         ))
         self.assertEqual(roster[name]["role"], "review")
+        self.assertEqual(roster[name]["task"], "delegate.impl")
 
     def test_compaction_threshold_must_be_configured_as_a_positive_integer(self) -> None:
         configured = self.config_file.read_text(encoding="utf-8")

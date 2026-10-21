@@ -501,7 +501,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
       --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
-      --service-tier "${AGENT_SERVICE_TIER:-}" &
+      --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
   else
     echo "ERROR: ${MESH_NAME} has mesh=none" >&2
     exit 2
@@ -526,7 +526,7 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     --log-file "${LOG_FILE}" \
     --model "${AGENT_MODEL}" \
     --effort "${AGENT_EFFORT:-}" \
-    --service-tier "${AGENT_SERVICE_TIER:-}" &
+    --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   rm -f "${BG_ID_FILE}"
   # The plain launcher writes the delegate's last message to its output file,

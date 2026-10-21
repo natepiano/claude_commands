@@ -645,6 +645,11 @@ agents_set_service_tier default kept.check
 cmp "$expected" "$AGENTS_CONFIG_FILE" || fail "row tier was not written after the section's last key"
 agents_resolve kept.check
 [[ "$AGENT_SERVICE_TIER" == "default" ]] || fail "row tier did not beat the function's tier"
+[[ "$(agents_turn_service_tier kept.check)" == "default" ]] || fail "turn tier missed the row override"
+[[ "$(agents_turn_service_tier kept)" == "flex" ]] || fail "unknown task did not use the function tier"
+printf 'service_tier = "fast"\n' > "$TEST_DIR/turn-codex-fast.toml"
+[[ "$(CODEX_CONFIG_FILE="$TEST_DIR/turn-codex-fast.toml" agents_turn_service_tier bare.work)" == "default" ]] \
+    || fail "empty turn tier inherited the Codex config"
 agents_resolve kept.work
 [[ "$AGENT_SERVICE_TIER" == "flex" ]] || fail "row tier leaked onto a sibling row"
 function_list="$(agents_list_function kept)"

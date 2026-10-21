@@ -26,6 +26,7 @@ class ProjectSpec(NamedTuple):
     repo: str
     crates: frozenset[str]
     published: frozenset[str]
+    checkouts: tuple[Path, ...]
 
 
 PROJECTS: dict[str, ProjectSpec] = {
@@ -72,8 +73,11 @@ PROJECTS: dict[str, ProjectSpec] = {
                 "hana_rubric",
             }
         ),
+        (Path.home() / "rust/hana", Path.home() / "rust/hana_catalyst"),
     ),
-    "natedev": ProjectSpec("natepiano/nixos", frozenset(), frozenset()),
+    "natedev": ProjectSpec(
+        "natepiano/nixos", frozenset(), frozenset(), (Path("/etc/nixos"),)
+    ),
     "cargo-liner": ProjectSpec(
         "natepiano/cargo-liner",
         frozenset(
@@ -88,6 +92,7 @@ PROJECTS: dict[str, ProjectSpec] = {
             }
         ),
         frozenset({"cargo-mend", "cargo-port", "cargo-tile", "tui_pane"}),
+        (Path.home() / "rust/cargo-liner",),
     ),
     "bevy_brp": ProjectSpec(
         "natepiano/bevy_brp",
@@ -102,14 +107,23 @@ PROJECTS: dict[str, ProjectSpec] = {
             }
         ),
         frozenset({"bevy_brp_extras", "bevy_brp_mcp", "bevy_brp_mcp_macros"}),
+        (Path.home() / "rust/bevy_brp",),
     ),
     "obsidian_knife": ProjectSpec(
-        "natepiano/obsidian_knife", frozenset({"obsidian_knife"}), frozenset()
+        "natepiano/obsidian_knife",
+        frozenset({"obsidian_knife"}),
+        frozenset(),
+        (Path.home() / "rust/obsidian_knife",),
     ),
     "nateroids": ProjectSpec(
-        "natepiano/nateroids", frozenset({"nateroids"}), frozenset()
+        "natepiano/nateroids",
+        frozenset({"nateroids"}),
+        frozenset(),
+        (Path.home() / "rust/nateroids",),
     ),
-    "claude": ProjectSpec("natepiano/claude_commands", frozenset(), frozenset()),
+    "claude": ProjectSpec(
+        "natepiano/claude_commands", frozenset(), frozenset(), (Path.home() / ".claude",)
+    ),
 }
 
 KINDS = ("feature", "fix", "change", "perf", "deprecation", "removal", "security")
@@ -778,6 +792,32 @@ def _canonical_link(project: str, value: str) -> str:
     return prefix + value[len(prefix) :].lower()
 
 
+def _commit_date(project: ProjectSpec, sha: str) -> str:
+    """Read the commit's committer date from the first checkout that holds it."""
+    for checkout in project.checkouts:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(checkout), "show", "-s", "--format=%cI", sha],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            continue
+        if result.returncode != 0:
+            continue
+        try:
+            committed = datetime.fromisoformat(result.stdout.strip())
+        except ValueError as error:
+            raise FeatureLogError(
+                f"cannot date commit {sha}: invalid committer date in {checkout}; pass --completed"
+            ) from error
+        return committed.astimezone(user_zone()).date().isoformat()
+    raise FeatureLogError(
+        f"cannot date commit {sha}: no checkout of {project.repo} holds it; pass --completed"
+    )
+
+
 def _validate_sorted_unique(values: list[str], field: str) -> None:
     if values != sorted(set(values)):
         raise FeatureLogError(f"{field} must be sorted with no duplicates")
@@ -845,7 +885,7 @@ def _flatten(values: list[list[str]] | None) -> list[str]:
 
 def _new_note(arguments: argparse.Namespace) -> Note:
     project = cast(str, arguments.project)
-    _ = _validate_project(project)
+    spec = _validate_project(project)
     title = normalize_title(cast(str, arguments.title))
     kind = cast(str, arguments.kind)
     if kind not in KINDS:
@@ -881,7 +921,10 @@ def _new_note(arguments: argparse.Namespace) -> Note:
     area = cast(str | None, arguments.area)
     if area is not None and not area.strip():
         raise FeatureLogError("area is empty")
-    completed = cast(str | None, arguments.completed) or today()
+    link = _canonical_link(project, raw_link)
+    completed = cast(str | None, arguments.completed)
+    if completed is None:
+        completed = _commit_date(spec, link.rsplit("/", 1)[1])
     _validate_date(completed, "completed")
     backfill = cast(bool, arguments.backfill)
     raw_releases = _flatten(cast(list[list[str]] | None, arguments.release))
@@ -899,7 +942,7 @@ def _new_note(arguments: argparse.Namespace) -> Note:
         "area": area,
         "completed_date": completed,
         "crate": crates,
-        "link": _canonical_link(project, raw_link),
+        "link": link,
         "production": production,
         "unit": units,
         "release": releases,
