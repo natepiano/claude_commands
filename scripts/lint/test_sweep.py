@@ -24,13 +24,17 @@ from zoneinfo import ZoneInfo
 
 import sweep
 if TYPE_CHECKING:
+    from ..message import process_table, sessions
     from ..notify import review
-    from ..notify.push_texts import catalog, render, render_entry
+    from ..notify.push_texts import RenderedPush, catalog, render, render_entry
     from ..notify.user_action import ActionRequired
 else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+    import process_table
+    import sessions
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     import review
-    from push_texts import catalog, render, render_entry
+    from push_texts import RenderedPush, catalog, render, render_entry
     from user_action import ActionRequired
 
 GIB = 1 << 30
@@ -41,6 +45,8 @@ DEMO = "1111111111111111"
 TOOL = "2222222222222222"
 MY_TOOL = "3333333333333333"
 STALE = "4444444444444444"
+PAGE_PATHS = ["/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.",
+              "/tmp/claude-1000/scratch: frees 86.0 GiB."]
 
 
 def write(path: Path, size: int = SIZE) -> Path:
@@ -372,14 +378,31 @@ class ProcessUseTests(SweepCase):
 
     def test_an_exe_a_working_directory_or_a_mapped_file_under_a_target_is_a_use(self) -> None:
         library = self.hana / "debug" / "deps" / "libbevy_dylib-1234.so"
-        fake_process(self.proc, 10, exe=str(self.hana / "debug" / "deps" / "hana-f4b6 (deleted)"))
+        fake_process(self.proc, 10, exe=str(self.hana / "debug" / "deps" / "hana-f4b6"))
         fake_process(self.proc, 11, cwd=str(self.other))
-        self.assertEqual(self.uses(), {str(self.hana): f"runs {self.hana}/debug/deps/hana-f4b6 (deleted)",
+        self.assertEqual(self.uses(), {str(self.hana): f"runs {self.hana}/debug/deps/hana-f4b6",
                                        str(self.other): f"works in {self.other}"})
         for entry in self.proc.iterdir():
             shutil.rmtree(entry)
         fake_process(self.proc, 12, maps=f"7f00-7f10 r-xp 00000000 00:1f 42    {library}\n")
         self.assertEqual(self.uses(), {str(self.hana): f"maps {library}"})
+
+    def test_a_stale_process_with_only_deleted_files_under_a_target_and_cwd_outside_is_not_a_use(self) -> None:
+        deps = self.hana / "debug" / "deps"
+        fake_process(self.proc, 10, exe=f"{deps}/cargo_berth-1234 (deleted)", cwd="/tmp/fixture (deleted)",
+                     maps=f"5600-5610 r-xp 00000000 00:1f 42    {deps}/cargo_berth-1234 (deleted)\n"
+                     + f"7f00-7f10 r-xp 00000000 00:1f 43    {deps}/libgit-5678.so (deleted)\n")
+        self.assertEqual(self.uses(), {})
+
+    def test_a_deleted_exe_counts_with_a_live_mapping_or_a_working_directory_inside(self) -> None:
+        deps = self.hana / "debug" / "deps"
+        library = deps / "libbevy_dylib-1234.so"
+        fake_process(self.proc, 10, exe=f"{deps}/hana-f4b6 (deleted)",
+                     maps=f"5600-5610 r-xp 00000000 00:1f 42    {deps}/hana-f4b6 (deleted)\n"
+                     + f"7f00-7f10 r-xp 00000000 00:1f 43    {library}\n")
+        fake_process(self.proc, 11, exe=f"{self.other}/debug/app (deleted)", cwd=f"{self.other}/debug")
+        self.assertEqual(self.uses(), {str(self.hana): f"maps {library}",
+                                       str(self.other): f"works in {self.other}/debug"})
 
     def test_a_sibling_whose_name_starts_with_the_target_is_not_a_use(self) -> None:
         fake_process(self.proc, 10, exe=f"{self.hana}-old/debug/hana", cwd=f"{self.hana}2",
@@ -415,6 +438,9 @@ class FloorTests(SweepCase):
         _ = self.enterContext(mock.patch.object(sweep, "CI_TARGETS", (str(base / "ci-1"), str(base / "ci-2"))))
         _ = self.enterContext(mock.patch.object(
             sweep, "send_floor_alert", side_effect=AssertionError("unexpected floor alert send")))
+        _ = self.enterContext(mock.patch.object(
+            sweep, "send_holder_message", side_effect=AssertionError("unexpected session message send")))
+        _ = self.enterContext(mock.patch.object(sweep, "holder_sessions", return_value={}))
         return base
 
     def test_base_blocks_real_phone_sends(self) -> None:
@@ -545,11 +571,16 @@ class FloorTests(SweepCase):
         self.assertEqual(send.call_count, 1)
         self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
         message = cast(str, send.call_args.args[0])
-        self.assertIn("No build cache is left to remove", message)
+        self.assertIn("No idle build cache is left to remove", message)
         self.assertIn("natedev still has only 9.0 GiB free. Builds need 10.0 GiB free", message)
-        self.assertIn("Free 1.0 GiB outside build caches", message)
-        self.assertIn(f"Not swept: 1 target dirs a build or test run uses ({sweep.gib(held_bytes)})", message)
-        self.assertIn(f"CI's targets ({sweep.gib(ci_bytes)})", message)
+        self.assertNotIn("Free ", message)
+        lock_path = busy_tree / sweep.LOCK_NAMES[0]
+        self.assertIn(f"- {busy_tree.parent} ({sweep.gib(held_bytes)}): pid {os.getpid()} holds the cargo lock {lock_path};"
+                      + " no session found", message)
+        self.assertIn(f"Not swept: CI's targets ({sweep.gib(ci_bytes)})", message)
+        self.assertIn("No session above could be told, so the user also gets a page with these paths.", message)
+        page = cast(RenderedPush, send.call_args.kwargs["phone"])
+        self.assertIn(f"{busy_tree.parent}: frees {sweep.gib(held_bytes)}. Process {os.getpid()} uses it now", page.values["paths"])
         self.assertNotIn("Could not remove", message)
         record = sweep.read_floor_record(sweep.floor_record_path())
         assert isinstance(record, sweep.FloorRecord)
@@ -707,7 +738,7 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "1", "SWEEP_USER_EXIT": "0"}),
               redirect_stdout(output), redirect_stderr(errors)):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
         self.assertEqual(run.call_count, 2)
         commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
         self.assertEqual([command[command.index("--to") + 1] for command in commands], ["natedev", "user"])
@@ -722,12 +753,12 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "0", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               mock.patch.dict(os.environ, {"SWEEP_NATEDEV_EXIT": "3", "SWEEP_USER_EXIT": "3"}),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO())):
             self.assertFalse(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
 
     def test_phone_alert_wait_covers_configured_review_while_session_wait_stays_short(self) -> None:
         config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "notify.conf"
@@ -736,18 +767,18 @@ raise SystemExit(int(os.environ[variable]))
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
         self.assertEqual([call.kwargs["timeout"] for call in run.call_args_list], [40, 220])
         self.assertEqual(run.call_count, 2)
 
     def test_phone_disk_alert_keeps_action_and_build_shortfall_without_directory_dump(self) -> None:
         """F011: the disk action states how much to free and the body explains why."""
         text = sweep.floor_out_of_reach_text(2000, 2 * GIB, 9 * GIB, 10 * GIB,
-            0, 0, 0, sweep.UnavailableDiskMeasurement("missing"), 0)
+            [], frozenset(), 0, sweep.UnavailableDiskMeasurement("missing"), 0)
         with (mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run,
               redirect_stdout(io.StringIO())):
             self.assertTrue(sweep.send_floor_alert(text, sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
         self.assertEqual(run.call_args_list[0].kwargs["input"], text)
         command = cast(list[str], run.call_args_list[1].args[0])
         self.assertEqual(command[command.index("--text-id") + 1], "sweep.disk_floor")
@@ -759,10 +790,42 @@ raise SystemExit(int(os.environ[variable]))
         entry = next(entry for entry in catalog() if entry.id == "sweep.disk_floor")
         typical = next(example for example in entry.examples if example.name == "typical")
         push = render_entry(entry, typical.values)
-        actual = sweep.disk_floor_push(2 * GIB, 290 * GIB, 300 * GIB)
+        actual = sweep.disk_floor_push(2 * GIB, 290 * GIB, 300 * GIB, PAGE_PATHS)
         self.assertEqual(push, actual)
         self.assertEqual(typical.values, {"shortfall": "10.0 GiB", "free": "290.0 GiB",
-                                        "floor": "300.0 GiB", "removed": "2.0 GiB"})
+                                        "floor": "300.0 GiB", "removed": "2.0 GiB", "paths": "\n\n".join(PAGE_PATHS)})
+
+    def test_disk_page_never_asks_the_user_to_free_space_by_hand(self) -> None:
+        entry = next(entry for entry in catalog() if entry.id == "sweep.disk_floor")
+        for example in entry.examples:
+            with self.subTest(example=example.name):
+                push = render_entry(entry, example.values)
+                assert isinstance(push.action, ActionRequired)
+                self.assertIn("Claude session named natedev", push.action.text)
+                for words in ("terminal", "delete", "personal files", "free more space"):
+                    self.assertNotIn(words, push.message)
+
+    def test_disk_page_names_as_many_exact_paths_as_fit_one_push(self) -> None:
+        long_paths = [f"/tmp/claude-1000/{'x' * 60}/{index}: frees 1.0 GiB." for index in range(6)]
+        push = sweep.disk_floor_push(0, 0, 300 * GIB, long_paths)
+        listed = push.values["paths"].split("\n\n")
+        self.assertLess(len(push.message), sweep.PUSH_TEXT_LIMIT)
+        self.assertTrue(listed)
+        self.assertEqual(listed, long_paths[:len(listed)])
+        self.assertEqual(sweep.disk_floor_push(0, 0, 300 * GIB, []).values["paths"], sweep.NO_PAGE_PATHS)
+
+    def test_page_lists_busy_targets_then_the_deepest_measured_folders_by_size(self) -> None:
+        def folder(path: str, size: int) -> sweep.OutsideCacheDirectory:
+            return sweep.OutsideCacheDirectory(path, size * GIB, 0, sweep.NoLargestGrowingChild())
+        measurement = sweep.AvailableDiskMeasurement(
+            datetime.now(PACIFIC), sweep.NoEarlierDiskMeasurement(),
+            [folder("/tmp/claude-1000", 90), folder("/tmp/claude-1000/scratch", 86), folder("/home/n/.cache/uv", 12)], 0)
+        holders = [sweep.FloorHolder("/home/n/rust/a/target", 26 * GIB, 41, "runs x", None),
+                   sweep.FloorHolder("/tmp/b/target", 3 * GIB, None, "holds the cargo lock y", None)]
+        self.assertEqual(sweep.page_paths(holders, measurement), [
+            "/home/n/rust/a/target: frees 26.0 GiB. Process 41 uses it now and can fail.",
+            "/tmp/b/target: frees 3.0 GiB. A build uses it now and can fail.",
+            "/tmp/claude-1000/scratch: frees 86.0 GiB.", "/home/n/.cache/uv: frees 12.0 GiB."])
 
     def test_nixos_disk_action_states_the_space_needed_to_restore_the_build_floor(self) -> None:
         for free in (149, 0, 290):
@@ -795,7 +858,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         with (mock.patch.object(sweep, "__file__", str(fake_module)),
               redirect_stdout(io.StringIO()), redirect_stderr(errors)):
             self.assertTrue(sweep.send_floor_alert("disk notice", sweep.FloorAlertChannels.NATEDEV_AND_PHONE,
-                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB)))
+                                                   phone=sweep.disk_floor_push(2 * GIB, 9 * GIB, 10 * GIB, PAGE_PATHS)))
         self.assertIn("phone alert failed (3): FAILED: Pushover keys are missing", errors.getvalue())
 
     def test_natedev_only_channel_never_calls_phone(self) -> None:
@@ -1030,6 +1093,54 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         _ = cargo_target(base / ".git", "hidden", TOOL, time.time())
         _ = write(base / "uv" / "CACHEDIR.TAG")
         self.assertEqual(sweep.target_dirs([str(base)]), [str(base / "repo" / "target")])
+
+    def test_cache_trace_targets_are_scratch_floor_targets_and_sccache_is_not_a_target(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root = home / ".cache" / "trace-targets" / "rich-placement-1ha815wz"
+        _ = unit(root / "debug", "deps", "hana", APP, time.time() - DAY)
+        _ = (root / sweep.RUSTC_INFO).write_text("{}")
+        # sccache's layout: two levels of one-character folders, then entries; no rustc info, no cargo tag.
+        _ = write(home / ".cache" / "sccache" / "0" / "1" / "01d2c3b4a5968778")
+        _ = write(home / ".cache" / "sccache" / "debug" / ".fingerprint" / "x" / "y")
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(home)}))
+        self.assertIn("~/.cache", sweep.FLOOR_ROOTS)
+        found = sweep.target_dirs([root for root in sweep.FLOOR_ROOTS if root.startswith("~/.cache")])
+        self.assertEqual(found, [str(root)])
+        self.assertTrue(sweep.is_scratch_target(found[0], sweep.SCRATCH_ROOTS))
+
+    def test_exhausted_cache_tells_the_holding_session_and_pages_only_when_none_was_told(self) -> None:
+        for delivered in (True, False):
+            with self.subTest(delivered=delivered):
+                base = self.base()
+                busy_tree, _ = cargo_target(base, "busy", DEMO, time.time())
+                lock_path = busy_tree / sweep.LOCK_NAMES[0]
+                lock = os.open(lock_path, os.O_RDONLY | os.O_CREAT)
+                self.addCleanup(os.close, lock)
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                with (mock.patch.object(sweep, "holder_sessions", return_value={os.getpid(): "hana-unit"}) as found,
+                      mock.patch.object(sweep, "send_holder_message", return_value=delivered) as tell,
+                      mock.patch.object(sweep, "send_floor_alert", return_value=True) as send):
+                    self.assertEqual(self.hold(base, 10 * GIB, [9 * GIB, 9 * GIB])[0], 0)
+                found.assert_called_once_with([os.getpid()])
+                self.assertEqual(tell.call_args.args[0], "hana-unit")
+                told = cast(str, tell.call_args.args[1])
+                self.assertIn(f"{busy_tree.parent} (", told)
+                self.assertIn(f"pid {os.getpid()} holds the cargo lock {lock_path}. This process is in your session", told)
+                self.assertIn("If the process is stale, stop it.", told)
+                message = cast(str, send.call_args.args[0])
+                if delivered:
+                    self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
+                    self.assertNotIn("phone", send.call_args.kwargs)
+                    self.assertIn("; session hana-unit was told", message)
+                    self.assertIn("The user gets no page while a session can end a use.", message)
+                else:
+                    self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV_AND_PHONE)
+                    self.assertIn("; the message to session hana-unit failed", message)
+                    page = cast(RenderedPush, send.call_args.kwargs["phone"])
+                    self.assertIn(f"{busy_tree.parent}: ", page.values["paths"])
+                record = sweep.read_floor_record(sweep.floor_record_path())
+                assert isinstance(record, sweep.FloorRecord)
+                self.assertIsInstance(record.push_history, sweep.DeliveredAlert)
 
     def test_target_dirs_finds_cargo_tag_beside_a_build_tree(self) -> None:
         base = self.base()
@@ -1353,6 +1464,48 @@ GIT_ENVIRONMENT = {
 
 def git(*args: str, cwd: Path) -> None:
     _ = subprocess.run(["git", *args], cwd=cwd, env=GIT_ENVIRONMENT, capture_output=True, check=True)
+
+
+class LockHolderTests(unittest.TestCase):
+    def test_the_flock_holder_comes_from_the_locks_listing(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        lock = base / ".cargo-lock"
+        _ = lock.write_text("")
+        stat = os.stat(lock)
+        device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+        locks = base / "locks"
+        _ = locks.write_text(f"1: POSIX  ADVISORY  WRITE 99 {device} 0 EOF\n"
+                             + f"2: -> FLOCK  ADVISORY  WRITE 77 {device} 0 EOF\n"
+                             + f"3: FLOCK  ADVISORY  WRITE 4242 {device} 0 EOF\n")
+        self.assertEqual(sweep.lock_holder(str(lock), str(locks)), 4242)
+        self.assertIsNone(sweep.lock_holder(str(lock), str(base / "missing")))
+        self.assertIsNone(sweep.lock_holder(str(base / "gone"), str(locks)))
+
+    @unittest.skipUnless(os.path.isfile(sweep.PROC_LOCKS), "the lock holder is read from /proc/locks")
+    def test_a_live_flock_names_this_process(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        fd = os.open(base / ".cargo-lock", os.O_RDONLY | os.O_CREAT)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.assertEqual(sweep.lock_holder(str(base / ".cargo-lock")), os.getpid())
+
+
+class HolderSessionTests(unittest.TestCase):
+    def test_a_pid_belongs_to_its_nearest_named_session(self) -> None:
+        table = {
+            1: process_table.Process(1, 0, "systemd", "/sbin/init"),
+            100: process_table.Process(100, 1, "claude", "claude"),
+            200: process_table.Process(200, 100, "zsh", "zsh"),
+            300: process_table.Process(300, 200, "cargo", "cargo build"),
+            400: process_table.Process(400, 1, "cargo-berth", "cargo-berth resolve"),
+        }
+        record = cast(sessions.SessionRecord, cast(object, {
+            "pid": 100, "sessionId": "d5b35898", "name": "hana-unit", "messagingSocketPath": "/tmp/s.sock",
+            "updatedAt": 1, "tmux": "", "formerNames": []}))
+        with (mock.patch.object(process_table, "snapshot", return_value=table),
+              mock.patch.object(sessions, "live_sessions", return_value=[record])):
+            self.assertEqual(sweep.holder_sessions([300, 400, 999]), {300: "hana-unit"})
+        self.assertEqual(sweep.holder_sessions([]), {})
 
 
 class BudgetTests(unittest.TestCase):

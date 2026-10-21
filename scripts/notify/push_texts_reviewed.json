@@ -653,14 +653,34 @@
   },
   "sweep.disk_floor": {
     "no_free_space": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:24:04.260987-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "/tmp/claude-1000/scratch",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:33.124483-04:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:23:53.034006-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Action: In the Claude session named natedev, name the paths below that it may remove.\nThe natedev computer has 290.0 GiB free. Builds need 300.0 GiB. They may fail until 10.0 GiB more is free. Build cache cleanup freed 2.0 GiB and has no idle build output left.\n\n/tmp/claude-1000/scratch (recommended): frees 86.0 GiB. That alone is enough, and no running process is at risk.\n\n/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\nThe session removes only the paths you name.",
+          "rule": "push-body-under-500"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:22.184346-04:00"
     }
   }
 }
