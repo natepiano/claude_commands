@@ -37,33 +37,17 @@ The unit director's calls, 2026-10-21:
 
 ### Phase 1 — A note's completed date defaults to its commit's date  · status: done
 
-#### Work Order
+#### As-built
 
-**Worktree and branch:** `/home/natepiano/worktrees/claude-build-followups-feature-log`, branch `build-followups-feature-log`.
-
-**Goal:** `add`, `supersede` and `propose` without `--completed` set `completed_date` to the linked commit's committer date in the user's zone.
-
-**Spec:**
-
-- **Where each project's commits live.** `ProjectSpec` gains `checkouts: tuple[Path, ...]`, filled from the list in Delegation Context, in that order.
-- **The lookup.** One function takes the project and the canonical link's 40-hex sha. For each checkout in order, it runs `git -C <checkout> show -s --format=%cI <sha>` without a shell. The first checkout that exits 0 gives the date: parse the ISO time, convert it to `user_zone()`, and return its `YYYY-MM-DD`. A missing checkout counts as a miss.
-- **The default.** In `_new_note`, an omitted `--completed` takes the lookup's date in place of `today()`. A given `--completed` runs no git and stays as it is. `date_created` and `date_modified` stay `today()`.
-- **The refusal.** When every checkout misses, the write is refused before anything is written: `cannot date commit <sha>: no checkout of <repo> holds it; pass --completed`.
-- **Unchanged.** `propose` keeps an open proposal's saved `completed` when the flag is omitted, and runs no lookup then. A repeat whose `--completed` was omitted still compares apart from `completed_date`. `amend --backfill` still takes `--link` and `--completed` together.
+- `ProjectSpec.checkouts: tuple[Path, ...]` lists each project's local checkouts on natedev, in lookup order: hana → `~/rust/hana`, `~/rust/hana_catalyst`; natedev → `/etc/nixos`; cargo-liner, bevy_brp, obsidian_knife, nateroids → `~/rust/<name>`; claude → `~/.claude`.
+- `_commit_date(project: ProjectSpec, sha: str) -> str` runs `git -C <checkout> show -s --format=%cI <sha>` with no shell in each checkout in order. The first exit 0 gives the committer date, converted to `user_zone()` as `YYYY-MM-DD`. A missing checkout, a non-zero exit or an `OSError` is a miss.
+- `_new_note` takes `PROJECTS[<project>]` at call time. An omitted `--completed` takes `_commit_date` of the canonical link's sha; a given `--completed` runs no git. `date_created` and `date_modified` stay `today()`. `add`, `supersede` and `propose` all go through it; `propose` saves the resolved date, so `add --review` and `supersede --review` land that date.
+- Refusals, before anything is written: `cannot date commit <sha>: no checkout of <repo> holds it; pass --completed`, and `cannot date commit <sha>: invalid committer date in <checkout>; pass --completed` when git output does not parse.
 
 **Files:**
-- `scripts/feature_log/feature_log.py` — `ProjectSpec`, `PROJECTS`, `_new_note`, one new lookup function.
-- `scripts/feature_log/test_feature_log.py` — the cases below. Existing cases that omit `--completed` must point their project at a temp checkout that holds their link, through one shared helper.
+- `scripts/feature_log/feature_log.py` — `ProjectSpec.checkouts`, `PROJECTS`, `_commit_date`, the default in `_new_note`.
+- `scripts/feature_log/test_feature_log.py` — `temporary_checkout` builds temp git repos with fixed committer dates and no global or system git config; every project points at one shared temp checkout in `setUp`; cases cover zone conversion, an explicit date with no git, the second checkout, the refusal with no writes, `supersede`, and `propose` with landing.
 
-**Seats:** `1 writer + 1 tester` — one function and one call site, each rule concrete enough to test first.
-- `impl` — `scripts/feature_log/feature_log.py`.
-- `test` — `scripts/feature_log/test_feature_log.py`, with temp git repos whose commits carry a fixed `GIT_COMMITTER_DATE`:
-  - `add` without `--completed` takes the commit's date; a committer time of 01:30 UTC dates to the day before in the user's zone.
-  - `add` with `--completed` keeps that date and runs no git.
-  - the second checkout of a project supplies the date when the first lacks the commit, or does not exist.
-  - no checkout holds the commit: exit 2, the reason line, and no note, event, proposal or temp file.
-  - `supersede` and `propose` without `--completed` take the commit's date; `add --review` lands a proposal with the date `propose` saved.
-
-**Constraints from prior phases:** none. From the earlier feature-log runs (as-built): a refusal test asserts the vault, `events.jsonl` and temp files are unchanged.
-
-**Acceptance gate:** the test command green; `basedpyright scripts/feature_log` ends `0 errors, 0 warnings, 0 notes`; `python3 scripts/feature_log/feature_log.py check` from the worktree root prints `ok: <n> notes` for the live vault.
+**Gotchas:**
+- A test that omits `--completed` needs a link to a real commit in a temp checkout; a made-up sha is refused.
+- `basedpyright scripts/feature_log` exits 3 in a worktree with no `.venv`; the result line (`0 errors, 0 warnings, 0 notes`) is the gate.
