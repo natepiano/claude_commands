@@ -1022,31 +1022,24 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 **Ruled out:** creating, renaming or moving a vault note so that `[[style]]` resolves to a different page; changing an issue with any area other than `[[unfiled]]` or none.
 
 ### Phase 38 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: done
-**Depends on:** none
 
-#### Work Order
-**Goal:** `style_footprint` answers `mechanical` for `_name: T` → `_: T` on a function or trait-method parameter when the body never reads `_name`; it still answers review when the body reads it.
+#### As-built
 
-**Spec:**
-- Today the edit answers `review: check 3 … check 6` (cargo-liner-style 2026-10-20: never-prefix-unused, tui_pane, 24 sites held). `scripts/style/style_footprint.py` ~:1704-1726 builds the check reasons.
-- A name with a leading underscore is still a usable binding, so the edit is mechanical only when no token in the item's body (or default body for a trait method) names `_name`, and the parameter's type and position are unchanged. A trait method declaration with no body (`fn f(&self, _name: T);`) has nothing to read and is mechanical.
-- Any other change in the same hunk keeps the existing checks. Reads of `_name` in a macro body count as reads (review).
-- Never weaken check 3 or check 6 for any other edit shape.
-- An implicit format capture is a read: a string literal that holds `{_name}` or `{_name:…}`, raw strings included, keeps review. The tokenizer keeps a literal as one token, so a token scan alone misses it; reuse the capture test the local-binding proof already uses (~:1418, `re.compile(r"\{" + re.escape(old_name) + r"(?=[}:])")` over literal tokens).
-- Check 2 (~:1705) compares the unnormalized public shapes, so `_name` → `_` on an externally reachable `pub fn` or a public trait method changes them even when unused. A proved parameter erasure must also pass check 2; any other change to the public shape in the same item still keeps check 2.
+- `style_footprint` answers `mechanical` for `_name: T` → `_: T` on a function or trait-method parameter when the body never reads `_name`. A trait method with no body (`fn f(&self, _name: T);`) has nothing to read and is mechanical.
+- `function_parameters` reads each named `fn` outside attributes and macro token trees into a `FunctionParameters` (the `fn` index, the parameter list span, each parameter span, and a body). The body is a `ParameterBody` span, or `BodylessFunction` when the signature ends in `;`.
+- `prove_parameter_erasures` proves an erasure only when old and new have the same token count, the same signature prefix and parameter spans, a plain `_name` becomes `_` at the same position, and the type tokens stay the same. The body must not read the name.
+- A read is any body identifier equal to the name after `removeprefix("r#")` (so `r#_name` is a read), a literal with a `{_name}` or `{_name:…}` capture, or a literal that holds a backslash and a `{`. Macro arguments are plain tokens, so a name in a macro call is a read.
+- `erase_proven_parameters` writes `_` into `before` at each proved position and rebuilds the hunks. `judge` passes `semantic_changes = {path: erase_proven_parameters(change)}` to `normalizations`, check 2 (`public_before`), check 3, check 6 and the macro checks. Every other edit in the same item still meets the full checks.
 
 **Files:**
-- `scripts/style/style_footprint.py`
-- `scripts/style/test_style_footprint.py`
+- `scripts/style/style_footprint.py` — `ParameterBody`, `BodylessFunction`, `FunctionParameters`, `function_parameters`, `prove_parameter_erasures`, `erase_proven_parameters`, and their use in `judge`.
+- `scripts/style/test_style_footprint.py` — mechanical and review cases: bodyless trait method, unread body, body read, `r#_name`, macro read, plain, raw and escaped format captures, type change, public `pub fn` and trait method, and check 2 kept for another public change.
 
-**Workers:** 1 writer + 1 tester. `impl`: style_footprint.py. `test`: test_style_footprint.py — mechanical for a required trait parameter, a trait declaration without body, and a function whose body never reads `_name`; review when the body reads `_name`, when a macro names it, when a format string captures `{_name}` (plain and raw), and when the type also changes; mechanical for an externally reachable `pub fn` and a public trait method with a proved erasure, and check 2 still raised when that item's public shape also changes in another way.
-
-**Constraints from prior phases:** phase 35 does not touch style_footprint.py; it uses `style_footprint.tokens`, `closing` and `attribute_spans`, which must keep their behavior. Phase 35 fixed the import direction `declarations → approved_renames → style_footprint`: style_footprint must not import either upper module (that is a cycle), so the erasure proof lives in style_footprint with its own reading.
-
-**Acceptance gate:**
-- `env -C <worktree> PYTHONPATH=<worktree>/scripts/style:<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.style.test_style_footprint scripts.style.test_style_ledger` passes.
-- basedpyright on each changed .py file: 0 errors, 0 warnings.
-- The gate copy's `merge_gate.py --tests-only` passes.
+**Gotchas:**
+- The tokenizer keeps a string literal as one token, so a token scan misses `{_name}`. The capture regex runs over literal tokens.
+- A literal escape (`\u{5f}`, `\x5f`) can spell a capture. Any body literal with a backslash and a `{` counts as a read.
+- When `token_spans` returns empty (an unsupported token), the original change is kept, so the answer stays review.
+- style_footprint must not import `approved_renames` or `declarations` (that is an import cycle). The erasure proof has its own parameter reading.
 
 ### Phase 39 — a cell with no live held finding is never offered again as held work  · status: todo
 **Depends on:** none
