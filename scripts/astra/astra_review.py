@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """astra_review.py — Ask gpt-6-astra for a review of one document and print the review.
 
-Usage: astra_review.py <document> [focus...]
+Usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]
 
 The review is one `codex exec` turn on the current workers account, read-only, at reasoning xhigh.
 The reviewer's last message is saved in the run folder under /tmp/claude/astra/ and printed when it
@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
+from scripts.guilds import astra_work, tips  # noqa: E402
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
@@ -63,7 +64,16 @@ Only read. Do not build, run tests, or change, create or delete any file.
 Your final message is the review. Start with a short verdict paragraph. Then list findings, most
 important first. Each finding names where it is (the section heading, or a file path with a line
 number), what is wrong or missing, why it matters, and the change you would make.
-"""
+
+## Guild
+
+{tips.guild_block("reviewers")}
+
+Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
+
+Use Events in ~/.claude/docs/plans/sdlc-guilds-design.md for report detection and form.
+
+{tips.load("reviewers")}"""
 
 
 def workers_label() -> str | subprocess.CompletedProcess[str]:
@@ -169,8 +179,25 @@ def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
 
 
 def main(arguments: list[str]) -> int:
+    usage = "usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]"
     if not arguments or arguments[0] in ("-h", "--help"):
-        print("usage: astra_review.py <document> [focus...]", file=sys.stderr)
+        print(usage, file=sys.stderr)
+        return 2
+    options: dict[str, str] = {}
+    while arguments and arguments[0].startswith("--"):
+        option = arguments[0]
+        if option not in ("--run-directory", "--phase") or option in options or len(arguments) < 2:
+            print(f"astra_review: {usage}", file=sys.stderr)
+            return 2
+        options[option] = arguments[1]
+        arguments = arguments[2:]
+    if not arguments or (options and (set(options) != {"--run-directory", "--phase"} or not all(options.values()))):
+        print(f"astra_review: supply --run-directory and --phase together; {usage}", file=sys.stderr)
+        return 2
+    try:
+        work = astra_work.phase_work(options["--run-directory"], options["--phase"]) if options else astra_work.StandaloneWork()
+    except ValueError as error:
+        print(f"astra_review: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
         return 2
     document = Path(arguments[0]).expanduser().resolve()
     if not document.is_file():
@@ -184,7 +211,16 @@ def main(arguments: list[str]) -> int:
         return 1
     folder = run_folder()
     review = folder / "review.md"
-    prompt = review_prompt(document, focus)
+    assignment = astra_work.AstraWork("astra-reviewer", str(folder), str(document),
+                                     datetime.now(timezone.utc).isoformat(), str(review), work)
+    try:
+        prompt = astra_work.header_line(assignment) + "\n" + review_prompt(document, focus)
+    except tips.BaselineMissing as error:
+        print(f"astra_review: {error}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as error:
+        print(f"astra_review: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
+        return 1
     _ = (folder / "prompt.md").write_text(prompt, encoding="utf-8")
     log = folder / "codex.log"
     returncode = run_review(label, review, prompt, log)

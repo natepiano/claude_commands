@@ -10,6 +10,10 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/guilds",
+      "extraPaths": [".", "scripts/guilds", "scripts/direct", "scripts/lib"]
+    },
+    {
       "root": "scripts/hierarchies",
       "extraPaths": [".", "scripts/hierarchies", "scripts/lib", "scripts/production", "scripts/message", "scripts/direct", "scripts/nightly_review"]
     },

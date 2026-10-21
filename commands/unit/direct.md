@@ -22,6 +22,35 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - Free text amends or narrows the selected work.
 - `single` and `verbose` are mutually exclusive.
 
+<Guild>
+Your guild is `units`. Your head is the `units` unit director in the top-level `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/units/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `units`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
+
+Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild units
+
+Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+In Synthesize / FixDispatch, send the units report when `findings.py gate` first
+returns `verdict=dispatch` with `round=4` for a phase instance; a repeated read
+sends no new report. The gate outcome does not change.
+For repeated titles in one run, normalize case and spaces. Count matching
+`finding_opened` titles across distinct `(phase_instance_id, round)` groups,
+or a `still_open`/`reopened` verdict after `finding_batch_landed` names that
+finding. Count one group once across lenses and one verdict per finding/round.
+Missing phase, round or repair order means `RepeatNotProven`; cite both event IDs.
+Send at most 100 words in six lines: Guild/event, Member/holder, Work,
+Evidence/time, Change, Result/cost/limit. Keep unsent reports with phase evidence.
+
+In LaunchImplementation, include `config/guilds/designer.md`, the expanded
+designers block and the loaded designers tip text in each Astra designer brief.
+Before dispatch, save the brief with:
+`~/.claude/scripts/lib/py ~/.claude/scripts/guilds/astra_work.py brief
+--run-directory <SESSION_DIR> --phase <id> --member <mesh name>
+--document <path> --round <N> --text-file <brief>`.
+Save the reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
+overwrite. A holder passes both `--run-directory` and `--phase` to each phase
+`astra_review.py` call. Codex holders pass the expanded block and loaded tip text
+to their worker, and relay its guild report unchanged.
+</Guild>
+
 At startup or restart, a header `**Standing:** style_plan.py` runs
 <StandingPlanRefill/> before choosing a phase; repeat after compaction.
 
