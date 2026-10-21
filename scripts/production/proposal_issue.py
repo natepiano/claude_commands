@@ -38,6 +38,7 @@ from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
@@ -470,6 +471,21 @@ def fill_ranking(path: Path, ranking: str) -> bool:
         return True
 
 
+class DecisionPathState(Enum):
+    AVAILABLE = "available"
+    ALREADY_FILED = "already filed"
+
+
+def _decision_path_state(path: Path, keys: dict[str, str]) -> DecisionPathState:
+    """Read the decision key at the path; refuse a different decision."""
+    if not path.exists():
+        return DecisionPathState.AVAILABLE
+    fields = frontmatter(path)
+    if any(fields.get(key) != [value] for key, value in keys.items()):
+        raise Refusal(f"{path}: different decision key")
+    return DecisionPathState.ALREADY_FILED
+
+
 def create(path: Path, project: str, short: str, proposed_by: str, tags: list[str],
            rule: str, crate: str, rule_blob: str, count: int, body: str, template: Path,
            today: date, proposed_ranking: str = "", rule_urls: tuple[str, ...] = (), *,
@@ -481,12 +497,11 @@ def create(path: Path, project: str, short: str, proposed_by: str, tags: list[st
     inherited = dict(initial_fields)
     if any(key not in INHERITED_FIELDS for key in inherited):
         raise Refusal("invalid inherited fields: " + ", ".join(sorted(set(inherited) - INHERITED_FIELDS)))
-    if path.exists():
-        fields = frontmatter(path)
-        if any(fields.get(key) != [value] for key, value in keys.items()):
-            raise Refusal(f"{path}: different decision key")
+    if _decision_path_state(path, keys) is DecisionPathState.ALREADY_FILED:
         return False
     with _folder_lock(path.parent):
+        if _decision_path_state(path, keys) is DecisionPathState.ALREADY_FILED:
+            return False
         return _create_numbered(path, template, project, short, proposed_by, tags, keys, count, body, today,
                                 proposed_ranking, rule_urls, inherited)
 

@@ -982,7 +982,7 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 
 **Ruled out:** resolving `extern crate` aliases to compare argument paths (it gave two wrong follows); a manual follow command; picking the best score or first file among candidates; `before`/`after` prose as rename proof; ignoring changed doc-comment lines to raise a body score.
 
-### Phase 36 — two filer runs at once never skip a decision  · status: todo
+### Phase 36 — two filer runs at once never skip a decision  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -1008,7 +1008,36 @@ Mapping (style-unit's choice, 2026-10-16): the proposal's Phases 1-3 are this pl
 - basedpyright on each changed .py file: 0 errors, 0 warnings.
 - The gate copy's `merge_gate.py --tests-only` passes.
 
-### Phase 37 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: todo
+### Phase 37 — a style decision files under area style, new and old  · status: todo
+**Depends on:** Phase 36
+
+#### Work Order
+**Goal:** every style decision issue has `area: "[[style]]"`: `proposal_issue create` writes it for each new one, and one command sets it on the ones already filed under `"[[unfiled]]"`.
+
+**Spec:**
+- User request 2026-10-20: "when we create a new issue for a style proposal - we need to set the area to style … backpopulate the area field on the ones that were created for style but don't have this".
+- `scripts/production/proposal_issue.py` `_create_numbered` (~:515) fills the template `area: "[[{{AREA}}]]"` (`~/rust/hanadocs/.claude/templates/issue.yaml` line 2) with `"AREA": "unfiled"`. `create` is the style decision path (it requires `style_rule`, `style_crate`, `style_rule_blob`), so set `"AREA": "style"` there, one named constant.
+- New verb `proposal_issue.py area-style <folder> [--dry-run]`: for each issue in the folder whose frontmatter carries the style decision key (`style_rule`), and whose area is `[[unfiled]]` or missing, set `area: "[[style]]"` under the issue lock with `_write`, and print one line per issue changed (`--dry-run` prints and writes nothing). It never changes an issue with any other area, and never touches `date_modified` beyond what `set_fields` already does for an edit (state the choice in the report). A second run changes nothing.
+- On 2026-10-20 about 600 files named `style …` in `~/rust/hanadocs/issues` carry `area: "[[unfiled]]"`, but a plain `grep 'style_rule:'` finds only 96: read a few of those files (read only) to learn how `style_rule` is written, so the verb matches every style decision. The director runs the verb on the real folder; workers never write there.
+- Update `commands/showrunner/proposal.md` or `docs/style_production.md` only where they state a style decision's area.
+
+**Files:**
+- `scripts/production/proposal_issue.py`
+- `scripts/production/test_proposal_issue.py`
+- `commands/showrunner/proposal.md`
+- `docs/style_production.md`
+
+**Workers:** 1 writer + 1 tester. `impl`: proposal_issue.py and the two docs. `test`: test_proposal_issue.py — a new decision has `area: "[[style]]"`; `area-style` sets it on an unfiled style decision and on one with no area, leaves a non-style issue and a style decision with another area byte-identical, `--dry-run` writes nothing, and a second run changes nothing.
+
+**Constraints from prior phases:** phase 36 re-checks the decision path inside `_folder_lock`; keep that.
+
+**Acceptance gate:**
+- `env -C <worktree> PYTHONPATH=<worktree>/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest scripts.production.test_proposal_issue` passes.
+- basedpyright on each changed .py file: 0 errors, 0 warnings.
+- The gate copy's `merge_gate.py --tests-only` passes.
+- Director: `area-style ~/rust/hanadocs/issues --dry-run` lists every style decision still unfiled; the real run sets them; a second run prints nothing.
+
+### Phase 38 — an unused parameter renamed to `_` needs no review when the body never reads it  · status: todo
 **Depends on:** none
 
 #### Work Order
