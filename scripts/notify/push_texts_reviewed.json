@@ -512,6 +512,38 @@
       "time": "2026-10-14T04:24:37.910956-04:00"
     }
   },
+  "session.needs_go": {
+    "delete_worktree": {
+      "objections": [
+        {
+          "quote": "build-followups: herdr waits for your go",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
+      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
+      "time": "2026-10-21T08:05:00.760833-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "natedev: trunk waits for your go",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Steps 130 and 140 both claim the arrange_jacks folder",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Your go removes it from step 130, and trunk goes on.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
+      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
+      "time": "2026-10-21T08:04:49.559420-04:00"
+    }
+  },
   "shutdown.holdout": {
     "typical": {
       "objections": [

@@ -1400,6 +1400,17 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             _ = send.parse(["--here", *self.auto_mode_arguments()])
         self.assertIn("no session record", errors.getvalue())
 
+    def test_sender_and_session_values_lose_the_unit_suffix_but_free_text_keeps_per_unit(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-unit"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options(self.auto_mode_arguments(session="types-unit", does="save the per-unit counts",
+                                                         waits="The trunk-unit plan waits for them"))
+        self.assertEqual(options.summary, "cargo-liner: auto mode stopped types")
+        self.assertEqual(options.sender, "cargo-liner")
+        self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, approve the prompt or add an allow rule"))
+        self.assertIn("Auto mode refused 2 commands in types. They save the per-unit counts. "
+                      + "The trunk-unit plan waits for them.", options.text or "")
+
     def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
         self.writer_session()
         for title, text in (("types: auto mode stopped", "It waits."), ("Build stopped", "Auto-mode DENIED two commands in types.")):
@@ -1425,6 +1436,59 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             _ = send.parse(["--help"])
         self.assertIn("auto_mode.refused: auto mode refused a command and the session waits for the user.", output.getvalue())
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
+        self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
+
+    def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
+        values = {"session": "trunk", "machine": "natedev", "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
+                  "why": "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.",
+                  "does": "removes it from step 130, and trunk goes on"} | changed
+        return ["--to", "user", "--text-id", "session.needs_go",
+                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")), *extra]
+
+    def test_needs_go_template_takes_its_sender_from_this_session(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options(self.needs_go_arguments())
+        self.assertEqual(options.summary, "natedev: trunk waits for your go")
+        self.assertEqual(options.sender, "natedev")
+        self.assertEqual(options.need, "decision")
+        self.assertEqual(options.action, ActionRequired(
+            "On natedev, in the trunk pane, type: Go: remove arrange_jacks/ from phases/130/files; 140 owns it"))
+        # The template gives why its period: a period in the value is not doubled.
+        self.assertEqual(options.text, "Session: trunk\n"
+                         + "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.\n"
+                         + "Your go removes it from step 130, and trunk goes on.")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "session.needs_go")
+        self.assertIn("sender=natedev", command)
+        for arguments in (self.needs_go_arguments("--value", "sender=someone"), self.needs_go_arguments("--from", "someone"),
+                          self.needs_go_arguments("--machine", "mac"), self.needs_go_arguments(colour="red")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.parse(arguments)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = send.parse(["--here", *self.needs_go_arguments()])
+        self.assertIn("no session record", errors.getvalue())
+
+    def test_a_free_text_push_that_asks_for_a_go_is_held_with_the_template_call(self) -> None:
+        self.writer_session()
+        for title, text, action in (("trunk waits", "Steps 130 and 140 clash.", "In the trunk pane, type: Go: remove arrange_jacks/"),
+                                    ("trunk stopped", "It does no work until you type the go.", "Answer in the trunk pane"),
+                                    ("trunk waits for your go", "Steps 130 and 140 clash.", "Answer in the trunk pane")):
+            with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                                  "--action", action, "--key", "go", "--repeat-minutes", "30", "--text", text])
+            self.assertEqual(code, 4)
+            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push asks the user to type a go."))
+            self.assertIn("--text-id session.needs_go --value session=<session> --value machine=<machine>", output.getvalue())
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "held")
+        # The hold claims no repeat window: the resend with the template goes out.
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options([*self.needs_go_arguments(), "--key", "go", "--repeat-minutes", "30"])).outcome,
+                             "sent")
 
     def paid_credits_arguments(self, *extra: str) -> list[str]:
         values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 EDT",

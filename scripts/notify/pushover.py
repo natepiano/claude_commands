@@ -15,7 +15,6 @@ While the user's silence is on (silence.py), a push below priority 2 is kept,
 not posted: it prints "pushover: kept: silence until ..." and exits 0, and
 `silence.py off` posts it later.
 
-Session names in the title, Session line, action and body lose a trailing "-unit".
 Messages without --action or --no-action are refused before sending. Exit 0
 sent or kept, 1 Pushover refused it or could not be reached, 2 refused before sending,
 usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent after failed review. Registry and emergency pushes still send.
@@ -40,8 +39,7 @@ import push_texts
 import silence
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefused, ActionRequired,
                          ActionUnstated, UserAction, first_line, parse_user_action, refused_at,
-                         NotificationSession, NO_SESSION_LINE, SessionLine, split_session, session_prefix,
-                         shown_session_names)
+                         NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
 API_URL = "https://api.pushover.net/1/messages.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
@@ -227,18 +225,15 @@ def parse(argv: list[str]) -> Arguments | None:
         return None
     if not text_id:
         session, positionals[1] = split_session(positionals[1])
-    # Every push, registered or free text, shows session names without "-unit".
-    if isinstance(session, SessionLine):
-        session = SessionLine(shown_session_names(session.text))
     return {
         "session": session,
         "priority": priority,
         "source": source,
-        "action": None if action is None else shown_session_names(action),
+        "action": action,
         "no_action": no_action,
         "answerable": answerable,
-        "title": shown_session_names(positionals[0]),
-        "message": shown_session_names(positionals[1]),
+        "title": positionals[0],
+        "message": positionals[1],
         "text_id": text_id,
         "header": header,
     }

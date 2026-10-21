@@ -57,8 +57,9 @@ message text as one JSON line in STATE/log.jsonl:
   KEPT: why      the user's silence is on; posted when it ends    exit 0
   REFUSED: why   rejected before delivery; not kept              exit 2
   HELD: not sent, failed review; revise and resend, no fallback     exit 4
-        also a free-text push that reports an auto-mode refusal or paid credit use:
-        the detail gives the auto_mode.refused or quota.paid_credits call to send instead
+        also a free-text push that reports an auto-mode refusal or paid credit use, or asks
+        the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits or
+        session.needs_go call to send instead
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -123,11 +124,20 @@ PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py
 PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\buse_credits\b", re.IGNORECASE)
 PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
                      + PAID_CREDITS_CALL)
+NEEDS_GO_TEXT = "session.needs_go"
+NEEDS_GO_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id session.needs_go'
+                 + ' --value session=<session> --value machine=<machine> --value "go=<the Go: line to type>"'
+                 + ' --value "why=<why the session waits>" --value "does=<what the go does>"')
+# "type: Go: ...", "until you type", "waits for your go": a free-text push that asks for a go.
+NEEDS_GO_REPORT = re.compile(r"\btype:?\s+[\"'`\u201c]?Go:|\buntil you (allow|type)\b|\bwaits? for your go\b", re.IGNORECASE)
+NEEDS_GO_HELD = ("not sent: this push asks the user to type a go. Send it with the session.needs_go template: "
+                 + NEEDS_GO_CALL)
 # Registered pushes a session or script sends with --text-id; `send.py --help` lists them.
 SESSION_TEMPLATES = {
     AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
     PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
                         + PAID_CREDITS_CALL),
+    NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
     "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
@@ -1244,6 +1254,18 @@ def paid_credits_values(values: dict[str, str], session: str, named: str | None)
     return values | {"sender": sender}
 
 
+def needs_go_values(values: dict[str, str], sender: str) -> dict[str, str]:
+    """The session.needs_go values with the sender filled: this session's own name. The template ends
+    why and does with its own period."""
+    if not sender:
+        raise ValueError(NEEDS_GO_TEXT + " is sent by a Claude session: its sender is that session's name,"
+                         + " and this run has no session record")
+    if "sender" in values:
+        raise ValueError(NEEDS_GO_TEXT + " takes no --value sender: it is this session's own name")
+    ends = {key: values[key].strip().rstrip(".") for key in ("why", "does") if key in values}
+    return values | ends | {"sender": sender}
+
+
 def reports_auto_mode_refusal(text: str) -> bool:
     return AUTO_MODE_REPORT.search(text) is not None and AUTO_MODE_REFUSAL.search(text) is not None
 
@@ -1256,6 +1278,8 @@ def wrong_template(options: Options, shown: str) -> str | None:
         return AUTO_MODE_HELD
     if not options.text_id and PAID_CREDITS_REPORT.search(shown) is not None:
         return PAID_CREDITS_HELD
+    if not options.text_id and NEEDS_GO_REPORT.search(shown) is not None:
+        return NEEDS_GO_HELD
     return None
 
 
@@ -1326,10 +1350,11 @@ def parse(argv: list[str]) -> Options:
                 parser.error("--value needs distinct key=value pairs")
             values[key] = item
         try:
-            if text_id == AUTO_MODE_TEXT:
+            if text_id in (AUTO_MODE_TEXT, NEEDS_GO_TEXT):
                 if attr(args, "sender") is not None or attr(args, "machine") is not None:
-                    parser.error(AUTO_MODE_TEXT + " takes no --from or --machine: it goes from this session's own name and machine")
-                values = auto_mode_values(values, own_session_name())
+                    parser.error(text_id + " takes no --from or --machine: it goes from this session's own name and machine")
+                fill = auto_mode_values if text_id == AUTO_MODE_TEXT else needs_go_values
+                values = fill(values, own_session_name())
                 raw_values = [f"{key}={item}" for key, item in values.items()]
             elif text_id == PAID_CREDITS_TEXT:
                 values = paid_credits_values(values, own_session_name(), optional_str(attr(args, "sender")))

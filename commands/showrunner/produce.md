@@ -952,7 +952,9 @@ it needs. Every other wait is yours to clear, and fast.
       to add, and why the check refused it, in a few words. Put it in
       `needed:` and send it as a <Notify/> `blocked` alert. An auto-mode refusal
       goes as `send.py --to user --need blocked --text-id auto_mode.refused` with its
-      `--value`s (`send.py --help`); free text about it is held.
+      `--value`s (`send.py --help`); free text about it is held. A session that waits
+      for the user to type a go goes as `send.py --to user --need blocked --text-id
+      session.needs_go` with its `--value`s; free text about it is held.
    4. **Rule 4's limit holds.** Each hour, run
       `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit>`
       and repeat 1–3.

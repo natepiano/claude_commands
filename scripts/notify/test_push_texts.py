@@ -174,6 +174,16 @@ class PushTextTests(unittest.TestCase):
                          + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
                          + "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.")
 
+    def test_needs_go_keeps_the_user_approved_lines(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "session.needs_go")
+        self.assertEqual(entry.need, "decision")
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertEqual(push.title, "natedev: trunk waits for your go")
+        self.assertEqual(push.message, "Session: trunk\n"
+                         + "Action: On natedev, in the trunk pane, type: Go: remove arrange_jacks/ from phases/130/files; 140 owns it\n"
+                         + "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.\n"
+                         + "Your go removes it from step 130, and trunk goes on.")
+
     def test_header_is_fingerprinted_and_cannot_hide_an_action_or_session(self) -> None:
         entry = replace(self.entry(), action=push_texts.NoActionNeeded())
         self.assertNotEqual(push_texts.fingerprint(entry), push_texts.fingerprint(replace(entry, header=False)))

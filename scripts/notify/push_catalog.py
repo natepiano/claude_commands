@@ -238,6 +238,22 @@ ENTRIES = (
             "credits": "25,345", "refill": "Tue 10-27 02:33 EDT", "next_reset": "Sat 10-24 16:40 EDT"}),
          PushExample("from_session", {"sender": "natedev", "account": "codex1", "machine": "natedev",
             "credits": "6,370", "refill": "Thu 10-29 07:00 EDT", "next_reset": "Sat 10-24 16:40 EDT"}))),
+    # A session waits for a go (user approved 2026-10-21): sent with send.py --text-id session.needs_go.
+    # send.py fills sender from the session's own name. Examples: the trunk push the user approved, and the
+    # herdr-panes worktree left after herdr-unit took over herdr work (2026-10-18).
+    PushText("session.needs_go", "{sender}", "decision", "{sender}: {session} waits for your go",
+        ActionTemplate("On {machine}, in the {session} pane, type: {go}"),
+        "{why}.\nYour go {does}.",
+        (PushExample("typical", {"sender": "natedev", "session": "trunk", "machine": "natedev",
+            "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
+            "why": "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix",
+            "does": "removes it from step 130, and trunk goes on"}),
+         PushExample("delete_worktree", {"sender": "build-followups", "session": "herdr", "machine": "natedev",
+            "go": "Go: delete the herdr-panes worktree and its branch",
+            "why": "The herdr session tried to delete the old herdr-panes worktree, and your permission check refused it. "
+            + "The main branch has all its work",
+            "does": "deletes them, and herdr starts its next phase"})),
+        session=SessionTemplate("{session}")),
     # Auto silence (user spec, 2026-10-20: "a very compact format"): auto_silence.py sends one when the
     # user goes idle, before silence starts, and one when their next prompt ends it.
     PushText("silence.auto_on", "{sender}", "note", "{sender} auto silence on", NoActionNeeded(),
