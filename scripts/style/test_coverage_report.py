@@ -289,8 +289,8 @@ class CoverageReportTests(unittest.TestCase):
 
         replacement = self.held(read, line=3)
         with style_ledger.open_ledger(self.repo) as ledger:
-            ledger.waive_held(first)
-            ledger.waive_held(duplicate)
+            ledger.waive_held(first, style_ledger.WaiveByPerson("nate"))
+            ledger.waive_held(duplicate, style_ledger.WaiveByPerson("nate"))
             ledger.file_held(replacement, new_proposal)
         output = self.report().stdout
 

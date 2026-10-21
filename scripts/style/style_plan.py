@@ -1432,7 +1432,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
         *record_lines,
         "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
         "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
-        "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
+        "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
+        + "Without `--reads`, the cell comes back after any change in its crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/direct/verify.sh check <package>`",
@@ -1662,7 +1663,7 @@ def _select_phase(
         # A finding in a removed file, or whose site a merge moved to another file, can never build at its
         # site, so it is waived and the decision can close.
         for words, finding_ids in sorted(gone.items()):
-            _ = ledger.decline_findings(finding_ids, words)
+            _ = ledger.decline_findings(finding_ids, words, style_ledger.WaiveByLedger())
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
         if (gone or withdrew or built) and style_proposals.close_finished_decision(ledger, issue.path):
             closed = True

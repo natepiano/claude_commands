@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import os
 import sys
 import tempfile
 import unittest
@@ -79,6 +78,7 @@ class FooterCountsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         # The doc's own line names the list; no live showrunner's list is looked up.
         _ = self.enterContext(mock.patch.object(change_review, "showrunner_of",
                                                 side_effect=change_review.ChangeReviewError("not running")))
@@ -193,8 +193,7 @@ class FooterCountsTests(unittest.TestCase):
         issue(folder, "plain", "open", "issue, proposal", "production", "stage: backlog")
         doc = self.doc(f"- **Proposals:** {folder}")
         self.assertEqual(footer_counts.proposals(doc), 1)
-        runtime = self.enterContext(tempfile.TemporaryDirectory())
-        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": runtime}), contextlib.redirect_stdout(io.StringIO()):
+        with contextlib.redirect_stdout(io.StringIO()):
             code = proposal_issue.main(["approve", str(folder / "plain.md"), "--showrunner", "s", "--unit", "u", "--plan", "p"])
         self.assertEqual(code, 0)
         self.assertEqual(footer_counts.proposals(doc), 0)

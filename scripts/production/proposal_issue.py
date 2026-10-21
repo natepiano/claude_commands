@@ -6,7 +6,7 @@ read the folder for the highest P number, move-approved edits each open approved
 and area-style sets the area on current and legacy style proposals. Every verb also sets
 date_modified to today in the user's zone, written "[[YYYY-MM-DD]]" as the vault writes dates.
 Each verb holds an exclusive lock on the issue for its whole read, change and write. The lock
-file is in the user's runtime folder, never in the issue folder.
+file is in the user's state folder, never in the issue folder.
 
 Usage:
   proposal_issue.py approve <issue> --showrunner S --unit U --plan P
@@ -155,7 +155,7 @@ def set_list_fields(text: str, fields: dict[str, list[str]], path: Path) -> tupl
 @contextmanager
 def _issue_lock(path: Path) -> Generator[None]:
     """Hold an exclusive lock on the issue. The lock file is named from the issue's resolved path."""
-    folder = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    folder = Path.home() / ".local/state/proposal-issue/locks"
     folder.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:32]
     with (folder / f"proposal-issue-{digest}.lock").open("a") as lock:
@@ -566,7 +566,12 @@ def _create_numbered(path: Path, template: Path, project: str, short: str, propo
         try:
             _ = stream.write(text)
             stream.flush()
-            os.link(temporary, path)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if _decision_path_state(path, keys) is DecisionPathState.ALREADY_FILED:
+                    return False
+                raise
         finally:
             temporary.unlink(missing_ok=True)
     return True

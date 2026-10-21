@@ -119,7 +119,7 @@ Loop/verbose only:
    For each `has no applied check` line that merge prints, check the change in
    the code and run the printed `held built` command when the change is there.
    A finding whose change is not there waits for a person, who makes the change
-   and runs that command, or waives the finding with `style_ledger.py held waive`.
+   and runs that command, or waives the finding with `style_ledger.py held waive --person <name>`.
    From `Active`, atomically replace the durable record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that same captured
    full id as `checkpoint_commit`, and read it back. This is the one case where
