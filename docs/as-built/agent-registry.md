@@ -154,7 +154,10 @@ codex_mesh.py sweep  [--root <dir>] [--stop]
 `long-lived-workers.md`; the role log and guarded roster writes in `usage-ledger.md`.
 `prime`, `fork` and `reset`, and `follow`'s `--cwd`, `--read-only` and
 `--image`, serve the review pool's reviewers and are described in
-`review-pool.md`.
+`review-pool.md`. `prime --held-design --held-role` starts a held design role's
+thread for `scripts/guilds/roles.py`; held roles, their access policy and the
+verbs that refuse them (`start`, `fork`, `reopen`, `set-instructions`, raw `stop`
+and `stop --pause`) are described in `guilds.md`.
 
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
 (`start_new_session=True`) and records `{port, pid}` in
@@ -211,7 +214,9 @@ and the reap constants as module attributes.
 
 `send` and `steer` address a delegate by mesh name through the roster file, which
 is why they work from an unrelated process — the unit director, or a peer
-delegate. `send` delivers only while a launcher is attached. To a `running` worker
+delegate. `send` to a held design role queues the text in the role store
+(`roles.queue_message`) and prints `queued for <name>; holder adds it to the next
+authorized assignment`. Otherwise `send` delivers only while a launcher is attached. To a `running` worker
 it calls `thread/queue/add`, and the message lands at the start of the target's
 **next** turn; to a `waiting_capacity` worker it stores the message in
 `<worker>.pending.json` under an `flock`, for the resume turn. It refuses a
@@ -225,7 +230,8 @@ a late message with nothing streaming it and nothing writing the summary.
 (`ENDABLE_STATUSES`): it drops the thread's queued messages, leaves the marker
 the `start` loop polls for, sets the worker's roster status to `ended`, and
 interrupts any live turn. Any other status, `ended` included, prints `<worker> is
-<status>; nothing to end` and exits 0.
+<status>; nothing to end` and exits 0, except that an `ended` held design role is
+ended again so `roles.py end` can confirm the thread release.
 
 `stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
 non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
@@ -425,7 +431,8 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - A codex delegate's launcher ends with its last turn, and `send` then refuses it
   though the thread persists. Unlike a claude delegate, whose
   background session stays resumable, a finished codex peer cannot be messaged;
-  only the unit director's `implement.sh --to <worker>` or `review.sh --to <worker>` (`codex_mesh.py follow`) gives it new work —
+  only the unit director's `implement.sh --to <worker>` or `review.sh --to <worker>` (`codex_mesh.py follow`) gives it new work
+  (a held design role is the exception: `implement.sh --to` refuses it, and only `roles.py resume` gives it a turn) —
   `<PhaseMesh/>` in `docs/delegate/write_prompt_contract.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - `/unit:direct` is itself implemented by `scripts/direct/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.

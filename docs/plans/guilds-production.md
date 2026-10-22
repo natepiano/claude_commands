@@ -4,7 +4,7 @@
 
 ## Production Context
 
-- **Source plans:** `docs/plans/sdlc-guilds-design.md` — Guilds and heads, Daily read, Phase 5; settled G1–G10.
+- **Source plans:** `docs/as-built/guilds.md` — Guilds and heads, Daily read; G1–G10 in `docs/plans/sdlc-production.md`, Review decisions.
 - **Repository:** `~/.claude`
 - **Merge branch:** `guilds`
 - **Showrunner checkout:** `/home/natepiano/worktrees/claude-guilds-trunk`
@@ -47,4 +47,4 @@ No automatic wrap. Stop a head or timer only on an explicit instruction; retain 
 5. Relay the user's guild feedback to that guild's head with sender and context (G4). Report the heads' evidence, tip paths and pushed commits, declined reports, process proposals and missing host coverage. A queued message is not delivered.
 6. Heads own tips, not assignments, acceptance, model choices or gates. A process proposal goes from its head through guilds to sdlc for `guild-process-unit` (G9); no head changes a user rule. The daily reader selects evidence and adds no stop rule.
 
-Source: settled `~/.claude/docs/plans/sdlc-guilds-design.md`, Guilds and heads / Daily read / Phase 5, 2026-10-21.
+Source: `~/.claude/docs/as-built/guilds.md`, Guilds and heads / Daily read; G1–G10 in `docs/plans/sdlc-production.md`, Review decisions.

@@ -10,7 +10,7 @@ Your guild is `reviewers`. Your head is the `reviewers` unit director in the top
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
 
-Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
 
 The script loads the reviewers block and tip text into each prompt. A Codex
 holder relays a guild report in the reply unchanged.

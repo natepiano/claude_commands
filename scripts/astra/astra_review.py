@@ -71,7 +71,7 @@ number), what is wrong or missing, why it matters, and the change you would make
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
 
-Use Events in ~/.claude/docs/plans/sdlc-guilds-design.md for report detection and form.
+Use Events in ~/.claude/docs/as-built/guilds.md for report detection and form.
 
 {tips.load("reviewers")}"""
 
