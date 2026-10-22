@@ -1778,31 +1778,33 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             return WaitingForBranchPointSync(standing.branch_point, branch_tip, tip)
         if ancestry.returncode:
             raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
-        board = berth_board.read_board(repo)
-        if isinstance(board, berth_board.BoardUnavailable):
-            return board
-        # One catalog read serves both refill passes.
+        # One catalog read serves both refill passes; it reads no shared state, so it runs before the lock.
         definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
-        busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                 definitions)
-        # A unit told to merge the style branch acts at once, so it records no sync wait.
-        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
-            ledger.clear_sync_wait(unit)
-            return selected
+        with style_ledger.refill_lock(repo):
+            board = berth_board.read_board(repo)
+            if isinstance(board, berth_board.BoardUnavailable):
+                return board
+            busy = busy_files(repo, doc, ledger, unit, board)
+            selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                     definitions)
+            # A unit told to merge the style branch acts at once, so it records no sync wait.
+            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
+                ledger.clear_sync_wait(unit)
+                return selected
         ledger.wait_for_sync(unit)
-        board = berth_board.read_board(repo)
-        if isinstance(board, berth_board.BoardUnavailable):
-            return board
-        busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                 definitions)
-        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
-            ledger.clear_sync_wait(unit)
-            return selected
-        if isinstance(selected, WaitingForStructure):
-            return selected
-        return WaitingForSync(len(ledger.unclassified_rules()))
+        with style_ledger.refill_lock(repo):
+            board = berth_board.read_board(repo)
+            if isinstance(board, berth_board.BoardUnavailable):
+                return board
+            busy = busy_files(repo, doc, ledger, unit, board)
+            selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                     definitions)
+            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
+                ledger.clear_sync_wait(unit)
+                return selected
+            if isinstance(selected, WaitingForStructure):
+                return selected
+            return WaitingForSync(len(ledger.unclassified_rules()))
 
 
 def main(argv: list[str]) -> int:
