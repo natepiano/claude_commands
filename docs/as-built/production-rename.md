@@ -218,8 +218,10 @@ and 2 for invalid arguments.
   against live state when testing.
 - Rename moves only the per-slug state listed above. These stay under the old
   slug: `outstanding/<slug>.history.jsonl`, the `review-health-<slug>` and
-  `bevy-upgrade-<slug>` notifier instances, and the
-  `BEVY_UPGRADE_STATE_DIR/<slug>.json` record.
+  `bevy-upgrade-<slug>` notifier instances, the
+  `BEVY_UPGRADE_STATE_DIR/<slug>.json` record, and the holder `production_slug`
+  of each held design role in `~/.local/state/guilds/roles/` (`docs/as-built/guilds.md`):
+  `rename.py` calls no `roles.py` verb.
 
 ## Why
 

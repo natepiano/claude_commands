@@ -1,6 +1,7 @@
 """Exercise durable design identity with local stores and a recording mesh transport."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -21,6 +22,7 @@ from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import codex_mesh  # noqa: E402
 from scripts.guilds import astra_work, daily_read, roles, tips  # noqa: E402
 from scripts.guilds.roles import resolve_holder as resolve_current_holder  # noqa: E402
+from scripts.guilds.roles import release_servers as release_design_servers  # noqa: E402
 from scripts.message import sessions  # noqa: E402
 from scripts.production import production_tree  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
@@ -551,6 +553,187 @@ class DurableRolesTests(unittest.TestCase):
                                     str(self.root / "new-checkout"))
         self.assertEqual(roles.read_design(design.placement.design_id).holder, design.holder)
         self.assertTrue(roles.rename_failures("demo", "design-unit", str(self.repository)))
+
+    def test_legacy_adoption_requires_matching_thread_launch_evidence(self) -> None:
+        holder = roles.UnitHolder("demo", "design-unit")
+        for evidence in ("matching", "missing", "different-model", "different-effort", "other-thread"):
+            with self.subTest(evidence=evidence):
+                document = evidence + ".md"
+                _ = (self.repository / document).write_text("# Design\n")
+                source = self.root / ("legacy-" + evidence)
+                source.mkdir()
+                name, thread = "legacy-" + evidence, "legacy-thread-" + evidence
+                _ = (source / "mesh_roster.json").write_text(json.dumps({name: {
+                    "thread_id": thread, "status": "paused", "paused_from": "done", "cwd": str(self.repository)}}))
+                _ = (source / "mesh_server.json").write_text(json.dumps({"port": 32100, "pid": os.getpid(),
+                    "codex_home": str(self.root / "codex-home")}))
+                if evidence != "missing":
+                    launch_thread = "another-thread" if evidence == "other-thread" else thread
+                    model = "gpt-other" if evidence == "different-model" else "gpt-fixture"
+                    effort = "low" if evidence == "different-effort" else "xhigh"
+                    _ = (source / "impl_worker_design.json").write_text(json.dumps({
+                        "name": name, "slot": "design", "family": "codex", "model": model, "worker_id": launch_thread}))
+                    phase = source / "phases/3"
+                    phase.mkdir(parents=True)
+                    _ = (phase / "impl_agent_design").write_text(
+                        "task=impl\nfamily=codex\nagent=" + model + "\neffort=" + effort + "\n")
+                    _ = (phase / "impl_agent_design.log").write_text(
+                        "[2026-10-21T12:00:00Z] mesh: " + name + " thread " + launch_thread + "\n")
+                placement = self.authority("reserve", {"repository_id": "fixture-repo", "document": document,
+                    "host": "natedev", "request_id": "inventory-" + evidence})
+                _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": document,
+                    "host": "natedev", "source": {"mesh": str(source), "name": name, "thread_id": thread,
+                    "holder": {"kind": "UnitHolder", "production_slug": "demo", "unit_name": "design-unit"}}})
+                _ = (self.run_a / "phases/1/files").write_text(document + "\n")
+                binding = roles.DesignBoundToPhase(str(self.run_a), "1", str(self.repository), (document,))
+                methods: list[str] = []
+
+                def request(method: str, params: object, **options: object) -> dict[str, object]:
+                    del params, options
+                    methods.append(method)
+                    if method == "thread/read":
+                        return {"result": {"thread": {"id": thread, "status": {"type": "idle"}, "turns": []}}}
+                    if method == "thread/queue/list":
+                        return {"result": {"data": []}}
+                    if method == "thread/unsubscribe":
+                        return {"result": {"status": "notLoaded"}}
+                    raise AssertionError("unexpected adoption request: " + method)
+
+                client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
+                client.port = 32100
+                with patch.object(codex_mesh, "Client", return_value=client), \
+                        patch.object(client, "call", side_effect=request), patch.object(roles, "confirm_adoption"):
+                    if evidence == "matching":
+                        adopted = roles.adopt("fixture-repo", document, "designer", holder, "design",
+                            source_mesh=str(source), name=name, thread_id=thread, adoption_id="adopt-" + evidence,
+                            binding=binding)
+                        destination = roles.mesh_directory(adopted.placement.design_id)
+                        roster = cast(dict[str, dict[str, object]], json.loads((destination / "mesh_roster.json").read_text()))
+                        self.assertEqual(self.instance(adopted, "designer").lifecycle, roles.RoleOpen(thread))
+                        self.assertEqual(adopted.placement.design_id, placement["design_id"])
+                        self.assertEqual(roster[name]["thread_id"], thread)
+                        self.assertEqual((roster[name]["model"], roster[name]["effort"]), ("gpt-fixture", "xhigh"))
+                        self.assertEqual(roster[name]["status"], "done")
+                        self.assertNotIn("paused_from", roster[name])
+                        self.assertIn("thread/unsubscribe", methods)
+                    else:
+                        with self.assertRaisesRegex(roles.RoleRefused, "^AdoptionRequired:"):
+                            _ = roles.adopt("fixture-repo", document, "designer", holder, "design",
+                                source_mesh=str(source), name=name, thread_id=thread, adoption_id="adopt-" + evidence,
+                                binding=binding)
+                        self.assertNotIn("thread/unsubscribe", methods)
+                        self.assertFalse((roles.design_directory(str(placement["design_id"])) / "design.json").exists())
+        self.assertEqual(self.launches, [])
+
+    def test_refused_adoption_leaves_the_authority_without_a_transfer_claim(self) -> None:
+        holder = roles.UnitHolder("demo", "design-unit")
+        for reason in ("unbound-designer", "missing-model-evidence"):
+            with self.subTest(reason=reason):
+                document = reason + ".md"
+                _ = (self.repository / document).write_text("# Design\n")
+                source = self.root / reason
+                source.mkdir()
+                name, thread = reason + "-seat", reason + "-thread"
+                entry: dict[str, object] = {"thread_id": thread, "status": "done"}
+                if reason == "unbound-designer":
+                    entry.update({"model": "gpt-fixture", "effort": "xhigh"})
+                roster = source / "mesh_roster.json"
+                _ = roster.write_text(json.dumps({name: entry}))
+                _ = (source / "mesh_server.json").write_text(json.dumps({"port": 32100, "pid": os.getpid(),
+                    "codex_home": str(self.root / "codex-home")}))
+                _ = self.authority("reserve", {"repository_id": "fixture-repo", "document": document,
+                    "host": "natedev", "request_id": "inventory-" + reason})
+                _ = self.authority("legacy", {"repository_id": "fixture-repo", "document": document,
+                    "host": "natedev", "source": {"mesh": str(source), "name": name, "thread_id": thread,
+                    "holder": {"kind": "UnitHolder", "production_slug": "demo", "unit_name": "design-unit"}}})
+                _ = (self.run_a / "phases/1/files").write_text(document + "\n")
+                binding = (roles.DesignUnbound() if reason == "unbound-designer" else
+                    roles.DesignBoundToPhase(str(self.run_a), "1", str(self.repository), (document,)))
+                before = roster.read_bytes()
+                client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
+                with patch.object(codex_mesh, "Client", return_value=client), \
+                        patch.object(client, "call", return_value={"result": {"thread": {"id": thread, "status": {"type": "idle"}}}}), \
+                        self.assertRaises(roles.RoleRefused):
+                    _ = roles.adopt("fixture-repo", document, "designer", holder, "design", source_mesh=str(source),
+                        name=name, thread_id=thread, adoption_id="refused-" + reason, binding=binding)
+                authority = self.authority("lookup", {"repository_id": "fixture-repo", "document": document,
+                    "host": "natedev"})
+                self.assertNotEqual(authority.get("adoption_state"), "AdoptionReserved")
+                self.assertNotIn("adoption_id", authority)
+                self.assertEqual(roster.read_bytes(), before)
+                self.assertFalse((source / "transfer.json").exists())
+                with self.assertRaisesRegex(roles.RoleRefused, "^AdoptionRequired:"):
+                    _ = roles.open_role("fixture-repo", document, "reviewer", holder, "design")
+        self.assertEqual(self.launches, [])
+
+    def test_last_role_end_stops_the_server_and_preserves_design_evidence(self) -> None:
+        design = self.open_designer()
+        design = roles.open_role("fixture-repo", "design.md", "reviewer", design.holder, "design",
+                                 binding=self.binding(self.run_a))
+        design_id = design.placement.design_id
+        directory, mesh = roles.design_directory(design_id), roles.mesh_directory(design_id)
+        _ = self.resume(design, "reviewer")
+        message = roles.queue_message(design_id, "reviewer", "fixture", "Keep this evidence after end.")
+        evidence = {path: path.read_bytes() for folder in ("prompts", "replies", "pending")
+                    for path in (directory / folder).rglob("*") if path.is_file()}
+        authority_before = self.authority("lookup", {"repository_id": "fixture-repo", "document": "design.md",
+                                                  "host": "natedev"})
+        process = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def clean_process() -> None:
+            if process.poll() is None:
+                process.kill()
+            _ = process.wait(timeout=5)
+            if process.stdin is not None:
+                process.stdin.close()
+
+        self.addCleanup(clean_process)
+        server = mesh / "mesh_server.json"
+        _ = server.write_text(json.dumps({"pid": process.pid, "port": 32100,
+                                         "codex_home": str(self.root / "codex-home")}))
+        methods: list[str] = []
+
+        def request(method: str, params: dict[str, object], **options: object) -> dict[str, object]:
+            del options
+            methods.append(method)
+            if method == "thread/queue/list":
+                return {"result": {"data": []}}
+            if method == "thread/read":
+                return {"result": {"thread": {"id": params["threadId"], "status": {"type": "idle"}, "turns": []}}}
+            if method == "thread/unsubscribe":
+                return {"result": {"status": "notLoaded"}}
+            raise AssertionError("unexpected end request: " + method)
+
+        def end_command(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            self.assertEqual(command[2], "end")
+            result = codex_mesh.command_end(argparse.Namespace(session_dir=str(mesh), to=command[-1]))
+            return subprocess.CompletedProcess(command, result, "", "")
+
+        client = cast(codex_mesh.Client, MagicMock(spec=codex_mesh.Client))
+        with patch.object(subprocess, "run", side_effect=end_command), \
+                patch.object(codex_mesh, "Client", return_value=client), patch.object(client, "call", side_effect=request), \
+                patch.object(roles, "release_servers", side_effect=release_design_servers), \
+                patch.object(codex_mesh, "REAP_WAIT_SECS", 0.05), patch.object(codex_mesh, "REAP_POLL_SECS", 0.001):
+            first = roles.end(design_id + "/designer")
+            self.assertIsInstance(self.instance(first, "designer").lifecycle, roles.RoleEnded)
+            self.assertIsInstance(self.instance(first, "reviewer").lifecycle, roles.RoleOpen)
+            self.assertIsNone(process.poll())
+            self.assertTrue(server.exists())
+            self.assertNotIn("thread/unsubscribe", methods)
+            ended = roles.end(design_id + "/reviewer")
+            _ = process.wait(timeout=2)
+        self.assertTrue(all(isinstance(instance.lifecycle, roles.RoleEnded) for instance in ended.roles))
+        self.assertFalse(server.exists())
+        self.assertIn("thread/unsubscribe", methods)
+        roster = cast(dict[str, dict[str, object]], json.loads((mesh / "mesh_roster.json").read_text()))
+        self.assertEqual({entry["thread_id"] for entry in roster.values()}, {"thread-designer", "thread-reviewer"})
+        self.assertTrue(all(entry["status"] == "ended" for entry in roster.values()))
+        self.assertEqual({path: path.read_bytes() for path in evidence}, evidence)
+        self.assertEqual(roles.pending_messages(design_id, "reviewer"), (message,))
+        self.assertEqual(self.authority("lookup", {"repository_id": "fixture-repo", "document": "design.md",
+                                                 "host": "natedev"}), authority_before)
 
     def test_adoption_preserves_thread_alias_and_pending_text_and_is_retryable(self) -> None:
         source = self.root / "old-run"
