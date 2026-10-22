@@ -918,8 +918,12 @@ Do not dispatch until this contract reaches one of its four persisted states.
    the shared `/sync board` entry point once, under <BerthDecisions/>:
 
    ```sh
-   cargo-berth board --json
+   set -o pipefail; cargo-berth board --json | jq -r .status
    ```
+
+   Only the status is read, so the board's long JSON is never saved as tool
+   output, and nothing needs deleting. Empty output or a non-zero exit is
+   `ledger_unreadable`.
 
    | Result | Action |
    | --- | --- |

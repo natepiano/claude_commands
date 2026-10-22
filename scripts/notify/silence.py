@@ -4,7 +4,7 @@
 While silence is on, pushover.py keeps each push here instead of posting it. A priority 2
 (blocked) push always goes out: power and UPS alerts are safety. `off` ends silence and posts
 the kept pushes, oldest first, as they would have gone out, and prints how many. `on` with no
-end lasts until `off`; --until (natedev local time, America/New_York) or --for (a span: 1h,
+end lasts until `off`; --until (a time in the user's zone, user_zone.py) or --for (a span: 1h,
 45min, 1h30min) makes a transient systemd user timer that runs `off` then. `on` again replaces
 the end. If the end passes without the timer (natedev was off), the next push or silence.py call
 ends silence as `off` does.
@@ -303,7 +303,7 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     commands = parser.add_subparsers(dest="command", required=True)
     start = commands.add_parser("on", help="keep pushes from now")
     end = start.add_mutually_exclusive_group()
-    _ = end.add_argument("--until", help='natedev local time: "YYYY-MM-DD HH:MM"')
+    _ = end.add_argument("--until", help='a time in the user\'s zone: "YYYY-MM-DD HH:MM"')
     _ = end.add_argument("--for", dest="span", help="a span: 1h, 45min, 1h30min")
     _ = commands.add_parser("off", help="end silence and post the kept pushes")
     _ = commands.add_parser("status", help="say whether silence is on")

@@ -8,16 +8,16 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
-    # Stall-watch examples use unit names from the build-followups production doc, and requests as
-    # stall_watch.prompt_request words them from a Claude Code permission prompt.
-    PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{unit} stopped until you answer",
+    # Stall-watch examples use unit names from production docs, and requests as stall_watch.prompt_request
+    # words them from a pending tool call and its permission prompt (the typical one is the 2026-10-21 push).
+    PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{unit} needs your answer",
         ActionTemplate("On {machine}, open the {unit} herdr tab and answer its prompt"),
         "The Claude coding session {unit} on {machine} wants to {request}. It needs your permission first. "
         + "It has waited since {since} and does no work until you answer.\n\n"
         + "Yes: the session does that and goes on with its work.\n\n"
         + "No: the session does not do that, and asks you what to do instead.",
-        (PushExample("typical", {"unit": "enh-showrunner", "machine": "natedev", "since": "21:40 EDT",
-            "request": "run a shell command to read part of a saved output"}),
+        (PushExample("typical", {"unit": "cargo-liner-style-types", "machine": "natedev", "since": "10:54 EDT",
+            "request": "delete its saved tool output b1e4yc8b9.txt, which is outside its allowed folders"}),
          PushExample("edit", {"unit": "herdr-panes", "machine": "natedev", "since": "06:05 EDT",
             "request": "edit panes.py"})),
         purpose="A session waits for you to answer its permission prompt.",
@@ -265,6 +265,17 @@ ENTRIES = (
          PushExample("from_session", {"sender": "natedev", "account": "codex1", "machine": "natedev",
             "credits": "6,370", "refill": "Thu 10-29 07:00 EDT", "next_reset": "Sat 10-24 16:40 EDT"})),
         purpose="An account now spends paid credits. You can turn this off."),
+    # Paid credits with a queued workers move (agreed with accounts-unit 2026-10-21): workers never go to
+    # Claude; they wait for the queued move. Same title, action, need and sender rule as quota.paid_credits.
+    PushText("quota.paid_credits_queued", "{sender}", "decision", "{sender}: {account} now uses paid credits",
+        ActionTemplate("To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}"),
+        "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
+        + "Leave on (recommended): workers spend these credits until your queued move runs. "
+        + "If the credits run out first, workers wait.\n\n"
+        + "Turn off: workers stop and wait for your queued move.",
+        (PushExample("typical", {"sender": "quota_alert", "account": "codex2", "machine": "natedev",
+            "credits": "25,345", "refill": "Tue 10-27 02:33 AST"}),),
+        purpose="An account now spends paid credits, and you queued a workers move."),
     # A session waits for a go (user approved 2026-10-21): sent with send.py --text-id session.needs_go.
     # send.py fills sender from the session's own name. Examples: the trunk push the user approved, and the
     # herdr-panes worktree left after herdr-unit took over herdr work (2026-10-18).

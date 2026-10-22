@@ -378,7 +378,7 @@ ETA_TIME = re.compile(r"\b(\d{1,2}:\d{2})(\+\d+)?(?: ([A-Z]{2,4})\b)?")
 # Zone words a unit writes after an ETA. An unknown word leaves the time as written.
 ETA_ZONES: dict[str, tzinfo] = {
     **{word: timezone(timedelta(hours=hours)) for word, hours in (
-        ("UTC", 0), ("GMT", 0), ("EDT", -4), ("EST", -5), ("CDT", -5), ("CST", -6),
+        ("UTC", 0), ("GMT", 0), ("ADT", -3), ("AST", -4), ("EDT", -4), ("EST", -5), ("CDT", -5), ("CST", -6),
         ("MDT", -6), ("MST", -7), ("PDT", -7), ("PST", -8))},
     **{word: ZoneInfo(name) for word, name in (
         ("ET", "America/New_York"), ("CT", "America/Chicago"),

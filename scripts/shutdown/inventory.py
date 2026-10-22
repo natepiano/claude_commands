@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
+import detection_rules
 import herdr
 import sessions
 from sessions import process_start as _process_start
@@ -1641,6 +1642,7 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
         units = _snapshot_units(timers)
         native, presentation = _snapshot_native_hosts()
         herdr.save_shared_layout(set(presentation))
+        _ = detection_rules.refresh(set(presentation), herdr.reload_agent_rules)
         desktops = _snapshot_desktops(refresh=False)
         processes = reader.paths()
         # Socket ownership also distinguishes a replacement with the same session name.
