@@ -23,6 +23,8 @@ COMMAND = f'statusline="{Path(__file__).parent}"; . "$statusline/statusline.sh"'
 USER_ZONE = ZoneInfo("America/New_York")
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 SHELLS = ("/bin/sh", "zsh") if shutil.which("zsh") else ("/bin/sh",)
+# Where NixOS's glibc finds zone files; Claude Code's environment carries it.
+ZONE_FILES = {"TZDIR": os.environ["TZDIR"]} if "TZDIR" in os.environ else {}
 
 
 def status_lines(*inputs: object, labels: Path | None = None, account: str = "claude1",
@@ -46,7 +48,7 @@ def status_lines(*inputs: object, labels: Path | None = None, account: str = "cl
             ["jq", "-r", "--arg", "pwd", "/tmp", "--arg", "account", account,
              "--arg", "showrunners", showrunners, *stored, *parent, *configured, "-f", str(PROGRAM)],
             input=stdin, capture_output=True, text=True, check=True,
-            env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], **marks},
+            env={"PATH": os.environ["PATH"], "HOME": os.environ["HOME"], "TZ": USER_ZONE.key, **ZONE_FILES, **marks},
         )
     return result.stdout.splitlines()
 
@@ -397,6 +399,19 @@ class RoleTests(unittest.TestCase):
             check=True, env=env, cwd=self.home,
         )
         return result.stdout.splitlines()
+
+    def test_reset_times_take_the_zone_from_the_setting_and_its_label(self) -> None:
+        reset = int(datetime(2026, 12, 3, 12, tzinfo=timezone.utc).timestamp())
+        payload = limits({"used_percentage": 95, "resets_at": reset}, {"used_percentage": 60})
+        conf = self.home / "user_zone.conf"
+        _ = conf.write_text("# the user's zone\nzone=America/Curacao\n", encoding="utf-8")
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                line = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf))[1]
+                self.assertIn("5-hour \x1b[91m5% left\x1b[0m until 08:00 AST", line)
+                pinned = self.command_lines(payload, shell=shell, USER_ZONE_CONF=str(conf),
+                                            USER_ZONE="Europe/Paris")[1]
+                self.assertIn("until 13:00 CET", pinned)
 
     def showrunner_record(self, pid: int, name: str | None, *, session_id: str = "parent-id") -> None:
         directory = self.home / ".claude/sessions"
