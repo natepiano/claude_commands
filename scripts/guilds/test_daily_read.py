@@ -59,7 +59,7 @@ class DailyReadTests(unittest.TestCase):
     def event(self, kind: str, offset: float, *, run_id: str = "run-one", instance: str = "phase-one",
               phase: str = "1", event_id: str = "", **fields: object) -> dict[str, object]:
         return {
-            "spine_version": 1, "schema_version": 1, "event_type": kind,
+            "spine_version": 1, "schema_version": 1, "event_type": kind, "skill": "plan-delegate",
             "event_id": event_id or f"{run_id}-{instance}-{kind}-{offset}-"
             + str(fields.get("pass_instance_id", fields.get("activity_instance_id", ""))),
             "timestamp_epoch": NOON + offset,
@@ -205,6 +205,49 @@ class DailyReadTests(unittest.TestCase):
         self.assertEqual(self.only_phase(report)["members"], ["durable-designer"])
         self.assertEqual(self.only_phase(report)["repair_rounds"], 4)
         self.assertEqual(self.rows(report, "assignments")[0]["source"], str(path))
+
+    def test_roles_state_override_supplies_saved_assignments_without_daily_override(self) -> None:
+        directory = self.save_run(self.phase_events())
+        prompt = self.assignment("astra-designer", directory, durable=True, member="held-designer")
+        del self.environment["GUILD_DAILY_ROLES_ROOT"]
+        self.environment["GUILD_ROLES_STATE"] = str(self.roles)
+        report = self.report("designers")
+        self.assertEqual([row["member"] for row in self.rows(report, "assignments")], ["held-designer"])
+        self.assertEqual(self.rows(report, "assignments")[0]["source"], str(prompt))
+        self.assertEqual(self.rows(report, "assignments")[0]["outcome"], "OutputRecorded")
+
+    def test_durable_header_requires_absolute_document_and_phase_run_directory(self) -> None:
+        directory = self.save_run(self.phase_events())
+        prompt = self.assignment("astra-designer", directory, durable=True)
+        original = prompt.read_text()
+        for absolute, relative in ((str(self.root / "design.md"), "design.md"),
+                                   (str(directory), "relative-run")):
+            with self.subTest(path=relative):
+                _ = prompt.write_text(original.replace(absolute, relative))
+                report = self.report("designers")
+                self.assertEqual(self.rows(report, "assignments"), [])
+                self.assertIn(("HeaderInvalid", str(prompt)),
+                              [(row["state"], row["source"]) for row in self.rows(report, "problems")])
+
+    def test_old_headerless_review_prompt_is_skipped_without_a_file_problem(self) -> None:
+        directory = self.save_run(self.phase_events())
+        _ = self.assignment("astra-reviewer", directory, member="current-review")
+        old = self.write(self.reviews / "old-review/prompt.md", "# Legacy review\n")
+        old_stamp = datetime.fromisoformat(SINCE).timestamp() - 1
+        os.utime(old, (old_stamp, old_stamp))
+        report = self.report("reviewers")
+        self.assertNotIn(str(old), json.dumps(report))
+        self.assertEqual(len(self.rows(report, "assignments")), 1)
+        self.assertEqual(self.rows(report, "problems"), [])
+
+    def test_current_headerless_review_prompt_names_missing_membership(self) -> None:
+        current = self.write(self.reviews / "current-review/prompt.md", "# Legacy review\n")
+        os.utime(current, (NOON, NOON))
+        report = self.report("reviewers")
+        self.assertIn(("MembershipNotRecorded", str(current)),
+                      [(row["state"], row["source"]) for row in self.rows(report, "problems")])
+        self.assertEqual(self.rows(report, "assignments"), [])
+        self.assertEqual(self.mapping(report["coverage"])["partial"], True)
 
     def test_invalid_and_legacy_headers_are_problems_without_invented_membership(self) -> None:
         directory = self.save_run(self.phase_events())
@@ -499,7 +542,6 @@ class DailyReadTests(unittest.TestCase):
     def test_absent_hierarchy_writers_name_missing_waits_and_receipts(self) -> None:
         _ = self.save_run(self.phase_events())
         stray_events = self.phase_events(run_id="stray-production", instance="stray-phase", rounds=4)
-        stray_events[0]["skill"] = "/showrunner:produce"
         stray = self.productions / "outstanding/stray.history.jsonl"
         self.save_events(stray, stray_events)
         self.save_events(self.productions / "waits.jsonl", [self.event(
@@ -522,28 +564,28 @@ class DailyReadTests(unittest.TestCase):
                 self.assertNotIn(str(stray), json.dumps(report))
                 self.assertNotIn("null", json.dumps(report))
 
-    def test_showrunner_records_are_selected_from_production_history(self) -> None:
+    def test_showrunner_history_has_no_writer_and_does_not_use_unit_phases(self) -> None:
         _ = self.save_run(self.phase_events(rounds=4))
-        events = self.phase_events(run_id="production-run", instance="production-phase", rounds=1)
-        events[0]["skill"] = "/showrunner:produce"
-        _ = self.save_run(events, run_id="production-run", instance="production-phase")
-        phase = self.only_phase(self.report("showrunners"))
-        self.assertEqual(phase["run_id"], "production-run")
-        self.assertEqual(phase["phase_instance_id"], "production-phase")
-        self.assertEqual(phase["repair_rounds"], 1)
+        report = self.report("showrunners")
+        self.assertEqual(self.rows(report, "phases"), [])
+        self.assertEqual(self.rows(report, "repeats"), [])
+        problems = self.rows(report, "problems")
+        self.assertTrue(any(row["state"] == "HistoryNotRecorded"
+                            and row["source"] == "WriterNotRecorded" for row in problems))
+        self.assertTrue(any(row["state"] == "MembershipNotRecorded" for row in problems))
+        self.assertEqual(self.mapping(report["coverage"])["partial"], True)
 
     def test_units_report_excludes_repeats_from_showrunner_runs(self) -> None:
         events = self.phase_events(run_id="production-run", instance="production-phase")
-        events[0]["skill"] = "/showrunner:produce"
         events.extend([
             self.event("finding_opened", 5, run_id="production-run", instance="production-phase",
                        event_id="production-first", finding_id="F001", title="Retain evidence", round=0),
             self.event("finding_opened", 10, run_id="production-run", instance="production-phase",
                        event_id="production-repeat", finding_id="F002", title="Retain evidence", round=1),
         ])
+        for event in events:
+            event["skill"] = "unrelated-production"
         _ = self.save_run(events, run_id="production-run", instance="production-phase")
-        showrunners = self.report("showrunners")
-        self.assertEqual([row["state"] for row in self.rows(showrunners, "repeats")], ["RepeatedTitle"])
         units = self.report("units")
         self.assertEqual(self.rows(units, "phases"), [])
         self.assertEqual(self.rows(units, "repeats"), [])

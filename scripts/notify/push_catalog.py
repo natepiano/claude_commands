@@ -265,6 +265,17 @@ ENTRIES = (
          PushExample("from_session", {"sender": "natedev", "account": "codex1", "machine": "natedev",
             "credits": "6,370", "refill": "Thu 10-29 07:00 EDT", "next_reset": "Sat 10-24 16:40 EDT"})),
         purpose="An account now spends paid credits. You can turn this off."),
+    # Paid credits with a queued workers move (agreed with accounts-unit 2026-10-21): workers never go to
+    # Claude; they wait for the queued move. Same title, action, need and sender rule as quota.paid_credits.
+    PushText("quota.paid_credits_queued", "{sender}", "decision", "{sender}: {account} now uses paid credits",
+        ActionTemplate("To stop it, set use_credits: off in ~/rust/hanadocs/agents/{account}.md on {machine}"),
+        "{account} has {credits} paid credits left. Its plan refills {refill}.\n\n"
+        + "Leave on (recommended): workers spend these credits until your queued move runs. "
+        + "If the credits run out first, workers wait.\n\n"
+        + "Turn off: workers stop and wait for your queued move.",
+        (PushExample("typical", {"sender": "quota_alert", "account": "codex2", "machine": "natedev",
+            "credits": "25,345", "refill": "Tue 10-27 02:33 AST"}),),
+        purpose="An account now spends paid credits, and you queued a workers move."),
     # A session waits for a go (user approved 2026-10-21): sent with send.py --text-id session.needs_go.
     # send.py fills sender from the session's own name. Examples: the trunk push the user approved, and the
     # herdr-panes worktree left after herdr-unit took over herdr work (2026-10-18).

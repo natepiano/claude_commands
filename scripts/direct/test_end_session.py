@@ -105,12 +105,13 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 3)
-        self.assertIn("remove_workers.py --session-dir", calls[0])
-        self.assertIn("codex_mesh.py stop --session-dir", calls[1])
-        self.assertIn(str(self.session_dir), calls[1])
-        self.assertIn("codex_mesh.py sweep --root", calls[2])
-        self.assertIn(f"{self.root} --stop", calls[2])
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(calls[0].endswith(f"guilds/roles.py unbind-run {self.session_dir}"))
+        self.assertIn("remove_workers.py --session-dir", calls[1])
+        self.assertIn("codex_mesh.py stop --session-dir", calls[2])
+        self.assertIn(str(self.session_dir), calls[2])
+        self.assertIn("codex_mesh.py sweep --root", calls[3])
+        self.assertIn(f"{self.root} --stop", calls[3])
         self.assertFalse(self.marker.exists())
 
     def make_run(self, name: str, director: str) -> Path:
@@ -135,7 +136,12 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(calls[0].split()[1:], ["--session-dir", str(marked), "--session-dir", str(side)])
+        unbinds = [line for line in calls if "guilds/roles.py unbind-run" in line]
+        self.assertEqual([line.split()[-1] for line in unbinds], [str(marked), str(side)])
+        self.assertTrue(all(calls.index(line) < next(index for index, call in enumerate(calls)
+                                                    if "remove_workers.py" in call) for line in unbinds))
+        removal = next(line for line in calls if "remove_workers.py" in line)
+        self.assertEqual(removal.split()[1:], ["--session-dir", str(marked), "--session-dir", str(side)])
         stops = [line.split()[-1] for line in calls if "codex_mesh.py stop" in line]
         self.assertEqual(stops, [str(marked), str(side)])
         sweeps = [line for line in calls if "codex_mesh.py sweep" in line]
@@ -164,7 +170,11 @@ class EndSessionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("No active unit run marker", result.stdout)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(calls[0].split()[1:], ["--session-dir", str(side)])
+        unbind = next(line for line in calls if "roles.py unbind-run" in line)
+        removal = next(line for line in calls if "remove_workers.py" in line)
+        self.assertLess(calls.index(unbind), calls.index(removal))
+        self.assertEqual(unbind.split()[-1], str(side))
+        self.assertEqual(removal.split()[1:], ["--session-dir", str(side)])
         self.assertNotIn(str(other), "\n".join(calls))
         self.assertFalse((side / "verify_cache").exists())
         self.assertTrue((other / "verify_cache").is_dir())

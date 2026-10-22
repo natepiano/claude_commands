@@ -439,18 +439,18 @@ class RestartTests(ShutdownTestCase):
                 # Shell parsing preserves every original argument, including spaces.
                 self.assertIn(shlex.join(expected), work_line)
                 # Seats with no readable launcher get every launcher argument, ready to run as pasted.
-                idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
-                self.assertTrue(idle_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "direct" / "review.sh"), "--to", "review", str(run), owner["cwd"],
-                    str(run / "review.resume-prompt.md"), "review", "resume after a move", "resuming after a move"])))
+                # An idle seat gets no command: it resumes with --to at the next dispatch, and a pass now needs an open phase.
+                self.assertIn("review (review, idle): paused on its thread; nothing to run now. "
+                              + "Your next dispatch with --to review resumes it.", lines)
                 unread_line = next(line for line in lines if line.startswith("test (test, was working):"))
                 self.assertTrue(unread_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
+                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
                     str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
-                repaired_line = next(line for line in lines if line.startswith("project-impl (fix, idle):"))
-                self.assertTrue(repaired_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
-                    str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"])))
+                self.assertIn("project-impl (fix, idle): paused on its thread; nothing to run now. "
+                              + "Your next dispatch with --to project-impl resumes it.", lines)
+                self.assertEqual(restart._resume_worker_command(seats[3], owner["cwd"]), shlex.join([  # pyright: ignore[reportPrivateUsage]
+                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
+                    str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"]))
                 self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)
                 self.assertNotIn(old_prompt, text)
@@ -471,7 +471,7 @@ class RestartTests(ShutdownTestCase):
         sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0][sends[0].index("--to") + 1], "session:" + owner["session_id"])
-        self.assertIn("implement.sh --to impl", sends[0][sends[0].index("--text") + 1])
+        self.assertIn("Your next dispatch with --to impl resumes it.", sends[0][sends[0].index("--text") + 1])
 
     def test_move_on_the_source_account_receives_no_worker_resume_message(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)

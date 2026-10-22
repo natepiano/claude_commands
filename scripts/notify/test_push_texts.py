@@ -201,6 +201,19 @@ class PushTextTests(unittest.TestCase):
                          + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
                          + "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.")
 
+    def test_paid_credits_queued_keeps_the_agreed_lines(self) -> None:
+        entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits_queued")
+        plain = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits")
+        self.assertEqual((entry.title, entry.action, entry.need, entry.sender), (plain.title, plain.action, plain.need, plain.sender))
+        push = push_texts.render_entry(entry, entry.examples[0].values)
+        self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
+        self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
+                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
+                         + "Leave on (recommended): workers spend these credits until your queued move runs. "
+                         + "If the credits run out first, workers wait.\n\n"
+                         + "Turn off: workers stop and wait for your queued move.")
+        self.assertNotIn("next_reset", entry.body)
+
     def test_needs_go_keeps_the_user_approved_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "session.needs_go")
         self.assertEqual(entry.need, "decision")

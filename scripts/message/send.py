@@ -58,8 +58,9 @@ message text as one JSON line in STATE/log.jsonl:
   REFUSED: why   rejected before delivery; not kept              exit 2
   HELD: not sent, failed review; revise and resend, no fallback     exit 4
         also a free-text push that reports an auto-mode refusal or paid credit use, or asks
-        the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits or
-        session.needs_go call to send instead
+        the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits
+        (quota.paid_credits_queued when a workers move is queued) or session.needs_go call
+        to send instead
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -121,9 +122,14 @@ PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
                      + ' --value "refill=<when its plan refills>" --value "next_reset=<the next Codex reset>"')
+PAID_CREDITS_QUEUED_TEXT = "quota.paid_credits_queued"
+PAID_CREDITS_QUEUED_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user'
+                            + ' --text-id quota.paid_credits_queued --value account=<account> --value machine=<machine>'
+                            + ' --value credits=<paid credits left> --value "refill=<when its plan refills>"')
 PAID_CREDITS_REPORT = re.compile(r"\bpaid[\s-]+credits?\b|\buse_credits\b", re.IGNORECASE)
 PAID_CREDITS_HELD = ("not sent: this push reports paid credit use. Send it with the quota.paid_credits template: "
-                     + PAID_CREDITS_CALL)
+                     + PAID_CREDITS_CALL + ". When a workers move is queued, send quota.paid_credits_queued: "
+                     + PAID_CREDITS_QUEUED_CALL)
 NEEDS_GO_TEXT = "session.needs_go"
 NEEDS_GO_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id session.needs_go'
                  + ' --value session=<session> --value machine=<machine> --value "go=<the Go: line to type>"'
@@ -137,6 +143,8 @@ SESSION_TEMPLATES = {
     AUTO_MODE_TEXT: "auto mode refused a command and the session waits for the user. " + AUTO_MODE_CALL,
     PAID_CREDITS_TEXT: ("an account now spends paid credits; a script with no Claude session names itself with --from. "
                         + PAID_CREDITS_CALL),
+    PAID_CREDITS_QUEUED_TEXT: ("an account now spends paid credits and the user queued a workers move; workers wait for"
+                               + " the move, never go to Claude. " + PAID_CREDITS_QUEUED_CALL),
     NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
     "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
 }
@@ -1245,12 +1253,12 @@ def auto_mode_values(values: dict[str, str], sender: str) -> dict[str, str]:
             "does": values["does"], "waits": values["waits"], "rule_line": " The rule: " + rule if rule else ""}
 
 
-def paid_credits_values(values: dict[str, str], session: str, named: str | None) -> dict[str, str]:
-    """The quota.paid_credits values with the sender filled: this session's own name. A script with no
-    session record names itself with --value sender or --from (a remote send forwards both)."""
+def paid_credits_values(text_id: str, values: dict[str, str], session: str, named: str | None) -> dict[str, str]:
+    """The quota.paid_credits or quota.paid_credits_queued values with the sender filled: this session's own
+    name. A script with no session record names itself with --value sender or --from (a remote send forwards both)."""
     sender = session or values.get("sender", "") or named or ""
     if not sender.strip():
-        raise ValueError(PAID_CREDITS_TEXT + " needs a sender: send it from a Claude session, or name the script with --from")
+        raise ValueError(text_id + " needs a sender: send it from a Claude session, or name the script with --from")
     return values | {"sender": sender}
 
 
@@ -1356,8 +1364,8 @@ def parse(argv: list[str]) -> Options:
                 fill = auto_mode_values if text_id == AUTO_MODE_TEXT else needs_go_values
                 values = fill(values, own_session_name())
                 raw_values = [f"{key}={item}" for key, item in values.items()]
-            elif text_id == PAID_CREDITS_TEXT:
-                values = paid_credits_values(values, own_session_name(), optional_str(attr(args, "sender")))
+            elif text_id in (PAID_CREDITS_TEXT, PAID_CREDITS_QUEUED_TEXT):
+                values = paid_credits_values(text_id, values, own_session_name(), optional_str(attr(args, "sender")))
                 raw_values = [f"{key}={item}" for key, item in values.items()]
             rendered = push_texts.render(text_id, **values)
         except ValueError as error:
