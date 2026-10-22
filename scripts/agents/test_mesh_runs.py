@@ -250,6 +250,17 @@ class MeshRunsTests(unittest.TestCase):
         _ = self.supervise(self.record([sys.executable, "-c", "pass"], done=str(done)))
         self.assertEqual(self.pending()["messages"], ["Stage 2: go"])
 
+    def test_a_superseded_run_delivers_a_result_that_is_not_a_failure(self) -> None:
+        done = self.root / "done.txt"
+        _ = done.write_text("Stage 2: go", encoding="utf-8")
+        record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(76)"], done=str(done)))
+        message = cast(list[str], self.pending()["messages"])[0]
+        self.assertIn("Result: SUPERSEDED (exit 76)", message)
+        self.assertIn("nothing needs a repair", message)
+        self.assertNotIn("FAIL", message)
+        self.assertNotIn("Stage 2: go", message)
+        self.assertEqual(record.get("exit_code"), 76)
+
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
         script = "print('x' * 1_100_000)\nfor n in range(30): print(str(n) * 5_000)\nprint('last line')"
         _ = self.supervise(self.record([sys.executable, "-c", script]))

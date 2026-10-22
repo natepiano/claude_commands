@@ -876,6 +876,66 @@ if sys.argv[1] == "wait-local":
         # The first take, then the memory gate's give-back and take; the hold wait adds none.
         self.assertEqual((log.count("token cargo acquired"), log.count("token cargo released")), (2, 2), log)
 
+    def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
+        process = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root, env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        self.started_groups.add(process.pid)
+        return process
+
+    def wait_for_waiter(self, board: Path, process: subprocess.Popen[str]) -> None:
+        """Waits until the call's own file is in the board's token waiter list."""
+        waiters = board / "token_waiters"
+        waiters.mkdir(parents=True, exist_ok=True)
+
+        def listed() -> bool:
+            return any(path.name.endswith(f".{process.pid}") for path in waiters.iterdir())
+        wait_until(lambda: listed() or process.poll() is not None, waiters, processes=(process,))
+        self.assertTrue(listed(), "verify never waited for the token")
+
+    def test_a_newer_call_supersedes_an_older_call_still_waiting_for_the_token(self) -> None:
+        board = self.root / "board"
+        shared = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board)}
+        holder = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "peer", "TEST_BLOCK": "1"})
+        try:
+            self.wait_for_running(self.root / "running", holder)
+            older = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+            self.wait_for_waiter(board, older)
+            newer = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+            older_output, older_errors = older.communicate(timeout=300)
+            self.assertEqual(older.returncode, 76, older_output + older_errors)
+            self.assertIn("superseded by a newer check call", older_output)
+            self.assertIn("nothing needs a repair", older_output)
+            self.assertIsNone(newer.poll(), "the newer call must still wait for the peer's token")
+            _ = (self.root / "release").touch()
+            newer_output = newer.communicate(timeout=300)
+            self.assertEqual(newer.returncode, 0, newer_output)
+            holder_output = holder.communicate(timeout=300)
+            self.assertEqual(holder.returncode, 0, holder_output)
+        finally:
+            _ = (self.root / "release").touch()
+        superseded = [record for record in self.records() if f"-{older.pid}-" in cast(str, record["id"])]
+        self.assertEqual([(record["outcome"], record["status"]) for record in superseded], [("superseded", 76)])
+        self.assertEqual(list((board / "token_waiters").iterdir()), [])
+
+    def test_a_call_that_holds_the_token_runs_on_when_a_newer_call_starts(self) -> None:
+        board = self.root / "board"
+        shared = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board), "PLAN_DELEGATE_TEAM_ROLE": "impl"}
+        holder = self.start_check({**shared, "TEST_BLOCK": "1"})
+        try:
+            self.wait_for_running(self.root / "running", holder)
+            newer = self.start_check(shared)
+            self.wait_for_waiter(board, newer)
+            self.assertIsNone(holder.poll(), "the call that holds the token must run on")
+            _ = (self.root / "release").touch()
+            holder_output = holder.communicate(timeout=300)
+            self.assertEqual(holder.returncode, 0, holder_output)
+            newer_output = newer.communicate(timeout=300)
+            self.assertEqual(newer.returncode, 0, newer_output)
+        finally:
+            _ = (self.root / "release").touch()
+        self.assertEqual(sorted(cast(str, record["outcome"]) for record in self.records()), ["ran", "ran"])
+
     def test_a_long_token_wait_never_gives_up(self) -> None:
         # Each refused acquire moves the clock past the old 1800 s limit.
         home = self.root / "busy-home"

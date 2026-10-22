@@ -61,6 +61,12 @@ RESULT_TAIL_LINES = 20
 # is a Codex turn input, which Codex refuses over 1,048,576 characters.
 RESULT_LINE_CHARS = 2_000
 RESULT_TAIL_CHARS = 20_000
+# verify.sh's VERIFY_SUPERSEDED_STATUS: a newer call of the same verb from the same worker in the
+# same worktree replaced this one while it waited for the cargo token. It ran nothing, so it is
+# neither a pass nor a failure, and the newer call's result answers instead.
+SUPERSEDED_STATUS = 76
+SUPERSEDED_VERDICT = ("SUPERSEDED (exit 76): a newer call of the same verb replaced this one before it built. "
+                      + "Nothing failed and nothing needs a repair; read the newer call's result.")
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
@@ -282,7 +288,8 @@ def _tail(path: Path, count: int) -> list[str]:
 
 
 def result_text(record: RunRecord, exit_code: int) -> str:
-    verdict = "PASS (exit 0)" if exit_code == 0 else f"FAIL (exit {exit_code})"
+    verdict = ("PASS (exit 0)" if exit_code == 0 else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
+               else f"FAIL (exit {exit_code})")
     lines = [f"Run finished: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES)
     if tail:
@@ -323,9 +330,9 @@ def deliver(record: RunRecord, exit_code: int) -> str:
     Returns the delivery outcome the record keeps.
     """
     done_file = record["done_message_file"]
-    if done_file and exit_code != 0:
+    if done_file and exit_code not in (0, SUPERSEDED_STATUS):
         return f"nothing delivered: exit {exit_code} with a done message"
-    if done_file:
+    if done_file and exit_code == 0:
         try:
             text = Path(done_file).read_text(encoding="utf-8")
         except OSError as exc:
