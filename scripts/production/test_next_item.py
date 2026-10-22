@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Tests for next_item.py: the one item /next shows from the four lists, and moving an item to the end."""
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import tempfile
+import unittest
+from datetime import date, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, cast, final, override
+from unittest import mock
+
+import change_review
+import next_item
+from change_review import Visible
+from next_item import NextError, Queue
+
+# Importable once next_item has put scripts/lib and scripts/nightly_review on the path.
+import urgency
+from urgency import Entry, Urgency
+
+if TYPE_CHECKING:
+    from ..nightly_review import candidates
+else:
+    import candidates
+
+PRODUCTION = Path.home() / "worktrees/demo-trunk/docs/plans/demo-production.md"
+LEDGER = """\
+- 2026-10-05 rust/nateroids: Build CI tests without debug info [gain/week: 2.5 h red CI] — deferred
+- 2026-10-12 rust/hana: Run the GPU tests 8 at a time [gain/week: 38 min waiting] — proposed
+"""
+
+
+def at(day: int) -> datetime:
+    return datetime(2026, 10, day, 9, 0)
+
+
+def demo_slug(doc: Path) -> str:
+    del doc
+    return "demo"
+
+
+def run(*arguments: str) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = next_item.main(list(arguments))
+    return code, out.getvalue(), err.getvalue()
+
+
+@final
+class NextItemTests(unittest.TestCase):
+    root: Path = Path()
+    queues: dict[str, Queue] = {}
+
+    @override
+    def setUp(self) -> None:
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        with contextlib.ExitStack() as stack:
+            _ = cast(object, stack.enter_context(mock.patch.dict(
+                os.environ, {"NEXT_STATE_DIR": str(self.root / "next"), "NIGHTLY_REVIEW_NOTE": str(self.root / "note.md")})))
+            _ = cast(object, stack.enter_context(mock.patch.object(candidates, "ROOT", self.root)))
+            self.addCleanup(stack.pop_all().close)
+        self.queues = {
+            "change": Queue("change-natedev", [Entry("C1", "C1 Old change", since=at(1)),
+                                               Entry("C2", "C2 Later change", Urgency(urgency.LATER), since=at(2))]),
+            "proposal": Queue("proposal-demo", [Entry("P1", "P1 A proposal", since=at(3), value=(9.0,))]),
+            "efficiency": Queue("efficiency", []),
+            "question": Queue("question-demo", [Entry("Q1", "demo: Which port?", Urgency(urgency.BLOCKS), since=at(4)),
+                                                Entry("Q2", "demo: Newest question", since=at(5))]),
+        }
+
+    def read(self, kind: str, production: Path | None) -> Queue:
+        del production
+        if kind not in self.queues:
+            raise NextError(f"{kind}: not readable")
+        return self.queues[kind]
+
+    def patched(self) -> contextlib.AbstractContextManager[object]:
+        stack = contextlib.ExitStack()
+        _ = stack.enter_context(mock.patch.object(next_item, "read_queue", self.read))
+        _ = stack.enter_context(mock.patch.object(next_item, "slug_of", demo_slug))
+        return stack
+
+    def test_bare_next_shows_the_most_urgent_item_across_the_lists_and_keeps_it(self) -> None:
+        with self.patched():
+            self.assertEqual(run("show", "--production", str(PRODUCTION)), (0, "question\ndemo: Which port?\n", ""))
+            # A more urgent item arrives: the shown one stays until its answer.
+            self.queues["change"].entries.append(Entry("C3", "C3 Marked", urgency.mark(at(6)), since=at(6)))
+            self.assertEqual(run("show", "--production", str(PRODUCTION))[1], "question\ndemo: Which port?\n")
+            # Answered, it leaves its list: the user's mark goes first.
+            del self.queues["question"].entries[0]
+            self.assertEqual(run("show", "--production", str(PRODUCTION))[1], "change\nC3 Marked\n")
+
+    def test_oldest_and_newest_order_by_age_alone_or_within_a_kind(self) -> None:
+        with self.patched():
+            self.assertEqual(run("show", "--order", "oldest", "--production", str(PRODUCTION))[1], "change\nC1 Old change\n")
+            self.assertEqual(run("show", "--order", "newest", "--production", str(PRODUCTION))[1],
+                             "question\ndemo: Newest question\n")
+            self.assertEqual(run("show", "--kind", "change", "--order", "newest")[1], "change\nC2 Later change\n")
+            # The newest question stays current until its answer, also in the urgent order.
+            self.assertEqual(run("show", "--kind", "question")[1], "question\ndemo: Newest question\n")
+            del self.queues["question"].entries[1]
+            self.assertEqual(run("show", "--kind", "question")[1], "question\ndemo: Which port?\n")
+
+    def test_a_kind_shows_its_most_urgent_item_and_an_empty_list_says_so(self) -> None:
+        with self.patched():
+            self.assertEqual(run("show", "--kind", "change"), (0, "change\nC1 Old change\n", ""))
+            self.assertEqual(run("show", "--kind", "efficiency"), (0, "no efficiency is waiting for you\n", ""))
+
+    def test_a_list_that_cannot_be_read_is_left_out_with_one_line(self) -> None:
+        del self.queues["question"]
+        with self.patched():
+            self.assertEqual(run("show", "--production", str(PRODUCTION)),
+                             (0, "change\nC1 Old change\n", "next_item: question: not readable\n"))
+            self.assertEqual(run("show", "--kind", "question"), (2, "", "next_item: question: not readable\n"))
+
+    def test_move_to_end_takes_the_shown_item_and_shows_nothing_after_it(self) -> None:
+        with self.patched():
+            self.assertEqual(run("move-to-end", "--kind", "question"),
+                             (2, "", "next_item: no question that /next showed is waiting; show one first\n"))
+            _ = run("show", "--production", str(PRODUCTION))
+            self.assertEqual(run("move-to-end", "--kind", "question"), (0, "question: moved Q1 to the end\n", ""))
+            # Normal and oldest: the change from day 1 goes before the proposal from day 3.
+            self.assertEqual(run("show", "--production", str(PRODUCTION))[1], "change\nC1 Old change\n")
+            self.assertEqual(run("show", "--kind", "question")[1], "question\ndemo: Newest question\n")
+            self.assertEqual(run("show", "--kind", "question", "--order", "oldest")[1], "question\ndemo: Newest question\n")
+
+    def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
+        _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        line = LEDGER.splitlines()[0]
+        self.assertEqual(run("show", "--kind", "efficiency"), (0, f"efficiency\n{line}\n", ""))
+        self.assertEqual(run("move-to-end", "--kind", "efficiency")[0], 0)
+        self.assertEqual(run("show", "--kind", "efficiency")[1], f"efficiency\n{LEDGER.splitlines()[1]}\n")
+        path = self.root / "change-review" / "change-review - natedev.md"
+        _ = change_review.append_rows(path, [Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")],
+                                      date(2026, 10, 15), "", PRODUCTION)
+        def the_list(production: str) -> Path:
+            del production
+            return path
+
+        with mock.patch.object(change_review, "production_list", the_list):
+            self.assertEqual(run("show", "--kind", "change", "--production", str(PRODUCTION)), (0, "\n".join([
+                "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
+                "  Merged: 2026-10-15", ""]), ""))
+
+
+if __name__ == "__main__":
+    _ = unittest.main()
