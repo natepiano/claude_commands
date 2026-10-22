@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, patch
 
@@ -46,6 +47,7 @@ from scripts.direct import plan_history
 from scripts.message import process_table, sessions
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
+from scripts.guilds import astra_work, roles
 from scripts.whoami import account, agent_accounts
 
 
@@ -419,6 +421,10 @@ class MeshCommandTests(unittest.TestCase):
             encoding="utf-8",
         )
         self.patches = contextlib.ExitStack()
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
+            "GUILD_ROLES_STATE": str(self.session_dir / "guild-roles"),
+            "GUILD_OWNERSHIP_STATE": str(self.session_dir / "guild-ownership"),
+        })))
         _ = self.patches.callback(set_environment("USAGE_STATE_DIR", str(self.session_dir / "usage-state")))
         _ = self.patches.enter_context(patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.0))
         _ = self.patches.enter_context(patch.object(codex_mesh, "RESIDENT_POLL_SECS", 0.01))
@@ -922,6 +928,305 @@ class MeshCommandTests(unittest.TestCase):
         self.write_pool_roster(entries)
         return replacement
 
+    def held_reviewer_record(self, lifecycle: roles.Lifecycle) -> roles.HeldDesign:
+        prompt = self.session_dir / "authorized.md"
+        design = roles.HeldDesign(roles.DesignPlacement("00000000-0000-4000-8000-000000000026", "fixture-host", 3),
+            "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
+            "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), roles.DesignUnbound(),
+            (roles.RoleInstance("designer", "unused-designer", roles.RoleNotOpened()),
+             roles.RoleInstance("reviewer", "worker", lifecycle, str(prompt))))
+        roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        _ = prompt.write_text("Current authorized reviewer instructions.")
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
+            "held_design_id": design.placement.design_id, "held_role": "reviewer", "port": self.server.port,
+            "authorized_generation": 3, "authorized_holder": "fixture-holder", "authorized_prompt": str(prompt),
+            "access_policy": {"kind": "ReadOnlyReviewer"}}})
+        _ = self.patches.enter_context(patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")))
+        _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder",
+                                                               "GUILD_ROLES_HOST": "fixture-host"})))
+        return design
+
+    def test_held_turn_with_current_binding_reuses_the_server_without_blocking(self) -> None:
+        design = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        binding = roles.DesignBoundToPhase(str(self.session_dir / "phase-run"), "1",
+                                          str(self.session_dir), ("design.md",))
+        design = dataclasses.replace(design, binding=binding)
+        roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        context_path = self.session_dir / "guild_context.json"
+        context = {"design_id": design.placement.design_id, "generation": design.placement.generation,
+                   "holder_session": "fixture-holder", "cwd": design.repository,
+                   "binding": {"kind": "DesignBoundToPhase", **dataclasses.asdict(binding)}}
+        _ = context_path.write_text(json.dumps(context))
+        server_path = self.session_dir / codex_mesh.SERVER_FILE
+        server_record = cast(dict[str, object], json.loads(server_path.read_text()))
+        server_record["guild_context"] = context
+        _ = server_path.write_text(json.dumps(server_record))
+        before = server_path.read_bytes()
+        args = self.start_args()
+        args.to, args.role = "worker", "review"
+        args.message_file = str(self.session_dir / "authorized.md")
+        results: list[int] = []
+        errors: list[BaseException] = []
+
+        def follow() -> None:
+            try:
+                results.append(codex_mesh.command_follow(args))
+            except BaseException as error:
+                errors.append(error)
+
+        with patch.object(codex_mesh, "_holds_old_sign_in", return_value=False), \
+                patch.object(codex_mesh, "_reap", return_value=False), \
+                patch.object(codex_mesh, "_start_server", side_effect=AssertionError("the fixture server must be reused")):
+            launcher = threading.Thread(target=follow, daemon=True)
+            launcher.start()
+            launcher.join(timeout=5)
+        self.assertFalse(launcher.is_alive(), "unchanged binding blocked the turn on its server lock")
+        if errors:
+            raise errors[0]
+        self.assertEqual(results, [0])
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertEqual(server_path.read_bytes(), before)
+        self.assertEqual(self.methods("thread/unsubscribe"), [])
+        self.assertFalse((self.session_dir / "serving_home.json").exists())
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_account_move_resume_refuses_a_fenced_source_before_touching_its_queue(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        record = self.worker_record()
+        record["transferring_role"] = {"adoption_id": "transfer-one", "destination": "/fixture/destination"}
+        self.write_pool_roster({"worker": record})
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        with self.assertRaisesRegex(SystemExit, "TransferringRole"):
+            _ = codex_mesh.command_resume_account_move(argparse.Namespace(session_dir=str(self.session_dir), to="worker"))
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
+        self.assertFalse((self.session_dir / "worker.account-move.json").exists())
+        self.assertEqual(self.methods("thread/queue/list"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_account_move_recovery_saves_the_held_reply_at_its_assignment_path(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        reply = self.session_dir / "saved-replies/assignment.md"
+        prompt = self.session_dir / "authorized.md"
+        header = astra_work.AstraWork("astra-reviewer", "worker", str(self.session_dir / "design.md"),
+            "2026-10-21T12:00:00+00:00", str(reply), astra_work.StandaloneWork())
+        _ = prompt.write_text(astra_work.header_line(header) + "\nCurrent authorized reviewer instructions.\n")
+        record = self.worker_record()
+        record.update({"instructions_file": str(prompt), "status": "running", "turn_id": "interrupted-turn"})
+        self.write_pool_roster({"worker": record})
+        self.live_turn = "interrupted-turn"
+        moved = codex_mesh._interrupt_worker_for_account_move(str(self.session_dir), "worker", record,  # pyright: ignore[reportPrivateUsage]
+                                                             self.server.port, "codex1")
+        self.assertIsInstance(moved, codex_mesh.InterruptedWorkerMove)
+        original = self.respond
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = original(request)
+            if request.get("method") == "turn/start" and frames:
+                frames.insert(-1, _notice("item/completed", {"threadId": THREAD_ID,
+                    "item": {"type": "agentMessage", "text": "Recovered reviewer evidence."}}))
+            return frames
+
+        self.server.respond = respond
+        code = codex_mesh.command_resume_account_move(argparse.Namespace(session_dir=str(self.session_dir), to="worker"))
+        self.assertEqual(code, 0)
+        self.assertTrue(reply.is_file())
+        self.assertEqual(reply.read_text().strip(), "Recovered reviewer evidence.")
+        self.assertFalse((self.session_dir / "worker.account-move-summary.txt").exists())
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_invalid_account_move_header_preserves_the_roster_for_a_later_follow(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        prompt = self.session_dir / "authorized.md"
+        _ = prompt.write_text("<!-- astra_work {invalid json} -->\nReviewer instructions.\n")
+        record = self.worker_record()
+        record.update({"instructions_file": str(prompt), "status": "running", "turn_id": "interrupted-turn"})
+        self.write_pool_roster({"worker": record})
+        self.live_turn = "interrupted-turn"
+        moved = codex_mesh._interrupt_worker_for_account_move(str(self.session_dir), "worker", record,  # pyright: ignore[reportPrivateUsage]
+                                                             self.server.port, "codex1")
+        self.assertIsInstance(moved, codex_mesh.InterruptedWorkerMove)
+        record.update({"status": "failed", "launcher_pid": 0})
+        self.write_pool_roster({"worker": record})
+        roster_path = self.session_dir / codex_mesh.ROSTER_FILE
+        before = roster_path.read_bytes()
+        code = codex_mesh.command_resume_account_move(argparse.Namespace(session_dir=str(self.session_dir), to="worker"))
+        self.assertEqual(code, 1)
+        result = cast(dict[str, object], json.loads((self.session_dir / "worker.account-move-result.json").read_text()))
+        self.assertIn("header is invalid", str(result["error"]))
+        self.assertEqual(roster_path.read_bytes(), before)
+        self.assertEqual(self.methods("turn/start"), [])
+        reply = self.session_dir / "reply.md"
+        header = astra_work.AstraWork("astra-reviewer", "worker", str(self.session_dir / "design.md"),
+            "2026-10-21T12:00:00+00:00", str(reply), astra_work.StandaloneWork())
+        _ = prompt.write_text(astra_work.header_line(header) + "\nReviewer instructions.\n")
+        self.assertTrue(codex_mesh._claim_follow(str(self.session_dir), "worker", THREAD_ID,  # pyright: ignore[reportPrivateUsage]
+                                                os.getpid(), "review"))
+        self.assertEqual(self.worker_record()["status"], "starting")
+
+    def test_held_instruction_and_turn_claim_has_one_winner_and_uses_current_prompt(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        def claim(pid: int) -> bool:
+            return codex_mesh._claim_follow(str(self.session_dir), "worker", THREAD_ID, pid, "review")  # pyright: ignore[reportPrivateUsage]
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            claims = list(pool.map(claim, (os.getpid(), os.getpid())))
+        self.assertCountEqual(claims, [True, False])
+        entry = self.worker_record()
+        self.assertEqual(entry["instructions_file"], str(self.session_dir / "authorized.md"))
+        self.assertEqual((entry["thread_id"], entry["status"]), (THREAD_ID, "starting"))
+        self.assertNotIn("authorized_prompt", entry)
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_stale_held_assignment_cannot_claim_a_turn_or_replace_instructions(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        record = self.worker_record()
+        record.update({"authorized_generation": 2, "instructions_file": "previous.md"})
+        self.write_pool_roster({"worker": record})
+        self.assertFalse(codex_mesh._claim_follow(str(self.session_dir), "worker", THREAD_ID,  # pyright: ignore[reportPrivateUsage]
+                                                 os.getpid(), "review"))
+        self.assertEqual(self.worker_record(), record)
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_held_thread_resume_failure_does_not_start_a_replacement(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        self.failing_method = "thread/resume"
+        args = self.start_args()
+        args.to = "worker"
+        args.role = "review"
+        args.message_file = str(self.session_dir / "authorized.md")
+        with contextlib.redirect_stderr(io.StringIO()) as output:
+            code = codex_mesh.command_follow(args)
+        errors = output.getvalue()
+        self.assertEqual(code, 1, errors)
+        self.assertIn("RoleNeedsRecovery", errors)
+        self.assertEqual(len(self.methods("thread/resume")), 1)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+
+    def test_held_roles_refuse_raw_pause_reopen_and_instruction_replacement(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        instructions = self.session_dir / "replacement.md"
+        _ = instructions.write_text("This text must not replace the authorized assignment.")
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        for command in (["stop", "--pause"], ["reopen", "--to", "worker"],
+                        ["set-instructions", "--to", "worker", "--instructions-file", str(instructions)]):
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                _ = self.run_mesh(command)
+            self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(self.methods("thread/resume"), [])
+
+    def test_adoption_fence_blocks_old_follow_reopen_move_and_cleanup_routes(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        entry = self.worker_record()
+        entry["transferring_role"] = {"adoption_id": "transfer-one", "destination": "/fixture/destination"}
+        self.write_pool_roster({"worker": entry})
+        before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
+        for command in (self.follow_cli(), ["reopen", "--to", "worker"], ["stop", "--pause"]):
+            with self.subTest(command=command), self.assertRaisesRegex(SystemExit, "TransferringRole"):
+                _ = self.run_mesh(command)
+        with self.assertRaisesRegex(SystemExit, "TransferringRole"):
+            _ = codex_mesh._switch_run_workers(self.session_dir, self.server.port, "codex1", dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((self.session_dir / codex_mesh.ROSTER_FILE).read_bytes(), before)
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_explicit_designer_access_stays_writable_with_standing_instructions(self) -> None:
+        instructions = self.session_dir / "designer.md"
+        _ = instructions.write_text("Edit only the phase output paths by patch.")
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
+            "instructions_file": str(instructions), "access_policy": {"kind": "PhaseBoundDesigner",
+                "binding_generation": 1, "launch_sandbox": "danger-full-access"}}})
+        code, errors = self.run_follow()
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(_as_test_dict(self.methods("thread/resume")[0]["params"])["developerInstructions"], instructions.read_text())
+        self.assertEqual(_as_test_dict(self.methods("turn/start")[0]["params"])["sandboxPolicy"], {"type": "dangerFullAccess"})
+
+    def test_end_from_recovery_marks_lost_thread_ended_before_failed_server_cleanup(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleNeedsRecovery(THREAD_ID, "thread lost"))
+        entry = self.worker_record()
+        entry["status"] = "failed"
+        self.write_pool_roster({"worker": entry})
+        self.read_failure = "error"
+        code, _output, errors = self.run_mesh(["end", "--to", "worker"])
+        self.assertEqual(code, 1, errors)
+        self.assertEqual(self.worker_record()["status"], "ended")
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertTrue((self.session_dir / "worker.end").exists())
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_move_without_a_prior_marker_parks_queued_text_before_interrupting(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        entry = self.worker_record()
+        entry.update({"status": "running", "turn_id": "live-one"})
+        self.write_pool_roster({"worker": entry})
+        self.live_turn = "live-one"
+        self.queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Keep this queued turn."}]}]
+        original = self.respond
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") in ("thread/queue/delete", "turn/interrupt"):
+                self.assertIn("Keep this queued turn.", (self.session_dir / "worker.pending.json").read_text())
+            return original(request)
+
+        self.server.respond = respond
+        moved = codex_mesh._interrupt_worker_for_account_move(str(self.session_dir), "worker", entry,  # pyright: ignore[reportPrivateUsage]
+                                                             self.server.port, "codex1")
+        self.assertIsInstance(moved, codex_mesh.InterruptedWorkerMove)
+        self.assertTrue((self.session_dir / "worker.account-move.json").exists())
+        self.assertIn("Keep this queued turn.", (self.session_dir / "worker.pending.json").read_text())
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_idle_server_release_parks_queue_before_unsubscribe_and_preserves_thread(self) -> None:
+        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        self.queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Idle queued evidence."}]}]
+        original = self.respond
+
+        def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "thread/unsubscribe":
+                self.assertIn("Idle queued evidence.", (self.session_dir / "worker.pending.json").read_text())
+            return original(request)
+
+        self.server.respond = respond
+        with patch.object(codex_mesh, "_reap", return_value=True):
+            codex_mesh._release_held_server(str(self.session_dir))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
+        self.assertEqual(self.worker_record()["status"], "done")
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+        self.assertIn("Idle queued evidence.", (self.session_dir / "worker.pending.json").read_text())
+
+    def test_idle_durable_account_move_without_run_marker_parks_queue_before_server_stop(self) -> None:
+        design = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        mesh = roles.mesh_directory(design.placement.design_id)
+        mesh.mkdir(parents=True)
+        _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": self.worker_record()}))
+        _ = (mesh / codex_mesh.SERVER_FILE).write_bytes((self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
+        roles._mesh_context(design, roles.HolderReach("fixture-holder"))  # pyright: ignore[reportPrivateUsage]
+        self.queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Keep idle account-move text."}]}]
+        stopped: list[int] = []
+
+        def stop(roots: object, pid: int, port: int, location: object = None) -> bool:
+            del roots, port, location
+            self.assertIn("Keep idle account-move text.", (mesh / "worker.pending.json").read_text())
+            stopped.append(pid)
+            return True
+
+        with patch.object(codex_mesh, "SWEEP_ROOTS", (self.session_dir / "empty-runs",)), \
+                patch.object(codex_mesh, "_stop_unused", side_effect=stop), \
+                patch.object(codex_mesh, "_notify_holder"), \
+                patch.object(codex_mesh, "_start_watcher", side_effect=AssertionError("idle server should stop")):
+            switches = codex_mesh.retire_workers_servers(self.session_dir / "next-account", "codex1")
+        self.assertEqual([switch.folder for switch in switches], [mesh])
+        self.assertEqual(switches[0].holders, ("fixture-holder",))
+        self.assertEqual(stopped, [os.getpid()])
+        self.assertEqual(self.methods("turn/start"), [])
+        self.assertEqual(self.methods("thread/start"), [])
+        self.assertEqual(cast(dict[str, dict[str, object]], json.loads((mesh / codex_mesh.ROSTER_FILE).read_text()))["worker"]["thread_id"], THREAD_ID)
+
     def test_old_launcher_normal_end_preserves_the_replacement_roster(self) -> None:
         replacement = self.replacement_record()
         def replace_at_end(_port: int, _thread_id: str, _log_path: Path) -> codex_mesh.RelaunchAllowed:
@@ -1218,6 +1523,7 @@ class MeshCommandTests(unittest.TestCase):
         self.write_pool_roster({"worker": {
             "thread_id": THREAD_ID, "status": "done", "role": "review",
             "context_tokens": 150000, "instructions_file": str(path),
+            "access_policy": {"kind": "ReadOnlyReviewer"},
         }})
 
     def assert_instruction_resume(self, path: Path) -> None:
@@ -1227,6 +1533,7 @@ class MeshCommandTests(unittest.TestCase):
             self.assertEqual(request["params"], {
                 "threadId": THREAD_ID,
                 "developerInstructions": path.read_text(encoding="utf-8"),
+                "sandbox": "read-only", "approvalPolicy": "never",
             })
 
     def test_prime_records_the_absolute_instructions_path(self) -> None:
@@ -1273,6 +1580,7 @@ class MeshCommandTests(unittest.TestCase):
         resumes = [request for request in new.requests if request.get("method") == "thread/resume"]
         self.assertEqual([request["params"] for request in resumes], [{
             "threadId": THREAD_ID, "developerInstructions": path.read_text(encoding="utf-8"),
+            "sandbox": "read-only", "approvalPolicy": "never",
         }])
         self.assertEqual(self.worker_record().get("instructions_file"), str(path))
 
@@ -1419,6 +1727,7 @@ class MeshCommandTests(unittest.TestCase):
         resumes = [request for request in new.requests if request.get("method") == "thread/resume"]
         self.assertEqual(resumes[0]["params"], {
             "threadId": THREAD_ID, "developerInstructions": path.read_text(encoding="utf-8"),
+            "sandbox": "read-only", "approvalPolicy": "never",
         })
         starts = [request for request in new.requests if request.get("method") == "turn/start"]
         self.assertEqual(len(starts), 1)
@@ -2016,6 +2325,7 @@ class MeshCommandTests(unittest.TestCase):
         self.write_pool_roster({"worker": {
             "thread_id": THREAD_ID, "status": "done", "role": "review",
             "instructions_file": str(instructions),
+            "access_policy": {"kind": "ReadOnlyReviewer"},
         }})
 
         code, _output, errors = self.run_mesh(self.follow_cli())
