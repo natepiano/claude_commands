@@ -123,7 +123,7 @@ A Codex workers-account move is a separate path (`resume-account-move`, the `<se
 
 ### Recovery snapshots
 
-Each snapshot pass also saves the shared herdr session's workspace and tab order (`herdr.save_shared_layout`), and a restart's tab opens put every session back in its saved place (herdr-adoption.md, Tab order). Whatever replaces the snapshot timer must keep that save.
+Each snapshot pass also saves the shared herdr session's workspace and tab order (`herdr.save_shared_layout`), and a restart's tab opens put every session back in its saved place (herdr-adoption.md, Tab order). The pass then rebuilds the local override of herdr's Claude detection rules (`detection_rules.refresh`, herdr-adoption.md, herdr behavior). Whatever replaces the snapshot timer must keep both.
 
 `RecoverySnapshot` holds machine, canonical login, label, taken time and tagged Claude/Codex entries. Each entry keeps its session, workers, timer restores, last-seen time and running/unresolved state. Codex entries also keep `CODEX_HOME` and either a session id or an explicit resume-picker choice. `agents status` lists unresolved entries with last-seen times in the user's zone; local JSON status includes `recovery` when unresolved entries exist. `agents forget <name|id> [--account <login|label>]` acknowledges one local snapshot entry and retires its stopped or failed shutdown record without touching its process; entries still shutting down are retained. After a move one session id can have a record or snapshot entry on two accounts; a bare id or name that matches only that one session forgets every copy and prints `<name>: forgotten on <label>` per account, and `--account` forgets one copy. A name shared by two different sessions is still refused with the list.
 
