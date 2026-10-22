@@ -990,6 +990,131 @@ class MeshCommandTests(unittest.TestCase):
         self.assertFalse((self.session_dir / "serving_home.json").exists())
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
 
+    def test_sweep_or_idle_stop_of_a_held_design_server_resumes_same_thread_with_pending_text(self) -> None:
+        fixture_root = self.session_dir
+        for stop_route in ("idle-stop", "sweep"):
+            with self.subTest(stop_route=stop_route):
+                design_id = "00000000-0000-4000-8000-000000000027"
+                self.session_dir = roles.mesh_directory(design_id)
+                self.session_dir.mkdir(parents=True, exist_ok=True)
+                directory = roles.design_directory(design_id)
+                prompt = directory / "prompts/assignment.md"
+                reply = directory / "replies/assignment.md"
+                prompt.parent.mkdir(exist_ok=True)
+                reply.parent.mkdir(exist_ok=True)
+                binding = roles.DesignBoundToPhase(str(fixture_root / "phase-run"), "1",
+                                                  str(fixture_root), ("design.md",))
+                design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 3),
+                    "fixture-repo", str(fixture_root), str(fixture_root / "design.md"), "design",
+                    "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), binding,
+                    (roles.RoleInstance("designer", "worker", roles.RoleOpen(THREAD_ID), str(prompt)),
+                     roles.RoleInstance("reviewer", "unused-reviewer", roles.RoleNotOpened())))
+                roles._save(design)  # pyright: ignore[reportPrivateUsage]
+                header = astra_work.AstraWork("astra-designer", "worker", design.document,
+                    design.created_at_utc, str(reply), astra_work.StandaloneWork())
+                _ = prompt.write_text(astra_work.header_line(header) + "\nContinue the authorized design.\n")
+                _ = reply.write_text("Previous saved reply.\n")
+                policy = {"kind": "PhaseBoundDesigner", "binding_generation": 3,
+                          "launch_sandbox": "danger-full-access"}
+                self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "impl",
+                    "held_design_id": design_id, "held_role": "designer", "access_policy": policy,
+                    "authorized_generation": 3, "authorized_holder": "fixture-holder",
+                    "authorized_prompt": str(prompt), "port": self.server.port}})
+                context = {"design_id": design_id, "generation": 3, "holder_session": "fixture-holder",
+                           "cwd": design.repository, "binding": {"kind": "DesignBoundToPhase",
+                                                                   **dataclasses.asdict(binding)}}
+                _ = (self.session_dir / "guild_context.json").write_text(json.dumps(context))
+                pending = self.session_dir / "worker.pending.json"
+                _ = pending.write_text(json.dumps({"thread_id": THREAD_ID,
+                    "messages": ["Keep this pending design correction."], "accepting_messages": True}))
+                _ = roles.queue_message(design_id, "designer", "fixture-holder", "Keep this holder message.",
+                                        message_id="00000000-0000-4000-8000-000000000028")
+                process = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
+                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+                # Reap this child as soon as the real stop code signals it, so kill(0) sees it gone.
+                reaper = threading.Thread(target=process.wait, daemon=True)
+                reaper.start()
+                server_path = self.session_dir / codex_mesh.SERVER_FILE
+                _ = server_path.write_text(json.dumps({"pid": process.pid, "port": self.server.port,
+                    "codex_home": str(agent_accounts.workers_home()),
+                    "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS, "guild_context": context}))
+                old = codex_mesh.SERVER_IDLE_SECS + 60
+                for name in codex_mesh.SWEEP_ACTIVITY_FILES:
+                    path = self.session_dir / name
+                    if path.exists():
+                        os.utime(path, (time.time() - old, time.time() - old))
+                preserved = {path: path.read_bytes() for path in directory.rglob("*") if path.is_file()
+                             and path != server_path and path.name != "lock"}
+                outside_roots = fixture_root / "ordinary-runs"
+                outside_roots.mkdir(exist_ok=True)
+                try:
+                    with (
+                        patch.object(codex_mesh, "_running_servers", return_value=[(process.pid, self.server.port, old)]),
+                        patch.object(codex_mesh, "_client_counts", return_value={}),
+                        patch.object(codex_mesh, "_running_daemons", return_value=[]),
+                        patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.MeshServerLog(self.session_dir)),
+                        contextlib.redirect_stdout(io.StringIO()),
+                    ):
+                        if stop_route == "idle-stop":
+                            code = codex_mesh.command_idle_stop(argparse.Namespace(
+                                session_dir=str(self.session_dir), pid=process.pid, port=self.server.port))
+                        else:
+                            code = codex_mesh.command_sweep(argparse.Namespace(root=str(outside_roots), stop=True))
+                    self.assertEqual(code, 0)
+                    reaper.join(timeout=5)
+                    self.assertFalse(reaper.is_alive(), "the stopped child was not reaped")
+                    self.assertIsNotNone(process.poll())
+                    self.assertFalse(codex_mesh._pid_alive(process.pid))  # pyright: ignore[reportPrivateUsage]
+                    self.assertFalse(server_path.exists())
+                    for path, contents in preserved.items():
+                        self.assertEqual(path.read_bytes(), contents, str(path))
+                    self.assertFalse((directory / "transition.json").exists())
+                    self.assertEqual(list(self.session_dir.glob("*.account-move.json")), [])
+
+                    started: list[dict[str, str]] = []
+
+                    def start_fixture_server(session_dir: str, home: Path) -> int:
+                        self.assertFalse(server_path.exists())
+                        self.server.close()
+                        self.server = StubAppServer(self.respond)
+                        started.append(codex_mesh._server_environment(session_dir, home))  # pyright: ignore[reportPrivateUsage]
+                        _ = server_path.write_text(json.dumps({"pid": os.getpid(), "port": self.server.port,
+                            "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
+                            "guild_context": context}))
+                        return self.server.port
+
+                    args = self.start_args()
+                    args.to = "worker"
+                    args.message_file = str(prompt)
+                    args.summary_file = str(reply)
+                    with (
+                        patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder", "GUILD_ROLES_HOST": "fixture-host"}),
+                        patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")),
+                        patch.object(codex_mesh, "_start_server", start_fixture_server),
+                        contextlib.redirect_stderr(io.StringIO()) as errors,
+                    ):
+                        self.assertEqual(codex_mesh.command_follow(args), 0, errors.getvalue())
+                    self.assertEqual(len(started), 1)
+                    self.assertEqual(started[0]["GUILD_DESIGN_ID"], design_id)
+                    self.assertEqual(started[0]["PLAN_DELEGATE_BOARD_DIR"], binding.run_directory)
+                    self.assertEqual([_as_test_dict(request["params"])["threadId"]
+                                      for request in self.methods("thread/resume")], [THREAD_ID])
+                    self.assertEqual(self.methods("thread/start"), [])
+                    turn = _as_test_dict(self.methods("turn/start")[0]["params"])
+                    self.assertIn("Keep this pending design correction.", json.dumps(turn["input"]))
+                    self.assertEqual(turn["sandboxPolicy"], {"type": "dangerFullAccess"})
+                    entry = self.worker_record()
+                    self.assertEqual((entry["thread_id"], entry["held_design_id"], entry["access_policy"]),
+                                     (THREAD_ID, design_id, policy))
+                    self.assertEqual([message.text for message in roles.pending_messages(design_id, "designer")],
+                                     ["Keep this holder message."])
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    reaper.join(timeout=5)
+                self.session_dir = fixture_root
+
     def test_account_move_resume_refuses_a_fenced_source_before_touching_its_queue(self) -> None:
         _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
         record = self.worker_record()
