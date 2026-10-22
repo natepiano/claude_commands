@@ -29,6 +29,10 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
 - The relaunch runs `add_unit.py` with the record's doc, so the unit's marks
   (`SHOWRUNNER_UNIT`, `SHOWRUNNER_UNIT_ID`) name the receiving production. Status, dailies, panes and
   merges find the unit there.
+- A held design role (`docs/as-built/guilds.md`) does not move: `transfer_unit.py` calls no
+  `roles.py` verb, so its `UnitHolder` keeps the giving slug. After the relaunch `resolve_holder`
+  reports `unit holder is not recorded`, and every `roles.py` verb that authorizes the holder
+  (`resume`, `rebind`, `end`) refuses.
 - The phase note follows at the unit's next refresh. The giving showrunner's report state keeps its
   rows as history.
 

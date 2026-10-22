@@ -957,6 +957,8 @@ def end(instance_id: str) -> HeldDesign:
     _ = _authorize(design)
     instance = _instance(design, role)
     if isinstance(instance.lifecycle, RoleEnded):
+        if all(isinstance(item.lifecycle, (RoleNotOpened, RoleEnded)) for item in design.roles):
+            release_servers(design)
         return design
     directory = design_directory(design_id)
     with _lock(directory):
@@ -982,6 +984,15 @@ def end(instance_id: str) -> HeldDesign:
                 _save(_set_lifecycle(read_design(design_id), role,
                                      RoleNeedsRecovery(thread, 'end cleanup is not confirmed')))
             raise RoleRefused('RoleNeedsRecovery: end cleanup failed; roster end marker is retained')
+    if all(item.role == role or isinstance(item.lifecycle, (RoleNotOpened, RoleEnded)) for item in design.roles):
+        try:
+            release_servers(design)
+            _atomic(directory / 'end-server-release.json', {'released_at_utc': datetime.now(UTC).isoformat()})
+        except (ConnectionError, OSError, SystemExit, RoleRefused) as error:
+            with _lock(directory):
+                _save(_set_lifecycle(read_design(design_id), role,
+                                     RoleNeedsRecovery(thread, 'design server release is not confirmed')))
+            raise RoleRefused('RoleNeedsRecovery: design server release failed') from error
     with _lock(design_directory(design_id)):
         current = read_design(design_id)
         updated = _set_lifecycle(current, role, RoleEnded(thread))
@@ -1015,6 +1026,67 @@ def confirm_adoption(design: HeldDesign, role: Role, thread_id: str) -> None:
             raise RoleRefused('AdoptionNeedsRecovery: destination is not proven idle')
     finally:
         client.close()
+
+
+def _check_adoption_source(entry: dict[str, object], thread_id: str) -> None:
+    if (entry.get('thread_id') != thread_id or entry.get('status') in BUSY
+            or (entry.get('status') == 'paused' and entry.get('paused_from') in BUSY)):
+        raise RoleRefused('AdoptionRequired: source is busy or its thread differs')
+
+
+def _adoption_model(source: Path, name: str, thread_id: str, entry: dict[str, object]) -> tuple[str, str]:
+    """Read missing settings only from records linked to this source thread."""
+    settings: dict[str, object] = {key: entry.get(key) for key in ('model', 'effort')}
+    for path in sorted(source.glob('impl_worker_*.json')):
+        if all(value is not None for value in settings.values()):
+            break
+        launch = _read(path)
+        if launch.get('worker_id') != thread_id:
+            continue
+        for key in settings:
+            if settings[key] is None:
+                settings[key] = launch.get(key)
+        slot = path.stem.removeprefix('impl_worker_')
+        assignments: dict[str, set[str]] = {'model': set(), 'effort': set()}
+        for assignment in sorted(source.glob(f'phases/*/impl_agent_{slot}')):
+            log = assignment.with_name(assignment.name + '.log')
+            if not log.exists():
+                continue
+            with log.open(encoding='utf-8') as handle:
+                if not any(line.rstrip().endswith(f'] mesh: {name} thread {thread_id}') for line in handle):
+                    continue
+            values = dict(line.split('=', 1) for line in assignment.read_text(encoding='utf-8').splitlines() if '=' in line)
+            for key, field in (('model', 'agent'), ('effort', 'effort')):
+                if values.get(field):
+                    assignments[key].add(values[field])
+        for key, values in assignments.items():
+            if settings[key] is None and values:
+                if len(values) != 1:
+                    raise RoleRefused('AdoptionRequired: conflicting source launch evidence for ' + key)
+                settings[key] = next(iter(values))
+    if any(value is None for value in settings.values()):
+        try:
+            server = _read(source / 'mesh_server.json')
+            client = _mesh_transport().Client(_integer(server, 'port'), 'guild-adopt-evidence')
+        except (OSError, ValueError, ConnectionError, SystemExit) as error:
+            raise RoleRefused('AdoptionRequired: source model or effort evidence is unavailable') from error
+        try:
+            reply = client.call('thread/read', {'threadId': thread_id, 'includeTurns': False})
+            result = _object(reply.get('result'))
+            thread = _object(result.get('thread'))
+            if not reply.get('error') and thread.get('id') == thread_id:
+                for key, fields in (('model', ('model',)), ('effort', ('reasoningEffort', 'effort', 'reasoning_effort'))):
+                    if settings[key] is None:
+                        settings[key] = next((record[field] for record in (thread, result)
+                                              for field in fields if record.get(field)), None)
+        except (ConnectionError, OSError, SystemExit) as error:
+            raise RoleRefused('AdoptionRequired: source model or effort evidence is unavailable') from error
+        finally:
+            client.close()
+    for key, value in settings.items():
+        if not isinstance(value, str) or not value:
+            raise RoleRefused('AdoptionRequired: no recorded source ' + key + ' for thread ' + thread_id)
+    return cast(str, settings['model']), cast(str, settings['effort'])
 
 
 def adopt(repository: str, document: str, role: Role, holder: Holder, area: str, *,
@@ -1052,8 +1124,6 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
             or Path(_text(recorded_source, 'mesh')).resolve() != Path(source_mesh).resolve()
             or _holder(_object(recorded_source.get('holder'))) != holder):
         raise RoleRefused('AdoptionRequired: source thread, mesh, name or holder differs from the authority record')
-    _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
-                                            'adoption_id': adoption_id})
     checkout = _text(placement, 'checkout')
     candidate = HeldDesign(DesignPlacement(design_id, host, _integer(placement, 'generation')), repository,
                            checkout, str((Path(checkout) / _text(placement, 'document')).resolve()), area,
@@ -1064,17 +1134,25 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
     reach = _authorize(candidate)
     _validate_binding(binding, candidate.repository, role)
     model, effort = resolve_model(role)
-    prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
     source = Path(source_mesh)
     source_path = source / 'mesh_roster.json'
+    entry = _object(_read(source_path).get(name))
+    _check_adoption_source(entry, thread_id)
+    source_model, source_effort = _adoption_model(source, name, thread_id, entry)
+    if source_model != model or source_effort != effort:
+        raise RoleRefused('AdoptionRequired: source model or effort differs from the configured guild model and effort')
+    transfer = {'adoption_id': adoption_id, 'destination': str(mesh_directory(design_id))}
+    if entry.get('transferring_role') is not None and entry.get('transferring_role') != transfer:
+        raise RoleRefused('source is fenced by another adoption')
+    prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
+    _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
+                                            'adoption_id': adoption_id})
     with _lock(design_directory(design_id)), source_path.open('r+', encoding='utf-8') as source_lock:
         fcntl.flock(source_lock, fcntl.LOCK_EX)
         roster = _object(cast(object, json.load(source_lock)))
         entry = _object(roster.get(name))
-        if entry.get('thread_id') != thread_id or entry.get('status') in BUSY:
-            raise RoleRefused('source is busy or its thread differs')
-        source_model, source_effort = entry.get('model'), entry.get('effort')
-        if source_model != model or source_effort != effort:
+        _check_adoption_source(entry, thread_id)
+        if entry.get('model', source_model) not in (None, model) or entry.get('effort', source_effort) not in (None, effort):
             raise RoleRefused('adoption requires the configured model and effort, recorded at the source')
         fence = entry.get('transferring_role')
         destination = str(mesh_directory(design_id))
@@ -1129,8 +1207,11 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
         destination_roster = _read(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
         adopted = dict(entry)
         _ = adopted.pop('transferring_role', None)
+        _ = adopted.pop('paused_from', None)
+        _ = adopted.pop('paused_turn', None)
         adopted.update({'held_design_id': design_id, 'held_role': role, 'access_policy': _tag(access_policy(design, role)),
-                        'instructions_file': str(prompt), 'status': 'done', 'cwd': design.repository})
+                        'instructions_file': str(prompt), 'status': 'done', 'cwd': design.repository,
+                        'model': source_model, 'effort': source_effort})
         destination_roster[name] = adopted
         _atomic(mesh / 'mesh_roster.json', destination_roster)
         _atomic(mesh / 'serving_home.json', {'codex_home': _text(server, 'codex_home')})

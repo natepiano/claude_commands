@@ -5,11 +5,14 @@ A launcher is a tracked file in scripts/direct whose first line starts with
 `#!` and whose name does not start with `test_`. Agents and scripts call these
 by path (`~/.claude/scripts/direct/verify.sh ...`), so a 100644 entry makes the
 call exit 126. Files with no `#!` line are imported modules and are not checked.
+A gate copy with no .git has no index, so there the test reads the modes of the
+files on disk instead; a copy keeps them, and a call by path needs them too.
 """
 
 from __future__ import annotations
 
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -28,15 +31,37 @@ def index_modes(ls_files_output: str) -> dict[str, str]:
     return modes
 
 
+def disk_modes(root: Path) -> dict[str, str]:
+    """Map each file in scripts/direct on disk to the git mode its executable bit gives."""
+    return {
+        f"{DIRECT}/{path.name}": EXECUTABLE if path.stat().st_mode & 0o111 else "100644"
+        for path in sorted((root / DIRECT).iterdir())
+        if path.is_file()
+    }
+
+
+def tracked_modes(root: Path) -> tuple[dict[str, str], str]:
+    """The index modes, or the disk modes when the tree has no git index, and where they came from."""
+    listed = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-s", "--", DIRECT],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if listed.returncode == 0 and listed.stdout:
+        return index_modes(listed.stdout), "in git"
+    return disk_modes(root), "on disk"
+
+
 def is_launcher(path: str, first_line: str) -> bool:
     """A file with a `#!` first line and no `test_` name prefix."""
     return first_line.startswith("#!") and not Path(path).name.startswith("test_")
 
 
-def failures(modes: dict[str, str], first_lines: dict[str, str]) -> list[str]:
-    """One message per launcher whose index mode is not 100755."""
+def failures(modes: dict[str, str], first_lines: dict[str, str], source: str = "in git") -> list[str]:
+    """One message per launcher whose mode is not 100755."""
     return [
-        f"{path} is {mode} in git; fix: git update-index --chmod=+x {path} && chmod +x {path}"
+        f"{path} is {mode} {source}; fix: git update-index --chmod=+x {path} && chmod +x {path}"
         for path, mode in sorted(modes.items())
         if is_launcher(path, first_lines.get(path, "")) and mode != EXECUTABLE
     ]
@@ -49,16 +74,10 @@ def first_line(path: Path) -> str:
 
 class LauncherModeTests(unittest.TestCase):
     def test_every_launcher_is_executable_in_git(self) -> None:
-        output = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "ls-files", "-s", "--", DIRECT],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        modes = index_modes(output)
+        modes, source = tracked_modes(REPO_ROOT)
         self.assertIn(f"{DIRECT}/verify.sh", modes)
         first_lines = {path: first_line(REPO_ROOT / path) for path in modes}
-        found = failures(modes, first_lines)
+        found = failures(modes, first_lines, source)
         if found:
             self.fail("launchers without 100755:\n" + "\n".join(found))
 
@@ -82,6 +101,26 @@ class LauncherModeTests(unittest.TestCase):
                 + "git update-index --chmod=+x scripts/direct/verify.sh && chmod +x scripts/direct/verify.sh"
             ],
         )
+
+    def test_a_tree_with_no_git_reads_the_modes_on_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            direct = root / DIRECT
+            direct.mkdir(parents=True)
+            for name, mode in (("verify.sh", 0o755), ("board.sh", 0o644), ("plan_history.py", 0o644)):
+                launcher = direct / name
+                _ = launcher.write_text("#!/usr/bin/env bash\n" if name.endswith(".sh") else '"""A module."""\n')
+                launcher.chmod(mode)
+            modes, source = tracked_modes(root)
+            self.assertEqual(source, "on disk")
+            first_lines = {path: first_line(root / path) for path in modes}
+            self.assertEqual(
+                failures(modes, first_lines, source),
+                [
+                    "scripts/direct/board.sh is 100644 on disk; fix: "
+                    + "git update-index --chmod=+x scripts/direct/board.sh && chmod +x scripts/direct/board.sh"
+                ],
+            )
 
 
 if __name__ == "__main__":

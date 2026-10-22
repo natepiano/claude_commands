@@ -720,6 +720,11 @@ exec "$TEST_REAL_SLEEP" "$@"
             self.assertEqual(waiter.wait(timeout=300), 0, output.read_text())
             self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 2)
             self.assertEqual(list(admission.glob("*.reservation")), [])
+            # The wait after the memory wait shows in the log; on 2026-10-22 its
+            # log ended on "starting anyway" for hours.
+            text = output.read_text(errors="replace")
+            self.assertIn("waiting for the cargo token since", text)
+            self.assertIn("took the cargo token after 0 min", text)
         finally:
             _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
             _ = (self.root / "release").touch()
@@ -875,6 +880,100 @@ if sys.argv[1] == "wait-local":
         log = (board / "board.log").read_text()
         # The first take, then the memory gate's give-back and take; the hold wait adds none.
         self.assertEqual((log.count("token cargo acquired"), log.count("token cargo released")), (2, 2), log)
+
+    def start_check(self, environment: dict[str, str]) -> subprocess.Popen[str]:
+        process = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root, env=environment,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        self.started_groups.add(process.pid)
+        return process
+
+    def wait_for_waiter(self, board: Path, process: subprocess.Popen[str]) -> None:
+        """Waits until the call's own file is in the board's token waiter list."""
+        waiters = board / "token_waiters"
+        waiters.mkdir(parents=True, exist_ok=True)
+
+        def listed() -> bool:
+            return any(path.name.endswith(f".{process.pid}") for path in waiters.iterdir())
+        wait_until(lambda: listed() or process.poll() is not None, waiters, processes=(process,))
+        self.assertTrue(listed(), "verify never waited for the token")
+
+    def test_a_newer_call_supersedes_an_older_call_still_waiting_for_the_token(self) -> None:
+        board = self.root / "board"
+        shared = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board)}
+        holder = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "peer", "TEST_BLOCK": "1"})
+        try:
+            self.wait_for_running(self.root / "running", holder)
+            older = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+            self.wait_for_waiter(board, older)
+            newer = self.start_check({**shared, "PLAN_DELEGATE_TEAM_ROLE": "impl"})
+            older_output, older_errors = older.communicate(timeout=300)
+            self.assertEqual(older.returncode, 76, older_output + older_errors)
+            self.assertIn("superseded by a newer check call", older_output)
+            self.assertIn("nothing needs a repair", older_output)
+            self.assertIsNone(newer.poll(), "the newer call must still wait for the peer's token")
+            _ = (self.root / "release").touch()
+            newer_output = newer.communicate(timeout=300)
+            self.assertEqual(newer.returncode, 0, newer_output)
+            holder_output = holder.communicate(timeout=300)
+            self.assertEqual(holder.returncode, 0, holder_output)
+        finally:
+            _ = (self.root / "release").touch()
+        superseded = [record for record in self.records() if f"-{older.pid}-" in cast(str, record["id"])]
+        self.assertEqual([(record["outcome"], record["status"]) for record in superseded], [("superseded", 76)])
+        self.assertEqual(list((board / "token_waiters").iterdir()), [])
+
+    def test_a_call_that_holds_the_token_runs_on_when_a_newer_call_starts(self) -> None:
+        board = self.root / "board"
+        shared = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board), "PLAN_DELEGATE_TEAM_ROLE": "impl"}
+        holder = self.start_check({**shared, "TEST_BLOCK": "1"})
+        try:
+            self.wait_for_running(self.root / "running", holder)
+            newer = self.start_check(shared)
+            self.wait_for_waiter(board, newer)
+            self.assertIsNone(holder.poll(), "the call that holds the token must run on")
+            _ = (self.root / "release").touch()
+            holder_output = holder.communicate(timeout=300)
+            self.assertEqual(holder.returncode, 0, holder_output)
+            newer_output = newer.communicate(timeout=300)
+            self.assertEqual(newer.returncode, 0, newer_output)
+        finally:
+            _ = (self.root / "release").touch()
+        self.assertEqual(sorted(cast(str, record["outcome"]) for record in self.records()), ["ran", "ran"])
+
+    def test_the_token_goes_to_the_call_that_waited_longest(self) -> None:
+        # On 2026-10-22 about 25 calls polled one board's token, any of them
+        # took it when it came free, and two calls waited 3 and 3.5 h. A call
+        # now waits while an older call that still runs verify.sh waits.
+        board = self.root / "board"
+        waiters = board / "token_waiters"
+        waiters.mkdir(parents=True)
+        older = subprocess.Popen(["bash", "-c", "sleep 600; :", "verify.sh"], start_new_session=True)
+        self.started_groups.add(older.pid)
+        older_entry = waiters / f"peer.0123456789abcdef.1000000.{older.pid}.again"
+        older_entry.touch()
+        output = self.root / "queued.out"
+        with output.open("wb") as stream:
+            call = subprocess.Popen(["bash", str(VERIFY), "check", "sample"], cwd=self.root,
+                                    env={**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                                         "PLAN_DELEGATE_TEAM_ROLE": "impl"},
+                                    stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        self.started_groups.add(call.pid)
+        try:
+            self.wait_for_output(output, "calls ahead of this one: 1", call)
+            self.assertIn("it is free and goes to an earlier call", output.read_text())
+            self.assertFalse((board / "locks" / "cargo.d").exists(), "the newer call took the token")
+            self.end_group(older.pid)
+            _ = older.wait(timeout=300)
+            self.assertEqual(call.wait(timeout=300), 0, output.read_text())
+        finally:
+            for process in (older, call):
+                if process.poll() is None:
+                    self.end_group(process.pid)
+                _ = process.wait(timeout=300)
+        self.assertIn("took the cargo token after 0 min", output.read_text())
+        self.assertEqual(list(waiters.iterdir()), [], "an ended waiter's file stays in the queue")
+        self.assertEqual((self.root / "cargo-calls").read_text().count("check"), 1)
 
     def test_a_long_token_wait_never_gives_up(self) -> None:
         # Each refused acquire moves the clock past the old 1800 s limit.

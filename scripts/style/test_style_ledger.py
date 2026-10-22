@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from contextlib import closing, redirect_stdout
 from datetime import datetime, timezone
@@ -157,6 +158,28 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = style_ledger.open_ledger(self.repo)
         self.addCleanup(ledger.close)
         return ledger
+
+    def test_refill_lock_blocks_another_worktree_until_the_body_exits(self) -> None:
+        worktree = self.root / "other-checkout"
+        _ = self.git("worktree", "add", "-q", "-b", "other", str(worktree))
+        lock_path = self.root / "state" / self.repo.name / "refill.lock"
+        self.assertEqual(lock_path.parent, style_ledger.ledger_location(self.repo).database.parent)
+        self.assertFalse(lock_path.parent.exists())
+        attempting, acquired = threading.Event(), threading.Event()
+
+        def take_lock() -> None:
+            attempting.set()
+            with style_ledger.refill_lock(worktree):
+                acquired.set()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with style_ledger.refill_lock(self.repo):
+                self.assertTrue(lock_path.is_file())
+                contender = pool.submit(take_lock)
+                self.assertTrue(attempting.wait(5), "second worktree did not attempt refill")
+                self.assertFalse(acquired.wait(0.2), "second worktree entered a held refill lock")
+            contender.result(timeout=5)
+        self.assertTrue(acquired.is_set(), "refill lock was not released on context exit")
 
     def record_reads(
         self, rule: str, path: str, commit: str, reads: tuple[str, ...], *,
