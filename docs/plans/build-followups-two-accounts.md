@@ -2261,42 +2261,17 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 85 — An expired Claude login renews itself before anyone is asked  · status: done
 
-**Depends on:** Phase 84
+#### As-built
 
-#### Work Order
-
-**Goal:** On 10-21 the queued `units` move to claude4 waited from 22:13Z because claude4's usage read said "login token expired". At 01:39Z the user got a push to start claude4 by hand. A session start on the account renews the login: the showrunner's manual move at 21:53 AST and `hello.sh claude2` on 10-22 both did it. Showrunner, 10-22: when a move's target, or any noted Claude account, shows an expired login, start a probe session on it first, read usage again and go on. Ask the user only when that session fails.
-
-**Constraints (diagnosis, 10-22):**
-- `refusal_watch._run_auto_moves_locked` (~1080) blocks the head with `TargetReadingUnavailable` when `refusals.stored_reading` is not a `FreshReading`. An expired login never gets a new `weekly.at`, so the move waits on every pass.
-- `agent_accounts.claude_live` (~769) returns early with `StaleTokenSkip` / `UsageReadOutcome.STALE_TOKEN` before `claim_read`. A successful read stores itself and clears `weekly_read_skip` (`usage_store` ~289). The read claim does not stop a re-read right after a renewal. Detect the expired login with `usage_store.latest_read_outcome` / `weekly_read_skip`.
-- `exec_account` calls `os.execvpe`, so the renewal must be a subprocess. `hello.sh` is on `~/.claude` main but not on this branch. Run the command it wraps: `[sys.executable, <scripts>/accounts/accounts.py, "exec", "--probe", label, "-p", "hello"]`, `cwd="/tmp"`, `stdin=subprocess.DEVNULL`, `timeout=120`, output captured and never logged. `--probe` keeps the session from pushing.
-- `run_auto_moves` holds `next_moves_lock`, so no renewal may run under that lock.
-
-**Spec:**
-1. `accounts.renew_login(label) -> LoginRenewed | LoginRenewalFailed(detail: str)`: run the probe subprocess, then read usage again with `agent_accounts.claude_live(claude_account_dir(label))`. The result is `LoginRenewed` only when the probe exits 0 and the new read does not say `STALE_TOKEN`. A non-zero exit, a timeout, a start failure or a still-expired read gives `LoginRenewalFailed` with a short detail (exit status, "timed out after 120 s", or "usage still shows an expired login"). Never put the probe's output in the detail.
-2. `refusal_watch.renew_expired_logins(now, dry_run)` runs on every machine in each `refusal_watch.run` pass, before `run_auto_moves` and outside its lock. For each noted Claude account on this machine whose latest stored read outcome is `STALE_TOKEN`, it calls `renew_login`, at most once per account per 60 minutes. Record each attempt (`at`, outcome, detail) in a small state file beside the refusal-watch state, written atomically. A dry run renews nothing and returns a "would renew claudeN" line. Each attempt returns one line for the pass output: `claudeN login renewed` or `claudeN login renewal failed: <detail>`.
-3. The blocked head: when the target's stored read outcome is `STALE_TOKEN` and its last renewal failed, block with a new `quota_alert.TargetLoginRenewalFailed(detail)` reason, with its own line in `blocked_next_move_line`: "<target>'s login expired, and a probe session on it failed (<detail>). Log in on <target> by hand." It goes to the showrunners by the existing relay, who push the user. Any other expired-login wait keeps `TargetReadingUnavailable`, because the next pass renews it.
-4. The status footnote for `STALE_TOKEN` (`accounts._read_failure_note`): with a failed renewal on record, "login token expired; a probe session at HH:MM failed; log in on it by hand". Otherwise, "login token expired; the next notes pass renews it".
-5. Tests (scratch HOME; patch `subprocess.run` and `claude_live`, never a real session):
-   - `renew_login` gives the right argv, `/tmp`, DEVNULL stdin and a 120 s timeout. A timeout, a non-zero exit and a still-expired read each fail.
-   - The pass renews an expired target, and the due move then goes on in the same pass.
-   - A failed renewal blocks the head with the new reason and its line.
-   - A second pass within 60 minutes runs no probe.
-   - A dry run runs no probe.
-   - An account with a fresh reading is never renewed.
-6. Docs: `docs/accounts.md` (~347, next-move entries need fresh readings) gets the renewal step and the failure line.
+- `refusal_watch.run` first calls `renew_expired_logins`, outside `next_moves_lock`. For each noted Claude account on this machine whose latest stored read outcome is `STALE_TOKEN`, it calls `accounts.renew_login`, at most once per account per 60 minutes. Each attempt (`at`, `renewed`/`failed`, detail) is kept in `~/.local/state/accounts/login_renewals.json`. A dry run says `would renew claudeN`.
+- `renew_login` runs `accounts.py exec --probe <label> -p hello` (the command `hello.sh` wraps) in `/tmp`, with stdin from DEVNULL, a 120 s timeout and captured output that is never logged. It then reads usage with `claude_live` and saves the reading. The result is `LoginRenewed` only for exit 0 and a read that no longer shows an expired login. Otherwise it is `LoginRenewalFailed(detail)`.
+- After a renewal, the rest of the pass uses a clock read taken after the probe, so the new reading is fresh and a due move goes on in the same pass.
+- A move target with an expired login blocks with `TargetReadingUnavailable(<last weekly read time>)` until the next renewal. After a failed probe, it blocks with `quota_alert.TargetLoginRenewalFailed(detail)`: "<group> 1 → claudeN due, claudeN's login expired, and a probe session on it failed (<detail>). Log in on claudeN by hand." This goes by the blocked-head relay to the showrunners, who push the user.
+- The status footnote for an expired login reads "the next notes pass renews it", or "a probe session at HH:MM failed; log in on it by hand". A damaged renewal file reads as no attempts.
 
 **Files:**
-- `scripts/accounts/accounts.py`, `scripts/accounts/refusal_watch.py`, `scripts/whoami/quota_alert.py`
-- `scripts/accounts/test_refusal_watch.py`, `scripts/accounts/test_accounts.py`, `scripts/whoami/test_quota_alert.py`
-- `docs/accounts.md`
+- `scripts/accounts/accounts.py`, `scripts/accounts/refusal_watch.py`, `scripts/whoami/quota_alert.py`; tests in `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/whoami/test_quota_alert.py`; `docs/accounts.md`.
 
-**Workers:** 1 writer. impl owns all files.
-
-**Verification:** `scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.accounts.test_next_moves scripts.whoami.test_quota_alert` with a scratch HOME; basedpyright 0/0 on changed Python files.
-
-**Acceptance gate:**
-- **Renews first:** an expired move target is renewed, and the move goes on in the same pass with no push.
-- **Asks only on failure:** a failed probe gives one blocked line naming the target and the cause.
-- **Suites:** pass, basedpyright 0/0, merge gate passes.
+**Gotchas:**
+- One repair round: the pass first used the clock from before the probe, and `stored_reading` refused the renewed reading as future-dated.
+- The probe holds the refusal-watch lock for up to 120 s per expired account.
