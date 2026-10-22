@@ -27,7 +27,7 @@ Your guild is `units`. Your head is the `units` unit director in the top-level `
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild units
 
-Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
 In Synthesize / FixDispatch, send the units report when `findings.py gate` first
 returns `verdict=dispatch` with `round=4` for a phase instance; a repeated read
 sends no new report. The gate outcome does not change.
@@ -578,6 +578,14 @@ Rules:
   workspace all-targets check and full tests.
 - Non-Rust prompts list the project's exact scoped commands under the same
   run-only-what-is-listed rule.
+- Type checks are per slot. In a Python project, each slot's prompt gets its
+  own line, `basedpyright <the Python files on its Workers line>`, which it
+  runs after its last edit and before it posts `done`. Only the footer counts:
+  it must read `0 errors, 0 warnings, 0 notes` (the exit status says nothing).
+  A plan's folder-wide basedpyright line becomes these per-slot lines; never
+  give one slot a run over files a peer owns. User, 2026-10-21: the impl
+  worker got the phase-wide run, its 13 warnings were in the test worker's
+  files, and the test worker had to be launched again.
 - Prove any claimed pre-existing failure on the pre-phase tree before mentioning
   it. Do not stash; use the existing clean tree or a scratch checkout.
 - Re-run suspected environment failures unsandboxed before classifying them.

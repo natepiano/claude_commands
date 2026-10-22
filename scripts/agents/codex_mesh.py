@@ -83,6 +83,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
 from scripts.lib import unit_runs
+from scripts.guilds.roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.whoami import account
 from scripts.usage import agents_log
@@ -894,6 +895,42 @@ class RosterUnchanged:
 ExpectedRoster = RosterOnThread | RosterAbsent | RosterEndedOnThread | RosterUnchanged
 
 
+@dataclass(frozen=True)
+class WorkerLaunchPolicy:
+    """The worker uses the sandbox selected by its launch arguments."""
+
+
+def roster_access_policy(record: Mapping[str, object]) -> ThreadAccessPolicy | WorkerLaunchPolicy:
+    """Resolve explicit policies and reviewer records made before policies were stored."""
+    if "access_policy" in record:
+        policy = _as_dict(record["access_policy"])
+        if policy.get("kind") == "ReadOnlyReviewer":
+            return ReadOnlyReviewer()
+        if policy.get("kind") == "PhaseBoundDesigner":
+            return PhaseBoundDesigner(_as_int(policy.get("binding_generation")),
+                                      _as_str(policy.get("launch_sandbox")) or WORKER_SANDBOX)
+        raise SystemExit("codex_mesh: invalid access policy; use roles.py recover for a held role")
+    if record.get("held_design_id"):
+        raise SystemExit("codex_mesh: held role has no access policy; use roles.py recover")
+    if record.get("instructions_file"):
+        return ReadOnlyReviewer()
+    return WorkerLaunchPolicy()
+
+
+def _migrate_legacy_reviewers(roster: dict[str, object]) -> dict[str, object]:
+    for name, value in roster.items():
+        entry = _as_dict(value)
+        if "access_policy" not in entry and not entry.get("held_design_id"):
+            if isinstance(roster_access_policy(entry), ReadOnlyReviewer):
+                entry["access_policy"] = {"kind": "ReadOnlyReviewer"}
+                roster[name] = entry
+    return roster
+
+
+def _load_roster_for_write(handle: TextIO) -> dict[str, object]:
+    return _migrate_legacy_reviewers(_as_dict(_loads(handle.read())))
+
+
 def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
                         record: ThreadRecord) -> None:
     previous = _as_dict(roster.get(name))
@@ -951,8 +988,7 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        text = handle.read()
-        roster = _as_dict(_loads(text)) if text.strip() else {}
+        roster = _load_roster_for_write(handle)
         _write_roster_record(handle, roster, name, record)
 
 
@@ -964,8 +1000,7 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        text = handle.read()
-        roster = _as_dict(_loads(text)) if text.strip() else {}
+        roster = _load_roster_for_write(handle)
         previous = _as_dict(roster.get(name))
         if isinstance(expected, RosterAbsent):
             matches = name not in roster
@@ -987,7 +1022,7 @@ def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: 
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry:
             entry["role"] = role
@@ -1007,7 +1042,7 @@ def _mark_roster_ended(session_dir: str, name: str) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry:
             entry["status"] = "ended"
@@ -1025,7 +1060,7 @@ def _mark_all_roster_ended(session_dir: str) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         for name, value in roster.items():
             entry = _as_dict(value)
             if entry:
@@ -1053,15 +1088,13 @@ def _lookup_state(session_dir: str, name: str) -> RosterThread:
 
 
 def _seat_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
-    """Access follows the explicit roster policy, independently of instructions."""
+    """Select the sandbox from the seat's resolved access policy."""
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    policy = _as_dict(record.get("access_policy"))
-    if policy.get("kind") == "ReadOnlyReviewer":
+    policy = roster_access_policy(record)
+    if isinstance(policy, ReadOnlyReviewer):
         return READ_ONLY_SANDBOX
-    if policy.get("kind") == "PhaseBoundDesigner":
-        return _as_str(policy.get("launch_sandbox")) or WORKER_SANDBOX
-    if record.get("instructions_file"):
-        raise SystemExit("codex_mesh: legacy instructions have no explicit access policy; recovery required")
+    if isinstance(policy, PhaseBoundDesigner):
+        return policy.launch_sandbox
     return _as_str(_attr(args, "sandbox")) or WORKER_SANDBOX
 
 
@@ -1124,10 +1157,9 @@ def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, obj
     """Restore a roster thread's standing instructions whenever it is reopened."""
     params: dict[str, object] = {"threadId": thread_id}
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    policy = _as_dict(record.get("access_policy"))
-    if policy.get("kind") in ("ReadOnlyReviewer", "PhaseBoundDesigner"):
-        params["sandbox"] = (READ_ONLY_SANDBOX if policy.get("kind") == "ReadOnlyReviewer"
-                             else _as_str(policy.get("launch_sandbox")))
+    policy = roster_access_policy(record)
+    if isinstance(policy, (ReadOnlyReviewer, PhaseBoundDesigner)):
+        params["sandbox"] = READ_ONLY_SANDBOX if isinstance(policy, ReadOnlyReviewer) else policy.launch_sandbox
         params["approvalPolicy"] = "never"
     instructions_file = _as_str(record.get("instructions_file"))
     if instructions_file:
@@ -1153,7 +1185,7 @@ def _claim_follow(
     with _design_claim_lock(session_dir, name), path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if not _validate_held_claim(name, entry, thread_id):
             return False
@@ -1202,7 +1234,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         status = entry.get("status")
         if expected_thread_id and entry.get("thread_id") != expected_thread_id:
@@ -1381,7 +1413,7 @@ def _note_worker_port(session_dir: str, name: str, launcher_pid: int, port: int)
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry.get("launcher_pid") != launcher_pid:
             return
@@ -1955,8 +1987,12 @@ def _release_held_server(session_dir: str) -> None:
                 with _pending_file(session_dir, name) as pending:
                     def park(message: str) -> None:
                         _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+                    state = _read_live_turn(client, thread_id)
+                    if isinstance(state, ThreadStateUnknown):
+                        if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                            continue
                     _move_queue_to_pending(client, thread_id, park)
-                    if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+                    if not isinstance(state, ThreadIdle):
                         raise SystemExit("RoleNeedsRecovery: old server turn is not proven idle")
                     released = _release_worker_thread(client, thread_id, session_dir)
                     if isinstance(released, WorkerThreadStateUnknown):
@@ -4451,29 +4487,20 @@ def command_send(args: argparse.Namespace) -> int:
         _ = roles.queue_message(design_id, role, _as_str(_attr(args, "source")) or "mesh send", _message_text(args))
         print(f"queued for {target}; holder adds it to the next authorized assignment")
         return 0
-    with _pending_file(session_dir, target) as pending_file:
-        record = _lookup(session_dir, target)
-        if _end_marker_path(session_dir, target).exists():
-            print(f"codex_mesh: {target} is being ended; message not delivered", file=sys.stderr)
-            return 2
-        status = record.get("status", "unknown")
-        if status == CAPACITY_EXHAUSTED:
-            print(
-                f"codex_mesh: {target} is out of retries and has no launcher; a message would start a turn nobody watches (codex_mesh.py end --to {target})",
-                file=sys.stderr,
-            )
-            return 2
-        if _messages_closed(pending_file, record["thread_id"]):
-            print(f"codex_mesh: {target}'s launcher is closing; message not delivered; relaunch the worker", file=sys.stderr)
-            return 2
-        if status not in LAUNCHER_ATTACHED_STATUSES:
-            raise SystemExit(
-                f"codex_mesh: {target} is {status}, not running; read its summary file"
-            )
-        launcher_pid = record.get("launcher_pid")
-        if not isinstance(launcher_pid, int) or launcher_pid <= 0 or not _pid_alive(launcher_pid):
-            print(f"codex_mesh: {target} has no live launcher to read a message; end the worker and relaunch it", file=sys.stderr)
-            return 2
+    if record.get("status") == CAPACITY_EXHAUSTED:
+        print(
+            f"codex_mesh: {target} is out of retries and has no launcher; a message would start a turn nobody watches (codex_mesh.py end --to {target})",
+            file=sys.stderr,
+        )
+        return 2
+    outcome = hold_message(session_dir, target, _message_text(args), without_launcher=True)
+    if isinstance(outcome, WorkerEnded):
+        print(f"codex_mesh: {outcome.reason}; message not delivered", file=sys.stderr)
+        return 2
+    if isinstance(outcome, HeldForNextDispatch):
+        print(f"queued for {target}; no launcher is attached, so the message waits for its next dispatch")
+        return 0
+    if isinstance(outcome, HeldForLauncher):
         home = workers_home()
         # Retiring is enough here. A live launcher keeps its outgoing connection
         # and claims this held message at its next checked turn boundary.
@@ -4481,9 +4508,6 @@ def command_send(args: argparse.Namespace) -> int:
             current = _read_json_object(_session_path(session_dir, SERVER_FILE))
             if current and server_record_home(current) != home:
                 _retire_record(session_dir, current)
-        messages = _pending_for_thread(pending_file, record["thread_id"])
-        messages.append(_message_text(args))
-        _write_pending(pending_file, record["thread_id"], messages)
 
     print(f"queued for {target}")
     return 0
@@ -4625,15 +4649,22 @@ def command_end(args: argparse.Namespace) -> int:
         return 0
     with _pending_file(session_dir, target) as pending_file:
         _end_marker_path(session_dir, target).touch()
-        _ = pending_file.seek(0)
-        _ = pending_file.truncate()
+        if not record.get("held_design_id"):
+            _ = pending_file.seek(0)
+            _ = pending_file.truncate()
     _mark_roster_ended(session_dir, target)
     availability = _server_availability(session_dir)
     dropped = 0
     if isinstance(availability, LiveServer):
         client = Client(availability.port, f"end-{os.getpid()}")
         thread_id = record["thread_id"]
-        dropped = _drop_queued_messages(client, thread_id)
+        if record.get("held_design_id"):
+            with _pending_file(session_dir, target) as pending_file:
+                def park(message: str) -> None:
+                    _write_pending(pending_file, thread_id, [*_pending_for_thread(pending_file, thread_id), message])
+                _move_queue_to_pending(client, thread_id, park)
+        else:
+            dropped = _drop_queued_messages(client, thread_id)
         # A queued message opens a turn the `start` loop never saw, so the
         # roster's id may be stale; the server names the live one.
         state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
@@ -4771,7 +4802,7 @@ def command_reopen(args: argparse.Namespace) -> int:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         status = _as_str(entry.get("status"))
         port = _as_int(entry.get("port"))
@@ -4814,7 +4845,7 @@ def _pause_roster(session_dir: str) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         for name, raw in roster.items():
             record = _as_dict(raw)
             status = _as_str(record.get("status"))
@@ -4859,7 +4890,7 @@ def _pause_roster(session_dir: str) -> None:
             if isinstance(state, (ThreadLive, ThreadIdle)):
                 with path.open("r+", encoding="utf-8") as handle:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                    current = _as_dict(_loads(handle.read()))
+                    current = _load_roster_for_write(handle)
                     entry = _as_dict(current.get(name))
                     if entry.get("status") == "paused" and entry.get("thread_id") == thread_id:
                         entry["paused_turn"] = isinstance(state, ThreadLive)
@@ -4958,6 +4989,13 @@ class CurrentRunServer:
 
 
 @dataclass(frozen=True)
+class HeldDesignServer:
+    """A durable mesh's current server belongs to a role still held for design work."""
+
+    session_dir: Path
+
+
+@dataclass(frozen=True)
 class RetiredRunServer:
     """A run's mesh_retired.json names this server until it becomes idle."""
 
@@ -4983,6 +5021,7 @@ class UnreadServerOwnership:
 
 KnownServerOwnership = (
     CurrentRunServer
+    | HeldDesignServer
     | RetiredRunServer
     | UnownedServerWithLog
     | UnownedServerWithoutLog
@@ -5008,7 +5047,7 @@ class CheckedRunLifecycle:
 
 @dataclass(frozen=True)
 class UncheckedRunLifecycle:
-    """The per-server idle watcher deliberately did not inspect run markers."""
+    """Run-liveness checks do not apply to this owner or this idle-watcher judgment."""
 
 
 RunLifecycle = CheckedRunLifecycle | UncheckedRunLifecycle
@@ -5069,14 +5108,17 @@ def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...
         return ServerInUse("a worker's launcher is still running: " + ", ".join(facts.live_launchers))
     if facts.age_secs < SERVER_IDLE_SECS:
         return ServerInUse(f"started {facts.age_secs / 60:.0f} min ago")
+    folder_kind = "mesh" if isinstance(facts.ownership, HeldDesignServer) else "run"
     if facts.quiet_secs is not None and facts.quiet_secs < SERVER_IDLE_SECS:
-        return ServerInUse(f"its run folder changed {facts.quiet_secs / 60:.0f} min ago")
+        return ServerInUse(f"its {folder_kind} folder changed {facts.quiet_secs / 60:.0f} min ago")
     if busy := busy_threads():
         return ServerInUse("a conversation is not idle: " + "; ".join(busy))
     if not facts.folder_exists:
-        folder = "its run folder was deleted"
+        folder = f"its {folder_kind} folder was deleted"
     else:
         folder = "no activity file" if facts.quiet_secs is None else f"quiet for {facts.quiet_secs / 3600:.1f} h"
+    if isinstance(facts.ownership, HeldDesignServer):
+        return ServerUnused(f"no client, no launcher, no conversation mid-turn; mesh folder: {folder}")
     return ServerUnused(f"no client, no launcher, no active marker, no conversation mid-turn, {folder}")
 
 
@@ -5895,6 +5937,13 @@ def _server_ownership(
                 or (quiet is not None and quiet < SERVER_IDLE_SECS)
             ):
                 return CurrentRunServer(folder)
+        from scripts.guilds import roles
+        for folder in roles.durable_meshes():
+            if _record_names_server(_read_json_object(folder / SERVER_FILE), pid, port) and any(
+                _as_dict(entry).get("held_design_id")
+                for entry in _read_json_object(folder / ROSTER_FILE).values()
+            ):
+                return HeldDesignServer(folder)
     for folder in folders:
         if _retired_file_names_server(folder / RETIRED_FILE, pid, port):
             return RetiredRunServer(folder)
@@ -6013,10 +6062,12 @@ def _judge(roots: tuple[Path, ...] | None, pid: int, port: int, age: float,
     ownership = _server_ownership(roots, pid, port, stderr)
     folder = None if isinstance(ownership, UnownedServerWithoutLog) else ownership.session_dir
     exists = folder is not None and folder.is_dir()
-    lifecycle: RunLifecycle = UncheckedRunLifecycle() if roots is None or folder is None else CheckedRunLifecycle(
-        _marked_active(roots, folder),
-        _running_roster_workers(folder) if exists else (),
-    )
+    lifecycle: RunLifecycle = UncheckedRunLifecycle()
+    if roots is not None and isinstance(ownership, CurrentRunServer):
+        lifecycle = CheckedRunLifecycle(
+            _marked_active(roots, ownership.session_dir),
+            _running_roster_workers(ownership.session_dir) if exists else (),
+        )
     facts = ServerFacts(
         pid, port, age, clients, ownership, exists, lifecycle,
         live_launchers=_live_launchers(folder) if folder is not None and exists else (),
@@ -6038,7 +6089,7 @@ def _stop_unused(
     launcher to wait and is not created again for the lock."""
     if isinstance(ownership, UnownedServerWithoutLog):
         return _stop_unused_with_lock_held(roots, pid, port)
-    if not isinstance(ownership, (CurrentRunServer, RetiredRunServer, UnownedServerWithLog)):
+    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer, UnownedServerWithLog)):
         return False
     folder = ownership.session_dir
     if not folder.is_dir():
@@ -6065,7 +6116,7 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
     if isinstance(judgment.ownership, UnownedServerWithoutLog):
         return True
     ownership = judgment.ownership
-    if not isinstance(ownership, (CurrentRunServer, RetiredRunServer, UnownedServerWithLog)):
+    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer, UnownedServerWithLog)):
         return False
     folder = ownership.session_dir
     if folder.is_dir():
@@ -6937,7 +6988,7 @@ def command_set_instructions(args: argparse.Namespace) -> int:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry.get("thread_id") != state.thread_id or entry.get("status") != "done":
             print(f"codex_mesh: {name}: worker changed while setting instructions; instructions unchanged",
@@ -6959,7 +7010,7 @@ def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_p
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if (entry.get("thread_id") != thread_id or entry.get("status") != "starting"
                 or entry.get("launcher_pid") != launcher_pid):
@@ -7157,7 +7208,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = release_follow.add_argument("--claim-pid", type=int, required=True)
     release_follow.set_defaults(handler=command_release_follow)
 
-    send = subparsers.add_parser("send", help="queue a message for a delegate")
+    send = subparsers.add_parser(
+        "send", help="queue a message for a delegate; without a launcher it waits for the next dispatch")
     _ = send.add_argument("--session-dir", required=True)
     _ = send.add_argument("--to", required=True)
     send_body = send.add_mutually_exclusive_group(required=True)

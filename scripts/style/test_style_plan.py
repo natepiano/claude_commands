@@ -10,7 +10,9 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import cast, final, override
@@ -238,6 +240,63 @@ class StylePlanTests(unittest.TestCase):
                 self.assertEqual(style_plan.next_phase(unit, retained, self.repo),
                                  style_plan.Resumed(f"{unit}-1"))
                 self.ledger().ticket_drop(f"{unit}-1")
+
+    def test_concurrent_refills_read_committed_tickets_and_choose_disjoint_files(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        types = self.root / "types"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-types", str(types))
+        types_plan = types / "docs/style-production/units/types-unit.md"
+        types_plan.parent.mkdir(parents=True)
+        _ = types_plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
+        _ = self.doc.write_text(self.doc.read_text() +
+                                f"| types-unit | docs/style-production/units/types-unit.md | {types} | demo-style-types |\n")
+        self.sync()
+        names_candidates = self.candidates("names")
+        types_candidates = self.candidates("types")
+        self.assertTrue(set(names_candidates[0].files) & set(types_candidates[0].files))
+        read_busy = style_plan.busy_files
+
+        for selection_pass in (1, 2):
+            with self.subTest(selection_pass=selection_pass):
+                _ = self.plan.write_text(self.plan_header())
+                _ = types_plan.write_text(self.plan_header().replace("names-unit", "types-unit"))
+                first_read, second_read = threading.Event(), threading.Event()
+                reads = {"names-unit": 0, "types-unit": 0}
+                second_saw_committed_ticket: list[bool] = []
+
+                def read_during_refill(
+                    repo: Path, doc: Path, ledger: style_ledger.Ledger, unit: str, board: berth_board.Board,
+                ) -> style_plan.BusyFiles:
+                    busy = read_busy(repo, doc, ledger, unit, board)
+                    reads[unit] += 1
+                    if reads[unit] < selection_pass:
+                        return style_plan.BusyFiles(board, frozenset(self.sources))
+                    if unit == "names-unit":
+                        first_read.set()
+                        _ = second_read.wait(1)
+                    else:
+                        second_saw_committed_ticket.append(bool(ledger.ticket_open("names-unit")))
+                        second_read.set()
+                    return busy
+
+                with (mock.patch.object(style_plan, "busy_files", side_effect=read_during_refill),
+                      ThreadPoolExecutor(max_workers=2) as pool):
+                    first = pool.submit(style_plan.next_phase, "names-unit", self.plan, self.repo)
+                    self.assertTrue(first_read.wait(5), "first refill did not read busy files")
+                    second = pool.submit(style_plan.next_phase, "types-unit", types_plan, self.repo)
+                    first_result, second_result = first.result(timeout=10), second.result(timeout=10)
+                self.assertIsInstance(first_result, style_plan.PhaseWritten)
+                self.assertIsInstance(second_result, style_plan.PhaseWritten)
+                ledger = self.ledger()
+                first_ticket = ledger.ticket_open("names-unit")[0]
+                second_ticket = ledger.ticket_open("types-unit")[0]
+                ledger.ticket_drop(first_ticket["id"])
+                ledger.ticket_drop(second_ticket["id"])
+                self.assertEqual(second_saw_committed_ticket, [True], "second read preceded the first ticket commit")
+                self.assertTrue(first_ticket["files"])
+                self.assertTrue(second_ticket["files"])
+                self.assertTrue(set(first_ticket["files"]).isdisjoint(second_ticket["files"]))
 
     def test_full_id_queue_reads_retained_plan_settings_and_only_declared_units(self) -> None:
         _ = self.rule("read")

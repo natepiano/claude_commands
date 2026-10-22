@@ -164,6 +164,8 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 5. When the pushed branch-point tip is not in the synced tip, record a sync wait and exit 3.
 6. Read the board (unavailable → exit 4, no ticket). Run `_select_phase`. On no work, record a sync wait, read the board again and select once more, so a wake that arrives between the check and the wait is not lost.
 
+**Refill lock.** `style_ledger.refill_lock(repo)` is a context manager beside `open_ledger`. It opens `refill.lock` (mode `"a"`) in the ledger folder, makes the folder when it is absent, and holds an exclusive `fcntl.flock` for the `with` body. One ledger gives one lock per style production. The lock blocks and has no timeout. `next_phase` takes it once for each selection pass, in two separate `with` blocks. Each block covers the board read, the busy-files read, `_select_phase` with its ticket add and assignment, the sync-wait clear and the return. Both ticket writes commit before the lock is released. So the next unit's `busy_files` reads those files as busy through `unit_file_holders`, and units that refill at the same time get disjoint files. The rule catalog read (`rules.load_rules`) runs once before the first block and serves both passes. The sync wait runs between the two blocks. Both are outside the lock. `queue` takes no lock.
+
 `_select_phase` order: the oldest queued ticket is assigned under its own id when its files are free and in scope, and every other queued ticket is dropped (`dropped <id>: files busy|outside pilot scope`). Then approved decisions for the unit: the declaration step runs once, findings whose file is gone or whose site moved to another file are waived with the actor `WaiveByLedger()` and print a waive line, and each decision gives one `proposal` ticket of free, in-scope files (structure limits when a restructure finding is present). Then coverage through `_tickets_from`. No candidate: exit 6 when a stored style branch would change left-out cells, else `waiting for structure` or `waiting for sync`.
 
 | Exit | Output |
@@ -306,6 +308,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - Read committed trees only through git objects (`ls-tree`, `cat-file --batch`), never `git archive`.
 - `rule_counts` is the one per-rule reader. The report's header numbers come from `summary_of`; the report defines no second count.
 - Ledger writers do git, file and catalog work before `BEGIN IMMEDIATE`, recheck their rows under the lock, and use `retry_on_change`.
+- `refill_lock` covers only the board read, busy-files read, selection and ticket writes of one refill pass. It never covers the catalog read, the sync wait, a judge run or any work after `next_phase` returns.
 - `phase_text` takes only the ticket record, pinned texts and Delegation Context, so a rebuild is byte-identical. Pinned text comes from the ledger, never the live catalog.
 - Plan and pin writes use `atomic_write`.
 - The style showrunner's unit-checkpoint merge keeps the unit tip an ancestor, so the unit's next `--ff-only` merge succeeds. Standing units never make `--no-ff` merges.
@@ -345,6 +348,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - cargo-berth exits 4 for an unconfigured repo and for an unreadable ledger; only the envelope status tells them apart.
 - Refill does not fetch. It reads the local `origin/<style branch>` and `origin/<branch point>` refs, so a stale tracking ref gives exit 3 until a fetch updates it. A branch point that is not pushed reads as missing.
 - `RepairFirst` returns before the discard, so finished phases stay until the repair clears. `board unavailable` records no ticket, but the discard may have already rewritten the plan.
+- `rules.load_rules` takes 4.5 s warm and 21 s cold on cargo-liner. Keep it, and every other read of no shared state, outside the refill lock: work inside the lock delays the refill of every other unit.
 - `ticket_base` refuses every state but `assigned` until a base is stored.
 - A `checkpointed` ticket blocks the unit's next `assign` until `ticket merge`.
 - `git add` on a path under the shared exclude exits 1 without `-f`; stage from `git status --porcelain`.
@@ -374,6 +378,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 ## Why
 
 - **Rule ids, not stems:** two rules can share a stem (a global and a member-local rule).
+- **A refill lock, not a judge tie-break:** without the lock, units that refill at the same time all read the ledger before any of them adds a ticket. They then get the same files, and their judges yield to each other's reservations. With the lock, two units cannot select the same file, so judges need no tie-break rule.
 - **`load_rules` reads the folder layout:** `load-rust-style.sh` filters drop tool-enforced and Bevy rules.
 - **No generator is `surface: whole`:** the generators miss cases (unlisted registrations, bare-name trait counting), so each listed rule needs a tier C read of its uncovered surface.
 - **Unclassified, not an error:** a machine whose nate_style lacks metadata must still load and list, but never count coverage.

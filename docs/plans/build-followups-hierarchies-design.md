@@ -32,7 +32,7 @@ Production references use these files. They came from `~/.claude/scripts/lib/py 
 | --- | --- | --- |
 | C01 | user | Find the hierarchy that delivers Hana fastest within the user's constraints. Fewer layers alone do not define success. Source: user, 2026-10-20, [unit plan, Source and Decisions](build-followups-hierarchies.md). |
 | C02 | user | Keep top-level showrunners as peers. The user wants a flat organization. Source: user, 2026-10-20, `nixos/flat-organization.md`; sdlc, Production rules. |
-| C03 | user | Make sdlc, the chief designer, and the chief reviewer top-level peers. The guild heads are not sdlc units. Source: user, 2026-10-20, sdlc, Guild heads and Production rules. |
+| C03 | user | The guild heads are not sdlc units. As built, the four heads (`designers`, `reviewers`, `showrunners`, `units`) are unit directors under the top-level `guilds` production, a peer of sdlc (user G1b, `docs/plans/sdlc-production.md`; `docs/as-built/guilds.md`). |
 | C04 | user | Ask the user before promotions, unit renames, role changes, or process changes during this redesign. Source: user, 2026-10-20, `nixos/process-redesigns-are-questions.md`; sdlc, Production rules. |
 | C05 | user | The user decides real scope changes, irreversible actions, and choices about their priorities, money, licences, or intended use. Source: `~/.claude/docs/decision_criteria.md`, DecisionEconomy; user, 2026-10-12, `hana/tool-design-changes-are-the-users.md`. |
 | C06 | user | Decide obvious, reversible choices. Record each self-made call and its risk in one line. Source: `~/.claude/docs/decision_criteria.md`, DecisionEconomy. |
@@ -106,10 +106,10 @@ These rows describe contracts. They do not assign new duties.
 | Pooled reviewer | `docs/production_format.md`, Words and item 16 | Reviews read-only in a persistent thread | Unit director through review lease |
 | Review template | `docs/production_format.md`, Words | Holds the standing review prompt | Review-pool scripts; never leased |
 | Small-fix helper | `nixos/small-fixes-by-subagent-in-main.md` | Writes a small unowned fix in place | Sending showrunner |
-| Chief designer, planned | sdlc production, Guild heads | Heads designer guild; role design pending | User; peer of other top-level heads |
-| Chief reviewer, planned | sdlc production, Guild heads | Heads reviewer guild; role design pending | User; peer of other top-level heads |
+| Guilds showrunner | `docs/plans/guilds-production.md` | Runs the top-level `guilds` production and its four head units | User; peer of other top-level showrunners |
+| Guild head (`designers`, `reviewers`, `showrunners`, `units`) | `docs/as-built/guilds.md`, Guilds and heads | Unit director that keeps its guild's tips | Guilds showrunner |
 
-`astra-designer` and `astra-reviewer` are temporary internal IDs. cargo-liner settles the names with the user. Source: sdlc production, Guild heads.
+`astra-designer` and `astra-reviewer` name the held per-design roles and their census edges, not the heads. Goddess names are on hold. Source: `docs/as-built/guilds.md`, Names.
 
 ### Productions
 
@@ -122,8 +122,8 @@ The current edges below come from `~/.claude/scripts/lib/py scripts/production/s
 | cargo-liner-style | cargo-liner-style | remove-running-section | cargo-liner-style production, Kind and Parent production |
 | tool-based-ui | hana | None | tool-based-ui production, Production Context; Hana product |
 | sdlc | sdlc | None | Planned in sdlc production; already listed by tree |
-| Chief designer | `astra-designer` | Planned top level | sdlc production, Guild heads |
-| Chief reviewer | `astra-reviewer` | Planned top level | sdlc production, Guild heads |
+| Guild heads | `designers`, `reviewers`, `showrunners`, `units` | Unit directors under top-level `guilds` | `docs/as-built/guilds.md` |
+| Astra designer / reviewer | `astra-designer` / `astra-reviewer` | Held per-design roles under a unit director or showrunner | `docs/as-built/guilds.md` |
 
 The style child is an observed edge, not approval to add more levels. The flat-organization constraint remains the target. Source: current tree; user, 2026-10-20, `nixos/flat-organization.md`.
 
@@ -167,7 +167,7 @@ The command files in the last column define each path. Script paths are relative
 | --- | --- | --- |
 | hierarchies-unit | Structure, priority ownership, work admission, capacity sharing, user contact, and measurement | Unit plan, Scope beside sdlc |
 | sdlc roles-unit | Role duties and names | sdlc production, Unit scopes |
-| sdlc guilds-unit | Designer and reviewer roles and guild design | sdlc production, Unit scopes |
+| sdlc guild-process-unit | Process changes for the guilds and the lasting designer and reviewer roles | sdlc production, Units |
 | sdlc phases-unit | Phase process, design and document preparation | sdlc production, Unit scopes |
 | sdlc fix-rounds-unit | Repair-round study and proposed changes | sdlc production, Unit scopes |
 
