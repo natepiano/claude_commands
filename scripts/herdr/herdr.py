@@ -2135,6 +2135,14 @@ def save_shared_layout(running: set[str]) -> None:
             client.save_layout()
 
 
+def reload_agent_rules(name: str) -> None:
+    """Make the running session `name` read its agent detection rules again; a failure is a line on stderr."""
+    try:
+        _ = Herdr(name).run("server", "reload-agent-manifests")
+    except HerdrFailure as error:
+        print(f"herdr {name}: detection rules not reloaded: {error}", file=sys.stderr)
+
+
 def close_agent(session: str, pane: str) -> None:
     """End one Claude session's place: its tab in the shared session, else its own session."""
     if session and session == shared_session():

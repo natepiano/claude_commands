@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast, override
@@ -14,6 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
+from scripts.guilds import roles  # noqa: E402
 
 SCRIPT = Path(__file__).with_name("astra_roles.py")
 
@@ -31,7 +35,9 @@ class AstraRolesTests(unittest.TestCase):
         self.state, self.mesh_run, self.home = (self.root / name for name in ("roles", "mesh", "codex-home"))
         self.mesh_run.mkdir()
         self.home.mkdir()
-        self.environment = {**os.environ, "ASTRA_ROLES_STATE": str(self.state), "HOME": str(self.root)}
+        self.environment = {**os.environ, "ASTRA_ROLES_STATE": str(self.state), "HOME": str(self.root),
+                            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
+                            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")}
         _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
         self.roster("running")
         _ = (self.mesh_run / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.home)}))
@@ -53,6 +59,49 @@ class AstraRolesTests(unittest.TestCase):
         shown = self.command("list", "--json")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         return cast(list[dict[str, object]], json.loads(shown.stdout))
+
+    def test_durable_lifetime_round_trip_survives_failed_mesh_and_ends_only_with_its_instance(self) -> None:
+        design_id = "00000000-0000-4000-8000-000000000066"
+        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
+            str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
+            roles.UnitHolder("demo", "design-unit"), roles.DesignUnbound(),
+            (roles.RoleInstance("designer", "lasting-alias", roles.RoleNeedsRecovery("thread-lasting", "server gone")),
+             roles.RoleInstance("reviewer", "unused-reviewer", roles.RoleNotOpened())))
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(roles, "resolve_holder", return_value=roles.HolderReach("restarted-holder")):
+            roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            mesh = roles.mesh_directory(design_id)
+            mesh.mkdir(parents=True)
+            _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-alias": {
+                "thread_id": "thread-lasting", "status": "failed"}}))
+            held = astra_roles.hold("designer", "thread-lasting", str(self.home), manager="old-holder",
+                                    design_id=design_id, role_id="designer")
+            self.assertEqual(held["lifetime"], astra_roles.HeldDesignRole(design_id, "designer"))
+            record = cast(dict[str, object], json.loads((self.state / "thread-lasting.json").read_text()))
+            self.assertEqual({key: record[key] for key in ("design_id", "role_id", "session_dir", "worker", "pid")},
+                             {"design_id": design_id, "role_id": "designer", "session_dir": None, "worker": None, "pid": None})
+            live = astra_roles.live_roles()
+            self.assertEqual([(entry["thread_id"], entry["manager"], entry["state"]) for entry in live],
+                             [("thread-lasting", "restarted-holder", "idle")])
+            ended = replace(design, roles=(replace(design.roles[0], lifecycle=roles.RoleEnded("thread-lasting")), design.roles[1]))
+            roles._save(ended)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(astra_roles.live_roles(), [])
+            self.assertFalse((self.state / "thread-lasting.json").exists())
+
+    def test_durable_record_refuses_mixed_lifetimes_wrong_role_and_unknown_keys(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            _ = astra_roles.hold("reviewer", "thread-durable", str(self.home), manager="holder",
+                                 design_id="00000000-0000-4000-8000-000000000067", role_id="reviewer")
+            path = self.state / "thread-durable.json"
+            valid = cast(dict[str, object], json.loads(path.read_text()))
+            for changes in ({"pid": os.getpid()}, {"session_dir": str(self.mesh_run), "worker": "project-design"},
+                            {"role_id": "designer"}, {"design_id": ""}, {"extra": "unknown"}):
+                with self.subTest(changes=changes), contextlib.redirect_stderr(io.StringIO()) as errors:
+                    _ = path.write_text(json.dumps({**valid, **changes}))
+                    self.assertEqual(astra_roles.live_roles(), [])
+                    self.assertEqual(len(errors.getvalue().splitlines()), 1)
+                    self.assertIn(str(path), errors.getvalue())
+                    self.assertTrue(path.exists())
 
     def test_mesh_hold_reads_the_thread_and_account_and_defaults_to_the_calling_manager(self) -> None:
         self.environment["CLAUDE_CODE_SESSION_ID"] = "sid-director"

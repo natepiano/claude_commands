@@ -100,6 +100,36 @@ class InventoryTests(ShutdownTestCase):
         self.assertEqual(seats["idle"], record.PausedSeat(run_dir=str(run), seat="idle", role="impl", thread_id="idle-thread", turn_live=False, launcher_command=[]))
         self.assertEqual(seats["orphan"]["launcher_command"], [])
 
+    def test_codex_seats_leaves_out_a_run_its_director_left_after_an_earlier_stop_offered_it(self) -> None:
+        def run_with(name: str, statuses: dict[str, str], *, board_at: int, offered_at: int | None) -> Path:
+            run = self.root / name
+            run.mkdir()
+            _ = (run / "mesh_roster.json").write_text(json.dumps({
+                seat: {"role": "test", "thread_id": f"{seat}-thread", "status": status}
+                for seat, status in statuses.items()
+            }))
+            board = run / "board.log"
+            _ = board.write_text("[director] dispatch\n")
+            os.utime(board, (board_at, board_at))
+            if offered_at is not None:
+                for seat in statuses:
+                    prompt = run / f"{seat}.resume-prompt.md"
+                    _ = prompt.write_text("paused\n")
+                    os.utime(prompt, (offered_at, offered_at))
+            return run
+
+        left = run_with("left", {"a75-test": "paused", "p39a-impl": "paused"}, board_at=1_000, offered_at=2_000)
+        taken_back = run_with("taken back", {"impl": "paused"}, board_at=3_000, offered_at=2_000)
+        dispatched = run_with("dispatched", {"impl": "paused", "test": "done"}, board_at=1_000, offered_at=2_000)
+        never_offered = run_with("never offered", {"impl": "paused"}, board_at=1_000, offered_at=None)
+
+        found = inventory.codex_seats([left, taken_back, dispatched, never_offered])
+
+        self.assertEqual(
+            sorted((Path(seat["run_dir"]).name, seat["seat"]) for seat in found),
+            [("dispatched", "impl"), ("dispatched", "test"), ("never offered", "impl"), ("taken back", "impl")],
+        )
+
     def test_old_shutdown_record_reads_back_without_codex_seats_and_new_seats_survive_wire_roundtrip(self) -> None:
         saved = entry(top_level("legacy-director"))
         document = cast(dict[str, object], json.loads(json.dumps(saved)))

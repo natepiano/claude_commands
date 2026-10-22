@@ -29,6 +29,9 @@ from showrunners import canonical_slug
 from add_unit import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
+# /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
+ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
+
 
 class ValidateAndPush(NamedTuple):
     pass
@@ -888,6 +891,14 @@ def pull_mac_checkout(mac: PurePosixPath, source: Path) -> None:
                    "the showrunner will repair the Mac pull and rerun this checkpoint")
 
 
+def send_queued_zone() -> None:
+    """Send a /zone change queued while the Mac was offline: the pull just done carried its commit."""
+    done = subprocess.run([sys.executable, str(ZONE_SCRIPT), "drain", "--pulled"],
+                          capture_output=True, text=True, check=False)
+    for line in done.stdout.splitlines():
+        report("promote", "ok", line)
+
+
 def promote(request: MergeRequest | ChildHandoffRequest, tip: str) -> None:
     if isinstance(request.promotion, NoPromotion):
         report("promote", "ok", "no promotion configured")
@@ -909,6 +920,7 @@ def promote(request: MergeRequest | ChildHandoffRequest, tip: str) -> None:
         source = request.promotion.checkouts[0] if request.promotion.checkouts else request.production.checkout
         pull_mac_checkout(mac, source)
         report("promote", "ok", f"mac {mac} main pulled")
+        send_queued_zone()
         into(mac, "main", "sessions on mac run the installed commands from it",
              f"the live gate of {label}")
 
