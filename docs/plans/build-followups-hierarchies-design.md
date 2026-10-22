@@ -33,7 +33,7 @@ Production references use these files. They came from `~/.claude/scripts/lib/py 
 | --- | --- | --- |
 | C01 | user | Find the hierarchy that delivers Hana fastest within the user's constraints. Fewer layers alone do not define success. Source: user, 2026-10-20, [unit plan, Source and Decisions](build-followups-hierarchies.md). |
 | C02 | user | Keep top-level showrunners as peers. The user wants a flat organization. Source: user, 2026-10-20, `nixos/flat-organization.md`; sdlc, Production rules. |
-| C03 | user | Make sdlc, the chief designer, and the chief reviewer top-level peers. The guild heads are not sdlc units. Source: user, 2026-10-20, sdlc, Guild heads and Production rules. |
+| C03 | user | The guild heads are not sdlc units. As built, the four heads (`designers`, `reviewers`, `showrunners`, `units`) are unit directors under the top-level `guilds` production, a peer of sdlc (user G1b, `docs/plans/sdlc-production.md`; `docs/as-built/guilds.md`). |
 | C04 | user | Ask the user before promotions, unit renames, role changes, or process changes during this redesign. Source: user, 2026-10-20, `nixos/process-redesigns-are-questions.md`; sdlc, Production rules. |
 | C05 | user | The user decides real scope changes, irreversible actions, and choices about their priorities, money, licences, or intended use. Source: `~/.claude/docs/decision_criteria.md`, DecisionEconomy; user, 2026-10-12, `hana/tool-design-changes-are-the-users.md`. |
 | C06 | user | Decide obvious, reversible choices. Record each self-made call and its risk in one line. Source: `~/.claude/docs/decision_criteria.md`, DecisionEconomy. |
@@ -111,12 +111,10 @@ These rows describe contracts. They do not assign new duties.
 | Pooled reviewer | `docs/production_format.md`, Words and item 16 | Reviews read-only in a persistent thread | Unit director through review lease |
 | Review template | `docs/production_format.md`, Words | Holds the standing review prompt | Review-pool scripts; never leased |
 | Small-fix helper | `nixos/small-fixes-by-subagent-in-main.md` | Writes a small unowned fix in place | Sending showrunner |
-| Lasting Astra designer | `origin/sdlc-guilds 7c162e23:docs/plans/sdlc-guilds-design.md`, Roles | One per design; instance `<production>-<area>-astra-designer` | One holder per design: its unit director or showrunner |
-| Lasting Astra reviewer | Same design, Roles | At most one per design; instance `<production>-<area>-astra-reviewer` | Same holder rule; retained across design revisions |
-| Chief designer, planned | Same design; sdlc production, Guild heads | Heads the designer guild after role and membership gates pass | User; top-level peer |
-| Chief reviewer, planned | Same design; sdlc production, Guild heads | Heads the reviewer guild after role and membership gates pass | User; top-level peer |
+| Guilds showrunner | `docs/plans/guilds-production.md` | Runs the top-level `guilds` production and its four head units | User; peer of other top-level showrunners |
+| Guild head (`designers`, `reviewers`, `showrunners`, `units`) | `docs/as-built/guilds.md`, Guilds and heads | Unit director that keeps its guild's tips | Guilds showrunner |
 
-`astra-designer` and `astra-reviewer` are temporary head IDs, separate from the per-design instance names. cargo-liner settles head names with the user. Guild names and review-guild membership remain open user choices in guilds-unit; this document chooses neither. Source: `docs/plans/sdlc-guilds-design.md` on `origin/sdlc-guilds 7c162e23`, Roles, Choices, and Steps. Each design has one holder, which may be a unit director or a showrunner. The two guilds' heads start only after the lasting-role and membership gates pass; no head starts from this document.
+`astra-designer` and `astra-reviewer` name the held per-design roles and their census edges, not the heads. Goddess names are on hold. Source: `docs/as-built/guilds.md`, Names.
 
 ### Productions
 
@@ -130,8 +128,8 @@ The current edges below come from `~/.claude/scripts/lib/py scripts/production/s
 | tool-based-ui | hana | None | tool-based-ui production, Production Context; Hana product |
 | sdlc | sdlc | None | Running; sdlc production, Production Context |
 | performance | fps | tool-based-ui | Created 2026-10-20 after the Baseline; four units; performance production, Production Context and Units |
-| Chief designer | `astra-designer` | Planned top level | sdlc production, Guild heads |
-| Chief reviewer | `astra-reviewer` | Planned top level | sdlc production, Guild heads |
+| Guild heads | `designers`, `reviewers`, `showrunners`, `units` | Unit directors under top-level `guilds` | `docs/as-built/guilds.md` |
+| Astra designer / reviewer | `astra-designer` / `astra-reviewer` | Held per-design roles under a unit director or showrunner | `docs/as-built/guilds.md` |
 
 The style and performance child edges remain observed edges. C02 keeps top-level showrunners as peers; Q6 asks how to resolve the new records without proposing an edge. The live tree labels performance’s showrunner `performance`; its production document names the session `fps`. This is a source difference, not a rename decision. Sources: live `showrunners.py list` and `tree`, and the production documents read for this fold.
 
@@ -175,7 +173,7 @@ The command files in the last column define each path. Script paths are relative
 | --- | --- | --- |
 | hierarchies-unit | Structure, priority ownership, work admission, capacity sharing, user contact, and measurement | Unit plan, Scope beside sdlc |
 | sdlc roles-unit | Role duties and names | sdlc production, Unit scopes |
-| sdlc guilds-unit | Designer and reviewer roles and guild design | sdlc production, Unit scopes |
+| sdlc guild-process-unit | Process changes for the guilds and the lasting designer and reviewer roles | sdlc production, Units |
 | sdlc phases-unit | Phase process, design and document preparation | sdlc production, Unit scopes |
 | sdlc fix-rounds-unit | Repair-round study and proposed changes | sdlc production, Unit scopes |
 
@@ -396,7 +394,7 @@ In **Flow to Hana main**, `goal 1 Hana-project issues closed` is 2, n=2, and `go
 
 ### Rules shared by all candidates
 
-Top-level showrunners stay peers: build-followups, remove-running-section, tool-based-ui, sdlc, and the planned chief designer and chief reviewer. Keep cargo-liner-style under remove-running-section and performance under tool-based-ui while Q6 is open. Propose no new showrunner or unit. All candidates use guilds-unit's lasting Astra designer and Astra reviewer roles, one holder per design (unit director or showrunner), and `<production>-<area>-astra-designer` / `<production>-<area>-astra-reviewer` instance names. Heads start after the role and membership gates. Guild names and review membership stay with the user's open guilds-unit choices. Source: Map, Roles; `origin/sdlc-guilds 7c162e23:docs/plans/sdlc-guilds-design.md`.
+Top-level showrunners stay peers: build-followups, remove-running-section, tool-based-ui, sdlc and guilds. Keep cargo-liner-style under remove-running-section and performance under tool-based-ui while Q6 is open. Propose no new showrunner or unit. All candidates use guilds-unit's lasting Astra designer and Astra reviewer roles, one holder per design (unit director or showrunner), and `<production>-<area>-astra-designer` / `<production>-<area>-astra-reviewer` instance names. Heads start after the role and membership gates. Guild names and review membership stay with the user's open guilds-unit choices. Source: Map, Roles; `origin/sdlc-guilds 7c162e23:docs/plans/sdlc-guilds-design.md`.
 
 Peers read the one global `backlog_rank`. The watcher computes scores and ranks; no workflow writes ranks directly. hana may propose re-ratings through `/prioritize`, with user approval; it does not maintain a separate backlog or command peers. Goal order gives a soft score bonus, not strict lanes. Sources: `commands/prioritize.md:51` and `~/rust/hanadocs/prioritization goals.md:9`. Demo and herdr keep their standing priority under C23. User-ordered work stays admitted under C05; a peer records an exception instead of refusing the user.
 

@@ -73,7 +73,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Generator, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -315,6 +315,7 @@ class ServerRecord(TypedDict):
     pid: int
     codex_home: NotRequired[str]
     auto_compact_tokens: NotRequired[int]
+    guild_context: NotRequired[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -349,7 +350,21 @@ class RolelessThread:
 RosterRole = AssignedDelegateRole | RolelessThread
 
 
-class FollowableRecord(TypedDict):
+class WorkerTaskRecord(TypedDict):
+    task: NotRequired[str]
+    model: NotRequired[str]
+    effort: NotRequired[str]
+    held_design_id: NotRequired[str]
+    held_role: NotRequired[str]
+    access_policy: NotRequired[dict[str, object]]
+    authorized_prompt: NotRequired[str]
+    authorized_generation: NotRequired[int]
+    authorized_holder: NotRequired[str]
+    transferring_role: NotRequired[dict[str, object]]
+    role_redirect: NotRequired[dict[str, object]]
+
+
+class FollowableRecord(WorkerTaskRecord):
     paused_from: NotRequired[str]
     paused_turn: NotRequired[bool]
     thread_id: str
@@ -363,7 +378,7 @@ class FollowableRecord(TypedDict):
 
 # `port` is the app-server the worker's launcher is attached to. It stays the worker's way in while
 # that launcher lives, even after the run has moved to a newer server.
-class ActiveRecord(TypedDict):
+class ActiveRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["running"]
     revision: NotRequired[int]
@@ -376,7 +391,7 @@ class ActiveRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class StartingRecord(TypedDict):
+class StartingRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["starting"]
     previous_role: NotRequired[WorkerRole]
@@ -390,7 +405,7 @@ class StartingRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class WaitingCapacityRecord(TypedDict):
+class WaitingCapacityRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["waiting_capacity"]
     revision: NotRequired[int]
@@ -402,7 +417,7 @@ class WaitingCapacityRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class ExhaustedRecord(TypedDict):
+class ExhaustedRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["capacity_exhausted"]
     revision: NotRequired[int]
@@ -412,7 +427,7 @@ class ExhaustedRecord(TypedDict):
     continuation_owed: NotRequired[bool]
 
 
-class EndedRecord(TypedDict):
+class EndedRecord(WorkerTaskRecord):
     thread_id: str
     status: Literal["ended"]
     revision: NotRequired[int]
@@ -880,6 +895,10 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
                         record: ThreadRecord) -> None:
     previous = _as_dict(roster.get(name))
     stored = dict(record)
+    if previous.get("thread_id") == record["thread_id"]:
+        for key in ("held_design_id", "held_role", "access_policy", "transferring_role", "role_redirect", "model", "effort"):
+            if key in previous and key not in stored:
+                stored[key] = previous[key]
     if "continuation_owed" not in record and previous.get("thread_id") == record["thread_id"]:
         owed = previous.get("continuation_owed")
         if isinstance(owed, bool):
@@ -888,6 +907,9 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
     role = record.get("role", previous.get("role"))
     if isinstance(role, str) and role in WORKER_ROLES:
         stored["role"] = role
+    task = record.get("task", previous.get("task"))
+    if isinstance(task, str) and task:
+        stored["task"] = task
     instructions_file = record.get("instructions_file")
     if instructions_file is None and previous.get("thread_id") == record["thread_id"]:
         instructions_file = previous.get("instructions_file")
@@ -956,7 +978,7 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
         return True
 
 
-def _set_roster_role(session_dir: str, name: str, role: WorkerRole) -> None:
+def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: str) -> None:
     """Record the work assigned to an existing worker without changing its state."""
     path = _session_path(session_dir, ROSTER_FILE)
     with path.open("a+", encoding="utf-8") as handle:
@@ -966,6 +988,8 @@ def _set_roster_role(session_dir: str, name: str, role: WorkerRole) -> None:
         entry = _as_dict(roster.get(name))
         if entry:
             entry["role"] = role
+            if task:
+                entry["task"] = task
             _advance_roster_revision(entry)
             roster[name] = entry
             _ = handle.seek(0)
@@ -1017,6 +1041,7 @@ def _lookup(session_dir: str, name: str) -> ThreadRecord:
     if not isinstance(entry, dict):
         known = ", ".join(sorted(roster)) or "(none)"
         raise SystemExit(f"codex_mesh: no delegate named '{name}'. Known: {known}")
+    _role_fence(_as_dict(cast(object, entry)))
     return cast("ThreadRecord", cast("object", entry))
 
 
@@ -1025,15 +1050,64 @@ def _lookup_state(session_dir: str, name: str) -> RosterThread:
 
 
 def _seat_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
-    """The SandboxMode a delegate's thread normally runs in.
-
-    A seat with standing instructions is a reviewer template or its fork, started read-only;
-    any other seat runs in the sandbox `start` gave it.
-    """
+    """Access follows the explicit roster policy, independently of instructions."""
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    if _as_str(record.get("instructions_file")):
+    policy = _as_dict(record.get("access_policy"))
+    if policy.get("kind") == "ReadOnlyReviewer":
         return READ_ONLY_SANDBOX
+    if policy.get("kind") == "PhaseBoundDesigner":
+        return _as_str(policy.get("launch_sandbox")) or WORKER_SANDBOX
+    if record.get("instructions_file"):
+        raise SystemExit("codex_mesh: legacy instructions have no explicit access policy; recovery required")
     return _as_str(_attr(args, "sandbox")) or WORKER_SANDBOX
+
+
+def _role_fence(record: dict[str, object]) -> None:
+    from scripts.guilds import roles
+    redirected = roles.transfer_route(_as_str(record.get("thread_id")), _as_str(record.get("held_design_id")))
+    if record.get("transferring_role") or record.get("role_redirect") or redirected:
+        raise SystemExit("codex_mesh: TransferringRole: use the destination holder route")
+
+
+@contextlib.contextmanager
+def _design_claim_lock(session_dir: str, name: str) -> Generator[None]:
+    record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    _role_fence(record)
+    design_id = _as_str(record.get("held_design_id"))
+    if not design_id:
+        yield
+        return
+    from scripts.guilds import roles
+    directory = roles.design_directory(design_id)
+    with (directory / "lock").open("a", encoding="utf-8") as design_lock:
+        fcntl.flock(design_lock, fcntl.LOCK_EX)
+        with _pending_file(session_dir, name):
+            yield
+
+
+def _validate_held_claim(name: str, entry: dict[str, object], thread_id: str) -> bool:
+    _role_fence(entry)
+    design_id = _as_str(entry.get("held_design_id"))
+    if not design_id:
+        return True
+    from scripts.guilds import roles
+    design = roles.read_design(design_id)
+    role = next((role for role in design.roles if role.name == name), None)
+    reach = roles.resolve_holder(design.holder)
+    generation = design.placement.generation
+    if (role is None or isinstance(role.lifecycle, (roles.RoleNotOpened, roles.RoleEnded, roles.RoleNeedsRecovery))
+            or role.lifecycle.thread_id != thread_id or not isinstance(reach, roles.HolderReach)
+            or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or entry.get("authorized_generation") != generation
+            or entry.get("authorized_holder") != reach.session_id
+            or not entry.get("authorized_prompt")
+            or role.assignment_claim != entry.get("authorized_prompt")
+            or (roles.design_directory(design_id) / "transition.json").exists()):
+        return False
+    entry["instructions_file"] = entry["authorized_prompt"]
+    entry["access_policy"] = {"kind": "ReadOnlyReviewer"} if role.role == "reviewer" else {
+        "kind": "PhaseBoundDesigner", "binding_generation": generation, "launch_sandbox": WORKER_SANDBOX}
+    return True
 
 
 def _turn_sandbox_policy(mode: str) -> dict[str, object]:
@@ -1047,6 +1121,11 @@ def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, obj
     """Restore a roster thread's standing instructions whenever it is reopened."""
     params: dict[str, object] = {"threadId": thread_id}
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    policy = _as_dict(record.get("access_policy"))
+    if policy.get("kind") in ("ReadOnlyReviewer", "PhaseBoundDesigner"):
+        params["sandbox"] = (READ_ONLY_SANDBOX if policy.get("kind") == "ReadOnlyReviewer"
+                             else _as_str(policy.get("launch_sandbox")))
+        params["approvalPolicy"] = "never"
     instructions_file = _as_str(record.get("instructions_file"))
     if instructions_file:
         try:
@@ -1068,11 +1147,13 @@ def _claim_follow(
 ) -> bool:
     """Take a finished roster entry before another follow can take it."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with path.open("a+", encoding="utf-8") as handle:
+    with _design_claim_lock(session_dir, name), path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
         roster = _as_dict(_loads(handle.read()))
         entry = _as_dict(roster.get(name))
+        if not _validate_held_claim(name, entry, thread_id):
+            return False
         current = _roster_thread(entry)
         stale = isinstance(current, (ActiveThread, StartingThread)) and (
             current.launcher_pid > 0 and not _pid_alive(current.launcher_pid)
@@ -1080,6 +1161,8 @@ def _claim_follow(
         if isinstance(current, InvalidThread) or not (
             isinstance(current, FollowableThread) or stale
         ) or current.thread_id != thread_id:
+            return False
+        if entry.get("held_design_id") and stale:
             return False
         previous_status = current.status if isinstance(current, FollowableThread) else "failed"
         previous_role = _roster_role(entry.get("role"))
@@ -1097,6 +1180,7 @@ def _claim_follow(
             "previous_status": previous_status,
             "role": role,
         })
+        _ = claimed.pop("authorized_prompt", None)
         _advance_roster_revision(claimed)
         roster[name] = claimed
         _ = handle.seek(0)
@@ -1801,6 +1885,100 @@ def server_record_home(record: dict[str, object]) -> Path:
     return Path(recorded) if recorded else Path.home() / ".codex"
 
 
+def _guild_context(session_dir: str) -> dict[str, object]:
+    path = _session_path(session_dir, "guild_context.json")
+    if not path.exists():
+        return {}
+    from scripts.guilds import roles
+    context = _read_json_object(path)
+    design = roles.read_design(_as_str(context.get("design_id")))
+    reach = roles.resolve_holder(design.holder)
+    if not isinstance(reach, roles.HolderReach):
+        raise SystemExit("RoleNeedsRecovery: holder session is unavailable")
+    context.update({"generation": design.placement.generation, "holder_session": reach.session_id,
+                    "binding": {"kind": type(design.binding).__name__, **asdict(design.binding)},
+                    "cwd": design.repository})
+    return _as_dict(_loads(json.dumps(context)))
+
+
+def _release_held_server(session_dir: str) -> None:
+    """Park every queue before releasing a proven-idle server. Keep evidence on uncertainty."""
+    roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+    record = _read_json_object(_session_path(session_dir, SERVER_FILE))
+    if record.get("codex_home"):
+        home_path = _session_path(session_dir, "serving_home.json")
+        temporary = home_path.with_name(home_path.name + f".{secrets.token_hex(8)}.tmp")
+        try:
+            _ = temporary.write_text(json.dumps({"codex_home": record["codex_home"]}), encoding="utf-8")
+            _ = temporary.replace(home_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    for server in _recorded_run_servers(session_dir):
+        port, pid = _as_int(server.get("port")), _as_int(server.get("pid"))
+        if not _pid_alive(pid):
+            continue
+        for name, value in roster.items():
+            entry = _as_dict(value)
+            _role_fence(entry)
+            thread_id = _as_str(entry.get("thread_id"))
+            if not thread_id:
+                continue
+            client = Client(port, "held-environment-release")
+            try:
+                with _pending_file(session_dir, name) as pending:
+                    def park(message: str) -> None:
+                        _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+                    state = _read_live_turn(client, thread_id)
+                    if isinstance(state, ThreadStateUnknown):
+                        if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                            continue
+                    _move_queue_to_pending(client, thread_id, park)
+                    if not isinstance(state, ThreadIdle):
+                        raise SystemExit("RoleNeedsRecovery: old server turn is not proven idle")
+                    released = _release_worker_thread(client, thread_id, session_dir)
+                    if isinstance(released, WorkerThreadStateUnknown):
+                        raise SystemExit("RoleNeedsRecovery: " + released.reason)
+            finally:
+                client.close()
+        with _server_lock(session_dir):
+            if not _reap(pid) and _pid_alive(pid):
+                raise SystemExit("RoleNeedsRecovery: old server release is uncertain")
+            current = _read_json_object(_session_path(session_dir, SERVER_FILE))
+            if current.get("pid") == pid:
+                _session_path(session_dir, SERVER_FILE).unlink(missing_ok=True)
+
+
+def command_release_held_server(args: argparse.Namespace) -> int:
+    _release_held_server(_as_str(_attr(args, "session_dir")))
+    return 0
+
+
+def held_thread_end_confirmed(session_dir: str, thread_id: str) -> bool:
+    """Check every recorded live server before releasing a durable role's hold."""
+    for record in _recorded_run_servers(session_dir):
+        if not record or not ("pid" in record or "port" in record):
+            continue
+        pid, port = record.get("pid"), record.get("port")
+        if not isinstance(pid, int) or not isinstance(port, int):
+            return False
+        if not _pid_alive(pid):
+            continue
+        client = Client(port, "held-end-proof")
+        try:
+            state = _read_live_turn(client, thread_id)
+            if isinstance(state, ThreadIdle):
+                continue
+            if isinstance(state, ThreadStateUnknown):
+                if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                    continue
+            return False
+        except (ConnectionError, OSError, SystemExit):
+            return False
+        finally:
+            client.close()
+    return True
+
+
 def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool]:
     """This session's app-server port, and whether this call is what started it.
 
@@ -1810,6 +1988,15 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
     nothing of the kind -- see _retry_warranted.
     """
     selected_home = workers_home() if home is None else home
+    context = _guild_context(session_dir)
+    previous = _read_json_object(_session_path(session_dir, SERVER_FILE))
+    if context and previous:
+        pid = _as_int(previous.get("pid"))
+        previous_home = server_record_home(previous)
+        if (previous.get("guild_context") != context or previous_home != selected_home
+                or previous.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
+                or (_pid_alive(pid) and _holds_old_sign_in(pid, previous_home))):
+            _release_held_server(session_dir)
     with _server_lock(session_dir):
         path = _session_path(session_dir, SERVER_FILE)
         record = _read_json_object(path)
@@ -1846,6 +2033,18 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     serves the turns of many units, so it keeps the caller's environment unchanged.
     """
     environment = {**os.environ, "CODEX_HOME": str(workers_home)}
+    context = _guild_context(session_dir)
+    if context:
+        for key in tuple(environment):
+            if key.startswith("PLAN_DELEGATE_") or key in ("CLAUDE_CODE_SESSION_ID", "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION"):
+                del environment[key]
+        environment["CLAUDE_CODE_SESSION_ID"] = _as_str(context.get("holder_session"))
+        environment["GUILD_DESIGN_ID"] = _as_str(context.get("design_id"))
+        environment["GUILD_BINDING_GENERATION"] = str(context.get("generation"))
+        binding = _as_dict(context.get("binding"))
+        if binding.get("kind") == "DesignBoundToPhase":
+            environment["PLAN_DELEGATE_BOARD_DIR"] = _as_str(binding.get("run_directory"))
+        return environment
     run = Path(session_dir).absolute()
     if run.resolve().parent in {root.resolve() for root in RUN_ROOTS}:
         environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
@@ -1868,6 +2067,9 @@ def _start_server(session_dir: str, workers_home: Path) -> int:
         )
     served: ServerRecord = {"port": chosen, "pid": process.pid, "codex_home": str(workers_home),
                             "auto_compact_tokens": AUTO_COMPACT_TOKENS}
+    context = _guild_context(session_dir)
+    if context:
+        served["guild_context"] = context
     try:
         deadline = time.time() + SERVER_START_TIMEOUT_SECS
         while time.time() < deadline:
@@ -1882,6 +2084,9 @@ def _start_server(session_dir: str, workers_home: Path) -> int:
                 continue
             probe.close()
             _record_started_server(session_dir, served)
+            if context:
+                from scripts.guilds import roles
+                roles.refresh_census(_as_str(context.get("design_id")))
             _STARTED_SERVERS.add((chosen, process.pid))
             _ = _start_watcher(session_dir, process.pid, chosen)
             return chosen
@@ -2290,6 +2495,10 @@ def command_start(args: argparse.Namespace) -> int:
     name = _as_str(_attr(args, "name"))
     resident = getattr(args, "resident", False) is True
     existing = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
+    if isinstance(existing, dict):
+        _role_fence(_as_dict(cast(object, existing)))
+        if _as_dict(cast(object, existing)).get("held_design_id"):
+            raise SystemExit("codex_mesh: held roles must resume through their holder")
     availability = _server_availability(session_dir)
     old_port = availability.port if isinstance(availability, LiveServer) else None
     if isinstance(existing, dict):
@@ -2378,6 +2587,12 @@ def command_start(args: argparse.Namespace) -> int:
 def command_follow(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
+    record = _lookup(session_dir, name)
+    if record.get("held_design_id") and _as_str(_attr(args, "message_file")) != record.get("authorized_prompt"):
+        moving = bool(_attr(args, "account_move")) and isinstance(
+            _read_account_move(session_dir, name, _as_str(record.get("thread_id"))), AccountMoveMarker)
+        if not moving:
+            raise SystemExit("codex_mesh: held role assignment must come from roles.py")
     role = _worker_role(args)
     claim_pid = _as_int(_attr(args, "claim_pid"))
     try:
@@ -2401,8 +2616,8 @@ def command_follow(args: argparse.Namespace) -> int:
     ):
         print(f"codex_mesh: {name} was already claimed", file=sys.stderr)
         return 2
+    _set_roster_assignment(session_dir, name, role, _as_str(_attr(args, "task")))
     if claim_pid:
-        _set_roster_role(session_dir, name, role)
         _record_assignment(thread_id, role, _dispatch_lens(args), only_if_changed=True)
     owner_pid = claim_pid or os.getpid()
     opened = time.time()
@@ -2777,11 +2992,15 @@ def _attach_and_run(
                     f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
                 )
         starting: StartingRecord = {
+            "model": _as_str(_attr(args, "model")), "effort": _as_str(_attr(args, "effort")),
             "thread_id": thread_id,
             "status": "starting",
             "port": port,
             "launcher_pid": os.getpid(),
         }
+        task = _as_str(_attr(args, "task"))
+        if task:
+            starting["task"] = task
         role = _roster_role(_attr(args, "role"))
         if isinstance(role, AssignedDelegateRole):
             starting["role"] = role.role
@@ -3754,15 +3973,22 @@ def _resume_worker_thread(
     workers_home: Path,
 ) -> _WorkerThreadForHome:
     params = _resume_params(session_dir, name, thread_id)
-    instructions_file = _as_str(_lookup(session_dir, name).get("instructions_file"))
+    previous_record = _lookup(session_dir, name)
+    instructions_file = _as_str(previous_record.get("instructions_file"))
+    held = bool(previous_record.get("held_design_id"))
+    sandbox = _seat_sandbox(args, session_dir, name)
     resumed = client.call("thread/resume", params)
     if not resumed.get("error"):
-        _ = _require(resumed, "thread/resume")
+        result = _require(resumed, "thread/resume")
+        if held and _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
+            raise SystemExit("RoleNeedsRecovery: resumed thread identity differs; replacement refused")
         return _WorkerThreadForHome(thread_id, False)
     if isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker):
         _ = _require(resumed, "thread/resume")
+    if held:
+        raise SystemExit("RoleNeedsRecovery: held thread could not resume; replacement refused")
     start_params = _thread_start_params(args)
-    start_params["sandbox"] = _seat_sandbox(args, session_dir, name)
+    start_params["sandbox"] = sandbox
     if "developerInstructions" in params:
         start_params.update({
             "developerInstructions": params["developerInstructions"], "approvalPolicy": "never",
@@ -3795,7 +4021,9 @@ def _release_other_worker_writers(
                 if record.get("port") == port and isinstance(pid := record.get("pid"), int)}
         live_pids = {pid for pid in pids if _pid_alive(pid)}
         current_pid = records[-1].get("pid") if records[-1].get("port") == port else None
-        stopped_pids = {pid for pid in live_pids if pid != current_pid
+        entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        held = bool(entry.get("held_design_id"))
+        stopped_pids = {pid for pid in live_pids if not held and pid != current_pid
                         and _stop_unused(None, pid, port, RetiredRunServer(Path(session_dir)))}
         if pids and live_pids <= stopped_pids:
             continue
@@ -3956,7 +4184,12 @@ def _move_idle_worker(
                 return WorkerThreadStateUnknown(state.reason)
             if not isinstance(state, ThreadIdle):
                 return WorkerWaitingOnLiveTurn()
-            port, _fresh = ensure_server(session_dir, worker_home_for_turn)
+        # Refresh may park every role's queue, so it must run without a pending lock.
+        port, _fresh = ensure_server(session_dir, worker_home_for_turn)
+        with _pending_file(session_dir, name) as handle:
+            if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
+                return WorkerThreadStateUnknown("worker ended or was replaced before the new turn")
+            messages = _pending_for_thread(handle, thread_id)
             previous = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
             old_port = client.port
             owes_continuation = previous.get("continuation_owed") is True
@@ -4079,6 +4312,35 @@ def _start_workers_turn(
         raise
 
 
+def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
+    """Resolve the current task's tier once for each turn, without a server cache."""
+    session_dir = _as_str(_attr(args, "session_dir")) or client.session_dir
+    name = _as_str(_attr(args, "to")) or _as_str(_attr(args, "name")) or client.name
+    log_file = _as_str(_attr(args, "log_file"))
+    try:
+        record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)) if session_dir else {}
+        task = _as_str(record.get("task"))
+        resolved = subprocess.run(
+            ["bash", "-c", 'AGENTS_CONFIG_TIER_ONLY=1; source "$1"; agents_turn_service_tier "$2"',
+             "codex-mesh-tier", str(Path(__file__).with_name("agents_config.sh")), task or "delegate"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if resolved.returncode:
+            raise ValueError(resolved.stderr.strip() or "agent tier resolver failed")
+        if resolved.stderr.strip():
+            raise ValueError(resolved.stderr.strip())
+        return _as_str(resolved.stdout).strip() or "default"
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        detail = f"[{_now_stamp()}] mesh: {name}: cannot resolve service tier: {error}\n"
+        try:
+            if log_file:
+                with Path(log_file).open("a", encoding="utf-8") as log:
+                    _ = log.write(detail)
+        except OSError:
+            print(detail, end="", file=sys.stderr)
+        return "default"
+
+
 def _start_turn(
     client: Client, args: argparse.Namespace, thread_id: str, seat_sandbox: str, message: str,
     pending: tuple[str, ...] = (),
@@ -4105,6 +4367,8 @@ def _start_turn(
     effort = _as_str(_attr(args, "effort"))
     if effort:
         params["effort"] = effort
+    service_tier = _turn_service_tier(client, args)
+    params["serviceTier"] = service_tier
     client.turn_submitted_at = time.time()
     result = _serving_request(client, "turn/start", params, submits_work=True)
     return _as_str(_as_dict(result.get("turn")).get("id"))
@@ -4152,6 +4416,16 @@ def _end_unwatched_turn(
 def command_send(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
+    record = _lookup(session_dir, target)
+    design_id = record.get("held_design_id")
+    if design_id:
+        from scripts.guilds import roles
+        role = record.get("held_role")
+        if role not in ("designer", "reviewer"):
+            raise SystemExit("codex_mesh: unknown held role")
+        _ = roles.queue_message(design_id, role, _as_str(_attr(args, "source")) or "mesh send", _message_text(args))
+        print(f"queued for {target}; holder adds it to the next authorized assignment")
+        return 0
     with _pending_file(session_dir, target) as pending_file:
         record = _lookup(session_dir, target)
         if _end_marker_path(session_dir, target).exists():
@@ -4318,23 +4592,30 @@ def command_end(args: argparse.Namespace) -> int:
     target = _as_str(_attr(args, "to"))
     record = _lookup(session_dir, target)
     status = record.get("status", "unknown")
-    if status == "ended":
+    if status == "ended" and not record.get("held_design_id"):
         print(f"{target} is ended; nothing to end")
         return 0
-    if status not in ENDABLE_STATUSES:
+    if status not in ENDABLE_STATUSES and not (status == "ended" and record.get("held_design_id")):
         print(f"{target} is {status}; nothing to end")
         return 0
     with _pending_file(session_dir, target) as pending_file:
         _end_marker_path(session_dir, target).touch()
-        _ = pending_file.seek(0)
-        _ = pending_file.truncate()
+        if not record.get("held_design_id"):
+            _ = pending_file.seek(0)
+            _ = pending_file.truncate()
     _mark_roster_ended(session_dir, target)
     availability = _server_availability(session_dir)
     dropped = 0
     if isinstance(availability, LiveServer):
         client = Client(availability.port, f"end-{os.getpid()}")
         thread_id = record["thread_id"]
-        dropped = _drop_queued_messages(client, thread_id)
+        if record.get("held_design_id"):
+            with _pending_file(session_dir, target) as pending_file:
+                def park(message: str) -> None:
+                    _write_pending(pending_file, thread_id, [*_pending_for_thread(pending_file, thread_id), message])
+                _move_queue_to_pending(client, thread_id, park)
+        else:
+            dropped = _drop_queued_messages(client, thread_id)
         # A queued message opens a turn the `start` loop never saw, so the
         # roster's id may be stale; the server names the live one.
         state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
@@ -4459,6 +4740,9 @@ def command_reopen(args: argparse.Namespace) -> int:
     """Recover an ended or abandoned seat without creating a new thread."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
+    record = _lookup(session_dir, name)
+    if record.get("held_design_id"):
+        raise SystemExit("codex_mesh: held roles recover through roles.py")
     finished = _finished_run(session_dir)
     if finished:
         # A finished run's seats stay ended, so no later run takes them for live ones.
@@ -4502,6 +4786,11 @@ def command_reopen(args: argparse.Namespace) -> int:
 
 def _pause_roster(session_dir: str) -> None:
     """Fence launcher completion writes before interrupting each retained thread."""
+    for value in _read_json_object(_session_path(session_dir, ROSTER_FILE)).values():
+        entry = _as_dict(value)
+        _role_fence(entry)
+        if entry.get("held_design_id"):
+            raise SystemExit("codex_mesh: raw stop --pause refuses held roles; use roles.py")
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
@@ -4569,6 +4858,11 @@ def _pause_roster(session_dir: str) -> None:
 def command_stop(args: argparse.Namespace) -> int:
     """Reap the run servers, ending seats unless a director restart pauses them."""
     session_dir = _as_str(_attr(args, "session_dir"))
+    for value in _read_json_object(_session_path(session_dir, ROSTER_FILE)).values():
+        entry = _as_dict(value)
+        _role_fence(entry)
+        if entry.get("held_design_id"):
+            raise SystemExit("codex_mesh: raw stop refuses held roles; use roles.py")
     if _attr(args, "pause"):
         _pause_roster(session_dir)
     else:
@@ -6128,6 +6422,7 @@ def _resume_account_move_detached(session_dir: str, name: str) -> None:
 def command_resume_account_move(args: argparse.Namespace) -> int:
     session_dir, name = _as_str(_attr(args, "session_dir")), _as_str(_attr(args, "to"))
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+    _role_fence(record)
     marker = _read_account_move(session_dir, name, _as_str(record.get("thread_id")))
     if isinstance(marker, NoAccountMove):
         port = record.get("port")
@@ -6150,6 +6445,16 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
     if launcher_pid > 0 and _pid_alive(launcher_pid):
         _fail_account_move(session_dir, name, marker, "resume failed: existing launcher is still running")
         return 1
+    summary = _session_path(session_dir, f"{name}.account-move-summary.txt")
+    if record.get("held_design_id"):
+        from scripts.guilds import astra_work
+        header = astra_work.read_header(Path(_as_str(record.get("instructions_file"))))
+        if (not isinstance(header, astra_work.AstraWork) or header.member != name
+                or not Path(header.reply_path).is_absolute()):
+            _fail_account_move(session_dir, name, marker, "resume failed: saved assignment header is invalid")
+            return 1
+        summary = Path(header.reply_path)
+        summary.parent.mkdir(parents=True, exist_ok=True)
     assignment = agents_log.role_at(
         agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
         marker.thread_id, datetime.now(timezone.utc),
@@ -6167,7 +6472,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
     _ = message.write_text(ACCOUNT_MOVE_CONTINUATION, encoding="utf-8")
     follow_args = argparse.Namespace(
         session_dir=session_dir, to=name, role=role.role, lens=lens, claim_pid=os.getpid(),
-        message_file=str(message), summary_file=str(_session_path(session_dir, f"{name}.account-move-summary.txt")),
+        message_file=str(message), summary_file=str(summary),
         reply_file="", log_file=str(_session_path(session_dir, f"{name}.account-move.log")),
         model="", effort="", service_tier="", turn_cwd="", read_only=False, image=[],
         timeout=86400.0, account_move=True,
@@ -6281,6 +6586,7 @@ def _finish_run_moves(
 
 def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[str, object],
                                        port: int, label: str) -> SwitchingWorker | InterruptedWorkerMove:
+    _role_fence(entry)
     thread_id = _as_str(entry.get("thread_id"))
     marker: AccountMoveMarker | NoAccountMove = NoAccountMove()
     client: Client | None = None
@@ -6305,6 +6611,10 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
                 raise SystemExit("worker ended or was replaced before interruption")
             _write_account_move_json(_account_move_path(session_dir, name), stored)
+        with _pending_file(session_dir, name) as pending:
+            def park(message: str) -> None:
+                _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+            _move_queue_to_pending(client, thread_id, park)
         if isinstance(state, ThreadLive):
             reply = _interrupt_turn(client, thread_id, state.turn_id)
             if "error" in reply and not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
@@ -6331,11 +6641,25 @@ def _switch_run_workers(
     workers: list[SwitchingWorker | InterruptedWorkerMove] = []
     for name, value in sorted(entries.items()):
         entry = _as_dict(value)
+        _role_fence(entry)
         if entry.get("status") == "ended" or entry.get("port", port) != port:
             continue
         if entry.get("status") == "running" and not dry_run:
             workers.append(_interrupt_worker_for_account_move(str(folder), name, entry, port, label))
         else:
+            if entry.get("held_design_id") and not dry_run:
+                thread_id = _as_str(entry.get("thread_id"))
+                client = Client(port, "held-idle-account-move")
+                try:
+                    with _pending_file(str(folder), name) as pending:
+                        def park(message: str) -> None:
+                            _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+                        _move_queue_to_pending(client, thread_id, park)
+                        released = _release_worker_thread(client, thread_id, str(folder))
+                        if isinstance(released, WorkerThreadStateUnknown):
+                            raise SystemExit("RoleNeedsRecovery: " + released.reason)
+                finally:
+                    client.close()
             workers.append(SwitchingWorker(name, entry.get("status") == "running"))
     return tuple(workers)
 
@@ -6346,8 +6670,10 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
     notice_failures: dict[str, list[str]] = {}
     runs: list[WorkersRunMove | EndedWorkersRun] = []
     at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
+    from scripts.guilds import roles
+    durable = set(roles.durable_meshes())
     folders = sorted({path.parent for root in SWEEP_ROOTS
-                      for filename in (SERVER_FILE, RETIRED_FILE) for path in root.glob(f"*/{filename}")})
+                      for filename in (SERVER_FILE, RETIRED_FILE) for path in root.glob(f"*/{filename}")} | durable)
     for folder in folders:
         with _server_lock(str(folder)):
             current = _read_json_object(folder / SERVER_FILE)
@@ -6360,7 +6686,10 @@ def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = Fa
             if not outgoing:
                 continue
             holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
-            live = _run_is_live(folder, holders)
+            if folder in durable:
+                context = _guild_context(str(folder))
+                holders = (_as_str(context.get("holder_session")),)
+            live = folder in durable or _run_is_live(folder, holders)
             current_port = current.get("port")
             if not dry_run and isinstance(current_port, int) and current_port in outgoing:
                 _retire_record(str(folder), current)
@@ -6427,14 +6756,34 @@ def command_prime(args: argparse.Namespace) -> int:
     name = _as_str(_attr(args, "name"))
     client: Client | None = None
     try:
+        existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        _role_fence(existing)
+        if existing.get("held_design_id"):
+            raise SystemExit("held role already has a thread; use roles.py resume")
+        held_design = _as_str(_attr(args, "held_design"))
+        held_role = _as_str(_attr(args, "held_role"))
+        if held_design:
+            from scripts.guilds import roles
+            design = roles.read_design(held_design)
+            instance = next((value for value in design.roles if value.name == name and value.role == held_role), None)
+            reach = roles.resolve_holder(design.holder)
+            if (instance is None or not isinstance(instance.lifecycle, roles.RoleNotOpened)
+                    or not instance.lifecycle.claim or not isinstance(reach, roles.HolderReach)
+                    or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")):
+                raise SystemExit("held thread creation lacks its holder's reserved claim")
+            claim = roles.design_directory(held_design) / f"{held_role}.creation-claimed"
+            with claim.open("x", encoding="utf-8") as handle:
+                _ = handle.write(instance.lifecycle.claim)
         instructions_path = Path(_as_str(_attr(args, "instructions_file"))).resolve()
         instructions = instructions_path.read_text(encoding="utf-8")
         params: dict[str, object] = {
             "developerInstructions": instructions,
             "cwd": _as_str(_attr(args, "cwd")),
-            "sandbox": READ_ONLY_SANDBOX,
+            "sandbox": _as_str(_attr(args, "sandbox")) or READ_ONLY_SANDBOX,
             "approvalPolicy": "never",
         }
+        if held_design:
+            params["sandbox"] = READ_ONLY_SANDBOX if held_role == "reviewer" else WORKER_SANDBOX
         model = _as_str(_attr(args, "model"))
         if model:
             params["model"] = model
@@ -6449,10 +6798,23 @@ def command_prime(args: argparse.Namespace) -> int:
         if not thread_id:
             raise SystemExit("thread/start returned no thread id")
         _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
-        _update_roster(session_dir, name, {
+        record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review",
             "context_tokens": 0, "instructions_file": str(instructions_path),
-        })
+        }
+        record["model"] = model
+        record["effort"] = _as_str(_attr(args, "effort"))
+        record["access_policy"] = {"kind": "ReadOnlyReviewer"}
+        if held_design:
+            context = _read_json_object(_session_path(session_dir, "guild_context.json"))
+            record.update({"held_design_id": held_design, "held_role": held_role,
+                           "access_policy": {"kind": "ReadOnlyReviewer"} if held_role == "reviewer" else {
+                               "kind": "PhaseBoundDesigner", "binding_generation": context.get("generation"),
+                               "launch_sandbox": params["sandbox"]}})
+        task = _as_str(_attr(args, "task"))
+        if task:
+            record["task"] = task
+        _update_roster(session_dir, name, record)
         print(thread_id)
         return 0
     except (ConnectionError, OSError, UnicodeError, SystemExit) as exc:
@@ -6481,6 +6843,8 @@ def command_fork(args: argparse.Namespace) -> int:
                                     if _as_str(existing.get("thread_id")) else RosterAbsent())
         source_name = _as_str(_attr(args, "from_name"))
         source_record = _lookup(session_dir, source_name)
+        if source_record.get("held_design_id"):
+            raise SystemExit("held role thread cannot be forked; use its holder route")
         source = _roster_thread(source_record)
         if isinstance(source, InvalidThread):
             raise SystemExit(source.reason)
@@ -6502,7 +6866,11 @@ def command_fork(args: argparse.Namespace) -> int:
         _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": name}), "thread/name/set")
         record: FollowableRecord = {
             "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
+            "access_policy": {"kind": "ReadOnlyReviewer"},
         }
+        task = _as_str(source_record.get("task"))
+        if task:
+            record["task"] = task
         instructions_file = _as_str(source_record.get("instructions_file"))
         if instructions_file:
             record["instructions_file"] = instructions_file
@@ -6536,6 +6904,8 @@ def command_set_instructions(args: argparse.Namespace) -> int:
     """
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
+    if _lookup(session_dir, name).get("held_design_id"):
+        raise SystemExit("codex_mesh: held-role set-instructions refused; use roles.py resume")
     instructions = Path(_as_str(_attr(args, "instructions_file"))).resolve()
     if not instructions.is_file():
         print(f"codex_mesh: {name}: no instructions file at {instructions}", file=sys.stderr)
@@ -6663,6 +7033,9 @@ def main(argv: list[str] | None = None) -> int:
     serve = subparsers.add_parser("serve", help="start the session app-server")
     _ = serve.add_argument("--session-dir", required=True)
     serve.set_defaults(handler=command_serve)
+    release_held = subparsers.add_parser("release-held-server")
+    _ = release_held.add_argument("--session-dir", required=True)
+    release_held.set_defaults(handler=command_release_held_server)
 
     start = subparsers.add_parser("start", help="launch a delegate and block")
     _ = start.add_argument("--session-dir", required=True)
@@ -6681,6 +7054,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument("--model", default="")
     _ = start.add_argument("--effort", default="")
     _ = start.add_argument("--service-tier", default="")
+    _ = start.add_argument("--task", default="")
     _ = start.add_argument("--sandbox", choices=SANDBOX_MODES, default=WORKER_SANDBOX)
     _ = start.add_argument("--timeout", type=float, default=86400.0)
     _ = start.add_argument(
@@ -6708,6 +7082,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = follow.add_argument("--model", default="")
     _ = follow.add_argument("--effort", default="")
     _ = follow.add_argument("--service-tier", default="")
+    _ = follow.add_argument("--task", default="")
     _ = follow.add_argument("--cwd", dest="turn_cwd", default="")
     _ = follow.add_argument("--read-only", action="store_true")
     _ = follow.add_argument("--image", action="append", default=[])
@@ -6720,7 +7095,12 @@ def main(argv: list[str] | None = None) -> int:
     _ = prime.add_argument("--instructions-file", required=True)
     _ = prime.add_argument("--cwd", required=True)
     _ = prime.add_argument("--model", default="")
+    _ = prime.add_argument("--effort", default="")
     _ = prime.add_argument("--service-tier", default="")
+    _ = prime.add_argument("--task", default="")
+    _ = prime.add_argument("--sandbox", choices=SANDBOX_MODES, default=READ_ONLY_SANDBOX)
+    _ = prime.add_argument("--held-design", default="")
+    _ = prime.add_argument("--held-role", default="")
     prime.set_defaults(handler=command_prime)
 
     fork = subparsers.add_parser("fork", help="create a named read-only fork of a template")

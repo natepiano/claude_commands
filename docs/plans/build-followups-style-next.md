@@ -19,3 +19,9 @@
   - Why needed: `style_proposals.py unwaive` refuses a finding whose decision is declined, and the only way to change a declined answer is a hand edit of the decision's frontmatter.
   - Completion condition: one command changes a declined decision's answer to approved or to no answer, and removes `style_answer` and `style_answer_words`; an answer of none also reopens the decision, because a closed decision with no answer and the reason `declined: <words>` refuses later findings (phase 31). After it, unwaive takes that decision's findings and the next file puts them in the decision.
   - Revealed by: Phase 26 (showrunner disposition next, 2026-10-20)
+
+- [ ] **A trait method finding inside a test module that reads its parent with `use super::*` follows its method instead of waiting for a person**
+  - Target: scripts/style/style_ledger.py (trait import reader, `_trait_import_path`)
+  - Why needed: three cargo-liner rows (`impl Subscriber for GitStatusTrace` inside checkout.rs `mod tests`, which has `use super::*`) stay "trait identity uncertain" after phase 34, because a block glob can bind the trait name. Resolving the glob from the parent module's proved items and imports would let them follow.
+  - Completion condition: a dry-run follow on a copy of cargo-liner's ledger shows those three rows in place; a glob whose parent cannot be fully read still keeps the row.
+  - Revealed by: Phase 34 (showrunner disposition next, 2026-10-20)

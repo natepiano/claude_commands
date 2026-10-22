@@ -14,6 +14,9 @@
 #   home_config  the home JSON for that check, /dev/null for numbered folders.
 #   labels       agent_notes' readings by label, /dev/null when missing.
 #   colors       config/statusline.conf, /dev/null when missing or unreadable.
+#   TZ           the user's zone, as user_zone.py reads it: USER_ZONE, else the
+#                zone= line of USER_ZONE_CONF or config/user_zone.conf, else
+#                user_zone.py's default. jq's strflocaltime writes reset times in it.
 #   showrunners  the session ids every showrunner's update timer targets: the
 #                TARGET line of each notifier showrunner-<slug>/conf, which
 #                notifier.sh's write_conf always writes first.
@@ -47,6 +50,18 @@ labels="$HOME/.local/state/agent-notes/by-label.json"
 
 colors="$statusline/../../config/statusline.conf"
 [ -r "$colors" ] || colors=/dev/null
+
+zone=${USER_ZONE:-}
+if [ -z "$zone" ]; then
+  {
+    while IFS= read -r line; do
+      case $line in zone=*) zone=${line#zone=}; break ;; esac
+    done < "${USER_ZONE_CONF:-$statusline/../../config/user_zone.conf}"
+  } 2>/dev/null
+fi
+export TZ="${zone:-America/New_York}"
+# NixOS's glibc finds zone files only through TZDIR; a bare environment would get UTC.
+[ -n "${TZDIR:-}" ] || [ ! -d /etc/zoneinfo ] || export TZDIR=/etc/zoneinfo
 
 showrunners=
 counts=

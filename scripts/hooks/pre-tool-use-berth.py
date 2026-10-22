@@ -3,7 +3,8 @@
 
 Claude Code edits reach `cargo-berth hook pre-tool-use` through `berth_pre_edit.sh`; a Codex
 seat's `apply_patch` had no berth check at all, so its first touch never turned the phase's
-`enrolled_awaiting_first_touch` state `Active`. This hook runs for Codex `PreToolUse` on
+`enrolled_awaiting_first_touch` state `Active`, and an `Active` record never followed a new
+reservation of its phase. This hook runs for Codex `PreToolUse` on
 `apply_patch`. It acts only for a seat of a running unit: the app-server a unit director starts
 carries the director's `CLAUDE_CODE_SESSION_ID` and, when codex_mesh started it for a run, that run
 as `PLAN_DELEGATE_BOARD_DIR`. The run named there is the session directory; when it is unset or
@@ -38,6 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_reservation  # noqa: E402
 import unit_runs  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.guilds import roles  # noqa: E402
 
 
 def _seat_session_dir() -> Path | None:
@@ -86,6 +89,13 @@ def decide(raw: str) -> int:
         return 0
     session_dir = _seat_session_dir()
     paths = phase_reservation.patch_paths(patch)
+    held = os.environ.get("GUILD_DESIGN_ID", "")
+    if held:
+        try:
+            binding = roles.check_patch(held, int(os.environ.get("GUILD_BINDING_GENERATION", "0")), Path(cwd), paths)
+            session_dir = Path(binding.run_directory)
+        except (OSError, ValueError) as error:
+            return _refuse(str(error))
     if session_dir is None or not paths:
         return 0
     root = phase_reservation.repository_root(Path(cwd))
@@ -102,7 +112,7 @@ def decide(raw: str) -> int:
         berth_session = phase_reservation.phase_session_id(session_id, phase.phase) if phase else session_id
         answer = phase_reservation.check(root, phase_scopes, berth_session)
         if answer.status in phase_reservation.FAILS_OPEN:
-            return 0
+            return _refuse("binding reservation ledger is unreadable") if held else 0
         if answer.status != phase_reservation.CLEAR:
             return _refuse(f"{answer.status}: {answer.message or 'no detail'}.")
         acquisition = phase_reservation.own_acquisition(answer, root, phases, session_id)

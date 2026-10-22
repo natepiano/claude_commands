@@ -33,11 +33,11 @@ def stem(unit: str) -> str:
 
 def branch(slug: str, unit_stem: str) -> str:
     """The slug names the branch, as it names the production; the merge branch may differ."""
-    return f"{slug}-{unit_stem}"
+    return unit_stem if unit_stem.startswith(f"{slug}-") else f"{slug}-{unit_stem}"
 
 
 def worktree(checkout: Path, unit_stem: str) -> Path:
-    return checkout.parent / f"{checkout.name.removesuffix('-trunk')}-{unit_stem}"
+    return checkout.parent / branch(checkout.name.removesuffix("-trunk"), unit_stem)
 
 
 def swap_stem(value: str, old_stem: str, new_stem: str) -> str | None:

@@ -356,7 +356,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
-        unit=f"{name}-unit",
+        unit=(name if any(cell_value(row["Unit"]) == name
+                          for row in unit_table(production.doc.read_text(encoding="utf-8").splitlines()))
+              else f"{name}-unit"),
         branch=branch,
         worktree=worktree,
         plan=plan,
@@ -698,7 +700,7 @@ def host_session_name(request: UnitLaunch) -> str:
         if recorded.startswith(f"{slug}-"):
             return recorded
     name = request.identity.session
-    return herdr.generated_session_name(name if name.startswith(f"{slug}-") else f"{slug}-{name}")
+    return herdr.generated_session_name(unit_names.branch(slug, name))
 
 
 def launch_session(

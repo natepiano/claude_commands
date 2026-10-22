@@ -5,17 +5,20 @@ import contextlib
 import io
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from collections.abc import Callable
 from typing import cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
+from scripts.guilds import roles  # noqa: E402
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
 DIRECTOR = "sid-director"
@@ -27,9 +30,13 @@ import json, os, sys
 with open(os.environ["FAKE_BERTH_LOG"], "a") as log:
     log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
                           "session": os.environ.get("CARGO_BERTH_SESSION_ID")}) + "\n")
-print(open(os.environ["FAKE_BERTH_ANSWER"]).read())
+board = os.environ["FAKE_BERTH_ANSWER"] + ".board"
+print(open(board if sys.argv[1] == "board" and os.path.exists(board) else os.environ["FAKE_BERTH_ANSWER"]).read())
 '''
 AWAITING: dict[str, object] = {"kind": "enrolled_awaiting_first_touch", "phase": "15"}
+EARLIER = "01a15ec6-0000-7000-8000-000000000001"
+ACTIVE_EARLIER: dict[str, object] = {"kind": "active", "active_phase_reservation": {
+    "reservation_id": EARLIER, "coordination_run_id": RUN, "phase": "15", "phase_start_head": "f" * 40}}
 
 
 def envelope(status: str, message: str = "", acquisition: dict[str, str] | None = None) -> dict[str, object]:
@@ -79,6 +86,9 @@ class BerthHookTests(unittest.TestCase):
             "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "unit" / "active"),
             "FAKE_BERTH_LOG": str(self.root / "berth.log"),
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
+            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
+            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership"),
+            "GUILD_ROLES_HOST": "fixture-host",
         }
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
         # A test run from inside a seat inherits its run; each test names the run it wants.
@@ -114,6 +124,68 @@ class BerthHookTests(unittest.TestCase):
         payload = {"tool_name": tool, "cwd": str(cwd or self.repo), "tool_input": {"command": patch}}
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
                               text=True, check=False, env=self.environment, timeout=60)
+
+    def bind_designer(self, directory: Path, phase: str) -> None:
+        design_id = "00000000-0000-4000-8000-000000000036"
+        binding = roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
+        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
+                                  str(self.repo), str(self.repo / "design.md"), "design",
+                                  "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), binding,
+                                  (roles.RoleInstance("designer", "lasting-designer", roles.RoleOpen("designer-thread")),
+                                   roles.RoleInstance("reviewer", "lasting-reviewer", roles.RoleNotOpened())))
+        self.environment.update({"GUILD_DESIGN_ID": design_id, "GUILD_BINDING_GENERATION": "2"})
+        with mock.patch.dict(os.environ, self.environment):
+            roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        _ = (directory / "phases" / phase / "files").write_text("src/lib.rs\n")
+        _ = (directory / "progress_history_state.json").write_text(json.dumps({
+            "run_id": directory.name, "history_file": str(self.root / (directory.name + ".jsonl")),
+            "open_phases": [{"id": phase, "instance_id": "instance-" + phase, "status": "open"}],
+            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "open"},
+        }))
+
+    def held_hook(self, patch: str) -> str:
+        decide = cast(Callable[[str], int], runpy.run_path(str(HOOK))["decide"])
+        payload = json.dumps({"tool_name": "apply_patch", "cwd": str(self.repo), "tool_input": {"command": patch}})
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(roles, "resolve_holder", return_value=roles.HolderReach(DIRECTOR)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(decide(payload), 0)
+        return output.getvalue()
+
+    def test_held_designer_uses_rebound_run_while_old_board_folder_still_exists(self) -> None:
+        current = self.side_run()
+        self.bind_designer(current, "7")
+        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(self.session_dir)
+        self.assertEqual(self.held_hook(patch_text("*** Update File: src/lib.rs")), "")
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-7"])
+        self.assertEqual(self.state(), AWAITING)
+        state = cast(dict[str, object], json.loads((current / "phases/7" / phase_reservation.STATE_FILE).read_text()))
+        self.assertEqual(state["kind"], "active")
+
+    def test_held_patch_rejects_stale_generation_and_both_unlisted_rename_paths_before_attribution(self) -> None:
+        self.bind_designer(self.session_dir, "15")
+        cases = (
+            ("1", patch_text("*** Update File: src/lib.rs")),
+            ("2", patch_text("*** Update File: src/lib.rs", "*** Move to: src/other.rs")),
+            ("2", patch_text("*** Update File: src/other.rs", "*** Move to: src/lib.rs")),
+            ("2", patch_text("*** Update File: src/lib.rs", "*** Add File: private.md")),
+        )
+        for generation, command in cases:
+            with self.subTest(generation=generation, patch=command):
+                self.environment["GUILD_BINDING_GENERATION"] = generation
+                refused = cast(dict[str, object], json.loads(self.held_hook(command)))
+                self.assertEqual(cast(dict[str, object], refused["hookSpecificOutput"])["permissionDecision"], "deny")
+                self.assertEqual(self.berth_calls(), [])
+                self.assertEqual(self.state(), AWAITING)
+
+    def test_held_designer_fails_closed_when_the_engine_cannot_read_its_ledger(self) -> None:
+        self.bind_designer(self.session_dir, "15")
+        self.answer(envelope("ledger_unreadable"))
+        refused = cast(dict[str, object], json.loads(self.held_hook(patch_text("*** Update File: src/lib.rs"))))
+        detail = cast(dict[str, object], refused["hookSpecificOutput"])
+        self.assertEqual(detail["permissionDecision"], "deny")
+        self.assertIn("ledger", str(detail["permissionDecisionReason"]))
+        self.assertEqual(self.state(), AWAITING)
 
     def test_a_path_a_sibling_phase_holds_allows_the_edit_and_records_nothing(self) -> None:
         # The engine names the sibling's reservation and leaves this phase's session unmapped.
@@ -216,14 +288,24 @@ class BerthHookTests(unittest.TestCase):
         self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-15"])
         self.assertEqual(self.state()["kind"], "active")
 
-    def test_an_already_active_phase_keeps_its_reservation(self) -> None:
-        active: dict[str, object] = {"kind": "active", "active_phase_reservation": {
-            "reservation_id": "earlier", "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD}}
-        _ = self.state(active)
+    def test_an_active_phase_keeps_the_reservation_its_check_still_names(self) -> None:
+        _ = self.state(ACTIVE_EARLIER | {"active_phase_reservation": {
+            "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD}})
+        before = self.state()
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(len(self.berth_calls()), 1)
-        self.assertEqual(self.state(), active)
+        self.assertEqual(self.state(), before)
+
+    def test_an_active_phase_follows_a_new_reservation_after_berth_released_its_own(self) -> None:
+        """cargo-liner handler-unit phase 22: berth released 01a15ec6 at a shrink checkpoint, the next
+        seat edit acquired 01a15ec8, and the record still named 01a15ec6, so drift exited 5."""
+        _ = self.state(ACTIVE_EARLIER)
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"]),
+                         {"reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15",
+                          "phase_start_head": HEAD})
 
     def test_a_blocked_check_refuses_the_edit_with_the_engine_reason(self) -> None:
         self.answer(envelope("blocked_by_overlap", "src/lib.rs is held by reservation 01a1 of run hana"))
@@ -364,6 +446,40 @@ class BerthHookTests(unittest.TestCase):
         code, output = self.backstop()
         self.assertEqual((code, self.state(), self.berth_calls()), (0, unenrolled, []))
         self.assertIn("repository_not_enrolled; nothing to record", output)
+
+    def board(self, status: str) -> None:
+        _ = (self.root / "answer.json.board").write_text(json.dumps(
+            {"verb": "board", "status": "board_ready", "payload": {"kind": "reservation", "data": {
+                "reservation_id": EARLIER, "lifecycle": {"status": status}}}}))
+
+    def test_the_backstop_keeps_an_active_record_whose_reservation_is_live(self) -> None:
+        _ = self.state(ACTIVE_EARLIER)
+        self.board("active")
+        code, output = self.backstop()
+        self.assertEqual((code, self.state()), (0, ACTIVE_EARLIER))
+        self.assertIn(f"reservation {EARLIER} is active on the board", output)
+        self.assertEqual([call["argv"] for call in self.berth_calls()],
+                         [["board", "--reservation", EARLIER, "--json"]])
+
+    def test_the_backstop_moves_a_released_reservation_to_the_phases_live_one(self) -> None:
+        _ = self.state(ACTIVE_EARLIER)
+        self.board("released")
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, output = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}; reservation {EARLIER} is released on the board", output)
+        self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"])["reservation_id"], RESERVATION)
+        self.assertEqual(self.berth_calls()[1]["argv"], ["check", "src/lib.rs", "--json"])
+
+    def test_the_backstop_fails_when_no_live_reservation_replaces_a_released_one(self) -> None:
+        _ = self.state(ACTIVE_EARLIER)
+        self.board("released")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code, _ = self.backstop()
+        self.assertEqual((code, self.state()), (1, ACTIVE_EARLIER))
+        self.assertIn(f"reservation {EARLIER} is released on the board, and nothing of this phase changed",
+                      errors.getvalue())
 
     def test_the_backstop_fails_on_a_refused_check(self) -> None:
         self.answer(envelope("blocked_by_overlap", "held elsewhere"))

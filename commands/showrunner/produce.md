@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
+description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA when asked.
 ---
 
 # Produce
@@ -324,6 +324,30 @@ State:
 </Throughout>
 
 ---
+
+<Guild>
+Your guild is `showrunners`. Your head is the `showrunners` unit director in the top-level `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/showrunners/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `showrunners`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
+
+Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild showrunners
+
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
+Pass the user's guild feedback to that guild's head. A Codex holder includes the
+expanded block and loaded tip text in its worker prompt.
+</Guild>
+
+<HeldProductionDesign>
+The showrunner may hold one lasting Astra designer/reviewer pair for a production
+design through `roles.py`. It briefs, records cited rulings and acceptance, and
+keeps the same threads across rounds, restarts and account moves. Configured
+`guild` models and explicit access policies apply. A writer needs an authorized
+production-design phase with exact output paths, baseline and reservation; until
+that phase exists, hold read-only roles only. New writing scope needs an idle
+rebind. Saved headed prompts and replies stay with the role; pending messages are
+added only to an authorized assignment. A busy, fenced or uncertain role blocks
+new work; never substitute a thread. Finish turns and unbind after reservation
+release; end only through the lifecycle. Existing DesignAuthority, DesignCheck,
+screenshot and visual acceptance duties remain.
+</HeldProductionDesign>
 
 <ExecutionSteps>
 **EXECUTE IN ORDER:**
@@ -950,7 +974,11 @@ it needs. Every other wait is yours to clear, and fast.
    3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
-      `needed:` and send it as a <Notify/> `blocked` alert.
+      `needed:` and send it as a <Notify/> `blocked` alert. An auto-mode refusal
+      goes as `send.py --to user --need blocked --text-id auto_mode.refused` with its
+      `--value`s (`send.py --help`); free text about it is held. A session that waits
+      for the user to type a go goes as `send.py --to user --need blocked --text-id
+      session.needs_go` with its `--value`s; free text about it is held.
    4. **Rule 4's limit holds.** Each hour, run
       `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit>`
       and repeat 1–3.

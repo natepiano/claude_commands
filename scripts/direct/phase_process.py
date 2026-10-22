@@ -1,0 +1,1054 @@
+#!/usr/bin/env python3
+"""Read phase costs and plan history. This command never updates a source store."""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import math
+import sqlite3
+import statistics
+import subprocess
+import sys
+from bisect import bisect_left
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from functools import cache
+from pathlib import Path
+from typing import Protocol, cast
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "history"))
+from scripts.direct import plan_history  # noqa: E402
+from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.usage import collect  # noqa: E402
+
+
+class HistoryLabels(Protocol):
+    PASS_STAGE: dict[str, str]
+    ACTIVITY_STAGE: dict[str, str]
+
+    def _clean_label(self, label: str) -> str: ...
+
+
+history = cast(HistoryLabels, cast(object, importlib.import_module("history")))
+MEASURE_EVENTS = frozenset(("run_started", "phase_started", "phase_finished", "pass_started",
+                            "pass_finished", "activity_started", "activity_finished"))
+
+
+@dataclass(frozen=True)
+class Window:
+    since: float
+    until: float
+
+    def contains(self, at: float) -> bool:
+        return self.since <= at < self.until
+
+    def label(self) -> str:
+        return f"[{stamp(self.since)}, {stamp(self.until)})"
+
+
+@dataclass(frozen=True)
+class NotRecorded:
+    source: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class DirectorSession:
+    family: str
+    session: str
+
+
+@dataclass(frozen=True)
+class Event:
+    run: str
+    phase: str
+    phase_id: str
+    kind: str
+    at: float
+    instance: str
+    step: str
+    status: str
+    director: DirectorSession | NotRecorded
+    directory: str
+    plan: str
+    branch: str
+
+
+@dataclass(frozen=True)
+class PhaseBoundary:
+    run: str
+    instance: str
+    identifier: str
+    start: float
+    end: float
+
+
+@dataclass(frozen=True)
+class StepInterval:
+    run: str
+    phase: str
+    step: str
+    start: float
+    end: float
+    is_pass: bool
+
+
+@dataclass(frozen=True)
+class StepCost:
+    step: str
+    n: int
+    median: float
+    p90: float
+    total: float
+    wall_share: float
+
+
+@dataclass(frozen=True)
+class PhaseSteps:
+    costs: tuple[StepCost, ...]
+    gaps: tuple[StepCost, ...]
+    phases: int
+    wall: float
+
+
+@dataclass(frozen=True)
+class UsageTurn:
+    director: DirectorSession
+    at: float
+    input: int
+    output: int
+
+
+@dataclass(frozen=True)
+class TokenCost:
+    turns: int
+    input: int
+    output: int
+    before_share: float | NotRecorded
+    after_share: float | NotRecorded
+
+
+@dataclass(frozen=True)
+class PhaseTokens:
+    phase: PhaseBoundary
+    cost: TokenCost | NotRecorded
+
+
+@dataclass(frozen=True)
+class ContractFile:
+    path: str
+    lines: int
+    bytes: int
+    cadence: str
+
+
+@dataclass(frozen=True)
+class DocCommit:
+    sha: str
+    at: float
+    message: str
+    text: str
+
+
+@dataclass(frozen=True)
+class PlanHistory:
+    path: str
+    runs: tuple[str, ...]
+    started: float
+    first_phase: float | NotRecorded
+    commits: tuple[DocCommit, ...]
+    sources: tuple[tuple[str, tuple[DocCommit, ...]], ...]
+    problem: str
+    churn_problem: str = ""
+
+
+@dataclass(frozen=True)
+class DocMilestone:
+    plan: str
+    document: str
+    first_commit: DocCommit | NotRecorded
+    run_started: float
+    phase_started: float | NotRecorded
+    commands: str
+    problem: str
+
+
+@dataclass(frozen=True)
+class PlanChurn:
+    plan: str
+    commits: int
+    todo_edits: int
+    decisions_opened: int
+    decisions_closed: int
+    inserted_phases: tuple[str, ...]
+    split: str
+    problem: str
+
+
+@dataclass(frozen=True)
+class NotPhasedPlan:
+    path: str
+
+
+@dataclass(frozen=True)
+class DocumentRevision:
+    sha: str
+    at: float
+    message: str
+    path: str
+
+
+@dataclass(frozen=True)
+class SourceReference:
+    path: str
+    relative_to_plan: bool
+
+
+def report_zone() -> ZoneInfo:
+    """One report uses one zone setting, read through the shared zone module."""
+    return user_zone()
+
+
+def stamp(at: float) -> str:
+    return datetime.fromtimestamp(at, UTC).astimezone(report_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def text_field(raw: dict[str, object], key: str) -> str:
+    value = raw.get(key)
+    return value if isinstance(value, str) else ""
+
+
+def parse_event(raw: dict[str, object]) -> Event | NotRecorded:
+    version = raw.get("spine_version", 0)
+    if not isinstance(version, int) or version > 1:
+        return NotRecorded("progress_history.py", "unsupported spine version")
+    epoch = raw.get("timestamp_epoch")
+    if not isinstance(epoch, int | float) or isinstance(epoch, bool) or not math.isfinite(epoch):
+        return NotRecorded("progress_history.py", "missing or invalid timestamp_epoch")
+    identity = raw.get("main_agent")
+    director: DirectorSession | NotRecorded = NotRecorded("run_started.main_agent", "session is absent")
+    if isinstance(identity, dict):
+        agent = cast(dict[str, object], identity)
+        session = text_field(agent, "session_id")
+        if session:
+            director = DirectorSession(text_field(agent, "family"), session)
+    kind = text_field(raw, "event_type")
+    is_pass = kind.startswith("pass_")
+    label = text_field(raw, "pass_kind" if is_pass else "activity_label")
+    step = history.PASS_STAGE.get(label, label or "unknown") if is_pass else history._clean_label(label)  # pyright: ignore[reportPrivateUsage]
+    # A fix activity and a fix pass have the same owner. Neither gets a duration here.
+    if not is_pass and history.ACTIVITY_STAGE.get(step) == "fix":
+        step = "fix"
+    return Event(text_field(raw, "run_id"), text_field(raw, "phase_instance_id"),
+                 text_field(raw, "phase_id"), kind, float(epoch),
+                 text_field(raw, "pass_instance_id" if is_pass else "activity_instance_id"),
+                 step, text_field(raw, "status"), director, text_field(raw, "working_dir"),
+                 text_field(raw, "plan_doc"), text_field(raw, "branch"))
+
+
+def read_events(paths: Iterable[Path]) -> tuple[tuple[Event, ...], tuple[str, ...]]:
+    events: list[Event] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    for path in sorted(paths):
+        try:
+            with path.open(encoding="utf-8") as source:
+                for line_no, line in enumerate(source, 1):
+                    try:
+                        raw = cast(object, json.loads(line))
+                    except ValueError:
+                        problems.append(f"{path}:{line_no}: invalid JSON")
+                        continue
+                    if not isinstance(raw, dict):
+                        problems.append(f"{path}:{line_no}: event is not an object")
+                        continue
+                    fields = cast(dict[str, object], raw)
+                    version = fields.get("spine_version", 0)
+                    if text_field(fields, "event_type") not in MEASURE_EVENTS and isinstance(version, int) and version <= 1:
+                        continue
+                    identifier = text_field(fields, "event_id")
+                    if identifier and identifier in seen:
+                        continue
+                    if identifier:
+                        seen.add(identifier)
+                    parsed = parse_event(fields)
+                    if isinstance(parsed, Event):
+                        events.append(parsed)
+                    else:
+                        problems.append(f"{path}:{line_no}: {parsed.reason}")
+        except OSError as error:
+            problems.append(f"{path}: {error}")
+    return tuple(sorted(events, key=lambda event: event.at)), tuple(problems)
+
+
+def phase_boundaries(events: Sequence[Event], window: Window) -> tuple[PhaseBoundary, ...]:
+    """Boundary seam: use recorded phases until fix-rounds-unit supplies rounds.py."""
+    opened: dict[tuple[str, str], Event] = {}
+    phases: list[PhaseBoundary] = []
+    for event in sorted(events, key=lambda event: event.at):
+        key = (event.run, event.phase)
+        if event.kind == "phase_started":
+            opened[key] = event
+        elif event.kind == "phase_finished" and key in opened:
+            start = opened.pop(key)
+            if event.status == "completed" and window.contains(event.at) and event.at >= start.at:
+                phases.append(PhaseBoundary(event.run, event.phase, event.phase_id, start.at, event.at))
+    return tuple(phases)
+
+
+def fix_time() -> NotRecorded:
+    """Fix seam: its owner supplies both phase meaning and fix costs."""
+    return NotRecorded("history.py rounds (fix-rounds-unit)", "not counted here")
+
+
+def step_intervals(events: Sequence[Event], phases: Sequence[PhaseBoundary]) -> tuple[StepInterval, ...]:
+    bounds = {(phase.run, phase.instance): phase for phase in phases}
+    opened: dict[tuple[str, str, str, bool], Event] = {}
+    intervals: list[StepInterval] = []
+    for event in sorted(events, key=lambda event: event.at):
+        is_pass = event.kind.startswith("pass_")
+        key = (event.run, event.phase, event.instance, is_pass)
+        if event.kind in ("pass_started", "activity_started") and event.instance:
+            opened[key] = event
+        elif event.kind in ("pass_finished", "activity_finished") and key in opened:
+            start = opened.pop(key)
+            phase = bounds.get((start.run, start.phase))
+            if phase is not None:
+                left, right = max(start.at, phase.start), min(event.at, phase.end)
+                if right > left:
+                    label = "fix" if start.step == "fix" else ("pass: " if is_pass else "activity: ") + start.step
+                    intervals.append(StepInterval(start.run, start.phase, label, left, right, is_pass))
+    # An unclosed window is unknown coverage, never assumed to last to phase end.
+    return tuple(intervals)
+
+
+def summarize(step: str, values: Sequence[float], wall: float) -> StepCost:
+    ordered = sorted(values)
+    return StepCost(step, len(ordered), statistics.median(ordered),
+                    ordered[max(0, math.ceil(len(ordered) * .9) - 1)],
+                    sum(ordered), sum(ordered) / wall if wall else 0)
+
+
+def allocated_step_seconds(events: Sequence[Event], phases: Sequence[PhaseBoundary]) -> tuple[dict[str, float], ...]:
+    intervals: dict[tuple[str, str], list[StepInterval]] = defaultdict(list)
+    for interval in step_intervals(events, phases):
+        intervals[(interval.run, interval.phase)].append(interval)
+    samples: list[dict[str, float]] = []
+    for phase in phases:
+        spans = intervals[(phase.run, phase.instance)]
+        points = sorted({phase.start, phase.end, *(span.start for span in spans), *(span.end for span in spans)})
+        totals: dict[str, float] = defaultdict(float)
+        for left, right in zip(points, points[1:]):
+            active = {span.step for span in spans if span.start <= left and span.end >= right}
+            if not active:
+                totals["director time"] += right - left
+            else:
+                for step in active - {"fix"}:
+                    totals[step] += (right - left) / len(active)
+        samples.append(dict(totals))
+    return tuple(samples)
+
+
+def measure_phase_steps(events: Sequence[Event], phases: Sequence[PhaseBoundary]) -> PhaseSteps:
+    samples: dict[str, list[float]] = defaultdict(list)
+    wall = sum(phase.end - phase.start for phase in phases)
+    for totals in allocated_step_seconds(events, phases):
+        for step, value in totals.items():
+            samples[step].append(value)
+    gaps: list[float] = []
+    starts: dict[str, list[float]] = defaultdict(list)
+    for event in events:
+        if event.kind == "phase_started":
+            starts[event.run].append(event.at)
+    for phase in phases:
+        following = [at for at in starts[phase.run] if at >= phase.end]
+        if following:
+            gaps.append(min(following) - phase.end)
+    return PhaseSteps(tuple(summarize(step, values, wall) for step, values in sorted(samples.items())),
+                      (summarize("phase end to next phase start", gaps, wall),) if gaps else (), len(phases), wall)
+
+
+def read_usage(path: Path, window: Window,
+               directors: Sequence[DirectorSession] = ()) -> tuple[UsageTurn, ...] | NotRecorded:
+    if not path.is_file():
+        return NotRecorded(str(path), "usage store is absent; collect.py supplies turns")
+    try:
+        with sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True) as db:
+            query = ("SELECT family, agent_id, at, input + cache_write_5m + cache_write_1h + cache_read, output " +
+                     "FROM turns WHERE machine = 'natedev' AND parent_id = '' AND at >= ? AND at < ?")
+            dates = (datetime.fromtimestamp(window.since, UTC).isoformat(),
+                     datetime.fromtimestamp(window.until, UTC).isoformat())
+            rows: list[tuple[str, str, str, int, int]] = []
+            if directors:
+                # The ledger indexes machine/family/parent/session/time. Select
+                # each mapped session through that index, without a store write.
+                for director in set(directors):
+                    rows.extend(cast(list[tuple[str, str, str, int, int]], db.execute(
+                        query + " AND family = ? AND agent_id = ?", (*dates, director.family, director.session)).fetchall()))
+            else:
+                rows = cast(list[tuple[str, str, str, int, int]], db.execute(query, dates).fetchall())
+        return tuple(UsageTurn(DirectorSession(family, session), datetime.fromisoformat(at).timestamp(), inp, out)
+                     for family, session, at, inp, out in rows)
+    except (sqlite3.Error, ValueError) as error:
+        return NotRecorded(str(path), str(error))
+
+
+def measure_director_tokens(events: Sequence[Event], phases: Sequence[PhaseBoundary],
+                            turns: tuple[UsageTurn, ...] | NotRecorded) -> tuple[PhaseTokens, ...]:
+    by_run: dict[str, list[Event]] = defaultdict(list)
+    pass_events: dict[tuple[str, str], list[Event]] = defaultdict(list)
+    for event in events:
+        by_run[event.run].append(event)
+        if event.kind in ("pass_started", "pass_finished"):
+            pass_events[(event.run, event.phase)].append(event)
+    by_director: dict[DirectorSession, list[UsageTurn]] = defaultdict(list)
+    if not isinstance(turns, NotRecorded):
+        for turn in turns:
+            by_director[turn.director].append(turn)
+    for director_turns in by_director.values():
+        director_turns.sort(key=lambda turn: turn.at)
+    passes_by_phase: dict[tuple[str, str], list[StepInterval]] = defaultdict(list)
+    for span in step_intervals(events, phases):
+        if span.is_pass:
+            passes_by_phase[(span.run, span.phase)].append(span)
+    result: list[PhaseTokens] = []
+    for phase in phases:
+        if isinstance(turns, NotRecorded):
+            result.append(PhaseTokens(phase, turns))
+            continue
+        # Only run_started identifies the director. Old worker pass events can carry
+        # the worker as main_agent, so they cannot change this mapping.
+        directors = {event.director for event in by_run[phase.run]
+                     if event.kind == "run_started" and isinstance(event.director, DirectorSession)}
+        if not directors:
+            result.append(PhaseTokens(phase, NotRecorded("run_started.main_agent.session_id + usage.db turns",
+                                                       "no director session maps to this run")))
+            continue
+        selected: list[UsageTurn] = []
+        for director in directors:
+            candidates = by_director[director]
+            left = bisect_left(candidates, phase.start, key=lambda turn: turn.at)
+            right = bisect_left(candidates, phase.end, key=lambda turn: turn.at)
+            selected.extend(candidates[left:right])
+        if not selected:
+            result.append(PhaseTokens(phase, NotRecorded("usage.db turns (collect.py)", "no mapped turns in phase")))
+            continue
+        passes = passes_by_phase[(phase.run, phase.instance)]
+        inp, out = sum(turn.input for turn in selected), sum(turn.output for turn in selected)
+        total = inp + out
+        missing = NotRecorded("pass_started/pass_finished", "no complete pass in phase")
+        before: float | NotRecorded = missing
+        after: float | NotRecorded = missing
+        if passes and total:
+            first, last = min(span.start for span in passes), max(span.end for span in passes)
+            before = sum(turn.input + turn.output for turn in selected if turn.at < first) / total
+            after = sum(turn.input + turn.output for turn in selected if turn.at >= last) / total
+        opened: set[str] = set()
+        for entry in sorted(pass_events[(phase.run, phase.instance)], key=lambda entry: entry.at):
+            if entry.at > phase.end:
+                break
+            if entry.kind == "pass_started" and entry.instance and entry.at < phase.end:
+                opened.add(entry.instance)
+            elif entry.kind == "pass_finished":
+                opened.discard(entry.instance)
+        if opened:
+            after = NotRecorded("pass_finished", "open pass start leaves last pass end unknown")
+        result.append(PhaseTokens(phase, TokenCost(len(selected), inp, out, before, after)))
+    return tuple(result)
+
+
+def measure_contract(files: Sequence[tuple[str, bytes]]) -> tuple[ContractFile, ...]:
+    """Follow direct full reads, then one level from files read during a phase.
+
+    Cadence is a minimum read per phase, not the number of repeated reads.
+    Briefs and reports are mode-dependent and are counted only on request.
+    """
+    import re
+
+    contents = dict(files)
+    direct = contents.get("commands/unit/direct.md", b"").decode("utf-8")
+    required = {"commands/unit/direct.md": "per phase"}
+    cadence_by_file = {
+        "docs/delegate/write_prompt_contract.md": "per dispatch",
+        "docs/delegate/dual_review.md": "per dispatch",
+        "docs/delegate/final_gate_commit.md": "final gate only",
+        "commands/unit/brief.md": "on request",
+        "commands/unit/phase_report.md": "on request",
+    }
+    full_read = re.compile(r"read\s+`(?:~/.claude/)?([^`]+\.md)`\s+in full", re.IGNORECASE)
+    for match in full_read.finditer(direct):
+        name = match.group(1)
+        required[name] = cadence_by_file.get(name, "per phase")
+    # TagReferenceContract requires the whole tagged contract at its call site.
+    # PhaseChecks is a per-phase full read expressed by that table, not a Read sentence.
+    if re.search(r"\| <PhaseChecks/> \| `docs/delegate/phase_checks.md`", direct):
+        required["docs/delegate/phase_checks.md"] = "per phase"
+    for name, cadence in tuple(required.items()):
+        if name == "commands/unit/direct.md" or cadence not in ("per phase", "per dispatch"):
+            continue
+        for match in full_read.finditer(contents.get(name, b"").decode("utf-8")):
+            child = match.group(1)
+            if child not in required:
+                required[child] = cadence_by_file.get(child, "per phase")
+    return tuple(ContractFile(name, len(contents[name].splitlines()), len(contents[name]), cadence)
+                 for name, cadence in sorted(required.items()) if name in contents)
+
+
+def git_output(directory: Path, args: Sequence[str]) -> str:
+    result = subprocess.run(["git", "--no-optional-locks", "-C", str(directory), *args],
+                            capture_output=True, text=True, timeout=8, check=False)
+    return result.stdout if result.returncode == 0 else ""
+
+
+def read_git_documents(root: Path, revisions: Sequence[DocumentRevision]) -> dict[str, str]:
+    """Read all required blobs in one git process, including names before a rename."""
+    if not revisions:
+        return {}
+    requests = "".join(f"{revision.sha}:{revision.path}\n" for revision in revisions)
+    result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), "cat-file", "--batch"],
+                            input=requests.encode(), capture_output=True, timeout=8, check=False)
+    documents: dict[str, str] = {}
+    offset = 0
+    for revision in revisions:
+        end = result.stdout.find(b"\n", offset)
+        if end < 0:
+            break
+        header = result.stdout[offset:end].split()
+        offset = end + 1
+        if len(header) != 3 or header[1] != b"blob" or not header[2].isdigit():
+            continue
+        length = int(header[2])
+        documents[revision.sha] = result.stdout[offset:offset + length].decode("utf-8", errors="replace")
+        offset += length + 1
+    return documents
+
+
+@cache
+def document_repository(path: Path) -> Path | NotRecorded:
+    """Find the document's own repository, even if its directory was removed."""
+    parent = path.parent
+    while not parent.is_dir() and parent != parent.parent:
+        parent = parent.parent
+    repository = git_output(parent, ["rev-parse", "--show-toplevel"]).strip()
+    return Path(repository) if repository else NotRecorded(str(path), "document repository is absent")
+
+
+@cache
+def doc_commits(directory: str, path: str, since: float = -math.inf,
+                until: float = math.inf, revision: str = "--all") -> tuple[DocCommit, ...]:
+    """Follow the document on all refs; each SHA is one observation, even after merge."""
+    document = Path(path).expanduser()
+    document = (document if document.is_absolute() else Path(directory) / document).resolve()
+    root = document_repository(document)
+    if isinstance(root, NotRecorded):
+        return ()
+    path = str(document.relative_to(root))
+    log = git_output(root, ["log", revision, "--follow", "--name-status", "--format=%x1e%H%x09%ct%x09%s", "--", path])
+    entries: list[DocumentRevision] = []
+    for block in log.split("\x1e"):
+        lines = block.strip().splitlines()
+        if not lines:
+            continue
+        parts = lines[0].split("\t", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue
+        sha, epoch, message = parts
+        names = [line.split("\t") for line in lines[1:] if "\t" in line]
+        name = names[0][-1] if names else path
+        entries.append(DocumentRevision(sha, float(epoch), message, name))
+    entries.reverse()
+    entries.sort(key=lambda entry: entry.at)
+    before = [entry.sha for entry in entries if entry.at < since]
+    baseline = before[-1] if before else ""
+    first = entries[0].sha if entries else ""
+    required = [entry for entry in entries if entry.at < until and (entry.sha in (first, baseline) or entry.at >= since)]
+    documents = read_git_documents(root, required)
+    commits: list[DocCommit] = []
+    for entry in entries:
+        # Only the initial doc, the run-start snapshot and later changes need
+        # full text. Old intermediate text cannot change any measure.
+        if entry.at >= until:
+            continue
+        commits.append(DocCommit(entry.sha, entry.at, entry.message, documents.get(entry.sha, "")))
+    return tuple({commit.sha: commit for commit in commits}.values())
+
+
+def source_paths(text: str) -> tuple[str, ...]:
+    """Only header and Source references establish document lineage."""
+    return tuple(sorted({reference.path for reference in source_references(text)}))
+
+
+def source_references(text: str) -> tuple[SourceReference, ...]:
+    """Markdown targets use the plan directory; bare docs/issues paths use the repo."""
+    import re
+
+    first_section = re.search(r"^## ", text, re.MULTILINE)
+    prefix = text[:first_section.start()] if first_section else text
+    header = "\n".join(line for line in prefix.splitlines()
+                       if re.search(r"source|based on|derived from", line, re.IGNORECASE))
+    sources = re.findall(r"^## Source[^\n]*\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    evidence = header + "\n" + "\n".join(sources)
+    links: list[SourceReference] = []
+    for match in re.finditer(r"\[[^\]\n]*\]\(\s*<?([^\s<>]+?\.md)(?:#[^\s<>]*)?>?(?:\s+\"[^\"]*\")?\s*\)", evidence):
+        target = match.group(1)
+        if "://" not in target:
+            links.append(SourceReference(target, True))
+    # Do not also read a link's label or target as a bare repository path.
+    evidence = re.sub(r"\[[^\]\n]*\]\([^\n)]*\)", "", evidence)
+    references = cast(list[tuple[str, str]], re.findall(
+        r"`([^`\n]+\.md)`|(?<![\w/])((?:~?/|docs/|issues/)[^\s`<>),;]+\.md)",
+        evidence))
+    bare = [SourceReference(quoted or plain, not (quoted or plain).startswith(("docs/", "issues/")))
+            for quoted, plain in references]
+    return tuple(sorted(set((*links, *bare)), key=lambda reference: (reference.path, reference.relative_to_plan)))
+
+
+def source_history(root: Path, source: str, until: float) -> tuple[DocCommit, ...]:
+    return doc_commits(str(root), source, math.inf, until)
+
+
+def load_plan_histories(events: Sequence[Event], window: Window) -> tuple[PlanHistory, ...]:
+    groups: dict[str, list[Event]] = defaultdict(list)
+    for event in events:
+        if event.kind == "run_started" and event.plan and event.directory:
+            path = Path(event.plan).expanduser()
+            resolved = path if path.is_absolute() else Path(event.directory) / path
+            groups[str(resolved)].append(event)
+    def load_plan(item: tuple[str, list[Event]]) -> PlanHistory | NotPhasedPlan:
+        absolute, runs = item
+        # Include a plan if a run starts in the window, but keep its first run
+        # ever. A resume must not move the first-dispatch milestone forward.
+        if not any(window.contains(run.at) for run in runs):
+            return NotPhasedPlan(absolute)
+        first = min(runs, key=lambda run: run.at)
+        run_ids = tuple(run.run for run in runs)
+        phase_starts = [event.at for event in events if event.run in run_ids and event.kind == "phase_started"]
+        # The run directory can belong to a different repository from its plan.
+        plan_path = Path(absolute).resolve()
+        problem = ""
+        churn_problem = ""
+        try:
+            repository = document_repository(plan_path)
+            root = repository if isinstance(repository, Path) else plan_path.parent
+            relative = str(plan_path.relative_to(root))
+            revision = f"refs/heads/{first.branch}"
+            if not root.is_dir() or not first.branch or not git_output(root, ["rev-parse", "--verify", revision]):
+                revision = "--all"
+                churn_problem = "not recorded: run branch is absent; all-ref history cannot establish churn order"
+            commits = doc_commits(str(root), relative, first.at, window.until, revision)
+            if not commits:
+                problem = "not recorded: document git history is absent"
+            current = plan_path.read_text(encoding="utf-8") if plan_path.is_file() else ""
+            # A plain run without a phased plan is not a plan sample.
+            evidence = current or (commits[-1].text if commits else "")
+            if evidence and not plan_history.PHASE_HEADING_PATTERN.search(evidence):
+                return NotPhasedPlan(absolute)
+            lineage: set[str] = set()
+            for version in ((commits[0].text if commits else ""), current):
+                for reference in source_references(version):
+                    source_path = Path(reference.path).expanduser()
+                    if not source_path.is_absolute():
+                        source_path = (plan_path.parent if reference.relative_to_plan else root) / source_path
+                    lineage.add(str(source_path.resolve()))
+            sources = tuple((source, source_history(root, source, window.until))
+                            for source in sorted(lineage) if source != str(plan_path))
+        except (OSError, subprocess.TimeoutExpired) as error:
+            commits, sources = (), ()
+            problem = f"not recorded: {error}"
+        return PlanHistory(absolute, run_ids, first.at,
+                           min(phase_starts) if phase_starts else NotRecorded("phase_started", "no dispatch"),
+                           commits, sources, problem, churn_problem)
+    # Repositories are independent read sources. Bound concurrent git readers;
+    # hundreds of serial process launches exceeded the baseline's time budget.
+    with ThreadPoolExecutor(max_workers=12) as readers:
+        loaded = readers.map(load_plan, sorted(groups.items()))
+        return tuple(plan for plan in loaded if isinstance(plan, PlanHistory))
+
+
+def measure_doc_pipeline(plans: Sequence[PlanHistory]) -> tuple[DocMilestone, ...]:
+    import re
+
+    result: list[DocMilestone] = []
+    for plan in plans:
+        for path, commits in ((plan.path, plan.commits), *plan.sources):
+            first: DocCommit | NotRecorded = commits[0] if commits else NotRecorded("git log --all --follow", "no commit")
+            evidence = "\n".join(commit.message for commit in commits)
+            if commits:
+                evidence += "\n" + commits[0].text.split("## Delegation Context", 1)[0]
+            commands = sorted(set(re.findall(r"/(?:(?:plan|producer|showrunner|unit):[a-z_]+|team_review|adversarial|api_review|module_review|astra_review|adhoc_review|issue)\b", evidence)))
+            result.append(DocMilestone(plan.path, path, first, plan.started, plan.first_phase,
+                                       ", ".join(commands) or "not recorded (git messages/doc header)", plan.problem))
+    return tuple(result)
+
+
+def todo_sections(text: str) -> dict[str, str]:
+    headings = list(plan_history.PHASE_HEADING_PATTERN.finditer(text))
+    sections: dict[str, str] = {}
+    for index, heading in enumerate(headings):
+        if "status: todo" in heading.group("rest"):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+            sections[heading.group("id")] = text[heading.start():end]
+    return sections
+
+
+def pending_decisions(text: str) -> set[str]:
+    import re
+
+    return set(re.findall(r"^\*\*Pending decision:\s*(.*?)\*\*\s*$", text, re.MULTILINE))
+
+
+def measure_plan_churn(plans: Sequence[PlanHistory], events: Sequence[Event], window: Window) -> tuple[PlanChurn, ...]:
+    import re
+
+    results: list[PlanChurn] = []
+    finishes = {(event.run, event.phase): event.at for event in events if event.kind == "phase_finished"}
+    phase_windows = [(event.run, event.at, finishes.get((event.run, event.phase), math.inf))
+                     for event in events if event.kind == "phase_started"]
+    for plan in plans:
+        todo_edits = opened = closed = n = 0
+        inserted: set[str] = set()
+        splits: list[str] = []
+        previous = ""
+        baseline_known = any(commit.at < plan.started and commit.text for commit in plan.commits)
+        for commit in plan.commits:
+            if plan.started <= commit.at < window.until:
+                n += 1
+                old_sections, new_sections = todo_sections(previous), todo_sections(commit.text)
+                # A commit between phase windows can amend a future Work Order.
+                active = any(run in plan.runs and start <= commit.at < end for run, start, end in phase_windows)
+                if not active and any(old_sections[key] != new_sections[key] for key in old_sections.keys() & new_sections.keys()):
+                    todo_edits += 1
+                before, after = pending_decisions(previous), pending_decisions(commit.text)
+                opened += len(after - before)
+                closed += len(before - after)
+                old_ids = {match.group("id") for match in plan_history.PHASE_HEADING_PATTERN.finditer(previous)}
+                new_ids = {match.group("id") for match in plan_history.PHASE_HEADING_PATTERN.finditer(commit.text)}
+                inserted.update(new_ids - old_ids)
+                if re.search(r"\bsplit\b.*\bphase|\bphase\b.*\bsplit\b", commit.message, re.IGNORECASE):
+                    splits.append(f"{commit.sha[:8]}: {commit.message}")
+            previous = commit.text
+        results.append(PlanChurn(plan.path, n, todo_edits, opened, closed, tuple(sorted(inserted)),
+                                 "; ".join(splits) or "not recorded (git messages do not name a phase split)",
+                                 plan.problem or plan.churn_problem or
+                                 ("" if baseline_known else "not recorded: no committed snapshot at run start")))
+    return tuple(results)
+
+
+def duration(seconds: float) -> str:
+    return f"{seconds / 3600:.2f}h" if abs(seconds) >= 3600 else f"{seconds:.1f}s"
+
+
+def missing(value: NotRecorded) -> str:
+    return f"not recorded ({value.source}: {value.reason})"
+
+
+def share(value: float | NotRecorded) -> str:
+    return missing(value) if isinstance(value, NotRecorded) else f"{value:.1%}"
+
+
+DETAIL_TABLES = ("phase-steps", "director-tokens", "contract-load", "doc-pipeline", "plan-churn")
+
+
+@dataclass(frozen=True)
+class RankedItem:
+    label: str
+    n: int
+    values: tuple[float | NotRecorded, ...]
+
+
+def top_items(items: Sequence[RankedItem]) -> tuple[RankedItem, ...]:
+    """Rank by the first total; retain unknown counts outside numeric columns."""
+    ranked = sorted(items, key=lambda item: item.values[0] if isinstance(item.values[0], float) else -math.inf,
+                    reverse=True)
+    if len(ranked) <= 10:
+        return tuple(ranked)
+    rest = ranked[10:]
+    totals: list[float | NotRecorded] = []
+    for index in range(len(rest[0].values)):
+        known = [item.values[index] for item in rest if isinstance(item.values[index], float)]
+        totals.append(sum(cast(list[float], known)) if known else NotRecorded("source records", "no values"))
+    n = sum(item.n for item in rest)
+    return (*ranked[:10], RankedItem(f"other (n={n})", n, tuple(totals)))
+
+
+def count(value: float) -> str:
+    return f"{value:,.0f}" if value.is_integer() else f"{value:,.1f}"
+
+
+def distribution_row(name: str, values: Sequence[float], absent: int,
+                     formatter: Callable[[float], str]) -> tuple[str, ...]:
+    if not values:
+        return (name, "0", "—", "—", "—", str(absent))
+    summary = summarize(name, values, 0)
+    return (name, str(summary.n), formatter(summary.median), formatter(summary.p90),
+            formatter(summary.total), str(absent))
+
+
+def item_rows(items: Sequence[RankedItem], formatters: Sequence[Callable[[float], str]]) -> list[tuple[str, ...]]:
+    return [(item.label, str(item.n), *("not recorded" if isinstance(value, NotRecorded) else formatter(value)
+                                      for value, formatter in zip(item.values, formatters))) for item in items]
+
+
+def table(title: str, columns: Sequence[str], rows: Sequence[Sequence[str]], window: Window) -> None:
+    print(f"\n{title} | {window.label()}")
+    widths = [max(len(row[index]) for row in [columns, *rows]) for index in range(len(columns))]
+    for row in [columns, *rows]:
+        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip())
+    if not rows:
+        print("not recorded; n=0")
+
+
+def compact_steps(events: Sequence[Event], phases: Sequence[PhaseBoundary], steps: PhaseSteps) -> tuple[StepCost, ...]:
+    """Merge small activity labels using per-phase allocated seconds, before quantiles."""
+    ranked = sorted(steps.costs, key=lambda cost: cost.total, reverse=True)
+    kept = [cost for cost in ranked if not cost.step.startswith("activity:")]
+    activities = [cost for cost in ranked if cost.step.startswith("activity:")]
+    tail: set[str] = set()
+    for cost in activities:
+        if cost.wall_share < .001 or len(kept) >= 10:
+            tail.add(cost.step)
+        else:
+            kept.append(cost)
+    if tail:
+        # Allocation precedes merging: merging concurrent labels first would change their shares.
+        samples = [sum(value for step, value in totals.items() if step in tail)
+                   for totals in allocated_step_seconds(events, phases) if tail.intersection(totals)]
+        kept.append(summarize(f"activity: other ({len(tail)} labels)", samples, steps.wall))
+    return tuple(sorted(kept, key=lambda cost: cost.total, reverse=True))
+
+
+def render_steps(events: Sequence[Event], window: Window, detailed: bool) -> None:
+    phases = phase_boundaries(events, window)
+    steps = measure_phase_steps(events, phases)
+    costs = steps.costs if detailed else compact_steps(events, phases, steps)
+    rows = [(cost.step, str(cost.n), duration(cost.median), duration(cost.p90), duration(cost.total),
+             f"{cost.wall_share:.1%}") for cost in costs]
+    stub = fix_time()
+    rows.append((f"fix — from {stub.source}, {stub.reason}", "0", "—", "—", "—", "—"))
+    wall = summarize("phase wall", [phase.end - phase.start for phase in phases], steps.wall) if phases else NotRecorded("phase_finished", "no finished phases")
+    rows.append(("phase wall", str(steps.phases), "—" if isinstance(wall, NotRecorded) else duration(wall.median),
+                 "—" if isinstance(wall, NotRecorded) else duration(wall.p90), duration(steps.wall), "100%"))
+    table("Phase steps — natedev only", ("step", "n phases", "median", "p90", "total", "wall share"), rows, window)
+    table("Phase end through next Work Order — natedev only", ("step", "n phases", "median", "p90", "total"),
+          [(cost.step, str(cost.n), duration(cost.median), duration(cost.p90), duration(cost.total)) for cost in steps.gaps], window)
+
+
+def render_tokens(tokens: Sequence[PhaseTokens], window: Window, detailed: bool) -> None:
+    known = [row for row in tokens if isinstance(row.cost, TokenCost)]
+    costs = [row.cost for row in known if isinstance(row.cost, TokenCost)]
+    absent = len(tokens) - len(known)
+    rows: list[tuple[str, ...]] = []
+    if detailed:
+        for row in tokens:
+            label = f"{row.phase.run}/{row.phase.identifier} ({stamp(row.phase.start)})"
+            cost = row.cost
+            rows.append((label, "0", "not recorded", "not recorded", missing(cost), "—") if isinstance(cost, NotRecorded)
+                        else (label, str(cost.turns), str(cost.input), str(cost.output), share(cost.before_share), share(cost.after_share)))
+        table("Director tokens detail — natedev only", ("run/phase (start)", "n turns", "input", "output", "before first pass", "after last pass"), rows, window)
+        return
+    rows = [distribution_row("input per phase", [float(cost.input) for cost in costs], absent, count),
+            distribution_row("output per phase", [float(cost.output) for cost in costs], absent, count)]
+    for name, shares in (("before first pass share", [cost.before_share for cost in costs]),
+                         ("after last pass share", [cost.after_share for cost in costs])):
+        values = [value for value in shares if isinstance(value, float)]
+        summary = distribution_row(name, values, len(tokens) - len(values), lambda value: f"{value:.1%}")
+        rows.append((*summary[:4], "—", summary[-1]))
+    table("Director tokens summary — natedev only", ("measure", "n phases", "median", "p90", "total", "not recorded"), rows, window)
+    items = [RankedItem(f"{row.phase.run[:8]}/{row.phase.identifier}@{stamp(row.phase.start)}", 1,
+                        (float(row.cost.input), float(row.cost.output), float(row.cost.turns)))
+             for row in known if isinstance(row.cost, TokenCost)]
+    table("Director tokens: top 10 phases by input — natedev only", ("run/phase@start", "n phases", "input", "output", "n turns"),
+          item_rows(top_items(items), (count, count, count)), window)
+    sources: dict[str, int] = defaultdict(int)
+    for row in tokens:
+        if isinstance(row.cost, NotRecorded):
+            sources[missing(row.cost)] += 1
+    for source, n in sorted(sources.items()):
+        print(f"{source}; n phases={n}")
+
+
+def render_contract(contract: Sequence[ContractFile], window: Window, detailed: bool) -> None:
+    per_phase = [row for row in contract if row.cadence in ("per phase", "per dispatch")]
+    if not detailed:
+        table("Contract size summary — static checkout", ("measure", "n files", "median", "p90", "total", "not recorded"),
+              [distribution_row("lines per file", [float(row.lines) for row in contract], 0, count),
+               distribution_row("bytes per file", [float(row.bytes) for row in contract], 0, count)], window)
+    rows: list[tuple[str, ...]] = []
+    ranked = sorted(contract, key=lambda row: row.bytes, reverse=True)
+    for row in ranked if detailed else ranked[:10]:
+        rows.append((row.path, "1", str(row.lines), str(row.bytes), row.cadence))
+    if not detailed and len(ranked) > 10:
+        rest = ranked[10:]
+        cadences = "; ".join(f"{cadence}: {sum(row.cadence == cadence for row in rest)}" for cadence in sorted({row.cadence for row in rest}))
+        rows.append((f"other (n={len(rest)})", str(len(rest)), str(sum(row.lines for row in rest)), str(sum(row.bytes for row in rest)), cadences))
+    rows.append(("sum per phase (minimum)", str(len(per_phase)), str(sum(row.lines for row in per_phase)),
+                 str(sum(row.bytes for row in per_phase)), "includes one read per dispatch file"))
+    table("Contract full reads — static checkout", ("file", "n files", "lines", "bytes", "cadence"), rows, window)
+    print("Per-phase sum counts each per-phase/dispatch file once; repeated dispatches add reads. Brief/report reads are on request or mode-dependent.")
+
+
+@dataclass(frozen=True)
+class PlanLeadTime:
+    plan: str
+    doc_to_run: float | NotRecorded
+    run_to_phase: float | NotRecorded
+    doc_to_phase: float | NotRecorded
+
+
+def plan_lead_times(pipeline: Sequence[DocMilestone]) -> tuple[PlanLeadTime, ...]:
+    groups: dict[str, list[DocMilestone]] = defaultdict(list)
+    for row in pipeline:
+        groups[row.plan].append(row)
+    results: list[PlanLeadTime] = []
+    for plan, milestones in groups.items():
+        commits = [row.first_commit.at for row in milestones if isinstance(row.first_commit, DocCommit)]
+        first = milestones[0]
+        absent = NotRecorded("git log + phase_started", "milestone absent")
+        complete_docs = len(commits) == len(milestones)
+        to_run = float(first.run_started - min(commits)) if complete_docs else absent
+        to_phase = float(first.phase_started - first.run_started) if not isinstance(first.phase_started, NotRecorded) else absent
+        lead = float(first.phase_started - min(commits)) if complete_docs and not isinstance(first.phase_started, NotRecorded) else absent
+        results.append(PlanLeadTime(plan, to_run, to_phase, lead))
+    return tuple(results)
+
+
+def render_pipeline(pipeline: Sequence[DocMilestone], window: Window, detailed: bool) -> None:
+    rows: list[tuple[str, ...]] = []
+    if detailed:
+        for row in pipeline:
+            commit = row.first_commit
+            first = missing(commit) if isinstance(commit, NotRecorded) else f"{stamp(commit.at)} {commit.sha[:8]}"
+            phase = missing(row.phase_started) if isinstance(row.phase_started, NotRecorded) else stamp(row.phase_started)
+            to_run = "not recorded" if isinstance(commit, NotRecorded) else duration(row.run_started - commit.at)
+            to_phase = "not recorded" if isinstance(row.phase_started, NotRecorded) else duration(row.phase_started - row.run_started)
+            lead = "not recorded" if isinstance(commit, NotRecorded) or isinstance(row.phase_started, NotRecorded) else duration(row.phase_started - commit.at)
+            rows.append((row.plan, row.document, "0" if isinstance(commit, NotRecorded) else "1", first,
+                         stamp(row.run_started), phase, to_run, to_phase, lead, row.commands, row.problem))
+        table("Doc pipeline detail — natedev only", ("plan", "document", "n commits", "first commit", "first run", "first phase", "doc to run", "run to phase", "doc to phase", "commands named", "source limit"), rows, window)
+        return
+    leads = plan_lead_times(pipeline)
+    for name, samples in (("first doc to run", [row.doc_to_run for row in leads]),
+                          ("run to first phase", [row.run_to_phase for row in leads]),
+                          ("first doc to first phase", [row.doc_to_phase for row in leads])):
+        values = [value for value in samples if isinstance(value, float)]
+        rows.append(distribution_row(name, values, len(leads) - len(values), duration))
+    table("Doc pipeline summary — natedev only", ("measure", "n plans", "median", "p90", "total", "not recorded"), rows, window)
+    items = [RankedItem(Path(row.plan).name, 1, (row.doc_to_phase, row.doc_to_run, row.run_to_phase)) for row in leads]
+    table("Doc pipeline: top 10 plans by lead time — natedev only", ("plan", "n plans", "doc to phase", "doc to run", "run to phase"),
+          item_rows(top_items(items), (duration, duration, duration)), window)
+    print(f"Earliest doc requires all named source commits. Document commits not recorded: n={sum(isinstance(row.first_commit, NotRecorded) for row in pipeline)}/{len(pipeline)} documents; source: git log. Commands and exact milestones: --detail doc-pipeline.")
+
+
+def churn_totals(row: PlanChurn) -> tuple[float | NotRecorded, ...]:
+    import re
+
+    if row.problem:
+        return (NotRecorded("plan git history", row.problem),) * 5
+    splits: float | NotRecorded = (NotRecorded("git messages", "no phase split named") if row.split.startswith("not recorded")
+                                   else float(len(re.findall(r"(?:^|; )[0-9a-f]+: ", row.split))))
+    return (float(row.todo_edits), float(row.decisions_opened), float(row.decisions_closed), float(len(row.inserted_phases)), splits)
+
+
+def render_churn(churn: Sequence[PlanChurn], window: Window, detailed: bool) -> None:
+    if detailed:
+        table("Plan churn detail — natedev only", ("plan", "n commits", "todo edits", "opened", "closed", "phase IDs added", "phase splits", "source limit"),
+              [(row.plan, str(row.commits), "not recorded" if row.problem else str(row.todo_edits),
+                "not recorded" if row.problem else str(row.decisions_opened), "not recorded" if row.problem else str(row.decisions_closed),
+                "not recorded" if row.problem else (", ".join(row.inserted_phases) or "none"), row.split, row.problem) for row in churn], window)
+        return
+    totals = [churn_totals(row) for row in churn]
+    names = ("Work Order edits", "decisions opened", "decisions closed", "phases inserted", "named phase splits")
+    rows: list[tuple[str, ...]] = []
+    for index, name in enumerate(names):
+        values = [values[index] for values in totals if isinstance(values[index], float)]
+        rows.append(distribution_row(name, cast(list[float], values), len(churn) - len(values), count))
+    table("Plan churn summary — natedev only; first run through window end", ("measure", "n plans", "median", "p90", "total", "not recorded"), rows, window)
+    items = [RankedItem(Path(row.plan).name, 1,
+                        (sum(value for value in values if isinstance(value, float)), *values)) for row, values in zip(churn, totals) if not row.problem]
+    table("Plan churn: top 10 plans by total changes — natedev only", ("plan", "n plans", "total", "todo", "opened", "closed", "inserted", "splits"),
+          item_rows(top_items(items), (count,) * 6), window)
+    print("Split counts use named git messages; absence is not recorded. Other totals sum known values only; unknown counts are above.")
+
+
+def render_baseline(events: Sequence[Event], window: Window, usage: tuple[UsageTurn, ...] | NotRecorded,
+                    contract: Sequence[ContractFile], plans: Sequence[PlanHistory], problems: Sequence[str]) -> None:
+    print("Phase process baseline — natedev only; no Mac records read. Use baseline --detail TABLE for full rows.")
+    print("n counts phases, plans or files as labeled; p90 is nearest rank. Top lists show 10 plus summed other.")
+    print("Distinct overlapping steps share wall time equally; parallel workers of one kind count once. Fix costs are excluded.")
+    print("Director time includes uncovered waits; unmatched steps have unknown coverage. Activity tails below 0.1% are merged.")
+    print("Recorded phases can hold multiple plan phases; rounds.py will supply boundaries. Plans are selected by run start, phases by finish.")
+    print("Token input includes caches; pass records bound before/after shares of input + output. Shared sessions can overlap; compose before phase start is not isolated.")
+    phases = phase_boundaries(events, window)
+    render_steps(events, window, False)
+    render_tokens(measure_director_tokens(events, phases, usage), window, False)
+    render_contract(contract, window, False)
+    render_pipeline(measure_doc_pipeline(plans), window, False)
+    render_churn(measure_plan_churn(plans, events, window), window, False)
+    print("Churn counts committed snapshots from first run, possibly before this window. Removed pending blocks count as closed.")
+    print("Git times are commit times; command names are evidence, not proof of execution. Uncommitted churn is not recorded.")
+    print(f"Source read problems: n={len(problems)}; first 3: {'; '.join(problems[:3]) or 'none'}")
+
+
+def render_detail(name: str, events: Sequence[Event], window: Window, usage: tuple[UsageTurn, ...] | NotRecorded,
+                  contract: Sequence[ContractFile], plans: Sequence[PlanHistory]) -> None:
+    if name == "phase-steps":
+        render_steps(events, window, True)
+    elif name == "director-tokens":
+        render_tokens(measure_director_tokens(events, phase_boundaries(events, window), usage), window, True)
+    elif name == "contract-load":
+        render_contract(contract, window, True)
+    elif name == "doc-pipeline":
+        render_pipeline(measure_doc_pipeline(plans), window, True)
+    elif name == "plan-churn":
+        render_churn(measure_plan_churn(plans, events, window), window, True)
+
+
+def date_epoch(value: str) -> float:
+    parsed = datetime.fromisoformat(value)
+    return (parsed.replace(tzinfo=user_zone()) if parsed.tzinfo is None else parsed).timestamp()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    _ = parser.add_argument("command", choices=("baseline",))
+    _ = parser.add_argument("--since", type=date_epoch)
+    _ = parser.add_argument("--until", type=date_epoch)
+    parser.add_argument("--detail", choices=DETAIL_TABLES, help="print full rows for one table only")  # pyright: ignore[reportUnusedCallResult]
+    args = parser.parse_args()
+    until = cast(float | None, args.until)
+    since = cast(float | None, args.since)
+    end = until if until is not None else datetime.now(UTC).timestamp()
+    window = Window(since if since is not None else end - timedelta(days=14).total_seconds(), end)
+    if window.since >= window.until:
+        parser.error("--since must be before --until")
+    events, problems = read_events((Path.home() / ".local/state/plan-delegate/runs").glob("*.jsonl"))
+    phases = phase_boundaries(events, window)
+    usage_window = Window(min((phase.start for phase in phases), default=window.since), window.until)
+    selected_runs = {phase.run for phase in phases}
+    directors = tuple({event.director for event in events if event.kind == "run_started" and
+                       event.run in selected_runs and isinstance(event.director, DirectorSession)})
+    usage = (read_usage(collect.store_path(), usage_window, directors) if directors else
+             NotRecorded("run_started.main_agent.session_id", "no selected phase has a mapped director"))
+    root = Path(__file__).resolve().parents[2]
+    paths = [*sorted((root / "commands/unit").glob("*.md")),
+             *sorted((root / "commands/plan").glob("*.md")),
+             *sorted((root / "docs/delegate").glob("*.md"))]
+    contract = measure_contract([(str(path.relative_to(root)), path.read_bytes()) for path in paths])
+    plans = load_plan_histories(events, window)
+    detail = cast(str | None, args.detail)
+    if detail is None:
+        render_baseline(events, window, usage, contract, plans, problems)
+    else:
+        render_detail(detail, events, window, usage, contract, plans)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -46,6 +46,7 @@ class StylePlanTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
         self.unit = self.root / "sample-style-names"
@@ -53,6 +54,7 @@ class StylePlanTests(unittest.TestCase):
         self.repo.mkdir()
         self.rule_dir.mkdir(parents=True)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
         })))
@@ -184,6 +186,83 @@ class StylePlanTests(unittest.TestCase):
             rows = cast(list[tuple[int]], connection.execute("SELECT COUNT(*) FROM tickets").fetchall())
         return rows[0][0]
 
+    def test_style_family_accepts_exact_suffixes_and_returns_a_typed_nonstyle_result(self) -> None:
+        families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
+        for family in families:
+            for unit in (f"{family}-unit", f"sample-style-{family}-unit", f"types-style-{family}-unit"):
+                with self.subTest(unit=unit):
+                    self.assertEqual(rules.style_family(unit), family)
+        for unit in ("", "names", "feature-unit", "nonnames-unit", "names-units", "names-unit-extra"):
+            with self.subTest(unit=unit):
+                self.assertIsInstance(rules.style_family(unit), rules.NotStyleUnit)
+
+    def test_family_plans_use_each_units_plan_cell_for_old_and_full_ids(self) -> None:
+        expected: dict[rules.Family, str] = {}
+        rows: list[str] = []
+        families: tuple[rules.Family, ...] = ("names", "types", "values", "modules")
+        for index, family in enumerate(families):
+            unit = f"sample-style-{family}-unit" if index % 2 else f"{family}-unit"
+            worktree = self.root / f"plan-{family}"
+            relative = f"docs/style-production/units/retained-{family}.md"
+            plan = worktree / relative
+            plan.parent.mkdir(parents=True)
+            expected[family] = f"# {family} unit settings\n"
+            _ = plan.write_text(expected[family])
+            _ = (plan.parent / f"{unit}.md").write_text("Do not read this path.\n")
+            rows.append(f"| {unit} | {relative} | {worktree} | demo-style-{family} |")
+        rows.append(f"| feature-unit | missing.md | {self.root / 'feature'} | feature |")
+        prefix = self.doc.read_text().split("## Units", 1)[0]
+        _ = self.doc.write_text(prefix + "## Units\n\n| Unit | Plan | Worktree | Branch |\n"
+                                + "| --- | --- | --- | --- |\n" + "\n".join(rows) + "\n")
+
+        self.assertEqual(dict(style_plan.family_plan_texts(self.doc)), expected)
+
+    def test_next_phase_keeps_the_declared_plan_path_for_old_and_full_ids(self) -> None:
+        _ = self.rule("read")
+        self.sync()
+        original_doc = self.doc.read_text()
+        retained = self.plan.with_name("retained-names-plan.md")
+        _ = self.plan.rename(retained)
+        for unit in ("names-unit", "sample-style-names-unit"):
+            with self.subTest(unit=unit):
+                _ = self.doc.write_text(original_doc.replace("| names-unit |", f"| {unit} |")
+                                        .replace("units/names-unit.md", "units/retained-names-plan.md"))
+                _ = retained.write_text(self.plan_header().replace("`names-unit`", f"`{unit}`"))
+                result = style_plan.next_phase(unit, retained, self.repo)
+                self.assertEqual(result, style_plan.PhaseWritten(f"{unit}-1"))
+                ticket = self.ledger().ticket_open(unit)[0]
+                self.assertEqual(ticket["family"], "names")
+                self.assertEqual(ticket["files"], list(self.sources[:2]))
+                self.assertIn(f"{unit}-1", retained.read_text())
+                self.assertFalse(self.plan.exists())
+                self.assertEqual(style_plan.next_phase(unit, retained, self.repo),
+                                 style_plan.Resumed(f"{unit}-1"))
+                self.ledger().ticket_drop(f"{unit}-1")
+
+    def test_full_id_queue_reads_retained_plan_settings_and_only_declared_units(self) -> None:
+        _ = self.rule("read")
+        _ = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.sync()
+        unit = "sample-style-names-unit"
+        retained = self.plan.with_name("retained-names-plan.md")
+        _ = self.plan.rename(retained)
+        first = self.sources[-1]
+        _ = retained.write_text(self.plan_header().replace("`names-unit`", f"`{unit}`").replace(
+            "## Phases", f"- **First files:** {first}\n\n## Phases"))
+        _ = self.doc.write_text(self.doc.read_text().replace("| names-unit |", f"| {unit} |")
+                                .replace("units/names-unit.md", "units/retained-names-plan.md"))
+        for selected in ([], ["--unit", unit]):
+            with self.subTest(selected=selected):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = style_plan.main(["queue", "--repo", str(self.repo), *selected])
+                self.assertEqual(code, 0)
+                lines = output.getvalue().splitlines()
+                self.assertTrue(lines)
+                self.assertTrue(all(line.startswith(f"{unit}: read ") for line in lines), lines)
+                self.assertEqual(lines[0].split(" files: ")[1], first)
+        self.assertEqual(self.count_tickets(), 0)
+
     def test_long_read_windows_balance_each_part_and_cover_the_test_module_separately(self) -> None:
         text = "//! Module docs\n" + "// production\n" * 759 + "#[cfg(test)]\nmod tests {\n" + "// test\n" * 599 + "}\n"
         windows = style_plan.read_windows(text)
@@ -274,7 +353,7 @@ class StylePlanTests(unittest.TestCase):
             + "A cell is recorded only after both judges have judged it: held when either judge holds a finding in it, ",
             self.plan.read_text())
 
-    def test_written_phase_requires_an_input_scope_on_crate_and_module_cells(self) -> None:
+    def test_written_phase_names_read_files_and_explains_refill_without_reads(self) -> None:
         _ = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
         self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
@@ -284,9 +363,46 @@ class StylePlanTests(unittest.TestCase):
             + "the ledger takes its pinned rule blob.\n"
             + "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.\n"
             + "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.\n"
-            + "Use `--input-scope rule` when the verdict rests on other files in the crate or module.\n",
+            + "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
+            + "Without `--reads`, the cell comes back after any change in its crate or module.\n",
             self.plan.read_text(),
         )
+
+    def test_refill_offers_rule_cell_again_only_when_a_named_read_file_changes(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        legacy = self.rule("legacy-read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        path = self.sources[0]
+        read = "crates/alpha/src/b.rs"
+        self.write(read, "pub fn read() {}\n")
+        self.tip = self.commit()
+        self.unit_takes_tip()
+        self.sync()
+        self.assertTrue(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
+        result = subprocess.run(
+            [sys.executable, str(Path(style_ledger.__file__)), "record", "--repo", str(self.repo),
+             "--rule", rule, "--path", path, "--commit", self.tip, "--rule-blob",
+             next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule),
+             "--verdict", "clean", "--ticket", "outside", "--worker", "test", "--input-scope", "rule",
+             "--reads", read], capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.record(legacy, path, self.tip)
+        self.assertFalse(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
+        self.assertFalse(any(legacy in ticket.rules and path in ticket.files for ticket in self.candidates()))
+
+        self.write(self.sources[1], "pub fn unrelated() {}\n")
+        self.tip = self.commit()
+        self.unit_takes_tip()
+        self.sync()
+        candidates = self.candidates()
+        self.assertFalse(any(rule in ticket.rules and path in ticket.files for ticket in candidates))
+        self.assertTrue(any(legacy in ticket.rules and path in ticket.files for ticket in candidates))
+
+        self.write(read, "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.unit_takes_tip()
+        self.sync()
+        self.assertTrue(any(rule in ticket.rules and path in ticket.files for ticket in self.candidates()))
 
     def test_written_names_read_phase_uses_two_blind_judges_for_small_and_large_slices(self) -> None:
         rule = self.rule("read")
@@ -842,6 +958,45 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotIn(nested, batch.files)
         self.assertNotIn((structure, nested), batch.cells)
 
+    def test_a_waived_only_cell_stops_refilling_until_its_file_or_rule_changes(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        path = self.sources[0]
+        finding = ledger.hold(rule, path, 1, "Keep this name", "rename", "value", "amount", blob, "outside")
+        ledger.record(rule, path, self.tip, blob, "held", ticket="outside", input_scope=style_ledger.DeclaredInputScope.RULE)
+        result = subprocess.run([sys.executable, style_ledger.__file__, "held", "waive", "--repo", str(self.repo),
+                                 "--id", finding.finding_id, "--person", "nate"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write(self.sources[1], "pub fn sibling_changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.unit_takes_tip()
+        for other in self.sources[1:]:
+            self.record(rule, other, self.tip)
+        self.assertEqual([ticket.files for ticket in self.candidates()], [(path,)])
+        refused = subprocess.run([sys.executable, style_ledger.__file__, "record", "--repo", str(self.repo),
+                                  "--rule", rule, "--path", path, "--commit", self.tip, "--rule-blob", blob,
+                                  "--verdict", "held", "--ticket", "outside", "--worker", "test", "--input-scope", "rule"],
+                                 capture_output=True, text=True, check=False)
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        ledger.record(rule, path, self.tip, blob, "waived", ticket="outside")
+        self.write("README.md", "Unrelated sync\n")
+        self.tip = self.commit()
+        self.sync()
+        self.unit_takes_tip()
+        self.assertEqual(self.candidates(), ())
+        self.write(path, "pub fn changed() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.unit_takes_tip()
+        self.assertIn(path, {file for ticket in self.candidates() for file in ticket.files})
+        ledger.record(rule, path, self.tip, blob, "waived", ticket="outside")
+        _ = (self.rule_dir / "read.md").write_text("---\ntier: C\nfamily: names\ninput_scope: crate\n---\nNew rule text.\n")
+        self.sync()
+        self.assertIn(path, {file for ticket in self.candidates() for file in ticket.files})
+
     def test_structure_work_order_shows_existing_holds_on_the_batch_files_only(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
@@ -849,8 +1004,13 @@ class StylePlanTests(unittest.TestCase):
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         held = ledger.hold(rule, self.sources[0], 1, "Split this module", "restructure", "before", "after", blob, "outside")
         waived = ledger.hold(rule, self.sources[0], 2, "Already waived", "restructure", "before", "after", blob, "outside")
-        _ = ledger.decline_findings((waived.finding_id,), "declined")[waived.finding_id]
+        _ = ledger.decline_findings((waived.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[waived.finding_id]
         outside = ledger.hold(rule, self.sources[2], 1, "Different batch", "restructure", "before", "after", blob, "outside")
+        ledger.waive_held(outside.finding_id, style_ledger.WaiveByPerson("nate"))
+        other_rule = self.rule("other-family")
+        other_blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == other_rule)
+        other = ledger.hold(other_rule, self.sources[0], 3, "Other rule", "rename", "before", "after", other_blob, "outside")
+        ledger.waive_held(other.finding_id, style_ledger.WaiveByPerson("nate"))
         worktree = self.root / "modules"
         _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
         plan = worktree / "docs/style-production/units/modules-unit.md"
@@ -860,9 +1020,32 @@ class StylePlanTests(unittest.TestCase):
         text = plan.read_text()
         self.assertIn(f"{held.finding_id} · {rule} · {self.sources[0]}:1 · Split this module", text)
         self.assertIn("do not hold these again", text)
-        self.assertNotIn(waived.finding_id, text)
+        heading = "Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."
+        self.assertIn(heading, text)
+        held_section, _, waived_section = text.partition(heading)
+        self.assertNotIn(waived.finding_id, held_section)
+        self.assertIn(waived.finding_id, waived_section)
+        self.assertNotIn(other.finding_id, text)
+        self.assertIn(f"{waived.finding_id} · {rule} · {self.sources[0]}:2 · Already waived", text)
         self.assertNotIn(outside.finding_id, text)
         self.assertIn("Judge these 2 files of `crates/alpha`", text)
+
+    def test_structure_resume_keeps_waived_findings_after_the_pinned_rule_leaves_the_catalog(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        self.sync()
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        finding = ledger.hold(rule, self.sources[0], 1, "Keep this module", "restructure",
+                              "before", "after", blob, "outside")
+        ledger.waive_held(finding.finding_id, style_ledger.WaiveByPerson("nate"))
+        plan = self.modules_unit()
+        self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+        expected = plan.read_bytes()
+        self.assertIn(f"{finding.finding_id} · {rule} · {self.sources[0]}:1 · Keep this module", expected.decode())
+        (self.rule_dir / "structure.md").unlink()
+        _ = plan.write_text(self.plan_header())
+        self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.Resumed)
+        self.assertEqual(plan.read_bytes(), expected)
 
     def test_first_files_get_a_separate_read_ticket_before_paths_that_sort_earlier(self) -> None:
         _ = self.rule("read")
@@ -2577,6 +2760,10 @@ class StylePlanTests(unittest.TestCase):
         ledger = self.ledger()
         self.assertIsInstance(next(finding.state for finding in ledger.proposal_findings(issue)
                                    if finding.finding_id == gone.finding_id), style_ledger.Waived)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT waive_provenance,waived_by FROM held_findings WHERE finding_id=?",
+                                                (gone.finding_id,)).fetchone(), ("ledger", "ledger"))
+        self.assertEqual(ledger.named_held((gone.finding_id,))[0].waive_actor, style_ledger.WaiveByLedger())
         ticket = ledger.ticket_open("names-unit")[0]
         self.assertEqual((ticket["kind"], ticket["files"]), ("proposal", [self.sources[0]]))
         ledger.ticket_checkpoint(ticket["id"], self.tip)
@@ -2712,6 +2899,35 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual(code, 0, errors)
         return output
 
+    def test_refill_uses_an_outside_follow_and_names_an_unproved_mapped_declaration(self) -> None:
+        site, destination = self.sources[:2]
+        source = "fn original() {\n    first();\n    second();\n    third();\n    fourth();\n}\n"
+        self.commit_files({site: source})
+        issue, (finding,) = self.judged_findings(self.rule("read"), ((site, 4, "third();"),))
+        self.write_generated_body(issue)
+        self.commit_files({site: "// removed\n", destination: source.replace("original", "renamed")})
+        output = self.refill_decisions()
+        self.assertNotIn("waived", output)
+        row, = self.ledger().proposal_findings(issue)
+        self.assertEqual((row.finding_id, row.path, row.line, row.state),
+                         (finding.finding_id, destination, 4, style_ledger.Filed(issue)))
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["files"], ticket["finding_ids"]), ([destination], [finding.finding_id]))
+        self.ledger().ticket_drop(ticket["id"])
+        failed = source.replace("original", "failed").replace("second();", "different();").replace("third();", "changed();").replace("fourth();", "other();")
+        # The old body line is copied to another file: unresolved proof must suppress the text-move waiver.
+        self.commit_files({destination: failed, site: "fn unrelated() { third(); }\n", "crates/alpha/src/failed.rs": failed})
+        output = self.refill_decisions()
+        self.assertIn(f"waiting {issue}:", output)
+        self.assertIn("outside rename not proved", output)
+        self.assertIn(f"mapped site {destination}:4", output)
+        self.assertIn("crates/alpha/src/failed.rs", output)
+        self.assertNotIn("waived", output)
+        row, = self.ledger().proposal_findings(issue)
+        self.assertEqual((row.finding_id, row.path, row.state), (finding.finding_id, destination, style_ledger.Filed(issue)))
+        self.assertFalse(any(finding.finding_id in ticket["finding_ids"] for ticket in self.ledger().ticket_open("names-unit")))
+        self.assertEqual(frontmatter(issue)["status"], ["open"])
+
     def test_decision_refill_tickets_a_finding_at_the_file_its_declaration_moved_to(self) -> None:
         issue, finding, output = self.refill_after_declaration_move({"crates/alpha/src/parent.rs": "pub struct Parent {\n    old: u32,\n}\n"})
         self.assertNotIn("waived", output)
@@ -2756,10 +2972,19 @@ class StylePlanTests(unittest.TestCase):
         followed, = self.ledger().proposal_findings(later)
         self.assertEqual((followed.finding_id, followed.path, followed.line), (moves.finding_id, "crates/alpha/src/moved.rs", 2))
 
+    def test_refill_names_every_ambiguous_declaration_destination(self) -> None:
+        source = "pub struct Parent {\n    old: u32,\n}\n"
+        first, second = "crates/alpha/src/one.rs", "crates/alpha/src/two.rs"
+        issue, finding, output = self.refill_after_declaration_move({second: source, first: source})
+        self.assertIn(f"waiting {issue}: {finding.finding_id} declared in 2 files: {first}, {second}", output)
+        row, = self.ledger().proposal_findings(issue)
+        self.assertEqual((row.path, row.state, row.follow), (finding.path, style_ledger.Filed(issue), style_ledger.NotFollowed()))
+
     def test_decision_refill_leaves_a_finding_declared_in_two_files_out_of_the_ticket(self) -> None:
         parent = "pub struct Parent {\n    old: u32,\n}\n"
         issue, finding, output = self.refill_after_declaration_move({"crates/alpha/src/one.rs": parent, "crates/alpha/src/two.rs": parent})
-        self.assertIn(f"waiting {issue}: {finding.finding_id} declared in 2 files\n", output)
+        self.assertIn(f"waiting {issue}: {finding.finding_id} declared in 2 files: crates/alpha/src/one.rs, crates/alpha/src/two.rs; outside rename not proved: old name still declared in crate; "
+                      + "candidates: none; mapped site unresolved: source site deleted\n", output)
         self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
                          [(finding.path, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
         self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
@@ -2770,7 +2995,7 @@ class StylePlanTests(unittest.TestCase):
         issue, (finding,) = self.judged_findings(self.rule("read"), ((site, 2, "old: u32,"),))
         self.commit_files({site: "pub fn other() {}\n"})
         output = self.refill_decisions()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} declaration gone\n", output)
+        self.assertIn(f"waiting {issue}: {finding.finding_id} outside rename not proved:", output)
         self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
                          [(site, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
         self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
@@ -3056,7 +3281,6 @@ class StylePlanTests(unittest.TestCase):
 
         Files replace or add HEAD files, and each pair adds a finding that renames an item of the file.
         """
-        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.root / "runtime")})))
         old = "crates/alpha/src/ledger/lock.rs"
         self.write(self.sources[0], "pub mod ledger;\n")
         self.write("crates/alpha/src/ledger/mod.rs", self.LEDGER_MOD)

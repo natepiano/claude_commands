@@ -65,7 +65,7 @@ if verb == 'follow':
 if verb == 'start':
     name = option('--name')
     roster[name] = {'thread_id': 'thread-for-' + name, 'turn_id': 'turn-1',
-                    'status': 'done', 'role': option('--role')}
+                    'status': 'done', 'role': option('--role'), 'task': option('--task')}
     pathlib.Path(option('--reply-file')).write_text('initial reply\\n')
 elif verb == 'compact':
     name = option('--to')
@@ -123,6 +123,7 @@ elif verb == 'follow':
     if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
         signal.pause()
     roster[name]['role'] = option('--role')
+    roster[name]['task'] = option('--task')
     (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
     if os.environ.get('STUB_FOLLOW_FAIL') == '1':
         roster[name]['status'] = 'failed'
@@ -1026,6 +1027,29 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertIn("launcher:", board)
         self.assertIn("done:", board)
 
+    def test_follow_refuses_transferring_and_redirected_roles_before_compaction_or_claim(self) -> None:
+        session = self.start_phase("adoption-fence")
+        initial = self.mesh_launch(session)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        path = session / "mesh_roster.json"
+        original = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
+        name = next(iter(original))
+        self.open_repair_round(session)
+        for field, value in (("transferring_role", {"adoption_id": "transfer-one", "destination": "/fixture/roles/mesh"}),
+                             ("role_redirect", {"design_id": "lasting-design", "destination": "/fixture/roles/mesh"})):
+            with self.subTest(field=field):
+                roster = {key: dict(entry) for key, entry in original.items()}
+                roster[name].update({field: value, "context_tokens": 999999})
+                _ = path.write_text(json.dumps(roster))
+                before = path.read_bytes()
+                events = session / "mesh_events.txt"
+                previous_events = events.read_bytes() if events.exists() else b""
+                result = self.mesh_launch(session, to=name, kind="fix", resolves_round=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("TransferringRole", result.stderr)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(events.read_bytes() if events.exists() else b"", previous_events)
+
     def test_follow_up_compacts_above_the_context_threshold_before_claiming(self) -> None:
         session_dir = self.start_phase("compact-above")
         first = self.mesh_launch(session_dir)
@@ -1093,6 +1117,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         ))
         name = next(iter(roster))
         self.assertEqual(roster[name]["role"], "impl")
+        self.assertEqual(roster[name]["task"], "delegate.impl")
 
         followed = self.mesh_launch(
             session_dir, to=name, kind="review", subtask="impl"
@@ -1103,6 +1128,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             roster_path.read_text(encoding="utf-8")
         ))
         self.assertEqual(roster[name]["role"], "review")
+        self.assertEqual(roster[name]["task"], "delegate.impl")
 
     def test_compaction_threshold_must_be_configured_as_a_positive_integer(self) -> None:
         configured = self.config_file.read_text(encoding="utf-8")

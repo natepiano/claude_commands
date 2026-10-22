@@ -6,7 +6,7 @@ Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunne
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
 `<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, stops
 the unit and its Codex seats at once through the shutdown path (`down`, then `now`), sends SIGTERM to
-what its runs leave in its worktree (a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
+what its runs leave in its worktree (an app-server and its seats, a detached run's supervisor, an app-server's watcher), merges the merge branch into the unit, moves the branch and
 worktree (unit_move), commits `chore(<slug>): rename unit <old> to <new>` on the merge branch, which
 merge_branch_history follows, merges that commit into the unit, moves the unit's state, retires the
 old branch, points the unit's shutdown record at the new names (each paused Codex seat's launcher
@@ -31,7 +31,7 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "herdr"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "style"))
 import add_unit  # noqa: E402
 import issues  # noqa: E402
 import merge_checkpoint  # noqa: E402
@@ -61,9 +62,11 @@ from unit_move import PathMove, git  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 if TYPE_CHECKING:
+    from scripts.style import style_ledger
     from scripts.shutdown import record as shutdown_record
     from scripts.shutdown.record import SessionShutdown
 else:
+    import style_ledger
     import record as shutdown_record
     from record import SessionShutdown
 
@@ -90,6 +93,24 @@ POLL_SECONDS = 1.0
 
 class RenameWaiting(RenameRefused):
     """The unit is still stopping after STOP_WAIT_SECONDS: a rerun of apply resumes once it has stopped."""
+
+
+class StopTarget(Protocol):
+    """What the stop steps read: the unit's production and ids, and where its worktree is now.
+    A rename and a transfer both stop a unit this way."""
+    @property
+    def slug(self) -> str: ...
+    @property
+    def old(self) -> str: ...
+    @property
+    def new(self) -> str: ...
+    @property
+    def id_matches(self) -> bool: ...
+    # The stop step fills these with the record the unit relaunches from.
+    account: str
+    session_id: str
+
+    def worktree(self) -> Path: ...
 
 
 @dataclass
@@ -186,8 +207,19 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
         raise RenameRefused(f"{old} is retired; its row is history")
     old_branch = production_units.cell_value(row.get("Branch", ""))
     worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
-    new_branch = _swap(old_branch, unit_names.stem(old), unit_names.stem(new), "branch")
-    new_worktree = worktree.with_name(_swap(worktree.name, unit_names.stem(old), unit_names.stem(new), "worktree"))
+    old_stem, new_stem = unit_names.stem(old), unit_names.stem(new)
+    if new_stem == old_branch:
+        new_branch = old_branch
+    elif old_branch == unit_names.branch(slug, old_stem):
+        new_branch = unit_names.branch(slug, new_stem)
+    else:
+        new_branch = _swap(old_branch, old_stem, new_stem, "branch")
+    if new_stem == worktree.name:
+        new_worktree = worktree
+    elif worktree.name == unit_names.worktree(production.checkout, old_stem).name:
+        new_worktree = worktree.with_name(unit_names.worktree(production.checkout, new_stem).name)
+    else:
+        new_worktree = worktree.with_name(_swap(worktree.name, old_stem, new_stem, "worktree"))
     if not (worktree / ".git").is_file():
         # A Mac unit's worktree is on the Mac: version one renames natedev units only.
         raise RenameRefused(f"{old}: no linked worktree at {worktree} on this machine; a Mac unit is not renamed")
@@ -207,7 +239,7 @@ def _unit_of_session(slug: str, name: str, units: list[str]) -> str:
         raise RenameRefused(f"{name}: cannot tell which unit's session it names: {error}") from error
     found = {unit for unit, place in marked.items()
              if isinstance(place.claude, unit_lookup.LiveClaude) and place.claude.name == name}
-    for item in _records(slug, tuple(units)):
+    for item in shutdown_records(slug, tuple(units)):
         host = item["session"]["host"]
         if host["kind"] == "unit" and item["session"]["name"] == name:
             found.add(host["unit"])
@@ -224,7 +256,7 @@ def _session_name(slug: str, unit: str) -> str:
         raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {error}") from error
     if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         return found.claude.name
-    names = [item["session"]["name"] for item in _records(slug, (unit,))]
+    names = [item["session"]["name"] for item in shutdown_records(slug, (unit,))]
     return names[0] if names else ""
 
 
@@ -249,7 +281,7 @@ def _check_stopped(rename: UnitRename) -> None:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
 
 
-def _check_stoppable(rename: UnitRename) -> None:
+def check_stoppable(rename: StopTarget) -> None:
     """What the stop step cannot settle: the new id running, a Claude it cannot read, or processes
     in the worktree of a unit with no Claude to stop. A live old unit is the stop step's to stop."""
     try:
@@ -284,17 +316,24 @@ def _preflight(rename: UnitRename) -> None:
     checkout = Path(rename.checkout)
     _check_checkout(rename)
     if rename.id_matches:
-        _check_stoppable(rename)
+        check_stoppable(rename)
         return
-    if unit_move.branch_tip(checkout, rename.new_branch) or unit_move.remote_tip(checkout, rename.new_branch):
+    if rename.old_branch != rename.new_branch and (unit_move.branch_tip(checkout, rename.new_branch)
+                                                  or unit_move.remote_tip(checkout, rename.new_branch)):
         raise RenameRefused(f"branch {rename.new_branch} already exists")
-    if unit_move.exists(Path(rename.new_worktree)):
+    if rename.old_worktree != rename.new_worktree and unit_move.exists(Path(rename.new_worktree)):
         raise RenameRefused(f"destination already exists: {rename.new_worktree}")
     if rename_state.unfinished(rename_state.production_journal(rename.slug)):
         raise RenameRefused(f"{rename.slug}: finish the production rename first")
+    if _is_style(rename):
+        try:
+            with style_ledger.preview_ledger(_style_repository(rename)) as ledger:
+                _ = ledger.rename_unit(rename.old, rename.new)
+        except style_ledger.LedgerError as error:
+            raise RenameRefused(str(error)) from error
     # A unit mid-phase is renamed too: its commits move with the branch, and _merge leaves work in
     # progress alone (user, 2026-10-18).
-    _check_stoppable(rename)
+    check_stoppable(rename)
 
 
 def _token(old: str, new: str, text: str) -> str:
@@ -335,12 +374,34 @@ def _doc_text(rename: UnitRename, text: str) -> str:
     return "".join(lines)
 
 
+def _is_style(rename: UnitRename) -> bool:
+    try:
+        return production_units.production_field(Path(rename.doc).read_text(encoding="utf-8").splitlines(), "Kind") == "style"
+    except production_units.Refusal:
+        return False
+
+
+def _style_repository(rename: UnitRename) -> Path:
+    repository = production_units.production_field(Path(rename.doc).read_text(encoding="utf-8").splitlines(), "Repository")
+    if not repository:
+        raise RenameRefused(f"{rename.doc}: style production lacks Repository")
+    return Path(repository).expanduser()
+
+
 def _plans(rename: UnitRename) -> list[Path]:
     checkout = Path(rename.checkout)
     row = next(row for row in _rows(Path(rename.doc)) if production_units.cell_value(row.get("Unit", "")) in
                (rename.old, rename.new))
-    return [] if production_units.plan_cell_is_retired(row.get("Plan", "")) else list(
-        unit_move.plan_paths(row.get("Plan", ""), checkout))
+    cell = row.get("Plan", "")
+    if production_units.plan_cell_is_retired(cell):
+        return []
+    if not _is_style(rename):
+        return list(unit_move.plan_paths(cell, checkout))
+    relative = Path(production_units.cell_value(cell))
+    if relative.parts[:3] != ("docs", "style-production", "units") or ".." in relative.parts or relative.suffix != ".md":
+        raise RenameRefused(f"{rename.doc}: invalid style Plan cell: {cell}")
+    return [path for directory in dict.fromkeys((checkout, rename.worktree()))
+            if (path := directory / relative).is_file()]
 
 
 def _plan_text(rename: UnitRename, text: str) -> str:
@@ -384,13 +445,18 @@ def _merge(rename: UnitRename, _save: Callable[[], None]) -> None:
 
 def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
     checkout = Path(rename.checkout)
-    unit_move.push_branch(checkout, rename.old_branch, rename.new_branch, rename.merged)
-    unit_move.move_worktree(checkout, rename.old_branch, rename.new_branch, Path(rename.old_worktree),
-                            Path(rename.new_worktree), rename.merged)
+    if rename.old_branch != rename.new_branch:
+        unit_move.push_branch(checkout, rename.old_branch, rename.new_branch, rename.merged)
+    if rename.old_worktree != rename.new_worktree:
+        unit_move.move_worktree(checkout, rename.old_branch, rename.new_branch, Path(rename.old_worktree),
+                                Path(rename.new_worktree), rename.merged)
+    elif rename.old_branch != rename.new_branch:
+        _ = git(Path(rename.new_worktree), "switch", rename.new_branch)
 
 
 def _move_claude(rename: UnitRename, _save: Callable[[], None]) -> None:
-    unit_move.move_configs(rename.old_worktree, rename.new_worktree)
+    if rename.old_worktree != rename.new_worktree:
+        unit_move.move_configs(rename.old_worktree, rename.new_worktree)
 
 
 def _commit_doc(rename: UnitRename, save: Callable[[], None]) -> None:
@@ -407,11 +473,12 @@ def _commit_doc(rename: UnitRename, save: Callable[[], None]) -> None:
                 if (updated := _plan_text(rename, text)) != text:
                     write_text(path, updated)
             changed = set(git(checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
-            allowed = {str(path.relative_to(checkout)) for path in (doc, *plans)}
+            allowed = {str(path.relative_to(checkout)) for path in (doc, *plans) if path.is_relative_to(checkout)}
             if changed - allowed:
                 raise RenameRefused("unrelated checkout changes during unit rename")
-            _ = git(checkout, "add", "--", *sorted(changed))
-            _ = git(checkout, "commit", "-m", rename.message)
+            if changed:
+                _ = git(checkout, "add", "--", *sorted(changed))
+            _ = git(checkout, "commit", *(["--allow-empty"] if _is_style(rename) else []), "-m", rename.message)
             rename.doc_commit = git(checkout, "rev-parse", "HEAD")
         save()
     # Recovery retries only the push, of the commit the journal names.
@@ -434,7 +501,26 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
-    _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch))
+    from scripts.guilds import roles
+    try:
+        roles.rename_holder(rename.slug, rename.old, rename.new, rename.old_worktree, rename.new_worktree)
+    except (OSError, ValueError, SystemExit) as error:
+        raise RenameRefused(str(error)) from error
+    if _is_style(rename):
+        try:
+            with style_ledger.open_ledger(_style_repository(rename)) as ledger:
+                _ = ledger.rename_unit(rename.old, rename.new)
+        except style_ledger.LedgerError as error:
+            raise RenameRefused(str(error)) from error
+    # Free text in the live lists names the branch and the worktree too.
+    paths = ((rename.old_branch, rename.new_branch), (rename.old_worktree, rename.new_worktree))
+    _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch), paths)
+    _ = rename_state.rename_outstanding(rename.slug, ((rename.old, rename.new), *paths))
+    # Other productions' showrunners, such as the parent, can have the unit in their lists too.
+    reworded, _ = _other_showrunner_states(rename)
+    for path in reworded:
+        _ = rename_state.reword_showrunner_lists(path, ((rename.old, rename.new), *paths))
+        _ = rename_state.rename_outstanding(path.parent.parent.name, ((rename.old, rename.new), *paths))
     # The relaunched unit records its new pane at SessionStart; its old pane's entry would resume the old name.
     _ = pane_record.forget_unit(rename.old)
     unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
@@ -453,14 +539,37 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
     _ = phase_table.rename_unit(rename.slug, rename.old, rename.new)
 
 
+def _other_showrunner_states(rename: UnitRename) -> tuple[list[Path], list[Path]]:
+    """Each other production's showrunner_state.json: those whose lists take the new names, and those
+    kept because their own production has a unit of the old id, or none can be read, so the old id
+    in their text can name another unit."""
+    docs = showrunners.timer_docs()
+    reworded: list[Path] = []
+    kept: list[Path] = []
+    for path in sorted(showrunners.SHOWRUNNER_STATE_DIR.glob("*/session/showrunner_state.json")):
+        slug = path.parent.parent.name
+        if slug != rename.slug:
+            (kept if _may_hold_unit(docs.get(slug), rename.old) else reworded).append(path)
+    return reworded, kept
+
+
+def _may_hold_unit(doc: Path | None, unit: str) -> bool:
+    try:
+        cells = production_units.unit_table(doc.read_text(encoding="utf-8").splitlines()) if doc else None
+    except (OSError, production_units.Refusal):
+        cells = None
+    return cells is None or any(production_units.cell_value(row.get("Unit", "")) == unit for row in cells)
+
+
 def _retire(rename: UnitRename, _save: Callable[[], None]) -> None:
     checkout = Path(rename.checkout)
     if unit_move.remote_tip(checkout, rename.new_branch) != rename.unit_tip:
         raise RenameRefused(f"origin {rename.new_branch} is not at {rename.unit_tip[:12]}; old branch kept")
-    unit_move.delete_branch(checkout, rename.old_branch, rename.merged)
+    if rename.old_branch != rename.new_branch:
+        unit_move.delete_branch(checkout, rename.old_branch, rename.merged)
 
 
-def _shutdown(*arguments: str) -> None:
+def run_shutdown(*arguments: str) -> None:
     """Run one shutdown verb on this machine. Without a session id in its environment it finds the
     account that holds the session, not the showrunner's own."""
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
@@ -470,12 +579,12 @@ def _shutdown(*arguments: str) -> None:
         raise RenameRefused(f"shutdown {arguments[0]}: {(result.stderr or result.stdout).strip()}")
 
 
-def _unit_records(rename: UnitRename) -> list[SessionShutdown]:
+def _unit_records(rename: StopTarget) -> list[SessionShutdown]:
     """This production's shutdown records of the unit, under either id."""
-    return _records(rename.slug, (rename.old, rename.new))
+    return shutdown_records(rename.slug, (rename.old, rename.new))
 
 
-def _records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
+def shutdown_records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
     try:
         saved = shutdown_record.all_session_records()
     except (shutdown_record.InvalidRecord, OSError) as error:
@@ -488,7 +597,7 @@ def _records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
     return found
 
 
-def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
+def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
     """Stop the unit through the shutdown path, so its record carries the relaunch, and wait for it.
 
     A live process cannot change its env mark and the director's context holds the old paths, so a
@@ -504,17 +613,25 @@ def _stop(rename: UnitRename, _save: Callable[[], None]) -> None:
             return
         if isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
-        _shutdown("down", "--only", found.claude.session_id)
+        run_shutdown("down", "--only", found.claude.session_id)
     saved = _await_stopped(rename)
     rename.account, rename.session_id = saved["login"], saved["session"]["session_id"]
     _stop_runs(rename)
 
 
-def _stop_runs(rename: UnitRename) -> None:
-    """SIGTERM what the unit's runs leave in its worktree once the unit has stopped: a detached
-    run's supervisor with its command, and an app-server's idle-stop watcher. Each leads its own
-    session, so the shutdown path does not end it, and nothing starts it again."""
+def _stop_runs(rename: StopTarget) -> None:
+    """End what the unit's runs leave in its worktree once the unit has stopped: each run's
+    app-server with its seats (`codex_mesh.py stop`, as retire_unit does), then by SIGTERM a
+    detached run's supervisor with its command, an app-server's idle-stop watcher, and an
+    app-server that did not stop. Each leads its own session, so the shutdown path does not end
+    it, and nothing starts it again."""
     worktree = rename.worktree()
+    for item in retire_unit.mesh_runs(retire_unit.runs_of(worktree)):
+        result = retire_unit.run([sys.executable, str(retire_unit.MESH), "stop", "--session-dir", str(item.run)])
+        if result.returncode:
+            print(f"{retire_unit.describe_run(item)}: {retire_unit.failure(result)}; SIGTERM instead")
+        else:
+            print(f"stopped: {retire_unit.describe_run(item)}")
     inside = unit_move.processes_inside(worktree) if unit_move.exists(worktree) else []
     runs = retire_unit.run_processes(worktree, inside) if inside else {}
     left = retire_unit.terminate(sorted(runs), runs, RUN_STOP_WAIT_SECONDS)
@@ -522,7 +639,7 @@ def _stop_runs(rename: UnitRename) -> None:
         raise RenameRefused("; ".join(left) + "; rerun apply once they stop")
 
 
-def _await_stopped(rename: UnitRename) -> SessionShutdown:
+def _await_stopped(rename: StopTarget) -> SessionShutdown:
     """The unit's shutdown record once it reads stopped. The stop is waited for here, so one apply
     does the whole rename (user, 2026-10-18). A stop that waits for an idle or ready mark is forced
     with `shutdown.py now`, once for each kind it reads."""
@@ -541,7 +658,7 @@ def _await_stopped(rename: UnitRename) -> SessionShutdown:
         if progress in STOPPED:
             return records[0]
         if progress in FORCEABLE and progress != forced:
-            _shutdown("now", "--only", records[0]["session"]["session_id"])
+            run_shutdown("now", "--only", records[0]["session"]["session_id"])
             forced = progress
         if progress not in STOPPING:
             raise RenameRefused(f"{rename.old}'s shutdown record reads {progress}; settle it first")
@@ -599,9 +716,9 @@ def _host_names(rename: UnitRename) -> dict[str, str]:
 
     new_stem = unit_names.stem(rename.new)
     olds = [unit_names.stem(rename.old), *([rename.old_session] if rename.old_session else [])]
-    return {herdr.generated_session_name(form.format(slug=rename.slug, stem=old)):
-            herdr.generated_session_name(form.format(slug=rename.slug, stem=new_stem))
-            for old in olds for form in ("{stem}", "{slug}-{stem}")}
+    return {herdr.generated_session_name(old_form): herdr.generated_session_name(new_form)
+            for old in olds for old_form, new_form in (
+                (old, new_stem), (unit_names.branch(rename.slug, old), unit_names.branch(rename.slug, new_stem)))}
 
 
 def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
@@ -645,7 +762,7 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
 
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
     if rename.session_id:
-        _shutdown("restart", "--only", rename.session_id)
+        run_shutdown("restart", "--only", rename.session_id)
         _await_live(rename)
 
 
@@ -661,25 +778,30 @@ def _await_live(rename: UnitRename) -> None:
 
 
 def _unit_proposals(rename: UnitRename, unit: str) -> list[issues.Issue]:
-    """The production's active proposal issues that name `unit` for one of this unit's plans."""
+    """Active issues naming `unit`, matched by proposer for style and by plan for other productions."""
     folder = proposals_folder.issues_folder(Path(rename.doc))
     if folder is None:
         return []
-    plans = [str(path.relative_to(Path(rename.checkout))) for path in _plans(rename)]
+    style = _is_style(rename)
+    owners = proposals_folder.owners(Path(rename.doc)) if style else frozenset[str]()
+    plans = [] if style else [str(path.relative_to(Path(rename.checkout))) for path in _plans(rename)]
     # The issues folder is shared by every production; unit ids are only unique within one, so an
-    # issue counts only when its plan is one of this unit's plans.
+    # issue must name an owning proposer for style, or one of this unit's plans otherwise.
     return [issue for issue in issues.open_issues(folder, proposals_folder.PROPOSAL_TAG)
-            if issue.value("unit") == unit and any(plan in (issue.value("plan") or "") for plan in plans)]
+            if issue.value("unit") == unit and (proposals_folder.proposer(issue) in owners if style else any(
+                plan in (issue.value("plan") or "") for plan in plans))]
 
 
 def _git_failures(rename: UnitRename) -> list[str]:
     checkout, old, new = Path(rename.checkout), Path(rename.old_worktree), Path(rename.new_worktree)
     failures: list[str] = []
-    if unit_move.branch_tip(checkout, rename.old_branch) or unit_move.remote_tip(checkout, rename.old_branch):
+    if rename.old_branch != rename.new_branch and (unit_move.branch_tip(checkout, rename.old_branch)
+                                                  or unit_move.remote_tip(checkout, rename.old_branch)):
         failures.append(f"git: branch {rename.old_branch} still exists")
     if unit_move.remote_tip(checkout, rename.new_branch) != unit_move.branch_tip(checkout, rename.new_branch):
         failures.append(f"git: origin {rename.new_branch} is not at the local tip")
-    if unit_move.exists(old) or f"worktree {old}" in git(checkout, "worktree", "list", "--porcelain").splitlines():
+    if old != new and (unit_move.exists(old) or f"worktree {old}" in git(
+            checkout, "worktree", "list", "--porcelain").splitlines()):
         failures.append(f"git: worktree {old} still exists")
     if not (new / ".git").is_file() or git(new, "branch", "--show-current") != rename.new_branch:
         failures.append(f"git: {new} is not a worktree on {rename.new_branch}")
@@ -690,6 +812,8 @@ def _process_failures(rename: UnitRename) -> list[str]:
     """No process has its working directory at the old path. Every stopped step refuses while a
     process works inside the worktree, so none moved with it; this finds one started there since,
     or one left in a removed folder."""
+    if rename.old_worktree == rename.new_worktree:
+        return []
     old = Path(rename.old_worktree)
     pids = unit_move.processes_inside(old)
     return [f"processes {', '.join(map(str, pids))} still work in {old}"] if pids else []
@@ -717,15 +841,23 @@ def _doc_failures(rename: UnitRename) -> list[str]:
 def _state_failures(rename: UnitRename) -> list[str]:
     old, new = Path(rename.old_worktree), Path(rename.new_worktree)
     failures = [f"{directory / 'projects'}: transcripts still under {old}" for directory in unit_move.config_dirs()
-                if (directory / "projects" / unit_move.project_folder(str(old))).exists()]
+                if old != new and (directory / "projects" / unit_move.project_folder(str(old))).exists()]
     if stall_watch.stretch_path(rename.slug, rename.old).exists():
         failures.append(f"stall-watch: the stretch is still under {rename.old}")
     # Step 7 moves the newest run, the one run_state reads; older runs under the old path are history.
     if unit_move.newest_run(old) is not None and unit_move.newest_run(new) is None:
         failures.append(f"run records: the newest run still names {old}")
     failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
+    if _is_style(rename):
+        with style_ledger.preview_ledger(_style_repository(rename)) as ledger:
+            if ledger.ticket_open(rename.old) or ledger.queued_tickets(rename.old):
+                failures.append(f"style ledger: current tickets still name {rename.old}")
+            if any(wait.unit == rename.old for wait in ledger.sync_waits()):
+                failures.append(f"style ledger: sync wait still names {rename.old}")
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(rename.slug, rename.old))
+    from scripts.guilds import roles
+    failures.extend(roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures
 
 
@@ -776,12 +908,13 @@ def _control_failures(rename: UnitRename) -> list[str]:
 def _sweep_roots(rename: UnitRename) -> unit_rename_sweep.Roots:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
     scratch = Path(rename.scratch)
+    reworded, kept = _other_showrunner_states(rename)
     return unit_rename_sweep.Roots(
         state=state, production_state=rename_state.unit_journal(rename.slug).parent,
         configs=tuple(directory for directory in unit_move.config_dirs() if not directory.name.endswith(".lock")),
         checkouts=(Path(rename.checkout), Path(rename.new_worktree)),
-        live_files=tuple(scratch / name for name in rename_state.SCRATCH_FILES),
-        history_prefixes=(str(Path(rename.checkout) / "docs/plans" / f"{rename.slug}-log"),))
+        live_files=(*(scratch / name for name in rename_state.SCRATCH_FILES), *reworded),
+        history_prefixes=(str(Path(rename.checkout) / "docs/plans" / f"{rename.slug}-log"), *map(str, kept)))
 
 
 def verify_failures(rename: UnitRename) -> list[str]:
@@ -791,8 +924,10 @@ def verify_failures(rename: UnitRename) -> list[str]:
     try:
         return [*_doc_failures(rename), *_git_failures(rename), *_process_failures(rename), *_state_failures(rename),
                 *_session_failures(rename), *_control_failures(rename),
-                *unit_rename_sweep.sweep((rename.old, rename.old_branch, rename.old_worktree), _sweep_roots(rename))]
-    except (shutdown_record.InvalidRecord, production_units.Refusal) as error:
+                *unit_rename_sweep.sweep(tuple(old for old, new in (
+                    (rename.old, rename.new), (rename.old_branch, rename.new_branch),
+                    (rename.old_worktree, rename.new_worktree)) if old != new), _sweep_roots(rename))]
+    except (shutdown_record.InvalidRecord, production_units.Refusal, style_ledger.LedgerError) as error:
         raise RenameRefused(f"verify could not read a place: {error}") from error
 
 
@@ -815,7 +950,7 @@ class Step(NamedTuple):
 
 def _describe_stop(r: UnitRename) -> str:
     return (f"stop {r.old} and its Codex seats at once through the shutdown path; its record carries the relaunch; "
-            + "then SIGTERM its runs' supervisors and app-server watchers left in the worktree")
+            + "then stop its runs' app-servers and SIGTERM their supervisors and app-server watchers left in the worktree")
 
 
 def _describe_merge(r: UnitRename) -> str:
@@ -824,7 +959,10 @@ def _describe_merge(r: UnitRename) -> str:
 
 
 def _describe_git(r: UnitRename) -> str:
-    return f"git: branch {r.old_branch} -> {r.new_branch}; worktree {r.old_worktree} -> {r.new_worktree}"
+    branch = f"branch {r.old_branch} -> {r.new_branch}" if r.old_branch != r.new_branch else f"keep branch {r.old_branch}"
+    worktree = (f"worktree {r.old_worktree} -> {r.new_worktree}" if r.old_worktree != r.new_worktree
+                else f"keep worktree {r.old_worktree}")
+    return f"git: {branch}; {worktree}"
 
 
 def _describe_claude(_: UnitRename) -> str:
@@ -845,7 +983,8 @@ def _describe_state(r: UnitRename) -> str:
 
 
 def _describe_retire(r: UnitRename) -> str:
-    return f"retire {r.old_branch} once origin {r.new_branch} holds the unit's new tip"
+    return (f"retire {r.old_branch} once origin {r.new_branch} holds the unit's new tip"
+            if r.old_branch != r.new_branch else f"keep branch {r.old_branch}")
 
 
 def _describe_record(r: UnitRename) -> str:
@@ -866,7 +1005,7 @@ def _describe_verify(r: UnitRename) -> str:
 
 
 STEPS = (
-    Step(_stop, _describe_stop, stopped=False, locked=False),
+    Step(stop_unit, _describe_stop, stopped=False, locked=False),
     Step(_merge, _describe_merge),
     Step(_move_git, _describe_git),
     Step(_move_claude, _describe_claude),
@@ -881,7 +1020,7 @@ STEPS = (
 
 
 # The steps a name-only rename runs; the rest name the id, which already is the new one.
-NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (_stop, _restart_record, _relaunch, _verify)
+NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (stop_unit, _restart_record, _relaunch, _verify)
 
 
 def step_number(run: Callable[[UnitRename, Callable[[], None]], None]) -> int:

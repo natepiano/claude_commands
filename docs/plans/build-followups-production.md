@@ -11,7 +11,7 @@
 - **Showrunner session:** natedev
 - **Log:** `docs/plans/build-followups-log.md` — git-excluded; one line per event
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — changes for the user to check, read only when the user asks; never open questions
-- **User zone:** America/New_York — every time the showrunner reports is in this zone only (user, 2026-10-12: "switch all showrunners and units to return to communicating in EDT"; PDT from 2026-10-04)
+- **User zone:** America/Curacao (AST) — every time the showrunner reports is in this zone only (user, 2026-10-21: "My time zone is Curacao- I think that's ast. Please adjust"; EDT from 2026-10-12, PDT from 2026-10-04). user_zone.conf is the setting; this line only records it
 - **Updates:** on demand (user, 2026-10-10: dailies only when the user asks); each dailies lists every unit; a simple dailies gives each waiting, idle unit one line
 - **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout
 - **Push:** git
@@ -38,7 +38,7 @@
 | sdlc-unit | (retired 2026-10-20: promoted to showrunner of sdlc) `docs/as-built/phase-tables.md` (run done; as-built merged) | /home/natepiano/worktrees/claude-build-followups-sdlc | build-followups-sdlc | — | `scripts/delegate/phase_table.py`, `scripts/delegate/progress_history.py` and their tests; `commands/unit/eta.md`, `commands/unit/eta_breakdown.md`; `docs/as-built/plan-delegate-progress-history.md`; in its Phase 4 `scripts/production/dailies_input.py`, its test and `commands/showrunner/dailies.md` |
 | delegate-rename-unit | docs/as-built/agent-registry.md and docs/as-built/session-notifier.md (runs done 2026-10-08) | /home/natepiano/worktrees/claude-build-followups-delegate-rename | build-followups-delegate-rename | — | commands/unit/direct.md, the stub commands/unit/delegate.md, and the lines that name the command in commands/, skills/, docs/, scripts/ and config/ (README.md, delegate.conf, lint.conf, clippy.conf); not CLAUDE.md, not settings.json |
 | shutdown-unit | run done; as-built `docs/as-built/shutdown-and-restart.md` (moves need no consent from an idle session), `docs/as-built/session-roster.md` | /home/natepiano/worktrees/claude-build-followups-shutdown | build-followups-shutdown | — | `docs/as-built/session-roster.md`; `scripts/message/`; `scripts/production/broadcast.py`; `commands/message.md`; the announce commands; `commands/notify_top_level.md`; `codex/AGENTS-messaging.md`; `scripts/notify/pushover.py`; `commands/alert_user.md`; `mods/postmaster/`; `.gitignore` (the mods/ allow entries) |
-| test-threads-unit | docs/as-built/nextest-width-and-lint-scope.md | /home/natepiano/worktrees/claude-build-followups-test-threads | build-followups-test-threads | — | scripts/delegate/verify.sh, scripts/lint/invoke.sh, the memory gate (memory_admit.py, anon_peaks.jsonl) |
+| test-threads-unit | (retired 2026-10-21, worktree removed, session 0a4a86e2-43e2-485f-9b67-9a38693d0cab) docs/as-built/nextest-width-and-lint-scope.md | /home/natepiano/worktrees/claude-build-followups-test-threads | build-followups-test-threads | — | scripts/delegate/verify.sh, scripts/lint/invoke.sh, the memory gate (memory_admit.py, anon_peaks.jsonl) |
 | feature-log-unit | `docs/as-built/feature-log.md` (run done) | /home/natepiano/worktrees/claude-build-followups-feature-log | build-followups-feature-log | 15798 (Phase 8 app checks only) | scripts/feature_log/; commands/validate_and_push.md (<FeatureLogCloseOut/> only); commands/showrunner/produce.md (<ChangeReviewFeatureLog/> and <CloseChangeReview/> only); commands/feature_log.md; commands/release.md (the changelog compare and release stamp steps only); pyrightconfig.json (its feature_log entry only); `docs/as-built/feature-log.md` |
 | accounts-unit | docs/plans/build-followups-two-accounts.md | /home/natepiano/worktrees/claude-build-followups-accounts | build-followups-accounts | — | docs/plans/build-followups-two-accounts.md |
 | review-pool-unit | (retired 2026-10-13: promoted to showrunner of nested-g2) `docs/as-built/review-pool.md` (runs done) | /home/natepiano/worktrees/claude-build-followups-review-pool | build-followups-review-pool | — | scripts/delegate/review_pool.py, commands/review/ |
@@ -48,12 +48,11 @@
 | herdr-trust-unit | (retired 2026-10-18, worktree removed) `docs/as-built/herdr-adoption.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-herdr-trust | build-followups-herdr-trust | — | — |
 | herdr-unit | docs/as-built/herdr-adoption.md | /home/natepiano/worktrees/claude-build-followups-herdr | build-followups-herdr | — | — |
 | nightly-review-unit | (retired 2026-10-19, worktree removed) permanent | /home/natepiano/worktrees/claude-build-followups-nightly-review | build-followups-nightly-review | — | — |
-| style-unit | docs/plans/build-followups-style.md | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
+| style-unit | `docs/as-built/style-showrunner.md` (run done; as-built) | /home/natepiano/worktrees/claude-build-followups-style | build-followups-style | — | — |
 | unit-board-unit | docs/as-built/unit-board.md | /home/natepiano/worktrees/claude-build-followups-unit-board | build-followups-unit-board | — | — |
 | hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 | efficiency-unit | docs/as-built/token-efficiency-study.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
-| hierarchies-unit | docs/plans/build-followups-hierarchies.md | /home/natepiano/worktrees/claude-build-followups-hierarchies | build-followups-hierarchies | — | — |
 
 ## Hub files
 

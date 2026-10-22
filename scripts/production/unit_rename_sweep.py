@@ -6,23 +6,27 @@ history class below, or the sweep names it: a place added later fails verify unt
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 # Under the state root: logs, reports and archives that keep a unit's old names as history.
 STATE_HISTORY = (
     "shutdown/", "nightly-review/", "message/log.jsonl", "message/relay/", "message/keys.json",
     "message/queue/", "message/postmaster/replies/", "notify/", "accounts/moves.jsonl", "showrunner/outstanding/",
     "plan-delegate/runs/", "plan-delegate/review_turns/", "model-study/", "claude-model-study/",
-    "screenshot-analysis/", "plan-backlog/", "usage-model/", "style-backups/",
+    "screenshot-analysis/", "plan-backlog/", "usage-model/", "style-backups/", "style/",
     # Build logs, hook trial records, the feature log, review prompts, verify events and shell history.
     "buildlog/", "mul-add-hook/", "fn-length-hook/", "claude/feature-log/", "review-pool/", "verify/", "zsh/",
     # Rebuilt from its sources on the next board refresh.
     "unit-board/",
+    # Copies of queued prompt texts, which the pause hook matches exactly against each prompt that
+    # comes in; the session's next stop rebuilds them from its wakeups. A rewrite breaks the match.
+    "conversation-pause/scheduled-prompts/",
 )
 # Under a production's own state folder.
 PRODUCTION_HISTORY = ("log-backups/", "dailies_last.json", "rename_unit.json", "rename.json")
@@ -68,6 +72,14 @@ def _tracked(checkout: Path) -> set[Path]:
 
 
 def _history(path: Path, roots: Roots, tracked: set[Path]) -> bool:
+    try:
+        relative = path.relative_to(roots.state / "guilds/roles")
+        if len(relative.parts) > 2 and relative.parts[1] in ("prompts", "replies"):
+            return True
+        if len(relative.parts) == 2 and relative.parts[1] in ("adoption.json", "transfer.json"):
+            return True
+    except ValueError:
+        pass
     return (path in tracked or any(_under(path, checkout, (".git/",)) for checkout in roots.checkouts)
             or str(path).startswith(roots.history_prefixes)
             or _under(path, roots.state, STATE_HISTORY)
@@ -110,6 +122,29 @@ def sweep(values: tuple[str, ...], roots: Roots) -> list[str]:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        try:
+            relative = path.relative_to(roots.state / "guilds/roles")
+            if path.name == "design.json":
+                fields = cast(dict[str, object], json.loads(text))
+                role_entries = fields.get("roles")
+                if isinstance(role_entries, list):
+                    for value in cast(list[object], role_entries):
+                        if isinstance(value, dict):
+                            entry = cast(dict[str, object], value)
+                            _ = entry.pop("name", None)
+                            _ = entry.pop("aliases", None)
+                _ = fields.pop("aliases", None)
+                text = json.dumps(fields)
+            elif path.name == "mesh_roster.json" and len(relative.parts) == 3:
+                fields = cast(dict[str, object], json.loads(text))
+                live: list[dict[str, object]] = []
+                for value in fields.values():
+                    entry = cast(dict[str, object], value)
+                    _ = entry.pop("aliases", None)
+                    live.append(entry)
+                text = json.dumps(live)
+        except (ValueError, TypeError, AttributeError):
+            pass
         if pattern.search(text):
             failures.append(f"unclassified: {shown(path, roots.state)} still holds an old name")
     return failures

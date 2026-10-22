@@ -73,7 +73,8 @@ that builds the wrong thing.
   when a plan predates the field, the launch step decides and says so.
 - Verification: translate Build/Test/Lint/Run/Smoke and Acceptance gate into
   <VerificationContract/> lines. Convert old raw Cargo/full-clippy entries to
-  scoped `verify.sh`; the unit director retains live smoke ownership.
+  scoped `verify.sh`, and a folder-wide basedpyright line to one line per
+  slot over its own files; the unit director retains live smoke ownership.
 - Three Gods: <WritePromptContract/> item 9's section, verbatim.
 
 Do not open code to fill a plan gap. Name the gap and let review catch its

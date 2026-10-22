@@ -63,7 +63,7 @@ class UserActionTests(unittest.TestCase):
 
     def test_messages_without_session_share_the_explicit_absence_state(self) -> None:
         entry = push_texts.PushText("test", "script", "note", "Done", push_texts.NoActionNeeded(),
-                                   "The check passed.", (push_texts.PushExample("typical", {}),))
+                                   "The check passed.", (push_texts.PushExample("typical", {}),), purpose="Test.")
         rendered = push_texts.render_entry(entry, {})
         draft = review.Draft("script", "0", rendered.title, rendered.action, rendered.body, False)
         parsed = pushover.parse(["--no-action", rendered.title, rendered.body])
@@ -121,12 +121,40 @@ class PushoverTests(unittest.TestCase):
     def test_catalog_session_reaches_the_post_and_review_record(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
             push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
-            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+            (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
         with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()) as output:
             code, form = self.run_send(["--text-id", "test"])
         self.assertEqual(code, 0)
         self.assertEqual(form["message"], ["Session: Owner\nAction: stop Owner\nReason: waiting."])
         self.assertIn('"session": "Owner"', output.getvalue())
+
+    def test_unit_suffix_leaves_per_unit_and_other_free_text_as_written(self) -> None:
+        body = "Session: style-unit\nCounts are per-unit now. Read the trunk-unit plan first."
+        code, form = self.run_send(["--action", "open the herdr-unit pane", "messaging-unit stopped", body])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], ["messaging-unit stopped"])
+        self.assertEqual(form["message"], ["Session: style-unit\nAction: open the herdr-unit pane\n"
+                                           + "Counts are per-unit now. Read the trunk-unit plan first."])
+        entry = push_texts.PushText("test", "{sender}", "decision", "{sender}: {session} is blocked",
+            push_texts.ActionTemplate("stop {session}"), "Reason: {why}. Next: {next}.",
+            (push_texts.PushExample("typical", {"sender": "x", "session": "y", "why": "z", "next": "w"}),),
+            purpose="Test.", session=push_texts.SessionTemplate("{session}"))
+        pushover.LOG_FILE.unlink()
+        with mock.patch.object(push_texts, "catalog", return_value=(entry,)), redirect_stdout(io.StringIO()):
+            code, form = self.run_send(["--text-id", "test", "--value", "sender=cargo-liner-unit", "--value", "session=types-unit",
+                                        "--value", "why=counts are per-unit and the trunk-unit plan waits", "--value", "next=style-unit"])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["title"], ["cargo-liner: types is blocked"])
+        self.assertEqual(form["message"], ["Session: types\nAction: stop types\n"
+                                           + "Reason: counts are per-unit and the trunk-unit plan waits. Next: style."])
+
+    def test_unit_suffix_drops_only_from_a_session_value(self) -> None:
+        for key, value, shown in (("session", "types-unit", "types"), ("sender", "cargo-liner-unit", "cargo-liner"),
+                                  ("next", "style-unit", "style"), ("why", "per-unit counts", "per-unit counts"),
+                                  ("why", "the trunk-unit plan", "the trunk-unit plan"), ("path", "/a/style-unit", "/a/style-unit"),
+                                  ("session", "x-unit-test", "x-unit-test"), ("why", "a unit", "a unit")):
+            with self.subTest(key=key, value=value):
+                self.assertEqual(push_texts.shown_value(key, value), shown)
 
     def test_session_header_counts_toward_the_post_limit_without_truncation(self) -> None:
         code, form = self.run_send(["--action", "stop Owner", "Owner is blocked", "Session: Owner\n" + "x" * 1200])

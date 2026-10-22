@@ -17,13 +17,16 @@
 # delegate so a peer can still reach a thread between turns -- so the end of
 # the run is the only point that knows nobody needs it any more.
 #
-# Deletes each run's verify.sh pass records (verify_cache/); the time they
-# saved is already in ~/.local/state/verify/saved.jsonl.
+# Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
+# records (verify_cache/), whose saved time is already in
+# ~/.local/state/verify/saved.jsonl, and every git checkout and cargo target in
+# the run folder, at any depth. Gate copies and before/after builds otherwise
+# stay in /tmp until the disk fills.
 #
 # PLAN_DELEGATE_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
 # Safe to run when no run is active. The rest of the session directory is left
-# alone; heartbeat and delegate logs stay readable after the run.
+# alone; ledgers, heartbeat and delegate logs stay readable after the run.
 
 set -euo pipefail
 
@@ -80,6 +83,9 @@ if (( ${#RUNS[@]} > 0 )); then
   for run in "${RUNS[@]}"; do
     REMOVE_ARGS+=(--session-dir "${run}")
   done
+  for run in "${RUNS[@]}"; do
+    "$PY" "${SCRIPT_DIR}/../guilds/roles.py" unbind-run "${run}" || exit 1
+  done
   "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
   for run in "${RUNS[@]}"; do
     if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" || -f "${run}/mesh_retired.json" ]]; then
@@ -87,11 +93,7 @@ if (( ${#RUNS[@]} > 0 )); then
     fi
   done
   "$PY" "${MESH}" sweep --root "$(dirname "${RUNS[0]}")" --stop || true
-  for run in "${RUNS[@]}"; do
-    if [[ -d "${run}/verify_cache" ]]; then
-      rm -rf -- "${run}/verify_cache"
-    fi
-  done
+  "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" "${RUNS[@]}" || true
 fi
 
 if [[ -f "${MARKER}" ]]; then
