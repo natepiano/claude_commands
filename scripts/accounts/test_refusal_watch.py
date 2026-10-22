@@ -4,6 +4,7 @@ from __future__ import annotations
 from scripts.whoami.note_file import note_name
 
 import io
+import fcntl
 import json
 import os
 import socket
@@ -269,6 +270,106 @@ class RefusalWatchTests(unittest.TestCase):
     def hold_rule(self, name: str = "units-low", *, target: str = "claude2",
                   minutes: float = 10) -> next_moves.ClaudeGroupMove:
         return next_moves.ClaudeGroupMove(name, "units", 1, minutes, target, NOW)
+
+    def expired_login(self, login: str = "main@example.invalid") -> None:
+        usage_store.save([agent_accounts.Report("Claude", email=login,
+            usage_read_outcome=agent_accounts.UsageReadOutcome.STALE_TOKEN)], NOW)
+
+    def test_expired_target_renews_before_the_queue_lock_and_moves_in_the_same_pass(self) -> None:
+        path = self.groups()
+        self.next_entries(self.low_rule())
+        self.expired_login()
+        report = agent_accounts.Report("Claude", email="main@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK,
+            quotas=[agent_accounts.Quota("Weekly", 10, NOW + timedelta(days=6))])
+
+        def probe(_command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+            # A second descriptor must take the queue lock without blocking.
+            with next_moves.next_moves_file().with_suffix(".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            WatchTime.at = NOW + timedelta(seconds=2)
+            return subprocess.CompletedProcess([], 0, "private", "private")
+
+        with (patch.object(subprocess, "run", side_effect=probe) as started,
+              patch.object(agent_accounts, "claude_live", return_value=report) as read):
+            lines = refusal_watch.run(NOW)
+        self.assertIn("claude2 login renewed", lines)
+        renewed_usage = usage_store.load()[usage_store.key("Claude", "main@example.invalid")]
+        assert "weekly" in renewed_usage
+        self.assertEqual(renewed_usage["weekly"]["at"], (NOW + timedelta(seconds=2)).isoformat())
+        self.assertTrue(any("move from claude1 to claude2" in line for line in lines))
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), ())
+        started.assert_called_once()
+        read.assert_called_once_with(accounts.account_dir("claude2"))
+        self.assertEqual(self.head_deliveries, [])
+        attempt = accounts.login_renewal_attempts()["claude2"]
+        self.assertEqual(attempt, accounts.LoginRenewalAttempt(NOW, accounts.LoginRenewed()))
+
+    def test_damaged_login_renewal_state_does_not_stop_the_pass(self) -> None:
+        self.expired_login()
+        path = accounts.login_renewals_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text('{"claude2":')
+        with (patch.object(accounts, "renew_login", return_value=accounts.LoginRenewed()) as probe,
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage"))):
+            self.assertIn("claude2 login renewed", refusal_watch.run(NOW))
+        probe.assert_called_once_with("claude2")
+        self.assertEqual(accounts.login_renewal_attempts(),
+                         {"claude2": accounts.LoginRenewalAttempt(NOW, accounts.LoginRenewed())})
+
+    def test_expired_login_wait_keeps_the_last_reading_time(self) -> None:
+        _ = self.groups()
+        self.next_entries(self.low_rule())
+        self.reading("main@example.invalid", 80, at=NOW - timedelta(hours=3, minutes=55))
+        self.expired_login()
+        lines = refusal_watch.run_auto_moves(NOW)
+        self.assertIn("units 1 → claude2 due, claude2 has no fresh reading since 04:05", lines)
+
+    def test_failed_login_renewal_blocks_once_and_does_not_probe_again_within_an_hour(self) -> None:
+        path = self.groups()
+        self.next_entries(self.low_rule())
+        self.expired_login()
+        with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 7, "private", "private")) as probe,
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("failed probe read usage"))):
+            first = refusal_watch.run(NOW)
+            later = refusal_watch.run(NOW + timedelta(minutes=59))
+        probe.assert_called_once()
+        self.assertIn("claude2 login renewal failed: probe exited with status 7", first)
+        blocked = ("units 1 → claude2 due, claude2's login expired, and a probe session on it failed "
+                   "(probe exited with status 7). Log in on claude2 by hand.")
+        self.assertIn(blocked, first)
+        self.assertNotIn("login renewal failed:", "\n".join(later))
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(len(self.head_deliveries), 1)
+        self.assertEqual(self.head_deliveries[0][0].text, blocked)
+        self.assertEqual(accounts.login_renewal_attempts()["claude2"].result,
+                         accounts.LoginRenewalFailed("probe exited with status 7"))
+
+    def test_expired_login_dry_run_and_fresh_account_do_not_probe(self) -> None:
+        self.expired_login()
+        before = self.snapshot()
+        with (patch.object(accounts, "renew_login", side_effect=AssertionError("dry run started a probe")),
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("dry run read usage"))):
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, True), ["would renew claude2"])
+        self.assertEqual(self.snapshot(), before)
+        self.reading("main@example.invalid", 80)
+        with (patch.object(accounts, "renew_login", side_effect=AssertionError("fresh account started a probe")),
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("fresh account read usage"))):
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, False), [])
+        self.assertFalse(accounts.login_renewals_file().exists())
+
+    def test_login_renewal_retries_at_an_hour_on_the_other_machine_too(self) -> None:
+        self.expired_login()
+        with (patch.object(accounts, "renew_login", return_value=accounts.LoginRenewalFailed("probe could not start")) as probe,
+              patch.object(agent_accounts, "claude_live", side_effect=AssertionError("unexpected live usage")),
+              patch.object(socket, "gethostname", return_value="macbook")):
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, False),
+                             ["claude2 login renewal failed: probe could not start"])
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW + timedelta(minutes=59), False), [])
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW + timedelta(minutes=60), False),
+                             ["claude2 login renewal failed: probe could not start"])
+        self.assertEqual(probe.call_count, 2)
 
     def test_list_and_runner_share_the_current_hold_verdict_for_every_selection_state(self) -> None:
         entry = self.hold_rule("shared-verdict", minutes=30)

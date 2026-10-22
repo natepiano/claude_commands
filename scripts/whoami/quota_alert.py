@@ -1058,6 +1058,11 @@ class TargetReadingUnavailable:
 
 
 @dataclass(frozen=True)
+class TargetLoginRenewalFailed:
+    detail: str
+
+
+@dataclass(frozen=True)
 class TargetAccountUnavailable:
     reason: str
 
@@ -1084,7 +1089,8 @@ class TargetIsCurrentAccount:
 
 
 BlockedHeadReason = (TargetReadingUnavailable | TargetAccountUnavailable | TargetAtOrBelowThreshold
-                     | TargetUnresolvedRefusal | TargetPreparationRefused | TargetIsCurrentAccount)
+                     | TargetUnresolvedRefusal | TargetPreparationRefused | TargetIsCurrentAccount
+                     | TargetLoginRenewalFailed)
 
 
 def blocked_next_move_reason_key(reason: BlockedHeadReason) -> str:
@@ -1095,6 +1101,9 @@ def blocked_next_move_reason_key(reason: BlockedHeadReason) -> str:
 
 
 def blocked_next_move_line(group: str, target: str, _entry_id: str, reason: BlockedHeadReason) -> str:
+    if isinstance(reason, TargetLoginRenewalFailed):
+        return (f"{group} 1 → {target} due, {target}'s login expired, and a probe session on it failed "
+                f"({reason.detail}). Log in on {target} by hand.")
     if isinstance(reason, TargetIsCurrentAccount):
         return f"{group} 1 → {target} due, {target} is already the current account"
     if isinstance(reason, TargetReadingUnavailable):

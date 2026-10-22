@@ -34,6 +34,7 @@ import usage_store
 from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blocked_next_move_reason_key, notify_blocked_next_move,  # pyright: ignore[reportPrivateUsage]
                          BlockedHeadReason as BlockedHeadReason, NoTargetReading as NoTargetReading,
                          TargetReadingUnavailable as TargetReadingUnavailable,
+                         TargetLoginRenewalFailed as TargetLoginRenewalFailed,
                          TargetAccountUnavailable as TargetAccountUnavailable,
                          TargetAtOrBelowThreshold as TargetAtOrBelowThreshold,
                          TargetUnresolvedRefusal as TargetUnresolvedRefusal,
@@ -1078,9 +1079,17 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                 TargetAccountUnavailable("no readable login"), now, dry_run))
             continue
         target = refusals.stored_reading("claude", target_identity.login, now)
+        last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
+                     and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
+        target_usage = usage_store.load().get(usage_store.key("Claude", target_identity.login), {})
+        if usage_store.latest_read_outcome(target_usage) == agent_accounts.UsageReadOutcome.STALE_TOKEN:
+            attempt = accounts.login_renewal_attempts().get(rule.to)
+            reason = (TargetLoginRenewalFailed(attempt.result.detail)
+                      if attempt is not None and isinstance(attempt.result, accounts.LoginRenewalFailed)
+                      else TargetReadingUnavailable(last_read))
+            lines.append(_record_blocked_head(state, rule, reason, now, dry_run))
+            continue
         if not isinstance(target, refusals.FreshReading):
-            last_read = (target.weekly.at if isinstance(target, refusals.StaleReading)
-                         and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
             lines.append(_record_blocked_head(state, rule, TargetReadingUnavailable(last_read), now, dry_run))
             continue
         if target.weekly.left <= rule.when.percent:
@@ -1133,13 +1142,46 @@ def run_auto_moves(now: datetime, *, dry_run: bool = False,
         return _run_auto_moves_locked(now, moved_groups=moved_groups)
 
 
+def renew_expired_logins(now: datetime, dry_run: bool) -> list[str]:
+    """Probe local noted accounts before any move takes the queue lock."""
+    stored = usage_store.load()
+    attempts = accounts.login_renewal_attempts()
+    lines: list[str] = []
+    for named in accounts.checked_named_accounts():
+        identity = accounts.account_identity(named.dir)
+        if not isinstance(identity, agent_accounts.NumberedAccount):
+            continue
+        usage = stored.get(usage_store.key("Claude", identity.login), {})
+        if usage_store.latest_read_outcome(usage) != agent_accounts.UsageReadOutcome.STALE_TOKEN:
+            continue
+        previous = attempts.get(named.label)
+        if previous is not None and now - previous.at < timedelta(minutes=60):
+            continue
+        if dry_run:
+            lines.append(f"would renew {named.label}")
+            continue
+        result = accounts.renew_login(named.label)
+        attempts[named.label] = accounts.LoginRenewalAttempt(now, result)
+        _atomic_json(accounts.login_renewals_file(), {
+            label: {"at": attempt.at.isoformat(),
+                    "outcome": "renewed" if isinstance(attempt.result, accounts.LoginRenewed) else "failed",
+                    "detail": attempt.result.detail if isinstance(attempt.result, accounts.LoginRenewalFailed) else ""}
+            for label, attempt in attempts.items()})
+        lines.append(f"{named.label} login renewed" if isinstance(result, accounts.LoginRenewed)
+                     else f"{named.label} login renewal failed: {result.detail}")
+    return lines
+
+
 @role_map.role_map_command
 def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
     at = now or datetime.now(timezone.utc)
     if dry_run:
-        return _run(at, True, proof_group)
+        return [*renew_expired_logins(at, True), *_run(at, True, proof_group)]
     with _watch_lock():
-        return _run(at, False, proof_group)
+        renewed = renew_expired_logins(at, False)
+        # A probe can save a reading after the pass started.
+        after_renewal = max(at, datetime.now(timezone.utc)) if renewed else at
+        return [*renewed, *_run(after_renewal, False, proof_group)]
 
 
 class WatchCommandLine(argparse.Namespace):

@@ -1250,6 +1250,74 @@ def _exec_codex_account(label: str, arguments: list[str]) -> None:
         raise AccountsError(f"accounts: could not start codex: {error}") from error
 
 
+@dataclass(frozen=True)
+class LoginRenewed:
+    """A probe ran and usage no longer reports an expired login."""
+
+
+@dataclass(frozen=True)
+class LoginRenewalFailed:
+    detail: str
+
+
+@dataclass(frozen=True)
+class LoginRenewalAttempt:
+    at: datetime
+    result: LoginRenewed | LoginRenewalFailed
+
+
+def login_renewals_file() -> Path:
+    return accounts_home() / ".local" / "state" / "accounts" / "login_renewals.json"
+
+
+def login_renewal_attempts() -> dict[str, LoginRenewalAttempt]:
+    """Read local probe results. Discard damaged state so the next attempt replaces it."""
+    try:
+        raw = cast(object, json.loads(login_renewals_file().read_text()))
+        if not isinstance(raw, dict):
+            return {}
+        attempts: dict[str, LoginRenewalAttempt] = {}
+        for label, value in cast(dict[str, object], raw).items():
+            if not isinstance(value, dict):
+                return {}
+            item = cast(dict[str, object], value)
+            at, outcome, detail = item.get("at"), item.get("outcome"), item.get("detail")
+            if not isinstance(at, str) or outcome not in ("renewed", "failed") or not isinstance(detail, str):
+                return {}
+            stamp = datetime.fromisoformat(at)
+            if stamp.tzinfo is None:
+                return {}
+            attempts[label] = LoginRenewalAttempt(stamp,
+                LoginRenewed() if outcome == "renewed" else LoginRenewalFailed(detail))
+        return attempts
+    except (OSError, ValueError):
+        return {}
+
+
+def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
+    """Run a quiet probe, then keep its new usage reading. Never expose probe output."""
+    directory = claude_account_dir(label)
+    try:
+        probe = subprocess.run([sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
+            "exec", "--probe", label, "-p", "hello"], cwd="/tmp", stdin=subprocess.DEVNULL,
+            timeout=120, capture_output=True)
+    except subprocess.TimeoutExpired:
+        return LoginRenewalFailed("timed out after 120 s")
+    except OSError:
+        return LoginRenewalFailed("probe could not start")
+    if probe.returncode != 0:
+        return LoginRenewalFailed(f"probe exited with status {probe.returncode}")
+    try:
+        report = agent_accounts.claude_live(directory)
+        usage_store.save([report], datetime.now(timezone.utc))
+    except (OSError, ValueError, RuntimeError):
+        return LoginRenewalFailed("usage could not be read")
+    if (report.usage_read_outcome == agent_accounts.UsageReadOutcome.STALE_TOKEN
+            or isinstance(report.weekly_read_skip, agent_accounts.StaleTokenSkip)):
+        return LoginRenewalFailed("usage still shows an expired login")
+    return LoginRenewed()
+
+
 def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> None:
     """Replace this process with the selected Claude or Codex account."""
     label = note_file.canonical_label(label)
@@ -3867,7 +3935,10 @@ def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:
                 if isinstance(row.read_at, datetime) else " and no reading is stored yet")
     match row.read_outcome:
         case agent_accounts.UsageReadOutcome.STALE_TOKEN:
-            reason = "login token expired; start a session on it to refresh"
+            attempt = login_renewal_attempts().get(row.label)
+            reason = (f"login token expired; a probe session at {attempt.at.astimezone(zone):%H:%M} failed; log in on it by hand"
+                      if attempt is not None and isinstance(attempt.result, LoginRenewalFailed)
+                      else "login token expired; the next notes pass renews it")
         case agent_accounts.UsageReadOutcome.REFUSED_401:
             reason = "the usage service did not accept this login; start a session on it to check it"
         case agent_accounts.UsageReadOutcome.RATE_LIMITED_429:
