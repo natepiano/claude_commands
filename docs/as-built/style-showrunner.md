@@ -164,6 +164,8 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 5. When the pushed branch-point tip is not in the synced tip, record a sync wait and exit 3.
 6. Read the board (unavailable → exit 4, no ticket). Run `_select_phase`. On no work, record a sync wait, read the board again and select once more, so a wake that arrives between the check and the wait is not lost.
 
+Each refill pass holds one lock per style production (`refill.lock` beside the ledger) across the board read, busy-files read, selection, and ticket add and assignment. Both ticket writes commit before the lock is released, so the next unit reads their files as busy. The sync wait is outside the lock; `queue` takes no lock.
+
 `_select_phase` order: the oldest queued ticket is assigned under its own id when its files are free and in scope, and every other queued ticket is dropped (`dropped <id>: files busy|outside pilot scope`). Then approved decisions for the unit: the declaration step runs once, findings whose file is gone or whose site moved to another file are waived with the actor `WaiveByLedger()` and print a waive line, and each decision gives one `proposal` ticket of free, in-scope files (structure limits when a restructure finding is present). Then coverage through `_tickets_from`. No candidate: exit 6 when a stored style branch would change left-out cells, else `waiting for structure` or `waiting for sync`.
 
 | Exit | Output |

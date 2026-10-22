@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
-from scripts.guilds import astra_work, tips  # noqa: E402
+from scripts.guilds import astra_work, tips, roles  # noqa: E402
 
 MODEL = "gpt-6-astra"
 REASONING = "xhigh"
@@ -71,7 +71,7 @@ number), what is wrong or missing, why it matters, and the change you would make
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
 
-Use Events in ~/.claude/docs/plans/sdlc-guilds-design.md for report detection and form.
+Use Events in ~/.claude/docs/as-built/guilds.md for report detection and form.
 
 {tips.load("reviewers")}"""
 
@@ -178,6 +178,39 @@ def run_review(label: str, review: Path, prompt: str, log: Path) -> int:
                     print(f"astra_review: could not release reviewer role: {error}", file=sys.stderr)
 
 
+def held_review(design: roles.HeldDesign, focus: str, work: astra_work.PhaseWork | astra_work.StandaloneWork) -> int:
+    reviewer = next(instance for instance in design.roles if instance.role == "reviewer")
+    if not isinstance(reviewer.lifecycle, (roles.RoleOpen, roles.RolePausedForMove)):
+        print(f"astra_review: held reviewer unavailable: {type(reviewer.lifecycle).__name__}", file=sys.stderr)
+        return 1
+    if isinstance(work, astra_work.PhaseWork):
+        if (not isinstance(design.binding, roles.DesignBoundToPhase)
+                or Path(design.binding.run_directory) != Path(work.run_directory)
+                or design.binding.phase != work.phase_id):
+            print("astra_review: held reviewer needs an idle rebind to the supplied phase", file=sys.stderr)
+            return 1
+    folder = roles.design_directory(design.placement.design_id)
+    request = folder / f"review-request-{os.getpid()}-{time.time_ns()}.txt"
+    with request.open("x", encoding="utf-8") as output:
+        _ = output.write(f"Review {design.document}.\nFocus: {focus}\n")
+    try:
+        reply = roles.resume(design.placement.design_id + "/reviewer", request)
+        if not reply.is_file():
+            raise roles.RoleRefused("held reviewer returned no saved reply")
+        print(f"# {MODEL} review of {design.document} (held reviewer)\n")
+        print(reply.read_text(encoding="utf-8").strip())
+        print(f"\nSaved: {reply}")
+        return 0
+    except tips.BaselineMissing as error:
+        print(f"astra_review: {error}", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as error:
+        print(f"astra_review: held reviewer busy or unavailable: {str(error).replace(chr(10), ' ')}", file=sys.stderr)
+        return 1
+    finally:
+        request.unlink(missing_ok=True)
+
+
 def main(arguments: list[str]) -> int:
     usage = "usage: astra_review.py [--run-directory <dir> --phase <id>] <document> [focus...]"
     if not arguments or arguments[0] in ("-h", "--help"):
@@ -204,6 +237,13 @@ def main(arguments: list[str]) -> int:
         print(f"astra_review: no document at {arguments[0]}", file=sys.stderr)
         return 2
     focus = " ".join(arguments[1:]).strip()
+    try:
+        held = roles.held_document(document)
+    except (OSError, ValueError) as error:
+        print(f"astra_review: held reviewer unavailable: {error}", file=sys.stderr)
+        return 1
+    if held is not None:
+        return held_review(held, focus, work)
     label = workers_label()
     if not isinstance(label, str):
         said = tail(label.stderr or label.stdout)

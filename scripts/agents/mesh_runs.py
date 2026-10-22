@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
+from uuid import NAMESPACE_URL, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
@@ -61,6 +62,12 @@ RESULT_TAIL_LINES = 20
 # is a Codex turn input, which Codex refuses over 1,048,576 characters.
 RESULT_LINE_CHARS = 2_000
 RESULT_TAIL_CHARS = 20_000
+# verify.sh's VERIFY_SUPERSEDED_STATUS: a newer call of the same verb from the same worker in the
+# same worktree replaced this one while it waited for the cargo token. It ran nothing, so it is
+# neither a pass nor a failure, and the newer call's result answers instead.
+SUPERSEDED_STATUS = 76
+SUPERSEDED_VERDICT = ("SUPERSEDED (exit 76): a newer call of the same verb replaced this one before it built. "
+                      + "Nothing failed and nothing needs a repair; read the newer call's result.")
 # Where run folders and their active markers live; tests point this at a temporary folder.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 SEND_SCRIPT = codex_mesh.SEND_SCRIPT
@@ -121,6 +128,8 @@ def _roster_folders() -> list[Path]:
     """Every run's mesh folder: unit run folders, then review pool meshes."""
     folders = [path.parent for root in RUN_ROOTS for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}"))]
     folders.extend(path.parent for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")))
+    from scripts.guilds import roles
+    folders.extend(roles.durable_meshes())
     return folders
 
 
@@ -135,7 +144,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         roster = codex_mesh._read_json_object(folder / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
         for name, value in roster.items():
             entry = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
-            if entry.get("thread_id") != thread_id or entry.get("status") == "ended":
+            if entry.get("thread_id") != thread_id or entry.get("status") == "ended" or entry.get("transferring_role") or entry.get("role_redirect"):
                 continue
             launcher = codex_mesh._pid_alive(codex_mesh._as_int(entry.get("launcher_pid")))  # pyright: ignore[reportPrivateUsage]
             found.append((launcher, MeshCaller(str(folder), name, thread_id)))
@@ -282,7 +291,8 @@ def _tail(path: Path, count: int) -> list[str]:
 
 
 def result_text(record: RunRecord, exit_code: int) -> str:
-    verdict = "PASS (exit 0)" if exit_code == 0 else f"FAIL (exit {exit_code})"
+    verdict = ("PASS (exit 0)" if exit_code == 0 else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
+               else f"FAIL (exit {exit_code})")
     lines = [f"Run finished: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES)
     if tail:
@@ -323,9 +333,9 @@ def deliver(record: RunRecord, exit_code: int) -> str:
     Returns the delivery outcome the record keeps.
     """
     done_file = record["done_message_file"]
-    if done_file and exit_code != 0:
+    if done_file and exit_code not in (0, SUPERSEDED_STATUS):
         return f"nothing delivered: exit {exit_code} with a done message"
-    if done_file:
+    if done_file and exit_code == 0:
         try:
             text = Path(done_file).read_text(encoding="utf-8")
         except OSError as exc:
@@ -333,6 +343,23 @@ def deliver(record: RunRecord, exit_code: int) -> str:
     else:
         text = result_text(record, exit_code)
     session_dir, name = record["session_dir"], record["worker"]
+    roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+    entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
+    from scripts.guilds import roles
+    destination = roles.transfer_route(record["thread_id"])
+    if destination:
+        destination_roster = codex_mesh._read_json_object(Path(destination) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+        for value in destination_roster.values():
+            candidate = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
+            if candidate.get("thread_id") == record["thread_id"]:
+                entry = candidate
+                break
+    design_id, role = entry.get("held_design_id"), entry.get("held_role")
+    if isinstance(design_id, str) and design_id and role in ("designer", "reviewer"):
+        message_id = str(uuid5(NAMESPACE_URL, str(Path(session_dir).resolve()) + "/" + record["run_id"]))
+        _ = roles.queue_message(design_id, role, "mesh_runs:" + record["run_id"],
+                                text, message_id=message_id)
+        return f"queued for held role {name}; its holder controls the next assignment"
     held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False)
     if isinstance(held, (codex_mesh.HeldForLauncher, codex_mesh.HeldForNextDispatch)):
         return f"held for {name}'s attached launcher on thread {held.thread_id}"

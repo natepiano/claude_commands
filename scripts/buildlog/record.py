@@ -17,7 +17,8 @@ port_lint.py writes its own call records through write_call() here.
       nothing.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
       From verify.sh, once per call. OUTCOME is ran, failed, interrupted,
-      reused or replayed; CACHED is 1 when the call was eligible for a pass
+      reused, replayed or superseded (a newer call of the same verb from the
+      same worker replaced it in the token queue, status 76); CACHED is 1 when the call was eligible for a pass
       record; WAIT, WALL, BUILD and SAVED are whole seconds, ELAPSED the
       script's $SECONDS at the end. STATUS and BUILD may be empty (unknown).
       BUILDLOG_TOKEN_WAIT_S is the time spent acquiring the cargo token.

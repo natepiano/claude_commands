@@ -330,10 +330,24 @@ Your guild is `showrunners`. Your head is the `showrunners` unit director in the
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild showrunners
 
-Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
 Pass the user's guild feedback to that guild's head. A Codex holder includes the
 expanded block and loaded tip text in its worker prompt.
 </Guild>
+
+<HeldProductionDesign>
+The showrunner may hold one lasting Astra designer/reviewer pair for a production
+design through `roles.py`. It briefs, records cited rulings and acceptance, and
+keeps the same threads across rounds, restarts and account moves. Configured
+`guild` models and explicit access policies apply. A writer needs an authorized
+production-design phase with exact output paths, baseline and reservation; until
+that phase exists, hold read-only roles only. New writing scope needs an idle
+rebind. Saved headed prompts and replies stay with the role; pending messages are
+added only to an authorized assignment. A busy, fenced or uncertain role blocks
+new work; never substitute a thread. Finish turns and unbind after reservation
+release; end only through the lifecycle. Existing DesignAuthority, DesignCheck,
+screenshot and visual acceptance duties remain.
+</HeldProductionDesign>
 
 <ExecutionSteps>
 **EXECUTE IN ORDER:**

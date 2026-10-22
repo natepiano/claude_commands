@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.direct import phase_process  # noqa: E402
+from scripts.direct import phase_process, progress_history  # noqa: E402
 from scripts.guilds import astra_work, tips  # noqa: E402
 from scripts.history import rounds  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
@@ -160,7 +160,7 @@ def discover(sources: LocalSources, problems: list[Problem]) -> tuple[dict[str, 
 
 
 def saved_assignments(sources: LocalSources, runs: dict[str, Path], guild: str,
-                      problems: list[Problem]) -> list[SavedAssignment]:
+                      problems: list[Problem], since: float = 0) -> list[SavedAssignment]:
     if guild not in ("designers", "reviewers"):
         return []
     paths = {path for run in runs.values() for path in run.glob("design/phase*/round*_brief.md")}
@@ -171,6 +171,13 @@ def saved_assignments(sources: LocalSources, runs: dict[str, Path], guild: str,
     for path in sorted(paths):
         header = astra_work.read_header(path)
         if isinstance(header, astra_work.HeaderMissing):
+            if path.parent.parent == sources.astra_root:
+                try:
+                    if path.stat().st_mtime < since:
+                        continue
+                except OSError as error:
+                    problems.append(Problem("EvidenceUnavailable", str(path), str(error)))
+                    continue
             problems.append(Problem("MembershipNotRecorded", header.path, "assignment header is absent"))
         elif isinstance(header, astra_work.HeaderInvalid):
             problems.append(Problem("HeaderInvalid", header.path, header.reason))
@@ -307,9 +314,9 @@ def phase_rows(events: list[SourcedEvent], measured: tuple[phase_process.Event, 
                     members[key].add(saved.assignment.member)
         selected.intersection_update(members)
     else:
-        production_runs = {text(event.fields, "run_id") for event in events
-                           if text(event.fields, "skill") in ("showrunner", "showrunner:produce", "/showrunner:produce")}
-        selected = {key for key in selected if (key[0] in production_runs) == (guild == "showrunners")}
+        director_runs = {text(event.fields, "run_id") for event in events
+                         if text(event.fields, "skill") == progress_history.SKILL_NAME}
+        selected = {key for key in selected if guild == "units" and key[0] in director_runs}
         directors = {text(event.fields, "run_id"): text(cast(dict[str, object], event.fields["main_agent"]), "session_id")
                      for event in events if text(event.fields, "event_type") == "run_started"
                      and isinstance(event.fields.get("main_agent"), dict)}
@@ -383,8 +390,11 @@ def read_daily(guild: str, since: datetime, until: datetime, sources: LocalSourc
         raise ValueError("give a known guild and an increasing UTC interval")
     window = phase_process.Window(since.timestamp(), until.timestamp())
     problems: list[Problem] = []
+    if guild == "showrunners":
+        problems.append(Problem("HistoryNotRecorded", "WriterNotRecorded",
+                                "no showrunner run writer records exist yet"))
     runs, histories = discover(sources, problems)
-    assignments = [saved for saved in saved_assignments(sources, runs, guild, problems)
+    assignments = [saved for saved in saved_assignments(sources, runs, guild, problems, window.since)
                    if utc_time(saved.assignment.assigned_at_utc).timestamp() < window.until]
     for saved in assignments:
         if isinstance(saved.assignment.work, astra_work.PhaseWork):

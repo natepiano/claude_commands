@@ -12,5 +12,5 @@ Your guild is `designers`. Your head is the `designers` unit director in the top
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild designers
 
-Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
 A holder includes this text, the expanded block and loaded tip text in each brief.

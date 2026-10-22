@@ -23,7 +23,7 @@
 
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
-| guild-process-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/plans/sdlc-guilds-design.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py`; `scripts/guilds/`; `config/guilds/`; `commands/astra_review.md` and `scripts/astra/astra_review.py` with its test (the guild block only; natedev's enh-showrunner owns the rest); `~/rust/nate_style/guilds/` (separate repo: committed on its main by this unit after its phase gates, fast-forward only) |
+| guild-process-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/as-built/guilds.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py`; `scripts/guilds/`; `config/guilds/`; `commands/astra_review.md` and `scripts/astra/astra_review.py` with its test (the guild block only; natedev's enh-showrunner owns the rest); `~/rust/nate_style/guilds/` (separate repo: committed on its main by this unit after its phase gates, fast-forward only) |
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
@@ -38,11 +38,11 @@ Scope of each unit:
 
 ### Guild heads
 
-The user, via the showrunner, 2026-10-20: "I like goddesses of wisdom and judgement for the chief designers and reviewers. Probably each is a top level showrunner."
+As built (`docs/as-built/guilds.md`; the user's G1b and G7 in Review decisions):
 
-- The chief designer (head of the designer guild) and the chief reviewer (head of the reviewer guild) are each a top-level showrunner. They are peers of the sdlc showrunner and of natedev, in a flat organization. They are not units of sdlc.
-- Their names come from goddesses: a goddess of wisdom for the chief designer, a goddess of judgement for the chief reviewer. cargo-liner settles the names with the user. Until then, the internal ids are `astra-designer` and `astra-reviewer`.
-- guilds-unit designs the guilds and the roles. It does not run the two heads. When the heads exist, they run their guilds from guilds-unit's design, and they send their findings about the design back to guilds-unit through the sdlc showrunner.
+- Each guild head is a unit director with the guild's exact ID, `designers`, `reviewers`, `showrunners` or `units`, under the top-level `guilds` production on natedev (`docs/plans/guilds-production.md`). The heads are not units of sdlc.
+- Goddess names are on hold. `astra-designer` and `astra-reviewer` name only the per-design Astra roles and their census edges, not the heads.
+- guild-process-unit owns process changes, not head operations. A head sends a process proposal through the guilds showrunner to sdlc for guild-process-unit.
 
 ## Hub files
 
@@ -63,7 +63,7 @@ No gates yet. The plans are not written. When a plan needs another unit's checkp
 
 ## Close-out
 
-- Send cargo-liner the final guild design and the role names the user chose, so its handler unit shows them, and the internal ids `astra-designer` and `astra-reviewer` are replaced everywhere.
+- Send cargo-liner the final guild design and the role names the user chose, so its handler unit shows them. `astra-designer` and `astra-reviewer` stay as the per-design role and census IDs (`docs/as-built/guilds.md`).
 - Each unit's as-built doc is in `docs/as-built/`, and the docs it replaces are deleted or amended.
 - Tell the natedev showrunner about each change to a build-followups hub file once it is on main.
 
