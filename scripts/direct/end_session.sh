@@ -83,6 +83,9 @@ if (( ${#RUNS[@]} > 0 )); then
   for run in "${RUNS[@]}"; do
     REMOVE_ARGS+=(--session-dir "${run}")
   done
+  for run in "${RUNS[@]}"; do
+    "$PY" "${SCRIPT_DIR}/../guilds/roles.py" unbind-run "${run}" || exit 1
+  done
   "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
   for run in "${RUNS[@]}"; do
     if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" || -f "${run}/mesh_retired.json" ]]; then

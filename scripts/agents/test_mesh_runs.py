@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
+from scripts.guilds import roles
 
 WORKER = "unit-impl"
 DEAD_PID = 2 ** 22 + 12345
@@ -43,7 +44,9 @@ class MeshRunsTests(unittest.TestCase):
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
-        self.stack.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(self.root / "pool"), "BUILDLOG_SCOPE": "0"}))
+        self.stack.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(self.root / "pool"),
+                                                        "GUILD_ROLES_STATE": str(self.root / "guilds/roles"),
+                                                        "BUILDLOG_SCOPE": "0"}))
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
 
@@ -57,6 +60,55 @@ class MeshRunsTests(unittest.TestCase):
     @override
     def tearDown(self) -> None:
         self.stack.close()
+
+    def test_durable_role_is_found_after_its_run_folder_is_gone(self) -> None:
+        role_root = self.root / "guilds/roles"
+        mesh = role_root / "design-one/mesh"
+        mesh.mkdir(parents=True)
+        _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"lasting-designer": {
+            "thread_id": "lasting-thread", "status": "idle", "launcher_pid": 0}}))
+        with patch.dict(os.environ, {"GUILD_ROLES_STATE": str(role_root)}):
+            caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "lasting-thread"})
+        self.assertEqual(caller, mesh_runs.MeshCaller(str(mesh), "lasting-designer", "lasting-thread"))
+        with patch.dict(os.environ, {"GUILD_ROLES_STATE": str(role_root), "CODEX_THREAD_ID": "lasting-thread"}), \
+                patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = mesh_runs.main(["start", "--label", "role fixture", "--", sys.executable,
+                                   "-c", "print('durable result')"])
+        self.assertEqual(code, 0)
+        records = list((mesh / codex_mesh.DETACHED_RUNS_DIR).glob("*.json"))
+        self.assertEqual(len(records), 1)
+        record = self.supervise(records[0])
+        self.assertEqual((record["status"], record.get("exit_code")), ("finished", 0))
+        pending = cast(object, json.loads((mesh / "lasting-designer.pending.json").read_text()))
+        self.assertIn("durable result", str(pending))
+        self.assertEqual(self.sent, [])
+
+    def test_detached_result_stays_pending_for_the_held_roles_next_authorized_turn(self) -> None:
+        design_id = "00000000-0000-4000-8000-000000000076"
+        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
+            str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
+            roles.UnitHolder("demo", "design-unit"), roles.DesignUnbound(),
+            (roles.RoleInstance("designer", "unused", roles.RoleNotOpened()),
+             roles.RoleInstance("reviewer", WORKER, roles.RoleOpen("thread-1"))))
+        roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        roster = {WORKER: {"thread_id": "thread-1", "status": "done", "held_design_id": design_id,
+                           "held_role": "reviewer", "launcher_pid": 0}}
+        _ = (self.session / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        path = self.record([sys.executable, "-c", "print('saved verification evidence')"])
+        with patch.object(codex_mesh, "command_follow", side_effect=AssertionError("result woke the role")), \
+                patch.object(codex_mesh, "command_send", side_effect=AssertionError("result sent a turn")), \
+                patch.object(roles, "dispatch_turn", side_effect=AssertionError("result dispatched a role")):
+            record = self.supervise(path)
+            repeated = mesh_runs.deliver(record, 0)
+        messages = roles.pending_messages(design_id, "reviewer")
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].source, "mesh_runs:r1")
+        self.assertIn("saved verification evidence", messages[0].text)
+        self.assertIn("queued for held role", repeated)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(cast(object, json.loads((self.session / codex_mesh.ROSTER_FILE).read_text())), roster)
+        self.assertFalse((self.session / (WORKER + ".pending.json")).exists())
 
     def write_roster(self, thread_id: str, status: str, launcher_pid: int, port: int) -> None:
         roster = {WORKER: {"thread_id": thread_id, "status": status, "launcher_pid": launcher_pid,
@@ -249,6 +301,17 @@ class MeshRunsTests(unittest.TestCase):
         self.assertIn("nothing delivered", record.get("delivery", ""))
         _ = self.supervise(self.record([sys.executable, "-c", "pass"], done=str(done)))
         self.assertEqual(self.pending()["messages"], ["Stage 2: go"])
+
+    def test_a_superseded_run_delivers_a_result_that_is_not_a_failure(self) -> None:
+        done = self.root / "done.txt"
+        _ = done.write_text("Stage 2: go", encoding="utf-8")
+        record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(76)"], done=str(done)))
+        message = cast(list[str], self.pending()["messages"])[0]
+        self.assertIn("Result: SUPERSEDED (exit 76)", message)
+        self.assertIn("nothing needs a repair", message)
+        self.assertNotIn("FAIL", message)
+        self.assertNotIn("Stage 2: go", message)
+        self.assertEqual(record.get("exit_code"), 76)
 
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
         script = "print('x' * 1_100_000)\nfor n in range(30): print(str(n) * 5_000)\nprint('last line')"

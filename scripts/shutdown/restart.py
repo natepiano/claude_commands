@@ -1929,7 +1929,8 @@ def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
     resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
     if resumed is not None:
         return resumed
-    start = [str(SCRIPTS / "direct" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
+    # The launchers are not executable files: `bash` runs them as pasted.
+    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"], seat["run_dir"], cwd, prompt]
     if launcher == "review.sh":
         return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
     from scripts.direct.worker_state import worker_slot
@@ -1970,8 +1971,12 @@ def _send_worker_resume(record: SessionShutdown) -> None:
     lines = ["Resume your Codex workers; do not open new ones."]
     cwd = record["session"]["cwd"]
     for seat in seats:
-        state = "was working" if seat["turn_live"] else "idle"
-        lines.append(f"{seat['seat']} ({seat['role']}, {state}): {_resume_worker_command(seat, cwd)}")
+        # An idle seat stays paused on its thread until the next dispatch; a command now would need an open phase.
+        if seat["turn_live"]:
+            lines.append(f"{seat['seat']} ({seat['role']}, was working): {_resume_worker_command(seat, cwd)}")
+        else:
+            lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
+                         + f"Your next dispatch with --to {seat['seat']} resumes it.")
     lines.append("Each seat continues its own thread; after resuming, send later work with --to as usual.")
     identity = record["session"]["session_id"]
     try:

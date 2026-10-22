@@ -18,6 +18,7 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
+from scripts.guilds import roles
 
 SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
@@ -127,6 +128,8 @@ class RosterTests(unittest.TestCase):
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "ROSTER_PS_FIXTURE": str(self.ps_state),
             "PROCESS_TABLE_PS": f"cat {self.ps_state}",
+            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
+            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership"),
         }
         environment_patch = cast(
             AbstractContextManager[object],
@@ -394,6 +397,27 @@ class RosterTests(unittest.TestCase):
             session=(roster.ClaudeSession(address.removeprefix("session:"))
                      if kind == "claude" and address.startswith("session:") else roster.NoClaudeSession()),
         )
+
+    def test_durable_role_roster_uses_holder_reach_after_its_run_folder_is_gone(self) -> None:
+        design = roles.HeldDesign(roles.DesignPlacement("00000000-0000-4000-8000-000000000046", "fixture-host", 2),
+            "fixture-repo", str(self.root / "checkout"), str(self.root / "checkout/design.md"), "design",
+            "2026-10-21T12:00:00+00:00", roles.UnitHolder("alpha", "unit-one"), roles.DesignUnbound(),
+            (roles.RoleInstance("designer", "lasting-designer-alias", roles.RoleOpen("lasting-thread")),
+             roles.RoleInstance("reviewer", "lasting-reviewer-alias", roles.RoleNotOpened())))
+        roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        mesh = roles.mesh_directory(design.placement.design_id)
+        mesh.mkdir(parents=True)
+        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"lasting-designer-alias": {
+            "thread_id": "lasting-thread", "status": "done"}}))
+        with mock.patch.object(roles, "resolve_holder", return_value=roles.HolderReach("sid-director")):
+            found = self._entries()
+        entry = found["lasting-designer-alias"]
+        self.assertEqual(entry.thread, roster.CodexThread("lasting-thread"))
+        self.assertEqual(entry.role, "astra-designer")
+        self.assertEqual(entry.director, roster.UnderDirector("unit-one", "director", "session:sid-director"))
+        self.assertEqual(entry.assignment, roster.WorkerAssignment("astra-designer", str(mesh)))
+        self.assertIsInstance(entry.reach, roster.CannotReceiveMessages)
+        self.assertEqual(sum(row.thread == roster.CodexThread("lasting-thread") for row in found.values()), 1)
 
     def test_every_role_and_status_is_returned_with_its_relationships(self) -> None:
         entries = self._entries()

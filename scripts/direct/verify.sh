@@ -74,8 +74,9 @@
 # cargo's own "Finished … in" build times, since a repeat on the same tree
 # builds nothing. Every call, of every verb, in a delegate session or not,
 # leaves one call record in the build log (~/.local/state/buildlog; `buildlog
-# schema` lists its fields): ran, failed, interrupted, reused (a pass) or
-# replayed (a lint failure), with the seconds saved and the repo, worktree,
+# schema` lists its fields): ran, failed, interrupted, reused (a pass),
+# replayed (a lint failure) or superseded (exit 76: a newer call of the same
+# verb from the same worker replaced it in the token queue), with the seconds saved and the repo, worktree,
 # branch and commit. The steps it ran carry the same call id. The build log
 # outlives the records; /verify_saved reports the time saved.
 #
@@ -1573,6 +1574,58 @@ token_wait_interrupted() {
     eval "$TOKEN_CALLER_TRAPS"
     kill -s "$signal_name" "${BASHPID:-$$}"
 }
+# A newer call from the same worker, with the same verb and arguments in the
+# same worktree, ends this one while it still waits for its first token: the
+# newer call checks a newer tree, so this verdict is no longer wanted (one
+# worker queued 27 such calls on 2026-10-21, and peers waited 20 h behind
+# them). A lint key leaves out its package, since every lint covers the
+# workspace. A waiting call keeps a file named <slot>.<key>.<start>.<pid> in
+# the board's token_waiters folder; a newer call sends SIGUSR1 to each older one that still
+# runs verify.sh. A call that holds the token runs to the end, and a signal
+# that lands after the wait does nothing.
+VERIFY_SUPERSEDED_STATUS=76
+TOKEN_WAITERS_DIR=""
+TOKEN_WAITER_PREFIX=""
+TOKEN_WAITER_FILE=""
+TOKEN_SUPERSEDED=0
+trap ':' USR1
+token_waiters_key() {
+    local key_args=(${ARGS[@]+"${ARGS[@]}"})
+    if [[ "$CMD" == lint && ${#key_args[@]} -gt 0 && "${key_args[0]}" != --* ]]; then
+        key_args=("${key_args[@]:1}")
+    fi
+    "$PY" -c 'import hashlib, sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:16])' \
+        "$(pwd -P)" "$CMD" ${key_args[@]+"${key_args[@]}"}
+}
+supersede_older_waiters() {
+    local file name pid stamp own=${TOKEN_WAITER_FILE%.*}
+    own=${own##*.}
+    for file in "$TOKEN_WAITERS_DIR/$TOKEN_WAITER_PREFIX".*.*; do
+        [[ -f "$file" ]] || continue
+        name=${file##*/}
+        pid=${name##*.}
+        stamp=${name%.*}
+        stamp=${stamp##*.}
+        [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$file"
+        elif (( 10#$stamp < 10#$own )) \
+            && ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'; then
+            kill -USR1 "$pid" 2>/dev/null || true
+        fi
+    done
+}
+# Ends a call that a newer one replaced. Its caller reads this as no verdict,
+# never as a failure to repair: the newer call's result answers instead.
+token_wait_superseded() {
+    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
+    rm -f "$TOKEN_WAITER_FILE"
+    trap - INT TERM HUP
+    TOKEN_WAIT_S=$TOKEN_WAITED
+    printf 'verify.sh: superseded by a newer %s call; this call ran nothing. Read the newer call'"'"'s result: nothing failed and nothing needs a repair.\n' "$CMD"
+    note_event superseded "$SECONDS" 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
+    exit "$VERIFY_SUPERSEDED_STATUS"
+}
 # Waits until this run holds the token, with no time limit: the pid reclaim and
 # the 3600 s hold already free a dead or stuck holder, and board.sh stops the
 # wait when this run's pid is gone. Sets TOKEN_WAITED to the seconds it waited.
@@ -1591,14 +1644,30 @@ acquire_token() {
     trap 'token_wait_interrupted HUP' HUP
     token_wait_clock
     started=$TOKEN_CLOCK_NOW
+    local status
     while :; do
+        if (( TOKEN_SUPERSEDED )); then
+            token_wait_clock
+            TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
+            token_wait_superseded
+        fi
         bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
             --pid $$ --hold 3600 --wait 60 >/dev/null 2>&1 &
         TOKEN_WAITER_PID=$!
-        if wait "$TOKEN_WAITER_PID"; then
+        status=0
+        wait "$TOKEN_WAITER_PID" || status=$?
+        # SIGUSR1 ends the wait builtin early; the acquire may have won first.
+        if (( status != 0 && TOKEN_SUPERSEDED )); then
+            kill "$TOKEN_WAITER_PID" 2>/dev/null || true
+            status=0
+            wait "$TOKEN_WAITER_PID" 2>/dev/null || status=$?
+        fi
+        if (( status == 0 )); then
+            TOKEN_SUPERSEDED=0
             break
         fi
-        sleep 1
+        TOKEN_WAITER_PID=""
+        (( TOKEN_SUPERSEDED )) || sleep 1
     done
     TOKEN_WAITER_PID=""
     TOKEN_HELD=1
@@ -1609,7 +1678,17 @@ acquire_token() {
 }
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
     TOKEN_USED=1
+    TOKEN_WAITERS_DIR="${BOARD_DIR}/token_waiters"
+    TOKEN_WAITER_PREFIX="${BOARD_SLOT}.$(token_waiters_key)"
+    mkdir -p "$TOKEN_WAITERS_DIR"
+    TOKEN_WAITER_STAMP=${EPOCHREALTIME:-$(date +%s).000000}
+    TOKEN_WAITER_FILE="${TOKEN_WAITERS_DIR}/${TOKEN_WAITER_PREFIX}.${TOKEN_WAITER_STAMP/[.,]/}.$$"
+    : > "$TOKEN_WAITER_FILE"
+    trap 'TOKEN_SUPERSEDED=1' USR1
+    supersede_older_waiters
     acquire_token
+    trap ':' USR1
+    rm -f "$TOKEN_WAITER_FILE"
     TOKEN_WAIT_S=$TOKEN_WAITED
 fi
 
