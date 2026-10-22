@@ -134,7 +134,8 @@ CALL_COLUMNS: list[Column] = [
         "outcome",
         "TEXT",
         "ran, failed, interrupted, reused (a recorded pass), replayed (a recorded failure),"
-        + " deferred (port-lint: an agent or a cargo was busy in the worktree)",
+        + " deferred (port-lint: an agent or a cargo was busy in the worktree),"
+        + " superseded (a newer call of the same verb from the same worker replaced it in the token queue)",
     ),
     ("status", "INTEGER", "exit status, NULL when unknown or interrupted"),
     ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
