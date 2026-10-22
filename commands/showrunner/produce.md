@@ -330,7 +330,7 @@ Your guild is `showrunners`. Your head is the `showrunners` unit director in the
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild showrunners
 
-Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
 Pass the user's guild feedback to that guild's head. A Codex holder includes the
 expanded block and loaded tip text in its worker prompt.
 </Guild>

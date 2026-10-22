@@ -1928,8 +1928,12 @@ def _release_held_server(session_dir: str) -> None:
                 with _pending_file(session_dir, name) as pending:
                     def park(message: str) -> None:
                         _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+                    state = _read_live_turn(client, thread_id)
+                    if isinstance(state, ThreadStateUnknown):
+                        if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                            continue
                     _move_queue_to_pending(client, thread_id, park)
-                    if not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+                    if not isinstance(state, ThreadIdle):
                         raise SystemExit("RoleNeedsRecovery: old server turn is not proven idle")
                     released = _release_worker_thread(client, thread_id, session_dir)
                     if isinstance(released, WorkerThreadStateUnknown):
@@ -4596,15 +4600,22 @@ def command_end(args: argparse.Namespace) -> int:
         return 0
     with _pending_file(session_dir, target) as pending_file:
         _end_marker_path(session_dir, target).touch()
-        _ = pending_file.seek(0)
-        _ = pending_file.truncate()
+        if not record.get("held_design_id"):
+            _ = pending_file.seek(0)
+            _ = pending_file.truncate()
     _mark_roster_ended(session_dir, target)
     availability = _server_availability(session_dir)
     dropped = 0
     if isinstance(availability, LiveServer):
         client = Client(availability.port, f"end-{os.getpid()}")
         thread_id = record["thread_id"]
-        dropped = _drop_queued_messages(client, thread_id)
+        if record.get("held_design_id"):
+            with _pending_file(session_dir, target) as pending_file:
+                def park(message: str) -> None:
+                    _write_pending(pending_file, thread_id, [*_pending_for_thread(pending_file, thread_id), message])
+                _move_queue_to_pending(client, thread_id, park)
+        else:
+            dropped = _drop_queued_messages(client, thread_id)
         # A queued message opens a turn the `start` loop never saw, so the
         # roster's id may be stale; the server names the live one.
         state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))

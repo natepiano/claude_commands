@@ -31,6 +31,8 @@ The verbs:
 | `idle-stop` | `--session-dir --pid --port` | The server's own watcher calls this. It stops the server, or touches its record if something still uses it. |
 | `list` | `--session-dir` | Prints the roster. |
 
+A held design role (a roster entry with `held_design_id`, `docs/as-built/guilds.md`) changes only through `scripts/guilds/roles.py`: `start`, `prime` over it, `fork` from it, `reopen`, `set-instructions`, raw `stop` and `stop --pause` refuse it, `follow` takes only its `authorized_prompt` (or an account-move continuation), and `send` queues the text in the role store.
+
 `follow` and `start` both send `model` on every `turn/start`. A follow-up therefore runs the configured model of the role the worker was reassigned to, not the model it opened with.
 
 **Roster fields (`mesh_roster.json`).** Each entry has:
@@ -41,7 +43,8 @@ The verbs:
 - `context_tokens`: `tokenUsage.last.inputTokens` from the turn's latest `thread/tokenUsage/updated`, or `"not_measured_since_compaction"` after a compaction turn that reported 0, until the worker's next turn reports a size.
 - `revision`: raised by one on every write inside the roster lock; an entry without one reads as 0. `_update_roster_if_expected` writes only when the entry still matches what the writer expects (still on its thread, absent, ended on its thread, or at an unchanged revision), so a command still at work for an earlier thread, or a compaction that ends late, cannot replace a newer record (`docs/as-built/usage-ledger.md`, Worker roster guards).
 - During a claim only: `previous_role` and `previous_status`.
-- For a pooled reviewer or its template only: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
+- For a pooled reviewer, its template or a held design role: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
+- `access_policy`, which decides the sandbox (`_seat_sandbox`, `_resume_params`): `{"kind": "ReadOnlyReviewer"}` (written by `prime` and `fork`, and for a held reviewer) gives `read-only`; `PhaseBoundDesigner` (a held designer) gives its `launch_sandbox`. An entry with no policy takes `--sandbox` or the default `danger-full-access`; an entry with `instructions_file` and no policy refuses with `recovery required`. Access never comes from the instructions text.
 
 The read-only roster reader `scripts/message/roster.py` (`docs/as-built/session-roster.md`) reads `thread_id`, `status`, `role`, `lens`, `launcher_pid` and `cwd`, and leaves `ended` workers out. A `review` worker with a `lens` field shows as `review (<lens>)`, but no launcher writes `lens` into the mesh roster. `codex_mesh.py --lens` records the lens in `agents.jsonl` only; it also appears in artifact names and in the progress and findings records.
 
@@ -109,14 +112,14 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 
 - **Phase end.** `<PhaseCleanup/>` runs `remove_workers.py --session-dir`. That removes Claude workers only and leaves Codex threads open. After a successful Claude session listing, and only under the real delegate root, it runs `codex_mesh.py sweep --stop` (best-effort). A sweep failure prints one line and worker cleanup continues.
 - **Run end.** `scripts/direct/end_session.sh` acts on every run folder the ending director holds, not only the one its marker names: a director runs independent phases side by side, each in its own run folder. `unit_runs.py held <session id>` lists them, the marker's run first, then every folder under the run roots whose `unit_runs.director(run)` is the session. It is a plain scan: reading the director of all 224 live folders took about 25 ms (2026-10-17). The marker's run is kept even when the scan fails. A run of another director is never touched. The steps, in order:
-  1. one `remove_workers.py` call with a `--session-dir` per held run
-  2. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
-  3. one `sweep --root <root of the first held run> --stop`
-  4. one `remove_run_scratch.py` call for every held run: it removes `verify_cache/` and every git checkout (a folder holding `.git`, a folder or a file) and cargo target (a folder holding `.rustc_info.json` or `CACHEDIR.TAG`) at any depth, without descending into what it removes or following a link; a linked worktree goes through `git worktree remove --force --force` in its source repo, or is deleted and its source pruned, so no stale entry keeps its branch "already checked out"; ledgers, logs, diffs, json and the run folder stay (2026-10-21: gate copies under `phases/`, exports under `scratch/` and builds such as `p62_bin` had filled run folders)
-  5. removal of the marker run's notifier
+  1. `roles.py unbind-run <run>` for each held run, which unbinds every held design role bound to it and leaves its thread, prompts and replies (`docs/as-built/guilds.md`); a failure stops the script before any other step
+  2. one `remove_workers.py` call with a `--session-dir` per held run
+  3. `codex_mesh.py stop` for each held run with `mesh_roster.json`, `mesh_server.json` or `mesh_retired.json`
+  4. one `sweep --root <root of the first held run> --stop`
+  5. one `remove_run_scratch.py` call for every held run: it removes `verify_cache/` and every git checkout (a folder holding `.git`, a folder or a file) and cargo target (a folder holding `.rustc_info.json` or `CACHEDIR.TAG`) at any depth, without descending into what it removes or following a link; a linked worktree goes through `git worktree remove --force --force` in its source repo, or is deleted and its source pruned, so no stale entry keeps its branch "already checked out"; ledgers, logs, diffs, json and the run folder stay (2026-10-21: gate copies under `phases/`, exports under `scratch/` and builds such as `p62_bin` had filled run folders)
   6. removal of the run-active marker
 
-  Steps 1 to 4 run even with no marker, for runs the session still holds. Each step continues after a failure. Tests point the scan at a temp folder with `PLAN_DELEGATE_RUN_ROOT` and the marker with `PLAN_DELEGATE_ACTIVE_DIR`.
+  Steps 1 to 5 run even with no marker, for runs the session still holds. Steps 2 to 5 each continue after a failure. Tests point the scan at a temp folder with `PLAN_DELEGATE_RUN_ROOT` and the marker with `PLAN_DELEGATE_ACTIVE_DIR`.
 - **Sweep.** It first decides who owns each `ws://` app-server: the current server of a run, a retired server of a run, an unowned server whose log names its run, or an unowned server with no log. It then judges whether anything still needs the server:
   - Any connected client means in use.
   - For a current server, a run-active marker or a running worker means in use.
@@ -162,7 +165,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 | `scripts/agents/codex_mesh.py` | Worker threads, roster, compaction, overflow press-on, role claim and restore, sweep |
 | `scripts/direct/implement.sh` | Writer, tester and repair dispatch; `--to` reuse with identity check, claim and compaction |
 | `scripts/direct/review.sh` | Reviews: `--to` reuse, `--slot` new worker, `--pool` pooled reviewer, tree guard, fresh read-only fallback |
-| `scripts/direct/end_session.sh` | Ends the workers of every run the director holds (`stop`) and sweeps |
+| `scripts/direct/end_session.sh` | Unbinds held design roles from every run the director holds, ends that run's workers (`stop`) and sweeps |
 | `scripts/direct/remove_run_scratch.py` | Removes `verify_cache/`, checkouts and cargo targets from each ended run folder |
 | `scripts/direct/remove_workers.py` | Removes Claude workers at phase end (`--session-dir`, repeatable); sweeps after a successful listing |
 | `scripts/lib/unit_runs.py` | `held`: every run folder a director holds |
@@ -179,7 +182,7 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
 
 ## Invariants
 
-- Codex workers open once per run and end only at `end_session.sh`. Phase cleanup never ends a Codex thread. A new worker opens only when no open worker can take the work.
+- Codex workers open once per run and end only at `end_session.sh`. A held design role is not a run worker: run end unbinds it and never ends its thread. Phase cleanup never ends a Codex thread. A new worker opens only when no open worker can take the work.
 - Claude workers keep their per-phase lifecycle; this design covers Codex workers only.
 - Only a launcher starts a worker's next turn. A peer message to a finished Codex turn is refused; messages are for questions only.
 - Compaction, the worker claim and the identity check run under one lock (`impl_worker_claim.lock`). Compaction is best-effort: a failure posts one board line and never blocks the follow-up.

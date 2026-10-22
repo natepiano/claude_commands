@@ -27,7 +27,7 @@ Your guild is `units`. Your head is the `units` unit director in the top-level `
 
 Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild units
 
-Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
 In Synthesize / FixDispatch, send the units report when `findings.py gate` first
 returns `verdict=dispatch` with `round=4` for a phase instance; a repeated read
 sends no new report. The gate outcome does not change.
