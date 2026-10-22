@@ -5935,6 +5935,8 @@ class MeshCommandTests(unittest.TestCase):
         self.outcomes = ["capacity"] * 20
         code, _errors = self.run_start()
         self.assertEqual(code, 1)
+        pending = self.session_dir / "worker.pending.json"
+        before = pending.read_bytes()
         with contextlib.redirect_stderr(io.StringIO()) as errors:
             sent = codex_mesh.command_send(argparse.Namespace(
                 session_dir=str(self.session_dir), to="worker",
@@ -5945,6 +5947,7 @@ class MeshCommandTests(unittest.TestCase):
         self.assertIn("end --to worker", errors.getvalue())
         self.assertEqual(self.methods("thread/queue/add"), [])
         self.assertEqual(self.auto_turn_starts, 0)
+        self.assertEqual(pending.read_bytes(), before)
 
     def test_capacity_exhaustion_drains_the_server_queue(self) -> None:
         """No queued message can start unwatched after start returns."""
@@ -6411,6 +6414,23 @@ class MeshCommandTests(unittest.TestCase):
         self.assertIn("being ended", errors.getvalue())
         self.assertEqual((self.session_dir / "worker.pending.json").read_text(encoding="utf-8"), "")
 
+    def test_send_to_ended_status_without_end_marker_refuses_and_keeps_pending_empty(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "ended"}})
+        code, output, errors = self.run_mesh(["send", "--to", "worker", "--message", "Too late"])
+        self.assertEqual((code, output), (2, ""))
+        self.assertEqual(errors, "codex_mesh: worker is ended; message not delivered\n")
+        self.assertEqual((self.session_dir / "worker.pending.json").read_text(), "")
+        self.assertEqual(self.server.requests, [])
+
+    def test_send_to_worker_missing_from_roster_names_the_known_workers_and_holds_nothing(self) -> None:
+        self.write_pool_roster({"peer": {"thread_id": THREAD_ID, "status": "done"}})
+        with self.assertRaises(SystemExit) as refused:
+            _ = self.run_mesh(["send", "--to", "worker", "--message", "No recipient"])
+        self.assertEqual(str(refused.exception.code), "codex_mesh: no delegate named 'worker'. Known: peer")
+        self.assertNotIn("No recipient", "".join(
+            path.read_text() for path in self.session_dir.glob("*.pending.json")))
+        self.assertEqual(self.server.requests, [])
+
     def test_unreadable_thread_after_completion_ends_and_cleans_up(self) -> None:
         """Failed liveness reads end the launcher through cleanup."""
         self.outcomes = ["completed"]
@@ -6522,19 +6542,70 @@ class MeshCommandTests(unittest.TestCase):
         self.assertEqual(pending["messages"], [])
         self.assertIs(pending["accepting_messages"], False)
 
-    def test_send_after_launcher_closes_inbox_is_refused_and_stores_nothing(self) -> None:
+    def test_send_after_launcher_closes_inbox_is_held_until_follow_after_its_prompt(self) -> None:
         sent: list[int] = []
+        output = io.StringIO()
         def after_close(_port: int, _thread_id: str, _log_path: Path) -> codex_mesh.RelaunchAllowed:
-            sent.append(codex_mesh.command_send(argparse.Namespace(
-                session_dir=str(self.session_dir), to="worker", message="too late", message_file="")))
+            with contextlib.redirect_stdout(output):
+                sent.append(codex_mesh.command_send(argparse.Namespace(
+                    session_dir=str(self.session_dir), to="worker", message="late peer message", message_file="")))
             return codex_mesh.RelaunchAllowed()
         with patch.object(codex_mesh, "_end_unwatched_turn", side_effect=after_close):
             code, errors = self.run_start()
-        self.assertEqual(code, 0)
-        self.assertEqual(sent, [2])
-        self.assertIn("closing", errors)
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(sent, [0])
+        self.assertEqual(output.getvalue(),
+                         "queued for worker; no launcher is attached, so the message waits for its next dispatch\n")
         self.assertEqual(len(self.methods("turn/start")), 1)
-        self.assertNotIn("too late", (self.session_dir / "worker.pending.json").read_text())
+        self.assert_held_message_delivered_on_follow("late peer message")
+
+    def assert_held_message_delivered_on_follow(self, message: str) -> None:
+        pending_path = self.session_dir / "worker.pending.json"
+        pending = cast(codex_mesh.WorkerPendingMessages, json.loads(pending_path.read_text()))
+        self.assertEqual(pending["thread_id"], THREAD_ID)
+        self.assertEqual(pending["messages"], [message])
+        self.server.requests.clear()
+        self.assertEqual(self.run_follow("next dispatch prompt"), (0, ""))
+        starts = self.methods("turn/start")
+        self.assertEqual(len(starts), 1)
+        params = _as_test_dict(starts[0].get("params"))
+        self.assertEqual(params["threadId"], THREAD_ID)
+        inputs = cast(list[dict[str, object]], params["input"])
+        self.assertEqual([item["text"] for item in inputs], ["next dispatch prompt", message])
+        pending = cast(codex_mesh.WorkerPendingMessages, json.loads(pending_path.read_text()))
+        self.assertEqual(pending["messages"], [])
+        self.assertIs(pending["accepting_messages"], False)
+
+    def assert_send_without_launcher_waits_for_follow(self, status: str, launcher_pid: int) -> None:
+        self.assertEqual(self.run_start(), (0, ""))
+        record = {**self.worker_record(), "status": status, "launcher_pid": launcher_pid}
+        if status == "running":
+            record["turn_id"] = "turn-1"
+        self.write_pool_roster({"worker": record})
+        # Keep the inbox open so status and PID are each tested independently of inbox closure.
+        _ = (self.session_dir / "worker.pending.json").write_text(json.dumps({
+            "thread_id": THREAD_ID, "messages": [], "accepting_messages": True,
+        }))
+        self.server.requests.clear()
+        def launcher_alive(pid: int) -> bool:
+            return pid == os.getpid()
+
+        with patch.object(codex_mesh, "_pid_alive", side_effect=launcher_alive):
+            code, output, errors = self.run_mesh(["send", "--to", "worker", "--message", "held peer message"])
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output,
+                         "queued for worker; no launcher is attached, so the message waits for its next dispatch\n")
+        self.assertEqual(self.server.requests, [])
+        self.assert_held_message_delivered_on_follow("held peer message")
+
+    def test_send_to_paused_worker_is_held_until_follow_after_its_prompt(self) -> None:
+        self.assert_send_without_launcher_waits_for_follow("paused", os.getpid())
+
+    def test_send_to_done_worker_is_held_until_follow_after_its_prompt(self) -> None:
+        self.assert_send_without_launcher_waits_for_follow("done", os.getpid())
+
+    def test_send_with_dead_launcher_is_held_until_follow_after_its_prompt(self) -> None:
+        self.assert_send_without_launcher_waits_for_follow("running", 99999999)
 
     def test_resident_failed_turn_delivers_one_reply_and_ends_without_repeating_failure(self) -> None:
         self.outcomes = ["failed"]
@@ -9150,7 +9221,7 @@ class SweepTests(unittest.TestCase):
                 if verb == "steer":
                     self.assertEqual(self.worker_client({**attached, "launcher_pid": 0}, verb), ([4002], True))
 
-    def test_message_without_live_launcher_refuses_without_holding_or_starting_work(self) -> None:
+    def test_message_without_live_launcher_is_held_without_contacting_a_server(self) -> None:
         for launcher in (0, 99999999, None):
             with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as directory:
                 record: dict[str, object] = {"thread_id": "thread-1", "status": "running"}
@@ -9160,14 +9231,21 @@ class SweepTests(unittest.TestCase):
                 _ = roster.write_text(json.dumps({"worker": record}))
                 before = roster.read_bytes()
                 arguments = argparse.Namespace(session_dir=directory, to="worker", message="message", message_file="")
-                with patch.object(codex_mesh, "ensure_server") as ensure, patch.object(codex_mesh, "Client") as client, contextlib.redirect_stderr(io.StringIO()) as errors:
-                    self.assertEqual(codex_mesh.command_send(arguments), 2)
-                self.assertIn("no live launcher", errors.getvalue())
-                self.assertIn("relaunch", errors.getvalue())
+                with (patch.object(codex_mesh, "ensure_server") as ensure,
+                      patch.object(codex_mesh, "Client") as client,
+                      contextlib.redirect_stdout(io.StringIO()) as output,
+                      contextlib.redirect_stderr(io.StringIO()) as errors):
+                    self.assertEqual(codex_mesh.command_send(arguments), 0)
+                self.assertEqual(errors.getvalue(), "")
+                self.assertEqual(output.getvalue(),
+                                 "queued for worker; no launcher is attached, so the message waits for its next dispatch\n")
                 ensure.assert_not_called()
                 client.assert_not_called()
                 self.assertEqual(roster.read_bytes(), before)
-                self.assertNotIn("message", (Path(directory) / "worker.pending.json").read_text())
+                pending = cast(codex_mesh.WorkerPendingMessages, json.loads(
+                    (Path(directory) / "worker.pending.json").read_text()))
+                self.assertEqual(pending["thread_id"], "thread-1")
+                self.assertEqual(pending["messages"], ["message"])
 
 
 class SignInChangeTests(unittest.TestCase):

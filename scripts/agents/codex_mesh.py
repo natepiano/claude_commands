@@ -4458,29 +4458,20 @@ def command_send(args: argparse.Namespace) -> int:
         _ = roles.queue_message(design_id, role, _as_str(_attr(args, "source")) or "mesh send", _message_text(args))
         print(f"queued for {target}; holder adds it to the next authorized assignment")
         return 0
-    with _pending_file(session_dir, target) as pending_file:
-        record = _lookup(session_dir, target)
-        if _end_marker_path(session_dir, target).exists():
-            print(f"codex_mesh: {target} is being ended; message not delivered", file=sys.stderr)
-            return 2
-        status = record.get("status", "unknown")
-        if status == CAPACITY_EXHAUSTED:
-            print(
-                f"codex_mesh: {target} is out of retries and has no launcher; a message would start a turn nobody watches (codex_mesh.py end --to {target})",
-                file=sys.stderr,
-            )
-            return 2
-        if _messages_closed(pending_file, record["thread_id"]):
-            print(f"codex_mesh: {target}'s launcher is closing; message not delivered; relaunch the worker", file=sys.stderr)
-            return 2
-        if status not in LAUNCHER_ATTACHED_STATUSES:
-            raise SystemExit(
-                f"codex_mesh: {target} is {status}, not running; read its summary file"
-            )
-        launcher_pid = record.get("launcher_pid")
-        if not isinstance(launcher_pid, int) or launcher_pid <= 0 or not _pid_alive(launcher_pid):
-            print(f"codex_mesh: {target} has no live launcher to read a message; end the worker and relaunch it", file=sys.stderr)
-            return 2
+    if record.get("status") == CAPACITY_EXHAUSTED:
+        print(
+            f"codex_mesh: {target} is out of retries and has no launcher; a message would start a turn nobody watches (codex_mesh.py end --to {target})",
+            file=sys.stderr,
+        )
+        return 2
+    outcome = hold_message(session_dir, target, _message_text(args), without_launcher=True)
+    if isinstance(outcome, WorkerEnded):
+        print(f"codex_mesh: {outcome.reason}; message not delivered", file=sys.stderr)
+        return 2
+    if isinstance(outcome, HeldForNextDispatch):
+        print(f"queued for {target}; no launcher is attached, so the message waits for its next dispatch")
+        return 0
+    if isinstance(outcome, HeldForLauncher):
         home = workers_home()
         # Retiring is enough here. A live launcher keeps its outgoing connection
         # and claims this held message at its next checked turn boundary.
@@ -4488,9 +4479,6 @@ def command_send(args: argparse.Namespace) -> int:
             current = _read_json_object(_session_path(session_dir, SERVER_FILE))
             if current and server_record_home(current) != home:
                 _retire_record(session_dir, current)
-        messages = _pending_for_thread(pending_file, record["thread_id"])
-        messages.append(_message_text(args))
-        _write_pending(pending_file, record["thread_id"], messages)
 
     print(f"queued for {target}")
     return 0
@@ -7171,7 +7159,8 @@ def main(argv: list[str] | None = None) -> int:
     _ = release_follow.add_argument("--claim-pid", type=int, required=True)
     release_follow.set_defaults(handler=command_release_follow)
 
-    send = subparsers.add_parser("send", help="queue a message for a delegate")
+    send = subparsers.add_parser(
+        "send", help="queue a message for a delegate; without a launcher it waits for the next dispatch")
     _ = send.add_argument("--session-dir", required=True)
     _ = send.add_argument("--to", required=True)
     send_body = send.add_mutually_exclusive_group(required=True)
