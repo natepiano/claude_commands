@@ -10,6 +10,7 @@
   "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
+      "Bash(~/.claude/scripts/accounts/hello.sh *)",
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/accounts/refusal_watch.py --assume-refused *)",
       "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py *)",
       "Read(~/.claude/projects/**/tool-results/**)",
