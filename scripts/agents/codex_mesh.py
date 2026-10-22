@@ -4960,6 +4960,13 @@ class CurrentRunServer:
 
 
 @dataclass(frozen=True)
+class HeldDesignServer:
+    """A durable mesh's current server belongs to a role still held for design work."""
+
+    session_dir: Path
+
+
+@dataclass(frozen=True)
 class RetiredRunServer:
     """A run's mesh_retired.json names this server until it becomes idle."""
 
@@ -4985,6 +4992,7 @@ class UnreadServerOwnership:
 
 KnownServerOwnership = (
     CurrentRunServer
+    | HeldDesignServer
     | RetiredRunServer
     | UnownedServerWithLog
     | UnownedServerWithoutLog
@@ -5010,7 +5018,7 @@ class CheckedRunLifecycle:
 
 @dataclass(frozen=True)
 class UncheckedRunLifecycle:
-    """The per-server idle watcher deliberately did not inspect run markers."""
+    """Run-liveness checks do not apply to this owner or this idle-watcher judgment."""
 
 
 RunLifecycle = CheckedRunLifecycle | UncheckedRunLifecycle
@@ -5071,14 +5079,17 @@ def _sweep_verdict(facts: ServerFacts, busy_threads: Callable[[], tuple[str, ...
         return ServerInUse("a worker's launcher is still running: " + ", ".join(facts.live_launchers))
     if facts.age_secs < SERVER_IDLE_SECS:
         return ServerInUse(f"started {facts.age_secs / 60:.0f} min ago")
+    folder_kind = "mesh" if isinstance(facts.ownership, HeldDesignServer) else "run"
     if facts.quiet_secs is not None and facts.quiet_secs < SERVER_IDLE_SECS:
-        return ServerInUse(f"its run folder changed {facts.quiet_secs / 60:.0f} min ago")
+        return ServerInUse(f"its {folder_kind} folder changed {facts.quiet_secs / 60:.0f} min ago")
     if busy := busy_threads():
         return ServerInUse("a conversation is not idle: " + "; ".join(busy))
     if not facts.folder_exists:
-        folder = "its run folder was deleted"
+        folder = f"its {folder_kind} folder was deleted"
     else:
         folder = "no activity file" if facts.quiet_secs is None else f"quiet for {facts.quiet_secs / 3600:.1f} h"
+    if isinstance(facts.ownership, HeldDesignServer):
+        return ServerUnused(f"no client, no launcher, no conversation mid-turn; mesh folder: {folder}")
     return ServerUnused(f"no client, no launcher, no active marker, no conversation mid-turn, {folder}")
 
 
@@ -5897,6 +5908,13 @@ def _server_ownership(
                 or (quiet is not None and quiet < SERVER_IDLE_SECS)
             ):
                 return CurrentRunServer(folder)
+        from scripts.guilds import roles
+        for folder in roles.durable_meshes():
+            if _record_names_server(_read_json_object(folder / SERVER_FILE), pid, port) and any(
+                _as_dict(entry).get("held_design_id")
+                for entry in _read_json_object(folder / ROSTER_FILE).values()
+            ):
+                return HeldDesignServer(folder)
     for folder in folders:
         if _retired_file_names_server(folder / RETIRED_FILE, pid, port):
             return RetiredRunServer(folder)
@@ -6015,10 +6033,12 @@ def _judge(roots: tuple[Path, ...] | None, pid: int, port: int, age: float,
     ownership = _server_ownership(roots, pid, port, stderr)
     folder = None if isinstance(ownership, UnownedServerWithoutLog) else ownership.session_dir
     exists = folder is not None and folder.is_dir()
-    lifecycle: RunLifecycle = UncheckedRunLifecycle() if roots is None or folder is None else CheckedRunLifecycle(
-        _marked_active(roots, folder),
-        _running_roster_workers(folder) if exists else (),
-    )
+    lifecycle: RunLifecycle = UncheckedRunLifecycle()
+    if roots is not None and isinstance(ownership, CurrentRunServer):
+        lifecycle = CheckedRunLifecycle(
+            _marked_active(roots, ownership.session_dir),
+            _running_roster_workers(ownership.session_dir) if exists else (),
+        )
     facts = ServerFacts(
         pid, port, age, clients, ownership, exists, lifecycle,
         live_launchers=_live_launchers(folder) if folder is not None and exists else (),
@@ -6040,7 +6060,7 @@ def _stop_unused(
     launcher to wait and is not created again for the lock."""
     if isinstance(ownership, UnownedServerWithoutLog):
         return _stop_unused_with_lock_held(roots, pid, port)
-    if not isinstance(ownership, (CurrentRunServer, RetiredRunServer, UnownedServerWithLog)):
+    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer, UnownedServerWithLog)):
         return False
     folder = ownership.session_dir
     if not folder.is_dir():
@@ -6067,7 +6087,7 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
     if isinstance(judgment.ownership, UnownedServerWithoutLog):
         return True
     ownership = judgment.ownership
-    if not isinstance(ownership, (CurrentRunServer, RetiredRunServer, UnownedServerWithLog)):
+    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer, UnownedServerWithLog)):
         return False
     folder = ownership.session_dir
     if folder.is_dir():
