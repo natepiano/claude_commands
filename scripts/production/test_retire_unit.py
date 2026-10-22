@@ -16,6 +16,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.guilds import roles  # noqa: E402
+
 import retire_unit
 import unit_lookup
 import unit_move
@@ -129,7 +132,9 @@ class RetireUnitTests(unittest.TestCase):
             return []
 
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(runs),
-                                                       "BUILD_HOLD_DIR": str(holds)}))
+                                                       "BUILD_HOLD_DIR": str(holds),
+                                                       "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
+                                                       "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")}))
         _ = self.enterContext(mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "claims"))
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
@@ -254,6 +259,17 @@ class RetireUnitTests(unittest.TestCase):
         self.assertFalse(self.worktree.exists())
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
         self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+
+    def test_role_cleanup_refusal_keeps_the_unit_row_worktree_and_branch(self) -> None:
+        before = self.doc.read_bytes()
+        with mock.patch.object(roles, "end_holder", side_effect=roles.RoleRefused("designer turn is still running")):
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("held role cleanup", output)
+        self.assertIn("designer turn is still running", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
 
     def test_a_stopped_director_is_found_by_its_newest_interactive_transcript(self) -> None:
         self.marked = None

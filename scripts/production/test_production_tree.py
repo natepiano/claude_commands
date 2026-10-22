@@ -56,7 +56,9 @@ class ProductionTreeTests(unittest.TestCase):
         (state / "child").mkdir(parents=True)
         _ = (state / "child" / "parent").write_text("main\n")
         _ = cast(object, self.enterContext(mock.patch.dict(
-            os.environ, {"ASTRA_ROLES_STATE": str(self.root / "astra-roles")})))
+            os.environ, {"ASTRA_ROLES_STATE": str(self.root / "astra-roles"),
+                         "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
+                         "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")})))
         for patch in (
             mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier),
             mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", state),
