@@ -280,13 +280,12 @@ mid-run, without waiting for a phase to end.
   its turn ends, until <PhaseCleanup/>, and a message resumes it from its
   transcript. So the tester may ask the implementer a question after the
   implementer has reported done, and get an answer rather than silence. **A
-  finished Codex turn refuses `send`, but its thread remains open.** Ask while
-  it works or read its summary. Only the unit director starts its next turn —
-  a later phase, repair, or follow-up — through `implement.sh --to <worker>`;
-  the launcher attempts compaction above
+  finished Codex turn holds `send` for its next turn.** Its thread remains open.
+  Only the unit director starts its next turn — a later phase, repair, or
+  follow-up — through `implement.sh --to <worker>`. That turn receives the held
+  messages after its prompt. The launcher attempts compaction above
   `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
-  presses on after overflow per <LongLivedWorkers/>. A message without the
-  launcher is for questions only.
+  presses on after overflow per <LongLivedWorkers/>.
 - **A codex member has no route to the unit director.** It reaches its peer with
   the calls above and reaches the unit director only through the board, which the
   unit director reads at every progress tick. Anything that cannot wait for the
