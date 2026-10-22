@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -4567,6 +4568,16 @@ def ledger_location(repo: Path) -> LedgerLocation:
 def open_ledger(repo: Path) -> Ledger:
     location = ledger_location(repo)
     return Ledger(location.repo, location.database)
+
+
+@contextmanager
+def refill_lock(repo: Path) -> Generator[None]:
+    """Serialize refill selection for units that share a ledger."""
+    folder = ledger_location(repo).database.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "refill.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 @contextmanager
