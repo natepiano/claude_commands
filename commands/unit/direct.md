@@ -41,7 +41,7 @@ Evidence/time, Change, Result/cost/limit. Keep unsent reports with phase evidenc
 
 In LaunchImplementation, include `config/guilds/designer.md`, the expanded
 designers block and the loaded designers tip text in each Astra designer brief.
-Before dispatch, save the brief with:
+For a designer that `roles.py` does not hold, save the brief before dispatch with:
 `~/.claude/scripts/lib/py ~/.claude/scripts/guilds/astra_work.py brief
 --run-directory <SESSION_DIR> --phase <id> --member <mesh name>
 --document <path> --round <N> --text-file <brief>`.
@@ -71,6 +71,36 @@ or timer. It remains a units guild member under <Guild/>; this section changes
 no other standing plan. An idle head ends each turn with
 `— holding: waiting on the next guild report or daily check-in`.
 </GuildHeadStanding>
+
+<HeldAstraRoles>
+For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
+Astra authors the assigned design. Use one `roles.py` designer and at most one
+reviewer per design, with models resolved from `guild` in `agents.conf`. Open
+once; resume the same instance across rounds, phases and runs. `roles.py` saves
+each headed prompt and reply; do not also use `astra_work.py brief` for that role.
+
+For DelegatedPhaseReservationContract, prepare exact phase files, baseline and
+reservation before dispatch. Bind the designer to those output paths with explicit
+`PhaseBoundDesigner` access; reviews use `ReadOnlyReviewer`. Repository edits use
+patches. Finish a turn and rebind while idle before adding a path or changing scope.
+A stale binding, recovery state, adoption fence or unavailable holder blocks dispatch.
+
+For DualReview and FixDispatch, keep the same reviewer and writer. Save findings,
+responses and short rulings that cite files; update the Work Order for a scope
+change. Busy or unavailable review is not a pass and permits no replacement.
+
+For PhaseCleanup, FinalGate and RunSummary, finish turns, release the reservation,
+then unbind the design. Keep role threads, pending messages and evidence until
+explicit end. Run cleanup must not stop durable meshes. Account moves and holder
+restarts recover the same threads through the role lifecycle; never raw pause or
+silently replace a lost thread. Adoption uses its recorded transfer and destination.
+The existing checkpoint, visual check and gate order still applies.
+For rollback, set `[roles] new_open=false` in `config/guilds.conf`. Finish active
+turns and release servers through the holder lifecycle. Keep placements, fences,
+pending input, prompts, replies and unfinished reservations. Keep adopted ownership
+at its destination unless a reverse transfer proves no destination writer. Restore
+old command text only when it preserves these fences; never replace a thread.
+</HeldAstraRoles>
 
 At startup or restart, a header `**Standing:** style_plan.py` runs
 <StandingPlanRefill/> before choosing a phase; repeat after compaction.

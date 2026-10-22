@@ -1425,28 +1425,6 @@ def _credits_run_out(balance: float, usage: run_out.CreditsUsed, now: datetime) 
     return until.astimezone(user_zone())
 
 
-def _credit_balance_text(report: Report, label: str, now: datetime) -> str:
-    from scripts.whoami import run_out
-
-    value = report.credit_balance
-    if value == "unlimited":
-        return "There is no limit on paid credits."
-    try:
-        balance = float(value or "")
-    except ValueError:
-        return "The credit balance is unknown."
-    if not math.isfinite(balance) or balance < 0:
-        return "The credit balance is unknown."
-    usage = run_out.credits_used(run_out.read_credit_readings(run_out.READINGS_LOG), label,
-                                 since=now - timedelta(hours=1), until=now)
-    if isinstance(usage, (run_out.NoCreditReading, run_out.UsageUnknown)):
-        return f"It has {balance:,.0f} credits left; hourly use is unknown."
-    if usage.used == 0:
-        return f"It has {balance:,.0f} credits left; none were used in the last hour."
-    until = _credits_run_out(balance, usage, now)
-    return f"Its {balance:,.0f} credits last until about {until:%a %Y-%m-%d %H:%M %Z}."
-
-
 def _worker_move_failure_cause(cause: str) -> str:
     """Describe a swap failure without exposing the accounts command's diagnostics."""
     text = cause.lower()
@@ -1469,13 +1447,6 @@ def _work_routing_failure_cause(cause: str) -> str:
     if "longer than" in cause.lower() or "timeout" in cause.lower():
         return "the work-routing update timed out"
     return "the work-routing settings could not be updated"
-
-
-def _queued_credit_choices(label: str) -> dict[str, str]:
-    return {
-        "turn_off": f"Turn off: paid spending stops. Workers stay on {label} and wait for the account move you queued.",
-        "leave_on": f"Leave on: workers spend {label}'s credits until that move runs or the credits run out, then wait.",
-    }
 
 
 @dataclass(frozen=True)
@@ -1528,57 +1499,7 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
                                  if not accounts.codex_destination_uses_credits(chosen, now) else "its own paid credits")
             return ZeroEpisodeNotice(id="quota.codex_workers_moved", values=values)
     if isinstance(credits, agent_accounts.CreditsOn):
-        values["credits"] = _credit_balance_text(report, label, now)
-        values["file"] = note_file.note_name(label)
-        values["machine"] = os.uname().nodename
-        values["credit_action"] = "To stop paid credit use"
-        values["opening"] = f"Codex account {label} is now spending paid credits until its weekly refill on {values['reset']}. {values['credits']}"
-        values["clarification"] = ""
-        off = _zero_destination(label, now, prefer_weekly_room=True) if isinstance(chosen, accounts.PickedAccount) else chosen
-        if isinstance(off, accounts.PickedAccount) and isinstance(chosen, accounts.PickedAccount):
-            values["turn_off"] = (f"Turn off (recommended): no paid spend. Within minutes, new work moves to the other account, {off.label} ({off.weekly_left:g}% of its weekly allowance left)."
-                if not accounts.codex_destination_uses_credits(off, now) else
-                f"Turn off: within minutes, new work spends the other Codex account's ({off.label}) paid credits.")
-            prefix = "Leave on:" if not accounts.codex_destination_uses_credits(off, now) else "Leave on (recommended):"
-            values["leave_on"] = (f"{prefix} keep spending {label}'s paid credits without a limit."
-                if report.credit_balance == "unlimited" else
-                f"{prefix} new work spends {label}'s paid credits first, then {chosen.label}'s."
-                if accounts.codex_destination_uses_credits(chosen, now) else f"{prefix} {label} spends its credits, then work moves to {chosen.label}.")
-            if accounts.codex_destination_uses_credits(off, now):
-                values["credit_action"] = f"Optional: to spend {off.label}'s credits first"
-                values["opening"] = f"Codex account {label} now spends paid credits until its included usage refills {values['reset']}. {values['credits']}"
-                values["turn_off"] = f"Turn off: within minutes, new work spends {off.label}'s paid credits instead."
-                values["leave_on"] = f"Leave on (recommended, no edit needed): new work spends {label}'s credits, then {chosen.label}'s, then falls back to Claude."
-                values["clarification"] = ""
-            elif values["credits"] == "The credit balance is unknown.":
-                values["turn_off"] = (f"Turn off (recommended): paid spending stops. Within minutes, new work moves to the second account, {off.label}, which has {off.weekly_left:g}% of its weekly limit left.")
-                values["leave_on"] = f"Leave on: {label} spends its credits, then new work moves to {chosen.label}."
-            return ZeroEpisodeNotice(id="quota.codex_on_credits", values={key: values[key] for key in
-                ("file", "machine", "credit_action", "opening", "turn_off", "leave_on", "clarification")})
-        if isinstance(off, accounts.NoAccountWithRoom):
-            chosen = off
-        if isinstance(chosen, accounts.NoAccountWithRoom):
-            next_reset = min(reset, chosen.earliest_reset.at) if isinstance(chosen.earliest_reset, accounts.EarliestReset) else reset
-        else:
-            next_reset = reset
-        values["next_reset"] = reset_display(refusals.KnownReset(next_reset))
-        from push_texts import catalog
-        if any(entry.id == "quota.paid_credits" for entry in catalog()):
-            try:
-                balance = float(report.credit_balance or "")
-                credits_left = f"{balance:,.0f}" if math.isfinite(balance) and balance >= 0 else "unknown"
-            except ValueError:
-                credits_left = "unlimited" if report.credit_balance == "unlimited" else "unknown"
-            return ZeroEpisodeNotice(id="quota.paid_credits", values={
-                "sender": "quota_alert", "account": label, "machine": values["machine"], "credits": credits_left,
-                "refill": values["reset"], "next_reset": values["next_reset"],
-            })
-        values["turn_off"] = f"Turn off (recommended, saves paid credits): within minutes, work uses Claude until {values['next_reset']}, the next Codex reset, then returns to Codex if an account has room."
-        values["leave_on"] = ("Leave on: keep spending paid credits without a limit."
-            if report.credit_balance == "unlimited" else
-            "Leave on: spend these credits, then use Claude when they run out.")
-        return ZeroEpisodeNotice(id="quota.codex_on_credits_last", values={key: values[key] for key in
-            ("account", "reset", "credits", "file", "machine", "turn_off", "leave_on")})
+        return _paid_credits_notice(label, report, chosen, reset)
     if isinstance(chosen, accounts.NoAccountWithRoom):
         entries = moves.read_moves()
         closed = {entry["move_id"] for entry in entries if entry["kind"] == "room again"}
@@ -1609,6 +1530,26 @@ def _zero_open_notice(label: str, report: Report, credits: agent_accounts.CodexC
                               + f"at {values['until']}. Current turns finish first.")
     del values["until"]
     return ZeroEpisodeNotice(id="quota.codex_workers_stay", values=values)
+
+
+def _paid_credits_notice(label: str, report: Report,
+                         chosen: accounts.PickedAccount | accounts.NoAccountWithRoom,
+                         reset: datetime) -> ZeroEpisodeNotice:
+    from scripts.accounts import accounts
+
+    next_reset = (min(reset, chosen.earliest_reset.at)
+                  if isinstance(chosen, accounts.NoAccountWithRoom)
+                  and isinstance(chosen.earliest_reset, accounts.EarliestReset) else reset)
+    try:
+        balance = float(report.credit_balance or "")
+        credits_left = f"{balance:,.0f}" if math.isfinite(balance) and balance >= 0 else "unknown"
+    except ValueError:
+        credits_left = "unlimited" if report.credit_balance == "unlimited" else "unknown"
+    return ZeroEpisodeNotice(id="quota.paid_credits", values={
+        "sender": "quota_alert", "account": label, "machine": os.uname().nodename, "credits": credits_left,
+        "refill": reset_display(refusals.KnownReset(reset)),
+        "next_reset": reset_display(refusals.KnownReset(next_reset)),
+    })
 
 
 def _credits_forecast_notice(label: str, report: Report, now: datetime) -> ZeroEpisodeNotice:
@@ -1650,13 +1591,10 @@ def _current_notice(label: str, notice: ZeroEpisodeNotice, *, workers_queued: bo
     if "file" in values:
         values["file"] = note_file.note_name(label)
     if workers_queued:
-        if notice["id"] in ("quota.codex_on_credits", "quota.codex_on_credits_last"):
-            values.update(_queued_credit_choices(label))
-            if "credit_action" in values:
-                values["credit_action"] = "To stop paid credit use"
-            if "clarification" in values:
-                values["clarification"] = ""
-        elif notice["id"] == "quota.codex_credits_forecast":
+        if notice["id"] == "quota.paid_credits":
+            return ZeroEpisodeNotice(id="quota.paid_credits_queued", values={key: values[key] for key in
+                ("sender", "account", "machine", "credits", "refill")})
+        if notice["id"] == "quota.codex_credits_forecast":
             values["destination"] = "When credits run out, workers wait for the account move you queued."
     return ZeroEpisodeNotice(id=notice["id"], values=values)
 
@@ -1745,6 +1683,11 @@ def _codex_zero_alert(config: Config, readings: CodexAlertPassReadings, now: dat
             result = render(changed["id"], **changed["values"])
             log.append(f"quota credits off {label}: {result.body}")
 
+        # Old opening notices used values that the current templates do not accept.
+        if episode["notice"]["id"] not in ("quota.paid_credits", "quota.codex_workers_moved", "quota.codex_workers_stay"):
+            episode["notice"] = _paid_credits_notice(label, report,
+                _zero_destination(label, now, prefer_weekly_room=True, included_only=True),
+                report.weekly_reset or datetime.fromisoformat(episode["weekly_reset"]))
         if episode["phone"] == "due":
             episode["notice"] = _current_notice(label, episode["notice"])
             notice = _current_notice(label, episode["notice"], workers_queued=workers_queued)

@@ -1027,6 +1027,29 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertIn("launcher:", board)
         self.assertIn("done:", board)
 
+    def test_follow_refuses_transferring_and_redirected_roles_before_compaction_or_claim(self) -> None:
+        session = self.start_phase("adoption-fence")
+        initial = self.mesh_launch(session)
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        path = session / "mesh_roster.json"
+        original = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
+        name = next(iter(original))
+        self.open_repair_round(session)
+        for field, value in (("transferring_role", {"adoption_id": "transfer-one", "destination": "/fixture/roles/mesh"}),
+                             ("role_redirect", {"design_id": "lasting-design", "destination": "/fixture/roles/mesh"})):
+            with self.subTest(field=field):
+                roster = {key: dict(entry) for key, entry in original.items()}
+                roster[name].update({field: value, "context_tokens": 999999})
+                _ = path.write_text(json.dumps(roster))
+                before = path.read_bytes()
+                events = session / "mesh_events.txt"
+                previous_events = events.read_bytes() if events.exists() else b""
+                result = self.mesh_launch(session, to=name, kind="fix", resolves_round=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("TransferringRole", result.stderr)
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(events.read_bytes() if events.exists() else b"", previous_events)
+
     def test_follow_up_compacts_above_the_context_threshold_before_claiming(self) -> None:
         session_dir = self.start_phase("compact-above")
         first = self.mesh_launch(session_dir)

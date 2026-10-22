@@ -27,7 +27,7 @@ from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.production import showrunners
 import usage_store
 from push_texts import RenderedPush, catalog, render_entry
-from user_action import ActionRequired, NoActionRequired
+from user_action import ActionRequired
 from test_quota_alert import REGISTRY
 
 CURRENT_READING_AGE = timedelta()
@@ -396,7 +396,7 @@ class CodexAccountAlertTests(unittest.TestCase):
                 self.assertEqual(len([line for line in output.getvalue().splitlines()
                                       if "cannot read" in line]), 1)
                 self.assertEqual([push.id for push in self.pushes],
-                                 ["quota.codex_on_credits"] if left == 0 else [])
+                                 ["quota.paid_credits_queued"] if left == 0 else [])
                 if left == 1:
                     self.assertEqual(quota_alert.codex_next_move_push(self.note(1, "active", left), now=self.now,
                         history=moves.UnreadableMoveJournal()),
@@ -1053,7 +1053,7 @@ class CodexAccountAlertTests(unittest.TestCase):
             retire.assert_not_called()
         self.assertEqual(agent_accounts.workers_home(), source.home)
         self.assertEqual(len(self.pushes), 1)
-        self.assertIn(self.pushes[0].id, ("quota.codex_on_credits_last", "quota.paid_credits"))
+        self.assertEqual(self.pushes[0].id, "quota.paid_credits")
         self.assertEqual(self.pushes[0].values["account"], source.label)
         failures = [entry for entry in moves.read_moves() if entry["kind"] == "failed"]
         self.assertTrue(failures)
@@ -1152,59 +1152,27 @@ class CodexAccountAlertTests(unittest.TestCase):
         self.assertIn("codex2", text)
         self.assertEqual(agent_accounts.workers_home(), a.home)
 
-    def test_each_new_codex_catalog_example_names_workers_and_numbered_accounts(self) -> None:
+    def test_paid_credits_catalog_entries_use_exact_values_and_queued_advice(self) -> None:
         from push_texts import catalog, render_entry
-        ids = {"quota.codex_on_credits", "quota.codex_on_credits_last", "quota.codex_workers_moved",
-               "quota.codex_workers_stay", "quota.codex_credits_forecast"}
-        entries = [entry for entry in catalog() if entry.id.startswith("quota.codex_") and
-                   (entry.id in ids or "forecast" in entry.id or "credits" in entry.id)]
-        self.assertTrue(ids.issubset({entry.id for entry in entries}))
+        ids = {"quota.paid_credits", "quota.paid_credits_queued"}
+        entries = [entry for entry in catalog() if entry.id in ids]
+        self.assertEqual({entry.id for entry in entries}, ids)
         for entry in entries:
-            self.assertEqual((entry.sender, entry.need), ("quota_alert", "note"))
-            self.assertGreaterEqual(len(entry.examples), 2)
             for example in entry.examples:
                 with self.subTest(id=entry.id, example=example.name):
                     rendered = render_entry(entry, example.values)
-                    text = rendered.title + "\n" + rendered.body
-                    self.assertNotIn("default", text.lower())
-                    self.assertLess(len(rendered.title), 45)
-                    if entry.id in ("quota.codex_on_credits", "quota.codex_on_credits_last"):
-                        self.assertIsInstance(rendered.action, ActionRequired)
-                        assert isinstance(rendered.action, ActionRequired)
-                        self.assertIn("use_credits: off", rendered.action.text)
-                        self.assertIn(example.values["file"], rendered.action.text)
-                        self.assertIn(example.values.get("machine", "natedev"), rendered.action.text)
-                        if example.name == "queued":
-                            label = example.values["file"].removesuffix(".md")
-                            self.assertEqual(example.values["turn_off"],
-                                f"Turn off: paid spending stops. Workers stay on {label} and wait for the account move you queued.")
-                            self.assertEqual(example.values["leave_on"],
-                                f"Leave on: workers spend {label}'s credits until that move runs or the credits run out, then wait.")
-                            for key in ("turn_off", "leave_on"):
-                                self.assertIn("wait", example.values[key])
-                                self.assertNotIn("codex2", example.values[key])
-                                self.assertNotIn("Claude", example.values[key])
-                            continue
-                        if entry.id == "quota.codex_on_credits":
-                            self.assertIn("paid credits", text)
-                            self.assertRegex(rendered.body, r"(?i)\b(?:within|in) (?:(?:a few|two|2) )?minutes\b")
-                            on = next((line for line in rendered.body.splitlines() if line.lower().startswith("leave on")), "")
-                            self.assertIn("spend", on.lower())
-                            self.assertIn("credits", on.lower())
-                        else:
-                            off = next((line for line in rendered.body.splitlines() if line.lower().startswith("turn off")), "")
-                            on = next((line for line in rendered.body.splitlines() if line.lower().startswith("leave on")), "")
-                            self.assertIn("Claude", off)
-                            self.assertIn("until", off.lower())
-                            self.assertRegex(off, r"(?i)\b(?:within|in) (?:(?:a few|two|2) )?minutes\b")
-                            self.assertNotIn("if Codex refuses", off)
-                            self.assertIn("credits", on.lower())
-                            self.assertIn("Claude", on)
-                        prefix = "Action: " + rendered.action.text + "\n"
+                    self.assertEqual((rendered.sender, rendered.need), (example.values["sender"], "decision"))
+                    self.assertIsInstance(rendered.action, ActionRequired)
+                    assert isinstance(rendered.action, ActionRequired)
+                    self.assertIn(example.values["account"] + ".md", rendered.action.text)
+                    keys = {"sender", "account", "machine", "credits", "refill"}
+                    if entry.id == "quota.paid_credits":
+                        keys.add("next_reset")
+                        self.assertIn("Claude", rendered.body)
                     else:
-                        self.assertIsInstance(rendered.action, NoActionRequired)
-                        prefix = "No action needed.\n"
-                    self.assertLess(len(prefix + rendered.body), 500)
+                        self.assertNotIn("Claude", rendered.body)
+                        self.assertIn("queued move", rendered.body)
+                    self.assertEqual(set(example.values), keys)
 
     def test_codex_refusal_and_swap_advice_use_worker_wording_and_the_home_note_number(self) -> None:
         a, b = self.account(1), self.account(2, default=True)

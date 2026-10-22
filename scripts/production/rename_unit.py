@@ -501,6 +501,11 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
+    from scripts.guilds import roles
+    try:
+        roles.rename_holder(rename.slug, rename.old, rename.new, rename.old_worktree, rename.new_worktree)
+    except (OSError, ValueError, SystemExit) as error:
+        raise RenameRefused(str(error)) from error
     if _is_style(rename):
         try:
             with style_ledger.open_ledger(_style_repository(rename)) as ledger:
@@ -851,6 +856,8 @@ def _state_failures(rename: UnitRename) -> list[str]:
                 failures.append(f"style ledger: sync wait still names {rename.old}")
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(rename.slug, rename.old))
+    from scripts.guilds import roles
+    failures.extend(roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures
 
 

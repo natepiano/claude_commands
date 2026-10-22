@@ -2242,3 +2242,31 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:**
 - Pool review and three closure rounds: a swap loop between two 0% accounts, room that appeared later, credits turned on during a queued wait, a paid-only live reading at swap time, and the template's `sender` value.
+
+### Phase 84 — One paid-credits alert, with its own text for a queued move  · status: done
+
+**Depends on:** Phase 83
+
+#### Work Order
+
+**Goal:** the user gets one paid-credits alert, `quota.paid_credits`, and `quota.paid_credits_queued` while a workers move is queued. The old ids `quota.codex_on_credits` and `quota.codex_on_credits_last` are never sent again, so messaging can remove them from the catalog.
+
+**Constraints from prior phases:** Phase 83 sends `quota.paid_credits` from `_zero_open_notice` (`scripts/whoami/quota_alert.py`) only when no account has included room and the catalog holds that id; else it falls back to `quota.codex_on_credits_last`. With credits on and an account with room that workers did not move to (a queued workers entry, or an open Claude fallback), it still sends `quota.codex_on_credits`. The queued advice is an overlay applied at send time (`_current_notice(..., workers_queued=...)`, `_queued_credit_choices`) and never saved; retries keep the saved empty-queue facts. Today `quota.paid_credits` is also sent while a move is queued, and its text ("then moves to Claude", "Turn off: work moves to Claude until …") is wrong there: under a queued workers entry, workers wait for the move and never go to Claude. Messaging owns the texts (`scripts/notify/push_catalog.py`); `quota.paid_credits_queued` lands on origin/build-followups from messaging-unit before this phase dispatches. Its values are `account`, `machine`, `credits`, `refill`, with `sender` from `--from quota_alert`, like `quota.paid_credits`; read both entries in the catalog and match their values exactly.
+
+**Spec:**
+1. With credits on and no move made, the episode notice is always `quota.paid_credits` (values as in Phase 83: `sender`, `account`, `machine`, `credits`, `refill`, `next_reset`). `next_reset` is the earliest known Codex reset, as now. Remove the catalog-presence check.
+2. At send time, while a workers entry is queued, `_current_notice` renders a saved `quota.paid_credits` as `quota.paid_credits_queued` with that template's values only. The saved notice stays `quota.paid_credits`; a retry after the queue empties sends `quota.paid_credits`. This holds for the first send, the log line, the phone push and every retry.
+3. Remove `quota.codex_on_credits` and `quota.codex_on_credits_last` from `quota_alert.py`, and every helper and value only they used (`_queued_credit_choices` and the `turn_off`, `leave_on`, `credit_action`, `opening`, `clarification` texts), keeping the `quota.codex_credits_forecast` queued overlay.
+4. A state file saved before this phase can hold an open episode with an old id. Its next send is rebuilt as `quota.paid_credits` (or `_queued`) from the episode's account and the current reading; it never sends an old id and never fails to load.
+5. Docs: `docs/quota_alerts.md` names the two ids and when each goes; correct line 205 of `docs/as-built/message-clarity.md` (the old ids are no longer sent).
+
+**Files:**
+- `scripts/whoami/quota_alert.py`
+- `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py` — tests stop naming the old ids. New tests: credits on with an unmoved room account sends `quota.paid_credits`; a queued entry renders `quota.paid_credits_queued` and a retry after the queue empties sends `quota.paid_credits`; an old-id saved episode sends `quota.paid_credits`. Render each against the real catalog.
+- `docs/quota_alerts.md`, `docs/as-built/message-clarity.md` (messaging's doc; one line).
+
+**Workers:** one impl worker; nothing splits.
+
+**Verification:** from the repo root, `python3 -m unittest scripts.whoami.test_quota_alert scripts.whoami.test_codex_alert_accounts`, then basedpyright on the changed Python files (0 errors, 0 warnings). Tests use a scratch HOME only: never the live state, usage store, `~/.local/state/accounts` or a real send.
+
+**Acceptance gate:** `grep -rn "codex_on_credits" scripts/whoami` finds nothing; the gate suites pass; messaging-unit is told the old ids are unused.
