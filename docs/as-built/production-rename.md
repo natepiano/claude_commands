@@ -93,7 +93,7 @@ unfinished prior rename journal for the old slug.
 | 1 | Add or extend Formerly as the first bullet of Production Context, write the new doc, point CHECK at it, and `git mv` the doc. |
 | 2 | Rewrite unit-plan Production headers (both header forms) and their production-doc references; add a header where a plan has none. |
 | 3 | Rename `showrunner-<old>` to `showrunner-<new>` and keep the updated CHECK. |
-| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents. |
+| 4 | Move `footers-off/<slug>`, `review-paused/<slug>.json`, `outstanding/<slug>.json`, then each entry of `<slug>/` into the new directory; rewrite matching `*/parent` contents; each guild design the showrunner holds takes `ShowrunnerHolder(<new>)` (`roles.move_holder`). |
 | 5 | Move each Units row's stall-watch file from `sha256(old\0unit).json` to `sha256(new\0unit).json`. |
 | 6 | Move the production's review-pool directory, including leases. |
 | 7 | Create and switch to the new merge branch at the saved tip, update Merge branch, commit documents and push with upstream. |
@@ -131,7 +131,7 @@ exists, must stay at the recorded tip before each later change.
 | 0 | Saved old and new branch names, worktree paths and tips. |
 | 1 | Created `<new>-<stem>` at the old tip and pushed it. |
 | 2 | Ran `git worktree move`, `git worktree repair` and switched the moved worktree to its new branch. |
-| 3 | Moved account project directories and copied trust entries. |
+| 3 | Moved account project directories and copied trust entries; each guild design the unit holds took `UnitHolder(<new>, <unit>)` and the new worktree paths (`roles.move_holder`). |
 | 4 | Committed the Units row's Worktree and Branch cells and pushed the merge branch. |
 | 5 | Verified the new remote tip and deleted the old remote and local unit branch. |
 
