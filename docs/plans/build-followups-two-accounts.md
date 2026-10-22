@@ -2234,7 +2234,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A refusal clears on a fresh reading taken after it that shows usage left in a new window: reset unknown, earlier or later than the refused reset. A reading with the same reset (rounding, lag) keeps it (`refusals.resolved`).
 - A weekly window with usage left and no reset is room (`codex_can_work`, `codex_destination_uses_credits`).
 - At 0% with credits on, workers move silently to a Codex account with included usage left (`_zero_open_notice`, `accounts.swap(..., included_only=True)` checks the live reading too). Each pass of an open episode looks again, with the current use_credits setting. Queued moves and open Claude fallbacks keep control. An account with only paid credits is never a credits-on destination, so two exhausted accounts never swap.
-- With no account with included room, workers spend credits and the user gets `quota.paid_credits` once (`send.py --text-id quota.paid_credits --from quota_alert --value sender/account/machine/credits/refill/next_reset`). The old ids `quota.codex_on_credits(_last)` remain only as a fallback.
+- With no account with included room, workers spend credits and the user gets `quota.paid_credits` once (`send.py --text-id quota.paid_credits --from quota_alert --value sender/account/machine/credits/refill/next_reset`). Phase 84 removed the old ids `quota.codex_on_credits(_last)`.
 - The user's rule (2026-10-21) replaces design C37.
 
 **Files:**
@@ -2242,3 +2242,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:**
 - Pool review and three closure rounds: a swap loop between two 0% accounts, room that appeared later, credits turned on during a queued wait, a paid-only live reading at swap time, and the template's `sender` value.
+
+### Phase 84 — One paid-credits alert, with its own text for a queued move  · status: done
+
+#### As-built
+
+- With credits on and no move made, the opening notice is always `quota.paid_credits` (`_paid_credits_notice`: `sender`, `account`, `machine`, `credits`, `refill`, `next_reset`). The catalog-presence fallback is gone.
+- While a workers entry is queued, `_current_notice` renders it as `quota.paid_credits_queued` (`sender`, `account`, `machine`, `credits`, `refill`) for the first send, the log line, the phone push and every retry. The saved notice stays `quota.paid_credits`, so a retry after the queue empties sends the ordinary text.
+- `quota.codex_on_credits` and `quota.codex_on_credits_last` are never sent. An open episode saved with an old id is rebuilt as `quota.paid_credits` from the current reading, with the same pick as a fresh opening (`prefer_weekly_room=True, included_only=True`).
+- messaging-unit owns both templates and removes the old ids from the catalog.
+
+**Files:**
+- `scripts/whoami/quota_alert.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_codex_alert_accounts.py`; `docs/quota_alerts.md`, `docs/as-built/message-clarity.md`.
+
+**Gotchas:**
+- One repair round: the old-id rebuild first used the default pick, so a paid-only spare hid its earlier reset.
+- When an included-room account exists but an open Claude fallback holds the work, `next_reset` is the source reset (as Phase 83).
