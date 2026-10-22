@@ -35,6 +35,30 @@ AUTO_DENY_PROMPT = (" Bash command\n\n   sed -n '5,$p' /tmp/saved.txt\n   Read l
                     + " ⚠ Claude Code will automatically deny this request in 0:41, to avoid blocking progress on an"
                     + " unattended session.\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
 
+# Claude Code 2.1.296 shows the description first, then the command, then the warning, each wrapped to the pane.
+SAVED = "/home/natepiano/.claude1/projects/-home-natepiano-rust-cargo-liner-style-types/3d951fc8/tool-results"
+OUTSIDE_PROMPT = (" Bash command\n\n   Write the 212 enrolled state; confirm the prompt names\n   the worktree\n"
+                  + "   printf '{\"kind\":\"enrolled\"}' > /tmp/claude/unit/state.json; rm -f\n"
+                  + f"   {SAVED}/b1e4yc8b9.txt\n\n"
+                  + "   rm -f deletes a path that resolves to\n"
+                  + f"   {SAVED.replace('.claude1', '.claude')}/b1e4yc8b9.txt, which is outside the\n"
+                  + "   allowed working directories.\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
+DELETE_CALL = {"command": f"rm -f {SAVED}/b1e4yc8b9.txt",
+               "description": "Write the 212 enrolled state; confirm the prompt names the worktree"}
+
+DELETE_REQUEST = "delete its saved tool output b1e4yc8b9.txt, which is outside its allowed folders"
+
+
+def tool_call(name: str, arguments: dict[str, str], at: float, call_id: str = "toolu_1") -> str:
+    """A transcript's assistant entry that makes one tool call, as Claude Code writes it."""
+    stamp = datetime.fromtimestamp(at, ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
+    return json.dumps({"type": "assistant", "timestamp": stamp, "message": {"content": [
+        {"type": "tool_use", "id": call_id, "name": name, "input": arguments}]}}) + "\n"
+
+
+def tool_result(call_id: str = "toolu_1") -> str:
+    return json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": call_id}]}}) + "\n"
+
 
 def executable(path: Path, source: str) -> None:
     _ = path.write_text(source)
@@ -415,6 +439,72 @@ raise SystemExit(1 if record['to'] in fail else 0)
         # The banner quoted in the transcript above a prompt is not the prompt's own banner.
         quoted = " The push said ⚠ Claude Code will automatically deny this request in 0:41.\n\n" + EDIT_PROMPT
         self.assertFalse(stall_watch.auto_denied(quoted))
+
+    def test_the_request_comes_from_the_pending_tool_call_in_the_transcript(self) -> None:
+        import stall_watch
+        call = stall_watch.PendingTool("toolu_1", "Bash", dict(DELETE_CALL), START)
+        self.assertEqual(stall_watch.prompt_request(BASH_PROMPT, call),
+                         "run a shell command to write the 212 enrolled state and confirm the prompt names the worktree")
+        # The warning on screen names the file the prompt is for: the request is what the command does to it.
+        self.assertEqual(stall_watch.prompt_request(OUTSIDE_PROMPT, call),
+                         DELETE_REQUEST)
+        reading = stall_watch.PendingTool("toolu_1", "Bash", {"command": f"x=1 /bin/cat {SAVED}/b1e4yc8b9.txt"}, START)
+        self.assertEqual(stall_watch.prompt_request(OUTSIDE_PROMPT, reading),
+                         DELETE_REQUEST.replace("delete", "use"))
+        # A command without a description is named by its program and its target.
+        bare = stall_watch.PendingTool("toolu_1", "Bash", {"command": DELETE_CALL["command"]}, START)
+        self.assertEqual(stall_watch.prompt_request("", bare), "run the rm command on b1e4yc8b9.txt")
+        edit = stall_watch.PendingTool("toolu_1", "Edit", {"file_path": "/home/natepiano/rust/x/src/panes.py"}, START)
+        self.assertEqual(stall_watch.prompt_request("", edit), "edit panes.py")
+        # A tool the transcript cannot word falls back to the prompt on screen.
+        other = stall_watch.PendingTool("toolu_1", "WebFetch", {"url": "https://example.com"}, START)
+        self.assertEqual(stall_watch.prompt_request(EDIT_PROMPT, other), "edit panes.py")
+
+    def test_a_long_description_is_never_cut(self) -> None:
+        import stall_watch
+        description = ("Read the saved board output, find every reservation the run still holds for phase 212, "
+                       + "and write each one with its phase, its unit and the time it was made to the run's state "
+                       + "file so the next phase starts from a known list")
+        call = stall_watch.PendingTool("toolu_1", "Bash", {"command": "jq . /tmp/board.json", "description": description},
+                                       START)
+        request = stall_watch.prompt_request(BASH_PROMPT, call)
+        self.assertGreater(len(request), 200)
+        self.assertEqual(request, f"run a shell command to {description[:1].lower()}{description[1:]}")
+
+    def test_a_wrapped_prompt_with_the_outside_warning_reads_as_a_whole_sentence(self) -> None:
+        import stall_watch
+        self.assertEqual(stall_watch.prompt_request(OUTSIDE_PROMPT),
+                         DELETE_REQUEST)
+        # Without the warning, the wrapped description is the request, joined into one sentence.
+        unwarned = OUTSIDE_PROMPT[:OUTSIDE_PROMPT.index("\n\n   rm -f deletes")] + "\n\n Do you want to proceed?\n"
+        self.assertEqual(stall_watch.prompt_request(unwarned),
+                         "run a shell command to write the 212 enrolled state and confirm the prompt names the worktree")
+
+    def test_the_wait_starts_at_the_pending_tool_call_before_herdr_reports_blocked(self) -> None:
+        transcript = self.projects / "project" / "sid-unit-one.jsonl"
+        made = START - 3 * 3600
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, made))
+        self.panes["unit-one"]["agent_status"] = "blocked"
+        self.panes["unit-one"]["pane"] = OUTSIDE_PROMPT
+        # herdr first reports the pane blocked three hours after the call: the alert goes at once.
+        self.assertEqual(self.tick(START).returncode, 0)
+        alerts = self.sent()
+        self.assertEqual([item["to"] for item in alerts], ["user"])
+        values = cast(dict[str, dict[str, str]], json.loads(self.send_log.read_text().splitlines()[-1]))["values"]
+        self.assertEqual(values["since"], "09:00 PDT")
+        self.assertIn("b1e4yc8b9.txt", values["request"])
+        # The same prompt gets no second alert.
+        self.assertEqual(self.tick(START + 60).returncode, 0)
+        self.assertEqual(self.tick(START + 900).returncode, 0)
+        self.assertEqual(len(self.sent()), 1)
+        # The call is answered and the next call waits at a new prompt, with herdr blocked the whole time.
+        _ = transcript.write_text(tool_call("Bash", DELETE_CALL, made) + tool_result()
+                                  + tool_call("Bash", DELETE_CALL, START + 950, "toolu_2"))
+        self.assertEqual(self.tick(START + 960).returncode, 0)
+        self.assertEqual(len(self.sent()), 1)
+        self.assertEqual(self.tick(START + 1020).returncode, 0)
+        values = cast(dict[str, dict[str, str]], json.loads(self.send_log.read_text().splitlines()[-1]))["values"]
+        self.assertEqual((len(self.sent()), values["since"]), (2, "12:15 PDT"))
 
     def test_blocked_turn_end_waits_for_a_new_unblocked_status(self) -> None:
         self.configure({"showrunner": ["unit-one"]}, stall_minutes=10)

@@ -1436,6 +1436,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             _ = send.parse(["--help"])
         self.assertIn("auto_mode.refused: auto mode refused a command and the session waits for the user.", output.getvalue())
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
+        self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
         self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
 
     def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
@@ -1521,6 +1522,30 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 _ = local_options(self.paid_credits_arguments())
             self.assertIn("needs a sender", errors.getvalue())
 
+    def test_paid_credits_queued_template_fills_its_sender_as_the_paid_credits_one_does(self) -> None:
+        values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 AST"}
+        arguments = ["--to", "user", "--text-id", "quota.paid_credits_queued",
+                     *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options([*arguments, "--value", "sender=quota_alert"])
+        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.need, "decision")
+        self.assertEqual(options.action, ActionRequired(
+            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+        self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "quota.paid_credits_queued")
+        self.assertIn("sender=natedev", command)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
+            self.assertEqual(local_options([*arguments, "--from", "quota_alert"]).summary,
+                             "quota_alert: codex2 now uses paid credits")
+            with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = local_options(arguments)
+            self.assertIn("quota.paid_credits_queued needs a sender", errors.getvalue())
+
     def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
         self.writer_session()
         for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
@@ -1533,6 +1558,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(code, 4)
             self.assertTrue(output.getvalue().startswith("HELD: not sent: this push reports paid credit use."))
             self.assertIn("--text-id quota.paid_credits --value account=<account>", output.getvalue())
+            self.assertIn("When a workers move is queued, send quota.paid_credits_queued:", output.getvalue())
+            self.assertIn("--text-id quota.paid_credits_queued --value account=<account>", output.getvalue())
             self.assertFalse(self.failure_marker().exists())
             self.assertEqual(self.log()[-1]["outcome"], "held")
         # The hold claims no repeat window, and registered pushes about credits are not held.

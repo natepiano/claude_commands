@@ -128,6 +128,12 @@ def retry_on_change[T](attempt: Callable[[], T]) -> T:
 
 
 @dataclass(frozen=True)
+class UnitRenamed:
+    tickets: int
+    waits: int
+
+
+@dataclass(frozen=True)
 class SyncWait:
     unit: str
     since: str
@@ -1693,8 +1699,6 @@ class Ledger:
         proposal: str = "", cells: tuple[tuple[str, str], ...] = (),
         finding_ids: tuple[str, ...] = (),
     ) -> None:
-        if not re.fullmatch(re.escape(unit) + r"-\d+", id):
-            raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
         if kind == "listed" and (not rule or rule not in rules or rule.endswith("#uncovered")):
             raise LedgerError(f"{id}: listed ticket requires its canonical rule in rules")
         if kind != "listed" and rule:
@@ -1720,6 +1724,8 @@ class Ledger:
                 if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"], previous["finding_ids"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells], list(finding_ids)):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return True
+            if not re.fullmatch(re.escape(unit) + r"-\d+", id):
+                raise LedgerError(f"{id}: ticket id must be {unit}-<n>")
             if kind == "proposal":
                 findings = tuple(self._held(finding_id) for finding_id in finding_ids)
                 if not proposal or not findings:
@@ -1799,9 +1805,10 @@ class Ledger:
 
     def next_ticket_id(self, unit: str) -> str:
         rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT id FROM tickets WHERE unit=?", (unit,),
+            "SELECT id FROM tickets WHERE substr(id,1,?)=?", (len(unit) + 1, unit + "-"),
         ).fetchall())
-        highest = max((int(row[0].removeprefix(unit + "-")) for row in rows), default=0)
+        highest = max((int(row[0][len(unit) + 1:]) for row in rows
+                       if re.fullmatch(re.escape(unit) + r"-\d+", row[0])), default=0)
         return f"{unit}-{highest + 1}"
 
     def unjudged_ticket_cells(self, id: str) -> tuple[UnjudgedTicketCell, ...]:
@@ -2033,6 +2040,32 @@ class Ledger:
         if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
             raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         return self._ticket_transition(id, "merged")
+
+    def rename_unit(self, old: str, new: str) -> UnitRenamed:
+        family = rule_catalog.style_family(old)
+        if isinstance(family, rule_catalog.NotStyleUnit) or family != rule_catalog.style_family(new):
+            raise LedgerError(f"{old} -> {new}: units must name the same style family")
+        if old == new:
+            return UnitRenamed(0, 0)
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            source = cast(tuple[int, int], self._connection.execute(
+                "SELECT (SELECT count(*) FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed')), "
+                + "(SELECT count(*) FROM sync_waits WHERE unit=?)", (old, old),
+            ).fetchone())
+            if not any(source):
+                return UnitRenamed(0, 0)
+            target = cast(tuple[int, int], self._connection.execute(
+                "SELECT EXISTS(SELECT 1 FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed')), "
+                + "EXISTS(SELECT 1 FROM sync_waits WHERE unit=?)", (new, new),
+            ).fetchone())
+            if any(target):
+                raise LedgerError(f"{new}: target unit already owns a current ticket or sync wait")
+            _ = self._connection.execute(
+                "UPDATE tickets SET unit=? WHERE unit=? AND state IN ('queued','assigned','checkpointed')", (new, old),
+            )
+            _ = self._connection.execute("UPDATE sync_waits SET unit=? WHERE unit=?", (new, old))
+            return UnitRenamed(*source)
 
     def wait_for_sync(self, unit: str) -> None:
         with self._connection:
@@ -4574,6 +4607,7 @@ class LedgerArguments(argparse.Namespace):
     action: str = ""
     id: str = ""
     unit: str = ""
+    from_unit: str = ""
     branch: str = ""
     kind: str = ""
     family: str = ""
@@ -4702,6 +4736,7 @@ def main() -> None:
     for command in (record, candidate, lint, sync, status, summary, reconcile):
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
+        ("unit", ("rename",)),
         ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open", "yield")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
@@ -4713,7 +4748,10 @@ def main() -> None:
         for action in actions:
             command = children.add_parser(action)
             _ = command.add_argument("--repo", default=argparse.SUPPRESS)
-            if name == "ticket":
+            if name == "unit":
+                _ = command.add_argument("--from", dest="from_unit", required=True)
+                _ = command.add_argument("--to", required=True)
+            elif name == "ticket":
                 if action == "open":
                     _ = command.add_argument("--unit", required=True)
                 else:
@@ -4780,7 +4818,10 @@ def main() -> None:
             parser.error("held built --by requires a name")
     try:
         with open_ledger(Path(args.repo)) as ledger:
-            if args.command == "set-tip":
+            if args.command == "unit":
+                renamed = ledger.rename_unit(args.from_unit, args.to)
+                print(f"moved {renamed.tickets} tickets and {renamed.waits} sync waits")
+            elif args.command == "set-tip":
                 ledger.set_tip(args.tip, args.style_branch)
             elif args.command == "record":
                 ledger.record(args.rule, args.path, args.commit, args.rule_blob, args.verdict, args.detail, args.ticket, args.worker,

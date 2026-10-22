@@ -23,12 +23,14 @@ it joins; a tier A or E rule, local or global, has no family.
 
 | Unit | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
-| `names-unit` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
-| `values-unit` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
-| `types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
-| `modules-unit` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
+| `<style slug>-names-unit` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
+| `<style slug>-values-unit` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
+| `<style slug>-types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
+| `<style slug>-modules-unit` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
 
-Every partial B rule also has a C read in its own family.
+A unit id is `<style slug>-<family>-unit`, where the style slug is `<repo>-style`.
+Old `<family>-unit` ids remain valid. Every partial B rule also has a C read
+in its own family.
 
 ## Ticket queue
 
@@ -91,7 +93,7 @@ The gate and `ticket checkpoint` refuse any ticket with owned cells unjudged and
 Refill only the unit worktree's own plan copy:
 
 ```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <checkout>
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/<Plan cell> --repo <checkout>
 ~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py queue --repo <checkout> [--unit <unit>]
 ```
 
@@ -155,6 +157,8 @@ keeps a dropped ticket's abandoned commits reachable.
 ## Pilot scope
 
 Create a restricted pilot with repeated `add_style.py --pilot <unit>[=<package>,...]`.
+The selector accepts a family (`names`), its old id (`names-unit`) or its full
+id (`cargo-liner-style-names-unit`). `--check` prints full unit ids.
 Only named units get Units rows; all four standing plans are written. A unit
 without a scope covers every crate. Package names map to workspace member
 directories through `rules.workspace_members`.
@@ -163,7 +167,9 @@ The plan's Delegation Context carries `- **Pilot scope:** cargo-handler, cargo-p
 below its Family snapshot. Before first launch, edit the showrunner copy;
 an interrupted bootstrap rewrites only unlaunched units' rows and scope lines.
 After launch, only the unit's own copy counts:
-`<main checkout parent>/<slug>-<family>/docs/style-production/units/<family>-unit.md`.
+`<main checkout parent>/<style slug>-<family>/docs/style-production/units/<style slug>-<family>-unit.md`.
+Read the plan path from the Units row's Plan cell relative to that worktree;
+a unit rename keeps its existing plan filename.
 `next-phase` honors the `--plan` copy it receives for coverage and approved
 proposals. An out-of-scope approved proposal stays approved and unassigned;
 coverage selection proceeds.

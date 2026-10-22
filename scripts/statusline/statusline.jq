@@ -48,7 +48,7 @@ def color($config; $key):
       "bright-green": 92, "bright-yellow": 93, "bright-blue": 94,
       "bright-magenta": 95, "bright-cyan": 96, "bright-white": 97,
       orange: "38;5;208", purple: "38;5;141", pink: "38;5;211",
-      teal: "38;5;30", brown: "38;5;137"}
+      teal: "38;5;30", brown: "38;5;137", mauve: "38;5;139"}
      [($config[$key] // "")]) as $code
   | if $code == null then $text else "\u001b[\($code)m\($text)\u001b[0m" end;
 

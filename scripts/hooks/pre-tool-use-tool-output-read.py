@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Refuse a sed or awk read of saved tool output that would wait on a permission prompt.
+"""Refuse a sed or awk read, or a change or copy, of saved tool output that would wait on a permission prompt.
 
 A session's large tool results are saved under `~/.claude*/projects/**/tool-results/`.
 Claude Code asks before it runs `awk`, or a sed script with a `$` or `/re/` address, because
 such scripts can also run commands or write files. That prompt waits on the user. The Read
 tool, `grep -n`, `tail -n +N`, `head -N | tail -M` and `sed -n 'N,Mp'` read the same lines
-with no prompt (probed 2026-10-18), so this hook refuses the call and names them. A command
-this hook cannot split is allowed.
+with no prompt (probed 2026-10-18), so this hook refuses the call and names them.
+
+`rm`, `cp`, `mv` and `tee` with a saved-output path, and a `>` redirect into one, also ask, and
+units have waited hours on them (2026-10-21). Nothing needs deleting, so this hook refuses them
+and names `cat <file> > /tmp/claude/<name>` to keep a copy. A command this hook cannot split is
+allowed.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ TOOL_OUTPUT = re.compile(r"\.claude\d*/projects/\S*tool-results/")
 LINE_PRINT = re.compile(r"\d+(,\d+)?p")
 SEPARATORS = frozenset(("|", "||", "&&", ";", "&", "|&", "(", ")", "\n"))
 AWK = frozenset(("awk", "gawk", "mawk", "nawk"))
+WRITERS = frozenset(("rm", "cp", "mv", "tee"))
 
 
 class BashInput(TypedDict, total=False):
@@ -96,6 +101,25 @@ def asks_permission(words: list[str]) -> str | None:
     return None
 
 
+def changes_output(words: list[str]) -> str | None:
+    """The program or redirect when this simple command changes or copies saved tool output, else None."""
+    program = words[0].rsplit("/", 1)[-1]
+    if program in WRITERS and any(TOOL_OUTPUT.search(word) for word in words[1:]):
+        return program
+    for operator, target in zip(words, words[1:]):
+        if ">" in operator and set(operator) <= set("&>|") and TOOL_OUTPUT.search(target):
+            return operator
+    return None
+
+
+def change_refusal(program: str) -> str:
+    return (
+        f"Refused: this {program} on saved tool output asks for permission and waits on the user.\n"
+        + "Leave saved output alone: nothing needs deleting. "
+        + "To keep a copy, use `cat <file> > /tmp/claude/<name>`."
+    )
+
+
 def refusal(program: str) -> str:
     return (
         f"Refused: this {program} read of saved tool output asks for permission and waits on the user.\n"
@@ -111,16 +135,20 @@ def main() -> None:
         return
     if command is None or not TOOL_OUTPUT.search(command):
         return
-    if "sed" not in command and "awk" not in command:
-        return
     for words in segments(command) or []:
-        program = asks_permission(words)
-        if program is not None:
+        changer = changes_output(words)
+        reader = asks_permission(words)
+        reason = (
+            change_refusal(changer) if changer is not None
+            else refusal(reader) if reader is not None
+            else None
+        )
+        if reason is not None:
             print(json.dumps({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
-                    "permissionDecisionReason": refusal(program),
+                    "permissionDecisionReason": reason,
                 },
             }))
             return

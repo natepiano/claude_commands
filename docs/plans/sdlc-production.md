@@ -23,10 +23,11 @@
 
 | Unit | Plan | Worktree | Branch | Port | Owns |
 | --- | --- | --- | --- | --- | --- |
-| guilds-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guilds` | `sdlc-guilds` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/plans/sdlc-guilds-design.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py` |
+| guild-process-unit | `docs/plans/sdlc-guilds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-guild-process` | `sdlc-guild-process` | — | `docs/plans/sdlc-guilds.md`; `docs/plans/sdlc-guilds-next.md`; `docs/plans/sdlc-guilds-design.md`; `scripts/astra/astra_roles.py`; `scripts/astra/test_astra_roles.py`; `scripts/guilds/`; `config/guilds/`; `commands/astra_review.md` and `scripts/astra/astra_review.py` with its test (the guild block only; natedev's enh-showrunner owns the rest); `~/rust/nate_style/guilds/` (separate repo: committed on its main by this unit after its phase gates, fast-forward only) |
 | phases-unit | `docs/plans/sdlc-phases.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-phases` | `sdlc-phases` | — | `docs/plans/sdlc-phases.md`; `docs/plans/sdlc-phases-next.md`; `docs/plans/sdlc-phases-design.md`; `scripts/direct/phase_process.py`; `scripts/direct/test_phase_process.py` |
 | fix-rounds-unit | `docs/plans/sdlc-fix-rounds.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-fix-rounds` | `sdlc-fix-rounds` | — | `docs/plans/sdlc-fix-rounds.md`; `docs/plans/sdlc-fix-rounds-next.md`; `docs/plans/sdlc-fix-rounds-study.md`; `scripts/history/`; `commands/history.md` |
 | roles-unit | `docs/plans/sdlc-roles.md` | `/home/natepiano/worktrees/claude-build-followups-sdlc-roles` | `sdlc-roles` | — | `docs/plans/sdlc-roles.md`; `docs/plans/sdlc-roles-next.md`; `docs/plans/sdlc-roles-design.md`; `scripts/production/roles_audit.py`; `scripts/production/test_roles_audit.py`; `scripts/production/role_terms.toml` |
+| hierarchies-unit | docs/plans/build-followups-hierarchies.md | /home/natepiano/worktrees/claude-build-followups-hierarchies | build-followups-hierarchies | — | — |
 
 Scope of each unit:
 
@@ -47,9 +48,9 @@ The user, via the showrunner, 2026-10-20: "I like goddesses of wisdom and judgem
 
 | File | Owner unit | Other units that touch it |
 | --- | --- | --- |
-| `commands/unit/direct.md` | phases-unit | guilds-unit (the designer and reviewer roles); fix-rounds-unit (the repair round rules) |
-| `docs/production_format.md` | roles-unit | guilds-unit (role names); fix-rounds-unit (<ProductionUnit/> item 7) |
-| `commands/showrunner/produce.md` | roles-unit | guilds-unit (the designer and reviewer roles under a showrunner) |
+| `commands/unit/direct.md` | phases-unit | guild-process-unit (the designer and reviewer roles); fix-rounds-unit (the repair round rules) |
+| `docs/production_format.md` | roles-unit | guild-process-unit (role names); fix-rounds-unit (<ProductionUnit/> item 7) |
+| `commands/showrunner/produce.md` | roles-unit | guild-process-unit (the designer and reviewer roles under a showrunner) |
 
 These three files are also hub files in build-followups. An edit to one of them goes through cargo-berth's normal flow, and the checkpoint notice names the build-followups owner.
 
@@ -77,3 +78,76 @@ No gates yet. The plans are not written. When a plan needs another unit's checkp
   - experiments-unit (cargo-liner) starts with a hand-resumed Astra thread and `/astra_review`. guilds-unit reads what it learns before it writes the reviewer role.
 - **No CI on this repo** (natedev, 2026-10-04, for `~/.claude`). `~/.claude` has no workflows, so the Merge tests replace `verify.sh test`, and <CIPoint/>, the smoke launch, the Mac run and `validate_and_push.sh` do not apply.
 - **Each merged phase goes to main at once** (natedev, 2026-10-04, for `~/.claude`), because `~/.claude` main is the live configuration. After a merge's tests pass: merge `main` into `sdlc` if main moved, push `sdlc`, fast-forward `~/.claude` main to it (`git -C ~/.claude merge --ff-only <sha>`; other sessions' uncommitted files there stay untouched), and push main only when `origin/main..main` held no other session's commits before the fast-forward. Then the Mac pulls: `ssh mac 'cd ~/.claude && git pull --ff-only natedev:/home/natepiano/.claude main'`.
+
+## Review decisions
+
+The user's review with the showrunner, 2026-10-21, one item at a time. Each unit gets its answers by message and writes them into its own plan.
+
+### guilds-unit
+
+Model, in the user's words (2026-10-21): the goal of a guild is to help guild members do their jobs better. Showrunners and unit directors share behavior and get guild functionality too, not only designers and reviewers. Heads do not read every member turn: that costs too much. Set events make members write to their guild or head. The user sends all guild feedback through the head. Each skill that starts a member role carries short guidance on how to work with the guild and its head.
+
+| # | Item | Decision |
+| --- | --- | --- |
+| G1 | Which jobs get a guild (showrunners, unit directors, designers, reviewers; workers?) | Four guilds: showrunners, unit directors, designers, reviewers. Workers have no guild; they get better guidance through their unit director's work orders. |
+| G1b | The head's form | Each head is a unit director, one per guild, under one lasting top-level guilds showrunner (not sdlc). In herdr: a top-level guilds space, the guilds showrunner as the first tab, then the four head unit directors in alphabetical order. This replaces the brief's "each head is a top-level showrunner". |
+| G2 | What heads watch, since they do not read every turn | Events plus records: a head reads turns when an event fires (G3), and once a day reads the records already kept (repair rounds, time per phase step, review findings); it reads turns only where a record looks bad. |
+| G3 | The events that make a member write to its guild or head | The member sends one short message to its head only, never to the whole guild, when: the user corrects it; a phase reaches repair round 4; the same review finding comes back twice; it works around a tool fault or a rule that slowed it; it finds a way that saved real time. The head decides what goes to the whole guild. |
+| G3b | Where the heads keep the guild tips | In ~/rust/nate_style: one folder per guild plus one shared folder, one tip per markdown file like the rust rules, and a base folder per guild with Obsidian views by tag like rust_base. The head adds and edits tip files. A member loads its guild's tips when its skill starts. Tips reach both machines through git; the design's copy step and receipts go. Replaces docs/guilds in ~/.claude. |
+| G4 | The user's guild feedback goes through the head | Decided by the user's words. The user types in the head's tab in the guilds space, or tells any showrunner, which passes it on. The head writes it as a tip file. |
+| G5 | Short guild guidance in each skill that starts a member role | Decided by the user's words. /showrunner:produce, /unit:direct and the designer and reviewer start prompts each carry a short block: who your head is, load your guild's tips, the G3 events, and how to write to the head. |
+| G6 | Where the heads live | Settled by G1b: the guilds space in herdr on natedev (showrunner's call: the guild records and the other showrunners are on natedev). |
+| G7 | Guild names (was question B) | The top level is named guilds (the showrunner and its herdr space). The four guilds and their head units are named designers, reviewers, showrunners and units (herdr tab order after the guilds showrunner: designers, reviewers, showrunners, units). Goddess names are on hold. Showrunner's call: the tip folders are ~/rust/nate_style/guilds/<guild>/, with the shared tips in ~/rust/nate_style/guilds/common/. |
+| G8 | Done work: phase 1 (roles in the tree), phase 2 (design doc) | Revise: keep phase 1; guilds-unit updates the design doc with these decisions. Its lasting-role half stays; its guild half changes. |
+| G9 | Next phases: redesign for the new scope, then build | OK: 3 revise the design doc; 4 tip folders and views in nate_style/guilds plus the guild block and G3 events in each starting skill; 5 the guilds production doc, then the top-level guilds showrunner and its four head units, each with its daily record read; 6 lasting designer and reviewer threads. The user's model: sdlc's guild-process unit director owns the guild process; the guilds showrunner runs each guild by that process. The two need different session names. Showrunner's call: sdlc's guilds-unit becomes guild-process-unit (session guild-process). |
+| G10 | Where hierarchies-unit's work goes | Move hierarchies-unit into sdlc as its own unit, beside guild-process, with /showrunner:transfer_unit once natedev finishes that command. It keeps its session and reviewed work; guild-process reads its findings. |
+
+### roles-unit
+
+| # | Item | Decision |
+| --- | --- | --- |
+| R1 | Goal and plan: own who does each duty and what each thing is called; done 1 (name count, duty map), 2 (recommendations); next 3 (build the first approved step), 4 (measure it, propose the next) | OK. |
+| R1b | Session names apart from roles (the user, 2026-10-21) | Decided by the user's words. A session's name and its role are separate: many sessions can hold the designer role, and none needs to be called designer. Every session records its role apart from its name. The unit board and cargo-handler show the session name and the role as two columns, side by side, always easy to see. Later this allows more creative session names. roles-unit defines the role record; the unit board's owner and cargo-liner add the column. |
+| R2 | Q1 who owns the guild tips | Settled by G3b and G4: each guild head keeps its guild's tips in nate_style/guilds. |
+| R3 | Q5 head names versus per-design role names | Settled by G7: heads are named designers, reviewers, showrunners, units; astra-designer and astra-reviewer stay for the per-design threads; goddess names on hold. |
+| R4 | Q2 "gate" | A "wait" is one unit waiting on another. A "gate" always means a check that must pass (verification). This replaces roles-unit's recommendation ("gate" for the wait, "verification gate" for the check). |
+| R5 | Q3 "reviewer" | |
+| R6 | Q4 "proposal", "add-on", "change" | |
+| R7 | Q6 "orchestrator" | |
+| R8 | Q7 "worker" and its other names | |
+| R9 | Step 1: retire "seat" and add a check | |
+| R10 | Q8 "as-built" | |
+
+### fix-rounds-unit
+
+| # | Item | Decision |
+| --- | --- | --- |
+| F1 | Goal and plan: a true count of repair rounds, a study of the phases with the most, changes that cut rounds and keep the work; done 1-4; next 5 (apply approved changes), 6 (measure them) | |
+| F2 | P1 the director runs unchanged lint and test commands itself | |
+| F3 | P2 from round 4, a missing acceptance item becomes a follow-up | |
+| F4 | P3 from round 4, an open finding outside the kept kinds becomes a follow-up | |
+| F5 | P4 each launch checks the active phase and records planned work apart from repairs | |
+| F6 | P5 each repair prompt carries the accepted checks its edits can break | |
+
+### phases-unit
+
+| # | Item | Decision |
+| --- | --- | --- |
+| PH1 | Goal and plan: measure how a phase and the doc pipeline run, find where time and tokens go, change one step at a time; done 1 (measure); in 2 (recommend); next 3 (build first step), 4 (measure it) | |
+| PH2 | Step 1: tokens first (cheap A) or dispatch time first (C, then cheap A) | |
+
+### hierarchies-unit (moving into sdlc)
+
+| # | Item | Decision |
+| --- | --- | --- |
+| HI1 | Goal and plan: the organization that ships Hana fastest under the user's constraints; recommends A (repair today's tree) | |
+| HI2 | Q3 must build-followups and sdlc cut a measured Hana cost, or get a fixed share | |
+| HI3 | Q4 the user's daily review budget; may old unreviewed changes close | |
+| HI4 | Q5 is the account count fixed | |
+| HI5 | Q6 where each newly created showrunner and unit sits in the tree | |
+| HI6 | Q7 push-authorization audit | |
+| HI7 | Q8 record waits and merge receipts | |
+| HI8 | Q9 cargo Hana-cost note | |
+| HI9 | Q10 run-end ownership check | |
+| HI10 | Q11 trial B, only under both conditions | |
+| HI11 | Q12 defer C | |

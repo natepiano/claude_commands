@@ -37,7 +37,7 @@ STATUSLINE_PALETTE = (
     "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
     "bright-black", "bright-red", "bright-green", "bright-yellow", "bright-blue",
     "bright-magenta", "bright-cyan", "bright-white",
-    "orange", "purple", "pink", "teal", "brown",
+    "orange", "purple", "pink", "teal", "brown", "mauve",
 )
 STATUSLINE_EXCLUDED_COLORS = frozenset({
     "black", "white", "bright-black", "bright-white",

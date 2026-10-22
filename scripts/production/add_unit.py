@@ -74,6 +74,8 @@ class ProfiledLaunch(NamedTuple):
 
 LaunchProfile = StandardLaunch | ProfiledLaunch
 NIGHTLY_REVIEW_UNIT = "nightly-review-unit"
+GUILDS_PRODUCTION = "guilds"
+GUILD_HEAD_IDS = ("designers", "reviewers", "showrunners", "units")
 
 
 def launch_profile(unit: str) -> LaunchProfile:
@@ -356,7 +358,7 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
-        unit=f"{name}-unit",
+        unit=(name if production.slug == GUILDS_PRODUCTION and name in GUILD_HEAD_IDS else f"{name}-unit"),
         branch=branch,
         worktree=worktree,
         plan=plan,
@@ -698,7 +700,7 @@ def host_session_name(request: UnitLaunch) -> str:
         if recorded.startswith(f"{slug}-"):
             return recorded
     name = request.identity.session
-    return herdr.generated_session_name(name if name.startswith(f"{slug}-") else f"{slug}-{name}")
+    return herdr.generated_session_name(unit_names.branch(slug, name))
 
 
 def launch_session(

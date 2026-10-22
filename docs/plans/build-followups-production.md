@@ -11,7 +11,7 @@
 - **Showrunner session:** natedev
 - **Log:** `docs/plans/build-followups-log.md` — git-excluded; one line per event
 - **Change review:** `~/rust/hanadocs/change-review/change-review - natedev.md` — changes for the user to check, read only when the user asks; never open questions
-- **User zone:** America/New_York — every time the showrunner reports is in this zone only (user, 2026-10-12: "switch all showrunners and units to return to communicating in EDT"; PDT from 2026-10-04)
+- **User zone:** America/Curacao (AST) — every time the showrunner reports is in this zone only (user, 2026-10-21: "My time zone is Curacao- I think that's ast. Please adjust"; EDT from 2026-10-12, PDT from 2026-10-04). user_zone.conf is the setting; this line only records it
 - **Updates:** on demand (user, 2026-10-10: dailies only when the user asks); each dailies lists every unit; a simple dailies gives each waiting, idle unit one line
 - **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 because pyrightconfig names a `.venv` no checkout has), run in the showrunner checkout
 - **Push:** git
@@ -53,7 +53,6 @@
 | hanadocs-unit | standby | /home/natepiano/worktrees/claude-build-followups-hanadocs | build-followups-hanadocs | — | the hanadocs vault (~/rust/hanadocs); commits to its main |
 | review-unit | (retired 2026-10-18, worktree removed) docs/plans/build-followups-review.md | /home/natepiano/worktrees/claude-build-followups-review | build-followups-review | — | — |
 | efficiency-unit | docs/as-built/token-efficiency-study.md | /home/natepiano/worktrees/claude-build-followups-efficiency | build-followups-efficiency | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
-| hierarchies-unit | docs/plans/build-followups-hierarchies.md | /home/natepiano/worktrees/claude-build-followups-hierarchies | build-followups-hierarchies | — | — |
 
 ## Hub files
 
