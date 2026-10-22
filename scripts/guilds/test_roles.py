@@ -543,6 +543,40 @@ class DurableRolesTests(unittest.TestCase):
                          [("designer", "thread-designer"), ("reviewer", "thread-reviewer")])
         self.assertEqual(len(self.launches), 2)
 
+    def check_holder_move(self, old: roles.Holder, new: roles.Holder) -> None:
+        """The held role resumes under `new` only after the move, in the same thread, with its paths kept."""
+        design = roles.open_role("fixture-repo", "design.md", "designer", old, "design",
+                                 binding=self.binding(self.run_a))
+
+        def resolve(holder: roles.Holder) -> roles.HolderReach | roles.HolderUnavailable:
+            return roles.HolderReach("holder-one") if holder == new else roles.HolderUnavailable("not marked")
+
+        with patch.object(roles, "resolve_holder", side_effect=resolve):
+            with self.assertRaisesRegex(roles.RoleRefused, "not marked"):
+                _ = self.resume(design, "designer")
+            self.assertTrue(roles.holder_failures(old))
+            for _attempt in range(2):
+                roles.move_holder(old, new, reason="unit transfer")
+            current = roles.read_design(design.placement.design_id)
+            _ = self.resume(current, "designer")
+        self.assertEqual(current.holder, new)
+        self.assertEqual((current.repository, current.document, current.binding),
+                         (design.repository, design.document, design.binding))
+        self.assertEqual(current.placement.generation, 2)
+        self.assertEqual(current.roles[0].name, design.roles[0].name)
+        roster = cast(dict[str, dict[str, object]], json.loads(
+            (roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
+        self.assertEqual(roster[design.roles[0].name]["cwd"], design.repository)
+        self.assertEqual(roles.holder_failures(old), [])
+        self.assertEqual(self.dispatches[-1][1], "thread-designer")
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
+    def test_a_unit_transfer_moves_the_holder_to_the_receiving_production(self) -> None:
+        self.check_holder_move(roles.UnitHolder("demo", "design-unit"), roles.UnitHolder("other", "design-unit"))
+
+    def test_a_production_rename_moves_the_showrunner_holder(self) -> None:
+        self.check_holder_move(roles.ShowrunnerHolder("demo"), roles.ShowrunnerHolder("renamed"))
+
     def test_uncertain_server_release_blocks_rename_before_holder_changes(self) -> None:
         design = self.open_designer()
         with patch.object(roles, "release_servers", side_effect=roles.RoleRefused("release uncertain")):
