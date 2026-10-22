@@ -1372,6 +1372,11 @@ build_seconds() {
 # on the same tree. A third word `mac` marks a pass the Mac ran (`host=mac`),
 # which a --local call does not reuse. Fails when there is nothing to record,
 # or when the tree has changed since that verdict.
+# The time in the user's zone setting, with its label; UTC (labeled) when the setting cannot be read.
+user_clock() {
+    TZ="$(python3 "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
+}
+
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
     key="$(tree_key)"
@@ -1388,7 +1393,7 @@ cache_record() {
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
     {
         printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
-            "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+            "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(user_clock)" \
             "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
         if [[ "${host}" == mac ]]; then
             printf 'host=mac\n'
