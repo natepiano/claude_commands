@@ -78,6 +78,7 @@ class UnitEffortTests(unittest.TestCase):
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
+            "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "NOTIFIER_SESSIONS_DIR": str(self.records), "AGENTS_CONFIG_FILE": str(self.registry),

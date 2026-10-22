@@ -16,8 +16,11 @@ from typing import cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 import conversation_pause
+import session_pane
+from unit_lookup import Place
 
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
@@ -98,6 +101,13 @@ class ConversationPauseRegistrationTests(unittest.TestCase):
         permissions = cast(dict[str, object], settings["permissions"])
         allow = cast(list[str], permissions["allow"])
         self.assertEqual(allow.count(f"Bash({resume_prefix} *)"), 1)
+
+
+# The prompt that ended auto silence at 04:34 AST on 2026-10-22: Claude Code typed it in a showrunner.
+IDLE_NOTICE = (
+    '[Cross-session idle notice] "cargo-liner", which you asked to be notified about, is idle now '
+    "— it finished a turn at 04:34."
+)
 
 
 def cross_session(sender: str, text: str) -> str:
@@ -559,6 +569,9 @@ print("SENT: delivered")
             "<task-notification>done</task-notification>",
             "<system-reminder>remember</system-reminder>",
             '<agent-message from="a1">done</agent-message>',
+            IDLE_NOTICE,
+            "[Cross-session delivery notice] Do not resend now: one of your messages was dropped.",
+            "Your claude.ai usage limit has reset. Continue the task you were working on.",
             "",
         ):
             with self.subTest(prompt=prompt):
@@ -640,6 +653,26 @@ print("SENT: delivered")
         self.assertEqual(self.run_prompt(cross_session("unit-scheduled", "update")).returncode, 0)
         # A control: a typed prompt does reach the log, so the empty reading above means something.
         self.assertEqual(self.run_prompt("hello").returncode, 0)
+        self.assertEqual(self.activity_calls(1), [["active"]])
+
+    def test_only_the_users_own_prompt_ends_auto_silence(self) -> None:
+        """A mover's resume prompt, a pane typed by session_pane.py and Claude Code's notices are not the user."""
+        self.record_activity()
+        _ = self.create_instance("showrunner-demo")
+        pane = "w1:p7"
+        self.environment["HERDR_PANE_ID"] = pane
+        resume = ("You are now messaging-unit in production demo (doc demo.md), under the showrunner. "
+                  "Paused 03:10; resumed 03:12. This was an account move, not a stop. Continue where you stopped.")
+        relay = "From the user (via the showrunner): go on"
+        with patch.dict(os.environ, {"CONVERSATION_PAUSE_STATE_DIR": str(self.pause_root),
+                                     "HERDR_BIN": shutil.which("true") or "/bin/true"}):
+            conversation_pause.record_scheduled_prompts(SESSION, (resume,))
+            session_pane.type_place(Place("demo", pane), relay)
+        for prompt in (resume, relay, cross_session("natedev", "continue"), IDLE_NOTICE):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(self.run_prompt(prompt).returncode, 0)
+        # The same words typed in another pane are the user's: the record holds the pane.
+        self.assertEqual(self.run_prompt(relay, extra_env={"HERDR_PANE_ID": "w1:p8"}).returncode, 0)
         self.assertEqual(self.activity_calls(1), [["active"]])
 
     def test_typed_stamp_failure_does_not_skip_report_pause(self) -> None:
