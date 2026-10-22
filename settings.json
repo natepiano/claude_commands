@@ -111,7 +111,12 @@
       "~/Library",
       "~/rust",
       "/tmp",
-      "/tmp/claude/"
+      "/tmp/claude/",
+      "~/.claude/projects",
+      "~/.claude1/projects",
+      "~/.claude2/projects",
+      "~/.claude3/projects",
+      "~/.claude4/projects"
     ]
   },
   "skillOverrides": {
