@@ -47,6 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
 from typing import Literal, NotRequired, TypedDict, cast
+from uuid import NAMESPACE_URL, uuid5
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
@@ -121,6 +122,8 @@ def _roster_folders() -> list[Path]:
     """Every run's mesh folder: unit run folders, then review pool meshes."""
     folders = [path.parent for root in RUN_ROOTS for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}"))]
     folders.extend(path.parent for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")))
+    from scripts.guilds import roles
+    folders.extend(roles.durable_meshes())
     return folders
 
 
@@ -135,7 +138,7 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         roster = codex_mesh._read_json_object(folder / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
         for name, value in roster.items():
             entry = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
-            if entry.get("thread_id") != thread_id or entry.get("status") == "ended":
+            if entry.get("thread_id") != thread_id or entry.get("status") == "ended" or entry.get("transferring_role") or entry.get("role_redirect"):
                 continue
             launcher = codex_mesh._pid_alive(codex_mesh._as_int(entry.get("launcher_pid")))  # pyright: ignore[reportPrivateUsage]
             found.append((launcher, MeshCaller(str(folder), name, thread_id)))
@@ -333,6 +336,23 @@ def deliver(record: RunRecord, exit_code: int) -> str:
     else:
         text = result_text(record, exit_code)
     session_dir, name = record["session_dir"], record["worker"]
+    roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+    entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
+    from scripts.guilds import roles
+    destination = roles.transfer_route(record["thread_id"])
+    if destination:
+        destination_roster = codex_mesh._read_json_object(Path(destination) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
+        for value in destination_roster.values():
+            candidate = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
+            if candidate.get("thread_id") == record["thread_id"]:
+                entry = candidate
+                break
+    design_id, role = entry.get("held_design_id"), entry.get("held_role")
+    if isinstance(design_id, str) and design_id and role in ("designer", "reviewer"):
+        message_id = str(uuid5(NAMESPACE_URL, str(Path(session_dir).resolve()) + "/" + record["run_id"]))
+        _ = roles.queue_message(design_id, role, "mesh_runs:" + record["run_id"],
+                                text, message_id=message_id)
+        return f"queued for held role {name}; its holder controls the next assignment"
     held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False)
     if isinstance(held, (codex_mesh.HeldForLauncher, codex_mesh.HeldForNextDispatch)):
         return f"held for {name}'s attached launcher on thread {held.thread_id}"

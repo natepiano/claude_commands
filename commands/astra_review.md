@@ -12,15 +12,8 @@ Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guil
 
 Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
 
-**Usage:** `/astra_review [--run-directory <dir> --phase <id>] <document path> [focus text]`
-
-A holder passes both flags before the document for phase work; omit both for a
-standalone review. Consume both flags and their values before Step 1 reads the
-document path. Pass these flags to `astra_review.py` in Step 2. For exit 2 in
-Step 3, report an `astra_review:` line naming a phase or the tips baseline as
-that line; do not report a missing document for these errors. The script
-loads the reviewers block and tip text into the worker prompt and saves the
-assignment header. A Codex holder relays a guild report in the reply unchanged.
+The script loads the reviewers block and tip text into each prompt. A Codex
+holder relays a guild report in the reply unchanged.
 </Guild>
 
 One Codex turn with gpt-6-astra at reasoning xhigh reads the document read-only
@@ -29,15 +22,21 @@ each finding tied to a section or a file and line. The user, showrunners and uni
 directors use it the same way. It runs on the current workers account and
 changes no file.
 
+**Usage:** `/astra_review [--run-directory <dir> --phase <id>] <document path> [focus text]`
+
 ## Steps
 
-1. Take the path and the focus from `$ARGUMENTS`: the first word is the path,
-   the rest is the focus. With no path, ask for one in one plain line and stop.
+1. Consume `--run-directory <dir> --phase <id>` before reading the document;
+   pass both for phase work, neither for standalone work. The next word is the
+   path and the rest is focus. With no path, ask for one in one plain line and stop.
    Resolve a relative path from the working directory; if no file is there, say
    so and stop.
 2. Run the review as one command, with `dangerouslyDisableSandbox: true` (it
    reads `~/.codex*` and reaches the network):
-   `~/.claude/scripts/lib/py ~/.claude/scripts/astra/astra_review.py "<path>" <focus>`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/astra/astra_review.py [--run-directory <dir> --phase <id>] "<path>" <focus>`
+   A held document uses its sole reviewer in the same thread. Busy or unavailable
+   means report that state; do not start another reviewer. Without a held design,
+   the script keeps its one-turn read-only review.
    - **Claude:** run it with `run_in_background: true`, tell the caller in one
      line that the astra review is running, then end the turn or do other work.
      The task notification is the wait. Never poll it, sleep or read its output
@@ -53,7 +52,8 @@ changes no file.
      something you can check.
    - Exit 1: the review failed. Report what Codex said and the account it ran
      on. Do not retry with another model or account.
-   - Exit 2: the document was missing; say so.
+   - Exit 2: report the `astra_review:` error line. A phase or tips-baseline
+     error is that error, not a missing document.
 
 The run folder under `/tmp/claude/astra/` keeps the prompt, Codex's log and the
 review.

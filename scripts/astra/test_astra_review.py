@@ -1,6 +1,8 @@
 """Tests for asking gpt-6-astra to review a document, against a stand-in accounts tool."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -10,6 +12,11 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TypedDict, cast, override
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.astra import astra_review  # noqa: E402
+from scripts.guilds import astra_work, roles, tips  # noqa: E402
 
 SCRIPT = Path(__file__).with_name("astra_review.py")
 # The stand-in for accounts.py: answers `role workers`, and for `exec` records its call and writes
@@ -79,6 +86,9 @@ class AstraReviewTests(unittest.TestCase):
         _ = self.document.write_text("# Proposal\n", encoding="utf-8")
         self.environment = {**os.environ, "ASTRA_REVIEW_ACCOUNTS": str(stub),
                             "ASTRA_REVIEW_DIR": str(self.root / "runs"), "STUB_CALLS": str(self.root / "calls.json"),
+                            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
+                            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership"),
+                            "GUILD_ROLES_HOST": "fixture-host",
                             "ASTRA_ROLES_STATE": str(self.root / "roles"), "STUB_CODEX_HOME": str(self.root / "codex-home"),
                             "STUB_REVIEW": "Verdict: clear.\n\n1. Section Why: the cause is not shown."}
         _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
@@ -114,6 +124,71 @@ class AstraReviewTests(unittest.TestCase):
     def saved_prompt(self) -> Path:
         argv = self.call()["argv"]
         return Path(argv[argv.index("-o") + 1]).with_name("prompt.md")
+
+    def held_reviewer(self, status: str = "done") -> roles.HeldDesign:
+        design_id = "00000000-0000-4000-8000-000000000016"
+        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
+                                  str(self.root), str(self.document), "proposal", "2026-10-21T12:00:00+00:00",
+                                  roles.UnitHolder("demo", "proposal-unit"), roles.DesignUnbound(),
+                                  (roles.RoleInstance("designer", "demo-proposal-astra-designer", roles.RoleNotOpened()),
+                                   roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", roles.RoleOpen("held-thread"))))
+        roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        mesh = roles.mesh_directory(design_id)
+        mesh.mkdir(parents=True)
+        _ = (mesh / "mesh_roster.json").write_text(json.dumps({"demo-proposal-astra-reviewer": {
+            "thread_id": "held-thread", "status": status, "held_design_id": design_id, "held_role": "reviewer"}}))
+        _ = (mesh / "mesh_server.json").write_text(json.dumps({"codex_home": str(self.root / "codex-home")}))
+        return design
+
+    def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
+        assignments: list[tuple[str, roles.ThreadAccessPolicy]] = []
+
+        def dispatch(design: roles.HeldDesign, role: roles.Role, prompt: Path, reply: Path,
+                     model: str, effort: str) -> None:
+            del model, effort
+            instance = next(item for item in design.roles if item.role == role)
+            self.assertIsInstance(instance.lifecycle, roles.RoleOpen)
+            self.assertTrue(prompt.is_file())
+            if isinstance(instance.lifecycle, roles.RoleOpen):
+                assignments.append((instance.lifecycle.thread_id, roles.access_policy(design, role)))
+            _ = reply.write_text("Held reviewer evidence.\n")
+
+        with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
+                patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")), \
+                patch.object(roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
+                patch.object(roles, "dispatch_turn", side_effect=dispatch), \
+                patch.object(astra_review, "workers_label", side_effect=AssertionError("held review started a fresh exec")), \
+                patch.object(tips, "load", return_value="Fixture reviewer tips"), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            design = self.held_reviewer()
+            for focus in ("first round", "repair round"):
+                self.assertEqual(astra_review.main([str(self.document), focus]), 0)
+            prompts = sorted(roles.design_directory(design.placement.design_id).glob("prompts/*.md"))
+            self.assertEqual(len(prompts), 2)
+            replies: list[str] = []
+            for prompt in prompts:
+                header = astra_work.read_header(prompt)
+                self.assertIsInstance(header, astra_work.AstraWork)
+                if isinstance(header, astra_work.AstraWork):
+                    self.assertEqual((header.role, header.member), ("astra-reviewer", "demo-proposal-astra-reviewer"))
+                    self.assertEqual(Path(header.reply_path).read_text(), "Held reviewer evidence.\n")
+                    replies.append(header.reply_path)
+        self.assertEqual(assignments, [("held-thread", roles.ReadOnlyReviewer()), ("held-thread", roles.ReadOnlyReviewer())])
+        self.assertEqual(len(set(replies)), 2)
+        self.assertIn("held reviewer", output.getvalue())
+        self.assertFalse((self.root / "calls.json").exists())
+
+    def test_busy_held_reviewer_is_reported_without_a_fresh_thread_or_prompt(self) -> None:
+        with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
+                patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")), \
+                patch.object(roles, "dispatch_turn", side_effect=AssertionError("busy role dispatched")), \
+                patch.object(astra_review, "workers_label", side_effect=AssertionError("busy role used fresh exec")), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            design = self.held_reviewer("running")
+            self.assertEqual(astra_review.main([str(self.document)]), 1)
+            self.assertEqual(list(roles.design_directory(design.placement.design_id).glob("prompts/*.md")), [])
+        self.assertIn("busy", errors.getvalue())
+        self.assertFalse((self.root / "calls.json").exists())
 
     def header(self) -> dict[str, object]:
         path = self.saved_prompt()

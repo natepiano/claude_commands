@@ -2518,7 +2518,9 @@ class AddUnitTests(ShutdownTestCase):
 
     def assert_guild_head_launch_and_restart(self, guild: str) -> None:
         self.doc = self.checkout / "docs/plans/guilds-production.md"
-        _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
+        row = self.unit_row(guild, branch="guilds-" + guild, worktree=self.root / ("project-" + guild))
+        row = row.replace(f"| {guild}-unit |", f"| `{guild}` |")
+        _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"), encoding="utf-8")
         _ = self.git("add", str(self.doc.relative_to(self.checkout)))
         _ = self.git("commit", "-m", "Add guilds fixture production")
         _ = self.git("push", "origin", "build-followups")
@@ -2581,6 +2583,19 @@ class AddUnitTests(ShutdownTestCase):
                         probe=False,
                     ))
                     self.assertEqual(request.unit, name + "-unit")
+
+    def test_exact_table_row_is_adopted_without_suffix_in_another_production(self) -> None:
+        row = self.unit_row("designers", branch="build-followups-designers",
+                            worktree=self.root / "project-designers").replace("| designers-unit |", "| `designers` |")
+        self.commit_prepared_row(row)
+        request = add_unit.launch_request(argparse.Namespace(
+            production=str(self.doc), name="designers", plan="docs/plans/given.md", brief=None,
+            standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+            resume=None, cwd=None, restart_note=None, session_name=None, host_session=None, probe=False,
+        ))
+        self.assertEqual(request.unit, "designers")
+        self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines()),
+                              add_unit.ExistingUnitRow)
 
     def test_restore_flags_are_atomic_and_require_resume(self) -> None:
         note = self.root / "restart-note.txt"
