@@ -2682,7 +2682,8 @@ class AddUnitTests(ShutdownTestCase):
     def test_new_work_records_no_scheduled_prompt(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
-        self.assertFalse(self.pause_state.exists())
+        # herdr records the typed opening prompt under script-prompts; no scheduled prompt is kept.
+        self.assertFalse((self.pause_state / "scheduled-prompts").exists())
 
     def test_brief_row_cannot_be_retried_as_plan_on_its_stub(self) -> None:
         _ = self.successful("alpha", "--brief", "Write a full plan")
