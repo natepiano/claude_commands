@@ -43,36 +43,19 @@ style-unit checked the code: selection already skips files on another unit's ope
 
 ### Phase 43 — style units that refill at the same time never get the same file · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** two or more style units of one style production that run `style_plan.py next-phase` at the same time get tickets on disjoint files.
-
-**Spec:**
-- Add `refill_lock(repo: Path) -> Generator[None]` (a `@contextmanager`) to `style_ledger.py`, beside `open_ledger`. It opens `refill.lock` in the folder of `ledger_location(repo).database` (one ledger, so one lock, per style production), creating the folder when absent, with mode `"a"`, and holds `fcntl.flock(..., fcntl.LOCK_EX)` for the `with` body. Follow `proposal_issue._issue_lock`. The lock blocks; it has no timeout.
-- In `style_plan.next_phase`, hold `refill_lock(repo)` around each selection pass: from `berth_board.read_board` through `busy_files`, `_select_phase` and its return. Two passes, two separate `with` blocks: the first around :1783-1791, the second around :1795-1803. `wait_for_sync`, `synced_tip`, `discard_finished`, the open-ticket resume path and everything before :1783 stay outside the lock. So a second unit reads `busy_files` only after the first unit's `ticket_add` and `ticket_assign` are committed, and its selection skips those files through `unit_file_holders`.
-- The lock never spans a judge run or any work after `next_phase` returns. The `queue` command is read only and takes no lock.
-- No judge yield tie-break rule (showrunner, 2026-10-22): with the lock, two units cannot select the same file.
-- Update `docs/as-built/style-showrunner.md` where it describes refill selection: one lock per style production (`refill.lock` beside the ledger) covers the board read, the busy-files read, selection and the ticket add of each refill pass.
+- `style_ledger.refill_lock(repo: Path) -> Generator[None]` is a `@contextmanager` beside `open_ledger`. It opens `refill.lock` with mode `"a"` in the folder of `ledger_location(repo).database`, and makes the folder when it is absent. It holds `fcntl.flock(..., fcntl.LOCK_EX)` for the `with` body. One ledger gives one lock per style production. The lock blocks and has no timeout.
+- `style_plan.next_phase` holds `refill_lock(repo)` across each of its two selection passes, in two separate `with` blocks. Each block covers `berth_board.read_board`, `busy_files`, `_select_phase` (with its `ticket_add` and `ticket_assign`), `clear_sync_wait` and the return. Both ticket writes commit before the lock is released. So the next unit's `busy_files` sees those files as busy through `unit_file_holders`, and two units that refill at the same time get disjoint files.
+- The rule catalog read (`rules.load_rules`) runs once before the first lock block and serves both passes. `ledger.wait_for_sync` runs between the two blocks, outside the lock. The `queue` command takes no lock.
 
 **Files:**
 - `scripts/style/style_ledger.py` — `refill_lock`.
 - `scripts/style/style_plan.py` — the two lock blocks in `next_phase`.
-- `scripts/style/test_style_ledger.py` — `refill_lock` test.
-- `scripts/style/test_style_plan.py` — the two-refills-at-once test.
-- `docs/as-built/style-showrunner.md` — refill lock line.
+- `scripts/style/test_style_ledger.py` — `test_refill_lock_blocks_another_worktree_until_the_body_exits`: a second worktree waits on the lock until the first `with` body exits.
+- `scripts/style/test_style_plan.py` — `test_concurrent_refills_read_committed_tickets_and_choose_disjoint_files`: two `next_phase` calls start together, on each selection pass, and get disjoint files. The test fails when the lock blocks are removed.
+- `docs/as-built/style-showrunner.md` — the refill lock paragraph in refill selection.
 
-**Workers:** 1 writer + 1 tester; the code and its tests split by file.
-- `impl`: `scripts/style/style_ledger.py`, `scripts/style/style_plan.py`, `docs/as-built/style-showrunner.md`.
-- `test` opens as `test`: `scripts/style/test_style_ledger.py`, `scripts/style/test_style_plan.py`. From the Spec alone: (1) `refill_lock` — a second process (or thread with its own file handle) that takes the lock waits until the first `with` body exits; the lock file is beside the ledger under `STYLE_LEDGER_STATE_DIR`. (2) Two refills at once — in the `StylePlanTests` fixture, two units of different families whose candidates share a file; start both `next_phase` calls together (threads or processes, each with its own ledger connection), with the first unit's selection slowed (patch `_select_phase` or `busy_files` to wait on an event after its read) so that without the lock both would read before either adds; assert both return, the second unit's ticket files do not overlap the first's, and the second's `busy_files` ran after the first's `ticket_add`. Without the lock the test must fail.
+**Gotchas:** `rules.load_rules` takes 4.5 s warm and 21 s cold on cargo-liner. Keep it, and any other read of no shared state, outside the refill lock: work inside the lock delays the refill of every other unit. The lock never covers a judge run or any work after `next_phase` returns.
 
-**Constraints from prior phases:**
-- `unit_file_holders` already counts another unit's `assigned`/`checkpointed` ticket files as busy (phase 42 as-built); the lock only orders the reads after the writes.
-- `ticket_add` and `ticket_assign` each commit their own transaction, so both are committed before the `with` block exits.
-
-**Acceptance gate:**
-- `env -C /home/natepiano/worktrees/claude-build-followups-style PYTHONPATH=/home/natepiano/worktrees/claude-build-followups-style/scripts/style:/home/natepiano/worktrees/claude-build-followups-style/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest test_style_ledger test_style_plan` passes.
-- The two-refills-at-once test fails with the lock blocks removed from `next_phase`, and passes with them.
-- `basedpyright -p /home/natepiano/worktrees/claude-build-followups-style scripts/style/style_ledger.py scripts/style/style_plan.py scripts/style/test_style_ledger.py scripts/style/test_style_plan.py` reports `0 errors, 0 warnings`.
-- `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` from the worktree root passes.
+**Ruled out:** a judge yield tie-break rule — with the lock, two units cannot select the same file.
