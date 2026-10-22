@@ -1346,7 +1346,10 @@ class MeshCommandTests(unittest.TestCase):
         self.server.respond = reply
         code, output, errors = self.run_mesh(["steer", "--to", "worker", "--message", "invented correction"])
         self.assertEqual((code, output, errors), (0, "steered worker\n", ""))
-        self.assertEqual(self.worker_record(), {**original, "turn_id": "live-turn", "revision": 1})
+        self.assertEqual(self.worker_record(), {
+            **original, "turn_id": "live-turn", "revision": 1,
+            "access_policy": {"kind": "ReadOnlyReviewer"},
+        })
 
     def test_steer_reply_after_replacement_preserves_its_context_and_identity(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
@@ -2334,6 +2337,116 @@ class MeshCommandTests(unittest.TestCase):
         starts = self.methods("turn/start")
         self.assertEqual(len(starts), 1)
         self.assertEqual(_as_test_dict(starts[0]["params"]).get("sandboxPolicy"), READ_ONLY_POLICY)
+
+    def test_legacy_reviewer_resumes_and_follows_read_only_without_rewriting_on_read(self) -> None:
+        instructions = self.standing_instructions()
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "done", "role": "review",
+            "instructions_file": str(instructions),
+        }})
+        roster_path = self.session_dir / codex_mesh.ROSTER_FILE
+        before = roster_path.read_bytes()
+        modified = roster_path.stat().st_mtime_ns
+        params = codex_mesh._resume_params(  # pyright: ignore[reportPrivateUsage]
+            str(self.session_dir), "worker", THREAD_ID)
+        client = codex_mesh.Client(self.server.port, "legacy-reviewer")
+        try:
+            _ = client.call("thread/resume", params)
+        finally:
+            client.close()
+        self.assert_instruction_resume(instructions)
+        self.assertEqual(roster_path.read_bytes(), before)
+        self.assertEqual(roster_path.stat().st_mtime_ns, modified)
+
+        code, errors = self.run_follow(role="review")
+
+        self.assertEqual((code, errors), (0, ""))
+        self.assert_instruction_resume(instructions)
+        starts = self.methods("turn/start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(_as_test_dict(starts[0]["params"]).get("sandboxPolicy"), READ_ONLY_POLICY)
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_first_locked_roster_write_migrates_every_legacy_reviewer(self) -> None:
+        instructions = self.standing_instructions()
+        for writer in ("update", "compare-update", "set-instructions"):
+            with self.subTest(writer=writer):
+                explicit: dict[str, object] = {
+                    "thread_id": "explicit-thread", "status": "done", "instructions_file": str(instructions),
+                    "access_policy": {"kind": "PhaseBoundDesigner", "binding_generation": 2,
+                                      "launch_sandbox": "danger-full-access"},
+                }
+                worker: dict[str, object] = {"thread_id": "writer-thread", "status": "done"}
+                damaged: dict[str, object] = {
+                    "thread_id": "held-thread", "status": "done", "held_design_id": "damaged-design",
+                    "instructions_file": str(instructions),
+                }
+                self.write_pool_roster({
+                    "worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
+                               "instructions_file": str(instructions)},
+                    "template": {"thread_id": "template-thread", "status": "done", "role": "review",
+                                 "instructions_file": str(instructions)},
+                    "explicit": explicit, "writer": worker, "damaged": damaged,
+                })
+                roster_path = self.session_dir / codex_mesh.ROSTER_FILE
+                before = roster_path.read_bytes()
+                modified = roster_path.stat().st_mtime_ns
+                _ = codex_mesh._lookup(str(self.session_dir), "worker")  # pyright: ignore[reportPrivateUsage]
+                self.assertEqual(roster_path.read_bytes(), before)
+                self.assertEqual(roster_path.stat().st_mtime_ns, modified)
+                update: codex_mesh.ThreadRecord = {"thread_id": THREAD_ID, "status": "done"}
+                if writer == "update":
+                    codex_mesh._update_roster(str(self.session_dir), "worker", update)  # pyright: ignore[reportPrivateUsage]
+                elif writer == "compare-update":
+                    self.assertTrue(codex_mesh._update_roster_if_expected(  # pyright: ignore[reportPrivateUsage]
+                        str(self.session_dir), "worker", update, codex_mesh.RosterOnThread(THREAD_ID)))
+                else:
+                    code, output, errors = self.run_mesh([
+                        "set-instructions", "--to", "worker", "--instructions-file", str(instructions)])
+                    self.assertEqual((code, output, errors), (0, "", ""))
+                stored = self.roster()
+                for name in ("worker", "template"):
+                    self.assertEqual(_as_test_dict(stored[name]).get("access_policy"),
+                                     {"kind": "ReadOnlyReviewer"})
+                self.assertEqual(stored["explicit"], explicit)
+                self.assertEqual(stored["writer"], worker)
+                self.assertEqual(stored["damaged"], damaged)
+
+    def test_held_record_without_policy_names_recovery_and_stays_unchanged(self) -> None:
+        instructions = self.standing_instructions()
+        self.write_pool_roster({"worker": {
+            "thread_id": THREAD_ID, "status": "done", "held_design_id": "damaged-design",
+            "instructions_file": str(instructions),
+        }})
+        roster_path = self.session_dir / codex_mesh.ROSTER_FILE
+        before = roster_path.read_bytes()
+        with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
+            _ = codex_mesh._seat_sandbox(  # pyright: ignore[reportPrivateUsage]
+                self.start_args(), str(self.session_dir), "worker")
+        with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
+            _ = codex_mesh._resume_params(  # pyright: ignore[reportPrivateUsage]
+                str(self.session_dir), "worker", THREAD_ID)
+        self.assertEqual(roster_path.read_bytes(), before)
+        self.assertEqual(self.methods("thread/resume"), [])
+        self.assertEqual(self.methods("turn/start"), [])
+
+    def test_worker_without_instructions_keeps_each_launch_sandbox(self) -> None:
+        for sandbox, expected in (("read-only", READ_ONLY_POLICY), ("danger-full-access", WRITE_POLICY)):
+            with self.subTest(sandbox=sandbox):
+                self.write_pool_roster({"worker": {
+                    "thread_id": THREAD_ID, "status": "done", "role": "impl",
+                }})
+                self.server.requests.clear()
+                args = self.start_args()
+                args.sandbox = sandbox
+                args.to = "worker"
+                args.message_file = str(self.session_dir / "prompt.txt")
+                code = codex_mesh.command_follow(args)
+                self.assertEqual(code, 0)
+                starts = self.methods("turn/start")
+                self.assertEqual(len(starts), 1)
+                self.assertEqual(_as_test_dict(starts[0]["params"]).get("sandboxPolicy"), expected)
+                self.assertNotIn("access_policy", self.worker_record())
 
     def test_pool_verbs_report_server_failures_with_the_destination_name(self) -> None:
         cases = [

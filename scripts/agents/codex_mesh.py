@@ -83,6 +83,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
 from scripts.lib import unit_runs
+from scripts.guilds.roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
 from scripts.whoami import account
 from scripts.usage import agents_log
@@ -891,6 +892,42 @@ class RosterUnchanged:
 ExpectedRoster = RosterOnThread | RosterAbsent | RosterEndedOnThread | RosterUnchanged
 
 
+@dataclass(frozen=True)
+class WorkerLaunchPolicy:
+    """The worker uses the sandbox selected by its launch arguments."""
+
+
+def roster_access_policy(record: Mapping[str, object]) -> ThreadAccessPolicy | WorkerLaunchPolicy:
+    """Resolve explicit policies and reviewer records made before policies were stored."""
+    if "access_policy" in record:
+        policy = _as_dict(record["access_policy"])
+        if policy.get("kind") == "ReadOnlyReviewer":
+            return ReadOnlyReviewer()
+        if policy.get("kind") == "PhaseBoundDesigner":
+            return PhaseBoundDesigner(_as_int(policy.get("binding_generation")),
+                                      _as_str(policy.get("launch_sandbox")) or WORKER_SANDBOX)
+        raise SystemExit("codex_mesh: invalid access policy; use roles.py recover for a held role")
+    if record.get("held_design_id"):
+        raise SystemExit("codex_mesh: held role has no access policy; use roles.py recover")
+    if record.get("instructions_file"):
+        return ReadOnlyReviewer()
+    return WorkerLaunchPolicy()
+
+
+def _migrate_legacy_reviewers(roster: dict[str, object]) -> dict[str, object]:
+    for name, value in roster.items():
+        entry = _as_dict(value)
+        if "access_policy" not in entry and not entry.get("held_design_id"):
+            if isinstance(roster_access_policy(entry), ReadOnlyReviewer):
+                entry["access_policy"] = {"kind": "ReadOnlyReviewer"}
+                roster[name] = entry
+    return roster
+
+
+def _load_roster_for_write(handle: TextIO) -> dict[str, object]:
+    return _migrate_legacy_reviewers(_as_dict(_loads(handle.read())))
+
+
 def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
                         record: ThreadRecord) -> None:
     previous = _as_dict(roster.get(name))
@@ -948,8 +985,7 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        text = handle.read()
-        roster = _as_dict(_loads(text)) if text.strip() else {}
+        roster = _load_roster_for_write(handle)
         _write_roster_record(handle, roster, name, record)
 
 
@@ -961,8 +997,7 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        text = handle.read()
-        roster = _as_dict(_loads(text)) if text.strip() else {}
+        roster = _load_roster_for_write(handle)
         previous = _as_dict(roster.get(name))
         if isinstance(expected, RosterAbsent):
             matches = name not in roster
@@ -984,7 +1019,7 @@ def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: 
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry:
             entry["role"] = role
@@ -1004,7 +1039,7 @@ def _mark_roster_ended(session_dir: str, name: str) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry:
             entry["status"] = "ended"
@@ -1022,7 +1057,7 @@ def _mark_all_roster_ended(session_dir: str) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         for name, value in roster.items():
             entry = _as_dict(value)
             if entry:
@@ -1050,15 +1085,13 @@ def _lookup_state(session_dir: str, name: str) -> RosterThread:
 
 
 def _seat_sandbox(args: argparse.Namespace, session_dir: str, name: str) -> str:
-    """Access follows the explicit roster policy, independently of instructions."""
+    """Select the sandbox from the seat's resolved access policy."""
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    policy = _as_dict(record.get("access_policy"))
-    if policy.get("kind") == "ReadOnlyReviewer":
+    policy = roster_access_policy(record)
+    if isinstance(policy, ReadOnlyReviewer):
         return READ_ONLY_SANDBOX
-    if policy.get("kind") == "PhaseBoundDesigner":
-        return _as_str(policy.get("launch_sandbox")) or WORKER_SANDBOX
-    if record.get("instructions_file"):
-        raise SystemExit("codex_mesh: legacy instructions have no explicit access policy; recovery required")
+    if isinstance(policy, PhaseBoundDesigner):
+        return policy.launch_sandbox
     return _as_str(_attr(args, "sandbox")) or WORKER_SANDBOX
 
 
@@ -1121,10 +1154,9 @@ def _resume_params(session_dir: str, name: str, thread_id: str) -> dict[str, obj
     """Restore a roster thread's standing instructions whenever it is reopened."""
     params: dict[str, object] = {"threadId": thread_id}
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-    policy = _as_dict(record.get("access_policy"))
-    if policy.get("kind") in ("ReadOnlyReviewer", "PhaseBoundDesigner"):
-        params["sandbox"] = (READ_ONLY_SANDBOX if policy.get("kind") == "ReadOnlyReviewer"
-                             else _as_str(policy.get("launch_sandbox")))
+    policy = roster_access_policy(record)
+    if isinstance(policy, (ReadOnlyReviewer, PhaseBoundDesigner)):
+        params["sandbox"] = READ_ONLY_SANDBOX if isinstance(policy, ReadOnlyReviewer) else policy.launch_sandbox
         params["approvalPolicy"] = "never"
     instructions_file = _as_str(record.get("instructions_file"))
     if instructions_file:
@@ -1150,7 +1182,7 @@ def _claim_follow(
     with _design_claim_lock(session_dir, name), path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if not _validate_held_claim(name, entry, thread_id):
             return False
@@ -1199,7 +1231,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         status = entry.get("status")
         if expected_thread_id and entry.get("thread_id") != expected_thread_id:
@@ -1378,7 +1410,7 @@ def _note_worker_port(session_dir: str, name: str, launcher_pid: int, port: int)
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry.get("launcher_pid") != launcher_pid:
             return
@@ -4753,7 +4785,7 @@ def command_reopen(args: argparse.Namespace) -> int:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         status = _as_str(entry.get("status"))
         port = _as_int(entry.get("port"))
@@ -4796,7 +4828,7 @@ def _pause_roster(session_dir: str) -> None:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         for name, raw in roster.items():
             record = _as_dict(raw)
             status = _as_str(record.get("status"))
@@ -4841,7 +4873,7 @@ def _pause_roster(session_dir: str) -> None:
             if isinstance(state, (ThreadLive, ThreadIdle)):
                 with path.open("r+", encoding="utf-8") as handle:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                    current = _as_dict(_loads(handle.read()))
+                    current = _load_roster_for_write(handle)
                     entry = _as_dict(current.get(name))
                     if entry.get("status") == "paused" and entry.get("thread_id") == thread_id:
                         entry["paused_turn"] = isinstance(state, ThreadLive)
@@ -6919,7 +6951,7 @@ def command_set_instructions(args: argparse.Namespace) -> int:
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if entry.get("thread_id") != state.thread_id or entry.get("status") != "done":
             print(f"codex_mesh: {name}: worker changed while setting instructions; instructions unchanged",
@@ -6941,7 +6973,7 @@ def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_p
     with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
-        roster = _as_dict(_loads(handle.read()))
+        roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
         if (entry.get("thread_id") != thread_id or entry.get("status") != "starting"
                 or entry.get("launcher_pid") != launcher_pid):
