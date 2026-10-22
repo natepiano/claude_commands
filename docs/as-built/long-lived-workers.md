@@ -120,14 +120,14 @@ The rules live in `commands/unit/direct.md` `<LongLivedWorkers/>`, `docs/delegat
   6. removal of the run-active marker
 
   Steps 1 to 5 run even with no marker, for runs the session still holds. Steps 2 to 5 each continue after a failure. Tests point the scan at a temp folder with `PLAN_DELEGATE_RUN_ROOT` and the marker with `PLAN_DELEGATE_ACTIVE_DIR`.
-- **Sweep.** It first decides who owns each `ws://` app-server: the current server of a run, a retired server of a run, an unowned server whose log names its run, or an unowned server with no log. It then judges whether anything still needs the server:
+- **Sweep.** It first decides who owns each `ws://` app-server: the current server of a run, the current server of a held design role, a retired server of a run, an unowned server whose log names its run, or an unowned server with no log. Alongside the run folders selected by `--root`, it reads the durable design mesh folders returned by `roles.durable_meshes()` (folders with `mesh_roster.json`). A matching current server record belongs to a held design role only while its roster has an entry with `held_design_id`; a released role or deleted folder gets the usual ownership rules. It then judges whether anything still needs the server:
   - Any connected client means in use.
-  - For a current server, a run-active marker or a running worker means in use.
+  - For a current run server, a run-active marker or a running worker means in use.
   - A retired server is unused unless a conversation is mid-turn.
   - An unowned server is in use during the record-start window, or while a conversation is mid-turn.
-  - Otherwise, a live worker launcher, a server under 30 minutes old, a run folder changed in the last 30 minutes, or a conversation mid-turn means in use.
+  - Current run servers and held design servers share the 30-minute quiet window (`SERVER_IDLE_SECS`): a live worker launcher, a server under 30 minutes old, a mesh folder changed in the last 30 minutes, or a conversation mid-turn means in use.
 
-  It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the run folder's server lock before stopping a server. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
+  It prints `pid  port  verdict  reason  owner` with verdict `in use`, `unused`, `stopped` or `kept`. With `--stop`, it judges a second time under the owner's mesh folder server lock before stopping a server. Servers listening on `--listen unix://` are never touched. Each server also has its own watcher, which wakes every 300 s and runs `idle-stop` once the server record has gone 30 minutes untouched. If a server fails to start, its process is terminated and its record dropped.
 
 ### Measurement: `scripts/whoami/worker_usage.py`
 

@@ -8702,6 +8702,116 @@ class SweepTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
+        roles_state = self.enterContext(tempfile.TemporaryDirectory())
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"GUILD_ROLES_STATE": roles_state})))
+
+    @staticmethod
+    def write_sweep_server(folder: Path, quiet_secs: float, *, held: bool = False) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        worker: dict[str, object] = {"thread_id": "design-thread", "status": "done"}
+        if held:
+            worker["held_design_id"] = folder.parent.name
+        _ = (folder / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 9, "port": 4009}))
+        _ = (folder / codex_mesh.ROSTER_FILE).write_text(json.dumps({"designer": worker}))
+        changed = time.time() - quiet_secs
+        for name in (codex_mesh.SERVER_FILE, codex_mesh.ROSTER_FILE):
+            os.utime(folder / name, (changed, changed))
+
+    def sweep_recorded_server(
+        self, root: Path, folder: Path, *, age_secs: float,
+        clients: int = 0, busy: tuple[str, ...] = (), mesh_log: bool = True,
+    ) -> tuple[str, list[int]]:
+        """Exercise both sweep judgments and record cleanup, without signalling a real process."""
+        reaped: list[int] = []
+
+        def reap(pid: int) -> bool:
+            reaped.append(pid)
+            return True
+
+        stderr = codex_mesh.MeshServerLog(folder) if mesh_log else codex_mesh.NonMeshServerStderr()
+        with (
+            patch.object(codex_mesh, "_running_servers", return_value=[(9, 4009, age_secs)]),
+            patch.object(codex_mesh, "_client_counts", return_value={4009: clients}),
+            patch.object(codex_mesh, "_server_folder", return_value=stderr),
+            patch.object(codex_mesh, "_busy_threads", return_value=busy) as conversations,
+            patch.object(codex_mesh, "_reap", side_effect=reap),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(root=str(root), stop=True)), 0)
+        if busy and not clients:
+            conversations.assert_called_with(4009, {"design-thread": "designer"})
+        label = output.getvalue().splitlines()[0].split("\t")[2]
+        return label, reaped
+
+    def test_held_design_server_waits_for_the_quiet_window_before_sweep_stops_it(self) -> None:
+        now = time.time()
+        for mesh_log in (True, False):
+            for quiet in (codex_mesh.SERVER_IDLE_SECS - 1, codex_mesh.SERVER_IDLE_SECS):
+                with self.subTest(mesh_log=mesh_log, quiet=quiet), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    mesh = roles.state_root() / "held-design" / "mesh"
+                    with patch.object(time, "time", return_value=now):
+                        self.write_sweep_server(mesh, quiet, held=True)
+                        label, reaped = self.sweep_recorded_server(
+                            root / "ordinary-runs", mesh, age_secs=codex_mesh.SERVER_IDLE_SECS + 60,
+                            mesh_log=mesh_log,
+                        )
+                    expired = quiet >= codex_mesh.SERVER_IDLE_SECS
+                    self.assertEqual(label, "stopped" if expired else "in use")
+                    self.assertEqual(reaped, [9] if expired else [])
+                    self.assertEqual((mesh / codex_mesh.SERVER_FILE).exists(), not expired)
+
+    def test_held_design_server_keeps_its_startup_quiet_window_with_old_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mesh = roles.state_root() / "held-design" / "mesh"
+            self.write_sweep_server(mesh, codex_mesh.SERVER_IDLE_SECS + 60, held=True)
+            self.assertEqual(self.sweep_recorded_server(
+                root / "ordinary-runs", mesh, age_secs=codex_mesh.SERVER_IDLE_SECS - 1,
+            ), ("in use", []))
+            self.assertTrue((mesh / codex_mesh.SERVER_FILE).exists())
+
+    def test_held_design_server_with_a_live_turn_or_client_survives_sweep(self) -> None:
+        for clients, busy in ((1, ()), (0, ("designer: ThreadLive",))):
+            with self.subTest(clients=clients, busy=busy), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                mesh = roles.state_root() / "held-design" / "mesh"
+                old = codex_mesh.SERVER_IDLE_SECS + 60
+                self.write_sweep_server(mesh, old, held=True)
+                self.assertEqual(self.sweep_recorded_server(
+                    root / "ordinary-runs", mesh, age_secs=old, clients=clients, busy=busy,
+                ), ("in use", []))
+                self.assertTrue((mesh / codex_mesh.SERVER_FILE).exists())
+
+    def test_design_mesh_without_a_held_owner_keeps_unowned_sweep_behavior(self) -> None:
+        for folder_exists in (True, False):
+            with self.subTest(folder_exists=folder_exists), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                design = "released-design" if folder_exists else "missing-design"
+                mesh = roles.state_root() / design / "mesh"
+                if folder_exists:
+                    self.write_sweep_server(mesh, 1)
+                self.assertEqual(self.sweep_recorded_server(
+                    root / "ordinary-runs", mesh, age_secs=codex_mesh.SERVER_IDLE_SECS + 60,
+                ), ("stopped", [9]))
+                self.assertFalse((mesh / codex_mesh.SERVER_FILE).exists())
+                self.assertEqual(mesh.exists(), folder_exists)
+
+    def test_run_server_keeps_its_quiet_window_with_durable_design_meshes_present(self) -> None:
+        for quiet in (60, codex_mesh.SERVER_IDLE_SECS + 60):
+            with self.subTest(quiet=quiet), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                design_mesh = roles.state_root() / "held-design" / "mesh"
+                self.write_sweep_server(design_mesh, 1, held=True)
+                _ = (design_mesh / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 10, "port": 4010}))
+                runs = root / "ordinary-runs"
+                run = runs / "run-a"
+                self.write_sweep_server(run, quiet)
+                result = self.sweep_recorded_server(runs, run, age_secs=codex_mesh.SERVER_IDLE_SECS + 60)
+                expired = quiet >= codex_mesh.SERVER_IDLE_SECS
+                self.assertEqual(result, ("stopped", [9]) if expired else ("in use", []))
+                self.assertEqual((run / codex_mesh.SERVER_FILE).exists(), not expired)
+                self.assertTrue((design_mesh / codex_mesh.SERVER_FILE).exists())
 
     @staticmethod
     def facts(**changes: object) -> codex_mesh.ServerFacts:
@@ -10627,6 +10737,11 @@ class ServerRecordTests(unittest.TestCase):
 
 class RunFolderNameSweepTests(unittest.TestCase):
     """A sweep of one run root still sees the servers of runs under the other name."""
+
+    @override
+    def setUp(self) -> None:
+        roles_state = self.enterContext(tempfile.TemporaryDirectory())
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"GUILD_ROLES_STATE": roles_state})))
 
     def test_naming_one_real_root_sweeps_both(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
