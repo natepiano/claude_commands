@@ -1,8 +1,8 @@
 # Hierarchy for fast Hana delivery
 
-> **Status: DESIGN — phase 1 done: constraints, map and baseline; questions out to the user.**
+> **Status: DESIGN — phase 2 review folded; Q1 and Q2 answered; other decisions remain open.**
 
-This document records constraints, role contracts, channels, and a measured baseline. Phase 1 changes no live process.
+This document records constraints, role contracts, channels, a measured baseline, and proposed steps. It changes no live process.
 
 Source: [unit plan](build-followups-hierarchies.md), Decisions and Phase 1.
 
@@ -26,7 +26,8 @@ Production references use these files. They came from `~/.claude/scripts/lib/py 
 | remove-running-section | `/home/natepiano/rust/cargo-liner/docs/cargo-port/remove-running-section-production.md` |
 | cargo-liner-style | `/home/natepiano/rust/cargo-liner-style/docs/cargo-liner-style-production.md` |
 | tool-based-ui | `/home/natepiano/rust/hana_catalyst/docs/hana/tool-based-ui-production.md` |
-| sdlc | `docs/plans/sdlc-production.md` on branch `build-followups-sdlc` |
+| sdlc | `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/sdlc-production.md` |
+| performance | `/home/natepiano/rust/tool-based-ui-frame-time/docs/hana/performance-production.md` |
 
 | ID | Kind | Constraint and source |
 | --- | --- | --- |
@@ -51,7 +52,7 @@ Production references use these files. They came from `~/.claude/scripts/lib/py 
 | C19 | user | Keep replies short and answer the question asked. A question about why something happened does not authorize a new action. Source: user, 2026-10-08, `nixos/answer-in-a-few-lines.md` and `nixos/a-question-gets-an-answer-not-an-action.md`. |
 | C20 | derived | Route unit requests through their showrunner. Inference from the user's 2026-10-12 attention rule in `nixos/relay-directly-not-via-user.md`; applied by hana, 2026-10-18, `hana/unit-asks-go-through-the-showrunner.md`. |
 | C21 | user | Leave Remote Control on or off to the user. Send no alert and take no action solely because it is off. Source: user, 2026-10-15, `nixos/act-on-an-alert-a-session-can-do.md`, superseding its earlier example. |
-| C22 | user | Rank strategic goals as Ship Hana, Find Collaborators, Seek Investors, then Business Viability. Change goals only with explicit approval. Source: `~/rust/hanadocs/prioritization goals.md`, Current goals and Maintenance. |
+| C22 | user | Rank strategic goals as Ship Hana, Find Collaborators, Seek Investors, then Business Viability. Goal order gives a soft score bonus, not strict priority lanes. Change goals only with explicit approval. Source: `~/rust/hanadocs/prioritization goals.md:9`, Current goals and Maintenance. |
 | C23 | user | Give demo and herdr work priority over other work until the user ends that order. Source: user, 2026-10-17, `nixos/demo-and-herdr-priority.md`. |
 | C24 | user | Understand builds and speed them up. Use measured evidence for claims about saved time. Source: user, 2026-10-07, `config/build-speed-top-priority.md`. |
 | C25 | derived | Share natedev's build capacity across productions; a unit count is not a separate hardware allowance. Inference from the user's scarce-build-resource goal, 2026-10-16, `config/build-report-primary-job.md`; build-followups and sdlc, Capacity. |
@@ -80,6 +81,10 @@ Production references use these files. They came from `~/.claude/scripts/lib/py 
 | C48 | user | Route structural design to hierarchies-unit and role contracts to sdlc. Send role or name changes through their showrunners. Source: user, 2026-10-20, sdlc, Unit scopes and Production rules; [unit plan, Scope beside sdlc](build-followups-hierarchies.md). |
 | C49 | derived | Keep measurement read-only, with no messages, pushes, or new sessions. Inference from the user's 2026-10-20 request to improve communication; [unit plan, Source and Invariants](build-followups-hierarchies.md) adds the plan-author rule that measurement must add no traffic. |
 | C50 | user | Type Python throughout. Use specific JSON types; allow no file-level type ignore or untyped escape. Source: `~/.claude/CLAUDE.md`, python. |
+| C51 | user | No ship date. Drive Hana functionality at the fastest rate under good ergonomics, beauty, and a robust sdlc. Q1 answer: "no date - we are focused on simply driving functionality at the fastest rate under the constraints of good ergonomics, beauty, and a robust sdlc". Source: user via the showrunner, 2026-10-20. |
+| C52 | user | cargo-liner and its crates supply Hana. Publishing more crates is not a goal. Q2 answer: "they are tools for hana - we have published a couple of them but it's not super important to me that we publish more - as they are becoming more specialized for our work flow". Source: user via the showrunner, 2026-10-20. |
+
+C02 covers top-level peers. It does not forbid every child production: the user made performance a child of tool-based-ui on 2026-10-20. Keep observed child edges until the user answers Q6; propose no new showrunner, unit, promotion, or edge in this document.
 
 C04 is the specific user exception to C06 and C08 for this redesign. The 2026-10-20 rule does not require approval for measurement or writing. Source: `nixos/process-redesigns-are-questions.md`; [unit plan, Decisions](build-followups-hierarchies.md).
 
@@ -106,10 +111,12 @@ These rows describe contracts. They do not assign new duties.
 | Pooled reviewer | `docs/production_format.md`, Words and item 16 | Reviews read-only in a persistent thread | Unit director through review lease |
 | Review template | `docs/production_format.md`, Words | Holds the standing review prompt | Review-pool scripts; never leased |
 | Small-fix helper | `nixos/small-fixes-by-subagent-in-main.md` | Writes a small unowned fix in place | Sending showrunner |
-| Chief designer, planned | sdlc production, Guild heads | Heads designer guild; role design pending | User; peer of other top-level heads |
-| Chief reviewer, planned | sdlc production, Guild heads | Heads reviewer guild; role design pending | User; peer of other top-level heads |
+| Lasting Astra designer | `origin/sdlc-guilds 7c162e23:docs/plans/sdlc-guilds-design.md`, Roles | One per design; instance `<production>-<area>-astra-designer` | One holder per design: its unit director or showrunner |
+| Lasting Astra reviewer | Same design, Roles | At most one per design; instance `<production>-<area>-astra-reviewer` | Same holder rule; retained across design revisions |
+| Chief designer, planned | Same design; sdlc production, Guild heads | Heads the designer guild after role and membership gates pass | User; top-level peer |
+| Chief reviewer, planned | Same design; sdlc production, Guild heads | Heads the reviewer guild after role and membership gates pass | User; top-level peer |
 
-`astra-designer` and `astra-reviewer` are temporary internal IDs. cargo-liner settles the names with the user. Source: sdlc production, Guild heads.
+`astra-designer` and `astra-reviewer` are temporary head IDs, separate from the per-design instance names. cargo-liner settles head names with the user. Guild names and review-guild membership remain open user choices in guilds-unit; this document chooses neither. Source: `docs/plans/sdlc-guilds-design.md` on `origin/sdlc-guilds 7c162e23`, Roles, Choices, and Steps. Each design has one holder, which may be a unit director or a showrunner. The two guilds' heads start only after the lasting-role and membership gates pass; no head starts from this document.
 
 ### Productions
 
@@ -121,11 +128,12 @@ The current edges below come from `~/.claude/scripts/lib/py scripts/production/s
 | remove-running-section | cargo-liner | None | remove-running-section production, Production Context; cargo tools |
 | cargo-liner-style | cargo-liner-style | remove-running-section | cargo-liner-style production, Kind and Parent production |
 | tool-based-ui | hana | None | tool-based-ui production, Production Context; Hana product |
-| sdlc | sdlc | None | Planned in sdlc production; already listed by tree |
+| sdlc | sdlc | None | Running; sdlc production, Production Context |
+| performance | fps | tool-based-ui | Created 2026-10-20 after the Baseline; four units; performance production, Production Context and Units |
 | Chief designer | `astra-designer` | Planned top level | sdlc production, Guild heads |
 | Chief reviewer | `astra-reviewer` | Planned top level | sdlc production, Guild heads |
 
-The style child is an observed edge, not approval to add more levels. The flat-organization constraint remains the target. Source: current tree; user, 2026-10-20, `nixos/flat-organization.md`.
+The style and performance child edges remain observed edges. C02 keeps top-level showrunners as peers; Q6 asks how to resolve the new records without proposing an edge. The live tree labels performance’s showrunner `performance`; its production document names the session `fps`. This is a source difference, not a rename decision. Sources: live `showrunners.py list` and `tree`, and the production documents read for this fold.
 
 ### Channels
 
@@ -173,9 +181,15 @@ The command files in the last column define each path. Script paths are relative
 
 ## Baseline
 
-Command: `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline`.
+Original command: `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline`.
 
-Run `20261020T172406`: 2026-10-20 17:24 EDT; duration about 22.6 s. Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT; end excluded. Snapshot rows use the end time. Source: the impl writer's full output in `/tmp/claude/unit/62f4d2b7-0062-437a-b355-57bb09bfbc9e/phases/1/impl_baseline.txt`. The lines below sum its printed rows. Build, test, and token shares cover natedev only; repository labels are those in the output.
+Exact-window re-run command: `~/.claude/scripts/lib/py scripts/hierarchies/measure.py baseline --since 2026-10-13T17:24 --until 2026-10-20T17:24`. The date-time form came in Phase 2; its end is excluded.
+
+Run `20261020T172406`: 2026-10-20 17:24 EDT; duration about 22.6 s. Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT; end excluded. The original capacity and waiting snapshots below are at 2026-10-20 17:24 EDT. The corrected rank snapshot is at 2026-10-20 22:09 EDT; it does not recreate the earlier live state. Source: the impl writer's full output in `/tmp/claude/unit/62f4d2b7-0062-437a-b355-57bb09bfbc9e/phases/1/impl_baseline.txt`. The lines below sum its printed rows. Build, test, and token shares cover natedev only; repository labels are those in the output.
+
+The Phase 2 flow and rank rows below come from the exact-window re-run `20261020T220955`, saved at `/tmp/claude/unit/62f4d2b7-0062-437a-b355-57bb09bfbc9e/phases/2/baseline_fold.txt`. Capacity, resource, and attention rows retain the original report. A re-run of the same window reads different resource values because source stores take later records with earlier stamps. Keep the old resource values for this comparison; do not read the change between reports as a hierarchy effect. The saved re-run holds the later values. The printed old bounds omit seconds; the reports cannot assign each difference to a later write or an edge.
+
+The original `goal 1 issues closed` row counted 7, n=7. The current source has no usable closure date for three cargo-port issues: `phase state lifecycle enum`, `scope map owns its two way invariant`, and `worktree label takes its entry not an index` each have `date_closed: [[a]]`. They cannot be placed in the window now. This source change does not show that the old count was false. The corrected row counts only the dated records now available; it excludes declines and separates projects. A closure naming a commit is a text check, not proof of target-branch delivery.
 
 - Snapshot: Hana has 11/41 units (26.8%) and 66/187 workers (35.3%). Workers cover natedev only.
 - Hana build/check row: 14,897.2/18,571.3 recorded minutes (80.2%); n=12439 Hana steps.
@@ -280,17 +294,34 @@ tokens / /tmp/claude/lfo-gate31-fix                                             
 tokens / /tmp/claude/lfo-readout-fix                                                                                                         65,204,929                   356     2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  usage ledger; input + cache writes + cache reads + output; natedev only
 tokens / cwd has no repository                                                                                                               18,657,248,949               125338  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  usage ledger; input + cache writes + cache reads + output; natedev only
 
-Flow to Hana main (recorded phase/issue completion; merges not recorded)
-Measure                        Value                             n   Window                                                       Source
-Hana phases done               89                                89  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only
-Hana phase time                median 634.1 min; p90 2183.5 min  89  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only
-Hana wait / user               not recorded                      0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
-Hana wait / showrunner         not recorded                      0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
-Hana wait / gate               not recorded                      0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
-Hana wait / idle               not recorded                      0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
-goal 1 issues moved to active  not recorded                      0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs date_active; stage/date_modified do not record a transition
-goal 1 issues closed           7                                 7   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs date_closed; date-only precision
-goal 1 active to closed        not recorded                      0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs date_active + date_closed; date-only precision
+Flow to Hana main (recorded phase/issue completion; local-ref merge commits)
+Measure                                                     Value                                                           n   Window                                                       Source
+Hana phases done                                            89                                                              89  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only
+Hana phase time                                             median 634.1 min; p90 2183.5 min                                89  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only
+Hana wait / user                                            not recorded                                                    0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
+Hana wait / showrunner                                      not recorded                                                    0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
+Hana wait / gate                                            not recorded                                                    0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
+Hana wait / idle                                            not recorded                                                    0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  progress_history.py must record wait kind and start/end; activity labels do not prove waits
+goal 1 issues moved to active                               not recorded                                                    0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs date_active; stage/date_modified do not record a transition
+goal 1 issues closed                                        4                                                               4   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs date_closed; date-only precision; reason declined excluded
+goal 1 active to closed                                     not recorded                                                    0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs date_active + date_closed; date-only precision
+goal 1 issues closed / cargo-port / other                   not recorded (0 dated in window; 3 closure dates not recorded)  0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs project + date_closed; date-only precision; reason declined excluded
+goal 1 issues closed / hana / Hana                          2                                                               2   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs project + date_closed; date-only precision; reason declined excluded
+goal 1 issues closed / hanadocs / other                     2                                                               2   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs project + date_closed; date-only precision; reason declined excluded
+goal 1 Hana-project issues closed                           2                                                               2   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs project + date_closed; date-only precision; reason declined excluded
+goal 1 declined closures excluded                           0                                                               0   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs reason declined + date_closed; date-only precision
+goal 1 Hana closures naming a merge commit                  0                                                               2   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs reason naming a merge commit or merge_commit; text only, not checked against Git
+Hana closure merge commit / arrange jacks widget            not recorded                                                    1   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs reason naming a merge commit or merge_commit; text only, not checked against Git
+Hana closure merge commit / shortcuts and inspect commands  not recorded                                                    1   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  Hanadocs reason naming a merge commit or merge_commit; text only, not checked against Git
+Hana merges / origin/init/catalyst                          72                                                              72  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-13                                    3                                                               3   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-14                                    23                                                              23  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-15                                    11                                                              11  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-16                                    4                                                               4   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-17                                    10                                                              10  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-18                                    12                                                              12  2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-19                                    5                                                               5   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
+Hana merges / 2026-10-20                                    4                                                               4   2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch
 
 User attention
 Measure                             Value                       n    Window                                                       Source
@@ -334,25 +365,219 @@ questions answered                  not recorded                0    2026-10-13 
 question answer time                not recorded                0    2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)  showrunner/outstanding: no answer history or answered_at; producer must record answers; natedev only
 
 Rank coverage
-Measure                                Value  n   Window                         Source
-top 20 goal 1 open issues with a unit  2/20   20  snapshot 2026-10-20 17:24 EDT  backlog-rankings + Hanadocs unit frontmatter; assignment does not prove a running unit
-live units naming an open issue        9/41   41  snapshot 2026-10-20 17:24 EDT  production Issue column or open issue unit + showrunner frontmatter
+Measure                                  Value            n   Window                         Source
+top 20 goal 1 open issues with a unit    2/20             20  snapshot 2026-10-20 22:09 EDT  backlog-rankings + open issue links; unit has a running phase or live session
+live units naming an open issue          8/44             44  snapshot 2026-10-20 22:09 EDT  open production Issue link or open issue unit + showrunner; running phase or live session
+top 20 goal 1 open issues covered score  140/604 (23.2%)  20  snapshot 2026-10-20 22:09 EDT  backlog-rankings score; covered score / all top 20 scores; running phase or live session
 ```
+
+
+### Prior-week Hana merges
+
+Source: the measure writer's read-only check in `/tmp/claude/unit/62f4d2b7-0062-437a-b355-57bb09bfbc9e/phases/2/impl_summary_test.txt`. It uses `read_hana_merges(hana_repository([]))`, then `merge_flow` with `window_bounds('2026-10-06T17:24', '2026-10-13T17:24', now)`. Repository: `/home/natepiano/rust/hana`. Git command: `git log --first-parent --merges --format=%H%x09%cI origin/init/catalyst`. Both weeks count first-parent merges on the local ref by commit time, with no fetch. A local ref can be behind the remote.
+
+| Measure | Value | n | Window | Source |
+| --- | --- | --- | --- | --- |
+| Hana merges / origin/init/catalyst | 324 | 324 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-06 | 14 | 14 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-07 | 55 | 55 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-08 | 89 | 89 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-09 | 33 | 33 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-10 | 36 | 36 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-11 | 26 | 26 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-12 | 40 | 40 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+| Hana merges / 2026-10-13 | 31 | 31 | 2026-10-06 17:24 EDT to 2026-10-13 17:24 EDT (end excluded) | Local-ref first-parent merge check above |
+
+For the current window, **Flow to Hana main**, `Hana merges / origin/init/catalyst` is 72, n=72. Its daily rows for 2026-10-13 through 2026-10-20 are 3, 23, 11, 4, 10, 12, 5, 4; each row's n equals its count. The first and last days in both weekly lists are partial. The earlier review's current-week daily list is superseded by these checked rows. The fall from 324 to 72 does not explain its cause or establish a hierarchy effect.
+
+In **Flow to Hana main**, `goal 1 Hana-project issues closed` is 2, n=2, and `goal 1 Hana closures naming a merge commit` is 0, n=2. Plan phases deliver most Hana work without an issue link: 72 merges against 2 Hana-project closures in this window. These are different records, not a matched delivery ratio. Receipts and scope checks must connect them before a verified functionality rate is known.
+
+## Candidates
+
+### Rules shared by all candidates
+
+Top-level showrunners stay peers: build-followups, remove-running-section, tool-based-ui, sdlc, and the planned chief designer and chief reviewer. Keep cargo-liner-style under remove-running-section and performance under tool-based-ui while Q6 is open. Propose no new showrunner or unit. All candidates use guilds-unit's lasting Astra designer and Astra reviewer roles, one holder per design (unit director or showrunner), and `<production>-<area>-astra-designer` / `<production>-<area>-astra-reviewer` instance names. Heads start after the role and membership gates. Guild names and review membership stay with the user's open guilds-unit choices. Source: Map, Roles; `origin/sdlc-guilds 7c162e23:docs/plans/sdlc-guilds-design.md`.
+
+Peers read the one global `backlog_rank`. The watcher computes scores and ranks; no workflow writes ranks directly. hana may propose re-ratings through `/prioritize`, with user approval; it does not maintain a separate backlog or command peers. Goal order gives a soft score bonus, not strict lanes. Sources: `commands/prioritize.md:51` and `~/rust/hanadocs/prioritization goals.md:9`. Demo and herdr keep their standing priority under C23. User-ordered work stays admitted under C05; a peer records an exception instead of refusing the user.
+
+All candidates share the current slots and memory brake, try a free Mac for supported tests, respect holds, and accept a full supported Mac pass. natedev retains the role-to-account map and account authority. Moves follow the current queue and actual-refusal rules. No quota meter alone causes a move. No candidate buys accounts, downgrades a judgment role, or ends an active run to improve a count. Workers stay across phases and repairs; pooled reviewers keep their separate lifetime.
+
+Common repairs apply equally to A, B, and C. Check ownership at run end; end only confirmed completed-run workers. Stop unrequested report timers. Keep queues and show one item when asked. Send peer work to peers and user decisions through the showrunner. Target zero **unauthorized** pushes after a failed review. Preserve priority-2 and registered-text exceptions in `scripts/notify/pushover.py:316-319`; the raw failed-review count does not establish a fault. Changing those exceptions is a separate user question.
+
+Success means Hana functionality delivered per week, held to ergonomics, beauty, and a robust sdlc (C51). Count Hana-project closures, excluding declines, with receipts on the target branch, alongside Hana merges on `origin/init/catalyst`. Keep supplier closures separate. A Hana issue has project `hana`, `hana_diegetic`, `hana_conduit`, or `hana_liminal` and concerns code in the Hana repository; `backlog_goal: 1 - Ship Hana` alone does not establish that. Source: the measure writer’s fold inspection of issue project fields in `~/rust/hanadocs/issues` and its archive, relayed on 2026-10-20. Plan phases deliver most Hana work without an issue link: Baseline **Flow to Hana main**, `Hana merges / origin/init/catalyst` has 72, n=72, against `goal 1 Hana-project issues closed` 2, n=2; `goal 1 Hana closures naming a merge commit` is 0, n=2. Merge counts also need scope and quality checks: neither a merge nor a closed issue has a fixed amount of functionality.
+
+### A — Today's tree, repaired, with the answered cargo supplier rule
+
+**Roles and priority.** Keep current production scopes, directors, and workers. Each showrunner keeps its local selection duty within approved scope and reads the shared global rank as an input, with the standing exceptions above. A adds no mandatory cross-production order. The cargo note records dependencies and any deferral. Unresolved product choices go to the user. No new cross-production owner appears.
+
+**Admission.** Apply the answered Q2 Hana-cost test to cargo work. A new cargo unit, later unit run, added scope, or standing style-board pull names the Hana work it supports or the Hana cost it aims to cut, its current evidence, and a result check. A goal-1 tool issue alone is insufficient. For a small unowned fix under C47, use a short existing work note, not a new proposal or unit. User-ordered admissions and herdr proceed as exceptions. Finish already approved work. build-followups and sdlc keep their approved scope while Q3 is open; robust sdlc remains a constraint, not optional waste.
+
+**Capacity and contact.** Use current shared capacity and contact paths. Local showrunners coordinate scarce requests peer to peer. natedev keeps account control. Common cleanup may reduce unused sessions and traffic; its delivery effect is unknown. Cargo cost evidence adds some admission work; record that time.
+
+**Answers.** Q1 is answered: no date; maximize functionality under C51, without deadline cuts. Q2 is answered: cargo supplies Hana; more publishing is not a goal. Q3's Hana-cost answer would permit a later B trial only after wait evidence; a guaranteed share keeps A within that share. Q4's budget can bound requested review work; individual verdicts leave old queues open. No answer means no queue-drain claim. Q5 fixed accounts bound the pool; growth permission only permits a later measured purchase proposal.
+
+### B — Shared rank order and a Hana-cost test for the other suppliers
+
+**Roles and priority.** Keep A's common repairs and answered cargo test. B's added rule is a shared admission order across peers plus a Hana-cost test for build-followups and sdlc. The user must first answer Q3 = Hana cost and approve this duty. hana reads the global rank and proposes re-ratings; it has no rank-writing or superior role. Preserve robust sdlc and measured build-speed work rather than rejecting them for lacking a near-term issue closure.
+
+**Admission procedure.** Apply the added check at new-unit approval, a later run's Work Order before dispatch, a new add-on before it enters scope, and each standing board pull. Choose the highest-ranked eligible work that the owner can do within scope, file ownership, dependencies, and available capacity. Record candidate issue, global rank and score at selection, owner, dependency, cost evidence, decision time, and any deferral reason. Keep tied-score order from the watcher. A supplier request names the affected Hana-project work and a measured Hana cost; it cannot become eligible merely by carrying goal 1. Receiving peers check the claimed benefit. Peers settle competing requests; a real priority conflict goes to the user. C05 user orders and C23 demo/herdr bypass this added check with a recorded reason. C47 small fixes use an existing short note. Keep in-flight work unchanged; do not restart or cancel it for the trial.
+
+**Capacity and contact.** Apply the approved shared order only at the next free slot or new worker allocation. Keep running leases, persistent threads, account map, and move queue. Supplier workers remain in supplier repositories; reducing their builds cannot directly reduce `build/check minutes / hana`. It may release shared memory or quota only if the new wait records show that link. Contact stays as in A; admission and deferral records add peer work and must be timed.
+
+**Answers.** Q1 is answered: no date; C51 quality and robust sdlc constrain the test. Q2 is answered: cargo supplies Hana, as in A. Q3 = Hana cost is necessary but insufficient: four weeks must also show material Hana waits following non-Hana load. Under a guaranteed share, keep A; do not start B's added rule. Q4 budget or individual verdicts changes neither rule without approval; no automatic queue closure is part of B. Q5 fixed accounts are the trial default; any growth decision is separate and must account for trial attribution.
+
+### C — Capacity-led
+
+**Roles and priority.** Keep A's scopes, cargo test, and repairs. Propose natedev as the peer owner of cross-production slot and new-worker allocation by the existing global rank. The user approves the added duty; roles-unit writes the contract change. This is a capacity service, not control over scope, judgments, or another showrunner. There are no separate product ranks to reconcile.
+
+**Admission and capacity.** Existing showrunners admit approved work. Each scarce-resource request names its global rank, owner, resource, dependency, and standing exception. The capacity owner orders eligible requests at lease boundaries; it never moves workers out of an active run or overrides account rules. Added request and grant traffic can itself delay delivery. Record that delay before expanding the service.
+
+**Contact and answers.** Routine allocations go peer to peer; product trade-offs reach the user once. Q1 is answered: no date; use functionality and quality, not a deadline. Q2 is answered: cargo serves Hana, but remains a peer production. Q3 = Hana cost permits comparable cost claims; a guaranteed share partitions capacity before global rank applies within each share. Q4 budget or individual verdicts governs only requested decisions, with no queue-drain claim. Q5 fixed accounts make allocation the main control; permission to grow does not authorize a purchase or alter the move queue.
+
+## Comparison
+
+Use the historical Baseline window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT, end excluded, natedev. Capacity and pending-attention rows keep the 17:24 EDT snapshot; rank rows use the separate 22:09 EDT snapshot. Later snapshots cannot recreate earlier live ownership. Resource rows keep the original values despite later source writes. Each cell below scores the added mechanism against common repairs. A and B both include those repairs and the answered Q2 cargo test. Expected size is unknown unless a row states an explicit record-completeness or correctness target. The former percentage and phase-count forecasts had no measured basis and are removed. Report window, n, scope, and missing records for each later result.
+
+All candidates keep C02–C03, C05–C32, C34–C44, C46–C50 under the shared rules and approval guards. The table retains differences and risks. A superior over a top-level peer breaks C02/C03 and is out. Taking director account authority from natedev breaks C33 and is out. No core candidate adopts age closure or a new tree edge.
+
+| Measure or constraint; Baseline table and row | A — repaired plus cargo test | B — added shared order and supplier test | C — capacity service |
+| --- | --- | --- | --- |
+| Capacity: **Capacity on Hana**, all `units /` rows; summary Hana 11/41, Hana row n=11. | No count target; retain approved scope. | No count target; redirect future selection only. Supplier units remain outside Hana repositories. | No count target; resource order changes. |
+| Capacity: same table, all `workers /` rows; summary Hana 66/187; `workers / worktree not recorded / scope not recorded` 51, director not running 51, n=51. | Target zero unexplained entries after ownership checks, not termination of all 51. | Same cleanup; no extra worker target. | Same cleanup; size of a new-lease saving unknown. |
+| Resource use: same table, `build/check minutes / hana` 14897.2, n=12439, and all repository rows. | Avoid confirmed duplicate runs; size unknown. | Same repairs. Tool builds occur in other repositories. Shared-load relief can reduce Hana waiting, not directly its build runtime. | Queue order can reduce waits; no runtime saving claimed. |
+| Resource use: same table, `test minutes / hana` 16194.6, n=2704, and all repository rows. | Preserve gates; duplicate-run saving unknown. | Same as A until a supplier change proves a matched saving. | Scheduling alone does not shorten tests. Mac records needed for total cost. |
+| Resource use: same table, `tokens / /home/natepiano/rust/hana` 22,585,130,240, n=134547; all repository rows. | Completed-run cleanup may lower traffic; size unknown. | Added cost notes consume tokens; avoided supplier work may offset them. No per-issue saving is known. | Resource requests add tokens; allocation benefit unknown. |
+| Phase flow: **Flow to Hana main**, `Hana phases done` 89, n=89. Daily and weekly phase history is not measured by this report. | Observe only; phase size changes the count. | Same target as A: no separate count target or proven mechanism. | Observe only; no phase forecast. |
+| Phase flow: same table, `Hana phase time` median 634.1 min, p90 2183.5 min, n=89. | Direction and size unknown. | Direction and size unknown until waits show a cause. | Down only if resource waits dominate; size unknown. |
+| Phase flow: same table, four `Hana wait /` rows, each not recorded, n=0. | Record each kind before claims. | Need quota, memory, gate, and user waits plus same-hour load. | Need request, grant, and owner delay as well. |
+| Issue flow: same table, `goal 1 issues moved to active` and `goal 1 active to closed`, not recorded, n=0 each. | Add activation history; no duration target. | Same missing records; no faster activation claim. | Same missing records; no duration claim. |
+| Issue flow: same table, `goal 1 issues closed` 4, n=4; `goal 1 Hana-project issues closed` 2, n=2; `goal 1 issues closed / hanadocs / other` 2, n=2; cargo-port dates not recorded (3 missing, n=0); `goal 1 declined closures excluded` 0, n=0; `goal 1 Hana closures naming a merge commit` 0, n=2. | Hana-only deliveries with receipts; supplier results separate. No numerical gain claimed. | Compare only the added rule; effect may be zero or negative. No comparison of all-project closures with Hana deliveries. | Benefit unknown without resource wait evidence. |
+| Issue flow: same table, `Hana merges / origin/init/catalyst` 72, n=72; daily rows 3, 23, 11, 4, 10, 12, 5, 4, n=count each. **Prior-week Hana merges**, same total row 324, n=324, in its preceding seven-day window. | Main outcome alongside Hana-project receipt-backed closures. | Count plan-driven work without requiring issue links; assess scope and quality. | More merges alone cannot prove faster functionality. |
+| Phase flow: quota refusals and Hana refusal minutes; not measured by this report. | Record actual refusals; exclude probe subjects and quota readings. | Benefit requires waits to follow non-Hana use on the same role account. | Allocation must obey existing account and credit rules. |
+| Phase flow: memory-brake wait minutes; not measured by this report. | Record memory/slot brakes separately from merge gates. | Benefit requires same-hour non-Hana memory load to precede waits. | A capacity owner may help only if these waits dominate. |
+| Admission overhead and time to first effect; not measured by this report. | Cargo notes add work at the next eligible pull/run/addition; no effect before then. | Extra notes for build-followups/sdlc and shared choices; size unknown. Time all checks, deferrals, and time to first affected admission. | Added request/grant time; size unknown. Effect begins at a free lease. |
+| Attention: **User attention**, all `phone pushes /` rows; summary 64, after failed review 16, n=64. | Zero unauthorized sends target; approved priority-2 and registered texts remain. The 16 are not 16 proven faults. | Same correctness target, with common repairs scored equally. | Same target; capacity conflicts may add valid questions. |
+| Attention: same table, all agent, automation, and user-bound daily message rows. | End stale exchanges and unrequested timers; size unknown. | Same cleanup; extra coordination may offset savings. | More peer request traffic; net size unknown. |
+| Pending attention: same table, `waiting / changes` 315, oldest 11.7 days, n=315. | No removal without a verdict; age may rise. | Same; no admission effect is credited as queue drain. | Same; allocation does not settle reviews. |
+| Pending attention: same table, `waiting / proposals` 161, oldest 11.7 days, n=161. | Keep queue; no reduction target. | Optional arrivals may fall, size unknown. | No reduction target. |
+| Pending attention: same table, `waiting / efficiency items` 121, oldest 22.7 days, n=121. | Keep requested one-at-a-time rule. | Same; no count or age target. | Same; no count or age target. |
+| Pending attention: same table, `waiting / questions` 1, oldest 0.1 days, n=1. | Ask once, then count. | Added policy questions can raise it. | Added share questions can raise it. |
+| Pending attention: same table, `questions answered` and `question answer time`, each not recorded, n=0. | Add answer history; no speed claim. | Same; cannot promise faster user decisions. | Same. |
+| Rank coverage: **Rank coverage**, `top 20 goal 1 open issues with a unit` 2/20, n=20; `top 20 goal 1 open issues covered score` 140/604 (23.2%), n=20; snapshot 2026-10-20 22:09 EDT, open issues with live ownership. | Descriptive snapshot; validate current phase ownership. | Follow a fixed starting set through completion. Top 20 are Hana-project issues only Hana's own units can take; suppliers do not fill that gap. | Resource rank cannot make an ineligible unit own an issue. |
+| Rank coverage: same table, `live units naming an open issue` 8/44, n=44; snapshot 2026-10-20 22:09 EDT. | Validate the issue remains open and owner live. | Same; completed covered work can lower the next moving snapshot. Never a success gate alone. | Same; no link-count target. |
+| C01 — fastest Hana delivery | Kept: choose A now because no measured B advantage exists. | Kept with risk: extra admission work can delay useful sdlc; test only after evidence. | Kept with risk: new owner can add delay without a resource bottleneck. |
+| C04 — user decides redesign | Kept: questions Q7–Q10 approve new duties separately. | Kept only after Q3, evidence, and Q11 approval. | Kept only after Q12 approval; not a current step. |
+| C33 — account authority | Kept: natedev remains owner. | Kept: no rank rule overrides map or move queue. | Kept with risk: allocation must stay with natedev and cannot bypass moves. |
+| C45 — product priority | Kept: no deadline or cut order. | Kept with risk: shared order is a priority duty; user orders and C23 override it. | Kept with risk: allocation must not become a scope decision. |
+| C51 — functionality and robust sdlc | Kept: protect ergonomics, beauty, and robust sdlc. | Kept with risk: cost claims must not suppress robust sdlc; compare functionality, not issue volume. | Kept: preserve quality gates; resource gains alone do not win. |
+| C52 — cargo supplies Hana | Kept: apply cargo Hana-cost test now after duty approval. | Kept: same cargo test, not an added B benefit. | Kept: same cargo test, within shared allocation rules. |
+
+Daily/weekly phase history, daily tokens, and account-refusal records are outside the fold report’s changes. They are not measured here; this does not prove that their source records are absent. Do not use unverified review counts as replacement Baseline rows.
+
+The judge found no established B advantage after Q2: its estimated first-trial difference is about zero, and the small possible steady benefit is unproved. Those are review judgments, not Baseline measurements. A and B can both be limited by the user's review loop, Hana's own merge gate, or Hana's own builds. Do not infer capacity loss from token share or accounts reaching a limit. Record an actual Hana refusal and its duration. No reviewed account-out event proves a Hana refusal; probe subjects must be removed before counts are used.
+
+## Recommendation
+
+Use A now: repair the existing tree and apply the answered cargo Hana-cost test; keep top-level peers and observed child edges.
+Measure Hana functionality under C51: Baseline **Flow to Hana main**, `Hana merges / origin/init/catalyst` 72, n=72; `goal 1 Hana-project issues closed` 2, n=2; commit-text coverage 0, n=2 (`goal 1 Hana closures naming a merge commit`); verified receipts remain missing.
+B adds only a shared rank order and a Hana-cost test for build-followups/sdlc; common cleanup and cargo supply do not distinguish it from A.
+Start B only if Q3 = Hana cost and four weeks of records show material Hana waits that follow non-Hana load.
+Set quota/memory waits beside same-hour non-Hana role-account use and natedev memory; separate merge-gate and user waits.
+If these waits are under about 5% of Hana phase time, or do not follow that load, treat B as A and keep A.
+If waits are material and follow that load, ask for B's bounded trial; protect robust sdlc and the standing demo/herdr order.
+Keep C as an unapproved alternative; there is no measured case for its added owner yet.
+Q1 and Q2 are answered; no review-age closure or account growth is assumed while Q4/Q5 stay open.
+The director's judge and Astra findings are folded here; this proposal authorizes no live process change.
+
+## Steps
+
+Steps follow dependencies. Correctness comes first. Every changed duty goes through the showrunners to sdlc's roles-unit; phases-unit owns phase contract edits. Codex workers implement only after the specific user decision. No step proposes a new showrunner, unit, promotion, or edge. Report the new window, covered n, missing n, and scope with every later measure.
+
+1. **Check push authorization and repair confirmed faults.** Changes: trace `scripts/notify/review.py`, `scripts/notify/pushover.py`, and `scripts/message/send.py`, including the existing priority-2 and registered-text exceptions. Check originating admission paths in `commands/showrunner/add_unit.md` and `scripts/production/add_unit.py` as well. Roles: showrunners own user contact; roles-unit writes any changed duty through the showrunners. Measure: Baseline **User attention**, phone-push summary 64 pushes, 16 after failed review, n=64. Classify those sends by approved exception or unauthorized delivery before diagnosing faults; target zero unauthorized sends, with every exception retained and explained. Size of a fault reduction is unknown until classified. **Undo:** revert a faulty patch while retaining failed-review records and the approved exception behavior; never suppress required emergency delivery. **Needs the user: yes** for a new audit duty (Q7); a confirmed implementation fault under the existing contract needs no new policy approval. Any exception change is a separate question, not part of this step. This stays first because unauthorized user contact is a correctness defect even if its delivery gain is unknown.
+
+2. **Record waits and delivery before an admission trial.** Changes: propose typed events at `scripts/direct/progress_history.py` and its writers, through phases-unit; close-out receipts in `commands/showrunner/produce.md` and `scripts/production/merge_checkpoint.py`; activation in Hanadocs issue writers; answer history at `update_registration.py` / `dailies_render.py`; read-only additions to `scripts/hierarchies/measure.py` and fixtures. Roles: event producers own accuracy; receiving showrunners check receipts; roles-unit writes the added duties through showrunners (Q8). Record phase, owner, UTC start/end, and one named state: WaitingForQuotaRefusal, WaitingForMemoryOrSlot, WaitingForMergeGate, WaitingForUser, WaitingForSupplier, or ReadyWithoutCapacity. Missing history is HistoryNotRecorded, not zero. A merge receipt names project, issue or plan phase, commit, target branch, merge time, and delivered scope. Exclude declines; verify branch reachability; mark ReceiptMissing when absent. Measure: Baseline **Flow to Hana main**, four `Hana wait /` rows and activation/duration rows, plus **User attention** answer rows: not recorded, n=0 each. Target explicit records for all new trial events, with covered and missing n. Baseline **Flow to Hana main**, `goal 1 Hana-project issues closed` 2, n=2, and `goal 1 Hana closures naming a merge commit` 0, n=2, set the receipt gap; `Hana merges / origin/init/catalyst` 72, n=72, counts main-branch merges. Neither closure has receipt text; target a checked receipt or explicit ReceiptMissing for each new closure. Do not treat supplier closures as Hana. **Undo:** stop new writers, retain history, and print not recorded for uncovered windows. **Needs the user: yes** — recording and receipt duties change. Record for four weeks before considering B; no time-saving target is established.
+
+3. **Apply A's cargo supplier test at explicit boundaries.** Changes: after Q9 approval, update cargo production documents, `commands/producer/greenlight.md`, `commands/showrunner/add_unit.md`, `scripts/production/add_unit.py`, and standing-board pull rules. New unit: before creation; later run: before its first Work Order dispatch; added work: before acceptance; standing style issue: before the next pull. Directors record the Hana work/cost and before/after check in the existing work note. Roles: cargo showrunners admit within approved scope; receiving peers check the benefit. roles-unit writes responsibilities through showrunners; phases-unit receives Work Order changes. C05 user orders and C23 herdr/demo proceed with an exception record; C47 small fixes need only a short note. Keep current work and thread ownership. Measure: Baseline **Flow to Hana main**, `goal 1 Hana-project issues closed` 2, n=2, `Hana merges / origin/init/catalyst` 72, n=72, and four `Hana wait /` rows not recorded, n=0 each; target no loss of Hana functionality or quality from the added check. Direction and size of a gain are unknown. Time checks and time to first affected admission; no overhead baseline exists. **Undo:** remove the new note requirement at the next boundary with user approval, finish accepted work, and retain evidence. **Needs the user: yes** — Q2 settles purpose, not this new admission duty; Q9 approves it.
+
+4. **Check completed-run ownership without changing the tree.** Changes: propose a run-end check in `scripts/agents/codex_mesh.py` and `commands/unit/direct.md`; audit notifier registration in `scripts/message/notifier.sh`. Roles: directors confirm run completion, workers retain active threads, showrunners remove only unrequested timers; roles-unit and phases-unit own contracts through showrunners (Q10). Measure: Baseline **Capacity on Hana**, `workers / worktree not recorded / scope not recorded`, 51, director not running 51, n=51. Target zero unexplained entries; recover provenance or end confirmed completed-run workers, not every worker without a running director. Preserve pooled reviewers. **Undo:** restore the saved association and resume the same worker thread if a valid run was ended; revert the check and retain its evidence. **Needs the user: yes** — run-end check duty changes. There is no time target for tree edges or guild-head launch, and no such change is proposed here.
+
+5. **Run the settling test, then decide whether B merits a trial.** Changes: after Step 2, collect four full weeks of wait events and merge receipts under A; extend this document's Comparison with the result. Set actual quota and memory waits beside same-hour non-Hana tokens on the same role account and non-Hana build memory on natedev. Exclude probe subjects; report actual refusal counts, refused minutes, memory-brake minutes, merge-gate minutes, and user minutes separately. Roles: hierarchies-unit measures read-only; peers inspect cause; no new allocation owner. Measure: Baseline **Flow to Hana main**, four `Hana wait /` rows not recorded, n=0 each; `Hana merges / origin/init/catalyst` 72, n=72; `goal 1 Hana-project issues closed` 2, n=2; `goal 1 Hana closures naming a merge commit` 0, n=2. Settling threshold: under about 5% of phase time, or no following of non-Hana load, keep A. Material waits following that load plus Q3 = Hana cost permit asking Q11; they do not authorize B. **Undo:** end the observation extension and keep A; preserve records. **Needs the user: no** for read-only comparison under already approved records; **yes** for any policy verdict or trial duty. Four weeks provide evidence, not proof of causation; distinguish a shared-load association from a Hana-only gate.
+
+6. **Only after both conditions, trial B's added rule.** Changes: Q11 approval updates participating build-followups/sdlc production documents, shared selection notes, `commands/producer/greenlight.md`, `commands/showrunner/add_unit.md`, `scripts/production/add_unit.py`, and later-run/add-on/board-pull contracts. Apply the B admission procedure above. Roles: peer showrunners select and record deferrals; hana proposes re-ratings through `/prioritize`; roles-unit writes contract changes through showrunners, phases-unit owns phase text. Start at a dated boundary after records and A's cleanup are stable. Include only newly admitted participating work; label work already underway and retain its old routing. Freeze the starting issue set and its scores for follow-through, while live choices still use current global rank and C23. Measure: Baseline **Flow to Hana main**, `Hana merges / origin/init/catalyst` 72, n=72, `goal 1 Hana-project issues closed` 2, n=2, and `goal 1 Hana closures naming a merge commit` 0, n=2; **Rank coverage**, `top 20 goal 1 open issues covered score` 140/604 (23.2%), n=20, snapshot 22:09 EDT, remains descriptive, not a gate. Use at least four weeks, or a declared matched-work comparison with enough comparable deliveries; never decide from a lone seven-day change. Report the changed work mix as an intended effect, compare scope/quality/cost by work class, and report missing receipts rather than treating missing links as failure. Measure admission minutes and time to first effect. Effect size is unknown; B minus A may be zero or negative. **Undo:** ask to restore A at the next admission boundary, preserve accepted work and records. **Needs the user: yes** — Q3, evidence, and Q11 must all clear; shared selection and supplier duties change. Keep fixed resources unless Q5 separately authorizes a measured addition; no reserve exists until the user sets its size.
+
+7. **Report the outcome and keep approval separate from measurement.** Changes: update this design's Comparison with dated A/B results and the recommendation. Roles: hierarchies-unit compares; showrunners give the user one decision; roles-unit receives any later duty change. Measure: Baseline **Flow to Hana main**, `Hana merges / origin/init/catalyst` 72, n=72, `goal 1 Hana-project issues closed` 2, n=2, `goal 1 Hana closures naming a merge commit` 0, n=2, and `goal 1 declined closures excluded` 0, n=0. Count supplier output separately; verified delivery remains not recorded until receipts are checked. Compare matched scope, ergonomics, beauty, robust sdlc, admission overhead, and resource waits. Common cleanup is scored on both sides; if changes overlap, label the result a combined trial. Require at least four weeks or suitable matched work before a verdict. Changed mix alone does not make B inconclusive; missing receipts, unequal gates, or insufficient comparable work can. **Undo:** ask to retain or restore A; preserve quality gates and records. **Needs the user: yes** — expansion, reversal, spending, or C's proposed capacity duty (Q12) is a new decision. No count-only success target is justified today.
 
 ## Questions for the user
 
-These are requests for user decisions. Each unit recommendation is a proposal; it changes no current rule.
+Answers below are the user's words, relayed by the showrunner on 2026-10-20. Open questions are design text for the showrunner, not a new message sent by this measurement work.
 
-Q1. Does Hana have a ship date or first public release date, and what must that release include? Unit recommendation: name the date and release scope, or say no date. With no date, improve throughput in goal 1 rank order.
+Q1. **Answered.** Does Hana have a ship date or first public release date, and what must that release include?
 
-Q2. Is cargo-liner, including cargo-port, cargo-tile, and cargo-berth, a separate product or a supplier of tools to Hana? Unit recommendation: supplier; admit its work against a measured Hana cost.
+> no date - we are focused on simply driving functionality at the fastest rate under the constraints of good ergonomics, beauty, and a robust sdlc
 
-Q3. Must build-followups and sdlc cut a measured Hana cost, or do they have a guaranteed share of capacity? Unit recommendation: require a measured Hana cost; reserve a fixed small share for broken-tool fixes.
+Q2. **Answered.** Is cargo-liner, including cargo-port, cargo-tile, and cargo-berth, a separate product or a supplier of tools to Hana?
 
-Q4. How much daily time can you give reviews and questions, and may an old unreviewed change close without your check? Unit recommendation: name a daily budget. Close unreviewed changes older than 7 days as accepted, only after you approve this new rule.
+> they are tools for hana - we have published a couple of them but it's not super important to me that we publish more - as they are becoming more specialized for our work flow
 
-Q5. Is the number of Claude and Codex accounts fixed, or may it grow when the measures show a benefit? Unit recommendation: keep it fixed until the measures show a cost per Hana phase.
+Q3. Must build-followups and sdlc cut a measured Hana cost, or do they have a guaranteed share of capacity? Q1's requirement for a "robust sdlc" bears on this choice. Unit recommendation: require a measured Hana cost with robust sdlc protected; reserve a fixed small share for broken-tool fixes only after you choose its size. Keep A while this is open; any B trial also needs the four-week wait test.
 
-Source check: Q1 uses `~/rust/hanadocs/prioritization goals.md` and `hana/units-do-not-carry-the-deadline.md`. Neither sets a release date or release scope. Q2 uses remove-running-section, Production Context and Production rules. It defines cargo work but does not settle its product status. Q3 uses build-followups, Capacity and Production rules, and the unit plan, Phase 2 candidate seeds. They do not grant a permanent share. Q4 uses `commands/change_review.md` and `nixos/next-thing-never-auto-advances.md`. They require the user's verdict today; they set no daily budget or age rule. Q5 uses `nixos/account-moves-at-one-percent.md`. It governs account moves, not the total account count.
+Q4. How much daily time can you give reviews and questions, and may an old unreviewed change close without your check? Unit recommendation: name a daily budget. Close unreviewed changes older than 7 days as accepted only if you explicitly approve a replacement verdict rule. No Step relies on this age rule; current individual verdicts remain in force.
 
-Dropped the proposed C23 question. `nixos/demo-and-herdr-priority.md` already keeps demo and herdr first until the user says demo is done. That order still applies; this document records no later cancellation.
+Q5. Is the number of Claude and Codex accounts fixed, or may it grow when the measures show a benefit? Unit recommendation: keep it fixed until delivery and cost records support a specific purchase; cost per phase alone is insufficient.
+
+Q6. How do you want each newly created showrunner and unit listed below resolved in the tree?
+
+The user's instruction, via the showrunner on 2026-10-20:
+
+> make sure questions include resolving the newly created showrunners and units if they don't already - don't propose any yet
+
+This question has no unit recommendation and proposes no showrunner, unit, promotion, or edge. The inventory lists creations and changes since the Baseline start, 2026-10-13 17:24 EDT. Dates below are EDT. A creation date comes from a production source or its adding commit, not a session file modification time.
+
+| Showrunner, edge, or unit | Created or changed | Source and current record |
+| --- | --- | --- |
+| performance; showrunner fps | 2026-10-20, after Baseline | `/home/natepiano/rust/tool-based-ui-frame-time/docs/hana/performance-production.md`, Production Context; user asked promotion under hana. Live tree shows performance under tool-based-ui, with session label performance; production document says fps. |
+| performance/frame-cost-unit | 2026-10-20 | Same document, Units; carries frame-time-unit's remaining work. |
+| performance/metrics-gathering-unit | 2026-10-20 | Same document, Units. |
+| performance/metrics-visualization-unit | 2026-10-20 | Same document, Units. |
+| performance/benchmark-unit | 2026-10-20 | Same document, Units. |
+| cargo-liner-style child edge under remove-running-section | 2026-10-17 | `/home/natepiano/rust/cargo-liner-style/docs/cargo-liner-style-log.md`, opening 08:29 entry attaches the child from d1ced22c; that source commit is dated 2026-10-17. Production document, Parent production; live tree confirms the edge. |
+| cargo-liner-style/modules-unit, names-unit, types-unit | 2026-10-17 | Same log, opening 08:29 entries launch each by name; production document, Units. |
+| cargo-liner-style/values-unit | 2026-10-18, inferred from the adjacent merge record | Same log, 19:14 pilot-rollout launch entry immediately followed by the ee2b5ff8 sync; that commit is dated 2026-10-18 19:07 EDT. Units confirms the name. The log entry itself omits a calendar date. |
+| sdlc showrunner | 2026-10-20 | `/home/natepiano/worktrees/claude-build-followups-sdlc/docs/plans/sdlc-production.md`, Source plans; log 16:47 promotion. |
+| sdlc/guilds-unit | 2026-10-20 | Same production, Units; sdlc log 16:55 adds all four units. |
+| sdlc/phases-unit | 2026-10-20 | Same production and log. |
+| sdlc/fix-rounds-unit | 2026-10-20 | Same production and log. |
+| sdlc/roles-unit | 2026-10-20 | Same production and log. |
+| build-followups/hierarchies-unit | 2026-10-20 | build-followups production adding commit 2b527f68, 16:36 EDT. |
+| cargo-liner-berth-parallel; now berth-unit | Created 2026-10-15; renamed 2026-10-20 | remove-running-section production, commit 6d01f704 adds berth-parallel-unit; 6f2b6e48 renames it berth-unit. Current Units row points to `/home/natepiano/rust/cargo-liner-berth`; the plan still names the older worktree. The fold instruction names cargo-liner-berth-parallel on 10-20; source history distinguishes creation from rename. |
+| cargo-liner-experiments; experiments-unit | 2026-10-20 | remove-running-section production, adding commit 5e0ba048, 16:35 EDT; current Units row. |
+| build-followups/herdr-panes-unit; now herdr-unit | 2026-10-13 18:59 EDT; renamed 2026-10-18 | build-followups production, adding commit 979be297 and rename a8ea44fb. |
+| build-followups/herdr-trust-unit | 2026-10-13 18:59 EDT; retired 2026-10-18 | Same production, ab54c119 and Units retirement record. |
+| build-followups/nightly-review-unit | 2026-10-14; retired 2026-10-19 | Same production, 0dd94a99 and Units retirement record. |
+| build-followups/style-unit | 2026-10-16 | Same production, 372b8259. |
+| build-followups/unit-board-unit | 2026-10-16 | Same production, 7e4838f8. |
+| build-followups/hanadocs-unit | 2026-10-16 | Same production, c9ca38de. |
+| build-followups/review-unit | 2026-10-16; retired 2026-10-18 | Same production, b92802ae and Units retirement record. |
+| build-followups/efficiency-unit | 2026-10-19 | Same production, cf46de04. |
+| remove-running-section/berth-hook-hang-unit | 2026-10-13 23:00 EDT; retired 2026-10-14 | remove-running-section production, 9c730f97 and Units retirement record. |
+| remove-running-section/berth-ceiling-unit | 2026-10-14; retired 2026-10-14 | Same production, 020b7103 and Units retirement record. |
+| remove-running-section/handler-enh-unit; now handler-unit | 2026-10-14; renamed 2026-10-20 | Same production, 4a148622 and 1c16e273. |
+| remove-running-section/review-unit | 2026-10-16; retired 2026-10-19 | Same production, 5cf99c2a and Units retirement record. |
+| tool-based-ui/merge-gate-unit | 2026-10-13 21:29 EDT | tool-based-ui production, adding commit beb775d57. |
+| tool-based-ui/inspectors-unit | 2026-10-14 | Same production, bf47e235a. |
+
+Sources for this inventory: live `showrunners.py list` and `tree`, each production's Units table, and its git history after the Baseline start. Historical and retired entries are kept so that a later rename does not hide a new unit. This inventory is not a live routing list. The values-unit date is an inference from the adjacent dated commit, not a date written in its launch entry.
+
+Q7. Should showrunners own an explicit push-authorization audit and record which failed-review sends use approved exceptions? Unit recommendation: yes; repair only confirmed unauthorized paths, keep priority-2 and registered-text behavior unchanged, and ask a separate question before changing an exception. This approves Step 1's duty, not a new role or unit.
+
+Q8. Should event producers record wait states, activation and answer history, and merge receipts, with receiving showrunners checking project and branch? Unit recommendation: yes; route phase events to phases-unit and duties to roles-unit, then collect four weeks before any B decision. This approves Step 2's recording and receipt duties without altering gates.
+
+Q9. Should cargo showrunners apply the Hana-cost note at new units, later runs, added work, and standing board pulls, with receiving peers checking the result? Unit recommendation: yes; use a short existing note, preserve user orders and demo/herdr priority, and do not delay a C47 small fix with a new proposal. This is A's Step 3 duty under the answered Q2 purpose.
+
+Q10. Should directors check ownership at each run end and showrunners check that report timers were requested? Unit recommendation: yes; keep active workers and pooled reviewers, recover missing provenance first, and end only confirmed completed-run workers. This approves Step 4's lifecycle check duty, not a tree change.
+
+Q11. If Q3 is Hana cost and the four-week test shows material shared-load waits, should peers trial the shared admission order and Hana-cost test for build-followups and sdlc, recording dependencies, deferrals, overhead, and supplier checks? Unit recommendation: only under both conditions, after stable A records, for at least four weeks or suitable matched work. Preserve robust sdlc, C05 user orders and C23 priority. This approves Step 6's added duties; it does not transfer rank ownership to hana.
+
+Q12. If later evidence supports C, should natedev gain the cross-production slot and new-worker allocation duty? Unit recommendation: defer; keep current account authority and allocation rules until resource-wait evidence shows an added owner would help. This addresses C's duty without proposing a new role holder, showrunner, or unit.
+
+Review fold: the director's adversarial judge and Astra review are the sources of the changed recommendation, measures, order, and questions. The judge supersedes the early adversarial helper where they differ. Review paths: `/tmp/claude/unit/62f4d2b7-0062-437a-b355-57bb09bfbc9e/phases/2/adversarial_judge.md` and `astra_result.md` in that same directory. No user answer to Q3–Q12 is inferred here.

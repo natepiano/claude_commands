@@ -106,10 +106,11 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Files:**
 - `docs/plans/build-followups-hierarchies-design.md` — new sections above
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — review fixes to the Baseline measures: goal-1 closures split by project with declines left out, Hana merges per week, rank coverage of open issues with live units and a score-weighted ratio, date-time window flags
 
-**Workers:** `2 writers` — nothing splits: one doc. `impl` takes it; `test` has no test lane, so it opens as impl and only checks numbers.
+**Workers:** `2 writers` — one doc and one module. `impl` takes the doc; `test` has no test lane, so it opens as impl, checks numbers, and then fixes the measures.
 - `impl` — `docs/plans/build-followups-hierarchies-design.md`
-- `test` — opens as impl — re-runs `measure.py baseline` for the doc's Comparison window and checks each number the doc cites against it; it writes no doc text
+- `test` — opens as impl — re-runs `measure.py baseline` for the doc's Comparison window and checks each number the doc cites against it; then fixes the measure rows the reviews found wrong in `scripts/hierarchies/measure.py` and `scripts/hierarchies/test_measure.py`, re-runs the Baseline, and sends `impl` the new rows
 
 **Constraints from prior phases:**
 - The design doc holds Constraints C01–C50 (each marked `user` or `derived`, with its source), the Map, the Baseline (run 2026-10-20 17:24 EDT, 7 days, natedev) and Questions Q1–Q5. Rank 1 of the user's goals is `1 - Ship Hana`.
@@ -174,7 +175,7 @@ Step 1 from the design doc's Steps section.
 - `test` — `scripts/hierarchies/test_measure.py`: `compare` on fixtures with known before and after values
 
 **Constraints from prior phases:**
-- `measure.py baseline [--since DATE] [--until DATE]` exists: default window the 7 days to now, end excluded. Each measure is a function over typed domain records built by read-only loaders; `compare` runs the same functions on both windows and does not add new loaders.
+- `measure.py baseline [--since DATE|DATETIME] [--until DATE|DATETIME]` exists (date-time form from Phase 2): default window the 7 days to now, end excluded. Each measure is a function over typed domain records built by read-only loaders; `compare` runs the same functions on both windows and does not add new loaders.
 - A missing or corrupt source prints a source-problem row instead of failing; `compare` keeps that row in each window and shows no change for it.
 - Rows with no recording source (phase wait kinds, issue activation times, question answer times) print `not recorded`; `compare` prints them the same way, unless the Phase 3 step added the record.
 - Items waiting on the user come from showrunner/outstanding through `dailies_render.read_outstanding`.
