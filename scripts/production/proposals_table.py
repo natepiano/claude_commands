@@ -326,20 +326,23 @@ def waiting_entries(doc: Path) -> tuple[list[urgency.Entry[Row]], list[Row]]:
 def open_rows(doc: Path, records: dict[str, object]) -> list[Row]:
     """The waiting proposals, the one /next shows first; then the rest; then the add-ons."""
     waiting, rows = waiting_entries(doc)
-    rows = [entry.item for entry in urgency.order(waiting, urgency.pinned(queue(doc)))] + rows
+    rows = [entry.item for entry in urgency.queue_order(waiting, queue(doc))] + rows
     for unit, plan in unit_plan_paths(records).items():
         rows.extend(unit_add_on_rows(unit, plan))
     return rows
+
+
+def proposal_text(shown: urgency.Entry[Row]) -> str:
+    """A waiting proposal as /next prints it: its title, then the file to read."""
+    where = BACKLOG_DIR / "ledger.md" if shown.key.startswith("backlog: ") else Path(shown.key)
+    return f"{shown.item.proposal}\n{where}"
 
 
 def next_proposal(doc: Path) -> str:
     """The proposal /next shows, and the file to read: the one shown last while it waits, else the first."""
     waiting, _ = waiting_entries(doc)
     shown = urgency.top(waiting, queue(doc))
-    if shown is None:
-        return "no proposal is waiting for your review"
-    where = BACKLOG_DIR / "ledger.md" if shown.key.startswith("backlog: ") else Path(shown.key)
-    return f"{shown.item.proposal}\n{where}"
+    return proposal_text(shown) if shown is not None else "no proposal is waiting for your review"
 
 
 def main(arguments: list[str]) -> int:
