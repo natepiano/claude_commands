@@ -53,6 +53,11 @@ FALLBACK = 12 * GIB
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
+# A step starts its scope, and writes the sidecar, within seconds of its admission. A reservation
+# whose sidecar is still missing after this is not building: on 2026-10-21 verify.sh runs on code
+# older than 208631b3 held 94.5 GiB that way while they waited for the cargo token, and every
+# waiting step reached the 15-minute limit.
+SCOPE_GRACE_SECONDS = 120
 
 
 class Reservation(TypedDict):
@@ -233,6 +238,18 @@ def read_meminfo(path: Path) -> tuple[int, int | None]:
     return available, total
 
 
+def building(row: Reservation, now: datetime) -> bool:
+    """False for a reservation that expects a scope and has none after SCOPE_GRACE_SECONDS. A step
+    with no scope at all (sidecar "") cannot show it is building, so it always counts."""
+    if not row["sidecar"] or os.path.exists(row["sidecar"]):
+        return True
+    try:
+        admitted = datetime.fromisoformat(row["admitted_at"])
+    except ValueError:
+        return True
+    return (now - admitted).total_seconds() < SCOPE_GRACE_SECONDS
+
+
 def admission_dir(root: Path) -> Path:
     directory = root / "admission"
     directory.mkdir(parents=True, exist_ok=True)
@@ -282,7 +299,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], force: bool = 
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         live = live_reservations(directory)
-        running = [RunningMemory(row["need"], cgroup_anon(row["sidecar"])) for _, row in live]
+        running = [RunningMemory(row["need"], cgroup_anon(row["sidecar"])) for _, row in live if building(row, now)]
         available, total = read_meminfo(meminfo)
         decision = decide(available, total, peak.bytes, running)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")

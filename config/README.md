@@ -129,6 +129,8 @@ file named.
   `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`.
 - `USER_ZONE` in the environment wins over the file. Tests whose expected
   output is in one zone pin it this way.
+- `/zone <place>` changes it on both machines and tells every session; a bare
+  `/zone` shows it. The status line reads the file in `statusline.sh`.
 
 A production keeps its own `User zone` line in its production doc, and the
 dailies read that. A time stored without an offset keeps the zone it was
@@ -138,13 +140,16 @@ roster.
 ## statusline.conf
 
 Colors for each role and account in the status line, plus usage-level colors
-and thresholds for context tokens used and quota percentages left. `counts.<type>`
+and thresholds for context tokens used and quota percentages left. Role keys are
+`role.showrunner` (purple), `role.unit-director` (yellow),
+`role.astra-designer` (mauve) and `role.astra-reviewer` (bright-green). Workers and
+unassigned sessions have no key and show as plain text. `counts.<type>`
 colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,
 `proposals` and `projects`.
 `scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;
 an edit applies on the next refresh. A missing or bad entry leaves that piece
 uncolored. Colors use ANSI names (`cyan`, `bright-magenta`, and so on) or the
-named 256-color entries `orange`, `purple`, `pink`, `teal` and `brown`.
+named 256-color entries `orange`, `purple`, `pink`, `teal`, `brown` and `mauve`.
 `/new_account` adds the new Claude account's `account.` line.
 
 ## cargo-fmt-exclusions.json

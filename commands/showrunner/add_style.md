@@ -16,8 +16,20 @@ Show the output; stop on a nonzero exit.
 
 On creation, repeat `--pilot` to launch only named units; package names after
 `=` restrict that unit's crates. All four plans are still written. Example:
-`--pilot modules-unit --pilot names-unit=cargo-handler --pilot types-unit=cargo-port`.
+`--pilot modules --pilot cargo-liner-style-names-unit=cargo-handler --pilot types-unit=cargo-port`.
+A pilot accepts a family, its old `<family>-unit` id, or its full id.
 `--check` lists the units and scopes. An existing production refuses `--pilot`.
 An interrupted bootstrap can change only units whose worktrees do not exist;
 after launch, edit scope only in that unit's own plan copy (see
 `docs/style_production.md`, Pilot scope).
+
+A unit id is `<style slug>-<family>-unit`; the style slug is `<repo>-style`,
+independent of the parent production's name. Worktrees and branches use
+`<style slug>-<family>`.
+
+| Family | Unit id |
+| --- | --- |
+| names | `<style slug>-names-unit` |
+| values | `<style slug>-values-unit` |
+| types | `<style slug>-types-unit` |
+| modules | `<style slug>-modules-unit` |

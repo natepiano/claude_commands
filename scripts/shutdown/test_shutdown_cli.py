@@ -19,7 +19,7 @@ from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, final, override
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -2043,6 +2043,35 @@ class OnlySessionCliTests(ShutdownTestCase):
                     self.assertEqual([report["login"] for report in reports], [LOGIN])
                     owners = cast(list[dict[str, object]], reports[0]["sessions"])
                     self.assertEqual([owner["session_id"] for owner in owners], ["beta-id"])
+
+    def terminal_now(self, selection: str) -> tuple[int, str, str, MagicMock]:
+        """`now --only` from a terminal on another account, as a rename does: no session is live, only records."""
+        showrunner = Account("claude", "showrunner@example.com", "claude2")
+        with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(shutdown, "own_claude_account", return_value=showrunner),
+              patch.object(shutdown, "listing", return_value=[]),
+              patch.object(settle, "_launch_conductor") as conductor,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+            status = shutdown.main(["now", "--only", selection, "--here"])
+        return status, output.getvalue(), error.getvalue(), conductor
+
+    def test_terminal_now_forces_an_earlier_record_held_by_another_account(self) -> None:
+        before = self.save_three({"kind": "waiting"})
+        status, output, error, conductor = self.terminal_now("beta-id")
+        self.assertEqual((status, output, error), (0, "Beta: stopping now\n", ""))
+        conductor.assert_called_once_with(LOGIN, LABEL)
+        latest = record.find_session(LOGIN, "beta-id")
+        assert latest is not None
+        self.assertEqual(latest["force"], "now")
+        self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+        self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
+
+    def test_terminal_now_refuses_an_id_with_no_session_and_no_record(self) -> None:
+        before = self.save_three({"kind": "waiting"})
+        status, output, error, conductor = self.terminal_now("unknown-id")
+        self.assertEqual((status, output, error), (2, "", "shutdown: unknown-id: matches no session\n"))
+        conductor.assert_not_called()
+        self.assertEqual(record.session_records(LOGIN), sorted(before, key=lambda item: item["session"]["name"]))
 
     def test_terminal_down_starts_both_accounts_without_following_the_first(self) -> None:
         class InteractiveTerminalOutput(io.StringIO):

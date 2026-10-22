@@ -885,6 +885,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(add_unit.host_session_name(hana), "hana-review")
         named = dataclasses.replace(request, identity=add_unit.UnitIdentity("review-unit", "build-followups-review"))
         self.assertEqual(add_unit.host_session_name(named), "build-followups-review")
+        style = dataclasses.replace(request, production=production._replace(slug="cargo-liner-style"),
+                                    identity=add_unit.UnitIdentity("cargo-liner-style-names-unit", "cargo-liner-style-names"))
+        self.assertEqual(add_unit.host_session_name(style), "cargo-liner-style-names")
         restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "build-followups-review")
         self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)),
                          "build-followups-review")
@@ -2513,6 +2516,72 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(request("feature_log_unit"), request("feature_log"))
         self.assertEqual(request("unit")[0], "unit-unit")
 
+    def assert_guild_head_launch_and_restart(self, guild: str) -> None:
+        self.doc = self.checkout / "docs/plans/guilds-production.md"
+        _ = self.doc.write_text(self.production_doc(), encoding="utf-8")
+        _ = self.git("add", str(self.doc.relative_to(self.checkout)))
+        _ = self.git("commit", "-m", "Add guilds fixture production")
+        _ = self.git("push", "origin", "build-followups")
+
+        result = self.successful(guild, "--plan", "docs/plans/given.md")
+        self.assertIn(f"{guild} started", result.stdout)
+        rows = list(production_units.unit_table(self.doc.read_text().splitlines()))
+        self.assertEqual([cell_value(row["Unit"]) for row in rows], [guild])
+        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT_ID"], guild)
+        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT"], "guilds")
+        with patch.dict(os.environ, self.env):
+            marked = unit_lookup.marked_unit("guilds", guild)
+            self.assertIsNotNone(marked)
+            if marked is not None:
+                self.assertEqual(marked.unit, guild)
+                self.assertEqual(marked.place.session, f"guilds-{guild}")
+            self.assertIsNone(unit_lookup.marked_unit("guilds", guild + "-unit"))
+
+        note = self.root / "guild-restart.md"
+        _ = note.write_text("Resume the guild loop.\n", encoding="utf-8")
+        request = add_unit.launch_request(argparse.Namespace(
+            production=str(self.doc), name=guild, plan="docs/plans/given.md", brief=None,
+            standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+            resume="guild-session", cwd=str(self.root / ("project-" + guild)),
+            restart_note=str(note), session_name=guild, host_session="guilds-" + guild, probe=False,
+        ))
+        self.assertEqual(request.unit, guild)
+        self.assertIsInstance(request.launch_kind, add_unit.UnitRestoreLaunch)
+        self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines()),
+                              add_unit.ExistingUnitRow)
+        before = self.doc.read_bytes()
+        resumed = self.cli(guild, "--plan", "docs/plans/given.md")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
+
+    def test_guilds_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("designers")
+
+    def test_guilds_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("reviewers")
+
+    def test_guilds_showrunner_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("showrunners")
+
+    def test_guilds_unit_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("units")
+
+    def test_head_names_in_other_productions_and_other_names_in_guilds_keep_suffix(self) -> None:
+        guilds_doc = self.doc.with_name("guilds-production.md")
+        _ = guilds_doc.write_text(self.production_doc(), encoding="utf-8")
+        for document, names in ((self.doc, ("designers", "reviewers", "showrunners", "units")),
+                                (guilds_doc, ("reports", "designers-helper"))):
+            for name in names:
+                with self.subTest(production=document.name, name=name):
+                    request = add_unit.launch_request(argparse.Namespace(
+                        production=str(document), name=name, plan="docs/plans/given.md", brief=None,
+                        standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+                        resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
+                        probe=False,
+                    ))
+                    self.assertEqual(request.unit, name + "-unit")
+
     def test_restore_flags_are_atomic_and_require_resume(self) -> None:
         note = self.root / "restart-note.txt"
         _ = note.write_text("resume here", encoding="utf-8")
@@ -2690,6 +2759,41 @@ class AddUnitTests(ShutdownTestCase):
                         patch.object(session_pane, "read_place", side_effect=session_pane.HerdrFailure("unreadable")):
                     with self.assertRaisesRegex(RuntimeError, "did not become active\\nunreadable"):
                         _ = add_unit.wait_for_remote_control(request)
+
+    def test_remote_control_is_read_from_the_session_record_after_the_pane_line_scrolls_off(self) -> None:
+        request = add_unit.UnitLaunch(
+            production=add_unit.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
+            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
+            launch_kind=add_unit.NewWorkLaunch(), timeout=0,
+        )
+        registry = self.root / "registry"
+        registry.mkdir()
+        place = HerdrPlace("native", "w1:p1")
+        live = unit_lookup.LiveClaude("alpha", "session-123", "/socket", 4242)
+        starting = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
+        marked = unit_lookup.MarkedUnit("alpha-unit", live, place)
+        busy_pane = "⏺ Reading the plan\n  ⎿  Read 400 lines"
+        cases: tuple[tuple[str, dict[str, str], bool], ...] = (
+            ("bridged", {"bridgeSessionId": "session_bridge"}, True),
+            ("no bridge", {}, False),
+            ("empty bridge", {"bridgeSessionId": ""}, False),
+            ("another session's record", {"sessionId": "session-other", "bridgeSessionId": "session_bridge"}, False))
+        for label, extra, active in cases:
+            with self.subTest(label):
+                _ = (registry / "4242.json").write_text(json.dumps({
+                    "pid": 4242, "sessionId": "session-123", "name": "alpha", "messagingSocketPath": "/socket",
+                    "updatedAt": 1, **extra}))
+                # The first lookup finds the mark before the record names the live Claude.
+                with patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}), \
+                        patch.object(add_unit, "launched_unit", side_effect=[
+                            add_unit.MarkedUnitFound(starting), add_unit.MarkedUnitFound(marked)]), \
+                        patch.object(session_pane, "read_place", return_value=busy_pane):
+                    if active:
+                        self.assertEqual(add_unit.wait_for_remote_control(request), marked)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "did not become active\\n⏺ Reading the plan"):
+                            _ = add_unit.wait_for_remote_control(request)
 
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"

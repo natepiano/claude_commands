@@ -98,6 +98,31 @@ class ProposalsTableTests(unittest.TestCase):
             Row("—", "unowned build", "2026-10-12", IN_PROGRESS_STATE),
         ])
 
+    def test_waiting_proposals_go_by_urgency_then_score_and_next_keeps_the_shown_one(self) -> None:
+        common = ("stage: backlog", "status: open", "tags: [issue, proposal]", "proposed_by: organon-unit")
+        _ = self.issue("unscored", "date_created: 2026-10-01", *common)
+        low = self.issue("low score", "date_created: 2026-10-02", *common)
+        _ = low.write_text(low.read_text() + "\nProposed ranking: goal 1 - Ship Hana · alignment ⭐ · impact ⭐ · urgency ⭐ · effort ⭐\n")
+        _ = self.issue("high score", "date_created: 2026-10-03", *common, 'backlog_goal: "1 - Ship Hana"',
+                       'backlog_alignment: "⭐⭐⭐"', 'backlog_impact: "⭐⭐"', 'backlog_urgency: "⭐"', 'backlog_effort: "⭐"')
+        _ = self.issue("blocking", "date_created: 2026-10-04", *common, 'review_urgency: "blocks"',
+                       'depends_on: ["[[unscored]]"]')
+        found = issues.open_issues(self.root / "issues", "proposal")
+        self.assertEqual([row.proposal for row in proposals_table.issue_rows(found)],
+                         ["unscored", "blocking", "high score", "low score"])
+        self.assertEqual(proposals_table.issue_rows(found)[1].state, f"{REVIEW_STATE} · blocks")
+        doc = self.write("trunk/docs/plans/demo-production.md", f"- **Proposals:** `{self.root / 'issues'}`\n")
+        with mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")}), \
+                mock.patch.object(proposals_table, "BACKLOG_DIR", self.root / "backlog"), \
+                mock.patch.object(proposals_folder, "owners", return_value=frozenset({"organon-unit"})):
+            self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines()[0], "unscored")
+            _ = self.issue("now important", "date_created: 2026-10-05", *common, 'review_urgency: "user"')
+            # The shown proposal stays until the user answers it.
+            self.assertEqual(self.run_main(["--next", "--production", str(doc)])[1].splitlines()[0], "unscored")
+            (self.root / "issues/unscored.md").unlink()
+            self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines(),
+                             ["now important", str(self.root / "issues/now important.md")])
+
     def test_closed_untagged_and_subfolder_issues_give_no_rows(self) -> None:
         _ = self.issue("built one", "status: closed", "tags: [issue, proposal]", "as_built: docs/hana/as-built/x.md")
         _ = self.issue("plain issue", "status: open", "tags:", "  - issue")

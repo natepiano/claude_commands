@@ -23,12 +23,14 @@ it joins; a tier A or E rule, local or global, has no family.
 
 | Unit | B: listed rules | C: file reads | D: crate checks |
 | --- | --- | --- | --- |
-| `names-unit` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
-| `values-unit` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
-| `types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
-| `modules-unit` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
+| `<style slug>-names-unit` | dont-repeat-type-name-in-fields, dont-repeat-enum-domain-in-variant-names, avoid-repeated-field-affixes, forbidden-words | spell-out-names, name-bindings-to-match-parameters, prefer-type-named-fields-and-bindings, comments-name-code-constructs | — |
+| `<style slug>-values-unit` | never-prefix-unused-fields-or-variables-with, import-constants-at-the-top, derive-test-values-from-production-constants, test-module-allow-boilerplate, agent-must-review-allows, always-use-nextest | no-magic-values, constants-file-organization, prefer-functional-patterns, tests-live-with-the-type-under-test, prefer-observers-over-polling, system-params-carry-their-behavior | — |
+| `<style slug>-types-unit` | enums-over-bool-for-owned-booleans, if-else-chains-signal-missing-types, dont-create-traits-for-single-implementations, prefer-from-impl-over-named-constructors, public-failures-return-named-errors, bevy-plugin-ownership, bevy-reflection-registration, extract-observer-run-conditions, prefer-events-over-messages, use-bevy_kana-in-all-bevy-crates | make-invalid-states-unrepresentable, uncovered components of its partial B rules | — |
+| `<style slug>-modules-unit` | — | — | module-roots-as-table-of-contents, name-submodules-after-anchor-types, workspace-dependencies, module-structure, when-to-split-a-module, split-by-type-ownership, types-live-with-their-behavior |
 
-Every partial B rule also has a C read in its own family.
+A unit id is `<style slug>-<family>-unit`, where the style slug is `<repo>-style`.
+Old `<family>-unit` ids remain valid. Every partial B rule also has a C read
+in its own family.
 
 ## Ticket queue
 
@@ -91,7 +93,7 @@ The gate and `ticket checkpoint` refuse any ticket with owned cells unjudged and
 Refill only the unit worktree's own plan copy:
 
 ```bash
-~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/docs/style-production/units/<unit>.md --repo <checkout>
+~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py next-phase --unit <unit> --plan <unit-worktree>/<Plan cell> --repo <checkout>
 ~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py queue --repo <checkout> [--unit <unit>]
 ```
 
@@ -127,6 +129,15 @@ branch is stored, the unit tip is in the pushed style tip
 tip changes the inputs of at least one such cell. Otherwise it returns 3,
 `waiting for sync`: the next sync or style merge changes the cell.
 
+`record --verdict held` requires an unfiled or filed finding on that rule's cell.
+Without one, the ledger refuses the verdict and names the cell's waived, built
+and withdrawn findings. A waived finding is the user's decision and does not
+make the cell held. Structure tickets list waived findings separately: do not
+hold them again. Record `waived` for a cell whose only findings are waived,
+or hold a new finding with `held add` before recording `held`. A `waived` verdict
+expires when the cell's rule text, file or context changes. Refill can then
+offer the cell again; it adds no skip based on waived findings alone.
+
 The ticket stores its rule text. Workers read the pinned files under the unit
 worktree's `docs/style-production/rules/`, including after an interruption;
 later rule edits cannot change an assigned ticket's Work Order. A queued ticket
@@ -146,6 +157,8 @@ keeps a dropped ticket's abandoned commits reachable.
 ## Pilot scope
 
 Create a restricted pilot with repeated `add_style.py --pilot <unit>[=<package>,...]`.
+The selector accepts a family (`names`), its old id (`names-unit`) or its full
+id (`cargo-liner-style-names-unit`). `--check` prints full unit ids.
 Only named units get Units rows; all four standing plans are written. A unit
 without a scope covers every crate. Package names map to workspace member
 directories through `rules.workspace_members`.
@@ -154,7 +167,9 @@ The plan's Delegation Context carries `- **Pilot scope:** cargo-handler, cargo-p
 below its Family snapshot. Before first launch, edit the showrunner copy;
 an interrupted bootstrap rewrites only unlaunched units' rows and scope lines.
 After launch, only the unit's own copy counts:
-`<main checkout parent>/<slug>-<family>/docs/style-production/units/<family>-unit.md`.
+`<main checkout parent>/<style slug>-<family>/docs/style-production/units/<style slug>-<family>-unit.md`.
+Read the plan path from the Units row's Plan cell relative to that worktree;
+a unit rename keeps its existing plan filename.
 `next-phase` honors the `--plan` copy it receives for coverage and approved
 proposals. An out-of-scope approved proposal stays approved and unassigned;
 coverage selection proceeds.
@@ -209,7 +224,11 @@ Fingerprints use committed Git objects at the rule's `file`, `crate` or
 `manifest` scope. A `clean`, `exception` or `held` verdict with `--input-scope file`
 uses the file's own fingerprint. It stays current when other files in its crate
 or module change. On a crate or module cell of a Rust file, these three verdicts
-must give `--input-scope file` or `--input-scope rule`. The manifest scope covers the workspace root and member
+must give `--input-scope file` or `--input-scope rule`. With `--input-scope rule`,
+use `--reads <files>` to name each other file the verdict rests on. The fingerprint
+uses the cell's own file plus those named files, so only a change to one of them
+brings the cell back. Without `--reads`, the fingerprint uses the whole crate or
+module. Each named file must exist at the checked commit. The manifest scope covers the workspace root and member
 manifests; crate `.` covers only its own files. Exceptions expire with their
 inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 `exception` (reviewed allowed case), `held` (proposal deferred) and `waived`
@@ -294,7 +313,7 @@ code, and run the printed `held built` command when the change is there. A rerun
 of `ticket merge` on a merged ticket prints these lines again. A finding whose
 change is not there waits for a person, who makes the change and
 runs that command, or waives the finding with
-`style_ledger.py held waive --repo <checkout> --id <finding id>`.
+`style_ledger.py held waive --repo <checkout> --id <finding id> --person <name>`.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.
@@ -387,6 +406,19 @@ edits from the applied diff; merge the remainder after its gate passes.
 Record each held finding with `style_ledger.py held add` and its cell with
 `record --verdict held`.
 
+Each `style_ledger.py held waive --id <finding id>` requires exactly one actor:
+`--ticket <judging ticket>` for the unit that found it, or `--person <name>` for
+a person. The ledger records the actor supplied by the caller.
+
+To correct the after text of a waived finding, use `style_ledger.py held replace
+--id <waived id> --after <text>`. It accepts a unit's waive, keeps the id and
+judging ticket, returns the finding to unfiled, and restores a newest waived
+cell judgment to held. For an old waive with no recorded source, add
+`--person <name>`; the ledger records who undid it, as `unwaive` does. A person's
+waive and a ledger waive are always refused by `replace`. When there is no
+waived cell judgment, record `held` for the cell after replacement. Plain `held add` keeps an existing
+waive.
+
 Run from the unit worktree, using the ticket's recorded start commit:
 
 ```bash
@@ -425,7 +457,8 @@ File held changes with `style_proposals.py file --repo <style checkout>
 `**Proposals:**` line and the parent from `showrunners.py parent <style slug>`.
 Run filing after each checkpoint with held cells and each no-change notice
 with held findings. Findings held by assigned or checkpointed tickets wait.
-Findings judged under an older rule text stay unfiled.
+Findings judged under an older rule text stay unfiled until a judgment under
+the current text judges their cell again; then filing withdraws them.
 A `skipped <issue>: <reason>` line means that filing cannot write that
 decision. When filing new findings, those findings stay unfiled. When
 refreshing an open decision, its findings stay filed and the file stays as it
@@ -433,18 +466,24 @@ was. The other decisions still file. When it skips one or more decisions,
 `file` exits 1. Fix the named decision file as the reason tells, then run
 `file` again. A `skipped <finding>: rule changed since judged` line names one
 finding, not a decision, and does not change the exit status.
+Its cell has no judgment under the current text yet: a refill judges the stale cell,
+and the next `file` withdraws the finding.
 
 Filing first withdraws each filed finding whose site has an `exception` as the
 newest judgment under its rule's current text, when the finding was judged
 under an older text. `withdrawn` is its own state, not `waived`, and the
 finding records that judgment's row. A finding that an open ticket builds is
-kept. The judgment must also be newer than the finding's own judgment. A
-decision whose findings are all withdrawn closes with a reason that names them
+kept. The judgment must also be newer than the finding's own judgment.
+An unfiled finding judged under an older text is withdrawn when the newest
+judgment at its site uses the current text. Any verdict withdraws it, and the
+finding records that row. It has no decision, so no decision changes.
+An unfiled finding of an open ticket waits for that ticket. A decision whose
+findings are all withdrawn closes with a reason that names them
 and the judgment rows. A decision that keeps other findings shows only those,
 and `complete` closes it when they are built or waived.
 `style_proposals.py withdraw --repo <style checkout> --proposals <folder>
 [--dry-run]` runs this step alone. It prints
-`withdraw <finding> <rule> <path>:<line>: judgment <row> exception under <blob>`,
+`withdraw <finding> <rule> <path>:<line>: judgment <row> <verdict> under <blob>`,
 a `kept` line with the ticket, a `close` line per decision and a `totals` line.
 The dry run prints the same lines and writes nothing. A decision that it cannot
 close or refresh gets a `skipped <issue>: <reason>` line, the other decisions
@@ -466,8 +505,51 @@ the finding stays as it is for a person to waive or fix in the code. No file:
   file. Two or more such files, or one in another crate, leave the finding as a
   move does. A rename in a decision that is not approved waits for the answer,
   with no line. The step reads the answer again when it writes.
+- A finding whose item, or the impl or trait that holds it, has a new name from
+  built rename or type findings of approved decisions in the same crate follows
+  the item to its newest name, in its own file or in the one file that gained
+  it, and keeps its id. The renames apply one after another; a name with two
+  new names, or a rename back to an earlier name, stops the chain. A rename
+  qualified by a module names only the items of that module's files and the
+  impl items of a type declared there; `crate::` names the crate root. A rename
+  qualified by a type names only the impl or trait items of that type under any
+  of its names, and a `Self` path names the type of its own impl or trait. A
+  trait path also names direct members of its readable trait impls. The member
+  keeps its implementing type, including that type's approved new name. The
+  destination must implement the same trait with the same generic arguments.
+  Equal paths with equal arguments name the same trait. A bare name can match
+  a qualified path through one declared trait or a plain file import, including
+  an `as` alias. A block import or glob affects only impls inside that block.
+  Conditional file imports, file globs, and re-exports block proofs for names they can bind.
+  File-level `self::` and `super::` paths resolve through plain file-level `mod` declarations.
+  Only `src/lib.rs` and `src/main.rs` name the crate root.
+  Files under `src/bin`, custom target paths, conditional links, and `#[path]` modules grant no layout proof.
+  Relative paths inside blocks or above the crate root grant no proof.
+  The module path must match the trait's declared module. Built renames must name that
+  trait at their own sites. A qualified path on the cited line uses that path's scope.
+  A member declaration without that path uses its owning trait or impl header's scope.
+  An uncertain trait identity keeps the finding
+  unchanged. Ambiguous members grant no follow. Two or more gaining files, or a filed finding's
+  file in another crate, leave the finding as a move does. A finding whose own
+  rename names its item keeps the rule above; a filed rename whose impl type a
+  built rename renamed is built at the renamed type.
+- An item renamed outside the ledger can follow without a built decision.
+  Its old name must be absent from every declaration in its crate, including test items.
+  An independent source diff must map the site to its renamed item in the same file.
+  Alternatively, exactly one changed file in that crate must gain one matching destination.
+  The original file counts when checking for competing destinations. An existing twin grants no proof.
+  The keyword, owner and proved trait identity must agree.
+  At least half the old body's non-blank lines must remain, in order, after replacing only the renamed identifier.
+  Body source includes internal comments. It excludes signatures, attributes and outer braces.
+  Empty or unreadable bodies grant no proof. Changed literals, calls and indentation do not count as equal lines.
+  A child follows only through its proved renamed owner and its own retained name and lexical scope.
+  A use of a local name does not prove a binding. Duplicate or unsupported bindings grant no proof.
+  An outside follow keeps the finding's id, request, state and decision. It never marks it built.
+  A refused outside search keeps the row, even when its source file is gone.
+  Its `left` line names the mapped declaration, sorted candidate sites, body counts and failed checks.
+  Earlier ambiguous-move, cross-crate, open-ticket and uncertain-trait refusals still apply.
 - Another filed finding whose file is still there stays filed for a person. A
-  person runs `style_ledger.py held waive --repo <checkout> --id <finding>`, or
+  person runs `style_ledger.py held waive --repo <checkout> --id <finding> --person <name>`, or
   puts the item back in the code.
 - An unfiled finding, or a filed finding whose file is gone, is withdrawn, with
   no decision when it was unfiled.
@@ -495,9 +577,18 @@ followed finding, and `--json` adds `followed_from`, `followed_at` and
 
 One style decision covers one rule and crate under one rule blob. An answer
 also covers later findings under that rule text: a declined decision waives
-them with its stored words, and `file` prints
-`waived <n> findings in <decision>: declined: <words>`. A new rule blob needs a new
-answer. Each decision shows counts and up to three examples from different
+them with its stored words and records the person actor `user`; `file` prints
+`waived <n> findings in <decision>: declined: <words>`. An approved decision
+that is closed opens again with its approval for a later finding when each of
+its findings is built, waived or withdrawn. The ledger decides this, not the
+close reason, so a decision closed by hand opens again too. A closed decision
+with a filed finding refuses it: `file` prints
+`skipped <decision>: closed decision has unbuilt findings` and exits 1. Open
+that decision with `proposal_issue.py reopen <decision>` and file again. A
+closed decision with no answer takes a later finding only when its close
+reason starts with `built in ` or `nothing left to build: `; else `file` prints
+`skipped <decision>: closed decision has no approval`. A new rule blob needs a
+new answer. Each decision shows counts and up to three examples from different
 files. The ledger holds its full site list. Show decisions only when the user
 asks through `/showrunner:proposals` or `/adhoc_review`.
 
@@ -526,10 +617,10 @@ changes during the refill gets `waiting <decision>: no longer approved`. A decis
 that the step skips gets `waiting <decision>: skipped by the declaration step`,
 and refill writes none of its findings. For a finding
 that the step cannot read, refill waives it when its file is not in the synced
-commit, and prints the file and the commit. It also waives a finding whose one-line site text left its
-file and moved into exactly one file that gained the line since the finding was
-judged, and prints both files and the commit. When no finding of the decision
-is left to build, refill closes it. Refill does not assign a queued proposal ticket that was
+commit, records the actor `ledger`, and prints the file and the commit. It also
+waives a finding whose one-line site text left its file and moved into exactly one file that gained the line since the finding was
+judged, records the actor `ledger`, and prints both files and the commit. When
+no finding of the decision is left to build, refill closes it. Refill does not assign a queued proposal ticket that was
 made before decisions. Drop that ticket with `style_ledger.py ticket drop`,
 then run migrate.
 
@@ -663,8 +754,8 @@ After each merge and at startup, run `style_proposals.py complete --repo
 findings are built or waived. It also closes an approved decision with no merged
 ticket when no finding is left to build. Decline only with `style_proposals.py decline --repo <style checkout>
 --issue <issue> --words '<the user's words>'`. It stores the answer and waives
-the findings still filed to the decision. Built findings stay built. Later
-findings are waived with the same words. Changed inputs stay stale.
+the findings still filed to the decision with the person actor `user`. Built
+findings stay built. Later findings are waived with the same words. Changed inputs stay stale.
 A general reason becomes a repo-local rule through `/local_style`.
 
 Record off-rule ideas as candidates, never held proposals. The showrunner
@@ -676,8 +767,9 @@ through `/new_style`, or drops the idea with `style_proposals.py drop-candidate
 --parent <slug> --dry-run` before migrating old style issues. Migration moves
 only the findings filed to each old issue. A moved finding takes the answer of
 its decision: a declined decision waives it with the stored words, and a
-decision closed as built opens again with its approval. A decision closed with
-nothing left to build also opens again with its approval for a later finding. Migration leaves an
+closed decision opens again by the rule for a later finding that `file` files
+(above). A closed decision that refuses the finding stops the migration before
+any write, with `style_proposals: <decision>: <reason>`. Migration leaves an
 issue with an unfinished build ticket unchanged, and it can resume after a crash.
 Migration does not change an off-rule issue that a style unit filed through
 `/issue`; it lists the issue as `skipped: off-rule <path>` and counts it in its totals.
@@ -697,8 +789,8 @@ decision whose duplicate an open ticket builds, or that has no generated body,
 prints `skipped <issue>: <reason>` and is not written. The run ends with
 `totals: drop <findings>, skipped <decisions>` and exits 1 when it skipped a
 decision. The dry run prints the same lines and writes nothing. `style_ledger.py
-held list` shows `duplicate of <finding id>` or `judgment <row> exception` after
-the state of a withdrawn row; `--json` gives `duplicate_of` and `withdrawn_by`.
+held list` shows `duplicate of <finding id>`, `judgment <row> exception` or
+`judged again in judgment <row>` after the state of a withdrawn row; `--json` gives `duplicate_of` and `withdrawn_by`.
 
 ## Lifetime
 
@@ -722,7 +814,8 @@ crate views include the oldest open ticket. Proposals are shown only when asked.
 
 The script is `scripts/style/coverage_report.py --repo <style checkout>
 [--rule <id or unique stem> | --crate <directory or package name>]`. It reads
-`style_ledger.Ledger`; its header uses `summary()`. Unclassified rules are listed
+`style_ledger.Ledger`. It reads `rule_counts(WholeRepository())` once, and its
+header uses `summary_of` over those rows, so the header and the table share one count. Unclassified rules are listed
 as a count with `pull nate_style`, and awaiting-merge cells count separately
 from current coverage. The comparison snapshot is `last_report.json` beside
 the ledger, including under `STYLE_LEDGER_STATE_DIR`.

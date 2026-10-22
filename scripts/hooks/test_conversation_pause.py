@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -143,6 +144,9 @@ class ConversationPauseTests(unittest.TestCase):
     notifier_stub: Path = Path()
     sessions_stub: Path = Path()
     send_stub: Path = Path()
+    activity_log: Path = Path()
+    activity_stub: Path = Path()
+    unit_active_root: Path = Path()
     socket_path: Path = Path()
     environment: dict[str, str] = {}
 
@@ -253,6 +257,21 @@ print("SENT: delivered")
 """
         )
         self.send_stub.chmod(0o755)
+        self.activity_log = self.root / "auto-silence.args"
+        self.activity_stub = self.root / "auto_silence.py"
+        _ = self.activity_stub.write_text(
+            """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+"""
+        )
+        self.activity_stub.chmod(0o755)
+        self.unit_active_root = self.root / "unit-active"
+        self.unit_active_root.mkdir()
         self.environment = {
             **os.environ,
             "HOME": str(self.root),
@@ -271,6 +290,12 @@ print("SENT: delivered")
             "SEND_LOG": str(self.send_log),
             "SESSION_SOCKET": str(self.socket_path),
             "SESSION_RUNNING": "1",
+            # The detached auto silence call outlives the hook, so a stub that writes could still
+            # be writing in the temp dir as it is removed. Only a test that waits for the log
+            # writes one (`record_activity`).
+            "AUTO_SILENCE_COMMAND": shutil.which("true") or "/bin/true",
+            "AUTO_SILENCE_LOG": str(self.activity_log),
+            "PLAN_DELEGATE_ACTIVE_DIR": str(self.unit_active_root),
         }
 
     def create_instance(
@@ -578,6 +603,44 @@ print("SENT: delivered")
         scheduled = self.run_prompt(cross_session("delegate-abc", "update"))
         self.assertEqual((scheduled.returncode, scheduled.stderr), (0, ""))
         self.assertFalse(stamp.exists())
+
+    def record_activity(self) -> None:
+        """Make the detached auto silence call write its arguments; every write then needs a wait."""
+        self.environment["AUTO_SILENCE_COMMAND"] = str(self.activity_stub)
+
+    def activity_calls(self, expected: int) -> list[list[str]]:
+        """The detached call lands after the hook exits: wait for `expected` lines, briefly."""
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            lines = self.activity_log.read_text().splitlines() if self.activity_log.exists() else []
+            if len(lines) >= expected:
+                return [cast(list[str], json.loads(line)) for line in lines]
+            time.sleep(0.05)
+        return []
+
+    def test_typed_prompt_in_a_showrunner_or_unit_director_records_activity(self) -> None:
+        self.record_activity()
+        _ = self.create_instance("showrunner-demo")
+        self.assertEqual(self.run_prompt("hello").returncode, 0)
+        self.assertEqual(self.activity_calls(1), [["active"]])
+        self.activity_log.unlink()
+        _ = (self.notifier_root / "showrunner-demo" / "conf").write_text("TARGET=session:other\nEVERY=5\nCOMMAND=report\n")
+        _ = (self.unit_active_root / SESSION).write_text("/tmp/claude/unit/run-1\n")
+        self.assertEqual(self.run_prompt("hello").returncode, 0)
+        self.assertEqual(self.activity_calls(1), [["active"]])
+
+    def test_other_sessions_and_prompts_record_no_activity(self) -> None:
+        self.record_activity()
+        plain = self.run_prompt("hello")
+        self.assertEqual((plain.returncode, plain.stderr), (0, ""))
+        _ = self.create_instance("showrunner-demo")
+        for prompt in (cross_session("natedev", "continue"), "<task-notification>done</task-notification>"):
+            self.assertEqual(self.run_prompt(prompt).returncode, 0)
+        _ = self.create_instance("unit-scheduled", sender="unit-scheduled")
+        self.assertEqual(self.run_prompt(cross_session("unit-scheduled", "update")).returncode, 0)
+        # A control: a typed prompt does reach the log, so the empty reading above means something.
+        self.assertEqual(self.run_prompt("hello").returncode, 0)
+        self.assertEqual(self.activity_calls(1), [["active"]])
 
     def test_typed_stamp_failure_does_not_skip_report_pause(self) -> None:
         _ = self.escalate_root.write_text("not a directory")

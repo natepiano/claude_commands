@@ -1,5 +1,5 @@
 ---
-description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA on a schedule.
+description: Run a production as its showrunner — launch each unit director (a /unit:direct session), merge and test every checkpoint on the merge branch, check visible work in screenshots before merging, clear waits between units, relay the user's words, and report each unit's ETA when asked.
 ---
 
 # Produce
@@ -50,7 +50,9 @@ State:
 - `SHOWRUNNER_STATE` — `<STATE_DIR>/showrunner_state.json`, one JSON object with
   optional `units` rows (`{"unit": "<unit session name>", "phase": "<text>",
   "wait": "<text>"}`), `merges_held` (a list of text), and `open_for_user`
-  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`), and
+  (a list of text or `{"text": "<text>", "after": "YYYY-MM-DDTHH:MM"}`; an
+  object may add `urgency`: `blocks`, `soon` with `due`, or `later`, and
+  `follows`: the text of the item it comes after), and
   `report_to_user` (a list of `{"text": "<short>", "until": "<ISO time>"}`: what
   the user asked to be told about, such as "tell me when hanadocs is back";
   remove an item once it is reported; it needs no review), and `next` (a list
@@ -264,11 +266,11 @@ State:
   The user sees the count at all times in the Claude Code status line's
   `For you: …` row, under the quota row, with the changes, proposals and
   projects.
-  When the user asks for the next question, show only the oldest due item
+  When the user asks for the next question, show only the current item
   (`/next question`).
   List the questions in full only when the user asks what they are: run
   `python3 ~/.claude/scripts/production/update_registration.py open
-  --production PRODUCTION_DOC` and show its list, oldest first, each item led
+  --production PRODUCTION_DOC` and show its list in the order of `/next`, each item led
   by the production that owns it. A dailies report still lists what needs the user in full, because
   it is a report the user asked for. User, 2026-10-12, replacing the
   2026-10-06 rule that restated the user's items in every reply.
@@ -322,6 +324,16 @@ State:
 </Throughout>
 
 ---
+
+<Guild>
+Your guild is `showrunners`. Your head is the `showrunners` unit director in the top-level `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/showrunners/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `showrunners`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
+
+Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild showrunners
+
+Use Events in `~/.claude/docs/plans/sdlc-guilds-design.md` for report detection and form.
+Pass the user's guild feedback to that guild's head. A Codex holder includes the
+expanded block and loaded tip text in its worker prompt.
+</Guild>
 
 <ExecutionSteps>
 **EXECUTE IN ORDER:**
@@ -499,7 +511,7 @@ whatever arrived:
 | a unit's finished proposal, or the user approves, declines or re-rates one | `/showrunner:proposal` |
 | the user asks for the nightly improvement list | `/showrunner:nightly` |
 | the user asks to put a showrunner under another, or asks for the tree | `/showrunner:attach` |
-| the user asks what the open questions are | run `update_registration.py open --production PRODUCTION_DOC` and show its list: every item now due in full, oldest first, each led by its production; a deferred item with its time; a list it could not read (<Throughout/> → Open questions) |
+| the user asks what the open questions are | run `update_registration.py open --production PRODUCTION_DOC` and show its list: every item now due in full, in the order of `/next`, each led by its production; a deferred item with its time; a list it could not read (<Throughout/> → Open questions) |
 | a child showrunner's item for the user | show it in the child's words; relay the answer to that child (<Throughout/> → Nested showrunners) |
 | the user's words for a production below this one | relay them to the child that holds it (<Throughout/> → Nested showrunners) |
 
@@ -948,7 +960,11 @@ it needs. Every other wait is yours to clear, and fast.
    3. **Otherwise, tell the user exactly what to do,** in one line they can act on from
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
-      `needed:` and send it as a <Notify/> `blocked` alert.
+      `needed:` and send it as a <Notify/> `blocked` alert. An auto-mode refusal
+      goes as `send.py --to user --need blocked --text-id auto_mode.refused` with its
+      `--value`s (`send.py --help`); free text about it is held. A session that waits
+      for the user to type a go goes as `send.py --to user --need blocked --text-id
+      session.needs_go` with its `--value`s; free text about it is held.
    4. **Rule 4's limit holds.** Each hour, run
       `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit>`
       and repeat 1–3.

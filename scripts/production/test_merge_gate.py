@@ -27,7 +27,7 @@ EXPECTED_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
     "mac_test", "usage", "bevy_upgrade", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline", "astra", "style",
+    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds",
 )
 # Each suite's fixture holds test_first.py, and lib also test_second.py.
 MODULES = len(EXPECTED_SUITES) + 1

@@ -390,6 +390,14 @@ def is_showrunner_session(session_id: str) -> bool:
     return bool(showrunner_footer.targeted_instances(session_id))
 
 
+def is_showrunner_or_unit_director(session_id: str) -> bool:
+    """A showrunner's dailies timer or a unit run's status timer targets it, or a unit run marks it."""
+    prefixes = ("showrunner-", *unit_runs.INSTANCE_PREFIXES)
+    if any(report.name.startswith(prefixes) for report in session_reports(session_id)):
+        return True
+    return unit_runs.marker(session_id, os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")).is_file()
+
+
 def session_reports(session_id: str) -> list[Report]:
     reports: list[Report] = []
     try:

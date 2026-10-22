@@ -20,6 +20,23 @@ must not drift from it:
 
 ## Words
 
+<GuildHeads>
+For Words and <ProductionUnit/> below, production `guilds` has four unit
+directors with the exact IDs `designers`, `reviewers`, `showrunners`, `units`,
+without `-unit`. The guilds showrunner is top-level on natedev; these heads
+are its units, not showrunners, and belong to the units guild. Other unit
+names and worker IDs keep their current rules.
+
+A plan headed `> **Standing:** guild-head` runs its report/evidence/tip/reply
+loop and daily read instead of a phased build. It dispatches no worker, runs
+no phase or gate, and makes no checkpoint or shrink. It may write and publish
+its owned guild tips directly. The production row still gives its identity,
+plan, worktree and ownership. It owns no assignments, acceptance, model
+choices or gates; process proposals go through guilds to sdlc for
+guild-process-unit. Ordinary phased and standing style contracts retain their
+current behavior.
+</GuildHeads>
+
 - **Production** — the whole effort: its units, its merge branch, and its
   production doc.
 - **Executive producer** — the user. Every product, scope and irreversible
@@ -28,7 +45,7 @@ must not drift from it:
   plans and splits them into a production doc and unit plans.
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
-  and reports on a schedule. It writes no implementation code.
+  and reports when asked. It writes no implementation code.
 - **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.

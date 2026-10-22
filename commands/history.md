@@ -4,7 +4,7 @@ description: Query stage, phase, and run timings across skill run history
 
 # history
 
-`$ARGUMENTS` — a subcommand (`summary`, `compare`, `stages`, `phases`, `runs`,
+`$ARGUMENTS` — a subcommand (`summary`, `compare`, `stages`, `phases`, `rounds`, `runs`,
 `tests`, `versions`) and its flags.
 
 Run:
@@ -13,7 +13,7 @@ Run:
 python3 ~/.claude/scripts/history/history.py $ARGUMENTS
 ```
 
-Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the seven
+Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the eight
 subcommands → show `history.py --help` and stop.
 
 **Runs sandboxed — never pass `dangerouslyDisableSandbox`.** The script reads
@@ -55,6 +55,7 @@ unconverted.
   keys are rejected
 - `phases` — review and fix rounds per phase, grouped by `(run, phase)`; columns
   `run  phase  reviews  fixes  impl  fix  total`
+- `rounds` — repair rounds and causes per phase instance; `--top N` (default 25), `--plan <substring>`, `--status`, `--until` (same forms as `--since`); marks mixed phase records
 - `runs` — one row per run
 - `tests` — verification and smoke history
 - `versions` — which spine and schema versions each store holds

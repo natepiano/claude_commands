@@ -27,7 +27,7 @@ CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/sta
 CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
 
 # Keep the materialized registry current between periodic launchd runs.
-if [[ -f "$AGENTS_CONFIG_FILE" \
+if [[ "${AGENTS_CONFIG_TIER_ONLY:-}" != 1 && -f "$AGENTS_CONFIG_FILE" \
     && -x "$AGENTS_CONFIG_DIR/sync_codex_catalog.sh" \
     && ( ! -f "$CODEX_CATALOG_SYNC_STATE_FILE" \
         || "$CODEX_CONFIG_FILE" -nt "$CODEX_CATALOG_SYNC_STATE_FILE" \
@@ -403,6 +403,19 @@ _agents_codex_config_tier() {
             return 0
         fi
     done < "$CODEX_CONFIG_FILE"
+}
+
+# A running Codex turn uses only the registry. An empty setting means default.
+# A task without a row uses only the function's setting.
+agents_turn_service_tier() {
+    local task="${1:-delegate}"
+    if [[ ! -r "$AGENTS_CONFIG_FILE" ]]; then
+        echo "ERROR: cannot read agent registry: $AGENTS_CONFIG_FILE" >&2
+        return 1
+    fi
+    [[ "$task" == *.* ]] || task="$task."
+    _agents_resolve_service_tier "$task" codex || return
+    printf '%s' "${AGENT_SERVICE_TIER:-default}"
 }
 
 # A row's tier as /agent shows it: `-` for claude, which never takes one; the

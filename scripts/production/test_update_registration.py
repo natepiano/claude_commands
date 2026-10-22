@@ -106,7 +106,7 @@ class RegistrationTests(unittest.TestCase):
                     "REGISTRATION_TEST_STATE": str(self.state), "SHOWRUNNER_STATE_DIR": str(self.state / "showrunner"),
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
-                    "MAC_TEST_STATE_DIR": str(self.state / "mac-test"),
+                    "MAC_TEST_STATE_DIR": str(self.state / "mac-test"), "NEXT_STATE_DIR": str(self.state / "next"),
                     "CLAUDE_CODE_SESSION_ID": "current-session-id"}
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
@@ -841,6 +841,56 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
             "1. example, since Tue Oct 06 09:00: choose layout",
             "open: ok — 1 due, 0 deferred",
         ])
+
+    def test_open_and_next_put_the_most_urgent_first_and_keep_the_shown_item(self) -> None:
+        self.write_open_for("example", {"since": "2026-10-01T09:00", "text": "old normal"},
+                            {"since": "2026-10-06T09:00", "text": "needs the old one", "urgency": "blocks",
+                             "follows": "later one"},
+                            {"since": "2026-10-02T09:00", "text": "later one", "urgency": "later"},
+                            {"since": "2026-10-05T09:00", "text": "by friday", "urgency": "soon", "due": "2026-10-09"})
+        self.assertEqual(self.open_lines(), [
+            "1. example [later], since Fri Oct 02 09:00: later one",
+            "2. example [blocks], since Tue Oct 06 09:00: needs the old one",
+            "3. example [soon, due 2026-10-09], since Mon Oct 05 09:00: by friday",
+            "4. example, since Thu Oct 01 09:00: old normal",
+            "open: ok — 4 due, 0 deferred",
+        ])
+        shown = self.run_command("next")
+        self.assertEqual(shown.stdout.splitlines(), ["example [later], since Fri Oct 02 09:00: later one",
+                                                     "next: ok — 3 more due"])
+        marked = self.run_command("mark-important", "--item", "old normal")
+        self.assertEqual(marked.stdout.strip(), "mark-important: ok — old normal", marked.stdout + marked.stderr)
+        # The shown item stays first until it is answered; the user's mark takes the next place.
+        lines = self.open_lines()
+        self.assertEqual(lines[0], "1. example [later], since Fri Oct 02 09:00: later one")
+        self.assertTrue(lines[1].startswith("2. example [user, marked "), lines[1])
+        self.write_open_for("example", *cast(list[dict[str, str]], json.loads(self.outstanding().read_text())[:2]))
+        self.assertTrue(self.run_command("next").stdout.startswith("example [user, marked "))
+        self.assertEqual(self.run_command("mark-important", "--item", "nothing like it").returncode, 2)
+
+    def test_questions_store_a_level_and_keep_the_users_mark(self) -> None:
+        outstanding = self.outstanding()
+        _ = outstanding.write_text('[{"since":"2026-10-01T08:00","text":"choose layout","urgency":"user",'
+                                   + '"marked":"2026-10-01T09:00"},{"since":"2026-10-01T08:00","text":"merge before the demo"}]')
+        state = self.root / "judgment.json"
+        _ = state.write_text(json.dumps({"open_for_user": [
+            {"text": "choose layout", "urgency": "later"},
+            {"text": "merge before the demo", "urgency": "soon", "due": "2026-10-09T12:00", "follows": "choose layout"},
+        ]}), encoding="utf-8")
+        with mock.patch.dict(os.environ, self.env):
+            parsed = registration.judgment_state(state, "questions")
+        self.assertIsInstance(parsed.outstanding, registration.ReplaceOutstanding)
+        stored = self.run_command("questions", "--state", str(state))
+        self.assertEqual(stored.returncode, 0, stored.stdout + stored.stderr)
+        entries = cast(list[dict[str, str]], json.loads(outstanding.read_text(encoding="utf-8")))
+        self.assertEqual({key: entries[0].get(key) for key in ("urgency", "marked")},
+                         {"urgency": "user", "marked": "2026-10-01T09:00"})
+        self.assertEqual({key: entries[1].get(key) for key in ("urgency", "due", "follows")},
+                         {"urgency": "soon", "due": "2026-10-09T12:00", "follows": "choose layout"})
+        _ = state.write_text(json.dumps({"open_for_user": [{"text": "choose layout", "urgency": "soon"}]}),
+                             encoding="utf-8")
+        bad = self.run_command("questions", "--state", str(state))
+        self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
 
 
 if __name__ == "__main__":

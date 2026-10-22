@@ -1,4 +1,40 @@
 {
+  "auto_mode.refused": {
+    "one_with_rule": {
+      "objections": [
+        {
+          "quote": "build-followups: auto mode stopped messaging",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Approve: messaging goes on now, but the same command can stop it again later.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Auto mode refused 1 command in messaging.",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
+      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
+      "time": "2026-10-21T07:45:14.877215-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "cargo-liner-style: auto mode stopped types",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Approve: types goes on now, but the same commands can stop it again later.\n\nAllow rule: types goes on now and never stops on these commands again.",
+          "rule": "every-choice-says-what-it-does"
+        }
+      ],
+      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
+      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
+      "time": "2026-10-21T07:45:03.336113-04:00"
+    }
+  },
   "codex.reset_ready": {
     "long_machine": {
       "reviewer": "opus",
@@ -9,6 +45,34 @@
       "reviewer": "opus",
       "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
       "time": "2026-10-14T04:25:55.369515-04:00"
+    }
+  },
+  "nate.adhoc": {
+    "long_sender": {
+      "objections": [
+        {
+          "quote": "cargo-liner-style renames",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "both units run under their new names",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:23:00.784022-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "natedev the /nate skill is ready",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:22:51.437039-04:00"
     }
   },
   "nixos.disk_low": {
@@ -356,6 +420,75 @@
       "time": "2026-10-14T17:21:34.175899-04:00"
     }
   },
+  "quota.paid_credits": {
+    "from_session": {
+      "objections": [
+        {
+          "quote": "natedev: codex1 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "To stop it, set use_credits: off",
+          "rule": "first-150-stand-alone"
+        },
+        {
+          "quote": "codex1 has 6,370 paid credits left.",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
+      "sha256": "ef78c5d0af761155edfc6129883ea294405dc08a68906927def1ecf56d5603d5",
+      "time": "2026-10-21T07:51:58.757542-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "quota_alert: codex2 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "codex2 has 25,345 paid credits left.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
+      "sha256": "ef78c5d0af761155edfc6129883ea294405dc08a68906927def1ecf56d5603d5",
+      "time": "2026-10-21T07:51:44.021181-04:00"
+    }
+  },
+  "quota.paid_credits_queued": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "quota_alert: codex2 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "To stop it, set use_credits: off",
+          "rule": "first-150-stand-alone"
+        },
+        {
+          "quote": "codex2 has 25,345 paid credits left.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "workers spend these credits until your queued move runs",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: user 2026-10-21: approved whatever messaging and accounts decide on paid credits; text agreed with accounts-unit; reviewer: opus",
+      "sha256": "5ea0c1dd6ea4e5c01c8436fdb2344b7f9801ab24af834edda4bd55d63b505500",
+      "time": "2026-10-21T18:19:20.767262-04:00"
+    }
+  },
   "rust.errors": {
     "many_errors": {
       "reviewer": "opus",
@@ -402,6 +535,38 @@
       "reviewer": "opus",
       "sha256": "f780c17a61255b97f0f1a01227f04cc80dd0ebb73837ca16f62e75c41166cd9e",
       "time": "2026-10-14T04:24:37.910956-04:00"
+    }
+  },
+  "session.needs_go": {
+    "delete_worktree": {
+      "objections": [
+        {
+          "quote": "build-followups: herdr waits for your go",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
+      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
+      "time": "2026-10-21T08:05:00.760833-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "natedev: trunk waits for your go",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Steps 130 and 140 both claim the arrange_jacks folder",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Your go removes it from step 130, and trunk goes on.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
+      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
+      "time": "2026-10-21T08:04:49.559420-04:00"
     }
   },
   "shutdown.holdout": {
@@ -499,44 +664,168 @@
       "time": "2026-10-14T17:14:02.345122-04:00"
     }
   },
+  "silence.auto_off": {
+    "none_kept": {
+      "objections": [
+        {
+          "quote": "You are back; 0 kept.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence off",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "natedev auto silence off",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "You are back; 0 kept.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
+      "time": "2026-10-20T16:21:05.918014-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "You are back; 3 kept.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "3 kept",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "natedev auto silence off",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "You are back; 3 kept.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
+      "time": "2026-10-20T16:20:58.301946-04:00"
+    }
+  },
+  "silence.auto_on": {
+    "long_idle": {
+      "objections": [
+        {
+          "quote": "Idle 1440 min.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Idle 1440 min.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "aab611c0e487c2f7b5caed05a58bdb66448bdb6edb53fcdc4e1c147702936601",
+      "time": "2026-10-20T16:20:50.954293-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "Idle 45 min.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Idle 45 min.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "aab611c0e487c2f7b5caed05a58bdb66448bdb6edb53fcdc4e1c147702936601",
+      "time": "2026-10-20T16:20:43.314939-04:00"
+    }
+  },
   "stall_watch.permission_prompt": {
     "edit": {
       "objections": [
         {
-          "quote": "Yes: the session does that and goes on with its work.",
-          "rule": "every-choice-says-what-it-does"
+          "quote": "herdr-panes needs your answer",
+          "rule": "title-names-the-stake"
         },
         {
           "quote": "wants to edit panes.py",
           "rule": "reader-starts-cold"
         }
       ],
-      "reviewer": "user-spec: user via showrunner 2026-10-18: approved the permission-prompt alert text; reviewer: opus",
-      "sha256": "969f4008989a19b2b93283ace5682db37713c612e9a5f97979c90c326464adc0",
-      "time": "2026-10-18T22:42:23.375991-04:00"
+      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
+      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
+      "time": "2026-10-21T18:07:26.466772-04:00"
     },
     "typical": {
       "objections": [
         {
+          "quote": "cargo-liner-style-types needs your answer",
+          "rule": "title-names-the-stake"
+        },
+        {
           "quote": "Yes: the session does that and goes on with its work.",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Session: cargo-liner-style-types\nAction: On natedev, open the cargo-liner-style-types herdr tab and answer its prompt\nThe Claude coding session cargo-liner-style-types on natedev wants to delete its own saved tool output, b1e4yc8b9.txt. The file is outside its allowed folders, so it needs your permission. It has waited since 10:54 EDT and does no work until you answer.\n\nYes (recommended): the session deletes its own file and goes on with its work.\n\nNo: the session keeps the file and asks you what to do instead.",
+          "rule": "push-body-under-500"
         }
       ],
-      "reviewer": "user-spec: user via showrunner 2026-10-18: approved the permission-prompt alert text; reviewer: opus",
-      "sha256": "969f4008989a19b2b93283ace5682db37713c612e9a5f97979c90c326464adc0",
-      "time": "2026-10-18T22:42:01.171501-04:00"
+      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
+      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
+      "time": "2026-10-21T18:07:13.543700-04:00"
     }
   },
   "sweep.disk_floor": {
     "no_free_space": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:24:04.260987-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "/tmp/claude-1000/scratch",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:33.124483-04:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:23:53.034006-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Action: In the Claude session named natedev, name the paths below that it may remove.\nThe natedev computer has 290.0 GiB free. Builds need 300.0 GiB. They may fail until 10.0 GiB more is free. Build cache cleanup freed 2.0 GiB and has no idle build output left.\n\n/tmp/claude-1000/scratch (recommended): frees 86.0 GiB. That alone is enough, and no running process is at risk.\n\n/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\nThe session removes only the paths you name.",
+          "rule": "push-body-under-500"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:22.184346-04:00"
     }
   }
 }

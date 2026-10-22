@@ -285,6 +285,73 @@ class PromptSubmissionTests(unittest.TestCase):
         self.assertEqual(self.typed, [("destination:p1", text, 0)])
         self.assertEqual(self.enters, [])
 
+    PRODUCE = "/showrunner:produce /x/doc.md resume"
+
+    def write_rejection(self, command: str) -> None:
+        """Claude's answer to a command its list lacks, as session cbc14765 recorded it on 2026-10-21."""
+        at = (self.launched_at + timedelta(seconds=self.elapsed + 1)).isoformat()
+        with self.path.open("a") as stream:
+            for content in (f"Unknown command: {command}", "Args from unknown skill: /x/doc.md resume"):
+                _ = stream.write(json.dumps({"type": "system", "subtype": "informational", "content": content,
+                                             "isMeta": False, "level": "warning", "timestamp": at}) + "\n")
+
+    def submit_command(self, accept: Callable[[str, int], bool], timeout_ms: int = 90_000) -> herdr.PromptSubmitOutcome:
+        """Type into a session that answers `Unknown command` unless `accept(text, typing)` takes the text."""
+        def type_text(pane: str, text: str) -> None:
+            self.typed.append((pane, text, self.elapsed))
+            if accept(text, len(self.typed)):
+                self.write_turn(text, seconds_after_launch=self.elapsed + 1)
+            else:
+                self.write_rejection(text.split()[0])
+        with patch.object(self.client, "prompt", side_effect=type_text):
+            return self.submit(timeout_ms, text=self.PRODUCE)
+
+    def command_file(self) -> Path:
+        path = self.transcript.config_dir / "commands/showrunner/produce.md"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("# Produce\n")
+        return path
+
+    def test_an_unknown_command_is_typed_once_more_after_its_list_settles(self) -> None:
+        outcome = self.submit_command(lambda _text, typing: typing == 2)
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE] * 2)
+        self.assertGreaterEqual(self.typed[1][2] - self.typed[0][2], herdr.PROMPT_SETTLE_SECONDS)
+        self.assertEqual(self.enters, [])
+
+    def test_a_command_unknown_twice_is_sent_as_its_file_in_a_plain_prompt(self) -> None:
+        path = self.command_file()
+        outcome = self.submit_command(lambda text, _typing: text.startswith("This session"))
+        self.assertIsInstance(outcome, herdr.PromptSubmitted)
+        fallback = (f"This session's command list does not have /showrunner:produce yet, so read {path.resolve()} "
+                    + "in full and follow it as /showrunner:produce with the arguments: /x/doc.md resume")
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE, self.PRODUCE, fallback])
+        self.assertLess(self.elapsed, 60)
+
+    def test_a_command_unknown_twice_with_no_file_reports_the_refusal(self) -> None:
+        outcome = self.submit_command(lambda _text, _typing: False)
+        self.assertIsInstance(outcome, herdr.PromptNotSubmitted)
+        reason = cast(herdr.PromptNotSubmitted, outcome).reason
+        self.assertIn("Claude answered Unknown command: /showrunner:produce; prompt typed 2 times", reason)
+        self.assertEqual([text for _pane, text, _at in self.typed], [self.PRODUCE] * 2)
+        self.assertFalse(cast(herdr.PromptNotSubmitted, outcome).never_typed)
+
+    def test_rejections_count_only_this_prompts_command(self) -> None:
+        cursor = herdr.TranscriptCursor(self.transcript, self.launched_at)
+        for command in ("/showrunner:produce-x", "/showrunner:producer", "/showrunner:produce", "/compat. Did you mean /compact?"):
+            self.write_rejection(command)
+        self.assertEqual(cursor.command_rejections(self.PRODUCE), 1)
+        self.assertEqual(cursor.command_rejections("resume the saved work"), 0)
+
+    def test_a_fallback_needs_a_slash_command_with_a_file(self) -> None:
+        path = self.command_file()
+        self.assertIsNone(herdr.command_fallback("resume the saved work", self.transcript))
+        self.assertIsNone(herdr.command_fallback("/showrunner:missing x", self.transcript))
+        self.assertIsNone(herdr.command_fallback("/../showrunner:produce", self.transcript))
+        self.assertEqual(herdr.command_fallback("/showrunner:produce", self.transcript),
+                         f"This session's command list does not have /showrunner:produce yet, so read {path.resolve()} "
+                         + "in full and follow it as /showrunner:produce with no arguments")
+
     def test_slash_command_matching_requires_the_name_arguments_and_non_meta_user(self) -> None:
         for text, content, kind, meta, matches in (
             ("/check", "<command-name>/check</command-name>", "user", False, True),
@@ -1920,21 +1987,26 @@ class HerdrTests(unittest.TestCase):
         options = ["--label", "boss", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(["workspace", "create", *options], json.dumps({"result": {
             "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}}}))
+        self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": []}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "boss", "/repo", {"SHOWRUNNER_UNIT": "prod"}), "w1:p1")
-        self.assertEqual(self.commands()[1:], [["--session", "fixture", "workspace", "create", *options],
-                                               ["--session", "fixture", "tab", "rename", "w1:t1", "boss"],
-                                               ["--session", "fixture", "pane", "rename", "w1:p1", "boss"]])
+        self.assertEqual(self.commands()[1:4], [["--session", "fixture", "workspace", "create", *options],
+                                                ["--session", "fixture", "tab", "rename", "w1:t1", "boss"],
+                                                ["--session", "fixture", "pane", "rename", "w1:p1", "boss"]])
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "boss"}]}}))
         tab = ["tab", "create", "--workspace", "w1", "--label", "alpha", "--cwd", "/wt", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]
         self.configure_herdr(tab, json.dumps({"result": {"root_pane": {"pane_id": "w1:p2"}}}))
-        self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
-            {"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]}}))
+        tabs = [{"tab_id": "w1:t1", "label": "boss", "pane_count": 1, "workspace_id": "w1"},
+                {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1, "workspace_id": "w1"}]
+        for arguments in (["tab", "list", "--workspace", "w1"], ["tab", "list"]):
+            self.configure_herdr(arguments, json.dumps({"result": {"tabs": tabs}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual(self.commands()[-4:], [["--session", "fixture", *tab],
-                                                ["--session", "fixture", "pane", "rename", "w1:p2", "alpha"],
-                                                ["--session", "fixture", "workspace", "list"],
-                                                ["--session", "fixture", "tab", "list", "--workspace", "w1"]])
+        self.assertEqual([command[2:] for command in self.commands()[-7:]], [
+            tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["workspace", "list"],
+            ["tab", "list", "--workspace", "w1"], ["workspace", "list"], ["tab", "list"]])
+        saved = herdr.saved_layout("fixture")
+        self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
+                         [("boss", ["boss", "alpha"])])
 
     def test_order_tabs_puts_the_showrunner_first_then_moves_each_tab_out_of_place(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
@@ -1949,7 +2021,7 @@ class HerdrTests(unittest.TestCase):
         for pane, tab in (("w1:p3", "w1:t4"), ("w1:p2", "w1:t5")):
             self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w1"], json.dumps({"result": {
                 "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": pane}}}}))
-        self.assertEqual(herdr.Herdr("fixture").order_tabs("w1"), {"w1:p3": "w1:p3", "w1:p2": "w1:p2"})
+        self.assertEqual(herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[])), {"w1:p3": "w1:p3", "w1:p2": "w1:p2"})
         acted = [command[2:] for command in self.commands() if command[2:4] not in (["workspace", "list"], ["tab", "list"],
                                                                                      ["pane", "list"])]
         self.assertEqual(acted, [["pane", "move", "w1:p3", "--new-tab", "--workspace", "w1"], ["tab", "rename", "w1:t4", "alpha"],
@@ -1972,7 +2044,7 @@ class HerdrTests(unittest.TestCase):
                 acted = [command[2:] for command in self.commands() if command[3:4] == ["rename"]]
                 self.assertEqual(acted, [["pane", "rename", "w1:p2", "new-name"], ["tab", "rename", "w1:t2", "new-name"]]
                                  if changed else [])
-                self.assertEqual(ordered.call_args_list, [call("w1")] if changed else [])
+                self.assertEqual(ordered.call_args_list, [call("w1", herdr.SavedLayout(at=0.0, workspaces=[]))] if changed else [])
         with self.assertRaisesRegex(herdr.HerdrFailure, "no pane"):
             _ = herdr.Herdr("fixture").retitle("w9:p9", "new-name")
 
@@ -1983,7 +2055,7 @@ class HerdrTests(unittest.TestCase):
                       {"tab_id": "w1:t3", "label": "alpha", "pane_count": 2}],
                      [{"tab_id": "w1:t1", "label": "boss", "pane_count": 1}, {"tab_id": "w1:t2", "label": "alpha", "pane_count": 1}]):
             self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": tabs}}))
-            self.assertEqual(herdr.Herdr("fixture").order_tabs("w1"), {})
+            self.assertEqual(herdr.Herdr("fixture").order_tabs("w1", herdr.SavedLayout(at=0.0, workspaces=[])), {})
         self.assertEqual({tuple(command[2:4]) for command in self.commands()}, {("workspace", "list"), ("tab", "list")})
 
     def test_shared_session_is_never_stopped_and_close_agent_closes_only_the_tab(self) -> None:
@@ -3119,6 +3191,160 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(trust_survey.descendant_repositories(self.root), 3)
         self.assertEqual(trust_survey.descendant_repositories(checkout), 2)
         self.assertEqual(trust_survey.project_kind(self.root, self.root, self.root), "ancestor of 3 repos")
+
+
+class LayoutHerdr(herdr.Herdr):
+    """An in-memory herdr session: workspaces and tabs in order, one pane per tab."""
+
+    def __init__(self) -> None:
+        super().__init__("fixture")
+        self.spaces: list[tuple[str, str]] = []
+        self.tabs: list[dict[str, str]] = []
+        self.count: int = 0
+
+    def new_id(self, kind: str) -> str:
+        self.count += 1
+        return f"{kind}{self.count}"
+
+    def add_tab(self, workspace: str, label: str) -> dict[str, object]:
+        tab = {"tab_id": self.new_id("t"), "pane_id": self.new_id("p"), "workspace_id": workspace, "label": label}
+        self.tabs.append(tab)
+        return {"tab": {"tab_id": tab["tab_id"]}, "root_pane": {"pane_id": tab["pane_id"]}}
+
+    def layout(self) -> list[tuple[str, list[str]]]:
+        return [(label, [tab["label"] for tab in self.tabs if tab["workspace_id"] == ident]) for ident, label in self.spaces]
+
+    @override
+    def result(self, *arguments: str) -> dict[str, object]:
+        words = list(arguments)
+        match words[:2]:
+            case ["workspace", "list"]:
+                return {"workspaces": [{"workspace_id": ident, "label": label, "focused": False} for ident, label in self.spaces]}
+            case ["workspace", "create"]:
+                ident = self.new_id("w")
+                self.spaces.append((ident, words[words.index("--label") + 1]))
+                return self.add_tab(ident, words[words.index("--label") + 1])
+            case ["tab", "create"]:
+                return self.add_tab(words[words.index("--workspace") + 1], words[words.index("--label") + 1])
+            case ["tab", "list"]:
+                shown = [tab for tab in self.tabs if "--workspace" not in words or tab["workspace_id"] == words[-1]]
+                return {"tabs": [{**tab, "pane_count": 1} for tab in shown]}
+            case ["pane", "list"]:
+                return {"panes": [{"pane_id": tab["pane_id"], "tab_id": tab["tab_id"], "workspace_id": tab["workspace_id"],
+                                   "label": tab["label"]} for tab in self.tabs]}
+            case ["pane", "move"]:
+                tab = next(tab for tab in self.tabs if tab["pane_id"] == words[2])
+                self.tabs.remove(tab)
+                moved = {**tab, "tab_id": self.new_id("t")}
+                self.tabs.append(moved)
+                return {"move_result": {"created_tab": {"tab_id": moved["tab_id"]}, "pane": {"pane_id": moved["pane_id"]}}}
+            case _:
+                raise AssertionError(f"unexpected herdr call {words}")
+
+    @override
+    def run(self, *arguments: str) -> str:
+        words = list(arguments)
+        match words[:2]:
+            case ["tab", "rename"]:
+                next(tab for tab in self.tabs if tab["tab_id"] == words[2])["label"] = words[3]
+            case ["tab", "close"]:
+                self.tabs = [tab for tab in self.tabs if tab["tab_id"] != words[2]]
+            case ["pane", "rename"] | ["tab", "focus"] | ["workspace", "focus"]:
+                pass
+            case _:
+                raise AssertionError(f"unexpected herdr call {words}")
+        return "{}"
+
+
+@final
+class SavedLayoutTests(unittest.TestCase):
+    """A restart puts every session back in its saved workspace and tab, in the saved order (user, 2026-10-21)."""
+
+    BEFORE: list[tuple[str, list[str]]] = [
+        ("ad-hoc", ["postmaster", "ups"]),
+        ("cargo-liner", ["cargo-liner", "berth", "tile"]),
+        ("hana", ["hana", "assembly", "widget"]),
+        ("fps", ["performance", "benchmark", "frame-cost", "metrics-gathering"]),
+        ("natedev", ["natedev", "accounts", "herdr", "unit-board"]),
+        ("sdlc", ["sdlc", "roles"]),
+        ("cargo-liner-style", ["cargo-liner-style", "names"]),
+    ]
+
+    def __init__(self, method: str = "runTest") -> None:
+        super().__init__(method)
+        self.root: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
+                                                                    "HOME": str(self.root)})))
+
+    def running(self) -> LayoutHerdr:
+        client = LayoutHerdr()
+        for space, titles in self.BEFORE:
+            for title in titles:
+                _ = client.open_tab(space, title, "/repo", {})
+        return client
+
+    def test_a_reboot_restart_in_any_order_brings_back_every_workspace_and_tab_in_place(self) -> None:
+        self.assertEqual(self.running().layout(), self.BEFORE)
+        launches = [(space, title) for space, titles in self.BEFORE for title in titles]
+        for seed in range(5):
+            with self.subTest(seed=seed):
+                import random
+                random.Random(seed).shuffle(launches)
+                fresh = LayoutHerdr()
+                for space, title in launches:
+                    _ = fresh.open_tab(space, title, "/repo", {})
+                self.assertEqual(fresh.layout(), self.BEFORE)
+
+    def test_a_partial_restart_keeps_the_place_of_the_sessions_still_to_come(self) -> None:
+        _ = self.running()
+        fresh = LayoutHerdr()
+        for space, title in (("natedev", "herdr"), ("hana", "widget"), ("natedev", "natedev")):
+            _ = fresh.open_tab(space, title, "/repo", {})
+        self.assertIn(("ad-hoc", [herdr.LAYOUT_PLACEHOLDER]), fresh.layout())
+        again = LayoutHerdr()
+        for space, titles in reversed(self.BEFORE):
+            for title in reversed(titles):
+                _ = again.open_tab(space, title, "/repo", {})
+        self.assertEqual(again.layout(), self.BEFORE)
+
+    def test_a_new_tab_takes_its_a_to_z_place_and_never_passes_the_first_tab(self) -> None:
+        client = self.running()
+        _ = client.open_tab("natedev", "builds", "/repo", {})
+        _ = client.open_tab("fps", "alpha", "/repo", {})
+        _ = client.open_tab("natedev", "zebra", "/repo", {})
+        shown = dict(client.layout())
+        self.assertEqual(shown["natedev"], ["natedev", "accounts", "builds", "herdr", "unit-board", "zebra"])
+        self.assertEqual(shown["fps"], ["performance", "alpha", "benchmark", "frame-cost", "metrics-gathering"])
+
+    def test_the_snapshot_pass_saves_a_tab_renamed_in_herdr_only_for_a_running_shared_session(self) -> None:
+        client = self.running()
+        next(tab for tab in client.tabs if tab["label"] == "roles")["label"] = "guilds"
+        with patch.object(herdr, "shared_session", return_value="fixture"), patch.object(herdr, "Herdr", return_value=client):
+            herdr.save_shared_layout({"other"})
+            self.assertNotIn("guilds", [tab["name"] for space in herdr.saved_layout("fixture")["workspaces"] for tab in space["tabs"]])
+            herdr.save_shared_layout({"fixture", "other"})
+        saved = {space["name"]: [tab["name"] for tab in space["tabs"]] for space in herdr.saved_layout("fixture")["workspaces"]}
+        self.assertEqual(saved["sdlc"], ["sdlc", "roles", "guilds"])
+
+    def test_without_a_saved_layout_the_showrunner_comes_first_then_a_to_z(self) -> None:
+        self.assertEqual(herdr.tab_order("boss", ["delta", "boss", "alpha"], []), [1, 2, 0])
+
+    def test_a_gone_entry_keeps_its_place_until_it_is_old(self) -> None:
+        saved = [herdr.SavedName(name="a", seen=100.0), herdr.SavedName(name="b", seen=100.0),
+                 herdr.SavedName(name="c", seen=100.0)]
+        self.assertEqual([entry["name"] for entry in herdr.merged_order(saved, ["c", "d"], 200.0)], ["a", "b", "c", "d"])
+        late = 100.0 + herdr.LAYOUT_KEEP_SECONDS + 1
+        self.assertEqual([entry["name"] for entry in herdr.merged_order(saved, ["c"], late)], ["c"])
+
+    def test_an_unreadable_layout_file_is_an_empty_layout(self) -> None:
+        path = herdr.layout_path("fixture")
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("{not json")
+        self.assertEqual(herdr.saved_layout("fixture"), herdr.SavedLayout(at=0.0, workspaces=[]))
 
 
 if __name__ == "__main__":
