@@ -1483,6 +1483,27 @@ class LockHolderTests(unittest.TestCase):
         self.assertIsNone(sweep.lock_holder(str(lock), str(base / "missing")))
         self.assertIsNone(sweep.lock_holder(str(base / "gone"), str(locks)))
 
+    def test_a_read_that_skips_the_holders_line_is_read_again(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        lock = base / ".cargo-lock"
+        _ = lock.write_text("")
+        stat = os.stat(lock)
+        device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+        other = "1: FLOCK  ADVISORY  WRITE 99 00:01:1 0 EOF\n"
+        reads = [other, other + f"2: FLOCK  ADVISORY  WRITE 4242 {device} 0 EOF\n"]
+
+        def skip_once(*_args: object, **_kwargs: object) -> io.StringIO:
+            return io.StringIO(reads.pop(0))
+
+        def never_held(*_args: object, **_kwargs: object) -> io.StringIO:
+            return io.StringIO(other)
+
+        with mock.patch.object(sweep, "open", create=True, side_effect=skip_once):
+            self.assertEqual(sweep.lock_holder(str(lock), "locks"), 4242)
+        with mock.patch.object(sweep, "open", create=True, side_effect=never_held) as opened:
+            self.assertIsNone(sweep.lock_holder(str(lock), "locks"))
+        self.assertEqual(opened.call_count, sweep.PROC_LOCKS_READS)
+
     @unittest.skipUnless(os.path.isfile(sweep.PROC_LOCKS), "the lock holder is read from /proc/locks")
     def test_a_live_flock_names_this_process(self) -> None:
         base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
