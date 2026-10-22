@@ -231,6 +231,9 @@ ROSTER_FILE = "mesh_roster.json"
 DETACHED_RUNS_DIR = "mesh_runs"
 # A run record written before its supervisor's pid counts as live for this long.
 DETACHED_RUN_START_GRACE_SECS = 60.0
+# mesh_runs.py ends a run whose supervisor is gone; its delivery may wait on send.py.
+MESH_RUNS_SCRIPT = Path(__file__).with_name("mesh_runs.py")
+DEAD_RUN_END_TIMEOUT_SECS = 300
 BOARD_HELPER = Path(__file__).resolve().parent.parent / "direct" / "board.sh"
 # The folders that hold unit run folders. An app-server whose session directory is one of their
 # children serves that run alone, so its seats get the run as PLAN_DELEGATE_BOARD_DIR.
@@ -1579,6 +1582,30 @@ def _detached_run_live(session_dir: str, name: str) -> bool:
         if pid == 0 and now - _as_float(record.get("started_at"), 0.0) < DETACHED_RUN_START_GRACE_SECS:
             return True
     return False
+
+
+def _end_dead_runs(session_dir: str, name: str) -> None:
+    """End the worker's runs whose supervisor is gone, so its launcher gets their FAIL result
+    instead of closing on nothing. The launcher calls this outside the inbox lock, which the
+    delivery takes."""
+    folder = _session_path(session_dir, DETACHED_RUNS_DIR)
+    if not folder.is_dir():
+        return
+    now = time.time()
+    for path in folder.glob("*.json"):
+        record = _read_json_object(path)
+        if record.get("worker") != name or record.get("status") != "running":
+            continue
+        pid = _as_int(record.get("pid"))
+        if (pid > 0 and not _pid_alive(pid)) or (
+                pid == 0 and now - _as_float(record.get("started_at"), now) >= DETACHED_RUN_START_GRACE_SECS):
+            try:
+                _ = subprocess.run([sys.executable, str(MESH_RUNS_SCRIPT), "reap", "--session-dir", session_dir,
+                                    "--worker", name], stdin=subprocess.DEVNULL, capture_output=True,
+                                   timeout=DEAD_RUN_END_TIMEOUT_SECS, check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            return
 
 
 def _waiting_on_detached_run(session_dir: str, name: str, thread_id: str) -> bool:
@@ -3376,6 +3403,7 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep:
 
 def _finish_if_ended_unseen(stream: TurnStream, log: TextIO) -> StreamStep:
     """Finish a one-turn launcher whose thread went idle without a completion notice."""
+    _end_dead_runs(stream.session_dir, stream.name)
     if _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id):
         return StreamStep.NEXT_FRAME
     quota_owed = _continuation_is_owed(stream.session_dir, stream.name)
@@ -3788,6 +3816,7 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
     # A finished turn may have a peer turn opening behind it.
     if _more_work_coming(stream.client, stream.thread_id, stream.deadline):
         return StreamStep.NEXT_FRAME
+    _end_dead_runs(stream.session_dir, stream.name)
     if _close_messages_if_empty(stream.session_dir, stream.name, stream.thread_id):
         return StreamStep.FINISH
     # The turn ended on a run still going: stay attached until its result is held.

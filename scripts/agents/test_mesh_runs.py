@@ -224,6 +224,55 @@ class MeshRunsTests(unittest.TestCase):
             popen, _ = self.start(command)
             popen.assert_called_once()
 
+    # On 2026-10-22 a unit stopped 23 queued runs by their process group: a supervisor that dies
+    # delivers nothing, and its worker waits for a result that never comes.
+    def test_a_start_ends_a_run_whose_supervisor_is_gone_with_a_failure_result(self) -> None:
+        path = self.record(["bash", "verify.sh", "test", "hana"])
+        self.update_record(path, pid=DEAD_PID)
+        popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
+        popen.assert_called_once()
+        record = cast(mesh_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
+        self.assertEqual((record["status"], record.get("ended"), record.get("exit_code")),
+                         ("finished", "supervisor gone", None))
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Run ended with no result: verify.sh check\nResult: FAIL (no exit status)", messages[0])
+        self.assertIn("Start the run again", messages[0])
+        # The new run's supervisor is a mock; drop it, then a second pass finds nothing to end.
+        for started in path.parent.glob("*.json"):
+            if started != path:
+                started.unlink()
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(len(cast(list[str], self.pending()["messages"])), 1)
+
+    def test_a_dead_run_that_a_newer_run_of_its_command_answers_delivers_nothing(self) -> None:
+        command = ["bash", "verify.sh", "lint", "hana"]
+        older = self.record(command)
+        self.update_record(older, pid=DEAD_PID, started_at=time.time() - 600)
+        newer = older.with_name("r2.json")
+        _ = newer.write_text(older.read_text(encoding="utf-8"), encoding="utf-8")
+        self.update_record(newer, run_id="r2", started_at=time.time(), pid=DEAD_PID)
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), ["r1", "r2"])
+        older_record = cast(mesh_runs.RunRecord, json.loads(older.read_text(encoding="utf-8")))
+        self.assertIn("a newer run of the same command answers", older_record.get("delivery", ""))
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1, "only the newest dead run reports")
+
+    def test_the_launcher_gets_a_dead_runs_failure_before_it_closes_its_inbox(self) -> None:
+        session, thread = str(self.session), "thread-1"
+        path = self.record(["bash", "verify.sh", "check"])
+        self.update_record(path, pid=DEAD_PID)
+        codex_mesh._end_dead_runs(session, "unit-other")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.pending(), {}, "another worker's launcher ends nothing of this one")
+        codex_mesh._end_dead_runs(session, WORKER)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("FAIL (no exit status)", cast(list[str], self.pending()["messages"])[0])
+        self.assertFalse(codex_mesh._close_messages_if_empty(session, WORKER, thread))  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_live_supervisor_is_not_ended(self) -> None:
+        path = self.live_run(["bash", "verify.sh", "check"])
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "running")
+
     def test_start_exits_3_for_a_caller_that_is_not_a_mesh_worker(self) -> None:
         popen = MagicMock()
         for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
