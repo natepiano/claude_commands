@@ -1610,30 +1610,59 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                          [f"auto: {head.id}", f"auto: {later.id}"])
         self.relay.assert_not_called()
 
-    def test_legacy_phone_retry_normalizes_the_saved_note_filename_without_reopening_or_relaying(self) -> None:
-        self.use_catalog_without_paid_credits_template()
-        _ = self.alert()
-        self.phone.reset_mock()
-        self.relay.reset_mock()
+    def test_old_paid_notices_are_rebuilt_before_retry_from_the_current_reading(self) -> None:
+        from push_texts import render
+        for suffix in ("_credits", "_credits_last"):
+            for queued in (False, True):
+                with self.subTest(suffix=suffix, queued=queued):
+                    quota_alert.STATE.unlink(missing_ok=True)
+                    next_moves.next_moves_file().unlink(missing_ok=True)
+                    _ = self.alert()
+                    with quota_alert.state_file() as state:
+                        episode = state.get("codex_zero", {})["codex1"]
+                        episode["phone"] = "due"
+                        episode["notice"] = quota_alert.ZeroEpisodeNotice(
+                            id="quota." + "codex_on" + suffix, values={"file": "codex 1.md"})
+                        opened = episode["since"]
+                    if queued:
+                        _ = next_moves.add_next_move("workers", 1, "codex1")
+                    self.phone.reset_mock()
+                    self.relay.reset_mock()
+                    _ = self.alert(self.now + timedelta(minutes=2), balance="6310")
+                    push, = self.zero_pushes()
+                    expected_id = "quota.paid_credits_queued" if queued else "quota.paid_credits"
+                    self.assertEqual(push.id, expected_id)
+                    self.assertEqual(push, render(expected_id, **push.values))
+                    self.assertEqual(push.values["credits"], "6,310")
+                    with quota_alert.state_file() as state:
+                        episode = state.get("codex_zero", {})["codex1"]
+                        self.assertEqual(episode["since"], opened)
+                        self.assertEqual(episode["notice"]["id"], "quota.paid_credits")
+                        self.assertNotEqual(episode["phone"], "due")
+
+    def test_old_paid_notice_keeps_the_earlier_reset_of_a_paid_only_spare(self) -> None:
+        from push_texts import render
+
+        _ = self.alert(selected=2, spare_accounts=((1, 0, "6370"),))
+        fresh, = self.zero_pushes()
+        earlier_reset = quota_alert.reset_display(refusals.KnownReset(self.now + timedelta(days=2)))
+        self.assertEqual(fresh.values["next_reset"], earlier_reset)
+        self.assertNotEqual(fresh.values["refill"], earlier_reset)
         with quota_alert.state_file() as state:
-            assert "codex_zero" in state
-            episode = state["codex_zero"]["codex1"]
+            episode = state.get("codex_zero", {})["codex2"]
             episode["phone"] = "due"
-            episode["notice"]["values"]["file"] = "codex 1.md"
-            opened = episode["since"]
-        _ = self.alert(self.now + timedelta(minutes=2))
-        self.assertEqual(len(self.zero_pushes()), 1)
-        rendered = self.zero_pushes()[-1]
-        self.assertIsInstance(rendered.action, ActionRequired)
-        assert isinstance(rendered.action, ActionRequired)
-        self.assertIn("codex1.md", rendered.action.text)
-        self.assertNotIn("codex 1.md", rendered.action.text)
-        self.relay.assert_not_called()
+            episode["notice"] = quota_alert.ZeroEpisodeNotice(
+                id="quota." + "codex_on" + "_credits_last", values={"file": "codex2.md"})
+        self.phone.reset_mock()
+
+        _ = self.alert(self.now + timedelta(minutes=2), selected=2, spare_accounts=((1, 0, "6370"),))
+
+        rebuilt, = self.zero_pushes()
+        self.assertEqual(rebuilt, fresh)
+        self.assertEqual(rebuilt, render("quota.paid_credits", **rebuilt.values))
         with quota_alert.state_file() as state:
-            assert "codex_zero" in state
-            episode = state["codex_zero"]["codex1"]
-            self.assertEqual(episode["since"], opened)
-            self.assertEqual(episode["notice"]["values"]["file"], "codex1.md")
+            self.assertEqual(state.get("codex_zero", {})["codex2"]["notice"]["values"]["next_reset"], earlier_reset)
+        self.swap.assert_not_called()
 
     def test_legacy_episode_keys_continue_without_a_second_opening_alert(self) -> None:
         _ = self.alert()
@@ -1690,12 +1719,6 @@ class CodexZeroEpisodeTests(unittest.TestCase):
             "at": (self.now + timedelta(minutes=minute)).isoformat(), "remaining": 0, "credits": value})
             + "\n" for minute, value in balances))
 
-    def use_catalog_without_paid_credits_template(self) -> None:
-        """Keep the real legacy entries to test stores and hosts from before the new template."""
-        from push_texts import catalog
-        entries = tuple(entry for entry in catalog() if entry.id != "quota.paid_credits")
-        _ = self.enterContext(mock.patch("push_texts.catalog", return_value=entries))
-
     def test_no_room_uses_the_real_paid_credits_template_once(self) -> None:
         from push_texts import catalog, render_entry, user_send_argv
         entry = next(entry for entry in catalog() if entry.id == "quota.paid_credits")
@@ -1721,13 +1744,28 @@ class CodexZeroEpisodeTests(unittest.TestCase):
     def test_real_paid_credits_notice_keeps_the_queued_move_in_control(self) -> None:
         head = next_moves.add_next_move("workers", 1, "codex1")
         with mock.patch.object(quota_alert, "switch_to_claude", side_effect=AssertionError("queued credits routed work")):
-            _ = self.alert()
+            log = self.alert()
             _ = self.note(1, "off")
             _ = self.alert(self.now + timedelta(minutes=2))
         push, = self.zero_pushes()
-        self.assertEqual(push.id, "quota.paid_credits")
+        self.assertTrue(any(push.body in line for line in log), log)
+        self.assertEqual(push.id, "quota.paid_credits_queued")
+        self.assertNotIn("next_reset", push.values)
+        self.assertNotIn("Claude", push.body)
         self.assertEqual(next_moves.read_next_moves(), (head,))
         self.assertEqual(accounts.role_account("workers").label, "codex1")
+        self.swap.assert_not_called()
+
+    def test_unmoved_included_room_during_an_open_fallback_uses_paid_credits(self) -> None:
+        from push_texts import render
+        owner = self.readings(self.now).selected_account
+        assert isinstance(owner, agent_accounts.KnownCodexAccount)
+        with quota_alert.state_file() as state:
+            state["fallback"] = quota_alert.AccountCodexQuotaFallback(owner, self.now.isoformat(), ("delegate",))
+        _ = self.alert(spare_left=50)
+        push, = self.zero_pushes()
+        self.assertEqual(push.id, "quota.paid_credits")
+        self.assertEqual(push, render("quota.paid_credits", **push.values))
         self.swap.assert_not_called()
 
     def test_credits_on_moves_to_room_without_a_phone_or_session_notice(self) -> None:
@@ -1813,7 +1851,6 @@ class CodexZeroEpisodeTests(unittest.TestCase):
             self.assertNotIn("sessions", episode)
 
     def assert_queued_credits_wait_without_a_fallback_promise(self, target: str) -> None:
-        self.use_catalog_without_paid_credits_template()
         head = next_moves.add_next_move("workers", 1, target)
         with mock.patch.object(quota_alert, "switch_to_claude", side_effect=AssertionError("queued credits routed work")):
             # An alternative target has no current reading, so the head cannot run.
@@ -1824,14 +1861,14 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                         self.root / ".claude", "fixture identity unavailable"), False, (), frozenset()),
                     codex_readings=self.stale_workers_target_readings(now))
             push, = self.zero_pushes()
-            self.assertEqual(push.id, "quota.codex_on_credits_last")
+            self.assertEqual(push.id, "quota.paid_credits_queued")
             self.assertIn("codex1", push.body)
             for forbidden in ("codex2", "codex3", "Claude", "Within minutes", "workers move"):
                 self.assertNotIn(forbidden, push.body)
-            self.assertEqual(push.values["turn_off"],
-                "Turn off: paid spending stops. Workers stay on codex1 and wait for the account move you queued.")
-            self.assertEqual(push.values["leave_on"],
-                "Leave on: workers spend codex1's credits until that move runs or the credits run out, then wait.")
+            from push_texts import render
+            self.assertEqual(push, render("quota.paid_credits_queued", **push.values))
+            self.assertEqual(set(push.values), {"sender", "account", "machine", "credits", "refill"})
+            self.assertIn("workers stop and wait for your queued move", push.body)
             _ = self.note(1, "off")
             _ = self.alert(self.now + timedelta(minutes=4),
                 spare_accounts=((3, 0, "0"),))
@@ -1840,10 +1877,10 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         self.assertEqual(accounts.role_account("workers").label, "codex1")
         self.assertEqual(next_moves.read_next_moves(), (head,))
 
-    def test_legacy_paid_credits_with_a_self_targeting_workers_head_promise_only_the_queue(self) -> None:
+    def test_paid_credits_with_a_self_targeting_workers_head_promise_only_the_queue(self) -> None:
         self.assert_queued_credits_wait_without_a_fallback_promise("codex1")
 
-    def test_legacy_paid_credits_with_a_blocked_other_workers_head_promise_only_the_queue(self) -> None:
+    def test_paid_credits_with_a_blocked_other_workers_head_promise_only_the_queue(self) -> None:
         self.assert_queued_credits_wait_without_a_fallback_promise("codex3")
 
     def test_queued_workers_credit_forecast_promises_only_the_entry_and_moves_nothing(self) -> None:
@@ -1878,8 +1915,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         self.swap.assert_not_called()
         self.phone.assert_not_called()
 
-    def test_legacy_paid_credit_retry_after_queue_removal_restores_the_never_queued_notice(self) -> None:
-        self.use_catalog_without_paid_credits_template()
+    def test_paid_credit_retry_after_queue_removal_restores_the_never_queued_notice(self) -> None:
         _ = self.alert()
         expected_push, = self.zero_pushes()
         with quota_alert.state_file() as state:
@@ -1902,7 +1938,11 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                 self.assertEqual(len(next_moves.read_next_moves()), 1)
                 _ = self.alert(self.now + timedelta(minutes=2))
                 queued_push = self.zero_pushes()[-1]
-                self.assertIn("wait for the account move you queued", queued_push.body)
+                self.assertEqual(queued_push.id, "quota.paid_credits_queued")
+                self.assertNotIn("next_reset", queued_push.values)
+                from push_texts import render
+                self.assertEqual(queued_push, render("quota.paid_credits_queued", **queued_push.values))
+                self.assertIn("wait for your queued move", queued_push.body)
                 with quota_alert.state_file() as state:
                     episode = state.get("codex_zero", {})["codex1"]
                     self.assertEqual(episode["phone"], "due")
@@ -2140,9 +2180,8 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         self.assertNotIn("~/.codex", push.body)
         self.assertTrue(any(entry["kind"] == "failed" and entry["reason"] == cause for entry in moves.read_moves()))
 
-    def test_legacy_codex_catalog_examples_equal_the_notices_emitted_for_their_scenarios(self) -> None:
+    def test_codex_catalog_examples_equal_the_notices_emitted_for_their_scenarios(self) -> None:
         """F005: reviewed example values must be the values the real alert pass emits."""
-        self.use_catalog_without_paid_credits_template()
         from push_texts import catalog, render_entry
         from scripts.whoami import run_out
 
@@ -2151,7 +2190,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                         2: datetime(2026, 10, 22, 11, tzinfo=timezone.utc)}
         spare_reset = datetime(2026, 10, 17, 11, tzinfo=timezone.utc)
         base_readings = self.readings
-        ids = {"quota.codex_on_credits", "quota.codex_on_credits_last", "quota.codex_workers_moved",
+        ids = {"quota.codex_workers_moved",
                "quota.codex_workers_stay", "quota.codex_credits_forecast"}
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
             for entry in catalog():
@@ -2177,15 +2216,13 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                         off = entry.id in ("quota.codex_workers_moved", "quota.codex_workers_stay")
                         _ = self.note(source, "off" if off else "on")
                         accounts.set_role("workers", f"codex{source}")
-                        queued_retry = example.name == "queued" and entry.id == "quota.codex_on_credits_last"
-                        if example.name == "queued" and not queued_retry:
+                        if example.name == "queued":
                             _ = next_moves.add_next_move("workers", 1, f"codex{source}")
                         balance = "6370" if source == 1 else "2114"
                         if example.name == "unlimited":
                             balance = "unlimited"
                         unknown_balance = example.name in ("unknown", "unknown_balance")
-                        no_room = (entry.id == "quota.codex_on_credits_last"
-                                   or example.name in ("no_room", "unknown_use"))
+                        no_room = example.name in ("no_room", "unknown_use")
                         target_left = 0 if source == 2 or no_room else 97
                         target_credits = "0" if no_room else "6370" if source == 2 else "2114"
                         used = 120 if source == 1 else 40
@@ -2216,15 +2253,11 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                             self.swap.side_effect = accounts.AccountsError(
                                 "accounts: cannot use codex1 (~/.codex1): usage reading is unavailable")
                         with mock.patch.object(self, "readings", side_effect=scenario_readings):
-                            if queued_retry:
-                                self.phone.side_effect = [quota_alert.PushFailed("fixture phone offline"), quota_alert.PushSent()]
-                                _ = self.alert(self.now)
-                                _ = next_moves.add_next_move("workers", 1, f"codex{source}")
                             if entry.id == "quota.codex_credits_forecast":
                                 _ = self.alert(self.now - timedelta(hours=1))
-                            _ = self.alert(self.now + timedelta(minutes=2) if queued_retry else self.now)
+                            _ = self.alert(self.now)
                             self.phone.side_effect = None
-                        if (entry.id in {"quota.codex_on_credits", "quota.codex_credits_forecast"}
+                        if (entry.id == "quota.codex_credits_forecast"
                                 and example.name != "queued" and not no_room and target_left > 0):
                             # These old examples now move to room with no notice.
                             self.swap.assert_called()
@@ -2237,24 +2270,12 @@ class CodexZeroEpisodeTests(unittest.TestCase):
                                 notice = episode["forecast_notice"]
                             else:
                                 notice = episode["notice"]
-                        if entry.id == "quota.codex_on_credits" and example.name == "codex_two":
-                            # A paid-only spare no longer gets a credits-on move.
-                            self.swap.assert_not_called()
-                            self.assertEqual(notice["id"], "quota.codex_on_credits_last")
-                            self.assertEqual(notice["values"]["account"], f"codex{source}")
-                            self.assertEqual(self.zero_pushes()[-1].id, notice["id"])
-                            continue
                         self.assertEqual(notice["id"], entry.id)
                         if example.name == "queued":
                             self.assertNotIn("account move you queued", " ".join(notice["values"].values()))
                         else:
                             self.assertEqual(notice["values"], example.values)
                         expected_values = dict(example.values)
-                        if example.name == "queued" and entry.id == "quota.codex_on_credits":
-                            # Queued advice overlays the ordinary opening saved for later retries.
-                            ordinary = next(item for item in entry.examples if item.name == "codex_one")
-                            expected_values["opening"] = ordinary.values["opening"]
-                            self.assertEqual(notice["values"]["opening"], ordinary.values["opening"])
                         self.assertEqual(self.zero_pushes()[-1].values, expected_values)
                         self.assertEqual(self.zero_pushes()[-1], render_entry(entry, expected_values))
 
