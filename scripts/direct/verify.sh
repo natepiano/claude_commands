@@ -1686,6 +1686,15 @@ token_wait_note() {
 }
 # Ends a call that a newer one replaced. Its caller reads this as no verdict,
 # never as a failure to repair: the newer call's result answers instead.
+# A step whose call is gone has no one to give a result to, and the token
+# never comes: board.sh answers a dead --pid with "gone" (exit 4). On
+# 2026-10-20 a step a test left behind tried again here for 45 h.
+token_wait_orphaned() {
+    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
+    trap - INT TERM HUP
+    echo "verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token." >&2
+    exit 1
+}
 token_wait_superseded() {
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
     rm -f "$TOKEN_WAIT_ENTRY"
@@ -1727,6 +1736,7 @@ acquire_token() {
             TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
             token_wait_superseded
         fi
+        kill -0 "$$" 2>/dev/null || token_wait_orphaned
         count_token_waiters_ahead
         # The line goes out before the first try when the token is not free.
         if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
@@ -1754,6 +1764,7 @@ acquire_token() {
                 break
             fi
             TOKEN_WAITER_PID=""
+            (( status != 4 )) || token_wait_orphaned
         fi
         token_wait_clock
         waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
