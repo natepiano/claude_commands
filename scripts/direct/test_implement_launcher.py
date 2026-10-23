@@ -324,6 +324,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", home_lib / "py")
@@ -335,7 +336,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
                 "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
             ), encoding="utf-8",
         )
-        for name in ("agents_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh"):
+        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")

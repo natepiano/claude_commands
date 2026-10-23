@@ -29,6 +29,9 @@ import note_file
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import agents_registry  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
@@ -698,7 +701,7 @@ def registry_assignments() -> dict[str, str]:
     """[assignments] in the registry: function, or exact-task override, -> family."""
     found: dict[str, str] = {}
     section = ""
-    for line in REGISTRY.read_text(encoding="utf-8").splitlines():
+    for line in agents_registry.registry_text(REGISTRY).splitlines():
         text = line.split("#", 1)[0].strip()
         if text.startswith("[") and text.endswith("]"):
             section = text[1:-1]

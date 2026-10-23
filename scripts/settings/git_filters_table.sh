@@ -8,7 +8,6 @@
 # Scripts are repo-relative; git runs filters from the working-tree root.
 GIT_FILTERS=(
   "claude-settings:scripts/settings/clean_settings_json.sh:scripts/settings/smudge_settings_json.sh:settings.json"
-  "claude-agents-conf:scripts/agents/clean_agents_conf.sh:cat:config/agents.conf"
 )
 
 # Split one GIT_FILTERS entry into GF_NAME, GF_CLEAN, GF_SMUDGE, GF_PATH.

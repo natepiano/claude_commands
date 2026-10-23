@@ -11,7 +11,13 @@ an agent family; `[<function>.<family>]` maps each subtask to an
 `agent[:effort]` row; and `[<family>.agents]` catalogs each valid agent and its
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
-Use `/agent` to view or edit assignments and rows. The Codex catalog is
+`config/agents.conf` holds the committed defaults. This machine's own rows go
+in the untracked `config/agents.local.conf`, which holds only the rows that
+differ; readers see them over the defaults, and a commit or merge never
+touches them. To move a full registry's local rows into the overlay, run
+`scripts/agents/agents_overlay.sh migrate --from <copy>`.
+
+Use `/agent` to view or edit assignments and rows; edits write the overlay. The Codex catalog is
 automatically synchronized from `~/.codex/config.toml` and
 `~/.codex/models_cache.json` by `scripts/agents/sync_codex_catalog.sh`. Its
 launchd job checks every five minutes and at login; the registry reader also

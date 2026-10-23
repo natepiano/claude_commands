@@ -25,7 +25,7 @@ from typing import NoReturn, TypedDict, cast
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import agents_registry, unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
@@ -226,6 +226,13 @@ def _config_digest() -> str:
     for path in (_agents_config_path(), _config_path()):
         try:
             contents.append(path.read_bytes())
+        except OSError:
+            return ""
+    # This machine's agent rows over the committed registry change the configuration too.
+    overlay = agents_registry.overlay_path(_agents_config_path())
+    if overlay.is_file():
+        try:
+            contents.append(overlay.read_bytes())
         except OSError:
             return ""
     return hashlib.sha256(b"".join(contents)).hexdigest()[:CONFIG_DIGEST_LENGTH]
