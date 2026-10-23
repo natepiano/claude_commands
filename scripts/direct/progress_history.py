@@ -1332,6 +1332,9 @@ def _start_phase(args: argparse.Namespace) -> None:
     # leaves every open phase open: each closes only by its own finish-phase.
     if _open_phase_named(state, phase_id) is not None:
         return
+    # A finished phase reopened for repair rounds gets its reservation state back from its kept
+    # /sync board answer, so its edits pass the berth hook with no hand-written state.
+    _ = phase_reservation.restore(phase_reservation.phase_directory(session_dir, phase_id), phase_id)
     # The phase count reads the plan's headings, so a phase the plan lacks makes
     # every later report disagree with its own phase number.
     missing_from = _phase_missing_from_plan(state, phase_id)
@@ -4592,6 +4595,13 @@ def _finish_phase(args: argparse.Namespace) -> None:
             record for record in _parked_phases(state) if record is not phase
         ]
     _write_state(session_dir, state)
+    # A completed phase's state that owns no reservation ends with it. Active and a pending
+    # release stay: only the checkpoint and its confirmed release clear them.
+    if status == "completed":
+        phase_dir = phase_reservation.phase_directory(session_dir, _string(phase.get("id")))
+        state_kind = _string(phase_reservation.read_state(phase_dir).get("kind"))
+        if state_kind in phase_reservation.BOARD_STATES.values():
+            _ = phase_reservation.clear(phase_dir)
     _refresh_phase_table(session_dir)
 
 

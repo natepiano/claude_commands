@@ -126,9 +126,11 @@ Loop/verbose only:
    the code and run the printed `held built` command when the change is there.
    A finding whose change is not there waits for a person, who makes the change
    and runs that command, or waives the finding with `style_ledger.py held waive --person <name>`.
-   From `Active`, atomically replace the durable record with
+   From `Active`, replace the durable record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that same captured
-   full id as `checkpoint_commit`, and read it back. This is the one case where
+   full id as `checkpoint_commit`, with `phase_reservation.py committed
+   --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured HEAD>`,
+   and read it back. This is the one case where
    that state carries a commit the phase did not make. A failed transition or
    read-back retains the valid durable state and invokes no release. Run step
    7 unchanged; inactive states release nothing. After confirmation, mark the
@@ -164,9 +166,15 @@ Loop/verbose only:
    A failed commit is an unsuccessful ending: do not invoke release, leave
    `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of
-   `git rev-parse HEAD`, atomically replace the `Active` record with
+   `git rev-parse HEAD` and replace the `Active` record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that value as
-   `checkpoint_commit`, and read the new record back. That durable transition
+   `checkpoint_commit`:
+
+   ```sh
+   phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured commit>
+   ```
+
+   Then read the new record back. Never write the record by hand. That durable transition
    must succeed before release is invoked, and its value comes only from the
    commit that just succeeded (or the ancestry-checked, captured HEAD of the
    no-change standing ticket above), never from conversation or from a later
@@ -238,8 +246,12 @@ Loop/verbose only:
    Do not consult the retention ref: it proves commit reachability but not
    whether the selected reservation is outstanding or released. Report a
    matching checkpoint as recovered rather than re-made. Only after the
-   first-attempt structured assertions or these recovery assertions pass, delete
-   `${PHASE_DIR}/delegated_phase_reservation_state.json`.
+   first-attempt structured assertions or these recovery assertions pass, clear
+   the record; never delete it by hand:
+
+   ```sh
+   phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <phase id> --released <read-back checkpoint_commit>
+   ```
 
    An ordinary failed release did not append anything because transaction
    validation precedes the journal write; it is not recovery, and the original
