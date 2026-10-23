@@ -2,10 +2,15 @@
 """Send the user one Pushover alert: the one way any session reaches their phone.
 
   pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] (--action TEXT | --no-action) TITLE MESSAGE
+  pushover.py cancel [--source NAME] KEY     stop the emergency push sent with --key KEY
 
 Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
 2 emergency: it repeats every RETRY_S seconds until the user taps Acknowledge,
-for at most EXPIRE_S. Which events get which priority is each caller's policy.
+for at most EXPIRE_S. Deleting it on the phone does not stop it. Which events
+get which priority is each caller's policy. An emergency push with --key carries
+the Pushover tag push_tag(KEY); `cancel` stops every emergency push with that tag.
+It prints "pushover: cancelled N" or "pushover: nothing to cancel" and exits 0;
+it exits 1 when Pushover refused it or could not be reached, 2 on usage or keys missing.
 
 The keys are in KEYS_FILE (PUSHOVER_USER, PUSHOVER_TOKEN; 0600, filled in by the
 user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
@@ -23,6 +28,7 @@ usage, or keys missing; 4 an existing claim is busy, 5 replaced, 6 not sent afte
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -43,6 +49,7 @@ from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionAllowed, ActionRefus
                          NotificationSession, NO_SESSION_LINE, split_session, session_prefix)
 
 API_URL = "https://api.pushover.net/1/messages.json"
+CANCEL_URL = "https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json"
 KEYS_FILE = Path.home() / ".config" / "pushover" / "env"
 LOG_FILE = Path.home() / ".local" / "state" / "notify" / "pushover.jsonl"
 PRIORITIES = ("0", "1", "2")
@@ -53,6 +60,7 @@ MESSAGE_MAX = 1024
 ACTION_TEXT_MAX = MESSAGE_MAX - len("Action: ") - 1
 TIMEOUT_S = 15
 USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE"
+CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
 
 
 class Keys(TypedDict):
@@ -64,6 +72,7 @@ class Reply(TypedDict, total=False):
     status: int
     request: str
     receipt: str
+    canceled: int
     errors: list[str]
 
 
@@ -102,7 +111,12 @@ def read_keys(path: Path) -> Keys | None:
     return {"user": user, "token": token} if user and token else None
 
 
-def fields(keys: Keys, title: str, message: str, priority: str) -> dict[str, str]:
+def push_tag(key: str) -> str:
+    """The Pushover tag for an emergency push with this key: the same key gives the same tag."""
+    return "key-" + hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def fields(keys: Keys, title: str, message: str, priority: str, key: str = "") -> dict[str, str]:
     body = {
         "token": keys["token"],
         "user": keys["user"],
@@ -112,6 +126,8 @@ def fields(keys: Keys, title: str, message: str, priority: str) -> dict[str, str
     }
     if priority == "2":
         body |= {"retry": str(RETRY_S), "expire": str(EXPIRE_S)}
+        if key:
+            body["tags"] = push_tag(key)
     return body
 
 
@@ -305,13 +321,19 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     except OSError as error:
         found = review.UnreadableHold(review.held_path(source), str(error))
     detail = ""
-    if review.switched_off():
-        outcome: review.ReviewOutcome = review.Unreviewed("review off")
+    approved = push_texts.approval_date(arguments["text_id"]) if arguments["text_id"] else ""
+    if approved:
+        # The text was reviewed and approved ahead of time: no live review, no reviewer wait.
+        detail = f"registered text, approved {approved}"
+        outcome: review.ReviewOutcome = review.Unreviewed(detail)
+        version = draft
+    elif review.switched_off():
+        outcome = review.Unreviewed("review off")
         version = draft
         detail = "review: off"
     else:
         outcome = review.review(draft, revision=claimed)
-        # A registered text is fixed and approved ahead of time: the review is a logged check only.
+        # A registered text without a current approval: the review is a logged check only.
         version = draft if arguments["text_id"] else review.best_version(draft, outcome)
         if isinstance(outcome, review.Unreviewed):
             detail = "unreviewed: " + outcome.why
@@ -398,24 +420,25 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
             print(f"pushover: kept: silence {kept.until}")
             return 0
-    return post_message(source, priority, title, message, keys_file, post, detail)
+    return post_message(source, priority, title, message, keys_file, post, detail, key)
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Post a push kept during silence, exactly as it was kept."""
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
-    return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail)
+    return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail,
+                        push["key"])
 
 
 def post_message(source: str, priority: str, title: str, message: str,
-                 keys_file: Path, post: Post, detail: str) -> int:
+                 keys_file: Path, post: Post, detail: str, key: str = "") -> int:
     suffix = f", {detail}" if detail else ""
     keys = read_keys(keys_file)
     if keys is None:
         log(source, priority, title, message, "keys missing" + suffix)
         print(f"pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in {keys_file}", file=sys.stderr)
         return 2
-    data = urllib.parse.urlencode(fields(keys, title, message, priority)).encode()
+    data = urllib.parse.urlencode(fields(keys, title, message, priority, key)).encode()
     try:
         status, raw = post(API_URL, data)
     except (urllib.error.URLError, TimeoutError) as error:
@@ -439,5 +462,44 @@ def post_message(source: str, priority: str, title: str, message: str,
     return 1
 
 
+def cancel(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
+    """Stop every emergency push sent with this key; log the outcome like a post."""
+    source = parent_source()
+    if len(argv) == 3 and argv[0] == "--source" and argv[1].strip():
+        source, argv = argv[1], argv[2:]
+    if len(argv) != 1 or not argv[0] or argv[0].startswith("--"):
+        print(CANCEL_USAGE, file=sys.stderr)
+        return 2
+    key = argv[0]
+    tag = push_tag(key)
+    title, message = "cancel emergency push", f"key {key}, tag {tag}"
+    keys = read_keys(keys_file)
+    if keys is None:
+        log(source, "2", title, message, "cancel: keys missing")
+        print(f"pushover: PUSHOVER_USER and PUSHOVER_TOKEN must both be set in {keys_file}", file=sys.stderr)
+        return 2
+    try:
+        status, raw = post(CANCEL_URL.format(tag=tag), urllib.parse.urlencode({"token": keys["token"]}).encode())
+    except (urllib.error.URLError, TimeoutError) as error:
+        log(source, "2", title, message, f"cancel: unreachable: {error}")
+        print(f"pushover: could not reach Pushover: {error}", file=sys.stderr)
+        return 1
+    try:
+        decoded = cast(object, json.loads(raw))
+    except json.JSONDecodeError:
+        decoded = None
+    reply = cast(Reply, cast(object, decoded)) if isinstance(decoded, dict) else Reply()
+    if status == 200 and reply.get("status") == 1:
+        count = reply.get("canceled")
+        outcome = "nothing to cancel" if count == 0 else f"cancelled {count}" if isinstance(count, int) else "cancelled"
+        log(source, "2", title, message, "cancel: " + outcome)
+        print(f"pushover: {outcome}")
+        return 0
+    errors = "; ".join(reply.get("errors", [])) or f"HTTP {status}"
+    log(source, "2", title, message, f"cancel: refused: {errors}")
+    print(f"pushover: refused: {errors}", file=sys.stderr)
+    return 1
+
+
 if __name__ == "__main__":
-    sys.exit(send(sys.argv[1:]))
+    sys.exit(cancel(sys.argv[2:]) if sys.argv[1:2] == ["cancel"] else send(sys.argv[1:]))
