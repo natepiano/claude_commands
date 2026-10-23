@@ -842,10 +842,22 @@ follow <AuthorizationContract/>.
 Coordination applies to phased Work Orders in every mode. Ad hoc work skips it.
 
 Persist exactly one tagged `PhaseReservationState` for each open
-phase at `${PHASE_DIR}/delegated_phase_reservation_state.json`. Write every
-state transition atomically and read it back before the next lifecycle action;
-the initial state must be durable before dispatch. The domain states and
-on-disk shapes are:
+phase at `${PHASE_DIR}/delegated_phase_reservation_state.json`. A script verb
+makes every state change, atomically; never write or delete this file by hand.
+Read it back before the next lifecycle action; the initial state must be
+durable before dispatch. The verbs:
+
+| Change | Verb |
+| --- | --- |
+| Initial state from `/sync board` | `phase_reservation.py enroll --session-dir "${SESSION_DIR}" --phase <id> --board <board_ready\|unconfigured>` |
+| First touch to `Active` | The Codex seat hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
+| `Active` to pending release | `phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <id> --commit <checkpoint commit>` |
+| Pending release confirmed | `phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <id> --released <checkpoint commit>` |
+| Inactive state at phase end | `progress_history.py finish-phase --status completed` |
+| A finished phase reopened | `progress_history.py start-phase` on that phase id restores its enrolled state from the board answer that `enroll` kept |
+
+Exit 2 means the verb refused the change; it names the state it found and
+leaves that state as it is. The domain states and on-disk shapes are:
 
 ```json
 {"kind":"repository_not_enrolled","phase":"<phase>"}
@@ -937,8 +949,8 @@ Do not dispatch until this contract reaches one of its four persisted states.
 
    | Result | Action |
    | --- | --- |
-   | `unconfigured` | Persist `RepositoryNotEnrolled` and proceed silently. |
-   | `board_ready` | Persist `EnrolledAwaitingFirstTouch` and proceed without claiming predicted paths. |
+   | `unconfigured` | Persist `RepositoryNotEnrolled` with `phase_reservation.py enroll --board unconfigured` and proceed silently. |
+   | `board_ready` | Persist `EnrolledAwaitingFirstTouch` with `phase_reservation.py enroll --board board_ready` and proceed without claiming predicted paths. |
    | `ledger_unreadable` | Stop the run; it is never opt-out. |
    | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
 2. The registered PreToolUse edit hooks own the next transition. A clear check
@@ -1520,11 +1532,11 @@ In loop and verbose, run at <PhaseEnd/>'s point; in `single`, follow
 --session-dir "${SESSION_DIR}" --status completed`, adding `--phase-id <id>`
 while another phase is open.
 
-After a loop/verbose phase with `RepositoryNotEnrolled` or
-`EnrolledAwaitingFirstTouch`, delete its completed-phase state
-file, `${PHASE_DIR}/delegated_phase_reservation_state.json`. `Active` must already have been replaced by
+`finish-phase --status completed` clears a `RepositoryNotEnrolled` or
+`EnrolledAwaitingFirstTouch` state file by itself; delete nothing by hand.
+`Active` must already have been replaced by
 `CheckpointCommittedAwaitingReleaseConfirmation`, and that pending state must
-already have been deleted by the validated successful release. If either state
+already have been cleared by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.
 
 In `single`, also run `finish-run --status completed`, then run <RunAsBuilt/>,

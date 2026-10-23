@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.direct import phase_table, plan_history, progress_history
+from scripts.direct import phase_reservation, phase_table, plan_history, progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 
 
@@ -1716,6 +1716,17 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.isolate_identity(environment)
         environment.update(former or {})
         return invoke_recorder(arguments, environment, Path.cwd())
+
+    def test_a_completed_phase_clears_its_enrolled_state_and_a_reopen_restores_it(self) -> None:
+        session_dir = self.start_run("reopen", 20_000)
+        start = ("start-phase", "--session-dir", str(session_dir), "--phase-id", "3", "--phase-title", "Retry handling")
+        _ = self.run_command(*start, at=20_010)
+        phase_dir = phase_reservation.phase_directory(session_dir, "3")
+        _ = phase_reservation.enroll(phase_dir, "3", "board_ready")
+        _ = self.run_command("finish-phase", "--session-dir", str(session_dir), "--status", "completed", at=20_020)
+        self.assertFalse((phase_dir / phase_reservation.STATE_FILE).exists())
+        _ = self.run_command(*start, at=20_030)
+        self.assertEqual(phase_reservation.read_state(phase_dir), {"kind": "enrolled_awaiting_first_touch", "phase": "3"})
 
     def test_a_launcher_started_before_the_rename_owns_its_pass_by_the_former_names(self) -> None:
         session_dir = self.start_run("former", 20_000)
