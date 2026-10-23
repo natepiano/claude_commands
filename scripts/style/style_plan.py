@@ -1329,15 +1329,20 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                               if windows else "empty file")
         files.append(line)
     authorization = (
-        f"Approved proposal `{ticket['proposal']}` overrides the mechanical-only invariant in the copied context "
-        + "and the mechanical-only style Spec for exactly this issue's approved findings. Apply those changes; "
-        + "Read the issue for its sites and before/after changes; hold every other non-mechanical finding. Package verification remains required."
+        f"This ticket builds the approved proposal `{ticket['proposal']}`: its approved findings are this ticket's work. "
+        + "Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required."
         if approved else "Every structure finding is held as a proposal. Apply only mechanical findings from other tickets."
     )
+    if approved:
+        goal = (f"Apply the approved findings of `{ticket['proposal']}` in {len(ticket['files'])} "
+                + f"{'file' if len(ticket['files']) == 1 else 'files'} of `{ticket['crate']}`.")
+    elif per_file_structure:
+        goal = f"Judge these {len(ticket['files'])} files of `{ticket['crate']}` against every pinned rule below."
+    else:
+        goal = f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below."
     return "\n".join([
         f"### Phase {number} — {ticket_id}  · status: todo", "", "#### Work Order", "", context, "",
-        "**Goal:**", (f"Judge these {len(ticket['files'])} files of `{ticket['crate']}` against every pinned rule below."
-                      if per_file_structure else f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below."),
+        "**Goal:**", goal,
         "", "**Spec:**", *rule_lines, *sites, *uncovered, *owned_lines,
         authorization,
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
