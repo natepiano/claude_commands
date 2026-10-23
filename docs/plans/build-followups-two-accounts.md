@@ -2258,3 +2258,20 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - One repair round: the old-id rebuild first used the default pick, so a paid-only spare hid its earlier reset.
 - When an included-room account exists but an open Claude fallback holds the work, `next_reset` is the source reset (as Phase 83).
+
+### Phase 85 — An expired Claude login renews itself before anyone is asked  · status: done
+
+#### As-built
+
+- `refusal_watch.run` first calls `renew_expired_logins`, outside `next_moves_lock`. For each noted Claude account on this machine whose latest stored read outcome is `STALE_TOKEN`, it calls `accounts.renew_login`, at most once per account per 60 minutes. Each attempt (`at`, `renewed`/`failed`, detail) is kept in `~/.local/state/accounts/login_renewals.json`. A dry run says `would renew claudeN`.
+- `renew_login` runs `accounts.py exec --probe <label> -p hello` (the command `hello.sh` wraps) in `/tmp`, with stdin from DEVNULL, a 120 s timeout and captured output that is never logged. It then reads usage with `claude_live` and saves the reading. The result is `LoginRenewed` only for exit 0 and a read that no longer shows an expired login. Otherwise it is `LoginRenewalFailed(detail)`.
+- After a renewal, the rest of the pass uses a clock read taken after the probe, so the new reading is fresh and a due move goes on in the same pass.
+- A move target with an expired login blocks with `TargetReadingUnavailable(<last weekly read time>)` until the next renewal. After a failed probe, it blocks with `quota_alert.TargetLoginRenewalFailed(detail)`: "<group> 1 → claudeN due, claudeN's login expired, and a probe session on it failed (<detail>). Log in on claudeN by hand." This goes by the blocked-head relay to the showrunners, who push the user.
+- The status footnote for an expired login reads "the next notes pass renews it", or "a probe session at HH:MM failed; log in on it by hand". A damaged renewal file reads as no attempts.
+
+**Files:**
+- `scripts/accounts/accounts.py`, `scripts/accounts/refusal_watch.py`, `scripts/whoami/quota_alert.py`; tests in `scripts/accounts/test_accounts.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/whoami/test_quota_alert.py`; `docs/accounts.md`.
+
+**Gotchas:**
+- One repair round: the pass first used the clock from before the probe, and `stored_reading` refused the renewed reading as future-dated.
+- The probe holds the refusal-watch lock for up to 120 s per expired account.

@@ -2,6 +2,7 @@
 """The nightly review's open candidates, as one Markdown table in the order /efficiency_next ranks them.
 
 Usage: candidates.py                   print the table
+       candidates.py next              print the one candidate /next efficiency shows, and pin it
        candidates.py record <report>   add a night's report to the ledger: its proposal and each
                                        Also found and Noted item, one line each
 
@@ -12,7 +13,10 @@ The ledger is the one record, and every candidate is a line of its own:
 
 A line is open while it ends `— proposed` or `— deferred`. The gain is measured user-visible time
 (`38 min waiting`, `2.5 h red CI`) or a share of tokens (`3.1% of tokens`); a line with no tag is
-unmeasured. Time ranks before tokens and unmeasured comes last, as /efficiency_next ranks them.
+unmeasured. Time ranks before tokens and unmeasured comes last, as /efficiency_next ranks them;
+candidates that rank alike go oldest night first. The table and `next` follow urgency.py under the
+queue name `efficiency`: the candidate `next` showed leads until its outcome is written, and one the
+user moved to the end goes last.
 
 The note at ~/rust/hanadocs/nightly improvement list.md copies the ledger's table.
 NIGHTLY_REVIEW_NOTE replaces that path; both commands rewrite the note.
@@ -29,6 +33,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 ROOT = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "nightly-review"
@@ -47,6 +52,8 @@ ITEM_LINE = re.compile(r"^(?:- |\d+\. )(?P<text>.+)$")
 ITEM_LEAD = re.compile(r"^\*\*(?P<title>.+?)\*\*")
 ITEM_KINDS = {"Also found": "also found", "Noted": "noted"}
 UNMEASURED_RANK = 2
+# The name urgency.py pins the candidate /next showed under.
+QUEUE = "efficiency"
 
 
 class TimeGain(NamedTuple):
@@ -134,9 +141,27 @@ def read_lines(path: Path) -> list[str]:
 
 
 def ranked(lines: list[str]) -> list[Candidate]:
-    """Every open candidate, best first; candidates that rank alike keep the ledger's order."""
+    """Every open candidate, best first; candidates that rank alike go oldest night first, then in ledger order."""
     found = [candidate for line in lines if (candidate := open_candidate(line)) is not None]
-    return sorted(found, key=rank)
+    return sorted(found, key=lambda candidate: (rank(candidate), candidate.night[:10]))
+
+
+def night_day(candidate: Candidate) -> datetime | None:
+    try:
+        return datetime.fromisoformat(candidate.night[:10])
+    except ValueError:
+        return None
+
+
+def entries(lines: list[str]) -> list[urgency.Entry[Candidate]]:
+    """Every open candidate as an urgency.py entry: its gain is the value, its night the age."""
+    return [urgency.Entry(each.head, each, since=night_day(each), value=tuple(-part for part in rank(each)))
+            for each in ranked(lines)]
+
+
+def ordered(lines: list[str]) -> list[Candidate]:
+    """Every open candidate in the order the table and /next show: the pinned one first, moved ones last."""
+    return [entry.item for entry in urgency.queue_order(entries(lines), QUEUE)]
 
 
 def escaped(cell: str) -> str:
@@ -246,7 +271,7 @@ def record(report: Path) -> int:
             print(f"candidates: {error}", file=sys.stderr)
             return 1
         print("\n".join(new))
-    open_candidates = ranked(read_lines(ledger))
+    open_candidates = ordered(read_lines(ledger))
     write_note(table(open_candidates) if open_candidates else "no open candidates")
     return 0
 
@@ -254,15 +279,20 @@ def record(report: Path) -> int:
 def main(arguments: list[str]) -> int:
     match arguments:
         case []:
-            candidates = ranked(read_lines(ROOT / "ledger.md"))
+            candidates = ordered(read_lines(ROOT / "ledger.md"))
             body = table(candidates) if candidates else "no open candidates"
             print(body)
             write_note(body)
             return 0
+        case ["next"]:
+            # One candidate only: the user asks for the next one when they want it (user, 2026-10-20).
+            shown = urgency.top(entries(read_lines(ROOT / "ledger.md")), QUEUE)
+            print(shown.item.line if shown is not None else "no open candidates")
+            return 0
         case ["record", report]:
             return record(Path(report).expanduser())
         case _:
-            print("usage: candidates.py [record <report>]", file=sys.stderr)
+            print("usage: candidates.py [next | record <report>]", file=sys.stderr)
             return 2
 
 

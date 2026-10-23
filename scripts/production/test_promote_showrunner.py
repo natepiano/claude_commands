@@ -103,6 +103,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
             "HERDR_BIN": str(Path(__file__).parents[1] / "herdr/fake_herdr.py"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
+            "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         })))
         self.marked = {"demo-unit": unit_lookup.MarkedUnit(
             "demo-unit", unit_lookup.LiveClaude("demo", SESSION, "/sock", PID), herdr.HerdrPlace("demo", PANE))}

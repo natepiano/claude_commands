@@ -3950,12 +3950,79 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[1][2:], ("", *("unavailable",) * 2, "—", "—", "—*"))
         self.assertEqual(self.live_reads.call_count, 2)
 
+    def test_login_renewal_uses_a_quiet_probe_and_keeps_the_new_reading(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude",
+            email="idle@example.invalid", usage_read_outcome=agent_accounts.UsageReadOutcome.OK,
+            quotas=[agent_accounts.Quota("Weekly", 10, datetime.now(timezone.utc) + timedelta(days=1))])
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"private", b"private")) as probe:
+            self.assertEqual(accounts.renew_login("claude2"), accounts.LoginRenewed())
+        probe.assert_called_once_with([sys.executable, str(accounts.SCRIPTS / "accounts" / "accounts.py"),
+            "exec", "--probe", "claude2", "-p", "hello"], cwd="/tmp", stdin=subprocess.DEVNULL,
+            timeout=120, capture_output=True)
+        self.live_reads.assert_called_once_with(accounts.account_dir("claude2"))
+        self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["idle@example.invalid"]),
+                         agent_accounts.UsageReadOutcome.OK)
+
+    def test_login_renewal_fails_without_exposing_probe_output(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        failures = (
+            (subprocess.TimeoutExpired("probe", 120, output=b"private"), "timed out after 120 s"),
+            (OSError("private"), "probe could not start"),
+        )
+        for error, detail in failures:
+            with self.subTest(detail=detail), patch.object(subprocess, "run", side_effect=error):
+                self.assertEqual(accounts.renew_login("claude2"), accounts.LoginRenewalFailed(detail))
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 7, b"private", b"private")):
+            self.assertEqual(accounts.renew_login("claude2"), accounts.LoginRenewalFailed("probe exited with status 7"))
+        self.live_reads.assert_not_called()
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude",
+            email="idle@example.invalid", usage_read_outcome=agent_accounts.UsageReadOutcome.STALE_TOKEN)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+            self.assertEqual(accounts.renew_login("claude2"),
+                             accounts.LoginRenewalFailed("usage still shows an expired login"))
+
+    def test_damaged_login_renewal_state_reads_empty_and_status_renders(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.STALE_TOKEN)], datetime.now(timezone.utc))
+        path = accounts.login_renewals_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for damaged in ('{"claude2":', '[]', '{"claude2": {}}',
+                        '{"claude2": {"at": "bad", "outcome": "failed", "detail": "failed"}}',
+                        '{"claude2": {"at": "2026-10-22T12:00:00", "outcome": "failed", "detail": "failed"}}'):
+            with self.subTest(damaged=damaged):
+                _ = path.write_text(damaged)
+                self.assertEqual(accounts.login_renewal_attempts(), {})
+                for arguments in (("status", "--stored"), ("status", "--stored", "--json")):
+                    code, output, error = self.run_cli(*arguments)
+                    self.assertEqual((code, error), (0, ""))
+                    self.assertIn("login token expired; the next notes pass renews it", output)
+        self.live_reads.assert_not_called()
+
+    def test_expired_login_note_names_the_failed_probe_in_table_and_json(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        at = datetime(2026, 10, 22, 15, 11, tzinfo=timezone.utc)
+        usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.STALE_TOKEN)], at)
+        path = accounts.login_renewals_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text(json.dumps({"claude2": {"at": at.isoformat(), "outcome": "failed", "detail": "probe exited with status 7"}}))
+        note = "claude2: login token expired; a probe session at 08:11 failed; log in on it by hand"
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn("* " + note, output)
+        code, output, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn(note, cast(list[str], cast(dict[str, object], json.loads(output))["problems"]))
+        self.live_reads.assert_not_called()
+
     def test_failed_read_causes_show_old_date_star_and_one_footnote_until_a_good_read(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
         cases = (
             (agent_accounts.UsageReadOutcome.STALE_TOKEN,
-             "login token expired; start a session on it to refresh"),
+             "login token expired; the next notes pass renews it"),
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
@@ -4001,8 +4068,8 @@ class AccountsTests(unittest.TestCase):
              "the usage service did not accept this login; start a session on it to check it",
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.STALE_TOKEN,
-             "login token expired; start a session on it to refresh",
-             "login token expired; start a session on it to refresh"),
+             "login token expired; the next notes pass renews it",
+             "login token expired; the next notes pass renews it"),
         )
         for outcome, with_reading, without_reading in cases:
             for has_reading, reason in ((True, with_reading), (False, without_reading)):

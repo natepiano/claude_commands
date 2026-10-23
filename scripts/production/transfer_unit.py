@@ -382,8 +382,15 @@ def _commit_from(transfer: UnitTransfer, save: Callable[[], None]) -> None:
 def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
     """The stall-watch stretch moves to the receiving slug; the giving pool's reviewers retire, so
     the receiving pool leases its own; the old pane entry goes, since the relaunch records a new one.
+    The unit's held guild roles name the receiving production as holder, so they resume under it.
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
+    from scripts.guilds import roles
+    try:
+        roles.move_holder(roles.UnitHolder(transfer.from_slug, transfer.unit),
+                          roles.UnitHolder(transfer.to_slug, transfer.unit), reason="unit transfer")
+    except (OSError, ValueError, SystemExit) as error:
+        raise RenameRefused(f"held roles: {error}") from error
     for path in (stall_watch.stretch_path, stall_watch.prompt_path):
         unit_move.move(PathMove(path(transfer.from_slug, transfer.unit), path(transfer.to_slug, transfer.unit)))
     retired = subprocess.run([sys.executable, str(POOL), "retire", "--production", transfer.from_slug,
@@ -484,6 +491,8 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
         failures.append(f"a session still carries the marks {transfer.from_slug} {unit}")
     if leased := _leased(transfer.from_slug, unit):
         failures.append(f"review pool {transfer.from_slug}: {', '.join(leased)} still leased to {unit}")
+    from scripts.guilds import roles
+    failures.extend(roles.holder_failures(roles.UnitHolder(transfer.from_slug, unit)))
     return failures
 
 
@@ -517,8 +526,8 @@ def _describe_from(t: UnitTransfer) -> str:
 
 
 def _describe_state(t: UnitTransfer) -> str:
-    return (f"state: stall-watch stretch {t.from_slug} -> {t.to_slug}; retire the {t.from_slug} reviewers; "
-            + "forget the old pane")
+    return (f"state: stall-watch stretch {t.from_slug} -> {t.to_slug}; held guild roles' holder "
+            + f"{t.from_slug} -> {t.to_slug}; retire the {t.from_slug} reviewers; forget the old pane")
 
 
 def _describe_record(t: UnitTransfer) -> str:
