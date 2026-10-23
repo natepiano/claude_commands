@@ -979,9 +979,13 @@ phase holds its dispatch on them. An id the ledger does not know is refused.
 A claim behind a holder you already sequenced against reuses that edge and
 adds the paths; only `cargo-berth sequence` still refuses a duplicate edge
 (exit 2). When several holders
-conflict, name every one in the same claim, one flag each: `--before`,
-`--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
-claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.
+conflict, name every one in the same claim, one flag each: `--before` and
+`--after` repeat once per holder and mix, as in `cargo-berth claim <paths>
+--reservation <id> --before <A> --after <B> --overlap-why "<why>"`. `--defer`
+repeats once per holder but excludes `--before`, `--after` and `--override`:
+a defer takes no paths, so it cannot share a claim that widens. To defer to
+one holder and order behind another, claim with `--defer` first, then claim
+the paths with `--before`/`--after` when the deferred holder ends.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
