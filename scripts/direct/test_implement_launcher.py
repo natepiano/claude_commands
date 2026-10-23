@@ -1388,7 +1388,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(status_file.read_text(encoding="utf-8"), "previous\n")
         self.assertEqual(self.open_passes(session_dir), before)
 
-    def test_follow_up_rejects_wrong_slot_and_changed_model(self) -> None:
+    def test_follow_up_rejects_wrong_slot_and_keeps_its_recorded_model(self) -> None:
         session_dir = self.start_phase("identity")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -1408,9 +1408,26 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             AGENTS_REGISTRY.replace("impl=gpt-called:xhigh", "impl=gpt-blind:max"),
             encoding="utf-8",
         )
+        # A registry row changed after the worker opened: the follow-up keeps the worker's model.
         changed_model = self.mesh_launch(session_dir, to=name)
-        self.assertEqual(changed_model.returncode, 2, changed_model.stderr)
-        self.assertEqual(self.open_passes(session_dir), before)
+        self.assertEqual(changed_model.returncode, 0, changed_model.stderr)
+        self.assertIn("agent=gpt-called\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        identity = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
+        self.assertEqual(identity["model"], "gpt-called")
+
+    def test_follow_up_resumes_a_worker_recorded_before_the_rename(self) -> None:
+        # Seats recorded before the delegate -> direct rename stored the model of the user's
+        # rows at that time, which the registry no longer names (rca of 2026-10-23).
+        session_dir = self.start_phase("before-rename")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        path = session_dir / "impl_worker_impl.json"
+        identity = cast("dict[str, object]", json.loads(path.read_text()))
+        _ = path.write_text(json.dumps({**identity, "model": "gpt-blind"}))
+        resumed = self.mesh_launch(session_dir, to=str(identity["name"]))
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("agent=gpt-blind\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(path.read_text()), {**identity, "model": "gpt-blind"})
 
     def test_follow_recovers_missing_claim_unless_the_roster_launcher_is_alive(self) -> None:
         for launcher_pid in (None, 99999999, os.getpid()):
