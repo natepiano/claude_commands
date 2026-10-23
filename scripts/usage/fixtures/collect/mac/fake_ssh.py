@@ -132,7 +132,7 @@ def main() -> int:
             return 0
         environment = os.environ.copy()
         _ = environment.pop("PYTHONPATH", None)
-        _ = environment.pop("PLAN_DELEGATE_HISTORY_DIR", None)
+        _ = environment.pop("UNIT_HISTORY_DIR", None)
         environment["HOME"] = configuration["home"]
         environment["USAGE_STATE_DIR"] = str(Path(configuration["home"]) / ".local/state/usage-model")
         environment["PYTHONDONTWRITEBYTECODE"] = "1"

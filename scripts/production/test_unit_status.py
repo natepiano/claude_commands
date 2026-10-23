@@ -61,12 +61,12 @@ exit "$NOTIFIER_HEALTH_EXIT"
 """)
             hooks = root / "scripts" / "hooks"
             hooks.mkdir()
-            _ = (hooks / "delegate_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+            _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
             for source_name in ("add_unit.py", "production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_pane.py"):
                 _ = shutil.copy2(SCRIPT.with_name(source_name), script.with_name(source_name))
             (root / "scripts" / "herdr").mkdir()
             _ = shutil.copy2(SCRIPT.parent.parent / "herdr" / "herdr.py", root / "scripts" / "herdr" / "herdr.py")
-            for source_name in ("user_zone.py", "probe_session.py"):
+            for source_name in ("user_zone.py", "probe_session.py", "unit_runs.py"):
                 _ = shutil.copy2(SCRIPT.parent.parent / "lib" / source_name, script.parent.parent / "lib" / source_name)
             active_dir = root / "active"
             active_dir.mkdir()
@@ -77,8 +77,8 @@ exit "$NOTIFIER_HEALTH_EXIT"
             environment = {
                 **os.environ,
                 "HOME": str(root),
-                "PLAN_DELEGATE_ACTIVE_DIR": str(active_dir),
-                "PLAN_DELEGATE_HISTORY_DIR": str(root / "history"),
+                "UNIT_ACTIVE_DIR": str(active_dir),
+                "UNIT_HISTORY_DIR": str(root / "history"),
                 "NOTIFIER_STATE_DIR": str(root / "notifier"),
                 "NOTIFIER_NOW_EPOCH": "20100",
                 "NOTIFIER_CALL_LOG": str(call_log),

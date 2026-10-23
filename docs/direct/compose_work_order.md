@@ -53,15 +53,15 @@ that builds the wrong thing.
    for ad hoc work it reuses the latest plan-backed clock for the exact working
    directory and branch, or starts at this run when none exists. Never
    calculate, pass, edit, or correct a project timestamp in the agent.
-4. A delegate-ready plan has `## Delegation Context` and a target
-   `#### Work Order` per `~/.claude/docs/delegate_plan_format.md`. `verbose`
+4. A direct-ready plan has `## Delegation Context` and a target
+   `#### Work Order` per `~/.claude/docs/direct_plan_format.md`. `verbose`
    requires one.
 5. For a phased plan, derive `${NEXT_ITEMS_PATH}` beside `${PLAN_DOC}`. Lowercase
    its filename stem, replace each run of non-alphanumeric characters with one
    hyphen, trim leading/trailing hyphens, and append `-next.md`. Stop if the
    normalized stem is empty. The file need not exist.
 
-**Delegate-ready fast path:** do not research the codebase. Assemble
+**Direct-ready fast path:** do not research the codebase. Assemble
 `${PHASE_DIR}/implementation_prompt.md` under <WritePromptContract/>:
 
 - Project Context: Delegation Context except **Style**, plus Constraints from
@@ -88,5 +88,5 @@ instead of copying their contents. Do not load style. Derive verification per
 
 If an initial verbose invocation contains a bounded-auto control, resolve
 `AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before
-<CoordinateDelegatedPhaseReservation/>. Otherwise
+<CoordinatePhaseReservation/>. Otherwise
 follow <AuthorizationContract/>.

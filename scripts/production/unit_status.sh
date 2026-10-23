@@ -40,8 +40,8 @@ PYTHON
 marked_lines=$("$PY" "$REPO/scripts/production/unit_lookup.py" list "$slug") || exit 1
 NOTIFIER=$REPO/scripts/message/notifier.sh
 # Run markers sit under unit/, or delegate/ for a run started before the rename.
-if [[ -n ${PLAN_DELEGATE_ACTIVE_DIR:-} ]]; then
-  ACTIVE_DIRS=($PLAN_DELEGATE_ACTIVE_DIR)
+if [[ -n ${UNIT_ACTIVE_DIR:-${PLAN_DELEGATE_ACTIVE_DIR:-}} ]]; then
+  ACTIVE_DIRS=(${UNIT_ACTIVE_DIR:-$PLAN_DELEGATE_ACTIVE_DIR})
 else
   ACTIVE_DIRS=(/tmp/claude/unit/active /tmp/claude/delegate/active)
 fi

@@ -80,7 +80,7 @@ Each start site has one `<Guild>` section (or `## Guild` in a prompt) with the e
 | Variable | Default |
 | --- | --- |
 | `GUILD_DAILY_RUN_ROOTS` (`os.pathsep` list) | `unit_runs.run_roots()` |
-| `GUILD_DAILY_HISTORY_ROOT` | `$PLAN_DELEGATE_HISTORY_DIR/runs`, else `~/.local/state/plan-delegate/runs` |
+| `GUILD_DAILY_HISTORY_ROOT` | `unit_runs.history_root()/runs`: `$UNIT_HISTORY_DIR`, else `~/.local/state/unit-history`, else `~/.local/state/plan-delegate` before the move |
 | `GUILD_DAILY_ASTRA_ROOT` | `$ASTRA_REVIEW_DIR`, else `/tmp/claude/astra` |
 | `GUILD_DAILY_ROLES_ROOT` | `$GUILD_ROLES_STATE`, else `~/.local/state/guilds/roles` |
 | `GUILD_DAILY_HOST` | `socket.gethostname()` |
@@ -169,7 +169,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Turn claim and lock order.** `_claim_follow` runs inside `_design_claim_lock` (design `lock`, then the pending file), then the roster flock: design, pending, roster, server. `_validate_held_claim` checks the role is open on the same thread, the caller is the live holder, the authorized generation and holder match, `assignment_claim` equals `authorized_prompt`, and no `transition.json` exists. It then sets `instructions_file` and `access_policy`. The claim pops `authorized_prompt`, so one authorization starts one turn. A stale launcher claim on a held entry is not taken over.
 
-**Server environment.** `_guild_context(session_dir)` rebuilds `guild_context.json` from `design.json` and the live holder. `ensure_server` compares it with the server record's `guild_context` (and home, compact limit, sign-in); any difference runs `_release_held_server` first. That function saves the serving home, parks each queue (`_move_queue_to_pending`), requires `ThreadIdle`, releases the thread (`_release_worker_thread`) and reaps the server; uncertainty raises `RoleNeedsRecovery`. `_server_environment` for a durable mesh drops `PLAN_DELEGATE_*`, `CLAUDE_CODE_SESSION_ID`, `GUILD_DESIGN_ID` and `GUILD_BINDING_GENERATION` from the caller and sets them from the context: holder session, design ID, generation, and `PLAN_DELEGATE_BOARD_DIR` only when bound.
+**Server environment.** `_guild_context(session_dir)` rebuilds `guild_context.json` from `design.json` and the live holder. `ensure_server` compares it with the server record's `guild_context` (and home, compact limit, sign-in); any difference runs `_release_held_server` first. That function saves the serving home, parks each queue (`_move_queue_to_pending`), requires `ThreadIdle`, releases the thread (`_release_worker_thread`) and reaps the server; uncertainty raises `RoleNeedsRecovery`. `_server_environment` for a durable mesh drops `UNIT_*`, `PLAN_DELEGATE_*`, `CLAUDE_CODE_SESSION_ID`, `GUILD_DESIGN_ID` and `GUILD_BINDING_GENERATION` from the caller and sets them from the context: holder session, design ID, generation, and `PLAN_DELEGATE_BOARD_DIR` only when bound.
 
 **File ownership.** `scripts/hooks/pre-tool-use-berth.py` checks `apply_patch` only. With `GUILD_DESIGN_ID` set, it calls `roles.check_patch(design_id, GUILD_BINDING_GENERATION, cwd, paths)` before phase attribution. It rejects the whole patch for `transition.json`, a stale generation, a holder mismatch, an unbound designer, any path (rename sources included, symlinks resolved) outside the bound output paths or the repository, or an unreadable ledger. The binding's run directory then drives attribution, and an unreadable reservation ledger refuses instead of failing open.
 
