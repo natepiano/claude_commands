@@ -1309,9 +1309,21 @@ delegate report is not a smoke test.
 
 Launch the real product from `${WORKING_DIR}` with useful logging/backtraces,
 exercise the changed runtime behavior, observe stability, close cleanly, and
-record command/action/result. The launch compiles its own target — never run a
-build, `check`, or `test` pass first to prove it builds. Startup alone suffices only when no changed
+record command/action/result. Never run a `check` or `test` pass first to prove
+it builds. Startup alone suffices only when no changed
 behavior can be invoked. A pass continues to <UXReview/>.
+
+A launch that needs a built binary — a smoke or shot helper's, or a launcher
+that takes a path — builds it with this one line, then starts the
+`binary: <path>` it prints:
+
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build <package> [--bin <name> | --example <name>]`
+
+It waits for a build hold, takes the cargo token and memory admission, and
+records the build, and its allow rule needs no approval. You and every helper
+never run raw cargo (`cargo build`, `cargo run`): a helper's raw `cargo build`
+needed the user's approval by hand (2026-10-23). Copy the line into every smoke
+or shot helper prompt.
 
 A panic, fatal log, unexpected exit, or wrong behavior is a blocker: route it
 through <Synthesize/>, then repeat review, synthesis, and smoke before later
