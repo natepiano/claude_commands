@@ -195,6 +195,7 @@ Verdicts: `clean | fixed | exception | held | waived`. Every verdict counts as c
 **Gate.** `style_plan.py gate --repo . --ticket <id>` serves `<StandingPlanRefill>` and checkpoint step 6. Exit 0 permits, 1 returns to repair (`review:` or `unjudged: <rule> <path>`), 2 could not run (`error: <reason>`).
 - Coverage ticket (`SelectedByCoverage(base)`): refuse unjudged owned cells, then `style_footprint.py check --base <base> --worktree`. The base is the later of the stored `base` and the merge-base of `HEAD` with the style branch, so style-branch work the unit took in is never judged.
 - Proposal ticket (`ApprovedProposal(issue, unit, finding_ids)`): the decision must still be open and approved for this unit, with each finding filed to it and built by this ticket. Every changed file must belong to a finding, except approved reference edits of qualified rename pairs and an approved module file rename. Each rename must be applied in the worktree (`review: <id>: <before> -> <after> not applied in <path>`).
+  Its Work Order Goal is `Apply the approved findings of <issue> in N files of <crate>` (`file` for N = 1); its Spec gives the build scope with no override of the copied invariants.
 
 ### Mechanical-fix filter: `style_footprint.py`
 
