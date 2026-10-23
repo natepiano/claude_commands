@@ -291,8 +291,14 @@ with worker_claim_lock(root):
         if not identity and worker_id and worker_slot(root, name) is None:
             identity_file.write_text(json.dumps(expected))
             identity = expected
+        # A resumed worker keeps the model it was recorded with: the registry row may have
+        # changed since, and the worker is still the same thread (rca of 2026-10-23).
+        stored_model = identity.get("model")
+        if isinstance(stored_model, str) and stored_model:
+            expected["model"] = stored_model
         if identity != expected:
             fail(f"{name} has no matching durable worker identity for slot {slot}")
+        print(expected["model"])
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
@@ -391,7 +397,7 @@ PY
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
-  worker_record claim
+  AGENT_MODEL="$(worker_record claim)"
   trap 'worker_record release' EXIT
 fi
 
