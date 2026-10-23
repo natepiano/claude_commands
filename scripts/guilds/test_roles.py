@@ -400,11 +400,11 @@ class DurableRolesTests(unittest.TestCase):
 
         with patch.object(codex_mesh, "_release_held_server", side_effect=release_server), \
                 patch.object(codex_mesh, "_start_server", side_effect=start_server), \
-                patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.run_a),
+                patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.run_a),
                                         "PLAN_DELEGATE_PHASE": "stale-phase"}):
             self.assertEqual(codex_mesh.ensure_server(str(mesh), home), (32101, True))
         self.assertEqual(operations, ["release", "start"])
-        self.assertEqual(environments[0]["PLAN_DELEGATE_BOARD_DIR"], str(self.run_b))
+        self.assertEqual(environments[0]["UNIT_RUN_DIR"], str(self.run_b))
         self.assertEqual(environments[0]["GUILD_BINDING_GENERATION"], str(rebound.placement.generation))
         self.assertNotIn("PLAN_DELEGATE_PHASE", environments[0])
         self.holder_session = "holder-restarted"
@@ -413,9 +413,10 @@ class DurableRolesTests(unittest.TestCase):
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "holder-restarted"}):
             unbound = roles.rebind(design.placement.design_id, expected_generation=2, reason="run end",
                                    binding=roles.DesignUnbound())
-        with patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.run_a), "PLAN_DELEGATE_PHASE": "old"}):
+        with patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.run_a), "PLAN_DELEGATE_BOARD_DIR": str(self.run_a),
+                                     "UNIT_PHASE": "old"}):
             context = codex_mesh._server_environment(str(mesh), home)  # pyright: ignore[reportPrivateUsage]
-        self.assertFalse(any(key.startswith("PLAN_DELEGATE_") for key in context))
+        self.assertFalse(any(key.startswith(("UNIT_", "PLAN_DELEGATE_")) for key in context))
         self.assertEqual(context["GUILD_BINDING_GENERATION"], str(unbound.placement.generation))
 
     def test_stale_rebind_and_busy_rebind_preserve_the_current_binding(self) -> None:

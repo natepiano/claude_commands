@@ -19,7 +19,7 @@ from current `HEAD` is not proof and will silently accept the wrong checkpoint.
 `/unit:direct` reads this file once per completed phase in loop and verbose
 mode. It defines `<CheckpointCommit/>`, `<ShrinkCommit/>`, and
 `<PushCheckpoint/>` in full. `single` never commits.
-Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
+Phase-end order: `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
 Everything below is the contract.
 
@@ -86,7 +86,7 @@ Loop/verbose only:
    re-derive acting identity. The cheap drift delta is forbidden here.
 
    Anything else is identity ambiguity or unsafe drift and blocks the
-   checkpoint: apply <RetainDelegatedPhaseReservation/> and report the exact
+   checkpoint: apply <RetainPhaseReservation/> and report the exact
    full-drift command above so a person can run it to see the conflict. That
    covers no result, more than one, a different reservation id, any comparison
    other than `full_phase_start`, an incursion, collision, attribution
@@ -162,7 +162,7 @@ Loop/verbose only:
    the merge turns each visible line into a row on the change-review list.
 
    A failed commit is an unsuccessful ending: do not invoke release, leave
-   `Active` untouched, and apply <RetainDelegatedPhaseReservation/>. After a
+   `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of
    `git rev-parse HEAD`, atomically replace the `Active` record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that value as
@@ -171,7 +171,7 @@ Loop/verbose only:
    commit that just succeeded (or the ancestry-checked, captured HEAD of the
    no-change standing ticket above), never from conversation or from a later
    reading of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
-   release and apply <RetainDelegatedPhaseReservation/> to whichever valid
+   release and apply <RetainPhaseReservation/> to whichever valid
    durable state remains.
 7. Read and validate the durable record again.
 
@@ -183,7 +183,7 @@ Loop/verbose only:
    | State | Action |
    | --- | --- |
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Read its reservation id and `checkpoint_commit` from the read-back `CheckpointReleaseConfirmationPending`, then invoke `/sync release` exactly once. |
-   | `Active` | Step 6's durable transition did not complete: do not invoke release; apply <RetainDelegatedPhaseReservation/>. |
+   | `Active` | Step 6's durable transition did not complete: do not invoke release; apply <RetainPhaseReservation/>. |
    | Either inactive state | Invoke no release. |
 
    ```sh
@@ -245,7 +245,7 @@ Loop/verbose only:
    validation precedes the journal write; it is not recovery, and the original
    first-attempt assertions still apply when it is run again. At the moment of
    any busy or failed release, invoke no retry and apply
-   <RetainDelegatedPhaseReservation/>. The checkpoint commit exists, but the
+   <RetainPhaseReservation/>. The checkpoint commit exists, but the
    phase does not complete until a later invocation confirms either the normal
    first-attempt reply or the matching already-journalled checkpoint above.
 8. Run <PushCheckpoint/>. Outside a production, report
@@ -296,13 +296,13 @@ successful release in <CheckpointCommit/>, and after <ShrinkCommit/>,
 
 1. **Branch.** The current branch, under its own name. On the default branch
    (`gh repo view --json defaultBranchRef -q .defaultBranchRef.name`), push to
-   `delegate/<plan-slug>` instead, so unfinished work never lands there.
+   `direct/<plan-slug>` instead, so unfinished work never lands there.
 2. **Ancestry.** `git fetch origin <branch>`; a branch origin lacks yet is
    fine. If origin has it and
    `git merge-base --is-ancestor origin/<branch> HEAD` fails, do not push. The
    note is `push skipped: origin/<branch> has commits this branch lacks`.
 3. **Push.** `git push -u origin <branch>`; on the default branch,
-   `git push origin HEAD:refs/heads/delegate/<plan-slug>`. Never force. Run
+   `git push origin HEAD:refs/heads/direct/<plan-slug>`. Never force. Run
    each step as its own command, never joined to another with `;` or `&&`:
    the allow list covers `git push` alone, and a joined line goes to the
    auto-mode classifier as a whole.

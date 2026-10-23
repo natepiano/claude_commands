@@ -167,7 +167,7 @@ class MeshRunsTests(unittest.TestCase):
     def test_start_detaches_a_supervisor_and_records_the_run(self) -> None:
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         environment = {"CODEX_THREAD_ID": "thread-1", "CLAUDE_CODE_SESSION_ID": "director-session",
-                       "PLAN_DELEGATE_TEAM_ROLE": "test"}
+                       "UNIT_TEAM_ROLE": "test"}
         with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             code = mesh_runs.main(["start", "--label", "verify.sh check", "--", "bash", "verify.sh", "check"])
@@ -285,7 +285,7 @@ class MeshRunsTests(unittest.TestCase):
 
     # Criterion 2: the result is held for the seat, then the record is marked finished.
     def test_supervise_delivers_before_marking_finished(self) -> None:
-        path = self.record([sys.executable, "-c", "import os; print('lint clean', os.environ['PLAN_DELEGATE_TEAM_ROLE'])"])
+        path = self.record([sys.executable, "-c", "import os; print('lint clean', os.environ['UNIT_TEAM_ROLE'])"])
         hold = codex_mesh.hold_message
         statuses: list[object] = []
 

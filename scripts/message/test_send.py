@@ -995,7 +995,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_unreadable_roster_keeps_bare_claude_fallback_but_worker_address_fails(
         self,
     ) -> None:
-        unavailable = roster.Roster([], ["cannot read the delegate root"])
+        unavailable = roster.Roster([], ["cannot read the worker root"])
         bare_errors = io.StringIO()
         with (
             mock.patch.object(roster, "roster", return_value=unavailable),
@@ -1009,7 +1009,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(len(self.relayed), 1)
         self.assertEqual(
             bare_errors.getvalue(),
-            "send.py: roster: cannot read the delegate root\n",
+            "send.py: roster: cannot read the worker root\n",
         )
 
         worker_errors = io.StringIO()
@@ -1024,7 +1024,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ])
 
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn("send.py: roster: cannot read the delegate root", worker_errors.getvalue())
+        self.assertIn("send.py: roster: cannot read the worker root", worker_errors.getvalue())
         self.assertIn("worker:missing/worker", worker_errors.getvalue())
         codex_send.assert_not_called()
 
@@ -1144,7 +1144,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertGreaterEqual(help_text.count(recipient_form), 2)
 
     def test_codex_failure_is_failed_not_queued(self) -> None:
-        with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no delegate named 'bogus'")):
+        with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no worker named 'bogus'")):
             result = self.send("--codex", "--session-dir", str(self.root), "--text", "hi")
         self.assertEqual(result.outcome, "failed")
         self.assertEqual(send.pending("bogus"), "")
@@ -2212,22 +2212,22 @@ class PeerSendTests(ShutdownTestCase):
         self.assertEqual(self.forwarded(), [])
 
     def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
-        self.local = roster.Roster([], ["delegate source unreadable"])
+        self.local = roster.Roster([], ["worker source unreadable"])
         self.peer([self.row("absent here", "codex:peer")])
         status, output, errors = self.run_main("absent here")
         self.assertEqual(status, 2, output + errors)
-        self.assertIn("delegate source unreadable", errors)
+        self.assertIn("worker source unreadable", errors)
         self.assertIn("--machine", errors)
         self.assertIn("address", errors)
         self.assertEqual(self.ssh_calls(), [])
         self.assertEqual(self.relayed + self.mesh_calls + self.daemon_calls, [])
 
     def test_an_address_can_resolve_on_peer_even_when_a_local_source_failed(self) -> None:
-        self.local = roster.Roster([], ["delegate source unreadable"])
+        self.local = roster.Roster([], ["worker source unreadable"])
         self.peer([self.row("peer", "codex:peer")])
         status, output, errors = self.run_main("codex:peer")
         self.assertEqual(status, 0, output + errors)
-        self.assertIn("delegate source unreadable", errors)
+        self.assertIn("worker source unreadable", errors)
         self.assertEqual(len(self.forwarded()), 1)
 
     def test_remote_between_turns_worker_address_keeps_no_roster_address_error(self) -> None:

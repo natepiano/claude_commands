@@ -1,6 +1,6 @@
-# Delegate-ready plan format
+# Direct-ready plan format
 
-The shared contract for a **delegate-ready phased implementation plan**. Five
+The shared contract for a **direct-ready phased implementation plan**. Five
 commands read or write this format and must not drift from it:
 
 - `/plan:to_phased_plan` — compiles a design/plan doc into this format.
@@ -26,7 +26,7 @@ to rediscover after a context compaction lives in the doc.
 ```markdown
 # <Feature name>
 
-> **Status: IMPLEMENTATION PLAN — phased, delegate-ready.** <one line: what this builds>
+> **Status: IMPLEMENTATION PLAN — phased, direct-ready.** <one line: what this builds>
 
 <!-- Optional; set by the originating review (e.g. /api_review). Preserved verbatim
      by /plan:to_phased_plan and /plan:phase_review; consumed by /plan:to_as_built.
@@ -89,12 +89,12 @@ to rediscover after a context compaction lives in the doc.
 ### Phase N — <title>  · status: todo
 <!-- status ∈ {todo, done}. The checkpoint flips it in loop/verbose, and
      /unit:direct shrinks the phase to As-built after the code commit
-     (~/.claude/docs/delegate/phase_end.md → <PhaseEnd/>). Review prose never
+     (~/.claude/docs/direct/phase_end.md → <PhaseEnd/>). Review prose never
      enters this document. -->
 
 #### Work Order
 <!-- The dispatch prompt. Self-contained against Delegation Context + named files.
-     A fresh delegate session reads ONLY the files named here — no exploration. -->
+     A fresh worker session reads ONLY the files named here — no exploration. -->
 
 **Goal:** <one line — the observable outcome of this phase>
 
@@ -117,7 +117,7 @@ This is the meat — do not paraphrase a resolved design down to a summary.>
      reads `opens as impl`. Writers hold disjoint files; every hub file has
      exactly one owner. Rule 7. -->
 
-**Constraints from prior phases:** <concrete facts a delegate would otherwise
+**Constraints from prior phases:** <concrete facts a worker would otherwise
 re-derive — what earlier phases built, decisions that bind this phase. Empty for
 Phase 1. Maintained by /plan:phase_review.>
 
@@ -134,7 +134,7 @@ them; nothing workspace-wide.>
 #### Work Order
 <the dispatched work order; /plan:shrink replaces this span after the code commit>
 
-Retrospective and review outcomes live only under the delegate session directory.
+Retrospective and review outcomes live only under the unit session directory.
 `/plan:phase_review` first propagates durable decisions into remaining Work
 Orders; `/plan:shrink --closeout` then writes the archive form:
 
@@ -209,22 +209,22 @@ Rules:
    Orders reference the context
    ("build/test/paths: see Delegation Context") rather than repeating it. The
    dispatch step concatenates the two.
-2. **A Work Order is self-contained against named files.** A fresh delegate agent
+2. **A Work Order is self-contained against named files.** A fresh worker agent
    with no conversation history must be able to implement it by reading only the files
    the Work Order names plus the Delegation Context. If it would have to *search*
    for something, that something belongs in the Work Order or Delegation Context.
 3. **Spec stays verbatim.** When the plan derives from a resolved design, copy the
    design's concrete types/signatures/constraints into the Work Order. Do not
-   compress a settled decision into a one-liner — the delegate needs the detail.
+   compress a settled decision into a one-liner — the worker needs the detail.
 4. **Live zone vs archive zone.** Remaining (`todo`) phases are dispatch-ready
    Work Orders. Every completed (`done`) phase is reduced to the `As-built`
    archive form by its own shrink commit, after its code commit
-   (`~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>). Retrospective, finding, reviewer,
+   (`~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>). Retrospective, finding, reviewer,
    and approval prose never persists in the plan. `/plan:shrink --closeout`
    changes only the current phase; earlier `As-built` blocks and remaining Work
    Orders are byte-stable during shrink.
 5. **No design narrative in the plan.** Justification essays, alternatives
-   considered, and resolved-decision debates do not belong in a delegate-ready
+   considered, and resolved-decision debates do not belong in a direct-ready
    plan. `/plan:to_phased_plan` strips them; anything a phase depends on becomes a Work Order
    **Spec** line or a Delegation Context **Invariant**. The full rationale lives
    in the eventual as-built doc, not the implementation plan.
