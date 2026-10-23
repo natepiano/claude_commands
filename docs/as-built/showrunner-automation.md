@@ -231,7 +231,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 ## Calibration and gotchas
 
-- **`config/agents.conf` clean filter.** `.gitattributes` gives it `filter=claude-agents-conf`, whose clean step (`scripts/agents/clean_agents_conf.sh`) pins staged content to the index: `git diff` is empty for it and a plain `git add` commits nothing. Stage a real change with `AGENTS_CONF_COMMIT=1 git add --renormalize config/agents.conf`, then confirm `git diff --cached --stat` lists it. Merging it into a machine's checkout rewrites that machine's live registry, so live `/agent` retunes there are lost.
+- **`config/agents.conf` holds the committed defaults only.** Each machine's own rows live in the untracked `config/agents.local.conf`, which holds only the rows that differ (`scripts/agents/agents_overlay.sh`). Readers see the overlay over the defaults; `/agent`, `/showrunner:effort` and the catalog sync write only the overlay. A commit that changes `config/agents.conf` is a plain change, and merging it never erases a machine's tuning (the former clean filter hid the local rows from git, and the 2026-10-23 fast-forward replaced them). `agents_overlay.sh migrate --from <copy>` moves a full registry's local rows into the overlay.
 
 - Sourcing `agents_config.sh` may run the Codex catalog refresh when its state is stale; `--check` writes nothing of its own but does not promise zero writes to the registry's state. Tests set `AGENTS_CONFIG_FILE`, `CODEX_CONFIG_FILE`, `CODEX_MODELS_CACHE_FILE` and `CODEX_CATALOG_SYNC_STATE_FILE` (newest) to temporary paths.
 

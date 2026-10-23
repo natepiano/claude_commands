@@ -363,12 +363,13 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         for name in (
             "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py",
             "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
-        for name in ("agents_config.sh", "heartbeat.sh"):
+        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         # Keep the watcher alive for early-launch tests without a shell sleep
         # child inheriting the subprocess output pipes for sixty seconds.

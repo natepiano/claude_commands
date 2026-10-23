@@ -12,7 +12,7 @@ Run:
 bash ~/.claude/scripts/agents/agent_admin.sh $ARGUMENTS
 ```
 
-**Always run `agent_admin.sh` with `dangerouslyDisableSandbox: true`** — edits rewrite `config/agents.conf` and even `status` triggers the catalog freshness sync, both of which the sandbox denies (a sandboxed status emits a harmless-but-noisy mktemp warning).
+**Always run `agent_admin.sh` with `dangerouslyDisableSandbox: true`** — edits rewrite `config/agents.local.conf` (this machine's rows over the committed `config/agents.conf`) and even `status` triggers the catalog freshness sync, both of which the sandbox denies (a sandboxed status emits a harmless-but-noisy mktemp warning).
 
 Relay the script's stdout and stderr exactly, except status output — see below. If it exits non-zero, stop; do not guess a correction.
 
