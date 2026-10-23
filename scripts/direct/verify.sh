@@ -4,6 +4,8 @@
 # Work Orders list exact invocations of this script; the delegate composes no
 # cargo flags and makes no scope choices. `check` pins lib and bin targets;
 # `test` selects the package's test targets, including examples with test = true.
+# `build` builds one package's binaries, or one bin or example, so a smoke run
+# or live shot can launch it, and prints each binary's path.
 # `lint` runs clippy with --all-targets --all-features to match CI, and mend
 # also uses --all-targets. It checks TOML formatting with taplo at the workspace
 # root. `example` runs clippy on one named example while
@@ -129,6 +131,13 @@
 #                                          does not answer --local
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
+#   verify.sh build <package> [--bin <name> | --example <name>] [--release]
+#                                          build the package's binaries, or the
+#                                          one named bin or example, for a smoke
+#                                          run or a live shot, and print each
+#                                          binary's path (`binary: <path>`);
+#                                          an example's required features are
+#                                          turned on. Accepts --features <list>
 #   verify.sh final                        full workspace gate; refuse examples
 #                                          that hold a test (unit director only)
 #   verify.sh --session-dir <dir> …        any of the above inside a delegate
@@ -277,6 +286,33 @@ for package in meta["packages"]:
     sys.exit(2)
 print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
 sys.exit(2)
+'
+
+# The cargo words that select what `build` builds, then the binaries it makes:
+# `select <word>` lines, `features <list>` for an example's required features,
+# and `binary <path under the profile folder>` lines. Bin and example names
+# are unique across the workspace, so --workspace --bin builds the one target
+# under the workspace's feature set, the set `test` already compiled.
+BUILD_TARGETS_PY='
+import json
+import sys
+
+package_name, kind, name = sys.argv[1], sys.argv[2], sys.argv[3]
+meta = json.load(sys.stdin)
+package = next(package for package in meta["packages"] if package["name"] == package_name)
+wanted = [target for target in package["targets"] if (kind or "bin") in target["kind"] and name in ("", target["name"])]
+if not wanted:
+    what = f"{kind} {name}" if name else "binary"
+    advice = "" if name else "; name an example with --example <name>"
+    print(f"verify.sh: package {package_name} has no {what}{advice}", file=sys.stderr)
+    sys.exit(2)
+for target in wanted:
+    print("select --" + (kind or "bin"))
+    print("select " + target["name"])
+    if kind == "example" and target.get("required-features"):
+        print("features " + ",".join(target["required-features"]))
+    print(("binary examples/" if kind == "example" else "binary ") + target["name"])
+print("target " + meta["target_directory"])
 '
 
 # Select the named package's test targets. Named targets with unavailable
@@ -609,6 +645,74 @@ take_features() {
         usage
         exit 2
     fi
+}
+
+# `build` arguments: at most one of --bin or --example, --release, and
+# --features in any order. An example's required features join the list.
+BUILD_ARGS=()
+BUILD_BINARIES=()
+BUILD_PROFILE_DIR=debug
+BUILD_TARGET_DIR=""
+take_build_args() {
+    local kind="" name="" features="" line words
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --bin|--example)
+                if [[ -n "$kind" || -z "${2:-}" || "${2:-}" == --* ]]; then
+                    usage
+                    exit 2
+                fi
+                kind=${1#--}
+                name=$2
+                shift 2
+                ;;
+            --release)
+                BUILD_PROFILE_DIR=release
+                shift
+                ;;
+            --features)
+                if [[ -z "${2:-}" ]]; then
+                    usage
+                    exit 2
+                fi
+                features=$2
+                shift 2
+                ;;
+            *)
+                usage
+                exit 2
+                ;;
+        esac
+    done
+    words="$(read_metadata | "$PY" -c "$BUILD_TARGETS_PY" "$PKG" "$kind" "$name")" || exit 2
+    while IFS= read -r line; do
+        case "$line" in
+            "select "*) BUILD_ARGS+=("${line#select }") ;;
+            "features "*) features="${features:+$features,}${line#features }" ;;
+            "binary "*) BUILD_BINARIES+=("${line#binary }") ;;
+            "target "*) BUILD_TARGET_DIR="${line#target }" ;;
+        esac
+    done <<< "$words"
+    if [[ "$BUILD_PROFILE_DIR" == release ]]; then
+        BUILD_ARGS+=(--release)
+    fi
+    if [[ -n "$features" ]]; then
+        BUILD_ARGS+=(--features "$(qualify_features "$PKG" "$features")")
+    fi
+}
+
+# One `binary: <path>` line per binary the build made, for the caller to launch.
+print_built_binaries() {
+    local binary path
+    for binary in "${BUILD_BINARIES[@]}"; do
+        path="${BUILD_TARGET_DIR}/${BUILD_PROFILE_DIR}/${binary}"
+        if [[ -x "$path" ]]; then
+            echo "binary: $path"
+        else
+            echo "verify.sh: cargo build passed but made no ${path}" >&2
+            exit 1
+        fi
+    done
 }
 
 NEXTEST_ARGS=()
@@ -2082,6 +2186,14 @@ case "$CMD" in
         take_features "$@"
         require_member "$PKG"
         run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
+        ;;
+    build)
+        PKG="${1:?verify.sh build <package> [--bin <name> | --example <name>] [--release] [--features <list>]}"
+        shift
+        require_member "$PKG"
+        take_build_args "$@"
+        run cargo build --workspace "${BUILD_ARGS[@]}"
+        print_built_binaries
         ;;
     test)
         run_local_test
