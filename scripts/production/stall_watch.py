@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 import push_texts  # noqa: E402
 import rca  # noqa: E402
+import sessions  # noqa: E402
 
 import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
 
@@ -261,12 +262,6 @@ def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
             end = start
 
 
-def latest_transcript(session_id: str) -> Path | None:
-    """The session's transcript: the newest one, when a resume left several."""
-    transcripts = sorted(PROJECTS_DIR.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
-    return transcripts[-1] if transcripts else None
-
-
 def transcript_turn_end(session_id: str) -> re.Match[str] | None:
     """The turn-end line closing the session's last assistant text, read from its transcript.
 
@@ -275,7 +270,7 @@ def transcript_turn_end(session_id: str) -> re.Match[str] | None:
     means the turn went on, so there is no turn-end line.
     """
     try:
-        transcript = latest_transcript(session_id)
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
         if transcript is None:
             return None
         for line in lines_from_end(transcript):
@@ -312,7 +307,7 @@ def pending_tool(session_id: str) -> PendingTool | None:
     try:
         paths = [path for directory in PROJECTS_DIR.glob(f"*/{session_id}/subagents")
                  for path in directory.glob("agent-*.jsonl")]
-        main = latest_transcript(session_id)
+        main = sessions.latest_transcript(session_id, PROJECTS_DIR)
     except OSError:
         return None
     calls = [call for path in ([main] if main else []) + paths if (call := transcript_pending(path)) is not None]
@@ -602,7 +597,7 @@ def prompt_report(slug: str, unit: str, session_id: str, pending: PendingTool | 
     else:
         commands = (command,) if pending.name == "Bash" and isinstance(command, str) else (pending.name,)
     try:
-        transcript = latest_transcript(session_id)
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
     except OSError:
         transcript = None
     return rca.Report(unit, machine_name(), "prompt", commands, str(transcript or ""), slug)

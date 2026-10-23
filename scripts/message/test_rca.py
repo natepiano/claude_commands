@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 import push_texts  # noqa: E402
 import rca  # noqa: E402
+import sessions  # noqa: E402
 import showrunners  # noqa: E402
 
 OPENED = datetime(2026, 10, 23, 13, 30, tzinfo=timezone.utc)
@@ -77,10 +79,13 @@ class RcaTests(unittest.TestCase):
         _ = stub.write_text(STUB)
         _ = self.enterContext(mock.patch.object(rca, "STATE", self.root / "rca"))
         _ = self.enterContext(mock.patch.object(rca, "SEND", stub))
+        _ = self.enterContext(mock.patch.object(rca, "PROJECTS", self.root / "projects"))
+        (self.root / "sessions").mkdir()
         removed = (rca.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
         environment = {key: value for key, value in os.environ.items() if key not in removed}
-        self.enterContext(mock.patch.dict(os.environ, environment | {"RCA_TEST_LOG": str(self.log),
-                                                                     "USER_ZONE": "America/Puerto_Rico"}, clear=True))
+        self.enterContext(mock.patch.dict(os.environ, environment | {
+            "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}, clear=True))
         _ = self.enterContext(mock.patch.object(showrunners, "canonical_slug", side_effect=same_slug))
         _ = self.enterContext(mock.patch.object(showrunners, "current_address", side_effect=showrunner_address))
         self.detached = []
@@ -96,6 +101,29 @@ class RcaTests(unittest.TestCase):
         process = REAL_POPEN(argv, stdin=stdin, stdout=stdout, stderr=stderr, text=True)
         _ = process.wait()
         return process
+
+    def live_session(self, name: str, session_id: str) -> None:
+        """A session record for this test's process, with a bound socket, so the record counts as live."""
+        listener = socket.socket(socket.AF_UNIX)
+        self.addCleanup(listener.close)
+        socket_path = self.root / f"{name}.sock"
+        listener.bind(str(socket_path))
+        record = {"pid": os.getpid(), "name": name, "sessionId": session_id, "messagingSocketPath": str(socket_path),
+                  "updatedAt": 1, "procStart": sessions.process_start(os.getpid()) or ""}
+        _ = (self.root / "sessions" / f"{name}.json").write_text(json.dumps(record))
+
+    def transcript(self, folder: str, session_id: str, mtime: float) -> Path:
+        path = self.root / "projects" / folder / f"{session_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _ = path.write_text("{}\n")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def caller(self) -> dict[str, str]:
+        """The environment of the session that runs rca.py open: a showrunner with a transcript of its own."""
+        _ = self.transcript("-home-showrunner", "sid-caller", 3000)
+        self.live_session("showrunner", "sid-caller")
+        return {"CLAUDE_CODE_SESSION_ID": "sid-caller", "CLAUDE_CONFIG_DIR": str(self.root)}
 
     def sends(self) -> list[list[str]]:
         if not self.log.exists():
@@ -162,13 +190,24 @@ class RcaTests(unittest.TestCase):
         import unit_lookup
         self.assertEqual(rca.PRODUCTION_MARK, unit_lookup.PRODUCTION_MARK)
 
-    def test_the_transcript_is_the_sessions_own_when_none_is_given(self) -> None:
-        transcript = self.root / "config/projects/-home-x/sid-1.jsonl"
-        transcript.parent.mkdir(parents=True)
-        _ = transcript.write_text("{}\n")
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-1", "CLAUDE_CONFIG_DIR": str(self.root / "config")}):
-            _ = rca.open_case(HANDLER._replace(transcript=""), OPENED)
-        self.assertEqual(self.case("261023-1")["transcript"], str(transcript))
+    def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:
+        _ = self.transcript("-home-handler-old", "sid-handler", 1000)
+        newest = self.transcript("-home-handler", "sid-handler", 2000)
+        self.live_session("handler", "sid-handler")
+        with mock.patch.dict(os.environ, self.caller()):
+            code, out, _ = self.quiet(["open", "--session", "handler-unit", "--machine", "natedev", "--kind", "prompt",
+                                       "--command", "cargo build", "--production", "cargo-liner"])
+        self.assertEqual((code, out), (0, "rca: opened 261023-1\n"))
+        self.assertEqual(self.case("261023-1")["transcript"], str(newest))
+        self.assertIn(f"Transcript: {newest}\n", flags(self.sends()[0])["--text"])
+
+    def test_an_unknown_session_gets_no_transcript_and_never_the_callers(self) -> None:
+        with mock.patch.dict(os.environ, self.caller()):
+            _ = rca.open_case(HANDLER._replace(session="gone-unit", transcript=""), OPENED)
+        self.assertEqual(self.case("261023-1")["transcript"], "")
+        text = flags(self.sends()[0])["--text"]
+        self.assertIn("Commands: cargo build -p cargo-handler\nFind why it stopped", text)
+        self.assertNotIn("Transcript", text)
 
     def test_open_never_fails_its_caller(self) -> None:
         blocked = self.root / "a-file"

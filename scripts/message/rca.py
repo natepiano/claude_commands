@@ -12,7 +12,8 @@ A permission alert to the user opens a case: stall_watch.py opens one after its 
 after an auto_mode.refused push. A new case sends its owner one message with the steps. An open or started
 case for the same session and the same commands counts one more alert instead. The owner is the showrunner
 of the session's production (--production, else the production mark the session's processes carry), or the
-natedev session when there is none or it is not running.
+natedev session when there is none or it is not running. The case's transcript is the stopped session's:
+--transcript, else the newest transcript of the live session on this machine that --session names, else none.
 
 `start` and `fixed` each send the user one push, permission.rca_started and permission.rca_fixed, with the
 key rca-<id>: while silence is on, the fixed push replaces the started one. `remind`, which stall_watch.py
@@ -39,16 +40,19 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import push_texts  # noqa: E402
+import sessions  # noqa: E402
 import showrunners  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
 SEND = Path(os.environ.get("RCA_SEND") or Path(__file__).resolve().parent / "send.py")
 CALL = "~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py"
+PROJECTS = Path.home() / ".claude" / "projects"
 # unit_lookup.PRODUCTION_MARK: the production slug every process of a unit's session inherits.
 # unit_lookup itself is not imported here, as its herdr import costs 160 ms.
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"
@@ -146,13 +150,14 @@ def new_id(at: datetime) -> str:
 
 
 def transcript_of(report: Report) -> str:
-    """The given transcript, else the newest transcript of the Claude session this runs under."""
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    if report.transcript or not session_id:
+    """The given transcript, else the newest transcript of the live session the report names, else "".
+
+    Never the caller's own: a showrunner or a session that sends auto_mode.refused reports another session."""
+    if report.transcript:
         return report.transcript
-    projects = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
-    found = sorted(projects.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
-    return str(found[-1]) if found else ""
+    session = sessions.named(report.session, sessions.live_sessions())
+    found = sessions.latest_transcript(session["sessionId"], PROJECTS) if session is not None else None
+    return str(found or "")
 
 
 def production_of(report: Report) -> str:
@@ -181,9 +186,10 @@ def shown_commands(commands: list[str]) -> str:
 def owner_message(case: Case, *, reminder: bool = False) -> str:
     stop = "stopped at a permission prompt" if case["kind"] == "prompt" else "was stopped by auto mode"
     first = (f"rca {case['id']} is still open after 30 minutes. " if reminder else f"rca {case['id']}: ")
+    transcript = ["Transcript: " + case["transcript"]] if case["transcript"] else []
     lines = [first + f"{case['session']} on {case['machine']} {stop}.",
              "Commands: " + ("; ".join(case["commands"]) or "none recorded"),
-             "Transcript: " + (case["transcript"] or "unknown"),
+             *transcript,
              f"Find why it stopped and fix the source. Run the rca.py commands on {case['machine']}:",
              f"1. Run `{CALL} start {case['id']} --owner <unit you route the fix to>`.",
              "2. Find where the command came from: a work order, a helper prompt, a skill or a script.",
@@ -328,7 +334,7 @@ def main(argv: list[str]) -> int:
     _ = opening.add_argument("--machine", required=True)
     _ = opening.add_argument("--kind", required=True, choices=("prompt", "auto_mode"))
     _ = opening.add_argument("--command", action="append", default=[], help="a command that needed permission")
-    _ = opening.add_argument("--transcript", default="")
+    _ = opening.add_argument("--transcript", default="", help="default: the transcript of the session --session names")
     _ = opening.add_argument("--production", default="", help="default: the session's production mark")
     starting = commands.add_parser("start", help="name the unit that fixes the case; the user gets a push")
     _ = starting.add_argument("id")
