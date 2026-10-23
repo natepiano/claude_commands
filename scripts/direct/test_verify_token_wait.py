@@ -171,14 +171,30 @@ esac
         self.temporary.cleanup()
 
     def live_group_processes(self, group: int) -> list[int]:
+        """The live processes in the group, and in the session a started call leads.
+
+        verify.sh runs each step in a group of its own (run()'s `set -m`), in the
+        call's session; a kill of the call's group alone left a step waiting for the
+        token for 45 h (2026-10-20).
+        """
         found: list[int] = []
         result = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
                                 capture_output=True, text=True, check=True)
         for line in result.stdout.splitlines():
             parts = line.split()
-            if len(parts) == 3 and int(parts[1]) == group and not parts[2].startswith("Z"):
-                found.append(int(parts[0]))
+            if len(parts) != 3 or parts[2].startswith("Z"):
+                continue
+            pid = int(parts[0])
+            if int(parts[1]) == group or self.session_of(pid) == group:
+                found.append(pid)
         return found
+
+    @staticmethod
+    def session_of(pid: int) -> int | None:
+        try:
+            return os.getsid(pid)
+        except OSError:
+            return None
 
     def end_group(self, group: int) -> None:
         try:
@@ -187,6 +203,11 @@ esac
             pass
         deadline = time.monotonic() + 300
         while pids := self.live_group_processes(group):
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             descriptors: list[int] = []
             poll_pids = False
             try:
@@ -745,6 +766,45 @@ exec "$TEST_REAL_SLEEP" "$@"
                         self.end_group(process.pid)
                     _ = process.wait(timeout=300)
 
+    def test_a_step_whose_call_is_gone_stops_waiting_for_the_token(self) -> None:
+        # On 2026-10-20 a test killed a call's group and left its step, in a
+        # group of its own, trying for the token for 45 h. The step gives the
+        # token back for its memory wait, a peer takes it, and the call is
+        # killed while its step waits for the token again.
+        board = self.root / "board"
+        waiting = self.root / "waiting-for-token"
+        meminfo = Path(self.environment["BUILDLOG_MEMINFO"])
+        _ = meminfo.write_text("MemAvailable: 0 kB\n")
+        real_sleep = shutil.which("sleep")
+        if real_sleep is None:
+            self.fail("the token wait test needs sleep on PATH")
+        sleep = self.root / "stubs" / "sleep"
+        _ = sleep.write_text("#!/bin/sh\n"
+                             + 'if [ "$1" = 3 ] && [ -n "${TEST_WAITING:-}" ]; then : > "$TEST_WAITING"; fi\n'
+                             + 'exec "$TEST_REAL_SLEEP" "$@"\n')
+        sleep.chmod(0o755)
+        environment = {**self.environment, "PLAN_DELEGATE_BOARD_DIR": str(board),
+                       "PLAN_DELEGATE_TEAM_ROLE": "impl", "BUILDLOG_MEM_POLL_S": "1",
+                       "TEST_REAL_SLEEP": real_sleep, "TEST_WAITING": str(waiting)}
+        output = self.root / "waiter.out"
+        call = self.start_memory_waiter(environment, output)
+        peer = subprocess.Popen([real_sleep, "600"], start_new_session=True)
+        self.started_groups.add(peer.pid)
+        self.addCleanup(peer.wait, 300)
+        taken = subprocess.run(["bash", str(BOARD), "acquire", str(board), "peer", "cargo", "--pid", str(peer.pid),
+                                "--hold", "3600", "--wait", "0"],
+                               capture_output=True, text=True, check=False, timeout=300)
+        self.assertEqual(taken.returncode, 0, taken.stderr)
+        _ = meminfo.write_text("MemAvailable: 50331648 kB\n")
+        self.wait_for_running(waiting, call)
+        os.kill(call.pid, signal.SIGKILL)
+        _ = call.wait(timeout=300)
+        deadline = time.monotonic() + 60
+        while (left := self.live_group_processes(call.pid)) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(left, [], output.read_text(errors="replace"))
+        self.assertIn("the call that started this step is gone", output.read_text(errors="replace"))
+
     def test_a_token_wait_does_not_start_a_new_memory_wait_limit(self) -> None:
         # On 2026-10-21 a step waited 15 min for memory, 24 min for the token,
         # then 15 min for memory again. The forced start counts the step's
@@ -790,6 +850,65 @@ exec "$TEST_REAL_SLEEP" "$@"
         last_token = len(lines) - 1 - lines[::-1].index("token")
         self.assertIn("sleep 1", lines[:last_token], "the first memory wait polls until its limit")
         self.assertNotIn("sleep 1", lines[last_token:], "the pass after the token wait started a new limit")
+
+    def build_stub(self, targets: list[dict[str, object]]) -> dict[str, str]:
+        """A cargo whose metadata lists `targets` for sample and whose build makes each bin and example."""
+        metadata = json.dumps({"packages": [{"name": "sample", "targets": targets, "features": {}}],
+                               "target_directory": str(self.root / "target")})
+        cargo = self.root / "stubs" / "cargo"
+        _ = cargo.write_text("#!/bin/sh\n"
+                             + 'if [ "$1" = metadata ]; then printf "%s\\n" "$TEST_METADATA"; exit 0; fi\n'
+                             + 'printf "%s\\n" "$*" >> "$CARGO_CALLS"\n'
+                             + 'profile=debug; kind=""\n'
+                             + 'for word in "$@"; do case "$word" in --release) profile=release ;; esac; done\n'
+                             + 'for word in "$@"; do\n'
+                             + '    case "$kind" in\n'
+                             + '        bin) mkdir -p "$CARGO_TARGET_DIR/$profile"; : > "$CARGO_TARGET_DIR/$profile/$word"; chmod +x "$CARGO_TARGET_DIR/$profile/$word" ;;\n'
+                             + '        example) mkdir -p "$CARGO_TARGET_DIR/$profile/examples"; : > "$CARGO_TARGET_DIR/$profile/examples/$word"; chmod +x "$CARGO_TARGET_DIR/$profile/examples/$word" ;;\n'
+                             + '    esac\n'
+                             + '    case "$word" in --bin) kind=bin ;; --example) kind=example ;; *) kind="" ;; esac\n'
+                             + 'done\n')
+        return {**self.environment, "TEST_METADATA": metadata,
+                "PLAN_DELEGATE_BOARD_DIR": str(self.root / "board"), "PLAN_DELEGATE_TEAM_ROLE": "impl"}
+
+    def build(self, environment: dict[str, str], *words: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["bash", str(VERIFY), "build", "sample", *words], cwd=self.root, env=environment,
+                              capture_output=True, text=True, check=False, timeout=300)
+
+    def test_build_makes_the_packages_binaries_under_the_token_and_prints_their_paths(self) -> None:
+        # A smoke or live-shot helper ran raw `cargo build` before it launched
+        # the app, and the user approved it by hand (2026-10-23).
+        environment = self.build_stub([{"name": "sample", "kind": ["lib"]},
+                                       {"name": "sample-app", "kind": ["bin"]},
+                                       {"name": "demo", "kind": ["example"]}])
+        result = self.build(environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"binary: {self.root / 'target' / 'debug' / 'sample-app'}\n", result.stdout)
+        self.assertNotIn("demo", result.stdout)
+        self.assertEqual((self.root / "cargo-calls").read_text(), "build --workspace --bin sample-app\n")
+        self.assertIn("claim: token cargo acquired", (self.root / "board" / "board.log").read_text())
+        self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
+
+    def test_build_of_an_example_turns_on_its_required_features(self) -> None:
+        environment = self.build_stub([{"name": "sample-app", "kind": ["bin"]},
+                                       {"name": "demo", "kind": ["example"], "required-features": ["extra"]}])
+        result = self.build(environment, "--example", "demo", "--release", "--features", "fast")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.root / "cargo-calls").read_text(),
+                         "build --workspace --example demo --release --features sample/fast,sample/extra\n")
+        self.assertIn(f"binary: {self.root / 'target' / 'release' / 'examples' / 'demo'}\n", result.stdout)
+
+    def test_build_refuses_a_package_with_no_binary_and_a_target_it_lacks(self) -> None:
+        environment = self.build_stub([{"name": "sample", "kind": ["lib"]}])
+        result = self.build(environment)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("package sample has no binary; name an example with --example <name>", result.stderr)
+        result = self.build(environment, "--bin", "other")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("package sample has no bin other", result.stderr)
+        result = self.build(environment, "--bin", "a", "--example", "b")
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((self.root / "cargo-calls").exists())
 
     def hold_environment(self, board: Path, wait_status: int) -> dict[str, str]:
         """A held natedev for the step's hold wait only.

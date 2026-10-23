@@ -3,11 +3,12 @@
 
 While silence is on, pushover.py keeps each push here instead of posting it. A priority 2
 (blocked) push always goes out: power and UPS alerts are safety. `off` ends silence and posts
-the kept pushes, oldest first, as they would have gone out, and prints how many. `on` with no
-end lasts until `off`; --until (a time in the user's zone, user_zone.py) or --for (a span: 1h,
-45min, 1h30min) makes a transient systemd user timer that runs `off` then. `on` again replaces
-the end. If the end passes without the timer (natedev was off), the next push or silence.py call
-ends silence as `off` does.
+the kept pushes, oldest first, as they would have gone out, and prints how many. A kept push
+with the same non-empty key from the same source replaces the older kept one, so `off` posts
+only the newest. `on` with no end lasts until `off`; --until (a time in the user's zone,
+user_zone.py) or --for (a span: 1h, 45min, 1h30min) makes a transient systemd user timer that
+runs `off` then. `on` again replaces the end. If the end passes without the timer (natedev was
+off), the next push or silence.py call ends silence as `off` does.
 
 auto_silence.py turns silence on with the auto marker when the user is idle, and ends only that
 silence when they come back; `on` replaces the marker, so a silence set by hand stays until `off`.
@@ -66,6 +67,7 @@ class KeptPush(TypedDict):
     title: str
     message: str
     detail: str
+    key: str
 
 
 @dataclass(frozen=True)
@@ -142,7 +144,8 @@ def parse_push(text: str) -> KeptPush | None:
     if not isinstance(value, dict):
         return None
     record = cast(dict[str, object], value)
-    found = {key: record.get(key) for key in KeptPush.__annotations__}
+    # A line kept before pushes had a key reads as key "".
+    found = {name: record.get(name) for name in KeptPush.__annotations__} | {"key": record.get("key", "")}
     if not all(isinstance(item, str) for item in found.values()):
         return None
     return cast(KeptPush, cast(object, found))
@@ -194,6 +197,12 @@ def keep_here(push: KeptPush, runner: Run | None = None, deliver: Deliver | None
         record = read_state()
         if record is None or past_end(record):
             return NotSilent()
+        older = read_kept() if push["key"] else []
+        newer = [old for old in older if (old["source"], old["key"]) != (push["source"], push["key"])]
+        if len(newer) != len(older):
+            temporary = kept_file().with_suffix(".tmp")
+            _ = temporary.write_text("".join(json.dumps(old) + "\n" for old in newer), encoding="utf-8")
+            _ = temporary.replace(kept_file())
         with kept_file().open("a", encoding="utf-8") as out:
             _ = out.write(json.dumps(push) + "\n")
         return Kept(ends(record))

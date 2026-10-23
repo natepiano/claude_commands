@@ -7,32 +7,48 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Approve: messaging goes on now, but the same command can stop it again later.",
+          "quote": "Approve: it goes on now, but this command can stop it again.",
           "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "Auto mode refused 1 command in messaging.",
+          "quote": "Refused: git push origin build-followups-messaging",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Refused: git push origin build-followups-messaging",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Refused: git push origin build-followups-messaging\nThe merge of that work waits for it.",
+          "rule": "first-150-stand-alone"
         }
       ],
-      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
-      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
-      "time": "2026-10-21T07:45:14.877215-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): 'i don't know what is the command that failed - this is still too verbose'. Each refused command is named and the prose is cut; the title and the Approve then Allow rule order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "fab1360d2a53ef4c3ccde57b8ed617e1e572de49c7f63d634a444dd05820bc88",
+      "time": "2026-10-23T09:30:40.307302-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style: auto mode stopped types",
+          "quote": "cargo-liner-style: auto mode stopped modules",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Approve: types goes on now, but the same commands can stop it again later.\n\nAllow rule: types goes on now and never stops on these commands again.",
+          "quote": "The P542 build waits for them.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Allow rule: it never stops on these commands again.",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Refused:",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
-      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
-      "time": "2026-10-21T07:45:03.336113-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): 'i don't know what is the command that failed - this is still too verbose'. Each refused command is named and the prose is cut; the title and the Approve then Allow rule order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "fab1360d2a53ef4c3ccde57b8ed617e1e572de49c7f63d634a444dd05820bc88",
+      "time": "2026-10-23T09:30:22.441144-04:00"
     }
   },
   "codex.reset_ready": {
@@ -104,6 +120,98 @@
       "reviewer": "opus",
       "sha256": "3e213a81f576f5cd5314a5d24f755ba59015d9d5f9a7e80d76d55e82f858f11e",
       "time": "2026-10-14T04:27:02.640947-04:00"
+    }
+  },
+  "permission.rca_fixed": {
+    "two_commands": {
+      "objections": [
+        {
+          "quote": "Fix: the work order uses the allowed launcher call (a73d0f18).",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "Cause: a work order told the seat to run the launchers directly.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "cargo-liner-style: fixed why modules stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Cause: a work order told the seat to run the launchers directly.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
+      "sha256": "5ca6396ff857332c7bbec7a5d91c0cd0502044bbb93a776e2a72d9c8dcee84f9",
+      "time": "2026-10-23T09:52:22.171287-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "Cause: a helper ran a raw cargo build.\nFix: the builds unit added a verify.sh build verb (5e2b9c41).",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "cargo-liner: fixed why handler stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "the builds unit added a verify.sh build verb (5e2b9c41)",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Fix: the builds unit added a verify.sh build verb (5e2b9c41).",
+          "rule": "before-and-after"
+        },
+        {
+          "quote": "Cause: a helper ran a raw cargo build.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
+      "sha256": "5ca6396ff857332c7bbec7a5d91c0cd0502044bbb93a776e2a72d9c8dcee84f9",
+      "time": "2026-10-23T09:52:10.889466-04:00"
+    }
+  },
+  "permission.rca_started": {
+    "two_commands": {
+      "objections": [
+        {
+          "quote": "The style unit finds why modules asked for implement.sh --to modules-impl and review.sh --to modules-test and fixes the source. A second push comes when it is fixed.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "cargo-liner-style: fixing why modules stops",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "implement.sh --to modules-impl and review.sh --to modules-test",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
+      "sha256": "250fdb0653693ff195ae1411cccd28ccbd81190de97adaa62a7d9da57def932b",
+      "time": "2026-10-23T09:51:57.218924-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "The builds unit finds why handler asked for cargo build -p cargo-handler and fixes the source. A second push comes when it is fixed.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "why handler asked for cargo build -p cargo-handler",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "cargo-liner: fixing why handler stops",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
+      "sha256": "250fdb0653693ff195ae1411cccd28ccbd81190de97adaa62a7d9da57def932b",
+      "time": "2026-10-23T09:51:43.982536-04:00"
     }
   },
   "quota.claude_next_move": {
@@ -676,36 +784,48 @@
     "edit": {
       "objections": [
         {
-          "quote": "herdr-panes needs your answer",
+          "quote": "messaging needs your answer",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "wants to edit panes.py",
+          "quote": "messaging asks to edit send.py.",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "messaging asks to edit send.py.",
+          "rule": "before-and-after"
+        },
+        {
+          "quote": "Yes: it does that and goes on.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "messaging asks to edit send.py. It has waited since 06:05 AST.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
-      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
-      "time": "2026-10-21T18:07:26.466772-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
+      "time": "2026-10-23T09:51:09.284207-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style-types needs your answer",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Yes: the session does that and goes on with its work.",
+          "quote": "Yes: it does that and goes on.",
           "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "Session: cargo-liner-style-types\nAction: On natedev, open the cargo-liner-style-types herdr tab and answer its prompt\nThe Claude coding session cargo-liner-style-types on natedev wants to delete its own saved tool output, b1e4yc8b9.txt. The file is outside its allowed folders, so it needs your permission. It has waited since 10:54 EDT and does no work until you answer.\n\nYes (recommended): the session deletes its own file and goes on with its work.\n\nNo: the session keeps the file and asks you what to do instead.",
-          "rule": "push-body-under-500"
+          "quote": "handler needs your answer",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "It has waited since 09:01 AST.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
-      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
-      "time": "2026-10-21T18:07:13.543700-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
+      "time": "2026-10-23T09:50:57.721466-04:00"
     }
   },
   "sweep.disk_floor": {

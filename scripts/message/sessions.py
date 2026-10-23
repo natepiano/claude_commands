@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find a live Claude session's socket, `SendMessage` address or session ID."""
+"""Find a live Claude session's socket, `SendMessage` address, session ID or transcript."""
 
 from __future__ import annotations
 
@@ -242,6 +242,20 @@ def addressed(to: str, records: list[SessionRecord]) -> SessionRecord | None:
         return now
     once = [record for record in records if to in record["formerNames"]]
     return once[0] if len(once) == 1 else None
+
+
+def named(name: str, records: list[SessionRecord]) -> SessionRecord | None:
+    """The live session a session name or unit id means, as `addressed` finds it: "handler-unit" and
+    "handler" each find the session named either way."""
+    bare = name.removesuffix("-unit")
+    return next((found for candidate in dict.fromkeys((name, bare, f"{bare}-unit"))
+                 if (found := addressed(candidate, records)) is not None), None)
+
+
+def latest_transcript(session_id: str, projects: Path) -> Path | None:
+    """The session's transcript under the Claude projects folder: the newest one, when a resume left several."""
+    transcripts = sorted(projects.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
+    return transcripts[-1] if transcripts else None
 
 
 def main(argv: list[str]) -> int:

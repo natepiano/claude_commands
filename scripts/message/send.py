@@ -16,7 +16,8 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
   send.py retire --to ADDRESS --from SENDER --key KEY
-                          remove obsolete queued messages for ADDRESS
+                          remove obsolete queued messages for ADDRESS; for --to user,
+                          also stop the emergency push sent with KEY (see below)
 
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
@@ -40,7 +41,8 @@ it reaches them is `user()`'s business: no caller names the channel.
 `--key` names a message. With `--repeat-minutes`, a send with the same key to the
 same recipient inside the window is skipped; `ack` skips every later send with
 the key until `reopen`. The window counts from the last attempt, delivered or
-not, as the queue keeps what did not arrive.
+not, as the queue keeps what did not arrive. While the user's silence is on, a
+kept push with the same key from the same sender replaces the older kept one.
 
 (user, 2026-10-05) Outcomes have a header followed by any payload lines and are logged with the full
 message text as one JSON line in STATE/log.jsonl:
@@ -61,6 +63,11 @@ message text as one JSON line in STATE/log.jsonl:
         the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits
         (quota.paid_credits_queued when a workers move is queued) or session.needs_go call
         to send instead
+`retire --to user` first prints "retired N queued messages", then one line from
+pushover.py cancel, which stops the emergency (--need blocked) push sent with KEY:
+  cancelled: the emergency push for KEY stopped                 exit 0
+  nothing to cancel: no emergency push for KEY is repeating      exit 0
+  FAILED: the emergency push for KEY may still repeat: why       exit 3
 Usage errors, an unreadable --file and an empty message exit 2. STATE is $XDG_STATE_HOME/message, or ~/.local/state/message.
 """
 
@@ -97,12 +104,13 @@ if TYPE_CHECKING:
     from ..accounts import accounts
     from ..whoami.account import named_account_environment
 import push_texts  # noqa: E402
+import rca  # noqa: E402
 import review  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
-                         UserAction, NoActionRequired, first_line, parse_user_action,
-                         SessionLine, split_session, session_prefix)  # noqa: E402
+                         UserAction, NoActionRequired, action_conflicts, first_line, named_places, parse_user_action,
+                         SessionLine, split_session, session_prefix, typed_texts)  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message"
 CLAUDE = Path.home() / ".local" / "bin" / "claude"
@@ -115,9 +123,12 @@ REMOTE = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/message/send.py"
 MODEL = "sonnet"
 AUTO_MODE_TEXT = "auto_mode.refused"
 AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id auto_mode.refused'
-                  + ' --value session=<session> --value machine=<machine> --value count=<number of commands>'
-                  + ' --value "does=<what they do; the verb agrees with count>" --value "waits=<a sentence: what waits>"'
+                  + ' --value session=<session> --value machine=<machine>'
+                  + ' --value "command=<a refused command, short: the program and its key arguments>"'
+                  + ' [one --value command=... for each] --value "waits=<a sentence: what waits; no instruction>"'
                   + ' [--value "rule=<the allow rule>"]')
+# The push shows a longer refused command cut to its first 89 characters and "…".
+REFUSED_COMMAND_LENGTH = 90
 PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
@@ -146,16 +157,25 @@ SESSION_TEMPLATES = {
     PAID_CREDITS_QUEUED_TEXT: ("an account now spends paid credits and the user queued a workers move; workers wait for"
                                + " the move, never go to Claude. " + PAID_CREDITS_QUEUED_CALL),
     NEEDS_GO_TEXT: "a session is stopped until the user types a go in its pane. " + NEEDS_GO_CALL,
+    rca.STARTED_TEXT: ("a unit starts to fix why a session stopped for a permission. Sent by rca.py start;"
+                       + " sessions run rca.py, not this: " + rca.CALL + " start <id> --owner <unit>"),
+    rca.FIXED_TEXT: ("the fix merged and the session does not stop for that permission again. Sent by rca.py fixed;"
+                     + " sessions run rca.py, not this: " + rca.CALL
+                     + ' fixed <id> --cause "<cause>" --fix "<fix>" --commit <sha>'),
     "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
 AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
+# The rca.py pushes tell of a session that stopped, and a cause can say auto mode refused a command.
+RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
 # One relay took 9 s when measured; quota_alert.py's budget is built on this.
 TIMEOUT = 40
 KILL_GRACE = 10
+# Above pushover.TIMEOUT_S, so Pushover's own timeout reports first.
+USER_CANCEL_TIMEOUT = 30
 
 Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept"]
 Need = Literal["note", "decision", "blocked"]
@@ -435,6 +455,8 @@ class Options(NamedTuple):
     answerable: bool = False
     text_id: str = ""
     values: tuple[str, ...] = ()
+    # The auto_mode.refused commands as given: rca.py opens its case with them.
+    commands: tuple[str, ...] = ()
 
     @property
     def to(self) -> str:
@@ -621,6 +643,18 @@ def retire(to: str, sender: str, key: str) -> int:
             _rewrite_queue(path, kept)
             removed += len(entries) - len(kept)
     return removed
+
+
+def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
+    """Stop the user's emergency push sent with key, through the same channel user() sends on."""
+    code, out, err = run([sys.executable, str(USER_CHANNEL), "cancel", "--source", sender, key], "",
+                         USER_CANCEL_TIMEOUT)
+    if code == 0 and "pushover: nothing to cancel" in out:
+        return 0, f"nothing to cancel: no emergency push for {key} is repeating"
+    if code == 0:
+        return 0, f"cancelled: the emergency push for {key} stopped"
+    why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
+    return EXIT["failed"], f"FAILED: the emergency push for {key} may still repeat: {why}"
 
 
 def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE_ROUTE) -> None:
@@ -1035,10 +1069,11 @@ def reviewed_failure(stdout: str, original: FailedPush, *,
 
 def user(message: Message, need: Need, action: UserAction, timeout: float, *, answerable: bool = False, text_id: str = "", values: tuple[str, ...] = ()) -> Result:
     """Reach the user. The channel is this function's business alone."""
-    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender,
+    key = ["--key", message.key] if message.key else []
+    command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
                *(["--answerable"] if answerable else []), *action_arguments(action), message.summary, message.text]
     if text_id:
-        command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender,
+        command = [sys.executable, str(USER_CHANNEL), "--priority", CHANNEL_PRIORITY[need], "--source", message.sender, *key,
                    "--text-id", text_id]
         for value in values:
             command.extend(["--value", value])
@@ -1233,24 +1268,32 @@ def default_sender() -> str:
     return f"send.py in {name}" if name else "send.py"
 
 
-def auto_mode_values(values: dict[str, str], sender: str) -> dict[str, str]:
-    """The auto_mode.refused values: the session gives the facts, this fills the sender and the grammar."""
+def auto_mode_values(values: dict[str, str], commands: list[str], sender: str) -> dict[str, str]:
+    """The auto_mode.refused values: the session gives the facts and each refused command, in order.
+    This fills the sender and the grammar, and shows the commands on the Refused line."""
     if not sender:
         raise ValueError(AUTO_MODE_TEXT + " is sent by a Claude session: its sender is that session's name,"
                          + " and this run has no session record")
     given = set(values)
-    required = {"session", "machine", "count", "does", "waits"}
+    required = {"session", "machine", "waits"}
     if not required <= given or not given <= required | {"rule"}:
-        raise ValueError(AUTO_MODE_TEXT + " takes --value session, machine, count, does, waits and an optional rule;"
+        raise ValueError(AUTO_MODE_TEXT + " takes --value session, machine, command, waits and an optional rule;"
                          + f" missing {sorted(required - given)}; extra {sorted(given - required - {'rule'})}")
-    count = values["count"]
-    if not count.isdigit() or int(count) < 1:
-        raise ValueError(AUTO_MODE_TEXT + ": count is the number of refused commands, 1 or more")
-    one = int(count) == 1
+    shown = [command.strip() for command in commands]
+    if not shown or not all(shown):
+        raise ValueError(AUTO_MODE_TEXT + ": give each refused command as its own --value command=..., none empty")
+    shown = [command if len(command) <= REFUSED_COMMAND_LENGTH else command[:REFUSED_COMMAND_LENGTH - 1] + "…"
+             for command in shown]
+    waits = values["waits"].strip().rstrip(".")
+    if typed_texts(waits) or named_places(waits):
+        raise ValueError(AUTO_MODE_TEXT + ": waits says only what waits; it tells the user to type nothing"
+                         + " and names no pane or session. The Action line says what the user does")
+    one = len(shown) == 1
     rule = values.get("rule", "").strip()
-    return {"sender": sender, "session": values["session"], "machine": values["machine"], "count": str(int(count)),
-            "noun": "command" if one else "commands", "they": "It" if one else "They", "this": "this" if one else "these",
-            "does": values["does"], "waits": values["waits"], "rule_line": " The rule: " + rule if rule else ""}
+    return {"sender": sender, "session": values["session"], "machine": values["machine"],
+            "refused": " " + shown[0] if one else "\n" + "\n".join(shown),
+            "noun": "command" if one else "commands", "this": "this" if one else "these",
+            "waits": waits, "rule_line": " The rule: " + rule if rule else ""}
 
 
 def paid_credits_values(text_id: str, values: dict[str, str], session: str, named: str | None) -> dict[str, str]:
@@ -1278,11 +1321,17 @@ def reports_auto_mode_refusal(text: str) -> bool:
     return AUTO_MODE_REPORT.search(text) is not None and AUTO_MODE_REFUSAL.search(text) is not None
 
 
+def refusal_report(options: Options) -> rca.Report:
+    """The facts of an auto_mode.refused push: rca.py opens a case for the stopped session with them."""
+    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    return rca.Report(values["session"], values["machine"], "auto_mode", options.commands)
+
+
 def wrong_template(options: Options, shown: str) -> str | None:
     """The hold detail when a user push tells in free text what a registered template carries, else None."""
     if options.to != USER:
         return None
-    if options.text_id != AUTO_MODE_TEXT and reports_auto_mode_refusal(shown):
+    if options.text_id != AUTO_MODE_TEXT and options.text_id not in RCA_TEXTS and reports_auto_mode_refusal(shown):
         return AUTO_MODE_HELD
     if not options.text_id and PAID_CREDITS_REPORT.search(shown) is not None:
         return PAID_CREDITS_HELD
@@ -1332,7 +1381,8 @@ def parse(argv: list[str]) -> Options:
                             help="to `user`: what they must do (default note: nothing)")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
-    _ = parser.add_argument("--key", help="names the message for --repeat-minutes, ack and the queue")
+    _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
+                                           + " the user replaces an older kept one with this key from the same sender"))
     _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
     location = parser.add_mutually_exclusive_group()
     _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
@@ -1347,6 +1397,8 @@ def parse(argv: list[str]) -> Options:
     to = as_str(attr(args, "to"))
     text_id = as_str(attr(args, "text_id"))
     raw_values = cast(list[str], attr(args, "value"))
+    # Only auto_mode.refused repeats a key: one command value for each refused command.
+    commands: list[str] = []
     if text_id:
         if to != USER:
             parser.error("--text-id goes with --to user")
@@ -1354,6 +1406,9 @@ def parse(argv: list[str]) -> Options:
         values: dict[str, str] = {}
         for value in raw_values:
             key, separator, item = value.partition("=")
+            if separator and key == "command" and text_id == AUTO_MODE_TEXT:
+                commands.append(item)
+                continue
             if not separator or key in values:
                 parser.error("--value needs distinct key=value pairs")
             values[key] = item
@@ -1361,13 +1416,18 @@ def parse(argv: list[str]) -> Options:
             if text_id in (AUTO_MODE_TEXT, NEEDS_GO_TEXT):
                 if attr(args, "sender") is not None or attr(args, "machine") is not None:
                     parser.error(text_id + " takes no --from or --machine: it goes from this session's own name and machine")
-                fill = auto_mode_values if text_id == AUTO_MODE_TEXT else needs_go_values
-                values = fill(values, own_session_name())
+                sender = own_session_name()
+                values = (auto_mode_values(values, commands, sender) if text_id == AUTO_MODE_TEXT
+                          else needs_go_values(values, sender))
                 raw_values = [f"{key}={item}" for key, item in values.items()]
             elif text_id in (PAID_CREDITS_TEXT, PAID_CREDITS_QUEUED_TEXT):
                 values = paid_credits_values(text_id, values, own_session_name(), optional_str(attr(args, "sender")))
                 raw_values = [f"{key}={item}" for key, item in values.items()]
             rendered = push_texts.render(text_id, **values)
+            # A value must not give a second action: the Action line is the one thing the user does.
+            conflicts = action_conflicts(rendered.action, rendered.body)
+            if conflicts:
+                raise ValueError(text_id + " gives a second action: " + "; ".join(conflicts))
         except ValueError as error:
             parser.error(str(error))
         args.summary, args.text = rendered.title, session_prefix(rendered.session) + rendered.body
@@ -1405,12 +1465,13 @@ def parse(argv: list[str]) -> Options:
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
-    get = {name: attr(args, name) for name in Options._fields if name not in {"action", "selection", "scope", "values"}}
+    get = {name: attr(args, name) for name in Options._fields if name not in {"action", "selection", "scope", "values", "commands"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
-                      file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values))
+                      file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values),
+                      commands=tuple(commands))
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -1505,6 +1566,8 @@ def send(options: Options) -> Result:
         if isinstance(options.action, NoUserRecipient):
             raise AssertionError("a user message must state its action")
         result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values)
+        if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
+            _ = rca.open_case(refusal_report(options))
     elif isinstance(route, CodexWorkerRecipient):
         transport = Message(
             route.name,
@@ -1575,6 +1638,10 @@ def main(argv: list[str]) -> int:
             request = parse_retire(arguments)
             removed = retire(request.to, request.sender, request.key)
             print(f"retired {removed} queued message{'s' if removed != 1 else ''}")
+            if request.to == USER:
+                code, line = cancel_user_push(request.sender, request.key)
+                print(line)
+                return code
         case ["ack", key]:
             print(acknowledge(key))
         case ["reopen", key]:

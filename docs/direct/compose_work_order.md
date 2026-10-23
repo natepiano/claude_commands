@@ -86,6 +86,12 @@ conversation with files, behavior, APIs, edges, and constraints. Point to files
 instead of copying their contents. Do not load style. Derive verification per
 <VerificationContract/>.
 
+Build the fallback prompt only from this unit's own Work Order, plan and
+conversation. Never read, copy or transform another unit's prompt files under
+`/tmp/claude/unit/*`: they are another session's state. When this unit's Work
+Order does not say what a build needs, send the gap to the showrunner for a
+production unit, or the user otherwise; do not borrow another unit's prompt.
+
 If an initial verbose invocation contains a bounded-auto control, resolve
 `AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before
 <CoordinatePhaseReservation/>. Otherwise

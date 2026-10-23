@@ -8,18 +8,17 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
-    # Stall-watch examples use unit names from production docs, and requests as stall_watch.prompt_request
-    # words them from a pending tool call and its permission prompt (the typical one is the 2026-10-21 push).
+    # Stall-watch examples are the real prompts of 2026-10-23: a Bash call reads "run <command>" (cut to 89
+    # characters and "…"), an edit "edit <file>", as stall_watch.prompt_request words them from the pending call.
     PushText("stall_watch.permission_prompt", "stall-watch", "blocked", "{unit} needs your answer",
         ActionTemplate("On {machine}, open the {unit} herdr tab and answer its prompt"),
-        "The Claude coding session {unit} on {machine} wants to {request}. It needs your permission first. "
-        + "It has waited since {since} and does no work until you answer.\n\n"
-        + "Yes: the session does that and goes on with its work.\n\n"
-        + "No: the session does not do that, and asks you what to do instead.",
-        (PushExample("typical", {"unit": "cargo-liner-style-types", "machine": "natedev", "since": "10:54 EDT",
-            "request": "delete its saved tool output b1e4yc8b9.txt, which is outside its allowed folders"}),
-         PushExample("edit", {"unit": "herdr-panes", "machine": "natedev", "since": "06:05 EDT",
-            "request": "edit panes.py"})),
+        "{unit} asks to {request}. It has waited since {since}.\n\n"
+        + "Yes: it does that and goes on.\n\n"
+        + "No: it does not, and asks you what to do instead.",
+        (PushExample("typical", {"unit": "handler", "machine": "natedev", "since": "09:01 AST",
+            "request": "run cargo build -p cargo-handler"}),
+         PushExample("edit", {"unit": "messaging", "machine": "natedev", "since": "06:05 AST",
+            "request": "edit send.py"})),
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
     PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
@@ -219,23 +218,44 @@ ENTRIES = (
         purpose="An update that an agent writes for you with /nate adhoc.",
         header=False),
     # Auto-mode refusal (user approved 2026-10-21): a session sends it with send.py --text-id auto_mode.refused.
-    # send.py fills sender from the session's own name, and noun, they, this and rule_line from count and rule.
+    # send.py fills sender from the session's own name, refused from the command values (one on the Refused
+    # line, or several one per line), noun and this from the number of commands, and rule_line from rule.
     PushText("auto_mode.refused", "{sender}", "decision", "{sender}: auto mode stopped {session}",
         ActionTemplate("On {machine}, in the {session} pane, approve the prompt or add an allow rule"),
-        "Auto mode refused {count} {noun} in {session}. {they} {does}. {waits}.\n\n"
-        + "Approve: {session} goes on now, but the same {noun} can stop it again later.\n\n"
-        + "Allow rule: {session} goes on now and never stops on {this} {noun} again.{rule_line}",
-        (PushExample("typical", {"sender": "cargo-liner-style", "session": "types", "machine": "natedev",
-            "count": "2", "noun": "commands", "they": "They", "this": "these",
-            "does": "save and merge one finished ticket",
-            "waits": "Three builds you approved wait for them", "rule_line": ""}),
+        "Refused:{refused}\n{waits}.\n\n"
+        + "Approve: it goes on now, but {this} {noun} can stop it again.\n\n"
+        + "Allow rule: it never stops on {this} {noun} again.{rule_line}",
+        (PushExample("typical", {"sender": "cargo-liner-style", "session": "modules", "machine": "natedev",
+            "refused": "\nimplement.sh --to modules-impl\nreview.sh --to modules-test",
+            "noun": "commands", "this": "these", "waits": "The P542 build waits for them", "rule_line": ""}),
          PushExample("one_with_rule", {"sender": "build-followups", "session": "messaging", "machine": "natedev",
-            "count": "1", "noun": "command", "they": "It", "this": "this",
-            "does": "pushes finished messaging work to GitHub",
-            "waits": "The merge of that work waits for it",
-            "rule_line": " The rule: Bash(git push:*)"})),
+            "refused": " git push origin build-followups-messaging", "noun": "command", "this": "this",
+            "waits": "The merge of that work waits for it", "rule_line": " The rule: Bash(git push:*)"})),
         purpose="Auto mode refused a session's commands, and the session waits for you.",
         session=SessionTemplate("{session}")),
+    # Permission root cause (user ask, 2026-10-23): rca.py sends these when the owner of a case starts it
+    # (`rca.py start`) and when its fix merges (`rca.py fixed`), with --key rca-<case id>. sender is the
+    # session's production, or messaging when it has none; commands is one command, "a and b" or "a, b and c".
+    # rca.py drops a final period from cause and fix. Examples: the handler and modules cases of 2026-10-23.
+    PushText("permission.rca_started", "{sender}", "note", "{sender}: fixing why {session} stops",
+        NoActionNeeded(),
+        "The {owner} unit finds why {session} asked for {commands} and fixes the source. "
+        + "A second push comes when it is fixed.",
+        (PushExample("typical", {"sender": "cargo-liner", "session": "handler", "owner": "builds",
+            "commands": "cargo build -p cargo-handler"}),
+         PushExample("two_commands", {"sender": "cargo-liner-style", "session": "modules", "owner": "style",
+            "commands": "implement.sh --to modules-impl and review.sh --to modules-test"})),
+        purpose="A unit starts to fix why a session stopped for a permission."),
+    PushText("permission.rca_fixed", "{sender}", "note", "{sender}: fixed why {session} stopped",
+        NoActionNeeded(),
+        "Cause: {cause}.\nFix: {fix} ({commit}).",
+        (PushExample("typical", {"sender": "cargo-liner", "session": "handler",
+            "cause": "a helper ran a raw cargo build", "fix": "the builds unit added a verify.sh build verb",
+            "commit": "5e2b9c41"}),
+         PushExample("two_commands", {"sender": "cargo-liner-style", "session": "modules",
+            "cause": "a work order told the seat to run the launchers directly",
+            "fix": "the work order uses the allowed launcher call", "commit": "a73d0f18"})),
+        purpose="The fix merged: the session does not stop for that permission again."),
     # Paid credits (user approved 2026-10-21): sent with send.py --text-id quota.paid_credits. send.py fills
     # sender from the session's own name; a script with no session record names itself with --from.
     # Examples: the codex2 values the user approved, and codex1 sent from the natedev session.

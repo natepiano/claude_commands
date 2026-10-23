@@ -287,6 +287,8 @@ The closed list:
   <WorkerLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
   refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (`send.py --help`),
   and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
+  An update to an earlier user push on the same subject reuses that push's `--key`,
+  so silence keeps only the newest.
 - **done** — <RunSummary/> has been emitted.
 
 Nothing else authorizes a turn end, however complete it feels:
@@ -979,9 +981,13 @@ phase holds its dispatch on them. An id the ledger does not know is refused.
 A claim behind a holder you already sequenced against reuses that edge and
 adds the paths; only `cargo-berth sequence` still refuses a duplicate edge
 (exit 2). When several holders
-conflict, name every one in the same claim, one flag each: `--before`,
-`--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
-claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.
+conflict, name every one in the same claim, one flag each: `--before` and
+`--after` repeat once per holder and mix, as in `cargo-berth claim <paths>
+--reservation <id> --before <A> --after <B> --overlap-why "<why>"`. `--defer`
+repeats once per holder but excludes `--before`, `--after` and `--override`:
+a defer takes no paths, so it cannot share a claim that widens. To defer to
+one holder and order behind another, claim with `--defer` first, then claim
+the paths with `--before`/`--after` when the deferred holder ends.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
@@ -1305,9 +1311,21 @@ worker report is not a smoke test.
 
 Launch the real product from `${WORKING_DIR}` with useful logging/backtraces,
 exercise the changed runtime behavior, observe stability, close cleanly, and
-record command/action/result. The launch compiles its own target — never run a
-build, `check`, or `test` pass first to prove it builds. Startup alone suffices only when no changed
+record command/action/result. Never run a `check` or `test` pass first to prove
+it builds. Startup alone suffices only when no changed
 behavior can be invoked. A pass continues to <UXReview/>.
+
+A launch that needs a built binary — a smoke or shot helper's, or a launcher
+that takes a path — builds it with this one line, then starts the
+`binary: <path>` it prints:
+
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build <package> [--bin <name> | --example <name>]`
+
+It waits for a build hold, takes the cargo token and memory admission, and
+records the build, and its allow rule needs no approval. You and every helper
+never run raw cargo (`cargo build`, `cargo run`): a helper's raw `cargo build`
+needed the user's approval by hand (2026-10-23). Copy the line into every smoke
+or shot helper prompt.
 
 A panic, fatal log, unexpected exit, or wrong behavior is a blocker: route it
 through <Synthesize/>, then repeat review, synthesis, and smoke before later
