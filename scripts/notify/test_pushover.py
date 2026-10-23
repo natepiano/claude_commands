@@ -649,6 +649,14 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
         self.assertEqual(self.log_lines()[-1]["outcome"], "kept: silence until off")
 
+    def test_key_reaches_the_kept_push_and_a_newer_push_with_it_replaces_the_older(self) -> None:
+        self.silence_on()
+        with redirect_stdout(io.StringIO()):
+            for title in ("Old note", "New note"):
+                code, _form = self.run_send(["--source", "hana", "--key", "subject", "--no-action", title, f"{title} body."])
+                self.assertEqual(code, 0)
+        self.assertEqual([(push["title"], push["key"]) for push in silence.read_kept()], [("New note", "subject")])
+
     def test_silence_never_keeps_a_blocked_push(self) -> None:
         self.silence_on()
         with redirect_stdout(io.StringIO()):

@@ -219,21 +219,19 @@ ENTRIES = (
         purpose="An update that an agent writes for you with /nate adhoc.",
         header=False),
     # Auto-mode refusal (user approved 2026-10-21): a session sends it with send.py --text-id auto_mode.refused.
-    # send.py fills sender from the session's own name, and noun, they, this and rule_line from count and rule.
+    # send.py fills sender from the session's own name, refused from the command values (one on the Refused
+    # line, or several one per line), noun and this from the number of commands, and rule_line from rule.
     PushText("auto_mode.refused", "{sender}", "decision", "{sender}: auto mode stopped {session}",
         ActionTemplate("On {machine}, in the {session} pane, approve the prompt or add an allow rule"),
-        "Auto mode refused {count} {noun} in {session}. {they} {does}. {waits}.\n\n"
-        + "Approve: {session} goes on now, but the same {noun} can stop it again later.\n\n"
-        + "Allow rule: {session} goes on now and never stops on {this} {noun} again.{rule_line}",
-        (PushExample("typical", {"sender": "cargo-liner-style", "session": "types", "machine": "natedev",
-            "count": "2", "noun": "commands", "they": "They", "this": "these",
-            "does": "save and merge one finished ticket",
-            "waits": "Three builds you approved wait for them", "rule_line": ""}),
+        "Refused:{refused}\n{waits}.\n\n"
+        + "Approve: it goes on now, but {this} {noun} can stop it again.\n\n"
+        + "Allow rule: it never stops on {this} {noun} again.{rule_line}",
+        (PushExample("typical", {"sender": "cargo-liner-style", "session": "modules", "machine": "natedev",
+            "refused": "\nimplement.sh --to modules-impl\nreview.sh --to modules-test",
+            "noun": "commands", "this": "these", "waits": "The P542 build waits for them", "rule_line": ""}),
          PushExample("one_with_rule", {"sender": "build-followups", "session": "messaging", "machine": "natedev",
-            "count": "1", "noun": "command", "they": "It", "this": "this",
-            "does": "pushes finished messaging work to GitHub",
-            "waits": "The merge of that work waits for it",
-            "rule_line": " The rule: Bash(git push:*)"})),
+            "refused": " git push origin build-followups-messaging", "noun": "command", "this": "this",
+            "waits": "The merge of that work waits for it", "rule_line": " The rule: Bash(git push:*)"})),
         purpose="Auto mode refused a session's commands, and the session waits for you.",
         session=SessionTemplate("{session}")),
     # Paid credits (user approved 2026-10-21): sent with send.py --text-id quota.paid_credits. send.py fills

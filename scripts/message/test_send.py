@@ -1221,6 +1221,18 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(result.outcome, "sent")
         self.assertIn("session unavailable", (self.root / "notify/template-fix-errors.jsonl").read_text())
 
+    def test_user_passes_the_key_to_the_channel_in_both_forms(self) -> None:
+        for key, text_id in ((None, ""), ("subject", ""), ("subject", "quota")):
+            message = send.Message("user", "hana", "Build done", "The build passed.", key)
+            with mock.patch.object(send, "run", return_value=(0, "", "")) as run:
+                _ = send.user(message, "note", NoActionRequired(), 145, text_id=text_id)
+            command = cast(list[str], run.call_args.args[0])
+            if key is None:
+                self.assertNotIn("--key", command)
+            else:
+                self.assertEqual(command[command.index("--key") + 1], key)
+                self.assertLess(command.index("--key"), command.index("--text-id" if text_id else "--no-action"))
+
     def test_busy_notice_claim_does_not_wait_or_change_successful_push_delivery(self) -> None:
         record: dict[str, object] = {"text_id": "quota", "sent_despite_failed_review": True}
         directory = review.state_path() / "template-fixes"
@@ -1366,25 +1378,30 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def failure_marker(self) -> Path:
         return self.root / "notify/failed/writer-id.json"
 
-    def auto_mode_arguments(self, *extra: str, **changed: str) -> list[str]:
-        values = {"session": "types", "machine": "natedev", "count": "2", "does": "save and merge one finished ticket",
-                  "waits": "Three builds you approved wait for them"} | changed
+    def auto_mode_arguments(self, *extra: str, commands: tuple[str, ...] = ("implement.sh --to modules-impl",
+                            "review.sh --to modules-test"), **changed: str) -> list[str]:
+        values = {"session": "modules", "machine": "natedev", "waits": "The P542 build waits for them"} | changed
         return ["--to", "user", "--text-id", "auto_mode.refused",
-                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")), *extra]
+                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")),
+                *(item for command in commands for item in ("--value", f"command={command}")), *extra]
 
-    def test_auto_mode_template_takes_its_sender_from_this_session_and_fills_the_grammar(self) -> None:
+    def test_auto_mode_template_takes_its_sender_from_this_session_and_shows_each_refused_command(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-style"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
         options = local_options(self.auto_mode_arguments())
-        self.assertEqual(options.summary, "cargo-liner-style: auto mode stopped types")
+        self.assertEqual(options.summary, "cargo-liner-style: auto mode stopped modules")
         self.assertEqual(options.sender, "cargo-liner-style")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=cargo-liner-style", options.values)
         self.assertIn("rule_line=", options.values)
-        self.assertIn("Auto mode refused 2 commands in types. They save", options.text or "")
-        one = local_options(self.auto_mode_arguments(count="1", does="pushes the work", waits="The merge waits for it",
-                                                     rule="Bash(git push:*)"))
-        self.assertIn("refused 1 command in types. It pushes the work.", one.text or "")
+        self.assertIn("Refused:\nimplement.sh --to modules-impl\nreview.sh --to modules-test\n"
+                      + "The P542 build waits for them.\n\nApprove: it goes on now, but these commands can stop it again.",
+                      options.text or "")
+        self.assertTrue((options.text or "").endswith("Allow rule: it never stops on these commands again."))
+        one = local_options(self.auto_mode_arguments(commands=("git push origin build-followups-messaging",),
+                                                     waits="The merge waits for it.", rule="Bash(git push:*)"))
+        self.assertIn("Refused: git push origin build-followups-messaging\nThe merge waits for it.\n\n"
+                      + "Approve: it goes on now, but this command can stop it again.", one.text or "")
         self.assertTrue((one.text or "").endswith("never stops on this command again. The rule: Bash(git push:*)"))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
@@ -1392,24 +1409,57 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(command[command.index("--text-id") + 1], "auto_mode.refused")
         self.assertIn("sender=cargo-liner-style", command)
         for arguments in (self.auto_mode_arguments("--value", "sender=someone"), self.auto_mode_arguments("--from", "someone"),
-                          self.auto_mode_arguments("--machine", "mac"), self.auto_mode_arguments(count="0"),
-                          self.auto_mode_arguments(count="two"), self.auto_mode_arguments(colour="red")):
+                          self.auto_mode_arguments("--machine", "mac"), self.auto_mode_arguments(commands=()),
+                          self.auto_mode_arguments(commands=("implement.sh", " ")), self.auto_mode_arguments(count="2"),
+                          self.auto_mode_arguments(does="dispatch the writer"), self.auto_mode_arguments(colour="red"),
+                          self.auto_mode_arguments("--value", "waits=twice")):
             with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 _ = send.parse(arguments)
         with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
             _ = send.parse(["--here", *self.auto_mode_arguments()])
         self.assertIn("no session record", errors.getvalue())
 
+    def test_auto_mode_cuts_a_long_refused_command_to_90_characters(self) -> None:
+        self.writer_session()
+        exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
+        options = local_options(self.auto_mode_arguments(commands=(exact, long)))
+        self.assertIn(f"Refused:\n{exact}\n{long[:89]}…\nThe P542", options.text or "")
+
+    def test_auto_mode_waits_says_what_waits_and_gives_no_instruction(self) -> None:
+        self.writer_session()
+        # The tile push that reached the phone: its waits gave a second action in a second session.
+        tile = "Type ! kill -TERM -3137969 -3138422 in the cargo-liner session."
+        for waits in (tile, "The build waits; type: /resume", "The merge waits in the cargo-liner pane"):
+            with self.subTest(waits=waits), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = send.parse(self.auto_mode_arguments(session="tile", commands=("cargo test -p tile",), waits=waits))
+            self.assertIn("waits says only what waits", errors.getvalue())
+        options = local_options(self.auto_mode_arguments(waits="The merge waits for them.."))
+        self.assertIn("\nThe merge waits for them.\n\n", options.text or "")
+
+    def test_a_registered_value_that_gives_a_second_action_is_refused(self) -> None:
+        self.writer_session()
+        arguments = self.needs_go_arguments(does="removes it; then type /resume in the cargo-liner session")
+        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = send.parse(arguments)
+        self.assertIn('session.needs_go gives a second action: the body says to type "/resume"', errors.getvalue())
+        self.assertIn("the body names the cargo-liner pane or session", errors.getvalue())
+
+    def test_only_auto_mode_takes_a_repeated_command_value(self) -> None:
+        for arguments in (["--to", "user", "--text-id", "nate.adhoc", "--value", "command=a", "--value", "command=b"],
+                          self.needs_go_arguments("--value", "command=a", "--value", "command=b")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = send.parse(arguments)
+            self.assertIn("--value needs distinct key=value pairs", errors.getvalue())
+
     def test_sender_and_session_values_lose_the_unit_suffix_but_free_text_keeps_per_unit(self) -> None:
         _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-unit"}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
-        options = local_options(self.auto_mode_arguments(session="types-unit", does="save the per-unit counts",
-                                                         waits="The trunk-unit plan waits for them"))
+        options = local_options(self.auto_mode_arguments(session="types-unit", commands=("save_counts.py --per-unit",),
+                                                         waits="The trunk-unit plan waits for it"))
         self.assertEqual(options.summary, "cargo-liner: auto mode stopped types")
         self.assertEqual(options.sender, "cargo-liner")
         self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, approve the prompt or add an allow rule"))
-        self.assertIn("Auto mode refused 2 commands in types. They save the per-unit counts. "
-                      + "The trunk-unit plan waits for them.", options.text or "")
+        self.assertIn("Refused: save_counts.py --per-unit\nThe trunk-unit plan waits for it.", options.text or "")
 
     def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
         self.writer_session()

@@ -181,14 +181,14 @@ class PushTextTests(unittest.TestCase):
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "cargo-liner-style: auto mode stopped types")
-        self.assertEqual(push.message.split("\n")[:3], [
-            "Session: types", "Action: On natedev, in the types pane, approve the prompt or add an allow rule",
-            "Auto mode refused 2 commands in types. They save and merge one finished ticket. Three builds you approved wait for them."])
+        self.assertEqual(push.title, "cargo-liner-style: auto mode stopped modules")
+        self.assertEqual(push.message.split("\n")[:6], [
+            "Session: modules", "Action: On natedev, in the modules pane, approve the prompt or add an allow rule",
+            "Refused:", "implement.sh --to modules-impl", "review.sh --to modules-test", "The P542 build waits for them."])
         self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Approve", "Allow rule"])
         self.assertTrue(push.body.endswith("never stops on these commands again."))
         one = push_texts.render_entry(entry, entry.examples[1].values)
-        self.assertIn("refused 1 command in messaging. It pushes", one.body)
+        self.assertTrue(one.body.startswith("Refused: git push origin build-followups-messaging\n"))
         self.assertTrue(one.body.endswith(" The rule: Bash(git push:*)"))
 
     def test_paid_credits_keeps_the_user_approved_lines(self) -> None:

@@ -1003,8 +1003,9 @@ push notifications:
 On the Mac, add `--machine natedev`; the keys exist only on natedev. The
 message is the one action or fact, under 500 characters, per the message guide. Every message says
 what the user does with `--action`, or says nothing is needed with
-`--no-action`. Emergency (`--need blocked`) is only for an action the user must
-take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
+`--no-action`. An update to an earlier user push on the same subject reuses that
+push's `--key`, so silence keeps only the newest. Emergency (`--need blocked`) is
+only for an action the user must take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
 with the `fallback text:` that `send.py` printed, and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.

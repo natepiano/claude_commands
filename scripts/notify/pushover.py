@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send the user one Pushover alert: the one way any session reaches their phone.
 
-  pushover.py [--priority 0|1|2] [--source NAME] (--action TEXT | --no-action) TITLE MESSAGE
+  pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] (--action TEXT | --no-action) TITLE MESSAGE
 
 Priority 0 is a normal notification, 1 high (sounds in Pushover's quiet hours),
 2 emergency: it repeats every RETRY_S seconds until the user taps Acknowledge,
@@ -13,7 +13,8 @@ holds the local time, source, priority, posted title and message, and outcome.
 
 While the user's silence is on (silence.py), a push below priority 2 is kept,
 not posted: it prints "pushover: kept: silence until ..." and exits 0, and
-`silence.py off` posts it later.
+`silence.py off` posts it later. A kept push with the same --key from the same
+--source replaces the older kept one.
 
 Messages without --action or --no-action are refused before sending. Exit 0
 sent or kept, 1 Pushover refused it or could not be reached, 2 refused before sending,
@@ -51,7 +52,7 @@ TITLE_MAX = 250
 MESSAGE_MAX = 1024
 ACTION_TEXT_MAX = MESSAGE_MAX - len("Action: ") - 1
 TIMEOUT_S = 15
-USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE"
+USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE"
 
 
 class Keys(TypedDict):
@@ -151,6 +152,7 @@ def log(source: str, priority: str, title: str, message: str, outcome: str) -> N
 class Arguments(TypedDict):
     priority: str
     source: str | None
+    key: str
     action: str | None
     no_action: bool
     answerable: bool
@@ -169,6 +171,7 @@ def parse(argv: list[str]) -> Arguments | None:
     no_action = False
     answerable = False
     text_id = ""
+    push_key = ""
     values: dict[str, str] = {}
     index = 0
     while index < len(argv) and argv[index].startswith("--"):
@@ -181,7 +184,7 @@ def parse(argv: list[str]) -> Arguments | None:
             no_action = True
             index += 1
             continue
-        if option not in ("--priority", "--source", "--action", "--text-id", "--value") or index + 1 >= len(argv):
+        if option not in ("--priority", "--source", "--key", "--action", "--text-id", "--value") or index + 1 >= len(argv):
             return None
         value = argv[index + 1]
         if option == "--priority":
@@ -192,6 +195,8 @@ def parse(argv: list[str]) -> Arguments | None:
             if not value.strip():
                 return None
             source = value
+        elif option == "--key":
+            push_key = value
         elif option == "--text-id":
             text_id = value
         elif option == "--value":
@@ -229,6 +234,7 @@ def parse(argv: list[str]) -> Arguments | None:
         "session": session,
         "priority": priority,
         "source": source,
+        "key": push_key,
         "action": action,
         "no_action": no_action,
         "answerable": answerable,
@@ -286,7 +292,7 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
     draft = review.Draft(source, priority, title, action,
                          trimmed_body(action, arguments["message"], arguments["session"], header=arguments["header"]),
                          arguments["answerable"], arguments["session"])
-    header = arguments["header"]
+    header, key = arguments["header"], arguments["key"]
     claimed = False
     try:
         found = review.NoHold() if arguments["text_id"] else review.held_for(source)
@@ -342,14 +348,14 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         if not isinstance(found, review.LiveHold):
             completion: review.ClaimDelivery = review.ClaimCancelled()
         else:
-            completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header))
+            completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header, key=key))
         if isinstance(completion, review.ClaimCancelled):
             review.log_review(draft, outcome, detail="claim cancelled before posting")
             print("pushover: replaced: a newer version replaced this push; nothing was sent")
             return 5
         code = completion.code if isinstance(completion, review.ClaimFailed) else 0
     else:
-        code = deliver(version, keys_file, post, detail=detail, header=header)
+        code = deliver(version, keys_file, post, detail=detail, header=header, key=key)
     delivery = review.Sent(version) if code == 0 else review.NotSent()
     review.log_review(draft, outcome, delivery, detail=detail, text_id=arguments["text_id"])
     if code == 0 and send_anyway:
@@ -377,13 +383,16 @@ def request_template_fix(record: ReviewedPushRecord) -> None:
 
 
 def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
-            post: Post = http_post, *, detail: str = "", header: bool = True) -> int:
-    """Post an already reviewed version, including expiry sends; do not review again."""
+            post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "") -> int:
+    """Post an already reviewed version, including expiry sends; do not review again.
+
+    During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
+    """
     source, priority, title = draft.source, draft.priority, draft.title
     message = posted_message(draft.action, draft.body, draft.session, header=header)
     if priority != "2":
         kept = silence.keep({"source": source, "priority": priority, "title": title,
-                             "message": message, "detail": detail},
+                             "message": message, "detail": detail, "key": key},
                             deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))

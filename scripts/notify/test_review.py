@@ -1065,6 +1065,26 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIsInstance(self.reviewed(verdict(self.draft, "rewrite", failed_rules=[
             {"rule": "reader-starts-cold", "quote": "Not in the original"}])), review.Approved)
 
+    def test_a_body_that_gives_a_second_action_fails_push_one_action(self) -> None:
+        action = ActionRequired("On natedev, in the tile pane, approve the prompt or add an allow rule")
+        draft = review.Draft("writer one", "1", "tile waits for you", action,
+                             "Auto mode refused 1 command in tile. Type ! kill -TERM -3137969 in the cargo-liner session.", True)
+        result = review.validate(verdict(draft), draft, False)
+        self.assertIsInstance(result, review.Failed)
+        assert isinstance(result, review.Failed)
+        self.assertEqual(result.failed_rules, ["push-one-action"])
+        self.assertEqual(result.failures, (review.RuleFailure("push-one-action",
+            'the body says to type "kill -TERM -3137969", which the Action line does not hold; '
+            + "the body names the cargo-liner pane or session, which the Action line does not name"),))
+        clean = replace(draft, body="Auto mode refused 1 command in tile. The tile build waits for it.")
+        # Code decides the rule: a model report on a clean draft is dropped, and a rewrite that adds a second action fails.
+        self.assertIsInstance(review.validate(verdict(clean, failed_rules=[
+            {"rule": "push-one-action", "quote": clean.body}]), clean, False), review.Approved)
+        rewrite = review.validate(verdict(clean, "rewrite", body=draft.body), clean, False)
+        self.assertIsInstance(rewrite, review.Failed)
+        assert isinstance(rewrite, review.Failed)
+        self.assertIn("push-one-action", rewrite.failed_rules)
+
     def test_oversized_rewrite_remains_a_review_failure_instead_of_a_reviewer_fault(self) -> None:
         result = self.reviewed(verdict(self.draft, "rewrite", body="B" * 500, failed_rules=[
             {"rule": "reader-starts-cold", "quote": "The build stopped."}]))

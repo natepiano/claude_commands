@@ -7,32 +7,48 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Approve: messaging goes on now, but the same command can stop it again later.",
+          "quote": "Approve: it goes on now, but this command can stop it again.",
           "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "Auto mode refused 1 command in messaging.",
+          "quote": "Refused: git push origin build-followups-messaging",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Refused: git push origin build-followups-messaging",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Refused: git push origin build-followups-messaging\nThe merge of that work waits for it.",
+          "rule": "first-150-stand-alone"
         }
       ],
-      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
-      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
-      "time": "2026-10-21T07:45:14.877215-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): 'i don't know what is the command that failed - this is still too verbose'. Each refused command is named and the prose is cut; the title and the Approve then Allow rule order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "fab1360d2a53ef4c3ccde57b8ed617e1e572de49c7f63d634a444dd05820bc88",
+      "time": "2026-10-23T09:30:40.307302-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style: auto mode stopped types",
+          "quote": "cargo-liner-style: auto mode stopped modules",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Approve: types goes on now, but the same commands can stop it again later.\n\nAllow rule: types goes on now and never stops on these commands again.",
+          "quote": "The P542 build waits for them.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Allow rule: it never stops on these commands again.",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Refused:",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
-      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
-      "time": "2026-10-21T07:45:03.336113-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): 'i don't know what is the command that failed - this is still too verbose'. Each refused command is named and the prose is cut; the title and the Approve then Allow rule order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "fab1360d2a53ef4c3ccde57b8ed617e1e572de49c7f63d634a444dd05820bc88",
+      "time": "2026-10-23T09:30:22.441144-04:00"
     }
   },
   "codex.reset_ready": {
