@@ -19,7 +19,7 @@ import auto_silence
 import silence
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
-                          "message": "The build passed.", "detail": ""}
+                          "message": "The build passed.", "detail": "", "key": ""}
 START = 1_000_000.0
 
 
