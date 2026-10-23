@@ -39,34 +39,13 @@ style-unit checked the verify.sh paths: `style_plan.py` and `add_style.py` alrea
 
 ### Phase 44 — a style unit's approved-proposal ticket reads as build work · status: done
 
-**Depends on:** none
+#### As-built
+- `style_plan.phase_text` gives an approved-proposal ticket (`approved = ticket["kind"] == "proposal"`) the **Goal** "Apply the approved findings of `<issue>` in N file(s) of `<crate>`." — "file" when `len(ticket["files"])` is 1, else "files". A structure ticket keeps "Judge these N files of `<crate>` …" and a read/listed ticket keeps "Judge the <kind> ticket for <family> …".
+- The approved branch of `authorization` is a plain scope statement: "This ticket builds the approved proposal `<issue>`: its approved findings are this ticket's work. Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required." It overrides no copied invariant and has no "overrides" or "invariant". The non-approved line, the "Apply the approved findings." line, the record lines and the acceptance gate are unchanged.
+- `docs/delegate/compose_work_order.md` **Fallback** builds a prompt only from this unit's own Work Order, plan and conversation. It never reads, copies or transforms another unit's prompt files under `/tmp/claude/unit/*`; a missing build fact goes to the showrunner for a production unit, else to the user.
+- `scripts/style/test_style_plan.py` — `test_approved_proposal_precedes_coverage_and_restart_rebuild_keeps_authorization`: the proposal Work Order has the Goal line, "This ticket builds the approved proposal", no "Judge" and no "overrides the mechanical-only invariant", and a restart rebuild writes the same text.
+- `docs/as-built/style-showrunner.md` — the proposal ticket entry under **Gate** states the Goal and the plain build scope.
 
-#### Work Order
+**Gotchas:** A todo phase that a unit plan already holds is not written again; only a resume with no todo phase for the open ticket rebuilds it from `phase_text`. `basedpyright -p <worktree>` exits 3 in a worktree with no `.venv` while its footer reads `0 errors, 0 warnings`; read the footer.
 
-**Goal:** the Work Order that `style_plan.py` writes for an approved-proposal ticket tells the unit to build the approved findings, and the unit director contract forbids building prompts from another unit's prompt files.
-
-**Spec:**
-- In `phase_text`, a proposal ticket (`approved`) gets the **Goal** `Apply the approved findings of `<ticket["proposal"]>` in <N> file(s) of `<crate>`.` (N is `len(ticket["files"])`; "file" when N is 1, else "files"). It never contains "Judge". The structure Goal ("Judge these N files …") and the read/listed Goal ("Judge the <kind> ticket …") stay as they are for the other kinds.
-- Replace the approved branch of `authorization` with a plain scope statement that overrides nothing: `This ticket builds the approved proposal `<issue>`: its approved findings are this ticket's work. Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required.` It must not contain "overrides" or "invariant". The non-approved branch stays as it is.
-- The rest of the proposal Work Order (the "Apply the approved findings." line at :1423, the record lines, the acceptance gate) stays as it is.
-- `docs/delegate/compose_work_order.md` **Fallback**: add that the fallback builds the prompt only from this unit's own Work Order, plan and conversation, and never reads, copies or transforms another unit's prompt files under `/tmp/claude/unit/*` (they are another session's state). When this unit's Work Order does not say what a build needs, send the gap to the showrunner (a production unit) or the user, and do not borrow another unit's prompt.
-- `docs/as-built/style-showrunner.md`: where it describes the proposal ticket, add one line: its Work Order Goal is "Apply the approved findings of <issue> in N files of <crate>", and its Spec states the build scope plainly, with no override of the copied invariants.
-
-**Files:**
-- `scripts/style/style_plan.py` — proposal Goal and scope statement in `phase_text`.
-- `docs/delegate/compose_work_order.md` — Fallback rule.
-- `docs/as-built/style-showrunner.md` — proposal Work Order line.
-- `scripts/style/test_style_plan.py` — proposal Goal test.
-
-**Workers:** 1 writer + 1 tester; the code and docs split from the tests by file.
-- `impl`: `scripts/style/style_plan.py`, `docs/delegate/compose_work_order.md`, `docs/as-built/style-showrunner.md`.
-- `test` opens as `test`: `scripts/style/test_style_plan.py`. From the Spec alone: in `test_approved_proposal_precedes_coverage_and_restart_rebuild_keeps_authorization` (or a new test beside it using the same fixture), assert the proposal ticket's Work Order has the Goal line `Apply the approved findings of `<issue>` in 1 file of `crates/alpha`.`, contains `This ticket builds the approved proposal`, and contains neither "Judge" nor "overrides the mechanical-only invariant"; replace the existing `assertIn("overrides the mechanical-only invariant", first)`.
-
-**Constraints from prior phases:**
-- Phase 43 put a refill lock around selection in `next_phase`; this phase changes only the text `phase_text` returns.
-
-**Acceptance gate:**
-- `env -C /home/natepiano/worktrees/claude-build-followups-style PYTHONPATH=/home/natepiano/worktrees/claude-build-followups-style/scripts/style:/home/natepiano/worktrees/claude-build-followups-style/scripts HERDR_BIN=/nonexistent/herdr ~/.claude/scripts/lib/py -m unittest test_style_plan test_style_proposals` passes.
-- The proposal Goal test fails against the old `phase_text` and passes with the change.
-- `basedpyright -p /home/natepiano/worktrees/claude-build-followups-style scripts/style/style_plan.py scripts/style/test_style_plan.py` reports `0 errors, 0 warnings`.
-- `~/.claude/scripts/lib/py scripts/production/merge_gate.py --tests-only` from the worktree root passes.
+**Ruled out:** a `scripts/delegate/verify.sh` fix in this repository — `style_plan.py` and `add_style.py` already write `scripts/direct/verify.sh`; the stale lines are in git-excluded cargo-liner unit plan copies, which cargo-liner-style owns.
