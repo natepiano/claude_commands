@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import send
+import rca
 import review
 import push_texts
 import postmaster
@@ -124,6 +125,7 @@ class SendTests(ShutdownTestCase):
         self.root: Path = Path()
         self.relayed: list[send.Message] = []
         self.outcome: send.Result = send.Result("sent", "ok")
+        self.cases: list[rca.Report] = []
 
     @override
     def setUp(self) -> None:
@@ -131,6 +133,8 @@ class SendTests(ShutdownTestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        # No test opens a real rca.py case: it would write the machine's cases and message its owner.
+        _ = self.enterContext(mock.patch.object(rca, "open_case", self.open_case))
         for name, value in (("STATE", self.root), ("SESSIONS", self.root / "sessions"), ("relay", self.relay)):
             patcher = mock.patch.object(send, name, value)
             _ = patcher.start()
@@ -169,6 +173,11 @@ class SendTests(ShutdownTestCase):
         _ = (self.root / "sessions" / f"{session_id}.json").write_text(json.dumps({
             "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
             "messagingSocketPath": str(path), "updatedAt": 1}))
+
+    def open_case(self, report: rca.Report, at: object = None) -> str:
+        del at
+        self.cases.append(report)
+        return "rca: opened 261023-1"
 
     def relay(self, message: send.Message, timeout: float) -> send.Result:
         del timeout
@@ -605,6 +614,26 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertNotIn("cancel", same_address)
         self.assertIn("keep same address", same_address)
         self.assertIn("keep other address", send.pending("two"))
+
+    def test_retire_to_user_cancels_the_emergency_push_for_the_key(self) -> None:
+        cases = (((0, "pushover: cancelled 1\n", ""), 0, "cancelled: the emergency push for prompt-1 stopped"),
+                 ((0, "pushover: nothing to cancel\n", ""), 0,
+                  "nothing to cancel: no emergency push for prompt-1 is repeating"),
+                 ((1, "", "pushover: could not reach Pushover: timed out\n"), 3,
+                  "FAILED: the emergency push for prompt-1 may still repeat: pushover: could not reach Pushover: timed out"))
+        for response, expected, line in cases:
+            with (self.subTest(line=line), mock.patch.object(send, "run", return_value=response) as run,
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["retire", "--to", "user", "--from", "stall_watch", "--key", "prompt-1"])
+            self.assertEqual(code, expected)
+            self.assertEqual(output.getvalue(), f"retired 0 queued messages\n{line}\n")
+            self.assertEqual(cast(list[str], run.call_args.args[0])[1:],
+                             [str(send.USER_CHANNEL), "cancel", "--source", "stall_watch", "prompt-1"])
+
+    def test_registry_argv_key_reaches_the_user_send(self) -> None:
+        rendered = push_texts.render("nixos.ups_shutdown")
+        options = send.parse(push_texts.user_send_argv(rendered, key="ups-shutdown")[2:])
+        self.assertEqual((options.key, options.need), ("ups-shutdown", "blocked"))
 
     def test_keyed_shutdown_result_survives_restart_retire_and_replaces_older_result(
         self,
@@ -1419,6 +1448,35 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             _ = send.parse(["--here", *self.auto_mode_arguments()])
         self.assertIn("no session record", errors.getvalue())
 
+    def test_an_auto_mode_push_that_is_sent_or_kept_opens_a_case_for_the_stopped_session(self) -> None:
+        self.writer_session()
+        long = "cargo test --workspace --all-features " + "b" * 60
+        options = local_options(self.auto_mode_arguments(commands=("implement.sh --to modules-impl", long)))
+        replies = {"sent": (0, "pushover: sent\n", ""), "kept": (0, "pushover: kept: silence is on\n", ""),
+                   "held": (4, "", "pushover: held\n"), "failed": (1, "", "pushover: unreachable\n")}
+        for outcome, reply in replies.items():
+            self.cases.clear()
+            with self.subTest(outcome=outcome), mock.patch.object(send, "run", return_value=reply):
+                self.assertEqual(send.send(options).outcome, outcome)
+                # The case names the stopped session, not the sender, and each command in full.
+                expected = [rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl", long))]
+                self.assertEqual(self.cases, expected if outcome in ("sent", "kept") else [])
+        self.cases.clear()
+        with mock.patch.object(send, "run", return_value=replies["sent"]):
+            self.assertEqual(send.send(local_options(self.needs_go_arguments())).outcome, "sent")
+        self.assertEqual(self.cases, [])
+
+    def test_the_rca_pushes_are_not_held_as_a_free_text_auto_mode_refusal(self) -> None:
+        values = {"sender": "cargo-liner", "session": "handler", "cause": "auto mode refused a raw cargo build",
+                  "fix": "the builds unit added a verify.sh build verb", "commit": "5e2b9c41"}
+        rendered = push_texts.render(rca.FIXED_TEXT, **values)
+        self.assertTrue(send.reports_auto_mode_refusal(rendered.title + "\n" + rendered.body))
+        for text_id in (rca.STARTED_TEXT, rca.FIXED_TEXT):
+            with self.subTest(text_id=text_id):
+                options = local_options(["--to", "user", "--summary", rendered.title, "--no-action", "--text", rendered.body])
+                self.assertEqual(send.wrong_template(options._replace(text_id=text_id), rendered.body), None)
+                self.assertEqual(send.wrong_template(options, rendered.body), send.AUTO_MODE_HELD)
+
     def test_auto_mode_cuts_a_long_refused_command_to_90_characters(self) -> None:
         self.writer_session()
         exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
@@ -1488,6 +1546,10 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
         self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
         self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
+        self.assertIn("permission.rca_started: a unit starts to fix why a session stopped for a permission. Sent by"
+                      + f" rca.py start; sessions run rca.py, not this: {rca.CALL} start <id> --owner <unit>", output.getvalue())
+        self.assertIn("permission.rca_fixed: the fix merged and the session does not stop for that permission again."
+                      + f" Sent by rca.py fixed; sessions run rca.py, not this: {rca.CALL} fixed <id>", output.getvalue())
 
     def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
         values = {"session": "trunk", "machine": "natedev", "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
