@@ -377,6 +377,7 @@ All follow writes run in one `BEGIN IMMEDIATE` transaction. The write refuses wh
 - The issues folder is shared, so `move-approved` moves every production's approved proposals.
 - A child Python process does not inherit a changed `sys.path`; tests that spawn one pass `PYTHONPATH`.
 - `load-rust-style.sh` is zsh; bash fails on it.
+- A file rename's `after` may say that code does not move ("no existing definition moves"). `names_other_change` accepts only closed negation forms (`NEGATED_VERB`, `NEGATED_SUBJECT`, `NEGATED_NOUN`) and refuses every other move word. Keep the forms closed: in phase 45, each open word list (any negation word, an exception list after `no`) let a review find a real move that passed as negated, over 5 rounds. A false refusal is safe, because the row can be reworded.
 - The repo base already carries two basedpyright errors (missing `bpy` and `PIL`), so a gate reads as "no new diagnostics".
 - Retired fix-pipeline names still exist outside history: `config/agents.conf` (header comment, `style_fix_review=` lines, `[fix.codex]`, `[fix.claude]`), `settings.json` (`nightly_weights`, `style_usage`), `CLAUDE.md:4` (`/style_eval`), and `.claude/settings.local.json` (`scripts/fix/` permissions). These edits wait for the user.
 
