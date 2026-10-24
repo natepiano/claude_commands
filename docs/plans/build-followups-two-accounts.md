@@ -444,7 +444,7 @@ Asked for by the user through the showrunner. Text above this section that names
 
 **Live check outstanding (with the user):** a scratch herdr probe moved claude 2 → claude 3 → `default` keeps its earlier turns, shows the target in its status line and `account.py --pid`, and answers through `send.py`; an unknown-host probe resumes from its one printed line; `move showrunners --from 'claude 2' --to 'claude 3'` brings each showrunner back in its own window on its own desktop with no old window left; `~/.claude/.credentials.json` is unchanged.
 
-### Phase 9 — Readout of the moves  · status: todo · gated by G3
+### Phase 9 — Readout of the moves  · status: done · gated by G3
 
 **Depends on:** Phase 25
 
@@ -480,6 +480,170 @@ Recommend whether more accounts are needed.
 **Workers:** nothing splits: the unit director writes the readout from the records; no worker opens.
 
 **Acceptance gate:** the readout cites its window, account identities, observed days, and the move, wait and no-room evidence. It tells unconfirmed or failed moves from completed ones and workers skipped as ended (or of unknown eligibility) from failed continuations, counts no `routing not restored` as a recovery, keeps each evidenced transition with a `home account unresolved` account in the counts with that account reported unknown (never read from today's login, no repair asked of the user), reports coverage gaps (two readings of one account more than 10 minutes apart show as a gap, never as continuous coverage), and is in this plan and sent to the showrunner. It counts each `auto` transition under its rule name once per group `move_id` (a role-only selection once, as a selection change; member retries deduplicated with their outcomes kept), and reports an auto member with missing peer evidence as partial or unknown, never counting a peer CLI rejection as a completed move. It tells a Codex command that exited after a refusal (its rerun handed to the director) from a failed Codex continuation, and reports that handoff's delivery from a `quota rerun …: sent` line or the received message, else as unknown; a handoff of finished work is marked as such only where a completed continuation turn on its thread shows it. It reports a `confirmed` written before Phase 60 reached its machine, or by reconciliation before Phase 63 did, as a completed move whose submission is unknown without a later non-meta user turn, never as proven submission. It reports a `restart prompt not submitted` failure of a receipt saved before Phase 63 reached its machine with submission unknown. It counts a `restart prompt not submitted` failure written before Phase 64 reached its machine as a failed move, reports the later sending of its text as unknown without a later non-meta user turn, and never attributes such a failure to a lost Enter. It reports a showrunner restart's `restart prompt not submitted` failure written before Phase 70 reached its machine as possibly accepted, with its prompt proven only by a later non-meta user row in the `<command-name>`/`<command-args>` form, counts no `is back` text, `done` machine result or live `restart failed` record as confirmed, and takes each failure's time and reason from its first journal `failed` line. It counts a move that closed a live session's `restart failed` record (Phase 71) by its own outcome and leaves the closed request a failed move, and reports a session with no move while such a record stayed open before Phase 71 reached its machine as blocked, never as no room or no refusal. It never reads a window with a queued next entry and no `no room` line as one with room, reports each blocked head from runner output or a received message with its source named (delivery unknown otherwise), and never counts a notice fingerprint, a deferred credits-off state or a suppressed reminder as a delivered notice, a move or a continuous interval. It correlates blocked notices by group, target and time, tells retained runner output from a received message, and never rebuilds historical heads or continuous hold intervals from today's positions. It reports an auto move's hold mode, hold minutes and the delay before the move as unknown unless retained evidence from that time shows them, never from today's next list or `refusal_watch.json`; it takes a hold's minutes, source or start only from a retained started or `hold over` row printed after Phase 67 reached natedev (a start only from a row with minutes left), never from an estimate row or the `watch state unreadable` line.
+
+#### Readout (2026-10-23, written from the records)
+
+**Window.** T0 = 2026-10-15 11:47 AST to T0 + 7 d = 2026-10-22 11:47 AST. All times are AST (UTC-4). EDT has the same offset in this window, so an EDT time in a record is the same clock time here.
+
+**Accounts.** Named by label only: claude1, claude2, claude3, claude4, codex1, codex2. codex3 shows first on 2026-10-23, after the window, and is not in the counts.
+
+**Sources read.**
+- natedev: `moves.read_journal()` from this worktree (441 entries in the window, 548 in all, no torn line). Shutdown records through `record.all_session_records()` and `record.restarted_history()`, plus a read of the other `history/` records (254 records in the window). natedev `roles.jsonl` through `worker_names.role_history_lines` (no legacy `seats` rows), `groups.json`, `config/accounts.json` `home_cutovers`, `readings.jsonl`.
+- Mac (read-only over ssh): no `moves.jsonl`, so `read_journal()` returns nothing. 13 shutdown records, none with a `target`: they are stops and same-account restarts, not moves. `roles.jsonl` (4 lines, all before Phase 40), `groups.json`, `cutover-home.json` (`complete`, at 2026-10-16 10:17 AST). The Mac keeps no `readings.jsonl`.
+- Retained runner output: natedev's user journal (`agent-sessions-snapshot` lines). Received messages: Claude transcripts in `~/.claude/projects`. Codex threads: rollout files of each moved worker's `worker_id`.
+- When each later phase reached natedev's live checkout (from the `~/.claude` reflog): Phase 55 10-17 02:26, 56 03:41, 58 13:18, 59 14:53, 60 and 61 19:04, 63 20:10, 64 20:40, 62 21:14, 67 22:18, 69 10-18 00:11, 70 01:36, 71 03:00.
+
+**Unresolved homes.** No entry in the window reads `home account unresolved`. No row needed the Mac `cutover-home.json` fallback, because the Mac journalled no move. The `account unknown` row is empty.
+
+##### Moves
+
+Claude sessions, all on natedev. There are 17 transitions with a `requested`, plus 4 role-only selection changes.
+
+| Cause | Transitions | Sessions confirmed | Not completed |
+| --- | --- | --- | --- |
+| by hand, group | 7: units ecd0c49b, 32635f47, 457fbdea, b7009899, 1a0c455b, 8724b034; showrunners a512a0e1 | 2 + 1 + 35 + 39 + 35 + 41 + 4 = 157 | 3 (one each in 457fbdea, 1a0c455b, 8724b034; these three are partial) |
+| by hand, one session | 5: f11f007a, 85d6cfc7 (claude4 → claude1, 10-15 12:34 and 12:36), 160fdfb8 (postmaster claude2 → claude1, 10-15 23:05, cutover), c2d4179a (claude2 → claude3, live check, 10-16 21:24), d8db9f0f (claude1 → claude3, 10-20 11:05) | 5 | 0 |
+| configured rule `auto: 842eb99c…` | 1: showrunners 6b55cb99, claude1 → claude2, 10-17 11:49 | 4 | 0 |
+| configured rule `auto: 0e635c70…` | 1: showrunners 4ae58cb6, claude4 → claude2, 10-17 14:32 | 4 | 0 |
+| configured rule `auto: 3e4088c0…` | 1: showrunners 126db1b2, claude2 → claude3, 10-19 07:25 | 4 | 0 |
+| weekly refusal | 2: 84e723e9 (claude3 → claude1, 10-16 21:31); 5db6839b (`ups`, claude1 → claude3, 10-22 08:18) | 1 | 1 (5db6839b) |
+| 5-hour refusal, unknown-window refusal, credits off | 0 | 0 | 0 |
+
+- Total: 175 sessions confirmed. Each confirmed session has a `restarted` record in `history/` under the same request. 4 moves did not complete:
+  - berth-ceiling (457fbdea): not trusted on claude2.
+  - startup (1a0c455b): first `failed` at 10-19 08:21, reason `start agent … timed out waiting for agent startup`. Its record now reads `restart prompt not submitted`. The first journal line counts.
+  - trunk (8724b034): `restart prompt not submitted` at 10-21 22:01.
+  - ups (5db6839b): `pane still holds a live agent`. Its record stays in `sessions/` as `restart failed`.
+- Role-only selection changes, counted once each:
+  - natedev: units e8abe283 (claude4 → claude4, 10-15 17:33).
+  - Mac, before Phase 40, all by hand: showrunners 04cdb461 (claude2, 10-16 08:56), showrunners bd86a33e (claude1, 10-16 11:00), units 39bba61a (claude4, 10-16 11:00).
+- The roles line of b7009899 is at 10-18 11:34, but its `requested` lines are at 16:08. At 11:34 there were 39 standalone `failed` lines (`GitHub keys are cold`), which are refused attempts. All 39 sessions then confirmed under the same move id, and each counts once, as confirmed. In 457fbdea, review failed twice (`herdr session review is already live`) and then confirmed: it counts once, as confirmed.
+- Other refused attempts: 9600591e has 2 standalone `failed`, `cancelled` lines (dashboard, tile-fixes, 10-15 17:23). They close a request made before the window.
+- No Mac move exists, so no auto member has missing peer evidence. No peer CLI rejection was found.
+
+**Prompt submission for confirmed moves made before Phase 60 reached natedev (10-17 19:04).** This covers 11 transitions and 55 sessions: f11f007a, 85d6cfc7, ecd0c49b, 160fdfb8, 32635f47, 457fbdea, c2d4179a, 84e723e9, 6b55cb99, a512a0e1, 4ae58cb6. Each is a completed move, but its submission is not proven. The 10-17 check recorded in this plan found the prompt unsent in 14 sessions of 457fbdea, 2 of 6b55cb99 and 1 of c2d4179a. Every one of the 55 sessions has a later non-meta user turn, so resumed work is shown. That turn does not prove the move's own prompt was sent:
+- 41 sessions took a turn within 60 min.
+- In 12 sessions of 457fbdea the first later turn came 1.2 to 29 h after the move.
+- Two showrunner sessions took their first later turn after 65 and 177 min. It was often a `You are now …-unit` prompt from a later message.
+
+No `confirmed` in the window was written by reconciliation between Phase 60 and Phase 63. Every move after 10-18 03:00 ran with Phases 60 to 71 on natedev.
+
+**Failed moves and their later sending.**
+- trunk (8724b034, after Phase 64, 69 and 70): a failed move. Its text sent later is unknown: the later turns are task notifications, and none holds the prompt. The journal reason does not name the path that lost it.
+- startup: a `You are now startup-polish-unit …` turn arrived at 10-19 09:07. The move stays failed.
+- berth-ceiling and ups: no later user turn.
+
+**Restart failures that are not moves** (no `target`):
+- Showrunner restarts before Phase 70: cargo-liner-style (294cac84) failed at 10-18 00:40 and cargo-liner (4dbdb78e) failed at 00:46. Each was accepted: a `<command-name>/showrunner:produce</command-name>` row shows it at 00:38:44 and 00:45:17.
+- trunk unit restore: failed 10-18 00:24.
+- cargo-liner-style and cargo-liner records: failed again on 10-18 18:37, after Phase 71.
+
+**Sessions blocked by an open `restart failed` record before Phase 71.**
+- cargo-liner-style: 10-18 00:40 to 01:46, closed by hand with `forget`.
+- cargo-liner: 00:46 to 01:46, closed the same way.
+- trunk: from 00:24, end unknown. At the latest, a move could close it from 03:00, when Phase 71 reached natedev.
+
+No move was journalled for these sessions in those spans. Read the spans as blocked, not as room or as no refusal.
+
+**Codex workers.** There is 1 transition: c9d1f08e, a weekly refusal, codex1 → codex2, `requested` at 10-19 01:45:42, reset 10-24 16:40.
+- 18 workers are confirmed (`run`, `worker`) from 01:45:58 to 01:49:37, with 0 failed. It is not partial.
+- This is the proof of the workers move. On every one of the 18 threads, a turn started at the second of its `confirmed`, and each turn reached `task_complete` within 0 to 3 min. All 18 continued.
+- Whether other workers were skipped because their run had ended is not journalled. Their eligibility at that time is unknown.
+- Hand swaps, from `roles.jsonl` only:
+  - natedev: codex2 → codex1, 10-15 22:32 (before Phase 54, no `why`).
+  - Mac: codex2 → codex1, 10-16 11:00.
+  - natedev: codex2 → codex1, 10-21 00:26.
+- No test-fixture `why` is in `roles.jsonl`. No credits-off request and no workers next-list entry ran.
+
+**Codex commands that exited after a refusal, with the rerun handed to the director.** None is shown. No `quota rerun <worker> -> <session>: sent` or `not delivered` line survives in task output or run dirs. No director transcript holds a received `Codex refused work for quota. Worker … stopped` message. Every match was plan or code text. Roster state is not counted. So the count is 0 shown, any others unknown, and no rerun of finished work is shown.
+
+**Routing to Claude.** There is 1 routing: `routed to claude`, fallback_at 10-19 01:45:50, owner codex1, cause refusal. It moved delegate, cli, fix, team_review, api_review and module_review. `routed back` came at 01:47:25 with all six restored and none kept: a completed recovery after 1 min 35 s. There are 0 `routing not restored` and 0 open routings.
+
+##### Waits
+
+| Tool | Window | Count | Duration |
+| --- | --- | --- | --- |
+| Claude (queued units group, Phase 58) | weekly, reset 10-26 02:00 | 17, from 10-21 18:46 to 20:40 | Unknown. No `wait ended` was written. |
+| Claude | five_hour | 0 | |
+| Codex | any | 0 | |
+
+All 17 sessions were on claude1. Each had its own `waited` line, matching runner lines `<name>: refused; wait until 2026-10-26T02:00`. Later, 16 of them confirmed in the hand move 8724b034 (10-21 21:54), and trunk failed there. That move is a separate transition. It does not close a wait in the journal.
+
+**Blocked next-list head.** There is 1: `units 1 → claude4 due, claude4 has no fresh reading since 09:05`.
+- Runner output (user journal) at 10-21 18:14:01.
+- Received at 18:13:52 by the natedev, cargo-liner, cargo-liner-style and hana showrunners and by two other sessions.
+- Relayed again by the cargo-liner showrunner at 21:39 and the hana showrunner at 21:53.
+- It ended with the hand move 8724b034 at 21:54, 3 h 40 min after the first notice. When it started before the notice is unknown.
+- A 10-21 00:43 `workers 1 → …` set of lines was a test's output and is not counted.
+- The 10-17 11:49 move that skipped the claude4 head ran before Phase 58 reached natedev.
+
+**Auto-move holds.**
+- 842eb99c: mode, minutes and delay are unknown. The runner line at 11:49:30 shows only the move.
+- 0e635c70: a fixed 92-minute hold, from `next` output kept in the natedev showrunner transcript at 10-17 12:16. That output was printed before Phase 67, so it is not a started row. The start and the delay from the first low reading are unknown.
+- 3e4088c0: a fixed 13-minute hold, from `next` output at 10-17 13:18, before Phases 62 and 67. No started or `hold over` row for it survives. Its mode at the move (10-19 07:25), its minutes and its delay are unknown.
+
+##### No eligible destination
+
+There is 1 interval: workers, move 8f7fe9ef, `no room` at 10-19 01:45:47, earliest reset 10-26 01:46:06, `room again` (codex2) at 01:47:25. It lasted 1 min 38 s. The union is the same 1 min 38 s. There are no Claude intervals and no unresolved ends. The readings at 01:45:20 and 01:47:22 show codex1 at 0% and codex2 at 100%, so not every account was exhausted.
+
+##### Burn and coverage
+
+Readings start at 10-15 22:10, because the eight-day retention has dropped older ones. So the first 10.4 h of the window are unobserved for every account. A gap is two readings of one account more than 10 min apart.
+
+| Account | Observed days of 7 | Long gaps (AST) |
+| --- | --- | --- |
+| claude1 | 6.46 | 10-15 11:47 to 22:10; plus 10 gaps of 10–30 min (154 min) |
+| claude2 | 3.56 | 10-15 11:47 to 22:10; 10-16 01:53 to 19:07; 10-19 10:32 to 16:36; 10-20 00:33 to 10-21 01:24; 10-21 09:21 to 10-22 08:32 |
+| claude3 | 4.65 | 10-15 11:47 to 10-16 21:31; 10-17 05:29 to 09:13; 10-17 17:13 to 10-18 11:36 |
+| claude4 | 2.64 | 10-15 11:47 to 22:10; 10-16 23:43 to 10-17 12:16; 10-17 20:15 to 10-19 16:36; 10-20 00:33 to 10-21 01:07; 10-21 09:05 to 21:56 |
+| codex1 | 6.56 | 10-15 11:47 to 22:10 |
+| codex2 | 6.50 | 10-15 11:47 to 22:10; 10-16 11:53 to 13:17 |
+
+Points per day are from `accounts.py burn`, run once per AST day with `-04:00` edges. The first and last days are partial. `*` marks a day whose points spread across a gap above.
+
+| Day | claude1 | claude2 | claude3 | claude4 | codex1 | codex2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10-15 from 11:47 | 0.4* | 0* | — | 5* | 4* | 1* |
+| 10-16 | 8.6 | 18* | 0* | 47* | 66 | 0* |
+| 10-17 | 2 | 49 | 0* | 1* | 57 | 0 |
+| 10-18 | 0 | 30 | 22* | 0* | 67 | 0 |
+| 10-19 | 30 | 2* | 20 | 0* | 6 | 48 |
+| 10-20 | 45 | 0* | 9 | 0* | 0 | 102.2 |
+| 10-21 | 25 | 0* | 7 | 7* | 54 | 1.8 |
+| 10-22 to 11:47 | 0 | 0* | 3 | 15 | 21 | 0 |
+
+**Burn per group interval** comes from `accounts.burn` over each interval of the natedev `group` lines. "Alone" means the other group was on another account. Ad hoc sessions are not tracked.
+
+| Interval (AST) | Account | Group | Points |
+| --- | --- | --- | --- |
+| 10-15 11:47 to 10-16 19:05 | claude4 | units alone | 52 (10.4 h unobserved) |
+| 10-15 11:47 to 10-17 11:48 | claude1 | showrunners alone | 11 (10.4 h unobserved) |
+| 10-16 19:05 to 10-17 11:48 | claude2 | units alone | 43 |
+| 10-17 11:48 to 12:16 | claude2 | shared | 1 |
+| 10-17 12:16 to 14:32 | claude2 / claude4 | units alone / showrunners alone | 6 / 1 |
+| 10-17 14:32 to 10-18 11:34 | claude2 | shared | 37.9 |
+| 10-18 11:34 to 10-19 07:25 | claude3 / claude2 | units alone / showrunners alone | 35 / 11.1 |
+| 10-19 07:25 to 08:10 | claude3 | shared | 2 |
+| 10-19 08:10 to 10-21 21:54 | claude1 / claude3 | units alone / showrunners alone | 100 / 19 |
+| 10-21 21:54 to 10-22 11:47 | claude4 / claude3 | units alone / showrunners alone | 22 / 5 |
+
+Workers: codex2 got 1 point to 10-15 22:32, with 10.4 h unobserved. codex1 got 200 points from 10-15 22:32 to 10-19 01:45. codex2 got 152 points from 10-19 01:45 to 10-21 00:26. codex1 got 74.5 points from 10-21 00:26 to the window end. On the Mac, showrunners were on claude2 from 10-16 08:56 to 11:00. That is a Mac-only selection, and the account readings cannot split it.
+
+##### What the data could not answer
+
+- The turns before 10-15 22:10.
+- Whether a worker was skipped as ended.
+- Any Codex rerun handoff.
+- Hold start times and delays.
+- When the units head began to block.
+- When the waits ended.
+- When trunk's pre-Phase-71 record was closed.
+
+##### Recommendation
+
+In the full days 10-16 to 10-21, Claude spent about 54 points per day, about 377 per week, against 400 for four accounts. Gaps in the readings make this a low estimate. Only one no-room interval happened, and it lasted 1.6 min. But the week ended with claude1 at its weekly limit, 17 sessions waiting, and the only queued target unreadable for 3 h 40 min. Add one Claude account.
+
+Codex spent about 67 points per day, about 470 per week, against 200 for two accounts. Paid credits covered the rest. codex3 was added after the window. Whether to add more Codex accounts depends on the cost of credits against the cost of an account, and only the user knows that cost.
 
 ### Phase 10 — A home per Codex account  · status: done
 
