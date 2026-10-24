@@ -674,7 +674,25 @@ nothing for any id.
 A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
 where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
 Neither file name may be a Rust keyword, and the rest of `after` may not name a
-second `<x>.rs to <y>.rs` pair or a move, split or merge.
+second `<x>.rs to <y>.rs` pair or a move, split or merge. Only these exact forms
+negate a move, so it is not a second change:
+- `does not`, `doesn't`, `cannot`, `never` or `without` right before it
+  (`does not move`, `without moving`);
+- a clause that is `nothing`, `none`, or `no`, at most three words and a noun that
+  names code (`definition`, `item`, `type`, `helper`, …) before it, with a place
+  word (`into`, `out`, `from`, `to`, …) or the clause end after it (`no existing
+  definition moves from those callers`);
+- a clause of `no` and at most three words before a move word that is a noun, with
+  a form of `be` after it (`no additional split is introduced`).
+
+`no longer`, `no more`, `no less`, `no fewer`, `no later`, `no sooner`, `no doubt`
+and `no matter` never negate.
+
+Every other form counts as a move, and a person decides: `Do not introduce a
+facade or move any definition`, `moves no item into a file` and `move nothing
+apart from LockError` are refused. A clause starts after a mark
+(`. ; : , ( )`) or after `and`, `but` or `then`. A hyphenated word such as
+`finding-merging` is a name, not a merge.
 It is applied when only the new file is in the code, and not applied when only the
 old file is. It has no check when a folder of child modules (`lock/` or
 `mutation_lock/`) is there; the gate refuses changes in that folder, and a person

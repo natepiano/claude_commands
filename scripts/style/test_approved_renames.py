@@ -213,6 +213,50 @@ class FileRenameTests(unittest.TestCase):
             with self.subTest(after=after, path=finding_path):
                 self.assertEqual(file_rename(kind, finding_path, after), NoFileRename())
 
+    def test_a_negated_move_after_a_file_rename_is_not_another_change(self) -> None:
+        path = "crates/cargo-berth/src/ledger/lock.rs"
+        rename = "Rename ledger/lock.rs to ledger/mutation_lock.rs; "
+        negated = (
+            "keep the dispatch and inline tests together; no existing definition moves from those callers.",
+            "update the imports; no types or behavior move into skipped files.",
+            "No existing definition moves into or out of a skipped file; callers update their paths.",
+            "the dispatch doesn't move.",
+            "this file cannot move.",
+            "keep the API, and no facade or additional split is introduced.",
+            "keep load_report and the finding-merging helpers together.",
+            "the dispatch does not move.",
+            "keep the tests here without moving them.",
+        )
+        for rest in negated:
+            with self.subTest(rest=rest):
+                self.assertEqual(file_rename("rename", path, rename + rest),
+                                 FileRename(path, "crates/cargo-berth/src/ledger/mutation_lock.rs"))
+        moves = (
+            "move scroll_indicator to its title.rs sole caller.",
+            "apply this to the residue after generic progress moves to tui_pane.",
+            "line_offsets and offset move to imports/scan.rs.",
+            "keep no facade, and move LockError into ledger/error.rs.",
+            "no facade stays but split the guard into its own file.",
+            "Merge LockError into ledger/error.rs.",
+            "without delay move LockError into ledger/error.rs.",
+            "move no fewer than two definitions into ledger/error.rs.",
+            "rename ledger/error.rs TO ledger/failure.rs.",
+            "with no further delay move LockError into ledger/error.rs.",
+            "not only move LockError into ledger/error.rs.",
+            "move nothing but LockError into ledger/error.rs.",
+            "No doubt move LockError into ledger/error.rs.",
+            "Do not introduce a facade or move any sibling definition.",
+            "create no extra facade and move no skipped definitions.",
+            "it moves no item into an existing skipped file.",
+            "move nothing apart from LockError into ledger/error.rs.",
+            "No longer needed compatibility helpers move into ledger/legacy.rs.",
+            "no doubt LockError moves into ledger/error.rs.",
+            "No fewer than two helpers move into ledger/legacy.rs.",
+        )
+        for rest in moves:
+            with self.subTest(rest=rest):
+                self.assertEqual(file_rename("rename", path, rename + rest), NoFileRename())
+
     def test_a_file_rename_with_a_folder_of_child_modules_has_no_check(self) -> None:
         old, new = "src/ledger/lock.rs", "src/ledger/mutation_lock.rs"
         after = "Rename ledger/lock.rs to ledger/mutation_lock.rs"
