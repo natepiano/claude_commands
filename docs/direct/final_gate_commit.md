@@ -13,7 +13,7 @@ phase review, so the run leaves no uncommitted work behind.
 1. With no changes in `git status --short`, skip it silently.
 2. Confirm the changed paths are only the repairs named by the synthetic
    phase's baseline and any source-comment edit the last phase's plan
-   review left in the tree (`~/.claude/docs/delegate/phase_end.md` →
+   review left in the tree (`~/.claude/docs/direct/phase_end.md` →
    <PhaseEnd/> step 3). Anything else stays uncommitted and is reported
    instead; never sweep an unrelated path into this commit.
 3. The repair workers' `lint` covers formatting; do not repeat it here.

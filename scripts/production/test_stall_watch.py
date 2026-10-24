@@ -188,7 +188,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "PATH": f"{self.bin}:{os.environ.get('PATH', '')}",
             "SHOWRUNNERS_CONFIG": str(self.config),
             "NOTIFIER_STATE_DIR": str(self.notifier),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions),
             "SHOWRUNNERS_SESSIONS": str(self.sessions_script),
             "STALL_WATCH_STATE_DIR": str(self.state),
@@ -834,7 +834,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         _ = self.tick(START + 480)
         self.assertEqual(len(self.sent()), 4)
 
-    def test_running_shell_or_delegate_launcher_prevents_a_bump(self) -> None:
+    def test_running_shell_or_worker_launcher_prevents_a_bump(self) -> None:
         for command in ("bash", "implement.sh"):
             with self.subTest(command=command):
                 self.state.mkdir(exist_ok=True)
@@ -944,15 +944,15 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual(len(retry), 1)
         self.assertEqual(retry[0]["key"], next(item["key"] for item in first if item["key"].endswith(":tell")))
 
-    def test_stale_delegate_status_does_not_count_as_running_work(self) -> None:
-        status = self.root / "delegate" / "status"
+    def test_stale_worker_status_does_not_count_as_running_work(self) -> None:
+        status = self.root / "run" / "status"
         status.parent.mkdir()
         _ = status.write_text("implementing\n")
         _ = self.tick(START)
         _ = self.tick(START + 300)
         self.assertEqual(len(self.sent()), 2)
 
-    def test_defunct_delegate_process_does_not_count_as_running_work(self) -> None:
+    def test_defunct_worker_process_does_not_count_as_running_work(self) -> None:
         _ = self.tick(START)
         claude_pid = self.children[0].pid
         self.process_rows.append(f"999999 {claude_pid} implement.sh <defunct>")

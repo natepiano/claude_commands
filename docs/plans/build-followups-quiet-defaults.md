@@ -17,7 +17,7 @@
 
 - **Production updates.** `update_registration.py register` reads the doc's `**Updates:**` line. `on demand` makes the `showrunner-<slug>` instance at 15 minutes and stops it, because the instance is the showrunner's only record. A missing line means every 15 minutes. `docs/production_format.md` gives `every <N> minutes (default 15), or on demand`.
 - **Production footers.** `showrunner_footer.py` reads a footer as on unless `~/.local/state/showrunner/footers-off/<slug>` exists. An empty file is off on purpose; a pause writes its own mark, which a resume clears.
-- **Unit runs.** `unit_notifier.sh` reads `PLAN_DELEGATE_PROGRESS_UPDATES` from `config/delegate.conf`: `scheduled` (the shipped value, also the value when the line is missing) or `on-demand`. On demand, a resumed run's schedule is stopped. Unit directors have no reply footer, so (b) has no footer to change for them.
+- **Unit runs.** `unit_notifier.sh` reads `UNIT_PROGRESS_UPDATES` from `config/direct.conf`: `scheduled` (the shipped value, also the value when the line is missing) or `on-demand`. On demand, a resumed run's schedule is stopped. Unit directors have no reply footer, so (b) has no footer to change for them.
 - **Pruning.** `dailies_input.py run` calls `phase_table.py prune --production-doc <doc>` before it reads anything. That moves the phase notes of units no longer in the Units table into the vault's archive. It runs only when a dailies is built.
 - **The snapshot timer.** `/etc/nixos/modules/linux/agent-sessions.nix` runs `agent-sessions-snapshot.py` every 2 minutes on natedev. Its first step, `refresh_agent_notes`, runs `~/.claude/scripts/whoami/agent_notes.py` as its own process, so a failure there can never cost the session record.
 - **Live now (read 08:50 EDT).** All four registered productions read `on demand` and have their footers off, so (b) changes nothing that runs today.
@@ -36,7 +36,7 @@
 
 **Unit runs.**
 
-- `config/delegate.conf`: `PLAN_DELEGATE_PROGRESS_UPDATES=on-demand`.
+- `config/direct.conf`: `UNIT_PROGRESS_UPDATES=on-demand`.
 - `unit_notifier.sh`: a missing line also means `on-demand`. An on-demand start leaves a run's existing instance as it is, so a run started on a schedule, or turned on with `/unit:report on`, keeps it through a resume.
 - Docs: `config/README.md`, `commands/unit/direct.md` (the progress-updates paragraph), and `commands/unit/report.md` if its text names the default.
 
@@ -72,10 +72,10 @@
 | `scripts/production/update_registration.py`, its test | enh-showrunner-unit | 1 |
 | `commands/showrunner/produce.md`, `report_interval.md`, `footer.md` | enh-showrunner-unit | 1 |
 | `docs/production_format.md` | model-study (also touches) | 1 |
-| `scripts/delegate/unit_notifier.sh`, `config/delegate.conf`, `config/README.md`, `commands/unit/direct.md`, `commands/unit/report.md`, their tests | model-study (also touches) | 1 |
+| `scripts/direct/unit_notifier.sh`, `config/direct.conf`, `config/README.md`, `commands/unit/direct.md`, `commands/unit/report.md`, their tests | model-study (also touches) | 1 |
 | `scripts/production/prune_phase_notes.py`, its test | enh-showrunner-unit (new) | 2 |
 | `scripts/production/dailies_input.py`, its test, `commands/showrunner/dailies.md` | enh-showrunner-unit | 2 |
-| `scripts/delegate/phase_table.py` | model-study; read only, not changed | 2 |
+| `scripts/direct/phase_table.py` | model-study; read only, not changed | 2 |
 | `/etc/nixos/modules/linux/agent-sessions-snapshot.py` | the showrunner applies; the user rebuilds | 2 |
 
 No phase touches `scripts/shutdown/*`, so neither waits on shutdown-unit's phases 8-9.

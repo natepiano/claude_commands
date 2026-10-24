@@ -1,5 +1,5 @@
 ---
-description: Judge whether delegate-ready phased plans should run as a production — several /unit:direct units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
+description: Judge whether direct-ready phased plans should run as a production — several /unit:direct units in parallel under one showrunner — and propose the units, hub-file owners and gates between units.
 ---
 
 # Greenlight
@@ -10,7 +10,7 @@ one `/unit:direct` run. The words and the production doc are defined in
 
 **Usage:** `/producer:greenlight <plan> [<plan>…]`
 
-**Argument:** one or more delegate-ready plans. If omitted, infer the single plan
+**Argument:** one or more direct-ready plans. If omitted, infer the single plan
 in the conversation; if there is none, ask for the path. A second plan joins as
 its own unit unless its phases split further.
 
@@ -32,8 +32,8 @@ This command reads only. It writes no file and creates no branch.
 ---
 
 <Locate>
-Each plan must be delegate-ready: it has a `## Delegation Context` section and
-the `Status: IMPLEMENTATION PLAN — phased, delegate-ready` line. A plan that is
+Each plan must be direct-ready: it has a `## Delegation Context` section and
+the `Status: IMPLEMENTATION PLAN — phased, direct-ready` line. A plan that is
 not stops the command with `Run /plan:to_phased_plan <path> first.`
 
 Resolve `${REPO}` from each plan's Git repository. Plans from different

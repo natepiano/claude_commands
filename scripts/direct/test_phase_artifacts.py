@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from typing import override
 
-from scripts.hooks import delegate_run
+from scripts.hooks import direct_run
 
 CLEAR = Path(__file__).with_name("clear_phase_review.sh")
 
@@ -54,11 +54,11 @@ class PhaseArtifactTests(unittest.TestCase):
 
     def test_a_phase_reviewing_counts_as_running_work(self) -> None:
         _ = self.write("phases/4/review_status_adversary", "reviewing\n")
-        self.assertEqual(delegate_run.running_work(self.session), "a review pass")
+        self.assertEqual(direct_run.running_work(self.session), "a review pass")
 
     def test_a_phase_implementing_counts_as_running_work(self) -> None:
         _ = self.write("phases/3/impl_status_impl", "implementing\n")
-        self.assertEqual(delegate_run.running_work(self.session), "an implementation or fix pass")
+        self.assertEqual(direct_run.running_work(self.session), "an implementation or fix pass")
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ PauseRecord(
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances that this pause switched off. A record written while reply footers existed (before 2026-10-18) also has `footers`, which nothing reads now.
 
-`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `delegate-*` status reports, `showrunner-*` dailies, and other scheduled reports. The pause stops enabled instances with `notifier.sh stop`.
+`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `worker-*` status reports, `showrunner-*` dailies, and other scheduled reports. The pause stops enabled instances with `notifier.sh stop`.
 
 `ensure_watcher()` creates or repairs the run-only `conversation-pause` notifier instance:
 
@@ -98,7 +98,7 @@ A unit's run state is stored nowhere. `unit_lookup.run_state(worktree) -> UnitSt
 
 ### As-built corrections and phone alerts
 
-`docs/production_format.md`, `commands/showrunner/produce.md` and `docs/delegate/final_gate_commit.md` allow any unit or showrunner to correct a file under `docs/as-built/` when it contradicts the code. No approval from the user, showrunner or owning unit is required. A unit still names the file as `also touches` in its checkpoint notice, and the showrunner does not delay a merge because of that correction.
+`docs/production_format.md`, `commands/showrunner/produce.md` and `docs/direct/final_gate_commit.md` allow any unit or showrunner to correct a file under `docs/as-built/` when it contradicts the code. No approval from the user, showrunner or owning unit is required. A unit still names the file as `also touches` in its checkpoint notice, and the showrunner does not delay a merge because of that correction.
 
 Every repository phone alert goes through `send.py --to user`. A session writes its own text:
 

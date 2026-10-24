@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""codex_mesh.py — Run codex delegates as addressable threads on one app-server.
+"""codex_mesh.py — Run codex workers as addressable threads on one app-server.
 
-Why this exists rather than agent_exec.sh: a delegate launched with `codex exec`
+Why this exists rather than agent_exec.sh: a worker launched with `codex exec`
 is unreachable. Nothing outside its own process can hand it a message, so peers
-coordinate only through the board and a delegate that goes down the wrong path
+coordinate only through the board and a worker that goes down the wrong path
 stays there until its turn ends. `codex app-server` fixes that by hosting every
-delegate as a thread on one local websocket: any process that can open a socket
-can queue a message for a named delegate, or steer one mid-turn.
+worker as a thread on one local websocket: any process that can open a socket
+can queue a message for a named worker, or steer one mid-turn.
 
 The pieces this depends on, each verified against codex 0.162.0:
 
@@ -15,20 +15,20 @@ The pieces this depends on, each verified against codex 0.162.0:
   * `sandbox` takes the SandboxMode STRING ("danger-full-access"), not the
     SandboxPolicy object the generated schema shows for other fields.
   * `thread/queue/add` reaches a thread between turns; `turn/steer` interrupts a
-    running one and needs the turn id the delegate is currently on.
+    running one and needs the turn id the worker is currently on.
 
-`start` deliberately blocks for the delegate's lifetime. Launches that return
+`start` deliberately blocks for the worker's lifetime. Launches that return
 immediately would break every caller that waits on a pid, so this stays in the
 foreground and implement.sh's `wait`, heartbeat watch, and pass recording work
 unchanged.
 
 Verbs:
   serve  Start the session's app-server and record where it listens.
-  start  Launch one delegate as a named thread; block until its turn ends.
+  start  Launch one worker as a named thread; block until its turn ends.
          The last reply lands in --summary-file, unless --reply-file names
-         where replies go: then the summary file belongs to the delegate,
+         where replies go: then the summary file belongs to the worker,
          which writes it as its own last act, and the reply fills it only
-         when the delegate left it empty.
+         when the worker left it empty.
          With --resident, stay attached across turns instead: each finished
          turn is printed to stdout and delivered the same way, the thread
          keeps accepting `send`, and only `end` releases the block.
@@ -39,19 +39,19 @@ Verbs:
          A compaction that does not finish in time is interrupted, so the
          worker can still take a follow-up (exit 1). Exit 3 means a turn is
          still live on the thread and no follow-up can be sent.
-  send   Queue a message for a named delegate, delivered at its next turn.
-  steer  Inject into a named delegate's running turn.
+  send   Queue a message for a named worker, delivered at its next turn.
+  steer  Inject into a named worker's running turn.
   interrupt
-         Stop a named delegate's running turn and keep the delegate. A --message
+         Stop a named worker's running turn and keep the worker. A --message
          is held first and opens its next turn.
-  end    Finish a resident delegate: drop its queued messages, interrupt its
+  end    Finish a resident worker: drop its queued messages, interrupt its
          running turn, if any, and release its `start`.
   stop   Stop the session's app-server, and any it replaced mid-run.
   signin-changed
          Move every run off an app-server started before the Codex sign-in
          last changed, and tell the session holding each run. A path watch
          on the sign-in file runs it.
-  list   Print the roster of named delegates and what each is doing.
+  list   Print the roster of named workers and what each is doing.
 """
 
 from __future__ import annotations
@@ -236,11 +236,11 @@ MESH_RUNS_SCRIPT = Path(__file__).with_name("mesh_runs.py")
 DEAD_RUN_END_TIMEOUT_SECS = 300
 BOARD_HELPER = Path(__file__).resolve().parent.parent / "direct" / "board.sh"
 # The folders that hold unit run folders. An app-server whose session directory is one of their
-# children serves that run alone, so its seats get the run as PLAN_DELEGATE_BOARD_DIR.
+# children serves that run alone, so its seats get the run as UNIT_RUN_DIR.
 RUN_ROOTS: tuple[Path, ...] = unit_runs.run_roots()
 # Servers dropped by _retire_server, kept so `stop` can still reap them. A
 # retired server is abandoned rather than signalled: it may still be finishing a
-# peer delegate's turn, and the end of the run is the only moment that knows
+# peer worker's turn, and the end of the run is the only moment that knows
 # nobody needs it.
 RETIRED_FILE = "mesh_retired.json"
 LOCK_FILE = "mesh_server.lock"
@@ -266,7 +266,7 @@ AUTO_COMPACT_TOKENS = 200_000
 BACKGROUND_TERMINAL_MAX_TIMEOUT_MS = 300_000
 # How long to keep watching after a turn ends for a queued turn already in flight.
 QUEUE_GRACE_SECS = 3.0
-# A resident delegate sits between turns with nothing on the socket, so its loop
+# A resident worker sits between turns with nothing on the socket, so its loop
 # wakes this often to look for the end marker.
 RESIDENT_POLL_SECS = 1.0
 # The SandboxMode strings a thread starts with: workers write, standing reviewers only read.
@@ -340,18 +340,18 @@ WORKER_ROLES = ("impl", "test", "fix", "review")
 
 
 @dataclass(frozen=True)
-class AssignedDelegateRole:
-    """A delegate-run thread whose current assignment belongs in the roster."""
+class AssignedWorkerRole:
+    """A unit-run thread whose current assignment belongs in the roster."""
 
     role: WorkerRole
 
 
 @dataclass(frozen=True)
 class RolelessThread:
-    """A mesh thread outside a delegate run, such as a consultation friend."""
+    """A mesh thread outside a unit run, such as a consultation friend."""
 
 
-RosterRole = AssignedDelegateRole | RolelessThread
+RosterRole = AssignedWorkerRole | RolelessThread
 
 
 class WorkerTaskRecord(TypedDict):
@@ -594,13 +594,13 @@ def _roster_role(value: object) -> RosterRole:
         raise SystemExit(
             f"codex_mesh: role must be impl, test, fix, or review; got '{role}'"
         )
-    return AssignedDelegateRole(role)
+    return AssignedWorkerRole(role)
 
 
 def _worker_role(args: argparse.Namespace) -> WorkerRole:
     role = _roster_role(_attr(args, "role"))
     if isinstance(role, RolelessThread):
-        raise SystemExit("codex_mesh: this delegate action requires a role")
+        raise SystemExit("codex_mesh: this worker action requires a role")
     return role.role
 
 
@@ -658,7 +658,7 @@ def _parse_frame(text: str) -> RpcMessage | None:
 #
 # The app-server's loopback listener needs no auth, so a client is a handshake
 # plus RFC 6455 framing. Pulling in a dependency for that would put an install
-# step between a delegate and its peers.
+# step between a worker and its peers.
 # ---------------------------------------------------------------------------
 
 
@@ -822,7 +822,7 @@ def _require(message: RpcMessage, what: str) -> dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
-# Session state. The delegates write the roster concurrently, so every
+# Session state. The workers write the roster concurrently, so every
 # read-modify-write takes an exclusive lock on the file itself.
 # ---------------------------------------------------------------------------
 
@@ -1078,7 +1078,7 @@ def _lookup(session_dir: str, name: str) -> ThreadRecord:
     entry = roster.get(name)
     if not isinstance(entry, dict):
         known = ", ".join(sorted(roster)) or "(none)"
-        raise SystemExit(f"codex_mesh: no delegate named '{name}'. Known: {known}")
+        raise SystemExit(f"codex_mesh: no worker named '{name}'. Known: {known}")
     _role_fence(_as_dict(cast(object, entry)))
     return cast("ThreadRecord", cast("object", entry))
 
@@ -1206,7 +1206,7 @@ def _claim_follow(
         _ = claimed.pop("paused_from", None)
         _ = claimed.pop("paused_turn", None)
         _ = claimed.pop("previous_role", None)
-        if isinstance(previous_role, AssignedDelegateRole):
+        if isinstance(previous_role, AssignedWorkerRole):
             claimed["previous_role"] = previous_role.role
         claimed.update({
             "thread_id": thread_id,
@@ -1248,7 +1248,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
         previous_role = _roster_role(entry.get("previous_role"))
         restored = dict(entry)
         _advance_roster_revision(restored)
-        if isinstance(previous_role, AssignedDelegateRole):
+        if isinstance(previous_role, AssignedWorkerRole):
             restored["role"] = previous_role.role
         else:
             _ = restored.pop("role", None)
@@ -1275,7 +1275,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
         _ = handle.truncate()
         _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
         handle.flush()
-        if isinstance(previous_role, AssignedDelegateRole) and entry.get("role") != previous_role.role:
+        if isinstance(previous_role, AssignedWorkerRole) and entry.get("role") != previous_role.role:
             _record_assignment(thread_id, previous_role.role, None)
 
 
@@ -1315,7 +1315,7 @@ def _server_availability(session_dir: str) -> ServerAvailability:
     """The running app-server or the need to restart it.
 
     `ensure_server` would start one; the verbs that only ever wind things down
-    must not, or ending a delegate whose server already died would leave a
+    must not, or ending a worker whose server already died would leave a
     fresh server behind for nothing.
     """
     record = _read_json_object(_session_path(session_dir, SERVER_FILE))
@@ -1738,7 +1738,7 @@ def _deliver_reply(
 
     stdout is for a caller polling the terminal this runs in. The reply file,
     when the caller named one, keeps every reply in order and leaves the
-    summary file to the delegate, which writes it as its own last act; without
+    summary file to the worker, which writes it as its own last act; without
     one, the summary file receives the reply. The log line records that it
     landed.
     """
@@ -1749,7 +1749,7 @@ def _deliver_reply(
     elif failure:
         body = f"[error] {failure}"
     else:
-        body = f"The delegate {name} produced no reply."
+        body = f"The worker {name} produced no reply."
     if reply_path is None:
         _ = summary_path.write_text(body + "\n", encoding="utf-8")
     else:
@@ -1762,12 +1762,12 @@ def _deliver_reply(
 def _finish_summary(
     summary_path: Path, reply_path: Path | None, name: str, index: int, final_answer: str
 ) -> None:
-    """Leave the delegate's answer where the caller will read it.
+    """Leave the worker's answer where the caller will read it.
 
     With no reply file the summary file receives the answer. With one, the
-    answer goes there, and the summary file is written only when the delegate
-    left it empty: the launcher truncates it at launch and the delegate fills
-    it as its last act, so a non-empty file is the delegate's own summary and
+    answer goes there, and the summary file is written only when the worker
+    left it empty: the launcher truncates it at launch and the worker fills
+    it as its last act, so a non-empty file is the worker's own summary and
     the last chat reply must not replace it.
     """
     if reply_path is None:
@@ -1909,7 +1909,7 @@ class ExistingServerWatcher:
 def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[bytes] | ExistingServerWatcher:
     """Leave a sleeping shell behind that has the server stop itself once nothing uses it.
 
-    The server is detached so it outlives each delegate, and only a run's end step stops one; a
+    The server is detached so it outlives each worker, and only a run's end step stops one; a
     run folder that never reaches that step kept its server for good. The shell wakes every
     WATCH_WAKE_SECS, and only when the record has gone SERVER_IDLE_SECS without a touch does it
     run `idle-stop`, which stops the server or touches the record. A server RETIRED_FILE lists is
@@ -2085,7 +2085,7 @@ def ensure_server(session_dir: str, home: Path | None = None) -> tuple[int, bool
 def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     """The app-server's environment: the caller's, with the workers home and, for a unit run, the run.
 
-    A seat's hooks and verify.sh runs read the run from PLAN_DELEGATE_BOARD_DIR. The caller's copy
+    A seat's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
     cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
     already have started this server. A run folder is known here, so the server names it itself. A
     review pool's mesh directory, or any other mesh directory, is not a run: one pool server
@@ -2095,18 +2095,18 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
     context = _guild_context(session_dir)
     if context:
         for key in tuple(environment):
-            if key.startswith("PLAN_DELEGATE_") or key in ("CLAUDE_CODE_SESSION_ID", "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION"):
+            if key.startswith(("UNIT_", "PLAN_DELEGATE_")) or key in ("CLAUDE_CODE_SESSION_ID", "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION"):
                 del environment[key]
         environment["CLAUDE_CODE_SESSION_ID"] = _as_str(context.get("holder_session"))
         environment["GUILD_DESIGN_ID"] = _as_str(context.get("design_id"))
         environment["GUILD_BINDING_GENERATION"] = str(context.get("generation"))
         binding = _as_dict(context.get("binding"))
         if binding.get("kind") == "DesignBoundToPhase":
-            environment["PLAN_DELEGATE_BOARD_DIR"] = _as_str(binding.get("run_directory"))
+            environment["UNIT_RUN_DIR"] = _as_str(binding.get("run_directory"))
         return environment
     run = Path(session_dir).absolute()
     if run.resolve().parent in {root.resolve() for root in RUN_ROOTS}:
-        environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
+        environment["UNIT_RUN_DIR"] = str(run)
     return environment
 
 
@@ -2223,7 +2223,7 @@ def _ended_unseen(client: Client, thread_id: str) -> bool:
 
 
 def _more_work_coming(client: Client, thread_id: str, deadline: float) -> bool:
-    """True when a turn that just ended is not the delegate's last.
+    """True when a turn that just ended is not the worker's last.
 
     Peer sends land in the worker's locked pending file, checked by the caller
     before it closes the launcher. This check covers older server-queued work:
@@ -2282,7 +2282,7 @@ TurnOutcome = TurnCompleted | TurnRefusedForCapacity | TurnContextWindowExceeded
 
 @dataclass(frozen=True)
 class RunCompleted:
-    """The delegate ended without a failure."""
+    """The worker ended without a failure."""
 
 
 @dataclass(frozen=True)
@@ -2465,7 +2465,7 @@ def _retry_warranted(outcome: RunOutcome, fresh_server: bool, resident: bool) ->
         away before any work, so a new thread repeats nothing either;
       * the failure arrived too fast to have reached the provider, or to have
         done work before the refusal;
-      * and the delegate is not resident, where a caller is already holding the
+      * and the worker is not resident, where a caller is already holding the
         replies and a silent second attempt would arrive behind them.
     """
     return (
@@ -2609,7 +2609,7 @@ def command_start(args: argparse.Namespace) -> int:
                 )
                 return 2
     port, fresh_server = ensure_server(session_dir)
-    outcome = _run_delegate(args, port, started_here=fresh_server)
+    outcome = _run_worker(args, port, started_here=fresh_server)
     tested = fresh_server
     if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
@@ -2620,7 +2620,7 @@ def command_start(args: argparse.Namespace) -> int:
         else:
             note = f"the inherited app-server failed in {outcome.seconds:.0f}s without reaching the provider"
         print(f"codex_mesh: {name}: {note}; retrying on a new one", file=sys.stderr)
-        outcome = _run_delegate(args, port, started_here=_fresh)
+        outcome = _run_worker(args, port, started_here=_fresh)
         tested = True
     if (isinstance(outcome, (FailedWithThread, CapacityRetriesExhausted))
             and isinstance(outcome.pending_refusal, PendingQuotaRefusal)):
@@ -2976,8 +2976,8 @@ def command_release_follow(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_delegate(args: argparse.Namespace, port: int, *, started_here: bool = False) -> RunOutcome:
-    """Attach one delegate to the app-server on `port` and run it to its end."""
+def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = False) -> RunOutcome:
+    """Attach one worker to the app-server on `port` and run it to its end."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     timeout = _as_float(_attr(args, "timeout"), 86400.0)
@@ -2991,7 +2991,7 @@ def _run_delegate(args: argparse.Namespace, port: int, *, started_here: bool = F
 
 
 def _thread_start_params(args: argparse.Namespace) -> dict[str, object]:
-    """The `thread/start` request for one delegate."""
+    """The `thread/start` request for one worker."""
     params: dict[str, object] = {
         "cwd": _as_str(_attr(args, "cwd")),
         "approvalPolicy": "never",
@@ -3061,10 +3061,10 @@ def _attach_and_run(
         if task:
             starting["task"] = task
         role = _roster_role(_attr(args, "role"))
-        if isinstance(role, AssignedDelegateRole):
+        if isinstance(role, AssignedWorkerRole):
             starting["role"] = role.role
         _update_roster(session_dir, name, starting)
-        if isinstance(role, AssignedDelegateRole):
+        if isinstance(role, AssignedWorkerRole):
             _record_assignment(thread_id, role.role, _dispatch_lens(args))
 
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
@@ -3846,7 +3846,7 @@ def _finish_stream(stream: TurnStream) -> RunOutcome:
         _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
     if not stream.resident or stream.replies == 0:
         _finish_summary(stream.summary_path, stream.reply_path, stream.name, stream.replies + 1,
-                        stream.final_answer or stream.failure or f"The delegate {stream.name} produced no summary.")
+                        stream.final_answer or stream.failure or f"The worker {stream.name} produced no summary.")
     if isinstance(stream.run_outcome, CapacityRetriesExhausted):
         return replace(stream.run_outcome, pending_refusal=stream.pending_refusal, director=stream.director)
     _ = _update_roster_if_expected(
@@ -4282,7 +4282,7 @@ def _move_idle_worker(
                         _update_roster(session_dir, name, {"thread_id": thread_id, "status": "starting",
                             "port": port, "continuation_owed": owes_continuation})
                         role = _roster_role(previous.get("role"))
-                        if isinstance(role, AssignedDelegateRole):
+                        if isinstance(role, AssignedWorkerRole):
                             _record_assignment(thread_id, role.role, _dispatch_lens(args))
                 except (ConnectionError, OSError, SystemExit) as error:
                     _record_worker_move_failure(request, str(error) or type(error).__name__)
@@ -4629,13 +4629,13 @@ def _live_turn_from_mismatch(reply: RpcMessage) -> str:
 
 
 def command_end(args: argparse.Namespace) -> int:
-    """Release a resident delegate: drop the messages queued for it, interrupt
+    """Release a resident worker: drop the messages queued for it, interrupt
     the turn it is on, then leave the marker its `start` loop polls for.
-    Nothing here starts a server -- a delegate whose server is already gone is
+    Nothing here starts a server -- a worker whose server is already gone is
     ended by the marker alone.
 
     The queue goes first because the server opens a new turn for each queued
-    message on its own: a delegate ended with messages waiting comes back, one
+    message on its own: a worker ended with messages waiting comes back, one
     turn per message, long after its `start` has returned."""
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
@@ -4761,7 +4761,7 @@ def command_list(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
     if not roster:
-        print("no delegates registered")
+        print("no workers registered")
         return 0
     for name in sorted(roster):
         entry = roster.get(name)
@@ -6507,7 +6507,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
             return 1
         return 0
     role = _roster_role(record.get("role"))
-    if not isinstance(role, AssignedDelegateRole):
+    if not isinstance(role, AssignedWorkerRole):
         _fail_account_move(session_dir, name, marker, "resume failed: worker has no recorded role")
         return 1
     launcher_pid = _as_int(record.get("launcher_pid"))
@@ -7040,7 +7040,7 @@ def command_reset(args: argparse.Namespace) -> int:
             print(f"codex_mesh: {name}: {reason}; reset refused", file=sys.stderr)
             return 2
         role = _roster_role(_lookup(session_dir, name).get("role"))
-        reset_role = role.role if isinstance(role, AssignedDelegateRole) else "review"
+        reset_role = role.role if isinstance(role, AssignedWorkerRole) else "review"
         if not _claim_follow(session_dir, name, state.thread_id, owner_pid, reset_role):
             print(f"codex_mesh: {name}: worker was already claimed; reset refused", file=sys.stderr)
             return 2
@@ -7106,7 +7106,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = release_held.add_argument("--session-dir", required=True)
     release_held.set_defaults(handler=command_release_held_server)
 
-    start = subparsers.add_parser("start", help="launch a delegate and block")
+    start = subparsers.add_parser("start", help="launch a worker and block")
     _ = start.add_argument("--session-dir", required=True)
     _ = start.add_argument("--name", required=True)
     _ = start.add_argument("--role", choices=WORKER_ROLES, default="")
@@ -7117,7 +7117,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = start.add_argument(
         "--reply-file",
         default="",
-        help="append replies here; the summary file is then the delegate's own",
+        help="append replies here; the summary file is then the worker's own",
     )
     _ = start.add_argument("--log-file", required=True)
     _ = start.add_argument("--model", default="")
@@ -7138,7 +7138,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = account_move.add_argument("--to", required=True)
     account_move.set_defaults(handler=command_resume_account_move)
 
-    follow = subparsers.add_parser("follow", help="run one turn on a finished delegate")
+    follow = subparsers.add_parser("follow", help="run one turn on a finished worker")
     _ = follow.add_argument("--session-dir", required=True)
     _ = follow.add_argument("--to", required=True)
     _ = follow.add_argument("--role", choices=WORKER_ROLES, required=True)
@@ -7189,7 +7189,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = reset.add_argument("--to", required=True)
     reset.set_defaults(handler=command_reset)
 
-    compact = subparsers.add_parser("compact", help="compact a finished delegate")
+    compact = subparsers.add_parser("compact", help="compact a finished worker")
     _ = compact.add_argument("--session-dir", required=True)
     _ = compact.add_argument("--to", required=True)
     compact.set_defaults(handler=command_compact)
@@ -7209,7 +7209,7 @@ def main(argv: list[str] | None = None) -> int:
     release_follow.set_defaults(handler=command_release_follow)
 
     send = subparsers.add_parser(
-        "send", help="queue a message for a delegate; without a launcher it waits for the next dispatch")
+        "send", help="queue a message for a worker; without a launcher it waits for the next dispatch")
     _ = send.add_argument("--session-dir", required=True)
     _ = send.add_argument("--to", required=True)
     send_body = send.add_mutually_exclusive_group(required=True)
@@ -7217,7 +7217,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = send_body.add_argument("--message-file", help="read the message from this file")
     send.set_defaults(handler=command_send)
 
-    steer = subparsers.add_parser("steer", help="interrupt a delegate's running turn")
+    steer = subparsers.add_parser("steer", help="interrupt a worker's running turn")
     _ = steer.add_argument("--session-dir", required=True)
     _ = steer.add_argument("--to", required=True)
     steer_body = steer.add_mutually_exclusive_group(required=True)
@@ -7225,7 +7225,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = steer_body.add_argument("--message-file", help="read the message from this file")
     steer.set_defaults(handler=command_steer)
 
-    interrupt = subparsers.add_parser("interrupt", help="stop a delegate's running turn, keeping the delegate")
+    interrupt = subparsers.add_parser("interrupt", help="stop a worker's running turn, keeping the worker")
     _ = interrupt.add_argument("--session-dir", required=True)
     _ = interrupt.add_argument("--to", required=True)
     interrupt_body = interrupt.add_mutually_exclusive_group()
@@ -7233,7 +7233,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = interrupt_body.add_argument("--message-file", help="read the message from this file")
     interrupt.set_defaults(handler=command_interrupt)
 
-    end = subparsers.add_parser("end", help="release a resident delegate")
+    end = subparsers.add_parser("end", help="release a resident worker")
     _ = end.add_argument("--session-dir", required=True)
     _ = end.add_argument("--to", required=True)
     end.set_defaults(handler=command_end)
@@ -7264,7 +7264,7 @@ def main(argv: list[str] | None = None) -> int:
     _ = signin_changed.add_argument("--root", default="")
     signin_changed.set_defaults(handler=command_signin_changed)
 
-    roster = subparsers.add_parser("list", help="print the delegate roster")
+    roster = subparsers.add_parser("list", help="print the worker roster")
     _ = roster.add_argument("--session-dir", required=True)
     roster.set_defaults(handler=command_list)
 

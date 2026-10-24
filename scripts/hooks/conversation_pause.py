@@ -404,7 +404,7 @@ def is_showrunner_or_unit_director(session_id: str) -> bool:
     prefixes = ("showrunner-", *unit_runs.INSTANCE_PREFIXES)
     if any(report.name.startswith(prefixes) for report in session_reports(session_id)):
         return True
-    return unit_runs.marker(session_id, os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")).is_file()
+    return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None).is_file()
 
 
 def session_reports(session_id: str) -> list[Report]:

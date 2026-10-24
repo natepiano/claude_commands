@@ -48,6 +48,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import agents_registry  # noqa: E402
+
 from note_file import InvalidReset, KnownReset, NoResetKnown, reset_time
 
 STATE_DIR = Path(os.environ.get("CODEX_PACER_STATE_DIR", Path.home() / ".local" / "state" / "codex-pacer"))
@@ -430,17 +433,17 @@ def make_plan(state: State, notes: Sequence[AgentNote], registry: str, now: date
 
 
 def registry_tier() -> str:
-    """The delegate rows' stored tier: what the bulk of codex launches carry."""
+    """The worker rows' stored tier: what the bulk of codex launches carry."""
     section = ""
     try:
-        lines = AGENTS_CONF.read_text(encoding="utf-8").splitlines()
+        lines = agents_registry.registry_text(AGENTS_CONF).splitlines()
     except OSError:
         return ""
     for line in lines:
         text = line.split("#", 1)[0].strip()
         if text.startswith("["):
             section = text.strip("[]")
-        elif section == "delegate.options" and text.startswith("codex_service_tier="):
+        elif section == "direct.options" and text.startswith("codex_service_tier="):
             return text.split("=", 1)[1].strip()
     return ""
 

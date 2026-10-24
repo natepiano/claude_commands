@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Durable plan-delegate progress events, headers, and calibration statistics."""
+"""Durable unit progress events, headers, and calibration statistics."""
 
 from __future__ import annotations
 
@@ -25,17 +25,19 @@ from typing import NoReturn, TypedDict, cast
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import agents_registry, unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
 SCHEMA_VERSION = 1
 # The shared history spine, read by scripts/history/history.py. Kept separate
 # from SCHEMA_VERSION, which versions this recorder's own fields: a reader has
-# to tell "delegate changed its events" apart from "the shared format changed",
+# to tell "worker changed its events" apart from "the shared format changed",
 # and one number cannot say both once other skills write to the same spine.
 SPINE_VERSION = 1
-SKILL_NAME = "plan-delegate"
+SKILL_NAME = "unit-history"
+# The name events carried before the rename: every history written before it, and a run still open.
+FORMER_SKILL_NAME = "plan-delegate"
 MIN_CALIBRATION_SAMPLES = 5
 # How long a stretch with no pass or activity open still counts as phase work: the unit
 # director reviews, gates and writes the next prompt between dispatches. Past it the phase
@@ -66,7 +68,7 @@ ARMED_REVIEW_KEY = "early_review"
 OPEN_PHASES_KEY = "open_phases"
 # A phase closed by finish-phase takes no more passes, its plan review's included.
 CLOSED_PHASE_RULE = ("A finished phase takes no more passes: run its plan review before its finish-phase "
-                     + "(docs/delegate/phase_end.md, step 3 before step 5).")
+                     + "(docs/direct/phase_end.md, step 3 before step 5).")
 # The state that describes the current phase alone. A phase a newer one
 # displaces keeps its own copy under PARKED_KEY, and gets it back when the newer
 # one finishes and it is current again.
@@ -172,7 +174,7 @@ class StageWindow(TypedDict):
     elapsed: int
     status: str
     result: str
-    delegate: str
+    worker: str
     main: str
 
 
@@ -184,13 +186,13 @@ class FindingTally(TypedDict):
     reopened: int
 
 
-# delegate.conf, whose digest a pass records. `PLAN_DELEGATE_CONFIG` overrides the
+# direct.conf, whose digest a pass records. `UNIT_CONFIG` overrides the
 # path so the tests read a fixture rather than the machine's live settings.
-DEFAULT_CONFIG_PATH = Path("~/.claude/config/delegate.conf").expanduser()
+DEFAULT_CONFIG_PATH = Path("~/.claude/config/direct.conf").expanduser()
 
 # A pass already records the agent identity it resolved to, so the digest covers
 # what that identity cannot: the assignment tables that produced it and the
-# delegate settings the run obeyed. Stamped on every pass_started, it lets a
+# worker settings the run obeyed. Stamped on every pass_started, it lets a
 # later query group passes by the configuration in force, which is what makes a
 # comparison survive interleaved runs and a conf edited between them.
 CONFIG_DIGEST_LENGTH = 12
@@ -201,7 +203,7 @@ DEFAULT_AGENTS_CONFIG_PATH = Path("~/.claude/config/agents.conf").expanduser()
 
 
 def _config_path() -> Path:
-    configured = os.environ.get("PLAN_DELEGATE_CONFIG")
+    configured = os.environ.get("UNIT_CONFIG") or os.environ.get("PLAN_DELEGATE_CONFIG")
     return Path(configured) if configured else DEFAULT_CONFIG_PATH
 
 
@@ -226,10 +228,17 @@ def _config_digest() -> str:
             contents.append(path.read_bytes())
         except OSError:
             return ""
+    # This machine's agent rows over the committed registry change the configuration too.
+    overlay = agents_registry.overlay_path(_agents_config_path())
+    if overlay.is_file():
+        try:
+            contents.append(overlay.read_bytes())
+        except OSError:
+            return ""
     return hashlib.sha256(b"".join(contents)).hexdigest()[:CONFIG_DIGEST_LENGTH]
 
 
-PASS_OWNER_ENV = "PLAN_DELEGATE_PASS_OWNER"
+PASS_OWNER_ENV = "UNIT_PASS_OWNER"
 PASS_OWNER_TOKEN = "launcher"
 
 PASS_OWNERSHIP_RULE = (
@@ -244,7 +253,7 @@ PASS_OWNERSHIP_RULE = (
 
 
 def _launcher_owned() -> bool:
-    return os.environ.get(PASS_OWNER_ENV) == PASS_OWNER_TOKEN
+    return (os.environ.get(PASS_OWNER_ENV) or os.environ.get("PLAN_DELEGATE_PASS_OWNER")) == PASS_OWNER_TOKEN
 
 
 def _iso_time(epoch: float) -> str:
@@ -469,7 +478,7 @@ def _append_event(state: dict[str, object], event: dict[str, object]) -> None:
         _ = handle.write(line)
         handle.flush()
         # Disposable fixtures may omit disk durability; production syncs by default.
-        if os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1") != "0":
+        if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
             os.fsync(handle.fileno())
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -875,7 +884,7 @@ def _ensure_project_timing(
 # never writes it here. Reading the value as a role is the mistake this comment
 # exists to stop -- the variable is the half with the wrong name, and it stays
 # that way because implement.sh exports it.
-TEAM_SLOT_ENV = "PLAN_DELEGATE_TEAM_ROLE"
+TEAM_SLOT_ENV = "UNIT_TEAM_ROLE"
 
 
 def _team_slot() -> str:
@@ -886,7 +895,7 @@ def _team_slot() -> str:
     review.sh included -- record under it, and must stay distinguishable from a
     launcher that really is sitting in `impl`.
     """
-    return os.environ.get(TEAM_SLOT_ENV, "")
+    return os.environ.get(TEAM_SLOT_ENV) or os.environ.get("PLAN_DELEGATE_TEAM_ROLE", "")
 
 
 def _record_slot(record: dict[str, object]) -> str:
@@ -1110,7 +1119,7 @@ def _event(
     # Only the window that is open right now identifies an event. A finished
     # pass stays in state, so stamping it unconditionally attributed every
     # activity -- and every progress report made during one -- to whichever
-    # delegate happened to run before it. A pass lifecycle event names its own
+    # worker happened to run before it. A pass lifecycle event names its own
     # record instead: several slots are open at once, and the launcher that
     # closes a stale pass is not always the one that opened it.
     if current_pass is not None and _string(current_pass.get("status")) == "active":
@@ -1330,6 +1339,9 @@ def _start_phase(args: argparse.Namespace) -> None:
     # leaves every open phase open: each closes only by its own finish-phase.
     if _open_phase_named(state, phase_id) is not None:
         return
+    # A finished phase reopened for repair rounds gets its reservation state back from its kept
+    # /sync board answer, so its edits pass the berth hook with no hand-written state.
+    _ = phase_reservation.restore(phase_reservation.phase_directory(session_dir, phase_id), phase_id)
     # The phase count reads the plan's headings, so a phase the plan lacks makes
     # every later report disagree with its own phase number.
     missing_from = _phase_missing_from_plan(state, phase_id)
@@ -1453,13 +1465,13 @@ def _finish_pass(args: argparse.Namespace) -> None:
         )
 
 
-def _resolve_delegate_agent(task: str) -> AgentIdentity:
+def _resolve_worker_agent(task: str) -> AgentIdentity:
     """Ask the shared agent registry which agent a task resolves to.
 
     The early reviewer is armed by the unit director in the same turn it launches
     `review.sh`, so the launcher has not written its resolved identity yet and
     waiting for it would be a poll. Resolving through the same bash entry point
-    the launcher uses gives the Delegate cell the same answer with no race.
+    the launcher uses gives the Worker cell the same answer with no race.
     """
     resolver = Path(__file__).resolve().parent.parent / "agents" / "agents_config.sh"
     unknown = AgentIdentity(family="", model="", effort="", session_id="")
@@ -1510,7 +1522,7 @@ def _arm_review(args: argparse.Namespace) -> None:
             + "launch it through review.sh and let it record its own pass."
         )
     now = plan_history.now_epoch()
-    called_task = _arg_string(args, "called_task", "delegate.review") or "delegate.review"
+    called_task = _arg_string(args, "called_task", "direct.review") or "direct.review"
     lens = _arg_string(args, "lens")
     suffix = f"_{lens}" if lens else ""
     # `review.sh --phase` writes its files in the phase's directory, so the marker names the same one.
@@ -1522,7 +1534,7 @@ def _arm_review(args: argparse.Namespace) -> None:
         "activity": _arg_string(args, "activity"),
         "started_at": now,
         "called_task": called_task,
-        "called_agent": _resolve_delegate_agent(called_task),
+        "called_agent": _resolve_worker_agent(called_task),
         # `review.sh` suffixes both files with its lens, so an armed reviewer
         # must name the same pair the launcher it precedes will write. Empty is
         # the single-reviewer layout and the unsuffixed names.
@@ -1812,7 +1824,7 @@ def _calibration_scopes(
     """
     # Match on the open window, the same rule `_event` records by. A finished
     # pass left in state would otherwise match this activity's report against
-    # samples from a delegate that is no longer running.
+    # samples from a worker that is no longer running.
     current_pass = _reporting_pass(state) or {}
     main_agent = _object_dict(state.get("main_agent")) or {}
     called_agent = _object_dict(current_pass.get("called_agent")) or {}
@@ -2142,7 +2154,7 @@ def _moment_stamp(epoch: float, now: float) -> str:
 STAGE_HEADERS: tuple[str, ...] = (
     "Stage",
     "Main",
-    "Delegate",
+    "Worker",
     "Start",
     "Elapsed",
     "Result",
@@ -2251,8 +2263,8 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
         label = ""
         started_at = _number(event.get("pass_started_at"))
     else:
-        # An activity is the unit director working directly, so it has no delegate
-        # and the Delegate cell stays empty rather than repeating the unit director.
+        # An activity is the unit director working directly, so it has no worker
+        # and the Worker cell stays empty rather than repeating the unit director.
         model, effort = "", ""
         instance_id = _string(event.get("activity_instance_id"))
         kind = "activity"
@@ -2273,7 +2285,7 @@ def _started_window(event: dict[str, object], event_type: str) -> StageWindow:
         elapsed=0,
         status="open",
         result="",
-        delegate=_agent_display(model, effort),
+        worker=_agent_display(model, effort),
         main=_agent_display(main_model, main_effort),
     )
 
@@ -2283,7 +2295,7 @@ def _running_window(
     slot: str,
     kind: str,
     label: str,
-    delegate: str,
+    worker: str,
     main: str,
     fallback_id: str,
     now: float,
@@ -2301,7 +2313,7 @@ def _running_window(
         elapsed=max(0, int(now - started_at)),
         status="running",
         result="running",
-        delegate=delegate,
+        worker=worker,
         main=main,
     )
 
@@ -2430,7 +2442,7 @@ def _armed_window(
         elapsed=max(0, int(now - started_at)),
         status="armed",
         result="running (early)",
-        delegate=_agent_display(model, effort),
+        worker=_agent_display(model, effort),
         main=_agent_display(main_model, main_effort),
     )
 
@@ -2706,7 +2718,7 @@ def _board_activity(session_dir: Path) -> dict[str, BoardActivity]:
 
     A worker that recorded no pass reaches the table with a role and no duration,
     and a role on its own cannot tell a worker deep in its work from one that
-    stopped an hour ago. The board can. Every delegate posts what it is about to
+    stopped an hour ago. The board can. Every worker posts what it is about to
     do before doing it, attributed to its slot, so the latest line and its age
     answer the question a pass window alone cannot -- for a worker that has one as
     much as for a worker that does not, since an open window says only that the
@@ -3450,7 +3462,7 @@ def _current_worker_cells(
     return tuple(cells)
 
 
-def _delegate_note(
+def _worker_note(
     windows: list[StageWindow],
     activity: dict[str, BoardActivity],
     now: float,
@@ -3475,7 +3487,7 @@ def _delegate_note(
     """
     model_windows = list(_current_worker_windows(windows).values()) if worker_cells else windows
     live = {
-        window["slot"]: window["delegate"]
+        window["slot"]: window["worker"]
         for window in model_windows
         if window["slot"] and (worker_cells or window["status"] in LIVE_WINDOW_STATUSES)
     }
@@ -3536,7 +3548,7 @@ def _stage_table(
             [
                 labels[index],
                 window["main"],
-                window["delegate"],
+                window["worker"],
                 _clock_stamp(window["started_at"]),
                 _format_duration(window["elapsed"]),
                 _window_result(window, _finding_tally(findings, window["started_at"], upper)),
@@ -4087,7 +4099,7 @@ def _phase_section(
     # A phase that has opened no window yet still draws its table: one row
     # saying so, never a header with nothing under it.
     rows = round_table["rows"] or [["-", "-", "-", *(["-"] * len(slots)), "no stage yet"]]
-    delegate_note = _delegate_note(
+    worker_note = _worker_note(
         stage_windows, board_activity, now, slots,
         _current_worker_cells(stage_windows, stage_labels, role_changes, board_activity, slots, now)
         if not tables else (),
@@ -4103,7 +4115,7 @@ def _phase_section(
         *([round_table["earlier"], ""] if tables and round_table["earlier"] else []),
         *([*_render_table(_round_headers(slots), rows, set()), ""] if tables else []),
         *([*round_table["gates"], ""] if round_table["gates"] else []),
-        *([*delegate_note, ""] if delegate_note else []),
+        *([*worker_note, ""] if worker_note else []),
     ]
     return lines, stage_windows, stage_labels
 
@@ -4590,6 +4602,13 @@ def _finish_phase(args: argparse.Namespace) -> None:
             record for record in _parked_phases(state) if record is not phase
         ]
     _write_state(session_dir, state)
+    # A completed phase's state that owns no reservation ends with it. Active and a pending
+    # release stay: only the checkpoint and its confirmed release clear them.
+    if status == "completed":
+        phase_dir = phase_reservation.phase_directory(session_dir, _string(phase.get("id")))
+        state_kind = _string(phase_reservation.read_state(phase_dir).get("kind"))
+        if state_kind in phase_reservation.BOARD_STATES.values():
+            _ = phase_reservation.clear(phase_dir)
     _refresh_phase_table(session_dir)
 
 
@@ -4790,7 +4809,7 @@ def _add_identity_options(parser: argparse.ArgumentParser) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Record and aggregate durable plan-delegate progress events."
+        description="Record and aggregate durable unit progress events."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -4871,7 +4890,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _ = arm_review.add_argument("--session-dir", required=True)
     _ = arm_review.add_argument("--activity", required=True)
-    _ = arm_review.add_argument("--called-task", default="delegate.review")
+    _ = arm_review.add_argument("--called-task", default="direct.review")
     _ = arm_review.add_argument("--lens", default="")
     _ = arm_review.add_argument("--phase-id", default="", help="the open phase the review belongs to, as review.sh --phase names it")
     arm_review.set_defaults(handler=_arm_review)

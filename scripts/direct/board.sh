@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # board.sh — Shared coordination board and mutual-exclusion tokens for a
-# multi-agent delegate phase.
+# multi-agent worker phase.
 #
 # Why a file and not messages: the agents of a phase may be codex
 # processes, which have no ListAgents/SendMessage tool at all, and the
@@ -51,6 +51,8 @@
 # exactly one of N racing acquirers creates the directory and the rest fail.
 
 set -euo pipefail
+UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+[[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
@@ -61,19 +63,19 @@ die() { printf 'board.sh: %s\n' "$1" >&2; exit 2; }
 # log and places them on a timeline built from its own events, so the two have
 # to agree on what time it is -- a board stamped from the wall clock against a
 # ledger stamped from an override puts every role change outside every round.
-# `PLAN_DELEGATE_NOW_EPOCH` is that override, and `-r` versus `-d @` is the only
+# `UNIT_NOW_EPOCH` is that override, and `-r` versus `-d @` is the only
 # thing BSD and GNU date disagree about here.
 now_iso() {
-    if [[ -n "${PLAN_DELEGATE_NOW_EPOCH:-}" ]]; then
-        { date -r "${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -d "@${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null; } \
-            || date -d "@${PLAN_DELEGATE_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z
+    if [[ -n "${UNIT_NOW_EPOCH:-}" ]]; then
+        { date -r "${UNIT_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null || date -d "@${UNIT_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z 2>/dev/null; } \
+            || date -d "@${UNIT_NOW_EPOCH%%.*}" +%Y-%m-%dT%H:%M:%S%z
         return
     fi
     date +%Y-%m-%dT%H:%M:%S%z
 }
 now_epoch() {
-    if [[ -n "${PLAN_DELEGATE_NOW_EPOCH:-}" ]]; then
-        printf '%s\n' "${PLAN_DELEGATE_NOW_EPOCH%%.*}"
+    if [[ -n "${UNIT_NOW_EPOCH:-}" ]]; then
+        printf '%s\n' "${UNIT_NOW_EPOCH%%.*}"
         return
     fi
     date +%s
@@ -87,7 +89,7 @@ flatten() {
 
 # `ask` and `answer` are deliberately absent. A question to a peer is a message
 # now -- SendMessage for a claude member, codex_mesh.py for a codex one -- and
-# leaving the kinds here would give a delegate two ways to ask one question,
+# leaving the kinds here would give a worker two ways to ask one question,
 # with the board's way being the one nobody is listening on. Every kind that
 # remains is a record something later reads back: the progress table, a peer
 # resuming hours on, or the unit director at its next tick.
