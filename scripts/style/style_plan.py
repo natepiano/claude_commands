@@ -425,19 +425,32 @@ def approved_reference_tokens(
     return approved_word_swaps(before[old_cursor:], after[new_cursor:], pairs, unique)
 
 
+@dataclass(frozen=True)
+class UnreadableText:
+    """The file is not at HEAD, or the HEAD file or the worktree file is not UTF-8 text the gate can read."""
+
+
+def head_and_worktree(repo: Path, head_path: str, target: Path) -> tuple[str, str] | UnreadableText:
+    """The text of the file at head_path in HEAD, and the text of the worktree file at target."""
+    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{head_path}"], capture_output=True, check=False)
+    if result.returncode:
+        return UnreadableText()
+    try:
+        return result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return UnreadableText()
+
+
 def approved_reference_file(
     repo: Path, path: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
 ) -> bool:
     target = repo / path
     if not pairs or target.is_symlink() or not target.is_file():
         return False
-    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
-    if result.returncode:
+    texts = head_and_worktree(repo, path, target)
+    if isinstance(texts, UnreadableText):
         return False
-    try:
-        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
-    except (OSError, UnicodeError):
-        return False
+    before, after = texts
     if target.suffix == ".md":
         return before != after and approved_word_swaps(before, after, pairs, unique)
     return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
@@ -761,13 +774,17 @@ class RenamedModuleScan:
         return False
 
 
-def without_trailing_commas(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The words without a comma that ends a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
+def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
+    """The indexes of the commas that end a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
 
     A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
     does not change the code, so a reformat that adds or drops one leaves the code the same. Any other paren list can be
-    a tuple, where `(x,)` and `(x)` differ, so its comma stays.
+    a tuple, where `(x,)` and `(x)` differ, so its comma stays. A comma inside a macro token tree or an attribute stays
+    too: a macro arm or an attribute macro can tell `[1,]` from `[1]`.
     """
+    trees = (*style_footprint.macro_spans(words, style_footprint.delimiter_ends(words)),
+             *style_footprint.attribute_spans(words))
+    in_macros = {index for start, end in trees for index in range(start + 1, end)}
     droppable: list[bool] = []
     dropped: set[int] = set()
     for index, word in enumerate(words):
@@ -775,13 +792,14 @@ def without_trailing_commas(words: tuple[str, ...]) -> tuple[str, ...]:
             lead = words[index - 1] if index else ""
             droppable.append(word != "(" or lead in {">", ")", "]"} or (
                 style_footprint.IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS))
-        elif word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",):
+        elif (word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",)
+              and index - 1 not in in_macros):
             dropped.add(index - 1)
-    return tuple(word for index, word in enumerate(words) if index not in dropped)
+    return frozenset(dropped)
 
 
 def sorted_use_groups(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The words of a `use` item with the entries of each brace group in sorted order."""
+    """The words of a use tree with the entries of each brace group in sorted order, no word dropped."""
     result: list[str] = []
     cursor = 0
     while cursor < len(words):
@@ -801,15 +819,24 @@ def sorted_use_groups(words: tuple[str, ...]) -> tuple[str, ...]:
             inner += 1
         entries.append(sorted_use_groups(words[start:end]))
         result.append("{")
-        for position, entry in enumerate(sorted(entry for entry in entries if entry)):
+        for position, entry in enumerate(sorted(entries)):
             result.extend((",", *entry) if position else entry)
         result.append("}")
         cursor = end + 1
     return tuple(result)
 
 
-def module_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
-    """The first and last word of each `use` item and `mod <name>;` item, attributes and visibility included, in order.
+@dataclass(frozen=True)
+class ModuleItem:
+    """A `use` item or `mod <name>;` item: its first word (attributes and visibility included), its keyword and its `;`."""
+
+    start: int
+    keyword: int
+    end: int
+
+
+def module_items(words: tuple[str, ...]) -> tuple[ModuleItem, ...]:
+    """Each `use` item and `mod <name>;` item, in order.
 
     An item with a `macro_use` attribute is left out: its place decides where its macros can be used.
     """
@@ -817,7 +844,7 @@ def module_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
     attributes = {end: start for start, end in style_footprint.attribute_spans(words)}
     visibilities = {style_footprint.closing(words, index + 1) + 1: index for index, word in enumerate(words[:-1])
                     if word == "pub" and words[index + 1] == "("}
-    items: list[tuple[int, int]] = []
+    items: list[ModuleItem] = []
     for keyword, word in enumerate(words):
         if keyword not in starts:
             continue
@@ -831,58 +858,104 @@ def module_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
         while start in attributes:
             start = attributes[start]
         if end < len(words) and "macro_use" not in words[start:keyword]:
-            items.append((start, end))
+            items.append(ModuleItem(start, keyword, end))
     return tuple(items)
 
 
-def module_runs(words: tuple[str, ...]) -> tuple[tuple[tuple[int, int], ...], ...]:
-    """The runs of adjacent module items, each item by its first and last word, in order."""
-    runs: list[list[tuple[int, int]]] = []
-    for start, end in module_items(words):
-        if runs and runs[-1][-1][1] + 1 == start:
-            runs[-1].append((start, end))
+def module_runs(words: tuple[str, ...]) -> tuple[tuple[ModuleItem, ...], ...]:
+    """The runs of adjacent module items, in order."""
+    runs: list[list[ModuleItem]] = []
+    for item in module_items(words):
+        if runs and runs[-1][-1].end + 1 == item.start:
+            runs[-1].append(item)
         else:
-            runs.append([(start, end)])
+            runs.append([item])
     return tuple(tuple(run) for run in runs)
 
 
-def canonical_order(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The words with trailing commas dropped, use group entries sorted and each run of adjacent module items sorted.
-
-    None of these changes the code, and rustfmt makes them when a rename changes a name's sort order or line length.
-    """
-    words = without_trailing_commas(words)
-    result: list[str] = []
-    cursor = 0
-    for run in module_runs(words):
-        result.extend(words[cursor:run[0][0]])
-        result.extend(word for item in sorted(sorted_use_groups(words[start:end + 1]) for start, end in run)
-                      for word in item)
-        cursor = run[-1][1] + 1
-    result.extend(words[cursor:])
-    return tuple(result)
-
-
-def comment_lines(text: str, spans: tuple[style_footprint.TokenSpan, ...],
-                  renamed: Callable[[str], str]) -> tuple[str | tuple[str, ...], ...]:
-    """The stripped lines of the comments between the code tokens, each passed through renamed, in order.
-
-    The lines from the start of a run of module items to its last word are one sorted entry: canonical_order sorts the
-    run's items, and their comments move with them.
-    """
+def comment_gaps(text: str, spans: tuple[style_footprint.TokenSpan, ...],
+                 renamed: Callable[[str], str]) -> tuple[tuple[str, ...], ...]:
+    """The stripped lines of the comments before each code token, then after the last one, each passed through renamed."""
     ends = (0, *(span.end for span in spans))
     starts = (*(span.start for span in spans), len(text))
-    gaps = tuple(tuple(renamed(line.strip()) for line in text[end:start].splitlines() if line.strip())
+    return tuple(tuple(renamed(line.strip()) for line in text[end:start].splitlines() if line.strip())
                  for end, start in zip(ends, starts, strict=True))
-    entries: list[str | tuple[str, ...]] = []
+
+
+def outer_doc(line: str) -> bool:
+    """Whether the stripped comment line starts an outer doc comment, an attribute of the item after it."""
+    return ((line.startswith("///") and not line.startswith("////"))
+            or (line.startswith("/**") and not line.startswith(("/***", "/**/"))))
+
+
+# A comment line, keyed by the count of the words of its piece before it.
+CommentLine = tuple[int, str]
+# The code words of one place in the code, and the comment lines before them and inside them.
+CodePiece = tuple[tuple[str, ...], tuple[CommentLine, ...]]
+
+
+def run_items(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...], run: tuple[ModuleItem, ...],
+              dropped: frozenset[int]) -> tuple[tuple[str, ...], tuple[CodePiece, ...]]:
+    """The comment lines before a run of module items that stay in place, and each item of the run with its comments.
+
+    An item has its words without the dropped commas, the entries of a `use` tree sorted, and the lines of the gap
+    before its first word and of the gaps inside it, each keyed by the count of the item's words before it. Only the
+    use tree sorts: an attribute, the visibility and a `mod` item keep their words. The gap before the run stays in
+    place up to its first outer doc comment, as rustfmt leaves it there.
+    """
+    first = gaps[run[0].start]
+    doc = next((index for index, line in enumerate(first) if outer_doc(line)), len(first))
+
+    def kept(start: int, end: int) -> tuple[str, ...]:
+        return tuple(words[index] for index in range(start, end) if index not in dropped)
+
+    items: list[CodePiece] = []
+    for item in run:
+        tree = kept(item.keyword + 1, item.end)
+        code = (*kept(item.start, item.keyword + 1), *(sorted_use_groups(tree) if words[item.keyword] == "use" else tree),
+                words[item.end])
+        lines: list[CommentLine] = []
+        key = 0
+        for gap in range(item.start, item.end + 1):
+            lines.extend((key, line) for line in (first[doc:] if gap == run[0].start else gaps[gap]))
+            key += gap not in dropped
+        items.append((code, tuple(lines)))
+    return first[:doc], tuple(items)
+
+
+def canonical_code(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...]) -> tuple[CodePiece, ...]:
+    """The code in canonical order: each word with the comment lines before it, and each item of a run of adjacent
+    module items with its comment lines, the run's items sorted.
+
+    A trailing comma drops, and its comment lines go to the next piece; no other word drops. Use tree entries and the
+    items of a run sort, and a comment moves with its item. None of these changes the code, and rustfmt makes them when
+    a rename changes a name's sort order or line length. A comment line keeps its place among the words of its piece, so
+    a comment that moves to another place in the code changes the pieces.
+    """
+    dropped = trailing_commas(words)
+    pieces: list[CodePiece] = []
+    lines: list[str] = []
+
+    def place(index: int) -> None:
+        """Add word index, or after the last word the comment lines left, as the next piece."""
+        lines.extend(gaps[index])
+        if (index not in dropped and index < len(words)) or (index == len(words) and lines):
+            pieces.append((words[index:index + 1], tuple((0, line) for line in lines)))
+            lines.clear()
+
     cursor = 0
-    for run in module_runs(tuple(span.token.value for span in spans)):
-        first, last = run[0][0], run[-1][1]
-        entries.extend(line for gap in gaps[cursor:first] for line in gap)
-        entries.append(tuple(sorted(line for gap in gaps[first:last + 1] for line in gap)))
-        cursor = last + 1
-    entries.extend(line for gap in gaps[cursor:] for line in gap)
-    return tuple(entries)
+    for run in module_runs(words):
+        for index in range(cursor, run[0].start):
+            place(index)
+        before, items = run_items(words, gaps, run, dropped)
+        if lines or before:
+            pieces.append(((), tuple((0, line) for line in (*lines, *before))))
+            lines.clear()
+        pieces.extend(sorted(items))
+        cursor = run[-1].end + 1
+    for index in range(cursor, len(gaps)):
+        place(index)
+    return tuple(pieces)
 
 
 def renamed_comment(line: str, scans: tuple[RenamedModuleScan, ...]) -> str:
@@ -899,50 +972,100 @@ def renamed_comment(line: str, scans: tuple[RenamedModuleScan, ...]) -> str:
     return CRATE_PATH.sub(renamed_path, line)
 
 
-def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
-    """Whether a Rust file outside the findings changes only the `mod` lines, `#[path]` strings and module paths of
-    approved file renames, and the qualified references of approved renames.
+@dataclass(frozen=True)
+class RenamedText:
+    """A Rust file's HEAD code and comment lines with the edits of the approved renames made, in canonical order.
 
-    The file's HEAD words with each module site renamed, then each qualified reference, must equal its worktree words in
-    canonical order. Its HEAD comments with each `crate` path to a renamed module renamed must equal its worktree
-    comments. A qualified reference reads its parent from the HEAD words.
+    Module sites tells whether the file names a module of an approved file rename, in its code or in a comment.
     """
-    target = repo / path
-    if not moves or target.suffix != ".rs" or target.is_symlink() or not target.is_file():
-        return False
-    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
-    if result.returncode:
-        return False
-    try:
-        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
-    except (OSError, UnicodeError):
-        return False
-    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
-    if len(old) != len(style_footprint.tokens(before)) or len(new) != len(style_footprint.tokens(after)):
-        return False
+
+    code: tuple[CodePiece, ...]
+    module_sites: bool
+
+    def matches(self, after: str) -> bool:
+        """Whether the worktree text has this code and these comment lines in canonical order."""
+        spans = style_footprint.token_spans(after)
+        return (len(spans) == len(style_footprint.tokens(after))
+                and self.code == canonical_code(tuple(span.token.value for span in spans),
+                                                comment_gaps(after, spans, lambda line: line)))
+
+
+@dataclass(frozen=True)
+class NoRenamedText:
+    """The HEAD text has a token the gate cannot read, or a renamed file is not in a crate whose modules it can name."""
+
+
+def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ...],
+                 pairs: tuple[ApprovedRename, ...]) -> RenamedText | NoRenamedText:
+    """The HEAD text of the Rust file at path with the edits of the approved renames made.
+
+    Each module site of an approved file rename takes its new word, then each qualified reference of an approved rename,
+    which reads its parent from the HEAD words. In comments, each `crate` path to a renamed module is renamed.
+    """
+    old = style_footprint.token_spans(before)
+    if len(old) != len(style_footprint.tokens(before)):
+        return NoRenamedText()
     words = tuple(span.token.value for span in old)
     renamed = list(words)
     scans: list[RenamedModuleScan] = []
     for moved in moves:
         root = crate_root(repo, moved)
         if isinstance(root, NoCrateRoot):
-            return False
+            return NoRenamedText()
         module = crate_module(moved.old, root)
         if isinstance(module, OutsideCrate):
-            return False
+            return NoRenamedText()
         scans.append(RenamedModuleScan(path, words, crate_module(path, root), module[:-1], moved, crate_library(repo, root)))
         for index, word in scans[-1].renames().items():
             renamed[index] = word
-    comments = comment_lines(before, old, lambda line: renamed_comment(line, tuple(scans)))
-    if tuple(renamed) == words and comments == comment_lines(before, old, lambda line: line):
-        return False
+    comments = comment_gaps(before, old, lambda line: renamed_comment(line, tuple(scans)))
+    module_sites = tuple(renamed) != words or comments != comment_gaps(before, old, lambda line: line)
     use_parents = use_reference_parents(words)
     for index, word in enumerate(words):
         for pair in pairs:
             if word == pair.old and approved_reference_qualifier(words, index, use_parents, pair):
                 renamed[index] = pair.new
-    return (canonical_order(tuple(renamed)) == canonical_order(tuple(span.token.value for span in new))
-            and comments == comment_lines(after, new, lambda line: line))
+    return RenamedText(canonical_code(tuple(renamed), comments), module_sites)
+
+
+def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
+    """Whether a Rust file outside the findings changes only the `mod` lines, `#[path]` strings and module paths of
+    approved file renames, and the qualified references of approved renames.
+
+    The file must name a renamed module, and its worktree text must be its renamed_text. A file that names no renamed
+    module is judged by approved_reference_file alone.
+    """
+    target = repo / path
+    if not moves or target.suffix != ".rs" or target.is_symlink() or not target.is_file():
+        return False
+    texts = head_and_worktree(repo, path, target)
+    if isinstance(texts, UnreadableText):
+        return False
+    expected = renamed_text(repo, path, texts[0], moves, pairs)
+    return isinstance(expected, RenamedText) and expected.module_sites and expected.matches(texts[1])
+
+
+def approved_renamed_file(repo: Path, moved: FileRename, moves: tuple[FileRename, ...],
+                          pairs: tuple[ApprovedRename, ...]) -> bool:
+    """Whether the new file of an approved file rename is the old file at HEAD with only the edits approved_module_file
+    allows, so no definition moves into or out of it.
+
+    The old file must be gone and no file may be at the new path in HEAD. Self references such as `crate::ledger::lock`
+    take the new name. The file's `use` and `mod` lines may take another order, which moves no definition between files.
+    """
+    target = repo / moved.new
+    in_head = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"HEAD:{moved.new}"],
+                             capture_output=True, check=False).returncode == 0
+    if target.is_symlink() or not target.is_file() or os.path.lexists(repo / moved.old) or in_head:
+        return False
+    texts = head_and_worktree(repo, moved.old, target)
+    if isinstance(texts, UnreadableText):
+        return False
+    # An unchanged file needs no scan, so a file outside every crate root, as in `tests/`, can move too.
+    if texts[0] == texts[1]:
+        return True
+    expected = renamed_text(repo, moved.old, texts[0], moves, pairs)
+    return isinstance(expected, RenamedText) and expected.matches(texts[1])
 
 
 def outside_refusal(path: str, moves: tuple[FileRename, ...]) -> str:
@@ -998,8 +1121,8 @@ def gate(repo: Path, ticket_id: str) -> int:
             moves = approved_file_renames(findings)
             allowed = {finding.path for finding in findings} | {moved.new for moved in moves}
             outside = changed_files(repo) - allowed
+            pairs = approved_rename_pairs(findings)
             if outside:
-                pairs = approved_rename_pairs(findings)
                 unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
                 modified = modified_reference_files(repo)
                 refused = [path for path in sorted(outside)
@@ -1008,6 +1131,16 @@ def gate(repo: Path, ticket_id: str) -> int:
                 if refused:
                     raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
                         outside_refusal(path, moves) for path in refused))
+            # A finding path is free, and a renamed file that another finding names moves under that approval.
+            free = {finding.path for finding in findings
+                    if not isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)}
+            # A rename with its old file still there and no new file is not applied: the check below reports it.
+            changed = [moved for moved in moves if not {moved.old, moved.new} & free
+                       and (os.path.lexists(repo / moved.new) or not os.path.lexists(repo / moved.old))
+                       and not approved_renamed_file(repo, moved, moves, pairs)]
+            if changed:
+                raise style_ledger.LedgerError("renamed files with other changes: " + ", ".join(
+                    f"{moved.new} (renamed from {moved.old}: change is not only the rename)" for moved in changed))
             unapplied = tuple(finding for finding in findings if isinstance(worktree_check(repo, finding), RenameNotApplied))
             if unapplied:
                 for finding in unapplied:

@@ -698,8 +698,20 @@ than LockError` and `move nothing apart from LockError` are refused. A clause st
 It is applied when only the new file is in the code, and not applied when only the
 old file is. It has no check when a folder of child modules (`lock/` or
 `mutation_lock/`) is there; the gate refuses changes in that folder, and a person
-moves it. The gate allows the old file to go and the new file to come, with any
-content. In other Rust files it allows only the `mod <old>;` line and the path
+moves it. The gate allows the old file to go and the new file to come, and it
+compares the new file with the old file at HEAD. The old file must be gone, and
+no file may be at the new path in HEAD. The new file may change only as the other
+Rust files below may: its own paths such as `crate::ledger::lock::LockError` take
+the new name, and its `use` and `mod` lines may take the order rustfmt gives them.
+A definition that comes into or goes out of the file, or any other change, is
+refused (`<new> (renamed from <old>: change is not only the rename)`). When
+another finding of the ticket has the old or the new path, the new file is free,
+as a finding's file is: it moves under that finding's approval, so an item rename
+declared there can change it. A new file that is byte-identical to the old one
+passes with no scan, also outside every crate root (`tests/helper.rs`). The text rules do not catch every move request
+(`only LockError goes into ledger/error.rs`): when the worker builds only the
+rename, the gate marks the finding built. In other
+Rust files it allows only the `mod <old>;` line and the path
 segments that name the module: `super::lock`, `self::lock`, `crate::ledger::lock`,
 `ledger::lock` from the module that holds `ledger`, `alpha::ledger::lock` in a file
 outside the crate (where `alpha` is the library's name), a `pub use lock::...`
@@ -710,11 +722,14 @@ marks changes with it. A `mod lock;` line with a `path` attribute in any other f
 stays, and so does a `mod` or `use` line inside a macro (`stringify!(…)`, a
 `macro_rules!` body), where the words are tokens, not items. When the ticket also renames an item, its qualified references there change
 too. The `use` and `mod` lines may take the order rustfmt gives them, with their
-attributes, and a call's trailing comma may change. The gate refuses every other
+attributes, and a call's trailing comma may change, except inside a macro or an attribute,
+which can match `[1,]` and not `[1]`. The gate refuses every other
 change in those files. A comment changes only where a `crate::` path names the
 module (`` [`crate::ledger::lock`] ``); a `self::` or `super::` path in a comment
-stays. Comments stay in their order; only comments inside a block of `use` and
-`mod` lines move with them.
+stays. Comments stay in their order. In a block of `use` and `mod` lines, a comment
+belongs to the line below it and moves with that line, so a doc comment cannot go to
+another module (`/// Alpha API.` stays on `pub mod alpha;`). A comment above the
+block that is not a doc comment stays above it, as rustfmt keeps it there.
 The decision stays open and approved until every finding is built or waived.
 
 To repair a decision or an old issue that closed too early, run
