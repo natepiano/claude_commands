@@ -206,6 +206,8 @@ class Failed:
     failed_rules: list[str]
     metadata: ReviewMetadata = ReviewMetadata()
     failures: tuple[RuleFailure, ...] = ()
+    # The reviewer's questions when it asked instead of rewriting.
+    questions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -745,14 +747,22 @@ def _review(draft: Draft, revision: bool, runner: ProcessRunner,
         return Unreviewed(f"review unavailable: {type(error).__name__}: {error}", details())
 
 
-def review(draft: Draft, revision: bool, *, runner: ProcessRunner = run_process) -> ReviewOutcome:
+def review(draft: Draft, revision: bool, *, runner: ProcessRunner = run_process,
+           limit: float = math.inf) -> ReviewOutcome:
+    """The cold-read review of a push. `limit` caps the seconds of the whole review, the check of a rewrite
+    included; a review that runs out of time is Unreviewed("timeout")."""
     timeout_seconds = review_timeout_seconds()
-    outcome = _review(draft, revision, runner, timeout_seconds=timeout_seconds)
+    started = time.monotonic()
+    outcome = _review(draft, revision, runner, timeout_seconds=min(timeout_seconds, limit))
     if isinstance(outcome, Questions):
-        return Failed(outcome.best_version, outcome.failed_rules, outcome.metadata, outcome.failures)
+        return Failed(outcome.best_version, outcome.failed_rules, outcome.metadata, outcome.failures,
+                      tuple(outcome.questions))
     if not isinstance(outcome, Rewritten):
         return outcome
-    checked = _review(outcome.version, True, runner, timeout_seconds=timeout_seconds)
+    left = limit - (time.monotonic() - started)
+    if left <= 0:
+        return Unreviewed("timeout", outcome.metadata, outcome.failures)
+    checked = _review(outcome.version, True, runner, timeout_seconds=min(timeout_seconds, left))
     metadata = replace(checked.metadata, seconds=outcome.metadata.seconds + checked.metadata.seconds)
     if isinstance(checked, Approved):
         return replace(outcome, metadata=metadata)
@@ -760,7 +770,8 @@ def review(draft: Draft, revision: bool, *, runner: ProcessRunner = run_process)
         return replace(checked, metadata=metadata)
     if isinstance(checked, Withheld):
         return replace(checked, metadata=metadata)
-    return Failed(best_version(outcome.version, checked), checked.failed_rules, metadata, checked.failures)
+    questions = tuple(checked.questions) if isinstance(checked, Questions) else ()
+    return Failed(best_version(outcome.version, checked), checked.failed_rules, metadata, checked.failures, questions)
 
 
 def _append(entry: ReviewRecord) -> None:

@@ -15,9 +15,21 @@ of the session's production (--production, else the production mark the session'
 natedev session when there is none or it is not running. The case's transcript is the stopped session's:
 --transcript, else the newest transcript of the live session on this machine that --session names, else none.
 
-`start` and `fixed` each send the user one push, permission.rca_started and permission.rca_fixed, with the
-key rca-<id>: while silence is on, the fixed push replaces the started one. `remind`, which stall_watch.py
-runs on each pass, sends the owner one reminder for a case still open 30 minutes after it opened.
+A case keeps what its pushes tell the user: when the session stopped, the commands (whose first words give
+the kind of action: a file change, a shell command), the alert's waits sentence, and the alert's sender and
+key. `start` and `fixed` each send the user one push, permission.rca_started and permission.rca_fixed, with
+the key rca-<id>: while silence is on, the fixed push replaces the started one. Only the started push repeats
+the waits sentence, as nothing waits once the stop is fixed. Neither names the owner, a file, a command or a
+commit; the commit stays in the case and the owner log.
+
+`fixed` runs the cold-read push review (review.py) on the whole fixed text first, as cause and fix are free
+text. On the first refusal it sends nothing, prints the reviewer's failures and questions, counts the
+refusal in the case and exits 1, so the owner rewrites --cause and --fix once. On a second refusal it sends
+the reviewer's own rewrite (permission.rca_fixed_rewritten), or the owner's text when the reviewer gave no
+rewrite. With no reviewer, or the review off, the owner's text goes. Before the push, `send.py retire`
+retires the case's alert by its sender and key: a kept alert never goes out at silence end, and an
+emergency alert stops repeating. `remind`, which stall_watch.py runs on each pass, sends the owner one
+reminder for a case still open 30 minutes after it opened.
 
 The owner message and the reminder start send.py detached and do not wait for it, as a relay can take
 minutes; its output goes to STATE/owner.log. The start and fixed pushes wait for send.py and print its outcome.
@@ -45,8 +57,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import push_texts  # noqa: E402
+import review  # noqa: E402
 import sessions  # noqa: E402
 import showrunners  # noqa: E402
+import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
@@ -63,14 +77,19 @@ SENDER = "rca"
 NO_PRODUCTION = "messaging"
 STARTED_TEXT = "permission.rca_started"
 FIXED_TEXT = "permission.rca_fixed"
+# The reviewer's rewrite of a fixed text it refused twice: its title and body as the reviewer wrote them.
+REWRITTEN_TEXT = "permission.rca_fixed_rewritten"
 REMIND_AFTER = timedelta(minutes=30)
-# send.py's REFUSED_COMMAND_LENGTH: a longer command shows its first 89 characters and "…".
-COMMAND_LENGTH = 90
 # A user push waits for its review; a Claude recipient falls back to a relay.
 SEND_SECONDS = 300
 # The output of each detached owner message and reminder, after a line with its time and key.
 OWNER_LOG = "owner.log"
-SHORT_SHA = re.compile(r"[0-9a-f]{9,40}")
+# The first word of a command that changes a file: auto_mode.refused's "write …" and "edit …", and the
+# tool names stall_watch.py records for a pending edit or write call.
+FILE_WORDS = frozenset({"write", "edit", "multiedit", "notebookedit"})
+# Any other Claude Code tool name stall_watch.py records: "WebFetch", "mcp__brp__brp_launch".
+TOOL_NAME = re.compile(r"[A-Z][A-Za-z]+|mcp__\S+")
+CHANNEL_PRIORITY = {"note": "0", "decision": "1", "blocked": "2"}
 
 Kind = Literal["prompt", "auto_mode"]
 Status = Literal["open", "started", "fixed"]
@@ -92,16 +111,31 @@ class Case(TypedDict):
     commit: str
     reminded: bool
     alerts: int
+    # When the session stopped (UTC ISO time); a case from before 2026-10-23 reads its opened time.
+    stopped: str
+    # The alert's sentence of what waits on the session, or "".
+    waits: str
+    # The alert's sender and key, which `send.py retire` retires it by; "" when the alert had no key.
+    alert_source: str
+    alert_key: str
+    # How many times the push review refused the fixed text.
+    refusals: int
 
 
 class Report(NamedTuple):
-    """One permission alert that went to the user: the facts a case opens with."""
+    """One permission alert that went to the user: the facts a case opens with.
+
+    stopped is a UTC ISO time, "" for the time the case opens; source and key are the alert's sender and key."""
     session: str
     machine: str
     kind: Kind
     commands: tuple[str, ...]
     transcript: str = ""
     production: str = ""
+    stopped: str = ""
+    waits: str = ""
+    source: str = ""
+    key: str = ""
 
 
 def now() -> datetime:
@@ -121,10 +155,13 @@ def case_path(case_id: str) -> Path:
 
 
 def read_case(path: Path) -> Case | None:
+    """The case in the file; a case saved before a field existed reads that field's default."""
     try:
-        return cast(Case, json.loads(path.read_text(encoding="utf-8")))
+        found = cast(Case, json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError):
         return None
+    defaults = {"stopped": found["opened"], "waits": "", "alert_source": "", "alert_key": "", "refusals": 0}
+    return cast(Case, cast(object, defaults | dict(found)))
 
 
 def cases() -> list[Case]:
@@ -175,12 +212,35 @@ def owner_address(production: str) -> str:
         return NATEDEV
 
 
-def shown_commands(commands: list[str]) -> str:
-    """One command, "a and b", or "a, b and c", each cut to fit the phone."""
-    shown = [command if len(command) <= COMMAND_LENGTH else command[:COMMAND_LENGTH - 1] + "…" for command in commands]
-    if not shown:
-        return "permission"
-    return shown[0] if len(shown) == 1 else ", ".join(shown[:-1]) + " and " + shown[-1]
+def kind_of(command: str) -> str:
+    words = command.split()
+    first = words[0] if words else ""
+    if first.lower() in FILE_WORDS:
+        return "file change"
+    return "action" if len(words) == 1 and TOOL_NAME.fullmatch(first) else "shell command"
+
+
+def action_of(commands: list[str] | tuple[str, ...]) -> str:
+    """The kind of action the commands are, in plain words: "a file change", "2 shell commands", or
+    "2 actions" when they are of mixed kinds; "an action" when there are none."""
+    kinds = [kind_of(command) for command in commands if command.strip()]
+    if not kinds:
+        return "an action"
+    if len(kinds) == 1:
+        return ("an " if kinds[0][0] in "aeiou" else "a ") + kinds[0]
+    return f"{len(kinds)} {kinds[0] if len(set(kinds)) == 1 else 'action'}s"
+
+
+def waits_line(waits: str) -> str:
+    """The sentence of what waits on the stopped session, after the sentence of the stop; "" for none."""
+    return f" {waits}." if waits else ""
+
+
+def story(case: Case) -> dict[str, str]:
+    """The values both pushes start with: the session, when it stopped, and why it stopped."""
+    action = action_of(case["commands"])
+    return {"session": case["session"], "time": silence.shown(datetime.fromisoformat(case["stopped"])),
+            "stop": f"auto mode refused {action}" if case["kind"] == "auto_mode" else f"it asked you to allow {action}"}
 
 
 def owner_message(case: Case, *, reminder: bool = False) -> str:
@@ -195,7 +255,9 @@ def owner_message(case: Case, *, reminder: bool = False) -> str:
              "2. Find where the command came from: a work order, a helper prompt, a skill or a script.",
              "3. Route the fix to the unit that owns that source, so the command never needs a prompt "
              + "(an allow rule only when the command is safe and expected).",
-             f"4. After the fix merges, run `{CALL} fixed {case['id']} --cause \"<cause>\" --fix \"<fix>\" --commit <sha>`.",
+             f"4. After the fix merges, run `{CALL} fixed {case['id']} --cause \"<cause>\" --fix \"<fix>\" --commit <sha>`."
+             + " Write cause and fix in plain words for someone who does not know the code: no file names,"
+             + " commands or shas. The push review reads them first; when it refuses, rewrite them once.",
              "Steps 1 and 4 each send the user a push."]
     return "\n".join(lines)
 
@@ -227,12 +289,48 @@ def tell_owner(case: Case, *, reminder: bool = False) -> str:
     return ""
 
 
-def push(case: Case, text_id: str, values: dict[str, str]) -> tuple[bool, str]:
-    sender = case["production"] or NO_PRODUCTION
-    rendered = push_texts.render(text_id, sender=sender, session=case["session"], **values)
-    command = push_texts.user_send_argv(rendered, sender=sender)
+def sender_of(case: Case) -> str:
+    return case["production"] or NO_PRODUCTION
+
+
+def push(case: Case, rendered: push_texts.RenderedPush) -> tuple[bool, str]:
+    command = push_texts.user_send_argv(rendered, sender=sender_of(case))
     # The send script is the one this module is set to use, so a test's stands in for it.
     return send([*command[2:], "--key", f"rca-{case['id']}"])
+
+
+def retire_alert(case: Case) -> str:
+    """Retire the case's alert by its sender and key, and say what send.py did; "" when it has no key."""
+    if not case["alert_key"]:
+        return ""
+    command = push_texts.user_retire_argv(case["alert_source"], case["alert_key"])
+    return send(command[2:])[1]
+
+
+def cold_read(rendered: push_texts.RenderedPush) -> review.ReviewOutcome:
+    """The live push review pushover.py runs on a push, on the whole rendered text."""
+    if review.switched_off():
+        return review.Unreviewed("review off")
+    draft = review.Draft(rendered.sender, CHANNEL_PRIORITY[rendered.need], rendered.title, rendered.action,
+                         rendered.body, False, rendered.session)
+    return review.review(draft, False)
+
+
+def refusal(outcome: review.Rewritten | review.Failed | review.Withheld, rendered: push_texts.RenderedPush) -> str:
+    """What the owner reads when the review refuses the fixed text: what failed, and what to do."""
+    lines = ["rca: not sent: the push review refused this text:", rendered.title, rendered.body]
+    lines += [f"failed: {failure.rule}: {failure.quote}" for failure in outcome.failures]
+    if isinstance(outcome, review.Withheld):
+        lines.append("withheld: " + outcome.why)
+    if isinstance(outcome, review.Failed):
+        lines += ["question: " + question for question in outcome.questions]
+    version = outcome.version if isinstance(outcome, review.Rewritten) else outcome.best_version
+    if version.body != rendered.body:
+        lines += ["The reviewer's rewrite:", version.title, version.body]
+    lines.append("Write --cause and --fix again in plain words for someone who does not know the code: no file"
+                 + " names, commands or shas. Then run fixed again; when the review refuses it again, the"
+                 + " reviewer's rewrite goes instead.")
+    return "\n".join(lines)
 
 
 def open_case(report: Report, at: datetime | None = None) -> str:
@@ -252,7 +350,9 @@ def open_case(report: Report, at: datetime | None = None) -> str:
             case = Case(id=new_id(opened), session=report.session, machine=report.machine,
                         production=production_of(report), commands=commands, kind=report.kind,
                         transcript=transcript_of(report), opened=opened.isoformat(), status="open", owner="",
-                        cause="", fix="", commit="", reminded=False, alerts=1)
+                        cause="", fix="", commit="", reminded=False, alerts=1,
+                        stopped=report.stopped or opened.isoformat(), waits=one_line(report.waits),
+                        alert_source=report.source, alert_key=report.key, refusals=0)
             save(case)
         failure = tell_owner(case)
         if failure:
@@ -278,19 +378,36 @@ def start(case_id: str, owner: str) -> tuple[bool, str]:
             raise ValueError(f"case {case_id} is fixed")
         case["status"], case["owner"] = "started", owner
         save(case)
-    return push(case, STARTED_TEXT, {"owner": owner, "commands": shown_commands(case["commands"])})
+    # Only the started push says what waits: the fixed push comes when nothing waits any more.
+    return push(case, push_texts.render(STARTED_TEXT, sender=sender_of(case), waits_line=waits_line(case["waits"]),
+                                        **story(case)))
 
 
 def fixed(case_id: str, cause: str, fix: str, commit: str) -> tuple[bool, str]:
-    """Close the case. The template ends cause and fix with its own period."""
-    commit = commit.strip()
+    """Close the case after the push review reads its fixed text, retire its alert, and send the fixed push.
+
+    The template ends cause and fix with its own period. On the first refusal nothing changes but the count."""
+    cause, fix = one_line(cause).rstrip("."), one_line(fix).rstrip(".")
+    case = loaded(case_id)
+    rendered = push_texts.render(FIXED_TEXT, sender=sender_of(case), cause=cause, fix=fix, **story(case))
+    outcome = cold_read(rendered)
+    refused = isinstance(outcome, review.Rewritten | review.Failed | review.Withheld)
     with locked():
         case = loaded(case_id)
-        case["status"], case["commit"] = "fixed", commit
-        case["cause"], case["fix"] = one_line(cause).rstrip("."), one_line(fix).rstrip(".")
+        if refused:
+            case["refusals"] += 1
+        if refused and case["refusals"] == 1:
+            save(case)
+            return False, refusal(outcome, rendered)
+        case["status"], case["commit"], case["cause"], case["fix"] = "fixed", commit.strip(), cause, fix
         save(case)
-    shown = commit[:8] if SHORT_SHA.fullmatch(commit) else commit
-    return push(case, FIXED_TEXT, {"cause": case["cause"], "fix": case["fix"], "commit": shown})
+    version = (outcome.version if isinstance(outcome, review.Rewritten) else outcome.best_version
+               if isinstance(outcome, review.Failed | review.Withheld) else None)
+    if version is not None and version.body != rendered.body:
+        rendered = push_texts.render(REWRITTEN_TEXT, sender=sender_of(case), title=version.title, body=version.body)
+    retired = retire_alert(case)
+    sent, detail = push(case, rendered)
+    return sent, "\n".join(part for part in (retired, detail) if part)
 
 
 def remind(at: datetime | None = None) -> None:

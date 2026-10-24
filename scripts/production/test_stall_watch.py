@@ -603,6 +603,11 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
         self.assertEqual((case["session"], case["production"], case["kind"], case["status"], case["commands"],
                           case["transcript"]),
                          ("unit-one", "showrunner", "prompt", "open", [DELETE_CALL["command"]], str(transcript)))
+        # The case keeps when the wait began (the pending call's time), and the alert's sender and key,
+        # which `rca.py fixed` retires it by.
+        self.assertEqual((case["stopped"], case["alert_source"], case["alert_key"], case["waits"]),
+                         (datetime.fromtimestamp(START - 60, ZoneInfo("UTC")).isoformat(), "stall-watch",
+                          "stall-watch:prompt:showrunner:unit-one", ""))
         owner = self.owner_messages()
         self.assertEqual([(item["to"], item["from"], item["key"]) for item in owner],
                          [(f"uds:{self.root / 'show-id.sock'}", "rca", "rca-261006-1")])

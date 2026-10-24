@@ -91,6 +91,24 @@ class SilenceTests(unittest.TestCase):
             _ = silence.keep(push, "Linux")
         self.assertEqual(self.kept_titles(), ["First", "Second", "Build", "Tests"])
 
+    def test_drop_removes_the_kept_pushes_with_its_source_and_key_and_says_how_many(self) -> None:
+        _ = self.main("on")
+        pushes: list[silence.KeptPush] = [{**PUSH, "title": "Alert", "source": "stall-watch", "key": "prompt"},
+                                          {**PUSH, "title": "Other source", "key": "prompt"},
+                                          {**PUSH, "title": "No key"}, {**PUSH, "title": "Other key", "source": "stall-watch",
+                                                                        "key": "prompt-2"}]
+        for push in pushes:
+            _ = silence.keep(push, "Linux")
+        self.assertEqual(silence.drop("stall-watch", "prompt", "Linux"), 1)
+        self.assertEqual(self.kept_titles(), ["Other source", "No key", "Other key"])
+        # An empty key drops nothing, as an empty key never replaces; a second drop finds nothing.
+        self.assertEqual(silence.drop("build", "", "Linux"), 0)
+        self.assertEqual(self.main("drop", "--source", "stall-watch", "--key", "prompt"), "0\n")
+        self.assertEqual(self.main("drop", "--source", "stall-watch", "--key", "prompt-2"), "1\n")
+        self.assertEqual(self.kept_titles(), ["Other source", "No key"])
+        # Drop works with silence off too, and leaves silence as it was.
+        self.assertIn("silence on", self.main("status"))
+
     def test_a_line_kept_before_pushes_had_a_key_reads_with_an_empty_key(self) -> None:
         old = {name: value for name, value in PUSH.items() if name != "key"}
         self.assertEqual(silence.parse_push(json.dumps(old)), PUSH)
@@ -213,6 +231,22 @@ class MacTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(silence.keep(PUSH, "Darwin", asker((255, ""))), silence.NotSilent())
         self.assertIn("natedev could not be asked", errors.getvalue())
+
+    def test_a_drop_asks_natedev_and_drops_nothing_when_natedev_cannot_answer(self) -> None:
+        asked: list[tuple[list[str], str]] = []
+
+        def asker(answer: tuple[int, str]) -> silence.Ask:
+            def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
+                asked.append((list(argv), text))
+                return answer
+            return ask
+
+        self.assertEqual(silence.drop("stall-watch", "stall-watch:prompt:x y", "Darwin", asker((0, "2\n"))), 2)
+        self.assertEqual(asked[0], ([*silence.SSH, silence.REMOTE + " drop --source stall-watch --key 'stall-watch:prompt:x y'"], ""))
+        for answer in ((255, ""), (0, "not a number\n")):
+            with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(silence.drop("stall-watch", "k", "Darwin", asker(answer)), 0)
+            self.assertIn("natedev could not be asked to drop k", errors.getvalue())
 
     def test_natedev_keep_reads_the_push_on_stdin(self) -> None:
         with (tempfile.TemporaryDirectory() as folder, mock.patch.object(silence, "state_dir", return_value=Path(folder)),

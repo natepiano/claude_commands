@@ -10,6 +10,11 @@ user_zone.py) or --for (a span: 1h, 45min, 1h30min) makes a transient systemd us
 runs `off` then. `on` again replaces the end. If the end passes without the timer (natedev was
 off), the next push or silence.py call ends silence as `off` does.
 
+`drop --source S --key K` removes the kept pushes with that source and non-empty key, by the rule
+that makes a newer kept push replace an older one, and prints how many it removed. `send.py retire
+--to user` runs it: a retired alert, such as the alert of a fixed rca.py case, never goes out at
+silence end.
+
 auto_silence.py turns silence on with the auto marker when the user is idle, and ends only that
 silence when they come back; `on` replaces the marker, so a silence set by hand stays until `off`.
 
@@ -208,6 +213,20 @@ def keep_here(push: KeptPush, runner: Run | None = None, deliver: Deliver | None
         return Kept(ends(record))
 
 
+def drop_here(source: str, key: str) -> int:
+    """Remove the kept pushes with this source and key, as a newer kept push replaces them; how many."""
+    if not key:
+        return 0
+    with locked():
+        kept = read_kept()
+        left = [push for push in kept if (push["source"], push["key"]) != (source, key)]
+        if len(left) != len(kept):
+            temporary = kept_file().with_suffix(".tmp")
+            _ = temporary.write_text("".join(json.dumps(push) + "\n" for push in left), encoding="utf-8")
+            _ = temporary.replace(kept_file())
+    return len(kept) - len(left)
+
+
 def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
     done = subprocess.run(list(argv), input=text, capture_output=True, text=True, check=False)
     return done.returncode, done.stdout
@@ -223,6 +242,17 @@ def keep(push: KeptPush, system: str | None = None, asker: Ask = ask, deliver: D
     if code != 1:
         print(f"silence: natedev could not be asked (exit {code}); sending", file=sys.stderr)
     return NotSilent()
+
+
+def drop(source: str, key: str, system: str | None = None, asker: Ask = ask) -> int:
+    """Remove the kept pushes with this source and key; how many. On the Mac natedev removes them."""
+    if not on_mac(system):
+        return drop_here(source, key)
+    code, out = asker([*SSH, f"{REMOTE} {shlex.join(['drop', '--source', source, '--key', key])}"], "")
+    if code != 0 or not out.strip().isdigit():
+        print(f"silence: natedev could not be asked to drop {key} (exit {code})", file=sys.stderr)
+        return 0
+    return int(out.strip())
 
 
 def on(until: datetime | None, runner: Run) -> int:
@@ -317,11 +347,14 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
     _ = commands.add_parser("off", help="end silence and post the kept pushes")
     _ = commands.add_parser("status", help="say whether silence is on")
     _ = commands.add_parser("keep", help="pushover.py: keep the push JSON on stdin when silence is on")
+    dropping = commands.add_parser("drop", help="send.py retire: remove the kept pushes with this source and key")
+    _ = dropping.add_argument("--source", required=True)
+    _ = dropping.add_argument("--key", required=True)
     options = parser.parse_args(arguments)
     if on_mac(system):
         return remote([*SSH, f"{REMOTE} {shlex.join(arguments)}"])
     command = cast(str, options.command)
-    if command not in ("off", "keep"):
+    if command not in ("off", "keep", "drop"):
         _ = end_if_past(runner)
     if command == "on":
         until_text, span = cast(str | None, options.until), cast(str | None, options.span)
@@ -350,6 +383,9 @@ def main(argv: Sequence[str] | None = None, runner: Run = run, system: str | Non
             print(kept.until)
             return 0
         return 1
+    if command == "drop":
+        print(drop_here(cast(str, options.source), cast(str, options.key)))
+        return 0
     return status()
 
 

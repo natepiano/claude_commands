@@ -126,6 +126,9 @@ class SendTests(ShutdownTestCase):
         self.relayed: list[send.Message] = []
         self.outcome: send.Result = send.Result("sent", "ok")
         self.cases: list[rca.Report] = []
+        # What the fake push review gives; None approves the draft. Each review's draft and time limit.
+        self.verdict: review.ReviewOutcome | None = None
+        self.reviews: list[tuple[review.Draft, float]] = []
 
     @override
     def setUp(self) -> None:
@@ -135,6 +138,8 @@ class SendTests(ShutdownTestCase):
         self.root = Path(directory.name)
         # No test opens a real rca.py case: it would write the machine's cases and message its owner.
         _ = self.enterContext(mock.patch.object(rca, "open_case", self.open_case))
+        # No test runs the real push review (claude -p): an auto_mode.refused send reviews its waits sentence.
+        _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
         for name, value in (("STATE", self.root), ("SESSIONS", self.root / "sessions"), ("relay", self.relay)):
             patcher = mock.patch.object(send, name, value)
             _ = patcher.start()
@@ -183,6 +188,11 @@ class SendTests(ShutdownTestCase):
         del timeout
         self.relayed.append(message)
         return self.outcome
+
+    def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
+        del revision
+        self.reviews.append((draft, limit))
+        return self.verdict or review.Approved(draft)
 
     def send(self, *args: str) -> send.Result:
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
@@ -621,14 +631,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                   "nothing to cancel: no emergency push for prompt-1 is repeating"),
                  ((1, "", "pushover: could not reach Pushover: timed out\n"), 3,
                   "FAILED: the emergency push for prompt-1 may still repeat: pushover: could not reach Pushover: timed out"))
-        for response, expected, line in cases:
+        # A push kept during silence with the key goes too, so it never goes out when silence ends.
+        kept = {"source": "stall_watch", "priority": "2", "title": "t", "message": "m", "detail": "", "key": "prompt-1"}
+        (self.root / "notify").mkdir()
+        _ = (self.root / "notify/silence-kept.jsonl").write_text(json.dumps(kept) + "\n"
+                                                                 + json.dumps(kept | {"key": "prompt-2"}) + "\n")
+        for (response, expected, line), dropped in zip(cases, ("1 kept push", "0 kept pushes", "0 kept pushes")):
             with (self.subTest(line=line), mock.patch.object(send, "run", return_value=response) as run,
                   redirect_stdout(io.StringIO()) as output):
                 code = send.main(["retire", "--to", "user", "--from", "stall_watch", "--key", "prompt-1"])
             self.assertEqual(code, expected)
-            self.assertEqual(output.getvalue(), f"retired 0 queued messages\n{line}\n")
+            self.assertEqual(output.getvalue(), f"retired 0 queued messages\ndropped {dropped}\n{line}\n")
             self.assertEqual(cast(list[str], run.call_args.args[0])[1:],
                              [str(send.USER_CHANNEL), "cancel", "--source", "stall_watch", "prompt-1"])
+        self.assertIn('"key": "prompt-2"', (self.root / "notify/silence-kept.jsonl").read_text())
 
     def test_registry_argv_key_reaches_the_user_send(self) -> None:
         rendered = push_texts.render("nixos.ups_shutdown")
@@ -1423,15 +1439,16 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.need, "decision")
         self.assertIn("sender=cargo-liner-style", options.values)
         self.assertIn("rule_line=", options.values)
-        self.assertIn("Refused:\nimplement.sh --to modules-impl\nreview.sh --to modules-test\n"
-                      + "The P542 build waits for them.\n\nApprove: it goes on now, but these commands can stop it again.",
-                      options.text or "")
-        self.assertTrue((options.text or "").endswith("Allow rule: it never stops on these commands again."))
+        self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n"
+                      + "implement.sh --to modules-impl\nreview.sh --to modules-test\n\n"
+                      + "Approve: the work goes on now, and auto mode can stop it on these commands again.", options.text or "")
+        self.assertTrue((options.text or "").endswith("Allow rule: the work goes on now, and auto mode lets these commands run from then on."))
         one = local_options(self.auto_mode_arguments(commands=("git push origin build-followups-messaging",),
                                                      waits="The merge waits for it.", rule="Bash(git push:*)"))
-        self.assertIn("Refused: git push origin build-followups-messaging\nThe merge waits for it.\n\n"
-                      + "Approve: it goes on now, but this command can stop it again.", one.text or "")
-        self.assertTrue((one.text or "").endswith("never stops on this command again. The rule: Bash(git push:*)"))
+        self.assertIn("Auto mode refused a shell command in the modules session. The merge waits for it.\n"
+                      + "git push origin build-followups-messaging\n\n"
+                      + "Approve: the work goes on now, and auto mode can stop it on this command again.", one.text or "")
+        self.assertTrue((one.text or "").endswith("lets this command run from then on. The rule: Bash(git push:*)"))
         with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
             self.assertEqual(send.send(options).outcome, "sent")
         command = cast(list[str], run.call_args.args[0])
@@ -1459,7 +1476,9 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             with self.subTest(outcome=outcome), mock.patch.object(send, "run", return_value=reply):
                 self.assertEqual(send.send(options).outcome, outcome)
                 # The case names the stopped session, not the sender, and each command in full.
-                expected = [rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl", long))]
+                expected = [rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl", long),
+                                       waits="The P542 build waits for them", source="Build writer",
+                                       key=send.auto_mode_key("modules", ("implement.sh --to modules-impl", long)))]
                 self.assertEqual(self.cases, expected if outcome in ("sent", "kept") else [])
         self.cases.clear()
         with mock.patch.object(send, "run", return_value=replies["sent"]):
@@ -1467,11 +1486,12 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(self.cases, [])
 
     def test_the_rca_pushes_are_not_held_as_a_free_text_auto_mode_refusal(self) -> None:
-        values = {"sender": "cargo-liner", "session": "handler", "cause": "auto mode refused a raw cargo build",
-                  "fix": "the builds unit added a verify.sh build verb", "commit": "5e2b9c41"}
+        values = {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
+                  "stop": "auto mode refused a shell command", "cause": "a helper ran a build command that needs your permission",
+                  "fix": "helpers use the build command that is always allowed"}
         rendered = push_texts.render(rca.FIXED_TEXT, **values)
         self.assertTrue(send.reports_auto_mode_refusal(rendered.title + "\n" + rendered.body))
-        for text_id in (rca.STARTED_TEXT, rca.FIXED_TEXT):
+        for text_id in (rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT):
             with self.subTest(text_id=text_id):
                 options = local_options(["--to", "user", "--summary", rendered.title, "--no-action", "--text", rendered.body])
                 self.assertEqual(send.wrong_template(options._replace(text_id=text_id), rendered.body), None)
@@ -1481,7 +1501,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.writer_session()
         exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
         options = local_options(self.auto_mode_arguments(commands=(exact, long)))
-        self.assertIn(f"Refused:\n{exact}\n{long[:89]}…\nThe P542", options.text or "")
+        self.assertIn(f"The P542 build waits for them.\n{exact}\n{long[:89]}…\n\nApprove", options.text or "")
 
     def test_auto_mode_waits_says_what_waits_and_gives_no_instruction(self) -> None:
         self.writer_session()
@@ -1492,7 +1512,50 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 _ = send.parse(self.auto_mode_arguments(session="tile", commands=("cargo test -p tile",), waits=waits))
             self.assertIn("waits says only what waits", errors.getvalue())
         options = local_options(self.auto_mode_arguments(waits="The merge waits for them.."))
-        self.assertIn("\nThe merge waits for them.\n\n", options.text or "")
+        self.assertIn(" in the modules session. The merge waits for them.\nimplement.sh", options.text or "")
+
+    def test_auto_mode_keeps_its_waits_sentence_only_when_the_review_approves_it_within_30_seconds(self) -> None:
+        self.writer_session()
+        options = local_options(self.auto_mode_arguments())
+        withheld = review.Withheld(review.Draft("s", "1", "t", NoActionRequired(), "b", False), "asks for nothing")
+        for verdict, kept in ((None, True), (review.Unreviewed("timeout"), False), (review.Unreviewed("review unavailable"), False),
+                              (review.Failed(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
+                              (review.Rewritten(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
+                              (withheld, False)):
+            self.verdict, self.reviews, self.cases = verdict, [], []
+            with (self.subTest(verdict=verdict), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.send(options).outcome, "sent")
+            # The review reads the whole alert with its waits sentence, and holds it back at most 30 s.
+            [(draft, limit)] = self.reviews
+            self.assertEqual(limit, send.WAITS_REVIEW_SECONDS)
+            self.assertEqual(send.WAITS_REVIEW_SECONDS, 30)
+            self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n", draft.body)
+            pushed = cast(list[str], run.call_args.args[0])
+            self.assertIn("waits_line= The P542 build waits for them." if kept else "waits_line=", pushed)
+            text = cast(str, self.log()[-1]["text"])
+            self.assertIn("in the modules session. The P542 build waits for them.\nimplement.sh" if kept else
+                          "Auto mode refused 2 shell commands in the modules session.\nimplement.sh", text)
+            self.assertEqual(self.cases[0].waits, "The P542 build waits for them" if kept else "")
+            self.assertEqual("goes without its waits sentence" in errors.getvalue(), not kept)
+        # With the review off, or no waits sentence, nothing is reviewed.
+        self.verdict, self.reviews = None, []
+        (self.root / "notify").mkdir(exist_ok=True)
+        _ = (self.root / "notify/review_off").write_text("")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(self.reviews, [])
+
+    def test_auto_mode_goes_with_one_key_per_session_and_set_of_commands_unless_the_session_gives_one(self) -> None:
+        self.writer_session()
+        key = local_options(self.auto_mode_arguments()).key
+        self.assertEqual(key, send.auto_mode_key("modules", ("implement.sh --to modules-impl", "review.sh --to modules-test")))
+        assert key is not None
+        self.assertRegex(key, r"^auto-mode:modules:[0-9a-f]{12}$")
+        swapped = local_options(self.auto_mode_arguments(commands=("review.sh  --to modules-test", "implement.sh --to modules-impl")))
+        self.assertEqual(swapped.key, key)
+        self.assertNotEqual(local_options(self.auto_mode_arguments(session="tile")).key, key)
+        self.assertEqual(local_options([*self.auto_mode_arguments(), "--key", "auto"]).key, "auto")
 
     def test_a_registered_value_that_gives_a_second_action_is_refused(self) -> None:
         self.writer_session()
@@ -1517,7 +1580,8 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(options.summary, "cargo-liner: auto mode stopped types")
         self.assertEqual(options.sender, "cargo-liner")
         self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, approve the prompt or add an allow rule"))
-        self.assertIn("Refused: save_counts.py --per-unit\nThe trunk-unit plan waits for it.", options.text or "")
+        self.assertIn("Auto mode refused a shell command in the types session. The trunk-unit plan waits for it.\n"
+                      + "save_counts.py --per-unit", options.text or "")
 
     def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
         self.writer_session()

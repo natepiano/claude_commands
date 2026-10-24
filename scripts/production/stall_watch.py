@@ -60,6 +60,8 @@ WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 BLOCKED = "blocked"
 PROMPT_ALERT_SECONDS = 60
 PROMPT_TEXT_ID = "stall_watch.permission_prompt"
+# The prompt alert's sender, which its retire names too.
+SENDER = "stall-watch"
 # The question of a Claude Code permission prompt: "Do you want to make this edit to panes.py?"
 PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
 # "make this edit to panes.py" reads as "edit panes.py".
@@ -400,7 +402,7 @@ def prompt_key(slug: str, unit: str) -> str:
 
 def retire_alert(slug: str, unit: str) -> Delivery:
     """Cancel the repeats of the unit's prompt alert; once that succeeds, its prompt state is removed."""
-    command = push_texts.user_retire_argv("stall-watch", prompt_key(slug, unit))
+    command = push_texts.user_retire_argv(SENDER, prompt_key(slug, unit))
     return Delivery(prompt_path(slug, unit), "retire", [sys.executable, str(SEND), *command[2:]])
 
 
@@ -589,8 +591,9 @@ def machine_name() -> str:
     return gethostname().split(".", 1)[0]
 
 
-def prompt_report(slug: str, unit: str, session_id: str, pending: PendingTool | None) -> rca.Report:
-    """The facts rca.py opens its case with: the pending Bash call's command, else the pending tool's name."""
+def prompt_report(slug: str, unit: str, session_id: str, pending: PendingTool | None, since: float) -> rca.Report:
+    """The facts rca.py opens its case with: the pending Bash call's command, else the pending tool's name,
+    when the wait started, and the alert's sender and key."""
     command = pending.input.get("command") if pending is not None else None
     if pending is None:
         commands: tuple[str, ...] = ()
@@ -600,7 +603,9 @@ def prompt_report(slug: str, unit: str, session_id: str, pending: PendingTool | 
         transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
     except OSError:
         transcript = None
-    return rca.Report(unit, machine_name(), "prompt", commands, str(transcript or ""), slug)
+    return rca.Report(unit, machine_name(), "prompt", commands, str(transcript or ""), slug,
+                      stopped=datetime.fromtimestamp(since, ZoneInfo("UTC")).isoformat(), source=SENDER,
+                      key=prompt_key(slug, unit))
 
 
 def prompt_alert(slug: str, unit: str, pane: str, since: float, zone: ZoneInfo,
@@ -608,7 +613,7 @@ def prompt_alert(slug: str, unit: str, pane: str, since: float, zone: ZoneInfo,
     rendered = push_texts.render(PROMPT_TEXT_ID, unit=unit.removesuffix("-unit"), machine=machine_name(),
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
                                  request=prompt_request(pane, pending))
-    command = push_texts.user_send_argv(rendered, sender="stall-watch", key=prompt_key(slug, unit))
+    command = push_texts.user_send_argv(rendered, sender=SENDER, key=prompt_key(slug, unit))
     # The send script is the one this watcher is set to use, so a test's stands in for it.
     return Delivery(prompt_path(slug, unit), "alert", [sys.executable, str(SEND), *command[2:]], report)
 
@@ -757,7 +762,7 @@ def tick(now: float) -> None:
                     pending.append(retire_alert(slug, name))
                 elif not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
                     pending.append(prompt_alert(slug, name, pane, prompt["since"], zone, call,
-                                                prompt_report(slug, name, session_id, call)))
+                                                prompt_report(slug, name, session_id, call, prompt["since"])))
                 continue
             if blocked is not None and (retire := end_prompt(slug, name)) is not None:
                 pending.append(retire)
