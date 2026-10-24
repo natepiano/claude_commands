@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import sqlite3
 import subprocess
@@ -13,7 +14,7 @@ import sys
 import tempfile
 import tomllib
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from enum import Enum
@@ -491,6 +492,14 @@ class UseTrees:
 
 
 @dataclass(frozen=True)
+class PathAttributes:
+    """The `mod` keywords whose attributes hold a `path` word, and the string of each one whose path is the renamed file."""
+
+    keywords: frozenset[int]
+    literals: Mapping[int, int]
+
+
+@dataclass(frozen=True)
 class ModuleBinding:
     """An item, import or alias that binds the renamed module's name in one inline module scope of a file."""
 
@@ -512,6 +521,8 @@ PATH_ANCHORS = frozenset({"crate", "self", "super"})
 TYPE_ITEM_KEYWORDS = frozenset({"mod", "struct", "enum", "union", "trait", "type"})
 # The words after a `use` leaf.
 USE_LEAF_ENDS = frozenset({";", ",", "}", "as"})
+# A path in a comment that starts at `crate`, as in an intra-doc link `[`crate::ledger::lock`]`.
+CRATE_PATH = re.compile(r"(?<![\w:$])crate(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 
 
 def crate_root(repo: Path, moved: FileRename) -> PurePosixPath | NoCrateRoot:
@@ -566,6 +577,13 @@ def resolved_module(prefix: tuple[str, ...], module: CrateModule) -> tuple[str, 
     return UnresolvedPath() if PATH_ANCHORS & set(rest) else base + rest
 
 
+def code_item_starts(words: tuple[str, ...]) -> frozenset[int]:
+    """The item starts outside every macro token tree: a macro reads the words in its tree as tokens, not as items."""
+    in_macros = {index for start, end in style_footprint.macro_spans(words, style_footprint.delimiter_ends(words))
+                 for index in range(start + 1, end)}
+    return item_starts(words) - in_macros
+
+
 def use_trees(words: tuple[str, ...], starts: frozenset[int]) -> UseTrees:
     prefixes: dict[int, tuple[str, ...]] = {}
     keywords: dict[int, int] = {}
@@ -597,23 +615,26 @@ def use_trees(words: tuple[str, ...], starts: frozenset[int]) -> UseTrees:
 
 @dataclass(frozen=True)
 class RenamedModuleScan:
-    """One Rust file read at HEAD, and the module file rename whose references the scan finds in it."""
+    """One Rust file at path read at HEAD, and the module file rename whose references the scan finds in it."""
 
+    path: str
     words: tuple[str, ...]
     module: CrateModule
     parent: tuple[str, ...]
-    stem: str
+    moved: FileRename
     library: Library | NoLibrary
 
-    def sites(self) -> frozenset[int]:
-        """The words that name the renamed module: its `mod` line and the path segments that name it.
+    def renames(self) -> Mapping[int, str]:
+        """The words that name the renamed module, each with its new word: its `mod` line, the path segments that name
+        it, and the `#[path]` string that names its file.
 
         A word is a site only when the scan is certain; the gate keeps every other word unchanged.
         """
-        words, stem = self.words, self.stem
-        starts = item_starts(words)
+        words, stem = self.words, self.moved.old_stem
+        starts = code_item_starts(words)
         modules = inline_modules(words, starts)
         trees = use_trees(words, starts)
+        paths = self.path_attributes(starts, modules)
         depths = (0, *accumulate((word == "{") - (word == "}") for word in words))
         bindings: list[ModuleBinding] = []
         globs: list[GlobImport] = []
@@ -628,7 +649,7 @@ class RenamedModuleScan:
                 if index in trees.prefixes:
                     globs.append(GlobImport(scope, resolved_module(trees.prefixes[index], self.scope_module(scope))))
                 continue
-            renamed = self.mod_line(index, starts, modules)
+            renamed = self.mod_line(index, starts, modules, paths)
             if index in trees.prefixes and words[index + 1] in {";", ",", "}"}:
                 renamed = self.names_parent(trees.prefixes[index], self.scope_module(scope))
             elif not (renamed or words[index - 1] == "as"
@@ -644,7 +665,7 @@ class RenamedModuleScan:
             if index == 0 or word != stem or words[index - 1] == "." or words[index + 1:index + 3] == ("::", "<"):
                 continue
             scope = enclosing(modules, index)
-            if self.mod_line(index, starts, modules):
+            if self.mod_line(index, starts, modules, paths):
                 found.add(index)
             elif index in trees.prefixes and (trees.prefixes[index] or words[index - 1] == "::"):
                 if (words[index + 1] == "::" or words[index + 1] in USE_LEAF_ENDS) and self.names_parent(
@@ -656,18 +677,48 @@ class RenamedModuleScan:
                         or (not prefix and words[index - 1] != "::" and not block_bindings
                             and self.bound_in(scope, tuple(bindings), tuple(globs)))):
                     found.add(index)
-        return frozenset(found)
+        old_name, new_name = PurePosixPath(self.moved.old).name, PurePosixPath(self.moved.new).name
+        return ({index: self.moved.new_stem for index in found}
+                | {index: words[index].removesuffix(old_name + '"') + new_name + '"' for index in paths.literals.values()})
 
     def scope_module(self, scope: tuple[InlineModule, ...]) -> CrateModule:
         if isinstance(self.module, OutsideCrate):
             return self.module
         return self.module + tuple(module.name for module in scope)
 
-    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> bool:
-        """Whether the word at index is the name in the renamed module's `mod <name>;` line."""
-        return (self.words[index - 1:index] == ("mod",) and index - 1 in starts
-                and self.words[index + 1:index + 2] == (";",)
-                and self.scope_module(enclosing(modules, index)) == self.parent)
+    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...], paths: PathAttributes) -> bool:
+        """Whether the word at index is the name in the renamed module's `mod <name>;` line.
+
+        A line with a `path` attribute declares the renamed module only when the attribute's string names its file.
+        """
+        if not (self.words[index - 1:index] == ("mod",) and index - 1 in starts
+                and self.words[index + 1:index + 2] == (";",)):
+            return False
+        if index - 1 in paths.keywords:
+            return index - 1 in paths.literals
+        return self.scope_module(enclosing(modules, index)) == self.parent
+
+    def path_attributes(self, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> PathAttributes:
+        """The `path` attributes of the file's `mod` items.
+
+        A `#[path = "<string>"]` names the renamed file when it is the only `path` word of a `mod` at an item start
+        outside every inline module, and its string, read from the file's own folder, is the old file and ends with the
+        old file's name. A string with an escape, or a `path` word in any other form, names no file the gate can read.
+        """
+        words, old_name = self.words, PurePosixPath(self.moved.old).name
+        spans = dict(style_footprint.attribute_spans(words))
+        attributes = style_footprint.decorated_items(words)
+        keywords = frozenset(owner for owner, words_of in attributes.items() if words[owner] == "mod" and "path" in words_of)
+        literals: dict[int, int] = {}
+        for start, owner in style_footprint.attribute_owners(words).items():
+            named = words[start + 4][1:-1] if spans[start] == start + 6 else ""
+            if (owner in keywords and owner in starts and attributes[owner].count("path") == 1
+                    and not enclosing(modules, owner)
+                    and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named
+                    and named.rsplit("/", 1)[-1] == old_name
+                    and posixpath.normpath(str(PurePosixPath(self.path).parent / named)) == self.moved.old):
+                literals[owner] = start + 4
+        return PathAttributes(keywords, MappingProxyType(literals))
 
     def names_parent(self, prefix: tuple[str, ...], module: CrateModule) -> bool:
         """Whether a path prefix read in module names the renamed module's parent.
@@ -762,7 +813,7 @@ def module_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
 
     An item with a `macro_use` attribute is left out: its place decides where its macros can be used.
     """
-    starts = item_starts(words)
+    starts = code_item_starts(words)
     attributes = {end: start for start, end in style_footprint.attribute_spans(words)}
     visibilities = {style_footprint.closing(words, index + 1) + 1: index for index, word in enumerate(words[:-1])
                     if word == "pub" and words[index + 1] == "("}
@@ -812,15 +863,16 @@ def canonical_order(words: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def comment_lines(text: str, spans: tuple[style_footprint.TokenSpan, ...]) -> tuple[str | tuple[str, ...], ...]:
-    """The stripped lines of the comments between the code tokens, in order.
+def comment_lines(text: str, spans: tuple[style_footprint.TokenSpan, ...],
+                  renamed: Callable[[str], str]) -> tuple[str | tuple[str, ...], ...]:
+    """The stripped lines of the comments between the code tokens, each passed through renamed, in order.
 
     The lines from the start of a run of module items to its last word are one sorted entry: canonical_order sorts the
     run's items, and their comments move with them.
     """
     ends = (0, *(span.end for span in spans))
     starts = (*(span.start for span in spans), len(text))
-    gaps = tuple(tuple(line.strip() for line in text[end:start].splitlines() if line.strip())
+    gaps = tuple(tuple(renamed(line.strip()) for line in text[end:start].splitlines() if line.strip())
                  for end, start in zip(ends, starts, strict=True))
     entries: list[str | tuple[str, ...]] = []
     cursor = 0
@@ -833,12 +885,27 @@ def comment_lines(text: str, spans: tuple[style_footprint.TokenSpan, ...]) -> tu
     return tuple(entries)
 
 
+def renamed_comment(line: str, scans: tuple[RenamedModuleScan, ...]) -> str:
+    """The comment line with each `crate` path segment that names a renamed module changed to the module's new name.
+
+    A segment names a renamed module when it is the old name and the segments before it name the module's parent. A
+    comment has no certain scope, so a `self` or `super` path stays unchanged.
+    """
+    def renamed_path(path: re.Match[str]) -> str:
+        segments = path[0].split("::")
+        return "::".join(next((scan.moved.new_stem for scan in scans if segment == scan.moved.old_stem
+                               and scan.names_parent(tuple(segments[:index]), scan.module)), segment)
+                         for index, segment in enumerate(segments))
+    return CRATE_PATH.sub(renamed_path, line)
+
+
 def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
-    """Whether a Rust file outside the findings changes only the `mod` lines and module paths of approved file renames,
-    and the qualified references of approved renames.
+    """Whether a Rust file outside the findings changes only the `mod` lines, `#[path]` strings and module paths of
+    approved file renames, and the qualified references of approved renames.
 
     The file's HEAD words with each module site renamed, then each qualified reference, must equal its worktree words in
-    canonical order, and no comment changes. A qualified reference reads its parent from the HEAD words.
+    canonical order. Its HEAD comments with each `crate` path to a renamed module renamed must equal its worktree
+    comments. A qualified reference reads its parent from the HEAD words.
     """
     target = repo / path
     if not moves or target.suffix != ".rs" or target.is_symlink() or not target.is_file():
@@ -855,6 +922,7 @@ def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], p
         return False
     words = tuple(span.token.value for span in old)
     renamed = list(words)
+    scans: list[RenamedModuleScan] = []
     for moved in moves:
         root = crate_root(repo, moved)
         if isinstance(root, NoCrateRoot):
@@ -862,10 +930,11 @@ def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], p
         module = crate_module(moved.old, root)
         if isinstance(module, OutsideCrate):
             return False
-        scan = RenamedModuleScan(words, crate_module(path, root), module[:-1], moved.old_stem, crate_library(repo, root))
-        for index in scan.sites():
-            renamed[index] = moved.new_stem
-    if tuple(renamed) == words:
+        scans.append(RenamedModuleScan(path, words, crate_module(path, root), module[:-1], moved, crate_library(repo, root)))
+        for index, word in scans[-1].renames().items():
+            renamed[index] = word
+    comments = comment_lines(before, old, lambda line: renamed_comment(line, tuple(scans)))
+    if tuple(renamed) == words and comments == comment_lines(before, old, lambda line: line):
         return False
     use_parents = use_reference_parents(words)
     for index, word in enumerate(words):
@@ -873,7 +942,7 @@ def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], p
             if word == pair.old and approved_reference_qualifier(words, index, use_parents, pair):
                 renamed[index] = pair.new
     return (canonical_order(tuple(renamed)) == canonical_order(tuple(span.token.value for span in new))
-            and comment_lines(before, old) == comment_lines(after, new))
+            and comments == comment_lines(after, new, lambda line: line))
 
 
 def outside_refusal(path: str, moves: tuple[FileRename, ...]) -> str:
