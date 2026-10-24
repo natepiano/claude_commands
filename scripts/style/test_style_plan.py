@@ -3400,9 +3400,11 @@ class StylePlanTests(unittest.TestCase):
                 self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
                 _ = handle.write_text(renamed)
 
-    def test_canonical_order_drops_a_trailing_comma_only_where_it_does_not_change_the_code(self) -> None:
-        def words(text: str) -> tuple[str, ...]:
-            return style_plan.canonical_order(tuple(token.value for token in style_footprint.tokens(text)))
+    def test_canonical_code_drops_a_trailing_comma_only_where_it_does_not_change_the_code(self) -> None:
+        def words(text: str) -> tuple[style_plan.CodePiece, ...]:
+            spans = style_footprint.token_spans(text)
+            return style_plan.canonical_code(tuple(span.token.value for span in spans),
+                                             style_plan.comment_gaps(text, spans, lambda line: line))
         # A one-entry tuple is not the grouped expression, even when its entry holds commas.
         self.assertNotEqual(words("let f = (|a: u8, b: u8| a + b,);"), words("let f = (|a: u8, b: u8| a + b);"))
         self.assertNotEqual(words("let m = (HashMap::<u8, u8>::new(),);"), words("let m = (HashMap::<u8, u8>::new());"))
@@ -3423,6 +3425,75 @@ class StylePlanTests(unittest.TestCase):
                 self.assertEqual(result, 1, output)
                 self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
                 _ = path.write_text(renamed)
+        # A doc comment that moves to the next item is not in its old place.
+        _ = path.write_text(renamed.replace("/// c\nfn third() {}\n\n", "fn third() {}\n\n/// c\n"))
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+
+    MODULE_DOCS = "/// Alpha API.\n#[enabled(alpha)]\npub mod alpha;\n#[enabled({1,})]\npub mod beta;\n"
+    # The doc comment moves to beta or into the attribute of alpha, or the attribute of beta loses its comma.
+    MODULE_EDITS = (("/// Alpha API.\n#[enabled(alpha)]\npub mod alpha;\n", "#[enabled(alpha)]\npub mod alpha;\n/// Alpha API.\n"),
+                    ("/// Alpha API.\n#[enabled(alpha)]", "#[enabled(\n    /// Alpha API.\n    alpha\n)]"),
+                    ("#[enabled({1,})]", "#[enabled({1})]"))
+
+    def test_approved_file_rename_keeps_each_doc_comment_with_its_module_item(self) -> None:
+        mod_file = "crates/alpha/src/ledger/mod.rs"
+        ticket = self.file_rename_ticket(files=(
+            (mod_file, self.MODULE_DOCS + self.LEDGER_MOD.replace("mod lock;", "/// The lock.\nmod lock;")),))
+        self.renamed_ledger()
+        # rustfmt moves the renamed item to its sorted place, with its doc comment.
+        renamed = (self.MODULE_DOCS + (self.repo / mod_file).read_text()).replace(
+            "mod mutation_lock;", "/// The lock.\nmod mutation_lock;")
+        self.write(mod_file, renamed)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for text in (*(renamed.replace(*edit) for edit in self.MODULE_EDITS),
+                     renamed.replace("/// The lock.\n", "").replace("mod map;", "/// The lock.\nmod map;")):
+            with self.subTest(text=text):
+                self.write(mod_file, text)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{mod_file} (change is not an approved rename reference)", output)
+
+    MACRO_COMMAS = ("macro_rules! enabled {\n    ([1,]) => { true };\n    ([1]) => { false };\n}\n\n"
+                    + "pub fn on() -> bool {\n    enabled!([1,])\n}\n\n#[enabled([1,])]\npub fn off() {}\n")
+
+    def test_approved_file_rename_keeps_a_trailing_comma_inside_a_macro_in_another_file(self) -> None:
+        handle = self.LEDGER_HANDLE + self.MACRO_COMMAS
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),))
+        self.renamed_ledger(handle)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        path = self.repo / "crates/alpha/src/ledger/handle.rs"
+        renamed = path.read_text()
+        for comma in ("([1,]) =>", "enabled!([1,])", "#[enabled([1,])]"):
+            with self.subTest(comma=comma):
+                _ = path.write_text(renamed.replace(comma, comma.replace(",", "")))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
+                _ = path.write_text(renamed)
+
+    def test_approved_file_rename_keeps_a_trailing_comma_inside_a_macro_in_the_renamed_file(self) -> None:
+        lock = "pub struct MutationLock;\npub struct LockError;\n" + self.MACRO_COMMAS
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/lock.rs", lock),))
+        self.renamed_ledger()
+        new = "crates/alpha/src/ledger/mutation_lock.rs"
+        for comma in ("([1,]) =>", "enabled!([1,])", "#[enabled([1,])]"):
+            with self.subTest(comma=comma):
+                self.write(new, lock.replace(comma, comma.replace(",", "")))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(self.RENAMED_REFUSAL, output)
+
+    def test_an_unchanged_renamed_file_outside_every_crate_root_passes(self) -> None:
+        old, new = "crates/alpha/tests/helper.rs", "crates/alpha/tests/test_helper.rs"
+        self.write(old, "pub fn helper() {}\n")
+        _ = self.commit()
+        _ = self.git("mv", old, new)
+        moved = approved_renames.FileRename(old, new)
+        self.assertTrue(style_plan.approved_renamed_file(self.repo, moved, (moved,), ()))
+        self.write(new, "pub fn helper() {}\npub fn other() {}\n")
+        self.assertFalse(style_plan.approved_renamed_file(self.repo, moved, (moved,), ()))
 
     UNIT_TESTS = ('#[path = "../src/ledger/handle.rs"]\nmod handle;\n#[path = "../src/ledger/lock.rs"]\nmod lock;\n'
                   + '#[path = "../src/ledger/map.rs"]\nmod map;\n')
@@ -3536,6 +3607,80 @@ class StylePlanTests(unittest.TestCase):
         for name in ("lock", "mutation_lock"):
             self.assertIn(f"crates/alpha/src/ledger/{name}/guard.rs (in crates/alpha/src/ledger/{name}/, the folder of "
                           + "a renamed module: a person moves it)", output)
+
+    LOCK = ("//! Holds the mutation lock.\nuse std::fmt;\nuse crate::ledger::handle::Handle;\n\n"
+            + "/// The lock a mutation takes.\npub struct MutationLock;\npub struct LockError;\n\n"
+            + "pub fn owner(_: &Handle) -> crate::ledger::lock::MutationLock {\n    MutationLock\n}\n")
+    RENAMED_REFUSAL = ("crates/alpha/src/ledger/mutation_lock.rs (renamed from crates/alpha/src/ledger/lock.rs: "
+                       + "change is not only the rename)")
+
+    def test_approved_file_rename_allows_only_the_rename_in_the_renamed_file(self) -> None:
+        new = "crates/alpha/src/ledger/mutation_lock.rs"
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/lock.rs", self.LOCK),))
+        self.renamed_ledger()
+        renamed = self.LOCK.replace("crate::ledger::lock::", "crate::ledger::mutation_lock::")
+        # rustfmt can order the use lines again; that moves no definition between files.
+        for text in (renamed, renamed.replace("use std::fmt;\nuse crate::ledger::handle::Handle;",
+                                              "use crate::ledger::handle::Handle;\nuse std::fmt;")):
+            with self.subTest(text=text):
+                self.write(new, text)
+                self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for first, second in (("pub struct LockError;\n", "pub struct LockError;\npub struct Guard;\n"),
+                              ("pub struct LockError;\n", ""),
+                              ("/// The lock a mutation takes.", "/// The lock each mutation takes.")):
+            with self.subTest(second=second):
+                self.write(new, renamed.replace(first, second))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(self.RENAMED_REFUSAL, output)
+
+    def test_approved_file_rename_keeps_each_doc_comment_with_its_module_item_in_the_renamed_file(self) -> None:
+        lock = self.MODULE_DOCS + "pub struct MutationLock;\npub struct LockError;\n"
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/lock.rs", lock),))
+        self.renamed_ledger()
+        new = "crates/alpha/src/ledger/mutation_lock.rs"
+        self.write(new, lock.replace(self.MODULE_DOCS, "#[enabled({1,})]\npub mod beta;\n/// Alpha API.\n"
+                                                       + "#[enabled(alpha)]\npub mod alpha;\n"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for edit in self.MODULE_EDITS:
+            with self.subTest(edit=edit):
+                self.write(new, lock.replace(*edit))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(self.RENAMED_REFUSAL, output)
+
+    def renamed_declaration_gate(self, pairs: tuple[tuple[str, str], ...]) -> tuple[int, str]:
+        """The gate after a file rename whose new file also renames its LockError declaration to LockFailure."""
+        new = "crates/alpha/src/ledger/mutation_lock.rs"
+        ticket = self.file_rename_ticket(pairs=pairs)
+        self.renamed_ledger(error="LockFailure" if pairs else "LockError")
+        self.write(new, (self.repo / new).read_text().replace("LockError", "LockFailure"))
+        return self.reference_gate(ticket)
+
+    def test_approved_file_rename_leaves_the_renamed_file_free_when_another_finding_names_it(self) -> None:
+        self.assertEqual(self.renamed_declaration_gate((("lock::LockError", "lock::LockFailure"),)),
+                         (0, "approved proposal\n"))
+
+    def test_approved_file_rename_refuses_a_declaration_rename_that_no_finding_names(self) -> None:
+        result, output = self.renamed_declaration_gate(())
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.RENAMED_REFUSAL, output)
+
+    def test_approved_file_rename_refuses_a_copy_or_a_removed_file(self) -> None:
+        old, new = "crates/alpha/src/ledger/lock.rs", "crates/alpha/src/ledger/mutation_lock.rs"
+        ticket = self.file_rename_ticket()
+        self.renamed_ledger()
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        text = (self.repo / new).read_text()
+        self.write(old, text)
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.RENAMED_REFUSAL, output)
+        (self.repo / old).unlink()
+        (self.repo / new).unlink()
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(self.RENAMED_REFUSAL, output)
 
     def test_approved_rename_allows_only_reference_edits_in_an_outside_file(self) -> None:
         before = ('// Outcome::OldName stays in this comment.\r\n'

@@ -208,6 +208,7 @@ class FileRenameTests(unittest.TestCase):
              path),
             ("rename", "Rename ledger/lock.rs to ledger/type.rs", path),
             ("rename", "Rename ledger/type.rs to ledger/kind.rs", "crates/cargo-berth/src/ledger/type.rs"),
+            ("rename", "Rename ledger/lock.rs to ledger/mutation_lock.rs; then ledger/mod.rs to ledger.rs", path),
         )
         for kind, after, finding_path in refused:
             with self.subTest(after=after, path=finding_path):
