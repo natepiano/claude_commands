@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
-    from ..lib import unit_runs
+    from ..lib import script_prompts, unit_runs
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import script_prompts
     import unit_runs
 
 
@@ -50,6 +51,9 @@ KEEP_COMMAND = (
 )
 NOTICE_TAG = re.compile(r"^<(?:task-notification|system-reminder|agent-message)(?:\s|>)")
 CROSS_SESSION_TAG = re.compile(r"^<cross-session-message\b[^>]*>")
+# Claude Code types these itself: a session it was asked to watch is idle, or a message was dropped.
+HARNESS_NOTICE = re.compile(r"^\[Cross-session [a-z]+ notice\]")
+USAGE_RESET = "Your claude.ai usage limit has reset."
 FROM_NAME = re.compile(r'\bfrom-name="([^"]*)"')
 CLIPPED_PROMPT_MARKER = re.compile(r"… \[\+\d+ chars\]")
 
@@ -60,6 +64,7 @@ type ScheduledPromptLookup = Callable[[], tuple[str, ...]]
 class PromptSource(Enum):
     TYPED = "typed"
     PEER = "peer"
+    # A job's prompt, or one a script typed into the pane (script_prompts).
     SCHEDULED = "scheduled"
     NOTICE = "notice"
 
@@ -355,7 +360,9 @@ def prompt_source(
     prompt: str,
     senders: ScheduledSenderLookup,
     scheduled_prompts: ScheduledPromptLookup,
+    typed_by_script: Callable[[str], bool] = script_prompts.typed_here,
 ) -> PromptSource:
+    """TYPED only for the user's own input: Claude Code's notices, peers, jobs and scripts are not."""
     text = prompt.lstrip()
     if not text:
         return PromptSource.NOTICE
@@ -367,9 +374,11 @@ def prompt_source(
                 else PromptSource.PEER)
     if (NOTICE_TAG.match(text) is not None
             or text.startswith("Another Claude session sent a message")
-            or text.startswith("[SYSTEM NOTIFICATION")):
+            or text.startswith("[SYSTEM NOTIFICATION")
+            or HARNESS_NOTICE.match(text) is not None
+            or text.startswith(USAGE_RESET)):
         return PromptSource.NOTICE
-    if _is_recorded_scheduled_prompt(text, scheduled_prompts()):
+    if _is_recorded_scheduled_prompt(text, scheduled_prompts()) or typed_by_script(text):
         return PromptSource.SCHEDULED
     return PromptSource.TYPED
 
@@ -395,7 +404,7 @@ def is_showrunner_or_unit_director(session_id: str) -> bool:
     prefixes = ("showrunner-", *unit_runs.INSTANCE_PREFIXES)
     if any(report.name.startswith(prefixes) for report in session_reports(session_id)):
         return True
-    return unit_runs.marker(session_id, os.environ.get("PLAN_DELEGATE_ACTIVE_DIR")).is_file()
+    return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None).is_file()
 
 
 def session_reports(session_id: str) -> list[Report]:

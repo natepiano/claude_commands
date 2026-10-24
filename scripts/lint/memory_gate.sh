@@ -17,6 +17,8 @@ BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" lint/memory_gate.sh || exit 2
+UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+[[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 BUILD_HOLD_MARK_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_hold" && pwd)/build_hold.py"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/memory_admit.py"
@@ -47,7 +49,7 @@ build_hold_mark() {
     local call_id=""
     if [[ -n "${BUILDLOG_CALL_ID:-}" && "${BUILDLOG_CALLER:-}" == verify ]]; then
         call_id=$BUILDLOG_CALL_ID
-    elif [[ -z "${CLAUDE_CODE_SESSION_ID:-}${PLAN_DELEGATE_BOARD_DIR:-}${PLAN_DELEGATE_SESSION_DIR:-}" ]]; then
+    elif [[ -z "${CLAUDE_CODE_SESSION_ID:-}${UNIT_RUN_DIR:-}${UNIT_SESSION_DIR:-}" ]]; then
         call_id="${BUILDLOG_HOLD_CALL_ID:-}"
     fi
     if [[ -n "$call_id" ]]; then

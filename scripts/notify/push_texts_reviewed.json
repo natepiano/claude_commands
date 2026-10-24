@@ -1,5 +1,28 @@
 {
   "auto_mode.refused": {
+    "file_change_no_waits": {
+      "objections": [
+        {
+          "quote": "hana: auto mode stopped demo",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "write phases/34h/delegated_phase_reservation_state.json",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Allow rule: the work goes on now, and auto mode lets this command run from then on.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Auto mode refused a file change in the demo session.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:25.542816-04:00"
+    },
     "one_with_rule": {
       "objections": [
         {
@@ -7,32 +30,40 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Approve: messaging goes on now, but the same command can stop it again later.",
+          "quote": "approve the prompt or add an allow rule",
           "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "Auto mode refused 1 command in messaging.",
+          "quote": "The merge of the messaging work waits for it.",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Session: messaging\nAction: On natedev, in the messaging pane, approve the prompt or add an allow rule\nAuto mode refused a git push in the messaging session, so its work cannot merge until you answer. The command:\ngit push origin build-followups-messaging\n\nApprove (recommended): this push runs now. Auto mode still checks later pushes, so a wrong push can still be stopped.\n\nAllow rule: this push runs now, and every git push from any session runs without a check after this. The rule: Bash(git push:*)",
+          "rule": "push-body-under-500"
         }
       ],
-      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
-      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
-      "time": "2026-10-21T07:45:14.877215-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:14.182975-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style: auto mode stopped types",
+          "quote": "cargo-liner-style: auto mode stopped modules",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Approve: types goes on now, but the same commands can stop it again later.\n\nAllow rule: types goes on now and never stops on these commands again.",
+          "quote": "implement.sh --to modules-impl\nreview.sh --to modules-test",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Approve: the work goes on now, and auto mode can stop it on these commands again.\n\nAllow rule: the work goes on now, and auto mode lets these commands run from then on.",
           "rule": "every-choice-says-what-it-does"
         }
       ],
-      "reviewer": "user-spec: the user approved this template 2026-10-21 07:5x EDT (via natedev): title {sender}: auto mode stopped {session}, Approve and Allow rule choices in that order. After 3 review passes the remaining objections target the approved title and choice order (recorded, not applied).; reviewer: opus",
-      "sha256": "af45037f2a6d9b12c02416474312ada5ef291662a114c82a577fee71739dff56",
-      "time": "2026-10-21T07:45:03.336113-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:00.398996-04:00"
     }
   },
   "codex.reset_ready": {
@@ -104,6 +135,103 @@
       "reviewer": "opus",
       "sha256": "3e213a81f576f5cd5314a5d24f755ba59015d9d5f9a7e80d76d55e82f858f11e",
       "time": "2026-10-14T04:27:02.640947-04:00"
+    }
+  },
+  "permission.rca_fixed": {
+    "prompt": {
+      "objections": [
+        {
+          "quote": "Now: helpers use the build command that is always allowed.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "cargo-liner: fixed why handler stopped",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
+      "time": "2026-10-23T19:48:49.400678-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "Now: a script writes that file, so the session never has to.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: fixed why demo stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "hana",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "14:23 AST",
+          "rule": "times-carry-zone"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
+      "time": "2026-10-23T19:48:41.507782-04:00"
+    }
+  },
+  "permission.rca_fixed_rewritten": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "Now: a script writes that file.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: fixed why demo stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "hana",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "717774694cd697ec398b79e979644b1c57255df845acbfa2655d3e438a55d07f",
+      "time": "2026-10-23T19:49:18.647629-04:00"
+    }
+  },
+  "permission.rca_started": {
+    "prompt": {
+      "objections": [
+        {
+          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "cargo-liner: finding why handler stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "The handler session",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
+      "time": "2026-10-23T19:47:30.202480-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: finding why demo stopped",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
+      "time": "2026-10-23T19:47:21.747732-04:00"
     }
   },
   "quota.claude_next_move": {
@@ -577,51 +705,50 @@
     }
   },
   "silence.auto_off": {
-    "none_kept": {
+    "none_held": {
       "objections": [
         {
-          "quote": "You are back; 0 kept.",
+          "quote": "No pushes were held while you were away.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "natedev auto silence off",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "natedev auto silence off",
+          "quote": "natedev: you are back",
           "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "You are back; 0 kept.",
-          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
-      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
-      "time": "2026-10-20T16:21:05.918014-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:55.849524-04:00"
+    },
+    "one_held": {
+      "objections": [
+        {
+          "quote": "The push held while you were away comes next.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev: you are back",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:50.284447-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "You are back; 3 kept.",
+          "quote": "The 3 pushes held while you were away come next.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "3 kept",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "natedev auto silence off",
+          "quote": "natedev: you are back",
           "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "You are back; 3 kept.",
-          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
-      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
-      "time": "2026-10-20T16:20:58.301946-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:43.273058-04:00"
     }
   },
   "silence.auto_on": {
@@ -676,36 +803,48 @@
     "edit": {
       "objections": [
         {
-          "quote": "herdr-panes needs your answer",
+          "quote": "messaging needs your answer",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "wants to edit panes.py",
+          "quote": "messaging asks to edit send.py.",
           "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "messaging asks to edit send.py.",
+          "rule": "before-and-after"
+        },
+        {
+          "quote": "Yes: it does that and goes on.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "messaging asks to edit send.py. It has waited since 06:05 AST.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
-      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
-      "time": "2026-10-21T18:07:26.466772-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
+      "time": "2026-10-23T09:51:09.284207-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "cargo-liner-style-types needs your answer",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Yes: the session does that and goes on with its work.",
+          "quote": "Yes: it does that and goes on.",
           "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "Session: cargo-liner-style-types\nAction: On natedev, open the cargo-liner-style-types herdr tab and answer its prompt\nThe Claude coding session cargo-liner-style-types on natedev wants to delete its own saved tool output, b1e4yc8b9.txt. The file is outside its allowed folders, so it needs your permission. It has waited since 10:54 EDT and does no work until you answer.\n\nYes (recommended): the session deletes its own file and goes on with its work.\n\nNo: the session keeps the file and asks you what to do instead.",
-          "rule": "push-body-under-500"
+          "quote": "handler needs your answer",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "It has waited since 09:01 AST.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user 2026-10-21 via showrunner: fix the permission-prompt push request text; reviewer: opus",
-      "sha256": "0210b0f3d6ccf06747f390d353f378d9958472977018bcabbb47410d2d3c59f0",
-      "time": "2026-10-21T18:07:13.543700-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
+      "time": "2026-10-23T09:50:57.721466-04:00"
     }
   },
   "sweep.disk_floor": {

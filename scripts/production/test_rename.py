@@ -15,7 +15,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
 
+from scripts.guilds import roles
 
 SCRIPT = Path(__file__).with_name("rename.py")
 OLD = "old"
@@ -208,8 +210,8 @@ class ProductionRenameTests(unittest.TestCase):
             "SHOWRUNNER_STATE_DIR": str(self.state),
             "STALL_WATCH_STATE_DIR": str(self.stall), "REVIEW_POOL_STATE": str(self.pool),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
             "HERDR_PROC": str(self.root / "proc"),
             "HERDR_PLATFORM": "linux",
@@ -810,6 +812,52 @@ class ProductionRenameTests(unittest.TestCase):
         (self.root / "state/sessions/broken.json").unlink()
         self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
         self.assert_unit_moved("alpha-unit")
+
+    def held_design(self, repository_id: str, checkout: Path, holder: roles.Holder) -> roles.HeldDesign:
+        """A design `holder` holds, with an open designer whose roster entry runs in `checkout`."""
+        with mock.patch.dict(os.environ, self.env):
+            roles.register_repository(repository_id, {"fixture-host": str(checkout)}, inventory_complete=True)
+            placement = roles.authority_request("reserve", {"repository_id": repository_id, "document": "design.md",
+                                                            "host": "fixture-host", "request_id": repository_id})
+            design = roles.HeldDesign(
+                roles.DesignPlacement(str(placement["design_id"]), "fixture-host", 1), repository_id, str(checkout),
+                str(checkout / "design.md"), "design", "2026-10-22T12:00:00+00:00", holder, roles.DesignUnbound(),
+                (roles.RoleInstance("designer", f"old-{repository_id}-astra-designer", roles.RoleOpen("designer-thread")),
+                 roles.RoleInstance("reviewer", f"old-{repository_id}-astra-reviewer", roles.RoleNotOpened())))
+            roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            self.write(roles.mesh_directory(design.placement.design_id) / "mesh_roster.json", json.dumps(
+                {design.roles[0].name: {"thread_id": "designer-thread", "status": "done", "cwd": str(checkout)}}))
+        return design
+
+    def read_held(self, design: roles.HeldDesign) -> tuple[roles.HeldDesign, str]:
+        """The design as saved now, and its designer's launch directory."""
+        with mock.patch.dict(os.environ, self.env):
+            current = roles.read_design(design.placement.design_id)
+            roster = cast(dict[str, dict[str, str]], json.loads(
+                (roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
+        return current, roster[design.roles[0].name]["cwd"]
+
+    def test_held_roles_move_to_the_new_slug_with_the_showrunner_and_each_unit(self) -> None:
+        self.prepare_unit_moves()
+        config = self.root / "guilds.conf"
+        self.write(config, "[ownership]\nhost=fixture-host\n")
+        self.env.update({"GUILD_CONFIG_FILE": str(config), "GUILD_ROLES_HOST": "fixture-host",
+                         "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
+                         "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership")})
+        old_unit, new_unit = self.unit_worktree(OLD, "alpha-unit"), self.unit_worktree(NEW, "alpha-unit")
+        showrunner = self.held_design("showrunner-repo", self.checkout, roles.ShowrunnerHolder(OLD))
+        unit = self.held_design("unit-repo", old_unit, roles.UnitHolder(OLD, "alpha-unit"))
+        self.assert_success(self.run_rename("apply"))
+        current, cwd = self.read_held(showrunner)
+        self.assertEqual(current.holder, roles.ShowrunnerHolder(NEW))
+        self.assertEqual((current.repository, current.roles, cwd), (str(self.checkout), showrunner.roles, str(self.checkout)))
+        self.assertEqual(self.read_held(unit)[0].holder, roles.UnitHolder(OLD, "alpha-unit"))
+        self.assert_success(self.run_command("unit", NEW, "alpha-unit"))
+        self.assert_unit_moved("alpha-unit")
+        current, cwd = self.read_held(unit)
+        self.assertEqual(current.holder, roles.UnitHolder(NEW, "alpha-unit"))
+        self.assertEqual((current.repository, current.document, cwd), (str(new_unit), str(new_unit / "design.md"), str(new_unit)))
+        self.assertEqual((current.roles, current.placement.generation), (unit.roles, 2))
 
     def test_unit_and_finish_wait_for_apply_to_complete(self) -> None:
         failed = self.run_rename("apply", fail_state=True)

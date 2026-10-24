@@ -20,7 +20,7 @@ import silence
 from user_zone import user_zone
 
 PUSH: silence.KeptPush = {"source": "build", "priority": "0", "title": "Build done",
-                          "message": "No action needed.\nThe build passed.", "detail": ""}
+                          "message": "No action needed.\nThe build passed.", "detail": "", "key": ""}
 
 
 class SilenceTests(unittest.TestCase):
@@ -72,6 +72,46 @@ class SilenceTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()) as output:
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
         self.assertIn("1 kept push delivered; 1 failed", output.getvalue())
+
+    def kept_titles(self) -> list[str]:
+        return [push["title"] for push in silence.read_kept()]
+
+    def test_a_kept_push_replaces_the_older_one_with_its_source_and_key(self) -> None:
+        _ = self.main("on")
+        for title in ("Old note", "Other", "New note"):
+            _ = silence.keep({**PUSH, "title": title, "key": "other" if title == "Other" else "subject"}, "Linux")
+        self.assertEqual(self.kept_titles(), ["Other", "New note"])
+
+    def test_an_empty_key_or_another_source_never_replaces(self) -> None:
+        _ = self.main("on")
+        pushes: list[silence.KeptPush] = [{**PUSH, "title": "First"}, {**PUSH, "title": "Second"},
+                                          {**PUSH, "title": "Build", "key": "subject"},
+                                          {**PUSH, "title": "Tests", "source": "tests", "key": "subject"}]
+        for push in pushes:
+            _ = silence.keep(push, "Linux")
+        self.assertEqual(self.kept_titles(), ["First", "Second", "Build", "Tests"])
+
+    def test_drop_removes_the_kept_pushes_with_its_source_and_key_and_says_how_many(self) -> None:
+        _ = self.main("on")
+        pushes: list[silence.KeptPush] = [{**PUSH, "title": "Alert", "source": "stall-watch", "key": "prompt"},
+                                          {**PUSH, "title": "Other source", "key": "prompt"},
+                                          {**PUSH, "title": "No key"}, {**PUSH, "title": "Other key", "source": "stall-watch",
+                                                                        "key": "prompt-2"}]
+        for push in pushes:
+            _ = silence.keep(push, "Linux")
+        self.assertEqual(silence.drop("stall-watch", "prompt", "Linux"), 1)
+        self.assertEqual(self.kept_titles(), ["Other source", "No key", "Other key"])
+        # An empty key drops nothing, as an empty key never replaces; a second drop finds nothing.
+        self.assertEqual(silence.drop("build", "", "Linux"), 0)
+        self.assertEqual(self.main("drop", "--source", "stall-watch", "--key", "prompt"), "0\n")
+        self.assertEqual(self.main("drop", "--source", "stall-watch", "--key", "prompt-2"), "1\n")
+        self.assertEqual(self.kept_titles(), ["Other source", "No key"])
+        # Drop works with silence off too, and leaves silence as it was.
+        self.assertIn("silence on", self.main("status"))
+
+    def test_a_line_kept_before_pushes_had_a_key_reads_with_an_empty_key(self) -> None:
+        old = {name: value for name, value in PUSH.items() if name != "key"}
+        self.assertEqual(silence.parse_push(json.dumps(old)), PUSH)
 
     def test_until_makes_a_timer_that_runs_off_and_a_new_end_stops_the_old_timer(self) -> None:
         end = (datetime.now() + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
@@ -185,10 +225,28 @@ class MacTests(unittest.TestCase):
         self.assertEqual(silence.keep(PUSH, "Darwin", asker((0, "until 07:00 EDT\n"))), silence.Kept("until 07:00 EDT"))
         self.assertEqual(asked[0][0][-1], silence.REMOTE + " keep")
         self.assertIn('"title": "Build done"', asked[0][1])
+        _ = silence.keep({**PUSH, "key": "subject"}, "Darwin", asker((0, "until off\n")))
+        self.assertIn('"key": "subject"', asked[1][1])
         self.assertEqual(silence.keep(PUSH, "Darwin", asker((1, ""))), silence.NotSilent())
         with redirect_stderr(io.StringIO()) as errors:
             self.assertEqual(silence.keep(PUSH, "Darwin", asker((255, ""))), silence.NotSilent())
         self.assertIn("natedev could not be asked", errors.getvalue())
+
+    def test_a_drop_asks_natedev_and_drops_nothing_when_natedev_cannot_answer(self) -> None:
+        asked: list[tuple[list[str], str]] = []
+
+        def asker(answer: tuple[int, str]) -> silence.Ask:
+            def ask(argv: Sequence[str], text: str) -> tuple[int, str]:
+                asked.append((list(argv), text))
+                return answer
+            return ask
+
+        self.assertEqual(silence.drop("stall-watch", "stall-watch:prompt:x y", "Darwin", asker((0, "2\n"))), 2)
+        self.assertEqual(asked[0], ([*silence.SSH, silence.REMOTE + " drop --source stall-watch --key 'stall-watch:prompt:x y'"], ""))
+        for answer in ((255, ""), (0, "not a number\n")):
+            with self.subTest(answer=answer), redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(silence.drop("stall-watch", "k", "Darwin", asker(answer)), 0)
+            self.assertIn("natedev could not be asked to drop k", errors.getvalue())
 
     def test_natedev_keep_reads_the_push_on_stdin(self) -> None:
         with (tempfile.TemporaryDirectory() as folder, mock.patch.object(silence, "state_dir", return_value=Path(folder)),
@@ -200,6 +258,11 @@ class MacTests(unittest.TestCase):
                 self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 0)
             self.assertEqual(output.getvalue(), "until off\n")
             self.assertEqual(len(silence.read_kept()), 1)
+            for title in ("old", "new"):
+                with (mock.patch("sys.stdin", io.StringIO(json.dumps({**PUSH, "title": title, "key": "subject"}))),
+                      redirect_stdout(io.StringIO())):
+                    self.assertEqual(silence.main(["keep"], lambda _argv: 0, "Linux"), 0)
+            self.assertEqual([push["title"] for push in silence.read_kept()], ["t", "new"])
 
 
 if __name__ == "__main__":

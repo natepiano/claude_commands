@@ -453,7 +453,7 @@ def open_lists(production: Production) -> OpenLists:
                 due.append(urgency.Entry(item_key(slug, item.text), OpenItem(slug, item), item.rank.urgency,
                                          item.since, after=item_key(slug, item.rank.follows) if item.rank.follows else ""))
     deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.slug))
-    return OpenLists(urgency.order(due, urgency.pinned(question_queue(production))), deferred, unreadable)
+    return OpenLists(urgency.queue_order(due, question_queue(production)), deferred, unreadable)
 
 
 def open_items(production: Production) -> None:

@@ -459,13 +459,27 @@ def _number(row_text: str) -> int:
     return int(found.group(1)) if found else 0
 
 
-def ordered(rows: list[dict[str, str]], current: str) -> list[dict[str, str]]:
-    """The rows in urgency.py's order: `current` first while it waits, then by urgency, then by C number."""
+def _merged_day(row: dict[str, str]) -> datetime | None:
+    """The day the row's Merged cell starts with: the row's age."""
+    try:
+        return datetime.fromisoformat(row.get("Merged", "").split(" ", 1)[0])
+    except ValueError:
+        return None
+
+
+def row_entries(rows: list[dict[str, str]]) -> list[urgency.Entry[dict[str, str]]]:
+    """The rows as urgency.py entries, by C number: each with its level, merge day and prerequisite."""
     entries: list[urgency.Entry[dict[str, str]]] = []
     for row in sorted(rows, key=lambda row: _number(row.get("#", ""))):
         level, after = _rank(row)
-        entries.append(urgency.Entry(row.get("#", ""), row, level, after=after))
-    return [entry.item for entry in urgency.order(entries, current)]
+        entries.append(urgency.Entry(row.get("#", ""), row, level, _merged_day(row), after=after))
+    return entries
+
+
+def ordered(rows: list[dict[str, str]], path: Path) -> list[dict[str, str]]:
+    """The rows in urgency.py's order: the pinned row first while it waits, then by urgency, then by C
+    number; a row the user moved to the end last."""
+    return [entry.item for entry in urgency.queue_order(row_entries(rows), queue(path))]
 
 
 def _sort(path: Path, lines: list[str]) -> None:
@@ -473,7 +487,7 @@ def _sort(path: Path, lines: list[str]) -> None:
     columns, first, end = _table(path, lines, SECTION)
     rows = {_cells(line)[0]: line for line in lines[first:end]}
     named = [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
-    lines[first:end] = [rows[row["#"]] for row in ordered(named, urgency.pinned(queue(path)))]
+    lines[first:end] = [rows[row["#"]] for row in ordered(named, path)]
 
 
 def append_rows(path: Path, changes: list[Visible], day: date, merged: str, production: Path,
@@ -716,8 +730,7 @@ def _run(options: CommandLine) -> int:
             # One row only: the user asks for the next one when they want it (user, 2026-10-20).
             path = _list(options)
             waiting = pending(path)
-            entries = [urgency.Entry(row["#"], row) for row in ordered(waiting, urgency.pinned(queue(path)))]
-            shown = urgency.top(entries, queue(path))
+            shown = urgency.top(row_entries(waiting), queue(path))
             print(describe(shown.item) + (f"\n\n{len(waiting) - 1} more to review" if len(waiting) > 1 else "")
                   if shown is not None else "nothing to review")
         case "mark-important":

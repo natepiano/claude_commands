@@ -19,7 +19,7 @@ from current `HEAD` is not proof and will silently accept the wrong checkpoint.
 `/unit:direct` reads this file once per completed phase in loop and verbose
 mode. It defines `<CheckpointCommit/>`, `<ShrinkCommit/>`, and
 `<PushCheckpoint/>` in full. `single` never commits.
-Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
+Phase-end order: `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
 Everything below is the contract.
 
@@ -86,7 +86,7 @@ Loop/verbose only:
    re-derive acting identity. The cheap drift delta is forbidden here.
 
    Anything else is identity ambiguity or unsafe drift and blocks the
-   checkpoint: apply <RetainDelegatedPhaseReservation/> and report the exact
+   checkpoint: apply <RetainPhaseReservation/> and report the exact
    full-drift command above so a person can run it to see the conflict. That
    covers no result, more than one, a different reservation id, any comparison
    other than `full_phase_start`, an incursion, collision, attribution
@@ -126,9 +126,11 @@ Loop/verbose only:
    the code and run the printed `held built` command when the change is there.
    A finding whose change is not there waits for a person, who makes the change
    and runs that command, or waives the finding with `style_ledger.py held waive --person <name>`.
-   From `Active`, atomically replace the durable record with
+   From `Active`, replace the durable record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that same captured
-   full id as `checkpoint_commit`, and read it back. This is the one case where
+   full id as `checkpoint_commit`, with `phase_reservation.py committed
+   --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured HEAD>`,
+   and read it back. This is the one case where
    that state carries a commit the phase did not make. A failed transition or
    read-back retains the valid durable state and invokes no release. Run step
    7 unchanged; inactive states release nothing. After confirmation, mark the
@@ -162,16 +164,22 @@ Loop/verbose only:
    the merge turns each visible line into a row on the change-review list.
 
    A failed commit is an unsuccessful ending: do not invoke release, leave
-   `Active` untouched, and apply <RetainDelegatedPhaseReservation/>. After a
+   `Active` untouched, and apply <RetainPhaseReservation/>. After a
    successful commit from `Active`, immediately capture the full output of
-   `git rev-parse HEAD`, atomically replace the `Active` record with
+   `git rev-parse HEAD` and replace the `Active` record with
    `CheckpointCommittedAwaitingReleaseConfirmation` carrying that value as
-   `checkpoint_commit`, and read the new record back. That durable transition
+   `checkpoint_commit`:
+
+   ```sh
+   phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured commit>
+   ```
+
+   Then read the new record back. Never write the record by hand. That durable transition
    must succeed before release is invoked, and its value comes only from the
    commit that just succeeded (or the ancestry-checked, captured HEAD of the
    no-change standing ticket above), never from conversation or from a later
    reading of `HEAD`. If capture, atomic replacement, or read-back fails, do not invoke
-   release and apply <RetainDelegatedPhaseReservation/> to whichever valid
+   release and apply <RetainPhaseReservation/> to whichever valid
    durable state remains.
 7. Read and validate the durable record again.
 
@@ -183,7 +191,7 @@ Loop/verbose only:
    | State | Action |
    | --- | --- |
    | `CheckpointCommittedAwaitingReleaseConfirmation` | Read its reservation id and `checkpoint_commit` from the read-back `CheckpointReleaseConfirmationPending`, then invoke `/sync release` exactly once. |
-   | `Active` | Step 6's durable transition did not complete: do not invoke release; apply <RetainDelegatedPhaseReservation/>. |
+   | `Active` | Step 6's durable transition did not complete: do not invoke release; apply <RetainPhaseReservation/>. |
    | Either inactive state | Invoke no release. |
 
    ```sh
@@ -238,14 +246,18 @@ Loop/verbose only:
    Do not consult the retention ref: it proves commit reachability but not
    whether the selected reservation is outstanding or released. Report a
    matching checkpoint as recovered rather than re-made. Only after the
-   first-attempt structured assertions or these recovery assertions pass, delete
-   `${PHASE_DIR}/delegated_phase_reservation_state.json`.
+   first-attempt structured assertions or these recovery assertions pass, clear
+   the record; never delete it by hand:
+
+   ```sh
+   phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <phase id> --released <read-back checkpoint_commit>
+   ```
 
    An ordinary failed release did not append anything because transaction
    validation precedes the journal write; it is not recovery, and the original
    first-attempt assertions still apply when it is run again. At the moment of
    any busy or failed release, invoke no retry and apply
-   <RetainDelegatedPhaseReservation/>. The checkpoint commit exists, but the
+   <RetainPhaseReservation/>. The checkpoint commit exists, but the
    phase does not complete until a later invocation confirms either the normal
    first-attempt reply or the matching already-journalled checkpoint above.
 8. Run <PushCheckpoint/>. Outside a production, report
@@ -296,13 +308,13 @@ successful release in <CheckpointCommit/>, and after <ShrinkCommit/>,
 
 1. **Branch.** The current branch, under its own name. On the default branch
    (`gh repo view --json defaultBranchRef -q .defaultBranchRef.name`), push to
-   `delegate/<plan-slug>` instead, so unfinished work never lands there.
+   `direct/<plan-slug>` instead, so unfinished work never lands there.
 2. **Ancestry.** `git fetch origin <branch>`; a branch origin lacks yet is
    fine. If origin has it and
    `git merge-base --is-ancestor origin/<branch> HEAD` fails, do not push. The
    note is `push skipped: origin/<branch> has commits this branch lacks`.
 3. **Push.** `git push -u origin <branch>`; on the default branch,
-   `git push origin HEAD:refs/heads/delegate/<plan-slug>`. Never force. Run
+   `git push origin HEAD:refs/heads/direct/<plan-slug>`. Never force. Run
    each step as its own command, never joined to another with `;` or `&&`:
    the allow list covers `git push` alone, and a joined line goes to the
    auto-mode classifier as a whole.

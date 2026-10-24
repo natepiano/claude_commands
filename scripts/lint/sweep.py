@@ -182,6 +182,9 @@ TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
 PROC_LOCKS = "/proc/locks"
+# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
+# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
+PROC_LOCKS_READS = 3
 # The kernel adds this to an exe, cwd or maps path whose file was removed.
 DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
@@ -549,19 +552,26 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
 
 
 def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
-    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder."""
+    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
+
+    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
+    """
     try:
         stat = os.stat(lock)
-        with open(locks, encoding="ascii", errors="replace") as handle:
-            lines = handle.read().splitlines()
     except OSError:
         return None
     # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
     device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
-    for line in lines:
-        fields = line.split()
-        if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
-            return int(fields[4])
+    for _ in range(PROC_LOCKS_READS):
+        try:
+            with open(locks, encoding="ascii", errors="replace") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
+                return int(fields[4])
     return None
 
 

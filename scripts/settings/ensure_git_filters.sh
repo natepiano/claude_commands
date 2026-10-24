@@ -15,7 +15,7 @@
 # come from outside the repo.
 #
 # Three things are needed, and all three are per-machine:
-#   1. the filter drivers, in .git/config
+#   1. the filter drivers, in .git/config (and no retired one)
 #   2. the launchd watcher, which keeps `git status` quiet after each write
 #      and snapshots settings.json's local-only keys for the smudge to restore
 #   3. a restore, snapshot, and index refresh right now, for anything that
@@ -59,6 +59,10 @@ for entry in "${GIT_FILTERS[@]}"; do
         echo "ensure_git_filters: could not configure filter.$name in $REPO_ROOT." >&2
     fi
 done
+
+# A driver the repo no longer uses goes, and its path's index entry is made to
+# see the file as it is (git_filters_table.sh says why).
+git_filters_retire "$REPO_ROOT"
 
 # ── 2. launchd watcher ──
 # The plist is generated rather than symlinked from a committed copy: it has to
