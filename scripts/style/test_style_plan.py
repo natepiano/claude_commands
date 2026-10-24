@@ -3424,6 +3424,74 @@ class StylePlanTests(unittest.TestCase):
                 self.assertIn("crates/alpha/src/ledger/handle.rs (change is not an approved rename reference)", output)
                 _ = path.write_text(renamed)
 
+    UNIT_TESTS = ('#[path = "../src/ledger/handle.rs"]\nmod handle;\n#[path = "../src/ledger/lock.rs"]\nmod lock;\n'
+                  + '#[path = "../src/ledger/map.rs"]\nmod map;\n')
+
+    def test_approved_file_rename_allows_a_path_attribute_that_names_the_file(self) -> None:
+        tests = "crates/alpha/tests/unit_tests.rs"
+        ticket = self.file_rename_ticket(files=((tests, self.UNIT_TESTS),))
+        self.renamed_ledger()
+        # rustfmt moves the renamed item to its sorted place.
+        renamed = ('#[path = "../src/ledger/handle.rs"]\nmod handle;\n#[path = "../src/ledger/map.rs"]\nmod map;\n'
+                   + '#[path = "../src/ledger/mutation_lock.rs"]\nmod mutation_lock;\n')
+        self.write(tests, renamed)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for literal in ('"../src/ledger/mutation_locks.rs"', '"../src/mutation_lock.rs"', '"../src/ledger/./mutation_lock.rs"'):
+            with self.subTest(literal=literal):
+                self.write(tests, renamed.replace('"../src/ledger/mutation_lock.rs"', literal))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{tests} (change is not an approved rename reference)", output)
+
+    def test_approved_file_rename_refuses_a_path_attribute_that_names_another_file(self) -> None:
+        tests = "crates/alpha/tests/unit_tests.rs"
+        ticket = self.file_rename_ticket(files=((tests, '#[path = "../src/ledger/map.rs"]\nmod lock;\n'),))
+        self.renamed_ledger()
+        self.write(tests, '#[path = "../src/ledger/map.rs"]\nmod mutation_lock;\n')
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(f"{tests} (change is not an approved rename reference)", output)
+
+    def test_approved_file_rename_refuses_a_mod_line_inside_a_macro(self) -> None:
+        mod_file = "crates/alpha/src/ledger/mod.rs"
+        lib = 'pub mod ledger;\nconst SOURCE: &str = stringify!(#[path = "ledger/lock.rs"] mod lock;);\n'
+        macros = "macro_rules! declare {\n    () => {\n        mod lock;\n    };\n}\nconst SOURCE: &str = stringify! { mod lock; };\n"
+        ticket = self.file_rename_ticket(files=((self.sources[0], lib), (mod_file, self.LEDGER_MOD + macros)))
+        self.renamed_ledger()
+        self.write(mod_file, (self.repo / mod_file).read_text() + macros)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for path, first, second in (
+                (self.sources[0], '"ledger/lock.rs"] mod lock;', '"ledger/mutation_lock.rs"] mod mutation_lock;'),
+                (mod_file, "        mod lock;", "        mod mutation_lock;"),
+                (mod_file, "{ mod lock; }", "{ mod mutation_lock; }")):
+            with self.subTest(path=path, second=second):
+                text = (self.repo / path).read_text()
+                self.write(path, text.replace(first, second))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{path} (change is not an approved rename reference)", output)
+                self.write(path, text)
+
+    def test_approved_file_rename_allows_a_crate_path_to_the_module_in_a_comment(self) -> None:
+        handle = "//! Holds [`crate::ledger::lock::MutationLock`], next to [`super::lock`].\n" + self.LEDGER_HANDLE
+        map_file = "//! Next to [`crate::ledger::lock`] and [`crate::other::lock`].\npub fn lock() {}\n"
+        ticket = self.file_rename_ticket(files=(("crates/alpha/src/ledger/handle.rs", handle),
+                                                ("crates/alpha/src/ledger/map.rs", map_file)))
+        self.renamed_ledger(handle.replace("crate::ledger::lock::", "crate::ledger::mutation_lock::"))
+        self.write("crates/alpha/src/ledger/map.rs", map_file.replace("crate::ledger::lock`", "crate::ledger::mutation_lock`"))
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for path, first, second in (
+                ("crates/alpha/src/ledger/handle.rs", "//! Holds", "//! Keeps"),
+                ("crates/alpha/src/ledger/map.rs", "crate::other::lock", "crate::other::mutation_lock"),
+                ("crates/alpha/src/ledger/handle.rs", "[`super::lock`]", "[`super::mutation_lock`]")):
+            with self.subTest(path=path, second=second):
+                text = (self.repo / path).read_text()
+                self.write(path, text.replace(first, second))
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{path} (change is not an approved rename reference)", output)
+                self.write(path, text)
+
     def test_approved_file_rename_reads_a_plain_path_from_its_module_or_the_library_name(self) -> None:
         store, beta = "crates/alpha/src/store/mod.rs", self.sources[3]
         ticket = self.file_rename_ticket(files=(

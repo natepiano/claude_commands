@@ -226,6 +226,7 @@ class FileRenameTests(unittest.TestCase):
             "keep load_report and the finding-merging helpers together.",
             "the dispatch does not move.",
             "keep the tests here without moving them.",
+            "create no extra facade and move no skipped definitions.",
         )
         for rest in negated:
             with self.subTest(rest=rest):
@@ -246,12 +247,16 @@ class FileRenameTests(unittest.TestCase):
             "move nothing but LockError into ledger/error.rs.",
             "No doubt move LockError into ledger/error.rs.",
             "Do not introduce a facade or move any sibling definition.",
-            "create no extra facade and move no skipped definitions.",
-            "it moves no item into an existing skipped file.",
             "move nothing apart from LockError into ledger/error.rs.",
             "No longer needed compatibility helpers move into ledger/legacy.rs.",
             "no doubt LockError moves into ledger/error.rs.",
             "No fewer than two helpers move into ledger/legacy.rs.",
+            "move no helpers, apart from LockError, into ledger/error.rs.",
+            "no helpers move, apart from LockError.",
+            "move no other helpers than LockError into ledger/error.rs.",
+            "move no-op helpers into ledger/legacy.rs.",
+            "it moves no item into an existing skipped file.",
+            "move no other helpers into ledger/error.rs except LockError.",
         )
         for rest in moves:
             with self.subTest(rest=rest):

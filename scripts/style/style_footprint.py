@@ -1044,6 +1044,20 @@ def delimiter_ends(words: tuple[str, ...]) -> dict[int, int]:
     return ends
 
 
+def macro_spans(words: tuple[str, ...], ends: dict[int, int]) -> tuple[tuple[int, int], ...]:
+    """The span of each macro token tree, from its `!` to the word after its closing delimiter.
+
+    A `macro_rules!` tree starts after the macro's name.
+    """
+    spans: list[tuple[int, int]] = []
+    for index, word in enumerate(words):
+        if word == "!":
+            begin = index + 2 if index and words[index - 1] == "macro_rules" else index + 1
+            if begin in ends:
+                spans.append((index, ends[begin] + 1))
+    return tuple(spans)
+
+
 def cfg_attribute(words: tuple[str, ...]) -> bool:
     return (words[:4] == ("#", "[", "cfg", "(") and words[-2:] == (")", "]")
             and closing(words, 1) == len(words) - 1 and closing(words, 3) == len(words) - 2)
@@ -1454,12 +1468,7 @@ def function_parameters(source: tuple[Token, ...]) -> tuple[FunctionParameters, 
     """Read named function parameters outside attributes and macro token trees."""
     words = tuple(token.value for token in source)
     ends = delimiter_ends(words)
-    excluded = list(attribute_spans(words))
-    for index, word in enumerate(words):
-        if word == "!":
-            begin = index + 2 if index and words[index - 1] == "macro_rules" else index + 1
-            if begin in ends:
-                excluded.append((index, ends[begin] + 1))
+    excluded = (*attribute_spans(words), *macro_spans(words, ends))
     result: list[FunctionParameters] = []
     for index, word in enumerate(words[:-1]):
         if word != "fn" or not IDENTIFIER.fullmatch(words[index + 1]) or any(

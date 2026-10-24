@@ -680,17 +680,19 @@ negate a move, so it is not a second change:
   (`does not move`, `without moving`);
 - a clause that is `nothing`, `none`, or `no`, at most three words and a noun that
   names code (`definition`, `item`, `type`, `helper`, …) before it, with a place
-  word (`into`, `out`, `from`, `to`, …) or the clause end after it (`no existing
+  word (`into`, `out`, `from`, `to`, …) or the sentence end (`.`, `;`, end of text) after it (`no existing
   definition moves from those callers`);
 - a clause of `no` and at most three words before a move word that is a noun, with
-  a form of `be` after it (`no additional split is introduced`).
+  a form of `be` after it (`no additional split is introduced`);
+- `no`, at most three words and a noun that names code right after it, then the
+  sentence end (`move no skipped definitions.`).
 
 `no longer`, `no more`, `no less`, `no fewer`, `no later`, `no sooner`, `no doubt`
 and `no matter` never negate.
 
 Every other form counts as a move, and a person decides: `Do not introduce a
-facade or move any definition`, `moves no item into a file` and `move nothing
-apart from LockError` are refused. A clause starts after a mark
+facade or move any definition`, `moves no item into a file`, `move no other helpers
+than LockError` and `move nothing apart from LockError` are refused. A clause starts after a mark
 (`. ; : , ( )`) or after `and`, `but` or `then`. A hyphenated word such as
 `finding-merging` is a name, not a merge.
 It is applied when only the new file is in the code, and not applied when only the
@@ -701,11 +703,18 @@ content. In other Rust files it allows only the `mod <old>;` line and the path
 segments that name the module: `super::lock`, `self::lock`, `crate::ledger::lock`,
 `ledger::lock` from the module that holds `ledger`, `alpha::ledger::lock` in a file
 outside the crate (where `alpha` is the library's name), a `pub use lock::...`
-re-export, and `lock::` where a `mod` line, import or glob binds the module. When
-the ticket also renames an item, its qualified references there change too. The
-`use` and `mod` lines may take the order rustfmt gives them, and a call's trailing
-comma may change. The gate refuses every other change in those files. Comments stay
-in their order; only comments inside a block of `use` and `mod` lines move with them.
+re-export, and `lock::` where a `mod` line, import or glob binds the module. A
+`#[path = "../src/ledger/lock.rs"]` string changes only its file name, and only when
+its path, read from the file's own folder, is the old file; the `mod lock;` line it
+marks changes with it. A `mod lock;` line with a `path` attribute in any other form
+stays, and so does a `mod` or `use` line inside a macro (`stringify!(…)`, a
+`macro_rules!` body), where the words are tokens, not items. When the ticket also renames an item, its qualified references there change
+too. The `use` and `mod` lines may take the order rustfmt gives them, with their
+attributes, and a call's trailing comma may change. The gate refuses every other
+change in those files. A comment changes only where a `crate::` path names the
+module (`` [`crate::ledger::lock`] ``); a `self::` or `super::` path in a comment
+stays. Comments stay in their order; only comments inside a block of `use` and
+`mod` lines move with them.
 The decision stays open and approved until every finding is built or waived.
 
 To repair a decision or an old issue that closed too early, run

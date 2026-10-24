@@ -50,8 +50,13 @@ CODE_NOUN = r"(?:definitions?|items?|types?|behaviou?r|code|functions?|methods?|
 # A clause that is a subject of `no` before its move: `nothing`, `none`, or `no`, at most three words and a noun that
 # names code, as in `no existing definition moves`.
 NEGATED_SUBJECT = re.compile(rf"\s*(?:nothing|none|{NO_LEAD}(?:\s+[\w-]+){{0,3}}?\s+{CODE_NOUN})\s*", re.IGNORECASE)
+# The end of a sentence: `.`, `;` or the end of the text. A comma or a colon can start an exception, so it is not an end.
+CLAUSE_END = r"\s*(?:[.;]|$)"
 # What follows the move of a negated subject: a place word or the end of the clause, as in `moves into a file`.
-SUBJECT_MOVE_END = re.compile(r"\s+(?:into|out|from|to|between|across|within)\b|\s*(?:[.;:,)]|$)", re.IGNORECASE)
+SUBJECT_MOVE_END = re.compile(rf"\s+(?:into|out|from|to|between|across|within)\b|{CLAUSE_END}", re.IGNORECASE)
+# An object of `no` right after a move, then the end of the clause, as in `move no skipped definitions.`; a place word
+# after the object can start an exception, as in `move no helpers into a file except LockError`.
+NEGATED_OBJECT = re.compile(rf"\s+{NO_LEAD}(?:\s+[\w-]+){{0,3}}?\s+{CODE_NOUN}{CLAUSE_END}", re.IGNORECASE)
 # A clause of `no` and at most three words before a move word that is itself the noun, as in `no additional split`.
 NEGATED_NOUN = re.compile(rf"\s*{NO_LEAD}(?:\s+[\w-]+){{0,3}}\s*", re.IGNORECASE)
 # What follows a move word that is a noun: a form of `be`, as in `no additional split is introduced`.
@@ -225,7 +230,8 @@ def names_other_change(rest: str) -> bool:
         clause = rest[max((start.end() for start in CLAUSE_START.finditer(rest, 0, move.start())), default=0):move.start()]
         negated_subject = NEGATED_SUBJECT.fullmatch(clause) and SUBJECT_MOVE_END.match(rest, move.end())
         negated_noun = NEGATED_NOUN.fullmatch(clause) and NOUN_MOVE_END.match(rest, move.end())
-        if not (NEGATED_VERB.search(clause) or negated_subject or negated_noun):
+        negated_object = NEGATED_OBJECT.match(rest, move.end())
+        if not (NEGATED_VERB.search(clause) or negated_subject or negated_noun or negated_object):
             return True
     return False
 
