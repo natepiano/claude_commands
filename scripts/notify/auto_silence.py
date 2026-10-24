@@ -3,8 +3,8 @@
 
 `on` sets the idle length to DEFAULT_IDLE (2 h); a SPAN (45min, 1h) sets that length: after that long with no prompt typed in a showrunner or unit
 director session, `check` tells the user, then turns silence on with the auto marker. `active`, the
-prompt hook's call, records the prompt; when the silence is an auto silence it ends it as
-`silence.py off` does and tells the user. A silence set by hand is never ended here. `off` stops
+prompt hook's call, records the prompt; when the silence is an auto silence it ends it, tells the
+user how many pushes it held, and then posts them as `silence.py off` does. A silence set by hand is never ended here. `off` stops
 auto silence; no argument shows it. Off until set.
 
 The idle length and the last prompt's time are in one file next to silence.json. `check` runs every
@@ -116,8 +116,18 @@ def come_back(sender: Send, runner: Run, deliver: Deliver) -> int:
     if claimed is None:
         return 0
     record, kept = claimed
-    code = silence.release(record, kept, runner, deliver, "silence off")
-    return max(code, tell(OFF_TEXT, sender, kept=str(len(kept))))
+    # The off push goes first, so it tells what comes next before the kept pushes arrive.
+    code = tell(OFF_TEXT, sender, held=held(len(kept)))
+    return max(code, silence.release(record, kept, runner, deliver, "silence off"))
+
+
+def held(count: int) -> str:
+    """The silence.auto_off sentence: what silence kept, which comes next."""
+    if count == 0:
+        return "No pushes were held while you were away."
+    if count == 1:
+        return "The push held while you were away comes next."
+    return f"The {count} pushes held while you were away come next."
 
 
 def turn_off(runner: Run, sender: Send, deliver: Deliver) -> int:
@@ -174,7 +184,7 @@ def check(clock: Clock, sender: Send) -> int:
             print(f"silence on after {minutes(idle)} min idle {silence.UNTIL_BACK}")
         write_config({**now, "started_for": record["last_active"]})
     if returned:
-        return max(code, tell(OFF_TEXT, sender, kept="0"))
+        return max(code, tell(OFF_TEXT, sender, held=held(0)))
     return code
 
 

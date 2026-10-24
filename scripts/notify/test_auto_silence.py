@@ -108,18 +108,38 @@ class AutoSilenceTests(unittest.TestCase):
         _ = self.main("check")
         self.assertEqual(len(self.pushes), 1)
 
-    def test_the_next_prompt_ends_an_auto_silence_and_delivers_what_was_kept(self) -> None:
+    def test_the_next_prompt_ends_an_auto_silence_and_says_what_comes_before_it_delivers_what_was_kept(self) -> None:
         _ = self.main("45min")
-        self.now += 50 * 60
-        _ = self.main("check")
-        for _push in range(2):
-            _ = silence.keep(PUSH, "Linux")
+        for count, held in ((0, "No pushes were held while you were away."),
+                            (1, "The push held while you were away comes next."),
+                            (3, "The 3 pushes held while you were away come next.")):
+            with self.subTest(count=count):
+                self.pushes.clear()
+                events: list[str] = []
+
+                def sender(argv: Sequence[str]) -> int:
+                    events.append(argv[argv.index("--text-id") + 1])
+                    return self.sender(argv)
+
+                def deliver(push: silence.KeptPush) -> int:
+                    events.append(push["title"])
+                    return self.deliver(push)
+
+                self.now += 50 * 60
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(auto_silence.check(lambda: self.now, sender), 0)
+                for index in range(count):
+                    _ = silence.keep({**PUSH, "title": f"Build {index} done"}, "Linux")
+                events.clear()
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(auto_silence.active(lambda: self.now, sender, self.runner, deliver), 0)
+                self.assertIsNone(silence.read_state())
+                # The off push goes first: it says how many pushes come next, then they come.
+                self.assertEqual(events, ["silence.auto_off", *(f"Build {index} done" for index in range(count))])
+                self.assertEqual(self.push_values(-1), ("silence.auto_off", [f"held={held}", "sender=natedev"]))
+        self.pushes.clear()
         _ = self.main("active")
-        self.assertIsNone(silence.read_state())
-        self.assertEqual(self.posted, ["Build done", "Build done"])
-        self.assertEqual(self.push_values(1), ("silence.auto_off", ["kept=2", "sender=natedev"]))
-        _ = self.main("active")
-        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes, [])
 
     def test_a_silence_set_by_hand_is_never_ended_or_replaced(self) -> None:
         _ = self.main("45min")
@@ -156,7 +176,7 @@ class AutoSilenceTests(unittest.TestCase):
             self.assertEqual(auto_silence.check(lambda: self.now, sender), 0)
         self.assertIsNone(silence.read_state())
         self.assertEqual([self.push_values(index)[0] for index in range(2)], ["silence.auto_on", "silence.auto_off"])
-        self.assertEqual(self.push_values(1)[1], ["kept=0", "sender=natedev"])
+        self.assertEqual(self.push_values(1)[1], ["held=No pushes were held while you were away.", "sender=natedev"])
 
     def test_off_removes_the_job_and_ends_an_auto_silence(self) -> None:
         _ = self.main("45min")
