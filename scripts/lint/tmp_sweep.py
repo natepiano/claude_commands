@@ -21,15 +21,17 @@ folder. It is deleted when both are true:
 
 These stay too: the roots and their active/ run-marker folders; a unit run
 folder whose `director` file names a running session; a session folder named
-for a running session, though each entry in its folders (scratchpad/, tasks/)
-is judged like any other; each of those when a session record cannot be read;
+for a running session, though an entry of SESSION_ENTRY_MIN_BYTES or more in
+its folders (scratchpad/, tasks/) is judged like any other: a live session
+keeps small files there that it only reads, and a read does not move mtime;
+each of those when a session record cannot be read;
 and an entry that cannot be read. Links are never followed, a read-only folder
 is made writable and deleted, and a project folder left empty goes. With no
 /proc (the Mac) nothing goes.
 
 Each run appends one JSON line to LOG_NAME in the lint-sweep state folder: the
 entries deleted, the GiB freed, the count kept for each reason, and the paths
-kept for each reason except a recent change. Lines older than LOG_KEEP_SECONDS
+kept for each reason except UNLISTED_REASONS, which hold most entries. Lines older than LOG_KEEP_SECONDS
 drop off. This replaced the 24-hour session scratch step (2026-10-21), whose
 folders it also covers.
 """
@@ -59,6 +61,8 @@ else:
 GIB = 1 << 30
 HOUR_SECONDS = 3600
 IDLE_SECONDS = 4 * HOUR_SECONDS
+# Inside a running session's folders only an entry this large can go (showrunner, 2026-10-25).
+SESSION_ENTRY_MIN_BYTES = GIB
 RUN_INTERVAL_SECONDS = HOUR_SECONDS
 LOG_KEEP_SECONDS = 7 * 24 * HOUR_SECONDS
 TMP_ROOT = "/tmp/claude"
@@ -80,6 +84,8 @@ DIRECTOR_RUNS = "its unit director runs"
 NO_SESSIONS = "a session record cannot be read"
 IN_USE = "a process uses it"
 RECENT = "changed in the last 4 h"
+SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
+UNLISTED_REASONS = (RECENT, SMALL_IN_LIVE_SESSION)
 UNREADABLE = "it cannot be read"
 NO_PROC = "no /proc to show which processes use it"
 
@@ -282,7 +288,7 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
 
 def session_folders(roots: Roots, live: frozenset[str] | None) -> tuple[str, ...]:
     """Each folder inside a running session's folder (scratchpad/, tasks/): the session folder stays,
-    but each entry in these is judged like any other."""
+    and each entry of SESSION_ENTRY_MIN_BYTES or more in these is judged like any other."""
     if live is None:
         return ()
     return tuple(inner.path for project in roots.projects for session in listing(project)
@@ -303,7 +309,8 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
                 result.keep(entry.path, NO_PROC)
         return result
     live = running_session_ids()
-    judged = roots.all() + session_folders(roots, live)
+    inner = session_folders(roots, live)
+    judged = roots.all() + inner
     uses = entry_uses(paths, judged)
     since = now - IDLE_SECONDS
     for root in judged:
@@ -318,6 +325,9 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
                 result.keep(entry.path, change)
                 continue
             newest, size = change
+            if root in inner and size < SESSION_ENTRY_MIN_BYTES:
+                result.keep(entry.path, SMALL_IN_LIVE_SESSION)
+                continue
             if not dry_run:
                 try:
                     delete_tree(entry.path)
@@ -350,7 +360,7 @@ def record(result: Sweep, dry_run: bool, now: float) -> RunRecord:
         deleted=result.deleted,
         failed=result.failed,
         kept={reason: len(paths) for reason, paths in sorted(result.kept.items())},
-        kept_paths={reason: sorted(paths) for reason, paths in sorted(result.kept.items()) if reason != RECENT},
+        kept_paths={reason: sorted(paths) for reason, paths in sorted(result.kept.items()) if reason not in UNLISTED_REASONS},
     )
 
 

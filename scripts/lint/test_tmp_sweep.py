@@ -211,23 +211,33 @@ class OwnerTests(TmpSweepCase):
         self.assertFalse(unowned.exists())
         self.assertEqual(result.kept[tmp_sweep.DIRECTOR_RUNS], [str(live)])
 
-    def test_a_running_sessions_folder_stays_and_its_idle_scratch_goes(self) -> None:
+    def test_a_running_sessions_folder_stays_and_only_its_large_idle_entries_go(self) -> None:
+        """The size line is three 4 KiB files: an entry at it goes, one a file under it stays."""
         live = self.project / LIVE_SESSION
-        idle = write(live / "scratchpad" / "gate" / "Cargo.toml").parent
-        fresh = write(live / "scratchpad" / "notes.md")
-        self.recent(fresh)
+        large = live / "scratchpad" / "merge"
+        for name in ("a", "b", "c"):
+            _ = write(large / name)
+        small = live / "scratchpad" / "template"
+        for name in ("a", "b"):
+            _ = write(small / name)
+        fresh = live / "scratchpad" / "fresh"
+        for name in ("a", "b", "c"):
+            self.recent(write(fresh / name))
         output = write(live / "tasks" / "b1.output")
         ended = write(self.project / ENDED_SESSION / "scratchpad" / "a").parents[1]
         other = write(self.project / "rust" / "kept")
-        result = self.sweep()
+        with mock.patch.object(tmp_sweep, "SESSION_ENTRY_MIN_BYTES", 3 * 4096):
+            result = self.sweep()
         self.assertTrue((live / "scratchpad").is_dir())
-        self.assertTrue((live / "tasks").is_dir())
-        self.assertFalse(idle.exists())
-        self.assertFalse(output.exists())
-        self.assertTrue(fresh.is_file())
+        self.assertFalse(large.exists())
+        self.assertTrue(small.is_dir())
+        self.assertTrue(fresh.is_dir())
+        self.assertTrue(output.is_file())
         self.assertFalse(ended.exists())
         self.assertFalse(other.exists())
         self.assertEqual(result.kept[tmp_sweep.SESSION_RUNS], [str(live)])
+        self.assertEqual(sorted(result.kept[tmp_sweep.SMALL_IN_LIVE_SESSION]), [str(small), str(output)])
+        self.assertIn(str(large), [entry["path"] for entry in result.deleted])
 
     def test_an_unreadable_session_record_keeps_session_and_run_folders(self) -> None:
         self.unreadable_sessions()
