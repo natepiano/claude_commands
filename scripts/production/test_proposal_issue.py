@@ -46,11 +46,15 @@ tags:
 status: open stays in the body
 """
 
+# Tags as the vault writes them, indented, which issues.frontmatter reads as a list.
+VAULT_ISSUE = ISSUE.replace("tags:\n- issue\n- proposal\n", "tags:\n  - issue\n  - proposal\n")
+
 
 @final
 class ProposalIssueTests(unittest.TestCase):
     root: Path = Path()
     runtime: Path = Path()
+    real_calling_showrunner = staticmethod(proposal_issue.calling_showrunner)
     issue: Path = Path()
 
     @override
@@ -62,6 +66,7 @@ class ProposalIssueTests(unittest.TestCase):
         self.runtime = home / ".local/state/proposal-issue/locks"
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=home))
         self.enterContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York", "XDG_RUNTIME_DIR": str(self.runtime)}))
+        _ = self.enterContext(mock.patch.object(proposal_issue, "calling_showrunner", return_value="hana"))
 
     def test_urgency_and_mark_important_set_the_review_fields_and_normal_removes_them(self) -> None:
         code, out, _ = self.run_cli("urgency", str(self.issue), "--level", "soon", "--due", "2026-10-22")
@@ -471,10 +476,15 @@ class ProposalIssueTests(unittest.TestCase):
             self.decision_issue()
             _ = self.issue.write_text(self.text().replace("tags:\n- issue\n- proposal\n", "tags: [issue, proposal]\n"))
             _ = proposal_issue.edit(self.issue, {"unit": "names-unit", "plan": "unit.md"}, date(2026, 10, 15))
+        def approved_by_showrunner() -> None:
+            approved_at_backlog()
+            _ = proposal_issue.edit(self.issue, {"approved_by": "showrunner", "approved_in": "hana"}, date(2026, 10, 15))
         verbs = (("edit", closed, lambda: proposal_issue.edit(self.issue, {"stage": "active"}, today)),
                  ("rules", closed, lambda: proposal_issue.edit_rules(self.issue, ["https://example.invalid/rule.md"], today)),
                  ("refresh", closed, lambda: proposal_issue.refresh_decision(self.issue, 3, "# Locked\n", "effort", today)),
                  ("reopen", closed, lambda: proposal_issue.reopen(self.issue, today)),
+                 ("unapprove", approved_by_showrunner,
+                  lambda: proposal_issue.unapprove(self.issue, "hana", today, dry_run=False)),
                  ("move-approved", approved_at_backlog,
                   lambda: list(proposal_issue.move_approved(self.root, today, dry_run=False))))
         for name, setup, verb in verbs:
@@ -580,7 +590,7 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_approve_moves_the_proposal_to_in_progress(self) -> None:
         code, out, _ = self.run_cli(
-            "approve", str(self.issue), "--showrunner", "hana", "--unit", "build-report",
+            "approve", str(self.issue), "--by", "user", "--showrunner", "hana", "--unit", "build-report",
             "--plan", "docs/plans/x.md Phase 4–6",
         )
         self.assertEqual(code, 0)
@@ -591,10 +601,87 @@ class ProposalIssueTests(unittest.TestCase):
         self.assertIn("stage: active\n", text)
         self.assertNotIn("stage: backlog", text)
         self.assertIn(f"date_modified: {self.today()}\n", text)
-        self.assertEqual(out, "approve a proposal.md: set showrunner, unit, plan, stage, date_modified\n")
+        self.assertIn('approved_by: "user"\n', text)
+        self.assertIn('approved_in: "hana"\n', text)
+        self.assertEqual(out, "approve a proposal.md: set showrunner, unit, plan, approved_by, approved_in, stage, date_modified\n")
         from issues import Issue, frontmatter
         self.assertEqual(proposal_issue.proposal_progress(Issue(self.issue, frontmatter(self.issue))),
                          proposal_issue.InProgress())
+
+    def test_unapprove_sets_an_approved_proposal_back_to_waiting_for_approval(self) -> None:
+        from issues import Issue, frontmatter
+        _ = self.issue.write_text(VAULT_ISSUE, encoding="utf-8")
+        _ = self.run_cli("approve", str(self.issue), "--by", "showrunner", "--showrunner", "hana", "--unit", "u", "--plan", "p")
+        approved = self.text()
+        code, out, error = self.run_cli("unapprove", str(self.issue), "--dry-run")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(out, "unapprove a proposal.md: set showrunner, unit, plan, approved_by, approved_in, stage\n")
+        self.assertEqual(self.text(), approved)
+        code, out, error = self.run_cli("unapprove", str(self.issue))
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(out, "unapprove a proposal.md: set showrunner, unit, plan, approved_by, approved_in, stage\n")
+        text = self.text()
+        for line in ('showrunner: ""\n', 'unit: ""\n', 'plan: ""\n', 'approved_by: ""\n', 'approved_in: ""\n', "stage: backlog\n", f"date_modified: {self.today()}\n"):
+            self.assertIn(line, text)
+        self.assertEqual(proposal_issue.proposal_progress(Issue(self.issue, frontmatter(self.issue))),
+                         proposal_issue.AwaitingApproval())
+
+    def test_unapprove_refuses_an_issue_with_no_approval_to_undo(self) -> None:
+        by_showrunner = {"unit": "u", "plan": "p", "approved_by": "showrunner", "approved_in": "hana"}
+        cases: tuple[tuple[str, dict[str, str], str], ...] = (("waiting", {}, "no approval is recorded"),
+                 ("declined", {**by_showrunner, "style_answer": "declined"}, "no approval is recorded"),
+                 ("closed", {**by_showrunner, "status": "closed"}, "not an open proposal"),
+                 ("user approval", {**by_showrunner, "approved_by": "user"}, "the user approved it"),
+                 ("approval without approved_by", {"unit": "u", "plan": "p"}, "the user approved it"),
+                 ("another showrunner", {**by_showrunner, "approved_in": "cargo-liner"},
+                  "approved in cargo-liner, not in hana"),
+                 ("no showrunner recorded", {**by_showrunner, "approved_in": ""}, "approved in no showrunner, not in hana"))
+        for name, fields, reason in cases:
+            with self.subTest(name=name):
+                _ = self.issue.write_text(VAULT_ISSUE, encoding="utf-8")
+                if fields:
+                    _ = proposal_issue.edit(self.issue, fields, date(2026, 10, 15))
+                before = self.text()
+                for dry_run in ([], ["--dry-run"]):
+                    code, _, error = self.run_cli("unapprove", str(self.issue), *dry_run)
+                    self.assertEqual(code, 2)
+                    self.assertIn(reason, error)
+                    self.assertEqual(self.text(), before)
+        _ = self.issue.write_text(VAULT_ISSUE.replace("  - proposal\n", ""), encoding="utf-8")
+        _ = proposal_issue.edit(self.issue, {"unit": "u", "plan": "p"}, date(2026, 10, 15))
+        code, _, error = self.run_cli("unapprove", str(self.issue))
+        self.assertEqual(code, 2)
+        self.assertIn("not an open proposal", error)
+
+    def test_a_user_approval_replaces_a_showrunner_one_and_a_showrunner_one_keeps_the_user(self) -> None:
+        def approve(by: str) -> str:
+            code, out, error = self.run_cli("approve", str(self.issue), "--by", by, "--showrunner", "hana",
+                                            "--unit", "u", "--plan", "p")
+            self.assertEqual((code, error), (0, ""))
+            return out
+        _ = approve("showrunner")
+        self.assertIn('approved_by: "showrunner"\n', self.text())
+        self.assertEqual(approve("user"), "approve a proposal.md: set approved_by\n")
+        self.assertIn('approved_by: "user"\n', self.text())
+        self.assertEqual(approve("showrunner"), "approve a proposal.md: unchanged\n")
+        self.assertIn('approved_by: "user"\n', self.text())
+        # An approval from before approved_by is the user's, so a showrunner approval keeps it.
+        _ = self.issue.write_text(ISSUE, encoding="utf-8")
+        _ = proposal_issue.edit(self.issue, {"unit": "u", "plan": "p", "stage": "active"}, date(2026, 10, 15))
+        self.assertEqual(approve("showrunner"), "approve a proposal.md: set showrunner, date_modified\n")
+        self.assertNotIn("approved_by", self.text())
+
+    def test_approve_and_unapprove_refuse_outside_a_showrunner(self) -> None:
+        before = self.text()
+        with mock.patch.object(proposal_issue, "calling_showrunner", self.real_calling_showrunner), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "no-such-session"}), \
+                mock.patch("showrunners.production_of", return_value=None):
+            for verb in (["approve", "--by", "user", "--showrunner", "hana", "--unit", "u", "--plan", "p"], ["unapprove"]):
+                with self.subTest(verb=verb[0]):
+                    code, _, error = self.run_cli(verb[0], str(self.issue), *verb[1:])
+                    self.assertEqual(code, 2)
+                    self.assertIn("this session is no production's showrunner", error)
+                    self.assertEqual(self.text(), before)
 
     def test_reopen_of_an_approved_proposal_closed_at_backlog_puts_it_in_progress(self) -> None:
         from issues import frontmatter
@@ -611,7 +698,7 @@ class ProposalIssueTests(unittest.TestCase):
                 self.assertEqual(out, f"reopen a proposal.md: set {changed}\n")
 
     def test_close_from_in_progress_closes_the_proposal_and_keeps_its_stage(self) -> None:
-        _ = self.run_cli("approve", str(self.issue), "--showrunner", "hana", "--unit", "u", "--plan", "p")
+        _ = self.run_cli("approve", str(self.issue), "--by", "user", "--showrunner", "hana", "--unit", "u", "--plan", "p")
         code, _, error = self.run_cli("close", str(self.issue), "--reason", "built in u-1")
         self.assertEqual(code, 0, error)
         from issues import frontmatter
@@ -701,11 +788,11 @@ class ProposalIssueTests(unittest.TestCase):
 
     def test_insert_goes_before_the_closing_fence_and_replace_stays_in_place(self) -> None:
         _ = self.run_cli(
-            "approve", str(self.issue), "--showrunner", "hana", "--unit", "u", "--plan", "p Phase 1",
+            "approve", str(self.issue), "--by", "user", "--showrunner", "hana", "--unit", "u", "--plan", "p Phase 1",
         )
         lines = self.text().splitlines()
         fence = lines.index("---", 1)
-        self.assertEqual(lines[fence - 2:fence], ['showrunner: "hana"', 'unit: "u"'])
+        self.assertEqual(lines[fence - 4:fence], ['showrunner: "hana"', 'unit: "u"', 'approved_by: "user"', 'approved_in: "hana"'])
         self.assertEqual(lines.index('plan: "p Phase 1"'), ISSUE.splitlines().index('plan: ""'))
 
     def test_a_home_relative_path_is_expanded(self) -> None:

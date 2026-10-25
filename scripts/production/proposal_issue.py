@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set a hanadocs issue's proposal fields: approve, start, close or stars.
+"""Set a hanadocs issue's proposal fields: approve, unapprove, start, close or stars.
 
 Each verb edits one issue file's frontmatter in place and reads nothing else, but number and create
 read the folder for the highest P number, move-approved edits each open approved proposal in it,
@@ -9,7 +9,8 @@ Each verb holds an exclusive lock on the issue for its whole read, change and wr
 file is in the user's state folder, never in the issue folder.
 
 Usage:
-  proposal_issue.py approve <issue> --showrunner S --unit U --plan P
+  proposal_issue.py approve <issue> --by user|showrunner --showrunner S --unit U --plan P
+  proposal_issue.py unapprove <issue> [--dry-run]
   proposal_issue.py start <issue>
   proposal_issue.py close <issue> --as-built PATH
   proposal_issue.py rules <issue> --rules URLS
@@ -24,6 +25,12 @@ Usage:
 `create` numbers a new decision the same way. `urgency` sets where the proposal goes among the ones
 waiting for the user (urgency.py): `review_urgency`, with `review_due` for soon; normal removes them.
 `mark-important` marks a proposal the user called important (`review_urgency: user`, `review_marked`).
+`approve` records who approved (`approved_by`: user, or showrunner when a showrunner approves without
+the user) and the production of the showrunner it runs in (`approved_in`). A user approval replaces
+a showrunner one; a showrunner approval keeps a user one. An approval with no `approved_by` is the
+user's. `unapprove` sets an open proposal that a showrunner approved, in the calling showrunner,
+back to waiting for approval: the approval fields empty, as filing writes them, and stage backlog.
+It refuses a user approval and any other issue; only the user's decline undoes a user approval.
 """
 from __future__ import annotations
 
@@ -55,7 +62,7 @@ KEY = re.compile(r"^([A-Za-z_][\w-]*):")
 GOAL = re.compile(r"^\d+ - \S.*$")
 STAR = "⭐"
 # The fields a migrated decision can take from the old issues it merges.
-INHERITED_FIELDS = frozenset({"showrunner", "unit", "plan", "stage", "backlog_goal", "backlog_alignment",
+INHERITED_FIELDS = frozenset({"showrunner", "unit", "plan", "approved_by", "approved_in", "stage", "backlog_goal", "backlog_alignment",
                               "backlog_impact", "backlog_urgency", "backlog_effort"})
 # The fields close adds or changes; reopen removes them and sets status open.
 CLOSE_FIELDS = ("as_built", "reason", "date_closed")
@@ -271,6 +278,63 @@ def reopen(path: Path, today: date) -> list[str]:
         return [*removed, *changed, *dates]
 
 
+USER = "user"
+SHOWRUNNER = "showrunner"
+APPROVERS = (USER, SHOWRUNNER)
+# The fields approve sets; unapprove writes them empty, as filing does.
+APPROVAL_FIELDS = ("showrunner", "unit", "plan", "approved_by", "approved_in")
+
+
+def calling_showrunner() -> str:
+    """The production slug of the showrunner this session runs, from its update timer."""
+    import showrunners  # only approve and unapprove read the update timers
+
+    doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    if doc is None:
+        raise Refusal("this session is no production's showrunner; approve and unapprove run in one")
+    return showrunners.production_slug(str(doc))
+
+
+def approver(issue: Issue) -> str:
+    """Who approved: showrunner only when approved_by says so; an approval without the field is the user's."""
+    return SHOWRUNNER if issue.value("approved_by") == SHOWRUNNER else USER
+
+
+def approve(path: Path, fields: dict[str, str], by: str, approved_in: str, today: date) -> list[str]:
+    """Record the approval and stage active. A showrunner approval keeps the approver of a user one."""
+    with _issue_lock(path):
+        issue = Issue(path, frontmatter(path))
+        kept = by == SHOWRUNNER and isinstance(decision_answer(issue), ApprovedDecision) and approver(issue) == USER
+        actor = {} if kept else {"approved_by": by, "approved_in": approved_in}
+        text, changed = set_fields(_read(path), {**fields, **actor, "stage": IN_PROGRESS_STAGE,
+                                                 "date_modified": _vault_date(today)}, path)
+        if changed:
+            _write(path, text)
+        return changed
+
+
+def unapprove(path: Path, approved_in: str, today: date, *, dry_run: bool) -> list[str]:
+    """Set a proposal a showrunner approved in `approved_in` back to waiting for approval.
+
+    A dry run refuses the same issues and writes nothing.
+    """
+    with _issue_lock(path):
+        issue = Issue(path, frontmatter(path))
+        if issue.value("status") != "open" or PROPOSAL_TAG not in issue.fields.get("tags", []):
+            raise Refusal(f"{path}: not an open proposal")
+        if not isinstance(decision_answer(issue), ApprovedDecision):
+            raise Refusal(f"{path}: no approval is recorded")
+        if approver(issue) == USER:
+            raise Refusal(f"{path}: the user approved it; only the user's decline undoes it")
+        if issue.value("approved_in") != approved_in:
+            raise Refusal(f"{path}: approved in {issue.value('approved_in') or 'no showrunner'}, not in {approved_in}")
+        text, changed = set_fields(_read(path), {**dict.fromkeys(APPROVAL_FIELDS, ""), "stage": "backlog",
+                                                 "date_modified": _vault_date(today)}, path)
+        if not dry_run:
+            _write(path, text)
+        return changed
+
+
 REVIEW_FIELDS = ("review_urgency", "review_due", "review_marked")
 
 
@@ -289,13 +353,6 @@ def set_urgency(path: Path, level: urgency.Urgency, today: date) -> list[str]:
 
 def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
     verb = cast(str, args.verb)
-    if verb == "approve":
-        return {
-            "showrunner": cast(str, args.showrunner),
-            "unit": cast(str, args.unit),
-            "plan": cast(str, args.plan),
-            "stage": IN_PROGRESS_STAGE,
-        }
     if verb == "start":
         return {"stage": IN_PROGRESS_STAGE}
     if verb == "close":
@@ -613,10 +670,14 @@ def _main_move_approved(folder: Path, today: date, *, dry_run: bool) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
-    approve = verbs.add_parser("approve", help="record the user's approval; stage active (in progress)")
-    _ = approve.add_argument("--showrunner", required=True, help="the showrunner's session name")
-    _ = approve.add_argument("--unit", required=True, help="the unit, as in the production's Units table")
-    _ = approve.add_argument("--plan", required=True, help="'<plan path> Phase N–M'")
+    approving = verbs.add_parser("approve", help="record the approval; stage active (in progress)")
+    _ = approving.add_argument("--by", required=True, choices=APPROVERS,
+                             help="user when the user approved, showrunner when a showrunner approved without the user")
+    _ = approving.add_argument("--showrunner", required=True, help="the showrunner's session name")
+    _ = approving.add_argument("--unit", required=True, help="the unit, as in the production's Units table")
+    _ = approving.add_argument("--plan", required=True, help="'<plan path> Phase N–M'")
+    unapproving = verbs.add_parser("unapprove", help="set an approved proposal back to waiting for approval")
+    _ = unapproving.add_argument("--dry-run", action="store_true", help="print the change and write nothing")
     _ = verbs.add_parser("start", help="stage active")
     close = verbs.add_parser("close", help="set as_built and close")
     closure = close.add_mutually_exclusive_group(required=True)
@@ -654,7 +715,7 @@ def main(argv: list[str]) -> int:
     _ = stars.add_argument("--goal", required=True, help="e.g. '1 - Ship Hana'")
     for name in ("alignment", "impact", "urgency", "effort"):
         _ = stars.add_argument(f"--{name}", required=True, help="1 to 5")
-    for verb in (approve, verbs.choices["start"], close, stars, linking, reopening, answer, ranking, important):
+    for verb in (approving, unapproving, verbs.choices["start"], close, stars, linking, reopening, answer, ranking, important):
         _ = verb.add_argument("issue", type=Path)
     args = parser.parse_args(argv)
     verb = cast(str, args.verb)
@@ -691,6 +752,11 @@ def main(argv: list[str]) -> int:
             return 0
         if verb == "reopen":
             changed = reopen(path, today)
+        elif verb == "approve":
+            changed = approve(path, {name: cast(str, getattr(args, name)) for name in ("showrunner", "unit", "plan")},
+                              cast(str, args.by), calling_showrunner(), today)
+        elif verb == "unapprove":
+            changed = unapprove(path, calling_showrunner(), today, dry_run=cast(bool, args.dry_run))
         elif verb == "decline-answer":
             changed = edit(path, {"style_answer": "declined", "style_answer_words": cast(str, args.words)}, today)
         elif verb in ("urgency", "mark-important"):
