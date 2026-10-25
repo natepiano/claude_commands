@@ -99,10 +99,10 @@ class ListTest(unittest.TestCase):
     def test_rows_take_the_next_number_in_the_whole_file_and_end_the_table(self) -> None:
         rows = change_review.append_rows(self.path, [Visible("A | B", "Look", "It"), Visible("C", "D.", "E")],
                                          date(2026, 10, 14), "61b65bbf", PRODUCTION)
-        self.assertEqual(rows, ["| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look. You see: It |",
-                                "| C82 | C | 2026-10-14 · 61b65bbf | not yet | D. You see: E |"])
+        self.assertEqual(rows, ["| C81 | A \\| B | 2026-10-14 · 61b65bbf | not yet | Look. You see: It | demo |",
+                                "| C82 | C | 2026-10-14 · 61b65bbf | not yet | D. You see: E | demo |"])
         lines = self.path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[lines.index("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font |") + 1], rows[0])
+        self.assertEqual(lines[lines.index("| C77 | Fonts redraw | 2026-10-14 | not yet | Change a font | |") + 1], rows[0])
 
     def test_a_list_without_the_section_is_refused_and_left_alone(self) -> None:
         _ = self.path.write_text("# list\n", encoding="utf-8")
@@ -218,20 +218,20 @@ class ActionTest(unittest.TestCase):
 
     def test_the_first_row_creates_a_missing_list_from_the_skeleton(self) -> None:
         rows = change_review.append_rows(self.fresh, [Visible("A", "B", "C")], date(2026, 10, 15), "", PRODUCTION)
-        self.assertEqual(rows, ["| C1 | A | 2026-10-15 | B. You see: C |"])
+        self.assertEqual(rows, ["| C1 | A | 2026-10-15 | B. You see: C | demo |"])
         self.assertEqual(self.fresh.read_text(encoding="utf-8").split("\n\n## To review")[0], "\n".join([
             "---", 'date_created: "[[2026-10-15]]"', 'date_modified: "[[2026-10-15]]"', "productions:",
             '  - "~/worktrees/demo-trunk/docs/plans/demo-production.md"', "showrunner: natedev", "---", "",
             "# natedev showrunner: changes to review", "",
             'Ask for "change review" any time to walk it one change at a time. A reviewed row moves to Reviewed '
             + "with your verdict."]))
-        self.assertIn("| --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
+        self.assertIn("| --- | --- | --- | --- | --- |\n| C1 | A | 2026-10-15 | B. You see: C | demo |\n\n## Reviewed", self.fresh.read_text(encoding="utf-8"))
 
     def test_add_takes_the_next_number_and_fills_the_mac_build_column_only_where_the_table_has_one(self) -> None:
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "Tabs | spaces", "--check", "Look", "--see", "It",
                              "--merged", "216c4e1d"), (0, "C81\n", ""))
         day = change_review.today().isoformat()
-        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look. You see: It |\n\n## Questions",
+        self.assertIn(f"| C81 | Tabs \\| spaces | {day} · 216c4e1d | not yet | Look. You see: It | demo |\n\n## Questions",
                       self.path.read_text(encoding="utf-8"))
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
         self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
@@ -340,7 +340,7 @@ class ActionTest(unittest.TestCase):
         text = self.path.read_text(encoding="utf-8")
         self.assertLess(text.index("| C77 |"), text.index("| C81 |"))
         self.assertLess(text.index("| C81 |"), text.index("| C76 |"))
-        self.assertIn("| Urgency |\n| --- | --- | --- | --- | --- | --- |", text)
+        self.assertIn("| Urgency | Production |\n| --- | --- | --- | --- | --- | --- | --- |", text)
         self.assertIn("| C76 | Panels keep shields | 2026-10-14 | not yet | Launch Hana | |", text)
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
                              "--see", "C", "--urgency", "soon")[0], 1)

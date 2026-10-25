@@ -14,6 +14,8 @@ from unittest import mock
 
 import change_review
 import next_item
+import proposals_folder
+import showrunners
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -131,10 +133,19 @@ class NextItemTests(unittest.TestCase):
 
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
+        doc = self.root / "docs" / "plans" / "demo-production.md"
+        doc.parent.mkdir(parents=True)
+        _ = doc.write_text(f"# Demo\n\n## Production Context\n\n- **Efficiency ledger:** {self.root / 'ledger.md'}\n")
         line = LEDGER.splitlines()[0]
-        self.assertEqual(run("show", "--kind", "efficiency"), (0, f"efficiency\n{line}\n", ""))
-        self.assertEqual(run("move-to-end", "--kind", "efficiency")[0], 0)
-        self.assertEqual(run("show", "--kind", "efficiency")[1], f"efficiency\n{LEDGER.splitlines()[1]}\n")
+        self.assertEqual(run("show", "--kind", "efficiency", "--production", str(doc)), (0, f"efficiency\n{line}\n", ""))
+        self.assertEqual(run("move-to-end", "--kind", "efficiency", "--production", str(doc))[0], 0)
+        self.assertEqual(run("show", "--kind", "efficiency", "--production", str(doc))[1],
+                         f"efficiency\n{LEDGER.splitlines()[1]}\n")
+        # A production whose doc names no Efficiency ledger has no efficiency items.
+        bare = doc.with_name("bare-production.md")
+        _ = bare.write_text("# Bare\n\n## Production Context\n\n- **Repository:** /nowhere\n")
+        self.assertEqual(run("show", "--kind", "efficiency", "--production", str(bare))[1],
+                         "no efficiency is waiting for you\n")
         path = self.root / "change-review" / "change-review - natedev.md"
         _ = change_review.append_rows(path, [Visible("Panels keep shields", "Run `hana`", "Each panel has its shield")],
                                       date(2026, 10, 15), "", PRODUCTION)
@@ -145,7 +156,47 @@ class NextItemTests(unittest.TestCase):
         with mock.patch.object(change_review, "production_list", the_list):
             self.assertEqual(run("show", "--kind", "change", "--production", str(PRODUCTION)), (0, "\n".join([
                 "change", "C1 Panels keep shields", "  How to check: Run `hana`. You see: Each panel has its shield",
-                "  Merged: 2026-10-15", ""]), ""))
+                "  Merged: 2026-10-15", "  Production: demo", ""]), ""))
+
+    def test_a_showrunner_sees_its_own_items_and_those_below_it_never_above_or_beside(self) -> None:
+        plans = self.root / "docs" / "plans"
+        plans.mkdir(parents=True)
+        docs = {slug: plans / f"{slug}-production.md" for slug in ("top", "kid", "side")}
+        for slug, doc in docs.items():
+            _ = (self.root / f"{slug}.md").write_text(f"- 2026-10-12 rust/{slug}: {slug} gain — proposed\n")
+            _ = doc.write_text(f"# {slug}\n\n- **Efficiency ledger:** {self.root / f'{slug}.md'}\n")
+        path = self.root / "change-review" / "change-review - natedev.md"
+        for slug in ("top", "kid", "side", "gone"):
+            _ = change_review.append_rows(path, [Visible(f"{slug} change", "Run it", "It works")], date(2026, 10, 15),
+                                          "", plans / f"{slug}-production.md")
+        # A row written before the Production column belongs to the list's root.
+        _ = path.write_text(path.read_text(encoding="utf-8").replace(" gone |", "  |"), encoding="utf-8")
+        below = {"top": [docs["top"], docs["kid"]], "kid": [docs["kid"]], "side": [docs["side"]]}
+
+        def owner_docs(doc: Path) -> list[Path]:
+            return below[doc.name.removesuffix("-production.md")]
+
+        def root_of(slug: str) -> str:
+            return "top" if slug == "kid" else slug
+
+        def the_list(production: str) -> Path:
+            del production
+            return path
+
+        with mock.patch.object(proposals_folder, "owner_docs", owner_docs), \
+                mock.patch.object(showrunners, "root_of", root_of), \
+                mock.patch.object(change_review, "production_list", the_list):
+            top = next_item.change_queue(docs["top"])
+            kid = next_item.change_queue(docs["kid"])
+            self.assertEqual([entry.item.splitlines()[0] for entry in top.entries],
+                             ["C1 top change", "C2 kid change", "C4 gone change"])
+            self.assertEqual([entry.item.splitlines()[0] for entry in kid.entries], ["C2 kid change"])
+            # Each showrunner pins its own item, so one /next never moves the other's.
+            self.assertNotEqual(top.name, kid.name)
+            self.assertEqual([entry.item for entry in next_item.efficiency_queue(docs["top"]).entries],
+                             ["- 2026-10-12 rust/top: top gain — proposed", "- 2026-10-12 rust/kid: kid gain — proposed"])
+            self.assertEqual([entry.item for entry in next_item.efficiency_queue(docs["kid"]).entries],
+                             ["- 2026-10-12 rust/kid: kid gain — proposed"])
 
 
 if __name__ == "__main__":
