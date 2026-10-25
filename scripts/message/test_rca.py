@@ -98,6 +98,8 @@ class RcaTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(rca, "STATE", self.root / "rca"))
         _ = self.enterContext(mock.patch.object(rca, "SEND", stub))
         _ = self.enterContext(mock.patch.object(rca, "PROJECTS", self.root / "projects"))
+        # A fixed clock: a case id carries the day, so a call with no time of its own opens 261023-<n> on any day.
+        _ = self.enterContext(mock.patch.object(rca, "now", return_value=OPENED))
         (self.root / "sessions").mkdir()
         removed = (rca.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
         environment = {key: value for key, value in os.environ.items() if key not in removed}

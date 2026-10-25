@@ -4043,6 +4043,113 @@ class StyleLedgerTests(unittest.TestCase):
             scopes = cast(list[tuple[str]], connection.execute("SELECT DISTINCT input_scope FROM judgments").fetchall())
         self.assertEqual(scopes, [("module",)])
 
+    def comment_scope_rules(self) -> tuple[str, str, str, str, str]:
+        """A modules rule at file, module and crate scope, a names rule, and the module file they share a crate with."""
+        file_rule = self.rule("file-layout", "tier: C\nfamily: modules\ninput_scope: file\n")
+        module_rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        crate_rule = self.rule("crate-layout", "tier: C\nfamily: modules\ninput_scope: crate\n")
+        names_rule = self.rule("naming", "tier: C\nfamily: names\ninput_scope: file\n")
+        path, _, _, base = self.structure_module()
+        self.set_tip(base)
+        for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0]), (names_rule, self.sources[0])):
+            self.record(rule, judged, base)
+        return file_rule, module_rule, crate_rule, names_rule, path
+
+    def comment_only_change(self, relative: str) -> None:
+        content = (self.repo / relative).read_text()
+        self.write(relative, "// A note.\n/// Returns the value.\n" + content.replace("{ 1 }", "{\n    // One.\n    1\n}"))
+
+    def test_a_modules_cell_stays_current_after_a_comment_only_change_at_each_scope(self) -> None:
+        file_rule, module_rule, crate_rule, _, path = self.comment_scope_rules()
+        for relative in (self.sources[0], self.sources[1], path, "crates/alpha/src/theme/mod.rs", "crates/alpha/src/theme.rs"):
+            self.comment_only_change(relative)
+        self.set_tip(self.commit("Change comments only"))
+        for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
+            with self.subTest(rule=rule):
+                self.assertEqual(self.states(rule)[judged], "current")
+
+    def test_a_names_cell_goes_stale_after_a_comment_only_change(self) -> None:
+        _, _, _, names_rule, _ = self.comment_scope_rules()
+        self.comment_only_change(self.sources[0])
+        self.set_tip(self.commit("Change comments only"))
+        self.assertEqual(self.states(names_rule)[self.sources[0]], "stale")
+
+    def test_a_modules_cell_goes_stale_after_a_code_inner_doc_file_set_or_manifest_change(self) -> None:
+        file_rule, module_rule, crate_rule, _, path = self.comment_scope_rules()
+        sibling = "crates/alpha/src/theme/mod.rs"
+        library = (self.repo / self.sources[0]).read_text()
+        changes: tuple[tuple[str, str, str, str, str | None], ...] = (
+            ("code", module_rule, path, sibling, "pub fn changed() {}\n"),
+            ("inner line doc", module_rule, path, sibling, "//! Theme values.\npub fn changed() {}\n"),
+            ("inner block doc", file_rule, self.sources[0], self.sources[0], "/*! The alpha crate. */\n" + library),
+            ("added file", module_rule, path, "crates/alpha/src/theme/added.rs", "pub fn added() {}\n"),
+            ("manifest", crate_rule, self.sources[0], "crates/alpha/Cargo.toml",
+             (self.repo / "crates/alpha/Cargo.toml").read_text() + "# A note.\n"),
+            ("removed file", crate_rule, self.sources[0], self.sources[1], None),
+            ("removed module file", module_rule, path, "crates/alpha/src/theme.rs", None),
+        )
+        tip = self.git("rev-parse", "HEAD")
+        for label, rule, judged, relative, content in changes:
+            with self.subTest(change=label):
+                self.record(rule, judged, tip)
+                if content is None:
+                    (self.repo / relative).unlink()
+                else:
+                    self.write(relative, content)
+                tip = self.commit(f"Change {label}")
+                self.set_tip(tip)
+                self.assertEqual(self.states(rule)[judged], "stale")
+
+    def test_a_modules_cell_goes_stale_when_an_inner_doc_moves_to_another_module_block(self) -> None:
+        file_rule, _, _, _, _ = self.comment_scope_rules()
+        blocks = "mod alpha {{\n{}    pub fn a() {{}}\n}}\nmod beta {{\n{}    pub fn b() {{}}\n}}\n"
+        doc = "    //! Alpha facade.\n"
+        self.write(self.sources[0], blocks.format(doc, ""))
+        tip = self.commit("Document the alpha block")
+        self.set_tip(tip)
+        self.record(file_rule, self.sources[0], tip)
+        self.write(self.sources[0], blocks.format("", doc))
+        self.set_tip(self.commit("Move the inner doc to the beta block"))
+        self.assertEqual(self.states(file_rule)[self.sources[0]], "stale")
+
+    def test_a_modules_cell_goes_stale_after_a_mode_or_submodule_change_beside_a_comment_edit(self) -> None:
+        _, _, crate_rule, _, _ = self.comment_scope_rules()
+        submodule = self.repo / "crates/alpha/vendored"
+        submodule.mkdir()
+
+        def submodule_commit(message: str) -> None:
+            _ = subprocess.run(["git", "-C", str(submodule), "-c", "user.name=Ledger tests", "-c",
+                                "user.email=ledger-tests@example.invalid", "commit", "-q", "--allow-empty", "-m", message],
+                               check=True, capture_output=True)
+
+        _ = subprocess.run(["git", "-C", str(submodule), "init", "-q"], check=True, capture_output=True)
+        submodule_commit("First")
+        tip = self.commit("Add a submodule")
+        self.assertIn("160000 commit", self.git("ls-tree", tip, "crates/alpha/vendored"))
+        changes: tuple[tuple[str, Callable[[], None]], ...] = (
+            ("submodule pointer", lambda: submodule_commit("Second")),
+            ("manifest mode", lambda: (self.repo / "crates/alpha/Cargo.toml").chmod(0o755)),
+            ("Rust file mode", lambda: (self.repo / self.sources[1]).chmod(0o755)),
+        )
+        for label, change in changes:
+            with self.subTest(change=label):
+                self.set_tip(tip)
+                self.record(crate_rule, self.sources[0], tip)
+                change()
+                self.comment_only_change(self.sources[0])
+                tip = self.commit(f"Change {label} and a comment")
+                self.set_tip(tip)
+                self.assertEqual(self.states(crate_rule)[self.sources[0]], "stale")
+
+    def test_a_modules_judgment_with_reads_stays_current_after_a_comment_only_change_in_a_read(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, _, _, base = self.structure_module()
+        self.set_tip(base)
+        self.record_reads(rule, path, base, (self.sources[1],))
+        self.comment_only_change(self.sources[1])
+        self.set_tip(self.commit("Change comments in a read file"))
+        self.assertEqual(self.states(rule)[path], "current")
+
     def test_legacy_structure_crate_key_carries_over_without_rewriting_the_row(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         path, sibling, _, base = self.structure_module()

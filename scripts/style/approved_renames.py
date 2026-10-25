@@ -32,9 +32,35 @@ NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 RUST_FILE = r"(?:[A-Za-z0-9_-]+/)*[A-Za-z_][A-Za-z0-9_]*\.rs"
 # A file rename finding's after: each path ends at a space, a mark, the end of a sentence or the end of the text.
 FILE_RENAME = re.compile(rf"Rename ({RUST_FILE}) to ({RUST_FILE})(?=$|[\s;,:)]|\.(?:\s|$))")
-# Words after a file rename that name another change: a second file pair, or a move, split or merge of code.
-OTHER_CHANGE = re.compile(
-    rf"{RUST_FILE}\s+to\s+{RUST_FILE}|\b(?:mov(?:e|es|ed|ing)|split(?:s|ting)?|merg(?:e|es|ed|ing))\b", re.IGNORECASE)
+# Words after a file rename that name a second file pair: another change.
+SECOND_FILE_PAIR = re.compile(rf"{RUST_FILE}\s+to\s+{RUST_FILE}", re.IGNORECASE)
+# A move, split or merge of code; a word joined to another with a hyphen, as in `finding-merging`, is a name.
+CODE_MOVE = re.compile(r"(?<![\w-])(?:mov(?:e|es|ed|ing)|split(?:s|ting)?|merg(?:e|es|ed|ing))(?![\w-])", re.IGNORECASE)
+# The text between the start of a clause and a move word: a mark or a joining word ends the clause before it.
+CLAUSE_START = re.compile(r"[.;:,()]|\b(?:and|but|then)\b", re.IGNORECASE)
+# The words right before a move that negate it: `does not move`, `doesn't move`, `cannot move`, `never moves` or
+# `without moving`. Only these exact forms count, so any other text names a move and a person decides.
+NEGATED_VERB = re.compile(
+    r"(?:\b(?:does|do|did|will|shall|must|should|may|can|could|would)\s+not|n't|\bcannot|\bnever|\bwithout)\s*$",
+    re.IGNORECASE)
+# A `no` that negates the words after it: `no longer`, `no more` and the like do not.
+NO_LEAD = r"no(?!\s+(?:longer|more|less|fewer|later|sooner|doubt|matter)\b)"
+# A noun that names code.
+CODE_NOUN = r"(?:definitions?|items?|types?|behaviou?r|code|functions?|methods?|impls?|tests?|helpers?|facades?|splits?)"
+# A clause that is a subject of `no` before its move: `nothing`, `none`, or `no`, at most three words and a noun that
+# names code, as in `no existing definition moves`.
+NEGATED_SUBJECT = re.compile(rf"\s*(?:nothing|none|{NO_LEAD}(?:\s+[\w-]+){{0,3}}?\s+{CODE_NOUN})\s*", re.IGNORECASE)
+# The end of a sentence: `.`, `;` or the end of the text. A comma or a colon can start an exception, so it is not an end.
+CLAUSE_END = r"\s*(?:[.;]|$)"
+# What follows the move of a negated subject: a place word or the end of the clause, as in `moves into a file`.
+SUBJECT_MOVE_END = re.compile(rf"\s+(?:into|out|from|to|between|across|within)\b|{CLAUSE_END}", re.IGNORECASE)
+# An object of `no` right after a move, then the end of the clause, as in `move no skipped definitions.`; a place word
+# after the object can start an exception, as in `move no helpers into a file except LockError`.
+NEGATED_OBJECT = re.compile(rf"\s+{NO_LEAD}(?:\s+[\w-]+){{0,3}}?\s+{CODE_NOUN}{CLAUSE_END}", re.IGNORECASE)
+# A clause of `no` and at most three words before a move word that is itself the noun, as in `no additional split`.
+NEGATED_NOUN = re.compile(rf"\s*{NO_LEAD}(?:\s+[\w-]+){{0,3}}\s*", re.IGNORECASE)
+# What follows a move word that is a noun: a form of `be`, as in `no additional split is introduced`.
+NOUN_MOVE_END = re.compile(r"\s+(?:is|are|was|were)\b", re.IGNORECASE)
 # The file stems that are their folder's module or a crate root, not a module of their own name.
 ROOT_STEMS = frozenset({"mod", "lib", "main"})
 # The Rust keywords, strict and reserved in any edition: a module with one of these names needs `r#`.
@@ -186,7 +212,7 @@ def approved_rename(kind: str, before: str, after: str) -> ApprovedRename | NoQu
 def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
     """The file rename a finding approves, when its after starts with `Rename <a> to <b>` and its path ends with <a>."""
     match = FILE_RENAME.match(after)
-    if kind != "rename" or not match or OTHER_CHANGE.search(after, match.end()):
+    if kind != "rename" or not match or names_other_change(after[match.end():]):
         return NoFileRename()
     named_old, named_new = PurePosixPath(match[1]), PurePosixPath(match[2])
     stems = {named_old.stem, named_new.stem}
@@ -194,6 +220,20 @@ def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
             or len(stems) == 1 or stems & ROOT_STEMS or stems & RUST_KEYWORDS):
         return NoFileRename()
     return FileRename(path, path.removesuffix(match[1]) + match[2])
+
+
+def names_other_change(rest: str) -> bool:
+    """Whether the text after a file rename names a second file pair, or a move, split or merge it does not negate."""
+    if SECOND_FILE_PAIR.search(rest):
+        return True
+    for move in CODE_MOVE.finditer(rest):
+        clause = rest[max((start.end() for start in CLAUSE_START.finditer(rest, 0, move.start())), default=0):move.start()]
+        negated_subject = NEGATED_SUBJECT.fullmatch(clause) and SUBJECT_MOVE_END.match(rest, move.end())
+        negated_noun = NEGATED_NOUN.fullmatch(clause) and NOUN_MOVE_END.match(rest, move.end())
+        negated_object = NEGATED_OBJECT.match(rest, move.end())
+        if not (NEGATED_VERB.search(clause) or negated_subject or negated_noun or negated_object):
+            return True
+    return False
 
 
 def file_module(path: str) -> str:

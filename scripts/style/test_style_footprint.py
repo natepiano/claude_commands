@@ -639,6 +639,125 @@ class StyleFootprintTests(unittest.TestCase):
         _ = self.commit()
         self.assert_mechanical(base)
 
+    def shorten_module_constants(self, module: str, extra: str) -> str:
+        self.write("src/lib.rs", f"mod {module};\nmod card;\n")
+        self.write(f"src/{module}.rs", 'pub(crate) const VERTICAL: &str = "|";\n'
+                   + 'pub(crate) const VERTICAL_RIGHT: &str = "|-";\n')
+        body = ("fn fade(text: &str) -> &str { text }\nfn set_symbol(_symbol: &str) {}\n"
+                + f"fn paint(symbol: &str) {{\n    if symbol == {module}::VERTICAL_RIGHT {{\n"
+                + f"        set_symbol({module}::VERTICAL);\n    }}\n}}\n" + extra)
+        self.write("src/card.rs", f"use crate::{module};\n" + body)
+        base = self.commit()
+        self.write("src/card.rs", f"use crate::{module}::VERTICAL;\nuse crate::{module}::VERTICAL_RIGHT;\n"
+                   + body.replace(f"{module}::VERTICAL", "VERTICAL"))
+        _ = self.commit()
+        return base
+
+    def test_constant_import_shortening_allows_a_removed_module_name_as_a_closure_binding(self) -> None:
+        base = self.shorten_module_constants(
+            "line", "fn widths(rows: &[&str]) -> usize { rows.iter().flat_map(|line| { fade(line).chars() }).count() }\n",
+        )
+        self.assert_mechanical(base)
+
+    def test_constant_import_shortening_with_a_removed_module_name_and_a_glob_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "use std::collections::*;\nfn count(line: usize) -> usize { line }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_prelude_module_name_requires_review(self) -> None:
+        for module, extra in (("drop", "fn release(value: String) { drop(value) }\n"),
+                              ("Option", "fn pick() -> Option<u32> { None }\n")):
+            with self.subTest(module=module):
+                base = self.shorten_module_constants(module, extra)
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_as_a_macro_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "fn here() -> u32 { line!() }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_path_left_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "fn other() -> &'static str { line::OTHER }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_in_a_macro_argument_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "fn here() { invoke!(line) }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_in_a_macro_rules_body_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "macro_rules! paint_line { () => { line }; }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_constant_left_as_a_pattern_requires_review(self) -> None:
+        self.write("src/lib.rs", "mod symbols;\nmod card;\n")
+        # A C binding crate exports snake-case constants such as `err_none`.
+        for constant in ("LIMIT", "err_none"):
+            with self.subTest(constant=constant):
+                self.write("src/symbols.rs", f"pub(crate) const {constant}: usize = 4;\n"
+                           + 'pub(crate) const VERTICAL: &str = "|";\n')
+                body = ("fn paint(symbol: &str) {\n    if symbol == symbols::VERTICAL {}\n}\n"
+                        + f"fn full(x: usize) -> bool {{ match x {{ {constant} => true, _ => false }} }}\n")
+                self.write("src/card.rs", f"use crate::symbols;\nuse crate::symbols::{constant};\n" + body)
+                base = self.commit()
+                self.write("src/card.rs", "use crate::symbols;\nuse crate::symbols::VERTICAL;\n"
+                           + body.replace("symbols::VERTICAL", "VERTICAL"))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def write_scope_definitions(self) -> None:
+        self.write("src/lib.rs", "mod c;\nmod shapes;\nmod card;\n")
+        self.write("src/c.rs", "pub(crate) const err_none: usize = 0;\n")
+        self.write("src/shapes.rs", 'pub(crate) mod err_none { pub(crate) const VERTICAL: &str = "|"; }\n'
+                   + 'pub(crate) mod line { pub(crate) const VERTICAL: &str = "|"; }\n')
+
+    def test_constant_import_shortening_with_a_child_import_in_another_module_requires_review(self) -> None:
+        self.write_scope_definitions()
+        query = ("mod ffi {\n    pub(crate) use crate::c::err_none;\n    mod query {\n        use super::err_none;\n"
+                 + "        fn ok(x: usize) -> bool { match x { err_none => true, _ => false } }\n    }\n}\n")
+        paint = ("mod ui {\n    pub(crate) use crate::shapes::err_none;\n    mod paint {\n        use super::err_none;\n"
+                 + "        fn paint(symbol: &str) { if symbol == err_none::VERTICAL {} }\n    }\n}\n")
+        self.write("src/card.rs", query + paint)
+        base = self.commit()
+        self.write("src/card.rs", query.replace("        use super::err_none;\n", "") + paint.replace(
+            "use super::err_none;", "use super::err_none::VERTICAL;").replace("err_none::VERTICAL {", "VERTICAL {"))
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_import_kept_elsewhere_requires_review(self) -> None:
+        self.write_scope_definitions()
+        paint = ("mod ui {\n    pub(crate) use crate::shapes::line;\n    mod paint {\n        use super::line;\n"
+                 + "        fn paint(symbol: &str) { if symbol == line::VERTICAL {} }\n    }\n}\n")
+        for kept in ("    }\n    mod check {\n        use super::err_none;\n        fn code() -> usize { err_none }\n",
+                     # The braces keep the block-level use from pairing with the removed module-level one.
+                     "        fn code() -> usize { use super::{err_none}; err_none }\n"):
+            with self.subTest(kept=kept):
+                query = ("mod ffi {\n    pub(crate) use crate::c::err_none;\n    mod query {\n        use super::err_none;\n"
+                         + "        fn ok(x: usize) -> bool { match x { err_none => true, _ => false } }\n"
+                         + kept + "    }\n}\n")
+                self.write("src/card.rs", query + paint)
+                base = self.commit()
+                self.write("src/card.rs", query.replace("        use super::err_none;\n", "", 1) + paint.replace(
+                    "use super::line;", "use super::line::VERTICAL;").replace("line::VERTICAL {", "VERTICAL {"))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_block_import_requires_review(self) -> None:
+        self.write_scope_definitions()
+        before = ("mod provider { pub(crate) const err_none: u32 = 0; }\nuse provider::err_none;\n"
+                  + "fn ok(x: u32) -> bool {\n    mod provider { pub const err_none: u32 = 1; }\n"
+                  + "    use provider::err_none;\n    match x { err_none => true, _ => false }\n}\n"
+                  + "use crate::shapes::line;\nfn paint(symbol: &str) { if symbol == line::VERTICAL {} }\n")
+        self.write("src/card.rs", before)
+        base = self.commit()
+        self.write("src/card.rs", before.replace("    use provider::err_none;\n", "").replace(
+            "use crate::shapes::line;", "use crate::shapes::line::VERTICAL;").replace("line::VERTICAL {", "VERTICAL {"))
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_in_an_attribute_requires_review(self) -> None:
+        for attribute in ("#[line]", "#[line(fast)]"):
+            with self.subTest(attribute=attribute):
+                base = self.shorten_module_constants("line", f"{attribute}\nfn tagged() {{}}\n")
+                self.assertIn("check 6", self.assert_review(base))
+
     def test_import_scope_allows_an_explicit_import_beside_a_module_glob(self) -> None:
         self.write("src/constants.rs", 'pub(crate) const KEYMAP_FILE: &str = "keys";\n')
         before = ("mod constants;\n"
