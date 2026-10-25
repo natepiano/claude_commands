@@ -89,8 +89,21 @@ answer through `/showrunner:proposal`.
 
 The open nightly-review proposal: its line in the ledger that the `Efficiency
 ledger` line names, of the production doc and of each production below it. A
-production with no such line has no efficiency items. Present and record it by
-`/efficiency_next` steps 3 and 4.
+production with no such line has no efficiency items. Each night's reports are
+in `<night>/config.md`, `<night>/rust.md` and `<night>/messages.md` beside the
+ledger. Where a cheap check exists (its measurement script, the line it cites),
+confirm the candidate still holds; record one already fixed as done.
+
+Present only this one; never list the backlog. Open with the line as it reads
+today next to the line as proposed (file:line), then the measured gain, then
+the cost. End with one choice line: `approve (recommended — reason) / decline /
+defer / elaborate`. A fix that belongs to another session offers `relay` in
+place of `approve`.
+
+Record the outcome on the candidate's own ledger line as soon as it is decided:
+its `— proposed` becomes `— accepted <date>, applied (<repo> <sha>)`,
+`— declined`, `— deferred`, `— done <date>` or `— relayed <date>`. Apply an
+approved change; commit and push only when the user says so.
 
 ## question
 
