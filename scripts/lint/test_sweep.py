@@ -1425,7 +1425,7 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
             mock.patch.dict(os.environ, {sweep.CONFIG_ENV: str(config)}),
             mock.patch.object(socket, "gethostname", return_value="testhost"),
             mock.patch.object(sweep, "sweep_workspace") as workspace,
-            mock.patch.object(sweep, "remove_session_scratch", return_value=0) as scratch,
+            mock.patch.object(sweep.tmp_sweep, "run_if_due", return_value=0) as scratch,
             mock.patch.object(sweep, "hold_floor", return_value=0) as floor,
         ):
             self.assertEqual(sweep.main([sweep.FLOOR_ONLY_FLAG]), 0)
@@ -1529,110 +1529,6 @@ class HolderSessionTests(unittest.TestCase):
               mock.patch.object(sessions, "live_sessions", return_value=[record])):
             self.assertEqual(sweep.holder_sessions([300, 400, 999]), {300: "hana-unit"})
         self.assertEqual(sweep.holder_sessions([]), {})
-
-
-LIVE_SESSION = "11111111-2222-3333-4444-555555555555"
-ENDED_SESSION = "66666666-7777-8888-9999-000000000000"
-RECENT_SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-
-
-class SessionScratchTests(unittest.TestCase):
-    """Times here are two days ahead of the clock, so every file the test writes is old, ctime included."""
-
-    def scratch(self) -> tuple[Path, float]:
-        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        project = root / "-home-natepiano-rust-hana"
-        for session in (LIVE_SESSION, ENDED_SESSION, RECENT_SESSION):
-            _ = write(project / session / "scratchpad" / "gate" / "Cargo.toml")
-            (project / session / "tasks").mkdir()
-        # Not session scratch: a folder an agent made, and one with no session id for a name.
-        _ = write(root / "scratch" / ENDED_SESSION / "big")
-        _ = write(project / "rust" / "kept")
-        now = time.time() + 2 * DAY
-        recent = project / RECENT_SESSION / "scratchpad" / "gate" / "Cargo.toml"
-        os.utime(recent, (now - 3600, now - 3600))
-        return root, now
-
-    def remove(self, root: Path, now: float, dry_run: bool = False) -> tuple[int, str]:
-        output = io.StringIO()
-        with (mock.patch.object(sweep, "running_session_ids", return_value=frozenset({LIVE_SESSION})),
-              redirect_stdout(output)):
-            status = sweep.remove_session_scratch(dry_run, str(root), now)
-        return status, output.getvalue()
-
-    def test_only_an_ended_session_with_no_recent_change_goes(self) -> None:
-        root, now = self.scratch()
-        project = root / "-home-natepiano-rust-hana"
-        status, output = self.remove(root, now)
-        self.assertEqual(status, 0)
-        self.assertFalse((project / ENDED_SESSION).exists())
-        self.assertTrue((project / LIVE_SESSION / "scratchpad").is_dir())
-        self.assertTrue((project / RECENT_SESSION / "scratchpad").is_dir())
-        self.assertTrue((project / "rust" / "kept").is_file())
-        self.assertTrue((root / "scratch" / ENDED_SESSION / "big").is_file())
-        lines = output.splitlines()
-        self.assertEqual(len(lines), 1, output)
-        self.assertRegex(lines[0], rf"^lint sweep: deleted {project / ENDED_SESSION} \(0\.0 GiB\),"
-                         + r" scratch of an ended session, last changed \d{4}-\d\d-\d\d \d\d:\d\d$")
-
-    def test_a_project_folder_left_empty_goes(self) -> None:
-        root, now = self.scratch()
-        project = root / "-home-natepiano-rust-hana"
-        for name in (LIVE_SESSION, RECENT_SESSION, "rust"):
-            shutil.rmtree(project / name)
-        _ = self.remove(root, now)
-        self.assertFalse(project.exists())
-        self.assertTrue(root.is_dir())
-
-    def test_a_dry_run_deletes_nothing(self) -> None:
-        root, now = self.scratch()
-        status, output = self.remove(root, now, dry_run=True)
-        self.assertEqual(status, 0)
-        self.assertTrue((root / "-home-natepiano-rust-hana" / ENDED_SESSION / "scratchpad" / "gate").is_dir())
-        self.assertIn(f"would delete {root / '-home-natepiano-rust-hana' / ENDED_SESSION} (", output)
-
-    def test_a_link_out_of_the_scratch_is_not_followed(self) -> None:
-        root, now = self.scratch()
-        outside = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        kept = write(outside / "kept")
-        (root / "-home-natepiano-rust-hana" / ENDED_SESSION / "link").symlink_to(outside)
-        _ = self.remove(root, now)
-        self.assertFalse((root / "-home-natepiano-rust-hana" / ENDED_SESSION).exists())
-        self.assertTrue(kept.is_file())
-
-    def test_a_read_only_folder_is_deleted(self) -> None:
-        root, now = self.scratch()
-        locked = root / "-home-natepiano-rust-hana" / ENDED_SESSION / "scratchpad" / "store"
-        _ = write(locked / "file")
-        locked.chmod(0o500)
-        self.addCleanup(lambda: locked.chmod(0o700) if locked.exists() else None)
-        status, _ = self.remove(root, now)
-        self.assertEqual(status, 0)
-        self.assertFalse(locked.exists())
-
-    def test_an_unreadable_session_record_keeps_all_scratch(self) -> None:
-        root, now = self.scratch()
-        registry = sessions.RegistryRead((), (Path("/sessions/1.json"),))
-        output = io.StringIO()
-        with mock.patch.object(sessions, "read_registry", return_value=registry), redirect_stdout(output):
-            self.assertEqual(sweep.remove_session_scratch(False, str(root), now), 0)
-        self.assertTrue((root / "-home-natepiano-rust-hana" / ENDED_SESSION).is_dir())
-        self.assertIn("a session record cannot be read", output.getvalue())
-
-    def test_running_session_ids_names_only_running_sessions(self) -> None:
-        def record(pid: int, session_id: str) -> sessions.SessionRecord:
-            return cast(sessions.SessionRecord, cast(object, {
-                "pid": pid, "sessionId": session_id, "name": "", "messagingSocketPath": "",
-                "updatedAt": 1, "tmux": "", "formerNames": []}))
-        def running(found: sessions.SessionRecord) -> bool:
-            return found["pid"] == 1
-        registry = sessions.RegistryRead((
-            sessions.RegistryObservation(record(1, LIVE_SESSION), {}),
-            sessions.RegistryObservation(record(2, ENDED_SESSION), {}),
-        ), ())
-        with (mock.patch.object(sessions, "read_registry", return_value=registry),
-              mock.patch.object(sessions, "running_session", side_effect=running)):
-            self.assertEqual(sweep.running_session_ids(), frozenset({LIVE_SESSION}))
 
 
 class BudgetTests(unittest.TestCase):
