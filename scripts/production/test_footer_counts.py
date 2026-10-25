@@ -193,8 +193,8 @@ class FooterCountsTests(unittest.TestCase):
         issue(folder, "plain", "open", "issue, proposal", "production", "stage: backlog")
         doc = self.doc(f"- **Proposals:** {folder}")
         self.assertEqual(footer_counts.proposals(doc), 1)
-        with contextlib.redirect_stdout(io.StringIO()):
-            code = proposal_issue.main(["approve", str(folder / "plain.md"), "--showrunner", "s", "--unit", "u", "--plan", "p"])
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(proposal_issue, "calling_showrunner", return_value="s"):
+            code = proposal_issue.main(["approve", str(folder / "plain.md"), "--by", "user", "--showrunner", "s", "--unit", "u", "--plan", "p"])
         self.assertEqual(code, 0)
         self.assertEqual(footer_counts.proposals(doc), 0)
 

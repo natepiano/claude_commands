@@ -11,6 +11,7 @@ from typing import NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import unit_runs  # noqa: E402
+from scripts.direct.recorder_state import STATE_FILENAME as STATE_FILENAME  # noqa: E402
 
 
 # How far the percentage beside an ETA is assumed to be off when no calibration
@@ -21,7 +22,6 @@ DEFAULT_PERCENT_SPREAD = 10.0
 # The widest the best and worst case may stray from the reported rate: at worst
 # the work is half as far along as it says, at best twice.
 RATE_FACTOR_LIMIT = 2.0
-STATE_FILENAME = "progress_history_state.json"
 # Every phase heading in a worker plan, in all three forms it takes over a
 # plan's life. `· status: todo` and `· status: done` are the live-zone forms;
 # a shrunk or as-built phase drops the status marker and usually carries a

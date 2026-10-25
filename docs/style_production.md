@@ -614,7 +614,7 @@ new answer. Each decision shows counts and up to three examples from different
 files. The ledger holds its full site list. Show decisions only when the user
 asks through `/showrunner:proposals` or `/adhoc_review`.
 
-Approve with `proposal_issue.py approve <issue> --showrunner <parent>
+Approve with `proposal_issue.py approve <issue> --by user --showrunner <parent>
 --unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
 Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.

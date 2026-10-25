@@ -201,9 +201,9 @@ class PushTextTests(unittest.TestCase):
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
         self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
-                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT.\n\n"
+                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
-                         + "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.")
+                         + "Turn off: work moves to Claude until Sat 10-24 16:40 AST.")
 
     def test_paid_credits_queued_keeps_the_agreed_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits_queued")

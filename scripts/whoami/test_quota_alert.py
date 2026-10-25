@@ -2200,7 +2200,7 @@ class CodexZeroEpisodeTests(unittest.TestCase):
         base_readings = self.readings
         ids = {"quota.codex_workers_moved",
                "quota.codex_workers_stay", "quota.codex_credits_forecast"}
-        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/Curacao"}):
             for entry in catalog():
                 if entry.id not in ids:
                     continue
