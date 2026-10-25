@@ -3401,10 +3401,10 @@ class StylePlanTests(unittest.TestCase):
                 _ = handle.write_text(renamed)
 
     def test_canonical_code_drops_a_trailing_comma_only_where_it_does_not_change_the_code(self) -> None:
-        def words(text: str) -> tuple[style_plan.CodePiece, ...]:
+        def words(text: str) -> tuple[style_footprint.CodePiece, ...]:
             spans = style_footprint.token_spans(text)
-            return style_plan.canonical_code(tuple(span.token.value for span in spans),
-                                             style_plan.comment_gaps(text, spans, lambda line: line))
+            return style_footprint.canonical_code(tuple(span.token.value for span in spans),
+                                                  style_footprint.comment_gaps(text, spans, lambda line: line))
         # A one-entry tuple is not the grouped expression, even when its entry holds commas.
         self.assertNotEqual(words("let f = (|a: u8, b: u8| a + b,);"), words("let f = (|a: u8, b: u8| a + b);"))
         self.assertNotEqual(words("let m = (HashMap::<u8, u8>::new(),);"), words("let m = (HashMap::<u8, u8>::new());"))
