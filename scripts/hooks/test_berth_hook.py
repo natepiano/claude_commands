@@ -7,6 +7,7 @@ import json
 import os
 import runpy
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -357,6 +358,135 @@ class BerthHookTests(unittest.TestCase):
         output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("not_installed: the cargo-berth binary is not on PATH.", output["permissionDecisionReason"])
+
+    def recorder_phases(self, *phases: str) -> None:
+        records = [{"id": phase, "status": "active"} for phase in phases]
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "phase": records[-1] if records else {"id": "15", "status": "completed"},
+            "open_phases": records[:-1]}))
+
+    def map_phase_session(self, phase: str) -> None:
+        """Berth's session map names the phase's own session, as a check acquired under it leaves it."""
+        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger.mkdir(exist_ok=True)
+        _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
+            phase_reservation.phase_session_id(DIRECTOR, phase): {"reservation_id": RESERVATION,
+                                                                   "coordination_run_id": RUN}}}))
+
+    def test_a_recorder_phase_never_enrolled_checks_under_the_bare_session(self) -> None:
+        # FinalGate's `final` phase starts with no reservation: no state file and no berth mapping.
+        self.recorder_phases("final")
+        directory = phase_reservation.phase_directory(self.session_dir, "final")
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [DIRECTOR])
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+        # Once berth maps the phase's own session, the missing state file is a lost record.
+        self.map_phase_session("final")
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn(phase_reservation.repair_command(self.session_dir, "final", self.repo),
+                      output["permissionDecisionReason"])
+
+    def test_an_unreadable_recorder_state_checks_the_held_phases_without_a_traceback(self) -> None:
+        state = self.session_dir / "progress_history_state.json"
+        for content in ("not JSON", "[1]", "\udcff"):
+            with self.subTest(content=content):
+                _ = state.write_bytes(content.encode("utf-8", "surrogateescape"))
+                result = self.hook(patch_text("*** Update File: src/lib.rs"))
+                self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.berth_calls()[-1]["session"], f"{DIRECTOR}.phase-15")
+                self.assertEqual(self.state()["kind"], "active")
+
+    def test_a_checkpoint_released_phase_does_not_own_edits_during_plan_review(self) -> None:
+        self.open_second_phase()
+        self.recorder_phases("15", "16")
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        _ = phase_reservation.record_active(directory, phase_reservation.Acquisition(RESERVATION, RUN, HEAD))
+        phase_reservation.committed(directory, HEAD)
+        self.assertTrue(phase_reservation.clear(directory, HEAD))
+        # Phase 16 alone owns both the released phase's old file and an unlisted new file.
+        result = self.hook(patch_text("*** Update File: src/lib.rs", "*** Add File: docs/new.md"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-16"])
+        self.assertEqual(self.state(phase="16")["kind"], "active")
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_reading_open_phases_starts_no_process(self) -> None:
+        self.recorder_phases("15")
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("process started")):
+            phases = phase_reservation.open_phases(self.session_dir)
+        self.assertEqual([phase.phase for phase in phases], ["15"])
+
+    def test_a_lone_open_phase_owns_paths_once_listed_by_finished_phases(self) -> None:
+        self.open_second_phase()
+        directory = phase_reservation.phase_directory(self.session_dir, "16")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        _ = (directory / phase_reservation.FILES_FILE).write_text("src/other.rs\n")
+        self.recorder_phases("15")
+        result = self.hook(patch_text("*** Add File: src/other.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-15"])
+        self.assertEqual(self.state()["kind"], "active")
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_between_phases_a_finished_directory_is_not_a_lost_record(self) -> None:
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        self.recorder_phases()
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [DIRECTOR])
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_a_lone_open_phase_with_a_lost_record_owns_unlisted_paths(self) -> None:
+        self.open_second_phase()
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        finished = phase_reservation.phase_directory(self.session_dir, "16")
+        (finished / phase_reservation.STATE_FILE).unlink()
+        self.recorder_phases("15")
+        self.map_phase_session("15")
+        result = self.hook(patch_text("*** Add File: src/other.rs"))
+        self.assertTrue(result.stdout, "the lost record must refuse the edit")
+        output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn(phase_reservation.repair_command(self.session_dir, "15", self.repo),
+                      output["permissionDecisionReason"])
+        self.assertNotIn("--phase 16", output["permissionDecisionReason"])
+        self.assertEqual(self.berth_calls(), [])
+
+    def test_a_missing_phase_record_refuses_with_the_ledger_repair_command(self) -> None:
+        for sibling_open in (False, True):
+            with self.subTest(sibling_open=sibling_open):
+                _ = self.state(AWAITING)
+                if sibling_open:
+                    self.open_second_phase()
+                self.recorder_phases(*(["15", "16"] if sibling_open else ["15"]))
+                self.map_phase_session("15")
+                directory = phase_reservation.phase_directory(self.session_dir, "15")
+                (directory / phase_reservation.STATE_FILE).unlink()
+                result = self.hook(patch_text("*** Update File: src/lib.rs"))
+                output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
+                self.assertEqual(output["permissionDecision"], "deny")
+                command = shlex.join(["python3", str(Path(__file__).resolve().parents[1] / "direct" / "phase_reservation.py"), "repair",
+                                      "--session-dir", str(self.session_dir), "--phase", "15",
+                                      "--repo", str(self.repo)])
+                self.assertIn(command, output["permissionDecisionReason"])
+                self.assertEqual(self.berth_calls(), [])
+                self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_a_completed_phases_files_do_not_block_an_explicit_live_owner(self) -> None:
+        self.open_second_phase()
+        self.recorder_phases("15")
+        directory = phase_reservation.phase_directory(self.session_dir, "16")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        _ = (directory / phase_reservation.FILES_FILE).write_text("src/lib.rs\n")
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state()["kind"], "active")
 
     def test_patch_paths_names_every_written_deleted_and_moved_path_once(self) -> None:
         patch = patch_text("*** Update File: a.rs", "*** Move to: b.rs", "*** Delete File: c.rs",
