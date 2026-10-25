@@ -2057,7 +2057,8 @@ class StylePlanTests(unittest.TestCase):
         text = plan.read_text()
         self.assertIn("uncovered: Read the crate layout.", text)
         self.assertIn('"line": 1', text)
-        self.assertIn("Every structure finding is held", text)
+        self.assertIn("Every structure finding other than a pure move is held", text)
+        self.assertIn("Apply a pure move inside one crate", text)
         self.assertNotIn("#uncovered`", text)
         pin = self.ledger().pinned_rule_texts(ticket["id"])[0]
         self.assertIn(str(plan.parent.parent / "rules" / (pin.blob + ".md")), text)
@@ -3277,7 +3278,7 @@ class StylePlanTests(unittest.TestCase):
             self.assertNotIn("overrides the mechanical-only invariant", first)
             self.assertIn("Apply the approved findings.", first)
             self.assertNotIn("Apply only mechanical fixes", first)
-            self.assertNotIn("Every structure finding is held", first)
+            self.assertNotIn("Every structure finding other than a pure move is held", first)
             self.assertIn("style_plan.py gate --repo . --ticket names-unit-1", first)
             _ = self.plan.write_text(self.plan_header())
             result = self.run_next()
@@ -3976,6 +3977,35 @@ class StylePlanTests(unittest.TestCase):
                 self.assertEqual(result, 1, output)
                 self.assertIn("files outside approved findings:", output)
                 self.assertIn(self.sources[1] + " (change is not an approved rename reference)", output)
+
+    def test_approved_proposal_gate_allows_the_files_of_a_pure_move_and_only_them(self) -> None:
+        ticket = self.approved_reference_ticket()
+        lib, other, extra = self.sources[2], self.sources[3], "crates/beta/src/extra.rs"
+        limit = "/// The most rows.\npub(crate) const LIMIT: usize = 4;\n"
+        text = "\npub fn text() -> &'static str { stringify!(a+b) }\n"
+        self.write(lib, "mod extra;\nmod other;\n\npub fn value() -> usize { crate::other::LIMIT }\n" + text)
+        self.write(other, limit + "\npub(crate) fn read() -> usize { 1 }\n")
+        self.write(extra, "pub(crate) fn more() -> usize { 2 }\n")
+        _ = self.commit()
+        moved = "mod constants;\nmod extra;\nmod other;\n\npub fn value() -> usize { crate::constants::LIMIT }\n" + text
+        self.write(lib, moved)
+        self.write(other, "pub(crate) fn read() -> usize { 1 }\n")
+        self.write("crates/beta/src/constants.rs", limit)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        constants = "crates/beta/src/constants.rs"
+        # The proof reads code without its spacing, and judge also reads the spacing inside a macro.
+        for path, edit, refused in ((lib, moved.replace("LIMIT }", "LIMIT + 1 }"), (lib, other, constants)),
+                                    (lib, moved.replace("a+b", "a + b"), (lib, other, constants)),
+                                    (extra, "pub(crate) fn more() -> usize {  2 }\n", (extra,))):
+            with self.subTest(edit=edit):
+                self.write(path, edit)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("files outside approved findings:", output)
+                for name in (lib, other, constants, extra):
+                    self.assertEqual(name + " (change" in output, name in refused, output)
+                self.write(lib, moved)
+                self.write(extra, "pub(crate) fn more() -> usize { 2 }\n")
 
     def test_approved_rename_refuses_unqualified_or_unapproved_names(self) -> None:
         ticket = self.approved_reference_ticket()

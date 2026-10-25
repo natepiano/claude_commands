@@ -2302,7 +2302,7 @@ class StyleFootprintTests(unittest.TestCase):
         before = {**self.LIMIT_FILES, "src/lib.rs": self.LIMIT_FILES["src/lib.rs"] + local}
         after = {**self.LIMIT_MOVED,
                  "src/lib.rs": before["src/lib.rs"].replace("    writer::LIMIT\n", "    constants::LIMIT\n")}
-        self.assert_move_refused("src/lib.rs: writer is declared or bound outside a path", before, after)
+        self.assert_move_refused("src/lib.rs: an `extern crate` that takes another name", before, after)
 
     def test_an_item_move_is_refused_when_the_item_reads_its_caller_location(self) -> None:
         line = "\npub(crate) fn line() -> u32 {\n    std::panic::Location::caller().line()\n}\n"
@@ -2409,3 +2409,200 @@ class StyleFootprintTests(unittest.TestCase):
         result = self.prove_move({**self.LIMIT_FILES, "src/lib.rs": lib}, {**self.LIMIT_MOVED, "src/lib.rs": lib})
         assert isinstance(result, style_footprint.ItemMoves), result
         self.assertEqual([(move.kind, move.name) for move in result.moves], [("const", "LIMIT")])
+
+    def test_an_item_move_is_refused_when_a_macro_outside_a_fn_body_can_define_a_name(self) -> None:
+        lib = ("macro_rules! make_value {\n    ($value:expr) => {\n        const fn value() -> usize { $value }\n"
+               + "    };\n}\n\nmod constants;\nmod writer;\n")
+        moved = "\npub(crate) fn read() -> usize { value() }\n"
+        before = {"src/lib.rs": lib, "src/constants.rs": "make_value!(2);\n\npub(crate) const OTHER: usize = 1;\n",
+                  "src/writer.rs": "make_value!(1);\n" + moved}
+        after = {"src/constants.rs": before["src/constants.rs"] + moved, "src/writer.rs": "make_value!(1);\n"}
+        self.assert_move_refused("src/writer.rs has a macro outside a fn body: make_value", before, after)
+
+    def test_an_item_move_is_refused_when_an_associated_path_finds_a_lowercase_trait(self) -> None:
+        before = {
+            "src/lib.rs": "mod constants;\nmod traits;\nmod writer;\n",
+            "src/traits.rs": "pub(crate) trait left {\n    const WIDTH: usize;\n}\n\npub(crate) trait right {\n"
+                             + "    const WIDTH: usize;\n}\n\nimpl left for u8 {\n    const WIDTH: usize = 1;\n}\n\n"
+                             + "impl right for u8 {\n    const WIDTH: usize = 2;\n}\n",
+            "src/constants.rs": "use crate::traits::right;\n\npub(crate) const OTHER: usize = <u8 as right>::WIDTH;\n",
+            "src/writer.rs": "use crate::traits::left;\n\npub(crate) const RESULT: usize = u8::WIDTH;\n\n"
+                             + "pub(crate) const LEFT: usize = <u8 as left>::WIDTH;\n",
+        }
+        after = {"src/constants.rs": before["src/constants.rs"] + "\npub(crate) const RESULT: usize = u8::WIDTH;\n",
+                 "src/writer.rs": "use crate::traits::left;\n\npub(crate) const LEFT: usize = <u8 as left>::WIDTH;\n"}
+        self.assert_move_refused("left is in scope in only one of src/writer.rs and src/constants.rs", before, after)
+
+    def test_an_item_move_is_refused_when_an_untouched_file_reads_a_raw_caller_location(self) -> None:
+        here = "\npub(crate) fn here() -> u32 {\n    crate::position::line()\n}\n"
+        position = ("#[r#track_caller]\npub(crate) fn line() -> u32 {\n"
+                    + "    std::panic::r#Location::r#caller().line()\n}\n")
+        lib = "mod constants;\nmod position;\nmod reader;\nmod writer;\n"
+        before = {**self.LIMIT_FILES, "src/lib.rs": lib, "src/position.rs": position,
+                  "src/writer.rs": self.LIMIT_FILES["src/writer.rs"] + here}
+        after = {"src/constants.rs": self.LIMIT_FILES["src/constants.rs"] + here,
+                 "src/writer.rs": self.LIMIT_FILES["src/writer.rs"]}
+        self.assert_move_refused("src/position.rs reads a caller location", before, after)
+
+    def test_an_item_move_is_refused_when_a_use_names_a_custom_standard_derive(self) -> None:
+        derive = "use custom_derives::Clone;\n\n"
+        before = {**self.SHAPE_FILES, "src/shape.rs": derive + self.SHAPE_FILES["src/shape.rs"]}
+        after = {**self.SHAPE_MOVED, "src/shape.rs": derive + self.SHAPE_MOVED["src/shape.rs"]}
+        self.assert_move_refused("src/shape.rs imports Clone, the name of a standard derive", before, after)
+
+    def test_an_item_move_is_refused_when_an_extern_crate_brings_its_macros(self) -> None:
+        lib = "#[macro_use]\nextern crate custom_derives;\n\n" + self.SHAPE_FILES["src/lib.rs"]
+        before = {**self.SHAPE_FILES, "src/lib.rs": lib}
+        self.assert_move_refused("src/lib.rs: a `macro_use` can bring a macro named like a standard derive",
+                                 before, self.SHAPE_MOVED)
+
+    def test_an_item_move_is_refused_when_a_macro_use_list_names_a_standard_derive(self) -> None:
+        lib = "#[macro_use(Clone)]\nextern crate custom_derives;\n\n" + self.SHAPE_FILES["src/lib.rs"]
+        before = {**self.SHAPE_FILES, "src/lib.rs": lib}
+        self.assert_move_refused("src/lib.rs: a `macro_use` can bring a macro named like a standard derive",
+                                 before, self.SHAPE_MOVED)
+
+    def test_a_struct_move_is_proven_beside_a_standard_debug_import_and_a_macro_use_module(self) -> None:
+        derive = "use std::fmt::Debug;\n\n"
+        lib = "mod draw;\n#[macro_use]\nmod macros;\nmod shape;\n"
+        before = {**self.SHAPE_FILES, "src/lib.rs": lib, "src/macros.rs": "pub(crate) const UNUSED: u8 = 0;\n",
+                  **{path: derive + self.SHAPE_FILES[path] for path in ("src/draw.rs", "src/shape.rs")}}
+        after = {path: derive + text for path, text in self.SHAPE_MOVED.items()}
+        result = self.prove_move(before, after)
+        assert isinstance(result, style_footprint.ItemMoves), result
+
+    def test_an_item_move_is_refused_when_the_destination_drops_the_prelude(self) -> None:
+        inner = "#![no_implicit_prelude]\n\n"
+        before = {**self.LIMIT_FILES, "src/constants.rs": inner + self.LIMIT_FILES["src/constants.rs"]}
+        after = {**self.LIMIT_MOVED, "src/constants.rs": inner + self.LIMIT_MOVED["src/constants.rs"]}
+        self.assert_move_refused("src/constants.rs: the inner attribute no_implicit_prelude on the path",
+                                 before, after)
+
+    def test_an_item_move_is_refused_when_an_attribute_macro_on_another_item_can_define_a_name(self) -> None:
+        moved = "\npub(crate) fn read() -> usize { value() }\n"
+        before = {"src/lib.rs": "mod constants;\nmod writer;\n",
+                  "src/constants.rs": "#[codegen::make_value(2)]\nfn marker_b() {}\n",
+                  "src/writer.rs": "#[codegen::make_value(1)]\nfn marker_a() {}\n" + moved}
+        after = {"src/constants.rs": before["src/constants.rs"] + moved,
+                 "src/writer.rs": "#[codegen::make_value(1)]\nfn marker_a() {}\n"}
+        self.assert_move_refused("src/writer.rs has an attribute outside a fn body: codegen::make_value", before, after)
+
+    def test_a_const_move_is_proven_beside_allowed_attributes_on_other_items(self) -> None:
+        tests = ("\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn reads() {}\n}\n\n#[derive(Debug)]\n#[must_use]\n"
+                 + "pub(crate) struct Kept;\n")
+        inner = "#![allow(dead_code)]\n//! The constants.\n\n"
+        before = {**self.LIMIT_FILES, "src/writer.rs": self.LIMIT_FILES["src/writer.rs"] + tests,
+                  "src/constants.rs": inner + self.LIMIT_FILES["src/constants.rs"]}
+        after = {**self.LIMIT_MOVED, "src/writer.rs": self.LIMIT_MOVED["src/writer.rs"] + tests,
+                 "src/constants.rs": inner + self.LIMIT_MOVED["src/constants.rs"]}
+        result = self.prove_move(before, after)
+        assert isinstance(result, style_footprint.ItemMoves), result
+
+    def test_an_item_move_is_refused_when_an_extern_crate_takes_another_name(self) -> None:
+        lib = "extern crate custom_derives as derives;\n\n" + self.SHAPE_FILES["src/lib.rs"]
+        self.assert_move_refused("src/lib.rs: an `extern crate` that takes another name",
+                                 {**self.SHAPE_FILES, "src/lib.rs": lib}, self.SHAPE_MOVED)
+
+    def test_an_item_move_is_refused_when_a_dependency_takes_the_name_std(self) -> None:
+        manifest = ('[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                    + "[target.'cfg(unix)'.dependencies]\n"
+                    + 'std = { package = "custom_derives", path = "../custom_derives" }\n')
+        derive = "use std::Clone;\n\n"
+        before = {**self.SHAPE_FILES, "Cargo.toml": manifest,
+                  **{path: derive + self.SHAPE_FILES[path] for path in ("src/draw.rs", "src/shape.rs")}}
+        after = {path: derive + text for path, text in self.SHAPE_MOVED.items()}
+        self.assert_move_refused("names std, and the crate gives the name to another crate or module", before, after)
+
+    def test_an_item_move_is_refused_when_an_untouched_parent_drops_the_prelude(self) -> None:
+        before = {"src/lib.rs": "mod beta;\nmod writer;\n",
+                  "src/beta/mod.rs": "#![no_implicit_prelude]\n\nmod constants;\n",
+                  "src/beta/constants.rs": self.LIMIT_FILES["src/constants.rs"],
+                  "src/writer.rs": self.LIMIT_FILES["src/writer.rs"]}
+        after = {"src/beta/constants.rs": self.LIMIT_MOVED["src/constants.rs"],
+                 "src/writer.rs": self.LIMIT_MOVED["src/writer.rs"].replace("crate::constants",
+                                                                            "crate::beta::constants")}
+        self.assert_move_refused("src/beta/mod.rs: the inner attribute no_implicit_prelude on the path to crate::beta",
+                                 before, after)
+
+    def test_an_item_move_is_refused_when_the_source_drops_the_prelude_after_the_move(self) -> None:
+        moved = "\npub(crate) fn read() -> usize { 1 }\n"
+        before = {"src/lib.rs": "mod constants;\nmod writer;\n", "src/constants.rs": "fn marker_b() {}\n",
+                  "src/writer.rs": "fn marker_a() {}\n" + moved}
+        after = {"src/constants.rs": before["src/constants.rs"] + moved,
+                 "src/writer.rs": "#![no_implicit_prelude]\n\nfn marker_a() {}\n"}
+        self.assert_move_refused("src/writer.rs has an inner attribute outside a fn body: no_implicit_prelude",
+                                 before, after)
+
+    def test_an_item_move_is_refused_when_a_use_gives_the_name_std_to_a_module(self) -> None:
+        lib = "mod draw;\nmod macros;\nmod shape;\n"
+        rebind = "use crate::macros::std;\n\n"
+        before = {**self.SHAPE_FILES, "src/lib.rs": lib, "src/macros.rs": "pub(crate) mod std {}\n",
+                  **{path: rebind + self.SHAPE_FILES[path].replace("Debug, Clone", "Debug, std::Clone")
+                     for path in ("src/draw.rs", "src/shape.rs")}}
+        after = {path: rebind + text.replace("Debug, Clone", "Debug, std::Clone")
+                 for path, text in self.SHAPE_MOVED.items()}
+        self.assert_move_refused("src/draw.rs or src/shape.rs names std, and the crate gives the name", before, after)
+
+    def test_a_struct_move_with_a_std_path_derive_is_proven_while_no_file_rebinds_std(self) -> None:
+        before = {path: text.replace("Debug, Clone", "Debug, std::Clone") for path, text in self.SHAPE_FILES.items()}
+        after = {path: text.replace("Debug, Clone", "Debug, std::Clone") for path, text in self.SHAPE_MOVED.items()}
+        result = self.prove_move(before, after)
+        assert isinstance(result, style_footprint.ItemMoves), result
+
+    P635_FILES: dict[str, str] = {
+        "src/lib.rs": "mod reader;\nmod writer;\n\npub use writer::LIMIT;\n",
+        "src/writer.rs": "/// The most rows one write takes.\npub const LIMIT: usize = 4;\n\n"
+                         + "pub(crate) fn write() -> usize { LIMIT + 1 }\n",
+        "src/reader.rs": "use crate::writer::LIMIT;\n\npub(crate) fn read() -> usize { LIMIT }\n",
+    }
+    P635_MOVED: dict[str, str] = {
+        "src/lib.rs": "mod constants;\nmod reader;\nmod writer;\n\npub use constants::LIMIT;\n",
+        "src/constants.rs": "/// The most rows one write takes.\npub const LIMIT: usize = 4;\n",
+        "src/writer.rs": "use crate::constants::LIMIT;\n\npub(crate) fn write() -> usize { LIMIT + 1 }\n",
+        "src/reader.rs": "use crate::constants::LIMIT;\n\npub(crate) fn read() -> usize { LIMIT }\n",
+    }
+
+    def judge_move(self, before: dict[str, str], after: dict[str, str]
+                   ) -> tuple[style_footprint.ItemMoves | style_footprint.NoItemMoves,
+                              style_footprint.Mechanical | style_footprint.Review]:
+        result = self.prove_move(before, after)
+        changes = style_footprint.changes_between(self.repo, "HEAD~1", "HEAD")
+        finding = style_footprint.Finding(style_footprint.WholeDiff(), changes)
+        return result, style_footprint.judge(finding, style_footprint.RevisionTree(self.repo, "HEAD~1"))
+
+    def test_a_const_moved_to_a_new_constants_module_is_judged_mechanical(self) -> None:
+        moves, verdict = self.judge_move(self.P635_FILES, self.P635_MOVED)
+        self.assertIsInstance(moves, style_footprint.ItemMoves, moves)
+        self.assertEqual(verdict, style_footprint.Mechanical())
+
+    def test_a_const_moved_with_a_changed_literal_is_judged_for_review(self) -> None:
+        # The proof refuses, so judge gives the verdict it gave before it read item moves.
+        after = {**self.P635_MOVED, "src/constants.rs": self.P635_MOVED["src/constants.rs"].replace("= 4;", "= 5;")}
+        moves, verdict = self.judge_move(self.P635_FILES, after)
+        self.assertIsInstance(moves, style_footprint.NoItemMoves, moves)
+        self.assertEqual(verdict, style_footprint.Review((
+            "check 1: file or module layout changes", "check 2: externally reachable item changes",
+            "check 6: condition, literal or control flow flagged",
+            "check 6: serialized, reflected, configured or documented name flagged",
+            "check 6: call target, method or other change not proven equivalent")))
+
+    def test_a_move_beside_another_edit_is_judged_for_review(self) -> None:
+        reader = self.P635_MOVED["src/reader.rs"].replace("{ LIMIT }", "{ LIMIT + 2 }")
+        after = {**self.P635_MOVED, "src/reader.rs": reader}
+        moves, verdict = self.judge_move(self.P635_FILES, after)
+        self.assertIsInstance(moves, style_footprint.NoItemMoves, moves)
+        assert isinstance(verdict, style_footprint.Review), verdict
+        self.assertIn("check 6: condition, literal or control flow flagged", verdict.reasons)
+
+    def test_a_const_move_of_more_lines_than_the_size_limit_is_judged_mechanical(self) -> None:
+        value = "= 0" + "\n    + 1" * style_footprint.FILE_CHANGED_LINE_LIMIT + ";"
+        before = {path: text.replace("= 4;", value) for path, text in self.P635_FILES.items()}
+        after = {path: text.replace("= 4;", value) for path, text in self.P635_MOVED.items()}
+        moves, verdict = self.judge_move(before, after)
+        self.assertIsInstance(moves, style_footprint.ItemMoves, moves)
+        self.assertEqual(verdict, style_footprint.Mechanical())
+
+    def test_the_check_command_passes_a_proven_const_move(self) -> None:
+        _ = self.prove_move(self.P635_FILES, self.P635_MOVED)
+        result = self.check("HEAD~1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

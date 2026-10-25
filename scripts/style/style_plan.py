@@ -854,6 +854,8 @@ def gate(repo: Path, ticket_id: str) -> int:
             outside = changed_files(repo) - allowed
             pairs = approved_rename_pairs(findings)
             if outside:
+                outside -= item_move_files(repo)
+            if outside:
                 unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
                 modified = modified_reference_files(repo)
                 refused = [path for path in sorted(outside)
@@ -879,12 +881,21 @@ def gate(repo: Path, ticket_id: str) -> int:
                 return 1
             print("approved proposal")
             return 0
-    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun, style_footprint.CheckCouldNotRun) as error:
         print(f"error: {error}")
         return 2
     except ValueError as error:
         print(f"review: {error}")
         return 1
+
+
+def item_move_files(repo: Path) -> frozenset[str]:
+    """The changed files of the worktree that a proven item move explains: the file each item leaves, the file it
+    moves to, the parent file that gains the new `mod` line, and each file with a re-pointed path or a use line of the
+    move. A pure move needs no approval. `style_footprint.judge` must find the whole change mechanical, so the gate and
+    judge read a move the same way, and a changed file with no span of the move stays outside it."""
+    changes = style_footprint.changes_between(repo, "HEAD", style_footprint.worktree_commit(repo))
+    return style_footprint.moved_files(changes, style_footprint.RevisionTree(repo, "HEAD"))
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
@@ -1264,7 +1275,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
     authorization = (
         f"This ticket builds the approved proposal `{ticket['proposal']}`: its approved findings are this ticket's work. "
         + "Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required."
-        if approved else "Every structure finding is held as a proposal. Apply only mechanical findings from other tickets."
+        if approved else "Every structure finding other than a pure move is held as a proposal. Apply only mechanical findings from other tickets."
     )
     if approved:
         goal = (f"Apply the approved findings of `{ticket['proposal']}` in {len(ticket['files'])} "
@@ -1373,6 +1384,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
           + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
+        "Apply a pure move inside one crate (one item to its owning module or a named shared owner, uses re-pointed, "
+        + "old paths re-exported); hold it only when `style_footprint.py check` refuses it.",
         "Hold a finding only when the cited rule's text requires the change.",
         f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
         *record_lines,
