@@ -27,6 +27,18 @@ PUNCTUATION = re.compile(r"::|->|=>|==|!=|<=|>=|&&|\|\||[{}()\[\];:,.<>!&|+*/%=\
 FILE_CHANGED_LINE_LIMIT = 200
 # The std traits whose derives add no names to the item they decorate.
 STD_DERIVES = frozenset({"Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Debug"})
+# Snake-case names a bare word reaches without an import: prelude functions, primitive types and path keywords.
+PRELUDE_NAMES = frozenset({
+    "drop", "bool", "char", "str", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize",
+    "u8", "u16", "u32", "u64", "u128", "usize", "self", "super", "crate",
+})
+# The Rust keywords, strict and reserved in any edition: a name with one of these needs `r#`.
+RUST_KEYWORDS = frozenset({
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
+    "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
+    "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract", "become",
+    "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
+})
 
 
 class FootprintError(Exception):
@@ -1044,6 +1056,90 @@ def delimiter_ends(words: tuple[str, ...]) -> dict[int, int]:
     return ends
 
 
+def macro_spans(words: tuple[str, ...], ends: dict[int, int]) -> tuple[tuple[int, int], ...]:
+    """The span of each macro token tree, from its `!` to the word after its closing delimiter.
+
+    A `macro_rules!` tree starts after the macro's name.
+    """
+    spans: list[tuple[int, int]] = []
+    for index, word in enumerate(words):
+        if word == "!":
+            begin = index + 2 if index and words[index - 1] == "macro_rules" else index + 1
+            if begin in ends:
+                spans.append((index, ends[begin] + 1))
+    return tuple(spans)
+
+
+def closes_named_generics(words: tuple[str, ...], close: int, openers: dict[int, int]) -> bool:
+    """Whether the `>` at close ends the generics of a turbofish (`f::<T>`) or of a `fn` or `struct` name.
+
+    Any other `>` before a paren can be a comparison, as in `a > (b,)`.
+    """
+    depth = 0
+    cursor = close
+    while cursor >= 0:
+        word = words[cursor]
+        if word in {")", "]", "}"}:
+            if cursor not in openers:
+                return False
+            cursor = openers[cursor] - 1
+            continue
+        if word in {"(", "[", "{", ";"}:
+            return False
+        depth += (word == ">") - (word == "<")
+        if not depth:
+            return words[cursor - 1:cursor] == ("::",) or (cursor >= 2 and words[cursor - 2] in {"fn", "struct"})
+        cursor -= 1
+    return False
+
+
+def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
+    """The indexes of the commas that end a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
+
+    A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
+    does not change the code, so a reformat that adds or drops one leaves the code the same. Any other paren list can be
+    a tuple, where `(x,)` and `(x)` differ, so its comma stays. A comma inside a macro token tree or an attribute stays
+    too: a macro arm or an attribute macro can tell `[1,]` from `[1]`.
+
+    Some of those leads can come before a tuple, so they do not count: a lifetime or label (`&'a (u8,)`,
+    `break 'a (1,)`), the `]` that ends an attribute (`#[cfg(x)] (a,) =>`), the `)` that ends a visibility
+    (`pub(crate) (u8,)`), and a `>` that does not end named generics (`closes_named_generics`).
+    """
+    ends = delimiter_ends(words)
+    openers = {close: opening for opening, close in ends.items()}
+    attributes = attribute_spans(words)
+    attribute_ends = {end for _, end in attributes}
+    in_macros = {index for start, end in (*macro_spans(words, ends), *attributes) for index in range(start + 1, end)}
+
+    def call_lead(index: int) -> bool:
+        """Whether the word before the paren at index makes its list the arguments of a call or a parameter list."""
+        lead = words[index - 1] if index else ""
+        if lead == ">":
+            return closes_named_generics(words, index - 1, openers)
+        if lead == "]":
+            return index not in attribute_ends
+        if lead == ")":
+            return words[openers[index - 1] - 1:openers[index - 1]] != ("pub",) if index - 1 in openers else True
+        return (IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS
+                and words[index - 2:index - 1] != ("'",))
+
+    droppable: list[bool] = []
+    dropped: set[int] = set()
+    for index, word in enumerate(words):
+        if word in {"(", "[", "{"}:
+            droppable.append(word != "(" or call_lead(index))
+        elif (word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",)
+              and index - 1 not in in_macros):
+            dropped.add(index - 1)
+    return frozenset(dropped)
+
+
+def without_trailing_commas(source_tokens: tuple[Token, ...]) -> tuple[Token, ...]:
+    """The tokens without the commas that `trailing_commas` finds, which rustfmt adds or drops when it joins lines."""
+    dropped = trailing_commas(tuple(token.value for token in source_tokens))
+    return tuple(token for index, token in enumerate(source_tokens) if index not in dropped)
+
+
 def cfg_attribute(words: tuple[str, ...]) -> bool:
     return (words[:4] == ("#", "[", "cfg", "(") and words[-2:] == (")", "]")
             and closing(words, 1) == len(words) - 1 and closing(words, 3) == len(words) - 2)
@@ -1184,6 +1280,26 @@ def scoped_import_sites(source: tuple[Token, ...], uses: tuple[UseItem, ...],
     return tuple(replacements)
 
 
+def removed_name_stays_bound(words: tuple[str, ...], uses: tuple[UseItem, ...], use_indices: set[int],
+                             path: tuple[str, ...], children: set[tuple[str, ...]]) -> bool:
+    # A bare word resolves through local bindings, same-module items, globs or the prelude. With no
+    # glob and no prelude name, it names the same thing after the import goes, or the build fails.
+    # A snake-case path with a child imported in the same module is a module, never a pattern or value.
+    # Macro token trees are refused: a macro can take the word into another namespace.
+    name = path[-1]
+    sites = [index for index, word in enumerate(words) if word == name and index not in use_indices]
+    if not sites:
+        return True
+    if (name in PRELUDE_NAMES or not re.fullmatch(r"[a-z][a-z0-9_]*", name)
+            or not any(child[:len(path)] == path and len(child) > len(path) for child in children)
+            or any("*" in words[item.start:item.end] for item in uses)):
+        return False
+    spans = attribute_spans(words) + macro_spans(words, delimiter_ends(words))
+    hidden = {index for begin, end in spans for index in range(begin, end)}
+    return all(index not in hidden and (index == 0 or words[index - 1] != "::")
+               and (index + 1 == len(words) or words[index + 1] not in {"::", "!"}) for index in sites)
+
+
 def prove_imports(change: FileChange) -> ImportProof:
     old, new = tokens(change.before), tokens(change.after)
     before, after = tuple(t.value for t in old), tuple(t.value for t in new)
@@ -1217,7 +1333,7 @@ def prove_imports(change: FileChange) -> ImportProof:
         return ImportProof()
     old_paths = {path for item in old_uses for path in item.paths}
     new_paths = {path for item in new_uses for path in item.paths}
-    added, removed = new_paths - old_paths, old_paths - new_paths
+    added = new_paths - old_paths
     candidates = [item for item in candidates if item.path in added]
     replaced_paths = {path for item in removed_items for path in item.paths}
     if any(not re.fullmatch(r"[A-Z][A-Z0-9_]*", path[-1]) for item in added_items for path in item.paths
@@ -1227,8 +1343,19 @@ def prove_imports(change: FileChange) -> ImportProof:
         return ImportProof()
     old_use_indices = {i for item in old_uses for i in range(item.start, item.end)}
     new_use_indices = {i for item in new_uses for i in range(item.start, item.end)}
-    for path in removed:
-        if any(word == path[-1] and i not in new_use_indices for i, word in enumerate(after)):
+    # A removed path stays imported only where a module-level plain use in its module still names it.
+    kept: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    for item in new_uses:
+        scope = new_context.scopes[item.start]
+        if plain_use(after, item) and (scope.block == -1 or scope.block in new_context.module_blocks):
+            kept.update((scope.module, path) for path in item.paths)
+    for item in removed_items:
+        # A block can redefine a path, so a removed block-level use keeps the strict rule: no bare word left.
+        scope = old_context.scopes[item.start]
+        module_level = scope.block == -1 or scope.block in old_context.module_blocks
+        children = {other.path for other in candidates if module_level and other.module == scope.module}
+        if any(not (module_level and (scope.module, path) in kept)
+               and not removed_name_stays_bound(after, new_uses, new_use_indices, path, children) for path in item.paths):
             return ImportProof()
     for path in added:
         name = path[-1]
@@ -1454,12 +1581,7 @@ def function_parameters(source: tuple[Token, ...]) -> tuple[FunctionParameters, 
     """Read named function parameters outside attributes and macro token trees."""
     words = tuple(token.value for token in source)
     ends = delimiter_ends(words)
-    excluded = list(attribute_spans(words))
-    for index, word in enumerate(words):
-        if word == "!":
-            begin = index + 2 if index and words[index - 1] == "macro_rules" else index + 1
-            if begin in ends:
-                excluded.append((index, ends[begin] + 1))
+    excluded = (*attribute_spans(words), *macro_spans(words, ends))
     result: list[FunctionParameters] = []
     for index, word in enumerate(words[:-1]):
         if word != "fn" or not IDENTIFIER.fullmatch(words[index + 1]) or any(
@@ -1852,8 +1974,9 @@ def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
             reasons.append("check 6: macro invocation requires review")
         if documented_text(change.before) != documented_text(change.after) or re.search(r"#\s*\[\s*(?:serde|reflect)|\brename\s*=", lines):
             reasons.append("check 6: serialized, reflected, configured or documented name flagged")
-        old_tokens = without_derives(normalized)
-        new_tokens = without_derives(rewrite_tokens(tokens(change.after), proof.rewrites.after))
+        old_tokens = without_trailing_commas(without_derives(normalized))
+        new_tokens = without_trailing_commas(without_derives(
+            rewrite_tokens(tokens(change.after), proof.rewrites.after)))
         if old_tokens != new_tokens or any(token.kind == "unknown" for token in (*old_tokens, *new_tokens)):
             reasons.append("check 6: call target, method or other change not proven equivalent")
         if not change.path.endswith(".rs") and change.before != change.after:

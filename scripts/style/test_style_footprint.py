@@ -639,6 +639,125 @@ class StyleFootprintTests(unittest.TestCase):
         _ = self.commit()
         self.assert_mechanical(base)
 
+    def shorten_module_constants(self, module: str, extra: str) -> str:
+        self.write("src/lib.rs", f"mod {module};\nmod card;\n")
+        self.write(f"src/{module}.rs", 'pub(crate) const VERTICAL: &str = "|";\n'
+                   + 'pub(crate) const VERTICAL_RIGHT: &str = "|-";\n')
+        body = ("fn fade(text: &str) -> &str { text }\nfn set_symbol(_symbol: &str) {}\n"
+                + f"fn paint(symbol: &str) {{\n    if symbol == {module}::VERTICAL_RIGHT {{\n"
+                + f"        set_symbol({module}::VERTICAL);\n    }}\n}}\n" + extra)
+        self.write("src/card.rs", f"use crate::{module};\n" + body)
+        base = self.commit()
+        self.write("src/card.rs", f"use crate::{module}::VERTICAL;\nuse crate::{module}::VERTICAL_RIGHT;\n"
+                   + body.replace(f"{module}::VERTICAL", "VERTICAL"))
+        _ = self.commit()
+        return base
+
+    def test_constant_import_shortening_allows_a_removed_module_name_as_a_closure_binding(self) -> None:
+        base = self.shorten_module_constants(
+            "line", "fn widths(rows: &[&str]) -> usize { rows.iter().flat_map(|line| { fade(line).chars() }).count() }\n",
+        )
+        self.assert_mechanical(base)
+
+    def test_constant_import_shortening_with_a_removed_module_name_and_a_glob_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "use std::collections::*;\nfn count(line: usize) -> usize { line }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_prelude_module_name_requires_review(self) -> None:
+        for module, extra in (("drop", "fn release(value: String) { drop(value) }\n"),
+                              ("Option", "fn pick() -> Option<u32> { None }\n")):
+            with self.subTest(module=module):
+                base = self.shorten_module_constants(module, extra)
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_as_a_macro_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "fn here() -> u32 { line!() }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_path_left_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "fn other() -> &'static str { line::OTHER }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_in_a_macro_argument_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "fn here() { invoke!(line) }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_in_a_macro_rules_body_requires_review(self) -> None:
+        base = self.shorten_module_constants("line", "macro_rules! paint_line { () => { line }; }\n")
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_constant_left_as_a_pattern_requires_review(self) -> None:
+        self.write("src/lib.rs", "mod symbols;\nmod card;\n")
+        # A C binding crate exports snake-case constants such as `err_none`.
+        for constant in ("LIMIT", "err_none"):
+            with self.subTest(constant=constant):
+                self.write("src/symbols.rs", f"pub(crate) const {constant}: usize = 4;\n"
+                           + 'pub(crate) const VERTICAL: &str = "|";\n')
+                body = ("fn paint(symbol: &str) {\n    if symbol == symbols::VERTICAL {}\n}\n"
+                        + f"fn full(x: usize) -> bool {{ match x {{ {constant} => true, _ => false }} }}\n")
+                self.write("src/card.rs", f"use crate::symbols;\nuse crate::symbols::{constant};\n" + body)
+                base = self.commit()
+                self.write("src/card.rs", "use crate::symbols;\nuse crate::symbols::VERTICAL;\n"
+                           + body.replace("symbols::VERTICAL", "VERTICAL"))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def write_scope_definitions(self) -> None:
+        self.write("src/lib.rs", "mod c;\nmod shapes;\nmod card;\n")
+        self.write("src/c.rs", "pub(crate) const err_none: usize = 0;\n")
+        self.write("src/shapes.rs", 'pub(crate) mod err_none { pub(crate) const VERTICAL: &str = "|"; }\n'
+                   + 'pub(crate) mod line { pub(crate) const VERTICAL: &str = "|"; }\n')
+
+    def test_constant_import_shortening_with_a_child_import_in_another_module_requires_review(self) -> None:
+        self.write_scope_definitions()
+        query = ("mod ffi {\n    pub(crate) use crate::c::err_none;\n    mod query {\n        use super::err_none;\n"
+                 + "        fn ok(x: usize) -> bool { match x { err_none => true, _ => false } }\n    }\n}\n")
+        paint = ("mod ui {\n    pub(crate) use crate::shapes::err_none;\n    mod paint {\n        use super::err_none;\n"
+                 + "        fn paint(symbol: &str) { if symbol == err_none::VERTICAL {} }\n    }\n}\n")
+        self.write("src/card.rs", query + paint)
+        base = self.commit()
+        self.write("src/card.rs", query.replace("        use super::err_none;\n", "") + paint.replace(
+            "use super::err_none;", "use super::err_none::VERTICAL;").replace("err_none::VERTICAL {", "VERTICAL {"))
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_import_kept_elsewhere_requires_review(self) -> None:
+        self.write_scope_definitions()
+        paint = ("mod ui {\n    pub(crate) use crate::shapes::line;\n    mod paint {\n        use super::line;\n"
+                 + "        fn paint(symbol: &str) { if symbol == line::VERTICAL {} }\n    }\n}\n")
+        for kept in ("    }\n    mod check {\n        use super::err_none;\n        fn code() -> usize { err_none }\n",
+                     # The braces keep the block-level use from pairing with the removed module-level one.
+                     "        fn code() -> usize { use super::{err_none}; err_none }\n"):
+            with self.subTest(kept=kept):
+                query = ("mod ffi {\n    pub(crate) use crate::c::err_none;\n    mod query {\n        use super::err_none;\n"
+                         + "        fn ok(x: usize) -> bool { match x { err_none => true, _ => false } }\n"
+                         + kept + "    }\n}\n")
+                self.write("src/card.rs", query + paint)
+                base = self.commit()
+                self.write("src/card.rs", query.replace("        use super::err_none;\n", "", 1) + paint.replace(
+                    "use super::line;", "use super::line::VERTICAL;").replace("line::VERTICAL {", "VERTICAL {"))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_block_import_requires_review(self) -> None:
+        self.write_scope_definitions()
+        before = ("mod provider { pub(crate) const err_none: u32 = 0; }\nuse provider::err_none;\n"
+                  + "fn ok(x: u32) -> bool {\n    mod provider { pub const err_none: u32 = 1; }\n"
+                  + "    use provider::err_none;\n    match x { err_none => true, _ => false }\n}\n"
+                  + "use crate::shapes::line;\nfn paint(symbol: &str) { if symbol == line::VERTICAL {} }\n")
+        self.write("src/card.rs", before)
+        base = self.commit()
+        self.write("src/card.rs", before.replace("    use provider::err_none;\n", "").replace(
+            "use crate::shapes::line;", "use crate::shapes::line::VERTICAL;").replace("line::VERTICAL {", "VERTICAL {"))
+        _ = self.commit()
+        self.assertIn("check 6", self.assert_review(base))
+
+    def test_constant_import_shortening_with_a_removed_module_name_in_an_attribute_requires_review(self) -> None:
+        for attribute in ("#[line]", "#[line(fast)]"):
+            with self.subTest(attribute=attribute):
+                base = self.shorten_module_constants("line", f"{attribute}\nfn tagged() {{}}\n")
+                self.assertIn("check 6", self.assert_review(base))
+
     def test_import_scope_allows_an_explicit_import_beside_a_module_glob(self) -> None:
         self.write("src/constants.rs", 'pub(crate) const KEYMAP_FILE: &str = "keys";\n')
         before = ("mod constants;\n"
@@ -1083,6 +1202,115 @@ class StyleFootprintTests(unittest.TestCase):
                     _ = self.assert_review(base)
                 else:
                     self.assert_mechanical(base)
+
+    def test_import_rewrite_with_joined_calls_that_drop_trailing_commas_is_mechanical(self) -> None:
+        self.write("src/lib.rs", "mod constants;\nmod error;\n")
+        self.write("src/constants.rs", "".join(f"pub(super) const {name}: &str = \"{name}\";\n" for name in (
+            "GIT_PATHSPEC_SEPARATOR", "LSOF_BINARY", "LSOF_PROCESS_IDS_ARG", "PROCESS_DESCRIPTORS_DIRECTORY",
+            "PROCESS_DIRECTORY")))
+        before = ("use std::path::Path;\n\n"
+                  "#[cfg(target_os = \"linux\")]\n"
+                  "fn git_lock_holders(path: &Path) -> u32 {\n"
+                  "    inspect_git_lock_holders(\n"
+                  "        Path::new(super::constants::PROCESS_DIRECTORY),\n"
+                  "        path,\n"
+                  "        metadata.uid(),\n"
+                  "    )\n"
+                  "}\n\n"
+                  "#[cfg(target_os = \"linux\")]\n"
+                  "fn inspect_git_lock_holders(root: &Path, path: &Path, owner: u32) -> u32 {\n"
+                  "    let Ok(descriptors) = std::fs::read_dir(\n"
+                  "        root\n"
+                  "            .join(path)\n"
+                  "            .join(super::constants::PROCESS_DESCRIPTORS_DIRECTORY),\n"
+                  "    ) else {\n"
+                  "        return owner;\n"
+                  "    };\n"
+                  "    consume(descriptors)\n"
+                  "}\n\n"
+                  "#[cfg(not(target_os = \"linux\"))]\n"
+                  "fn git_lock_holders(path: &Path) -> u32 {\n"
+                  "    let Ok(output) = std::process::Command::new(super::constants::LSOF_BINARY)\n"
+                  "        .args([\n"
+                  "            super::constants::LSOF_PROCESS_IDS_ARG,\n"
+                  "            super::constants::GIT_PATHSPEC_SEPARATOR,\n"
+                  "        ])\n"
+                  "        .arg(path)\n"
+                  "        .output()\n"
+                  "    else {\n"
+                  "        return owner;\n"
+                  "    };\n"
+                  "    consume(output)\n"
+                  "}\n")
+        self.write("src/error.rs", before)
+        base = self.commit()
+        imports = ("use std::path::Path;\n\n"
+                   "#[cfg(not(target_os = \"linux\"))]\nuse super::constants::GIT_PATHSPEC_SEPARATOR;\n"
+                   "#[cfg(not(target_os = \"linux\"))]\nuse super::constants::LSOF_BINARY;\n"
+                   "#[cfg(not(target_os = \"linux\"))]\nuse super::constants::LSOF_PROCESS_IDS_ARG;\n"
+                   "#[cfg(target_os = \"linux\")]\nuse super::constants::PROCESS_DESCRIPTORS_DIRECTORY;\n"
+                   "#[cfg(target_os = \"linux\")]\nuse super::constants::PROCESS_DIRECTORY;\n")
+        joins = (
+            (("inspect_git_lock_holders(\n        Path::new(super::constants::PROCESS_DIRECTORY),\n"
+              "        path,\n        metadata.uid(),\n    )"),
+             "inspect_git_lock_holders(Path::new(PROCESS_DIRECTORY), path, metadata.uid())"),
+            (("std::fs::read_dir(\n        root\n            .join(path)\n"
+              "            .join(super::constants::PROCESS_DESCRIPTORS_DIRECTORY),\n    ) else {"),
+             "std::fs::read_dir(root.join(path).join(PROCESS_DESCRIPTORS_DIRECTORY))\n    else {"),
+            ("super::constants::LSOF_BINARY", "LSOF_BINARY"),
+            ((".args([\n            super::constants::LSOF_PROCESS_IDS_ARG,\n"
+              "            super::constants::GIT_PATHSPEC_SEPARATOR,\n        ])"),
+             ".args([LSOF_PROCESS_IDS_ARG, GIT_PATHSPEC_SEPARATOR])"),
+        )
+        body = before[len("use std::path::Path;\n"):]
+        for old, new in joins:
+            self.assertIn(old, body)
+            body = body.replace(old, new)
+        self.write("src/error.rs", imports + body)
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_each_joined_call_that_drops_its_trailing_comma_is_mechanical(self) -> None:
+        cases = (
+            ("    consume(\n        columns::COL_DISK,\n        input,\n    );\n", "    consume(COL_DISK, input);\n"),
+            (("    reader\n        .args([\n            columns::COL_DISK,\n            input,\n        ])\n"
+              "        .output();\n"), "    reader.args([COL_DISK, input]).output();\n"),
+            ("    let Ok(value) = read(\n        columns::COL_DISK,\n    ) else {\n        return;\n    };\n",
+             "    let Ok(value) = read(COL_DISK) else {\n        return;\n    };\n"),
+        )
+        for body, joined in cases:
+            with self.subTest(joined=joined):
+                self.write("src/lib.rs", "mod columns;\nmod reader;\n")
+                self.write("src/columns.rs", "pub(crate) const COL_DISK: usize = 1;\n")
+                self.write("src/reader.rs", "use crate::columns;\nfn read(input: usize) {\n" + body + "}\n")
+                base = self.commit()
+                self.write("src/reader.rs", "use crate::columns::COL_DISK;\nfn read(input: usize) {\n" + joined + "}\n")
+                _ = self.commit()
+                self.assert_mechanical(base)
+
+    def test_a_dropped_comma_in_a_tuple_macro_or_attribute_requires_review(self) -> None:
+        cases = (
+            ("fn read(x: u8) { let t = (x,); consume(t); }\n", "(x,)", "(x)"),
+            ("fn read(v: (u8,)) { let (a,) = v; consume(a); }\n", "(a,)", "(a)"),
+            ("fn read(x: u8) -> (u8,) { make(x) }\n", "(u8,)", "(u8)"),
+            ("fn read(a: u8, b: u8) { assert_eq!(a, b,); }\n", "b,)", "b)"),
+            ("#[cfg(any(unix, windows,))]\nfn read() {}\n", "windows,)", "windows)"),
+        )
+        for before, old, new in cases:
+            with self.subTest(before=before):
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace(old, new))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_an_added_trailing_comma_is_mechanical(self) -> None:
+        before = "fn read(input: usize) {\n    consume(input);\n}\n"
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace("consume(input);", "consume(\n        input,\n    );"))
+        _ = self.commit()
+        self.assert_mechanical(base)
 
     def test_import_rewrite_can_remove_an_unused_qualifier_import(self) -> None:
         self.write("src/lib.rs", "mod columns;\nmod reader;\n")

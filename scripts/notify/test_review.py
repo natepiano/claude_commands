@@ -774,6 +774,43 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertIsInstance(result, expected)
                 configured.assert_called_once()
 
+    def test_a_review_limit_caps_the_whole_review_and_a_review_out_of_time_is_unreviewed(self) -> None:
+        revised = replace(self.draft, body="Choose whether to retry the nightly build.")
+        elapsed = [0.0]
+        timeouts: list[float] = []
+
+        def reads(replies: list[VerdictJSON], seconds: float, failure: Literal["none", "timeout"] = "none") -> review.ProcessRunner:
+            """A reviewer whose each read takes `seconds` and gives the next reply."""
+            left = iter(replies)
+
+            def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                if Path(argv[0]).name != "claude":
+                    return FakeReviewer(verdict(self.draft))(argv, timeout=timeout, env=env)
+                timeouts.append(timeout)
+                elapsed[0] += seconds
+                return FakeReviewer(next(left), failure=failure)(argv, timeout=timeout, env=env)
+            return runner
+
+        rewrite = verdict(self.draft, "rewrite", body=revised.body)
+        cases: tuple[tuple[review.ProcessRunner, type, list[float]], ...] = (
+            # The limit is the reviewer's timeout when it is shorter than the configured 60 s.
+            (reads([verdict(self.draft)], 5), review.Approved, [30]),
+            (reads([verdict(self.draft)], 30, "timeout"), review.Unreviewed, [30]),
+            # Time left after the first read is the timeout of the second.
+            (reads([rewrite, verdict(revised)], 12), review.Rewritten, [30, 18]),
+            # A rewrite whose first read used up the limit gets no second read.
+            (reads([rewrite, verdict(revised)], 31), review.Unreviewed, [30]))
+        for runner, expected, read_timeouts in cases:
+            elapsed[0], timeouts[:] = 0.0, []
+            with (self.subTest(expected=expected, read_timeouts=read_timeouts),
+                  mock.patch.object(review, "review_timeout_seconds", return_value=60),
+                  mock.patch.object(time, "monotonic", side_effect=lambda: elapsed[0])):
+                outcome = review.review(self.draft, False, runner=runner, limit=30)
+                self.assertIsInstance(outcome, expected)
+                if isinstance(outcome, review.Unreviewed):
+                    self.assertEqual(outcome.why, "timeout")
+                self.assertEqual(timeouts, read_timeouts)
+
     def test_two_slow_reviews_fit_the_sender_wait_and_keep_a_live_claim_owned(self) -> None:
         held = self.held()
         review.hold(held)

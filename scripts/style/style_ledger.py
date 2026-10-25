@@ -1249,6 +1249,19 @@ class LintCoverage:
 
 
 @dataclass(frozen=True)
+class TreeEntry:
+    """One `git ls-tree -r` entry: a blob, or a submodule's `commit`."""
+
+    mode: str
+    kind: str
+    object: str
+
+
+# A symlink is a blob too, but its content is a path, not Rust.
+REGULAR_FILE_MODES = ("100644", "100755")
+
+
+@dataclass(frozen=True)
 class RepositoryTip:
     commit: str
     tree: str
@@ -1256,6 +1269,7 @@ class RepositoryTip:
     # Deepest first, so the first that holds a path is its innermost crate.
     crate_dirs: tuple[str, ...]
     rust_files: tuple[str, ...]
+    entries: dict[str, TreeEntry]
 
     def crate(self, path: str) -> str:
         """The innermost crate directory that holds path, as a decision's crate is."""
@@ -1319,15 +1333,15 @@ def _is_ignored(path: str, patterns: tuple[str, ...]) -> bool:
 def _tip(repo: Path, commit: str) -> RepositoryTip:
     commit = _git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
     tree = _git(repo, "rev-parse", f"{commit}^{{tree}}")
-    entries = _git(repo, "ls-tree", "-rz", "--full-tree", commit)
-    blobs: dict[str, str] = {}
-    for entry in entries.split("\0"):
+    listing = _git(repo, "ls-tree", "-rz", "--full-tree", commit)
+    entries: dict[str, TreeEntry] = {}
+    for entry in listing.split("\0"):
         if not entry:
             continue
         metadata, path = entry.split("\t", 1)
-        _, kind, blob = metadata.split()
-        if kind == "blob":
-            blobs[path] = blob
+        mode, kind, name = metadata.split()
+        entries[path] = TreeEntry(mode, kind, name)
+    blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
     manifests = {path: _git(repo, "show", f"{commit}:{path}") for path in blobs if PurePosixPath(path).name == "Cargo.toml"}
     directories = tuple(member.directory for member in rule_catalog.workspace_members(manifests))
     ignored: list[str] = []
@@ -1335,7 +1349,7 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
         if config in blobs:
             ignored.extend(_ignored_paths(_table(tomllib.loads(_git(repo, "show", f"{commit}:{config}")))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
-    return RepositoryTip(commit, tree, blobs, directories, files)
+    return RepositoryTip(commit, tree, blobs, directories, files, entries)
 
 
 def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
@@ -1361,29 +1375,90 @@ def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
             _ = destination.write_bytes(content)
 
 
-def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+def _inputs(tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
+    """The tree entries a cell's fingerprint covers, by path; a crate scope covers its whole directory tree."""
+    if scope in (CellInputScope.MODULE, CellInputScope.FILE) and path not in tip.blobs:
+        raise LedgerError(f"{path}: no file at {tip.commit}")
     if scope == CellInputScope.MODULE:
-        if path not in tip.blobs:
-            raise LedgerError(f"{path}: no file at {tip.commit}")
         directory = PurePosixPath(path).parent
         parent_module = directory.as_posix() + ".rs"
-        inputs = sorted((name, blob) for name, blob in tip.blobs.items()
-                        if name.endswith(".rs") and (PurePosixPath(name).parent == directory or name == parent_module))
-        return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
-    if scope == "manifest":
+        return {name: entry for name, entry in tip.entries.items()
+                if name.endswith(".rs") and (PurePosixPath(name).parent == directory or name == parent_module)}
+    if scope == CellInputScope.MANIFEST:
         paths = {"Cargo.toml", *(str(PurePosixPath(directory) / "Cargo.toml") for directory in tip.crate_dirs)}
-        manifests = sorted((name, blob) for name, blob in tip.blobs.items() if name in paths)
-        return hashlib.sha256(json.dumps(manifests, separators=(",", ":")).encode()).hexdigest()
-    if scope == "crate":
+        return {name: entry for name, entry in tip.entries.items() if name in paths}
+    if scope == CellInputScope.CRATE:
         directory = tip.crate(path)
         if directory == ".":
-            inputs = sorted((name, blob) for name, blob in tip.blobs.items() if tip.crate(name) == ".")
-            return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
-        return _git(repo, "rev-parse", f"{tip.commit}:{directory}")
-    blob = tip.blobs.get(path)
-    if blob is None:
-        raise LedgerError(f"{path}: no file at {tip.commit}")
-    return blob
+            return {name: entry for name, entry in tip.entries.items() if tip.crate(name) == "."}
+        return {name: entry for name, entry in tip.entries.items() if _under(name, directory)}
+    return {path: tip.entries[path]}
+
+
+def _input_key(tip: RepositoryTip, scope: CellInputScope, path: str) -> tuple[str, CellInputScope, str]:
+    """Cells with the same inputs share a key: a crate scope by its crate, the manifest scope once per commit."""
+    return tip.commit, scope, tip.crate(path) if scope == "crate" else "." if scope == "manifest" else path
+
+
+def _inputs_hash(inputs: dict[str, TreeEntry]) -> str:
+    """SHA-256 over the sorted (path, blob) pairs; a submodule entry is not part of it."""
+    pairs = sorted((name, entry.object) for name, entry in inputs.items() if entry.kind == "blob")
+    return hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode()).hexdigest()
+
+
+def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+    if scope == CellInputScope.CRATE and tip.crate(path) != ".":
+        return _git(repo, "rev-parse", f"{tip.commit}:{tip.crate(path)}")
+    inputs = _inputs(tip, scope, path)
+    return inputs[path].object if scope == CellInputScope.FILE else _inputs_hash(inputs)
+
+
+@dataclass(frozen=True)
+class RustCode:
+    """What a modules judgment reads in a Rust file: its code tokens, and each inner doc with its code position."""
+
+    tokens: tuple[style_footprint.Token, ...]
+    # The count of code tokens before each doc, so a `//!` that moves into another `mod` block differs.
+    inner_docs: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
+class NotTokenized:
+    """The file is not UTF-8, or the tokenizer cannot read all of it."""
+
+
+NOT_TOKENIZED = NotTokenized()
+
+
+def _rust_code(content: bytes) -> RustCode | NotTokenized:
+    try:
+        text = content.decode()
+    except UnicodeDecodeError:
+        return NOT_TOKENIZED
+    code = style_footprint.tokens(text)
+    spans = style_footprint.token_spans(text)
+    if len(spans) != len(code):
+        return NOT_TOKENIZED
+    # Only whitespace and comments lie between two code tokens, so each gap holds the comments at one code position.
+    gaps = (text[start:end] for start, end in zip((0, *(span.end for span in spans)), (*(span.start for span in spans), len(text))))
+    # Module docs count toward a facade (when-to-split-a-module.md), so `//!` and `/*!` text is read as code.
+    return RustCode(code, tuple((position, doc) for position, gap in enumerate(gaps)
+                                for doc in style_footprint.documented_text(gap) if doc.startswith(("//!", "/*!"))))
+
+
+def _only_comments_changed(before: dict[str, TreeEntry], after: dict[str, TreeEntry],
+                           code: Callable[[str], RustCode | NotTokenized]) -> bool:
+    """Whether two input sets hold the same paths and each changed entry is a Rust file with the same code and inner docs.
+
+    code reads a blob. A changed mode, a changed submodule, a changed file that is not Rust or does not tokenize, and
+    a fingerprint change with no changed entry do not match.
+    """
+    changed = tuple(name for name, entry in before.items() if after.get(name) != entry)
+    if before.keys() != after.keys() or not changed:
+        return False
+    return all(name.endswith(".rs") and before[name].mode == after[name].mode and before[name].mode in REGULAR_FILE_MODES
+               and isinstance(old := code(before[name].object), RustCode) and old == code(after[name].object)
+               for name in changed)
 
 
 def _read_files(serialized: str) -> ReadFiles | NoReadFiles:
@@ -1392,14 +1467,17 @@ def _read_files(serialized: str) -> ReadFiles | NoReadFiles:
     return ReadFiles(tuple(cast(list[str], json.loads(serialized))))
 
 
-def _read_fingerprint(tip: RepositoryTip, path: str, reads: ReadFiles) -> str:
-    inputs: list[tuple[str, str]] = []
+def _read_inputs(tip: RepositoryTip, path: str, reads: ReadFiles) -> dict[str, TreeEntry]:
+    inputs: dict[str, TreeEntry] = {}
     for name in sorted({path, *reads.paths}):
-        blob = tip.blobs.get(name)
-        if blob is None:
+        if name not in tip.blobs:
             raise LedgerError(f"{name}: no file at {tip.commit}")
-        inputs.append((name, blob))
-    return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
+        inputs[name] = tip.entries[name]
+    return inputs
+
+
+def _read_fingerprint(tip: RepositoryTip, path: str, reads: ReadFiles) -> str:
+    return _inputs_hash(_read_inputs(tip, path, reads))
 
 
 def _config_hash(repo: Path, tip: RepositoryTip, tool: LintTool) -> str:
@@ -1543,6 +1621,8 @@ class Ledger:
         self._catalog: tuple[Rule, ...] = rule_catalog.load_rules(repo)
         self._tips: dict[str, RepositoryTip] = {}
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
+        self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
+        self._rust_codes: dict[str, RustCode | NotTokenized] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         # The declaration step's git reads, by commit: what each stored judged commit resolves to, the paths changed
@@ -1607,22 +1687,51 @@ class Ledger:
         return self._tips[commit]
 
     def _fingerprint(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
-        key = (tip.commit, scope, tip.crate(path) if scope == "crate" else "." if scope == "manifest" else path)
+        key = _input_key(tip, scope, path)
         if key not in self._fingerprints:
             self._fingerprints[key] = _fingerprint(self.repo, tip, scope, path)
         return self._fingerprints[key]
 
-    def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str) -> bool:
-        if isinstance(row.reads, ReadFiles):
-            try:
-                return row.input_fingerprint == _read_fingerprint(tip, path, row.reads)
-            except LedgerError:
-                return False
-        scope = _comparison_scope(row.declared_scope, scope)
+    def _scope_inputs(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
+        """What _inputs selects, selected once."""
+        key = _input_key(tip, scope, path)
+        if key not in self._inputs:
+            self._inputs[key] = _inputs(tip, scope, path)
+        return self._inputs[key]
+
+    def _rust_code(self, blob: str) -> RustCode | NotTokenized:
+        """What _rust_code reads in a blob, read once."""
+        if blob not in self._rust_codes:
+            result = subprocess.run(["git", "-C", str(self.repo), "cat-file", "blob", blob], capture_output=True, check=False)
+            if result.returncode:
+                raise CheckCouldNotRun(result.stderr.decode(errors="replace").strip() or f"git cat-file blob {blob} failed")
+            self._rust_codes[blob] = _rust_code(result.stdout)
+        return self._rust_codes[blob]
+
+    def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str, family: Family | None) -> bool:
+        """Whether the judged inputs are unchanged at tip.
+
+        Names rules judge comment text, so their inputs must be byte equal. A modules judgment also matches when only
+        comments other than inner docs changed; that check reads the inputs at the judged commit, so it runs only
+        after the fingerprints differ.
+        """
         try:
+            if isinstance(row.reads, ReadFiles):
+                if row.input_fingerprint == _read_fingerprint(tip, path, row.reads):
+                    return True
+                if family != "modules":
+                    return False
+                return _only_comments_changed(_read_inputs(self._tip(row.commit), path, row.reads),
+                                              _read_inputs(tip, path, row.reads), self._rust_code)
+            scope = _comparison_scope(row.declared_scope, scope)
             previous = (row.input_fingerprint if row.input_scope == scope
                         else self._fingerprint(self._tip(row.commit), scope, path))
-            return previous == self._fingerprint(tip, scope, path)
+            if previous == self._fingerprint(tip, scope, path):
+                return True
+            if family != "modules":
+                return False
+            return _only_comments_changed(self._scope_inputs(self._tip(row.commit), scope, path),
+                                          self._scope_inputs(tip, scope, path), self._rust_code)
         except LedgerError:
             return False
 
@@ -2514,7 +2623,7 @@ class Ledger:
         if isinstance(held, NoHeldJudgment):
             return held
         try:
-            unchanged = (self._judgment_inputs_match(held.inputs, tip, _cell_scope(definition, path, tip), path)
+            unchanged = (self._judgment_inputs_match(held.inputs, tip, _cell_scope(definition, path, tip), path, definition.family)
                          and self._is_ancestor(held.inputs.commit, tip.commit))
         except LedgerError:
             unchanged = False
@@ -4362,13 +4471,13 @@ class Ledger:
                 ancestor = self._is_ancestor(row.commit, tip.commit)
             except LedgerError:
                 continue
-            if ancestor and self._judgment_inputs_match(row, tip, scope, path):
+            if ancestor and self._judgment_inputs_match(row, tip, scope, path, rule.family):
                 return "current", row.verdict
             if not ancestor and isinstance(style_branch, StoredStyleBranch):
                 try:
                     branch_commit = self._branch_commit(style_branch.name)
                     checked_tip = self._tip(branch_commit)
-                    if self._is_ancestor(row.commit, branch_commit) and self._judgment_inputs_match(row, checked_tip, scope, path):
+                    if self._is_ancestor(row.commit, branch_commit) and self._judgment_inputs_match(row, checked_tip, scope, path, rule.family):
                         if not pending:
                             pending = row.verdict
                 except LedgerError:
@@ -4414,7 +4523,7 @@ class Ledger:
                     continue
                 try:
                     repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
-                               and self._judgment_inputs_match(row, tip, scope, cell.path))
+                               and self._judgment_inputs_match(row, tip, scope, cell.path, rule.family))
                 except LedgerError:
                     repeats = False
                 if repeats:
@@ -4436,7 +4545,7 @@ class Ledger:
             return NoStyleMergeChange()
         tip = self._tip(pushed)
         changed = tuple(cell for cell, row, scope in self._repeated_judgments(cells, base)
-                        if not self._judgment_inputs_match(row, tip, scope, cell.path))
+                        if not self._judgment_inputs_match(row, tip, scope, cell.path, cell.family))
         return StyleMergeChanges(style_branch.name, changed) if changed else NoStyleMergeChange()
 
     def _lint_coverage(self, tool: LintTool, tip: RepositoryTip) -> LintCoverage:

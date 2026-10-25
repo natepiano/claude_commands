@@ -63,8 +63,10 @@ message text as one JSON line in STATE/log.jsonl:
         the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits
         (quota.paid_credits_queued when a workers move is queued) or session.needs_go call
         to send instead
-`retire --to user` first prints "retired N queued messages", then one line from
-pushover.py cancel, which stops the emergency (--need blocked) push sent with KEY:
+`retire --to user` first prints "retired N queued messages", then "dropped N kept pushes": the
+pushes kept during silence with KEY from SENDER (silence.drop), so an obsolete alert never goes out
+when silence ends. Then one line from pushover.py cancel, which stops the emergency (--need blocked)
+push sent with KEY:
   cancelled: the emergency push for KEY stopped                 exit 0
   nothing to cancel: no emergency push for KEY is repeating      exit 0
   FAILED: the emergency push for KEY may still repeat: why       exit 3
@@ -106,6 +108,7 @@ if TYPE_CHECKING:
 import push_texts  # noqa: E402
 import rca  # noqa: E402
 import review  # noqa: E402
+import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 from user_action import (FIX, REFUSED_BEFORE_SENDING, ActionRefused, ActionRequired, ActionUnstated,
@@ -129,6 +132,8 @@ AUTO_MODE_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --
                   + ' [--value "rule=<the allow rule>"]')
 # The push shows a longer refused command cut to its first 89 characters and "…".
 REFUSED_COMMAND_LENGTH = 90
+# The cold-read review of an auto_mode.refused waits sentence holds the alert back at most this long.
+WAITS_REVIEW_SECONDS = 30
 PAID_CREDITS_TEXT = "quota.paid_credits"
 PAID_CREDITS_CALL = ('~/.claude/scripts/lib/py ~/.claude/scripts/message/send.py --to user --text-id quota.paid_credits'
                      + ' --value account=<account> --value machine=<machine> --value credits=<paid credits left>'
@@ -162,12 +167,14 @@ SESSION_TEMPLATES = {
     rca.FIXED_TEXT: ("the fix merged and the session does not stop for that permission again. Sent by rca.py fixed;"
                      + " sessions run rca.py, not this: " + rca.CALL
                      + ' fixed <id> --cause "<cause>" --fix "<fix>" --commit <sha>'),
+    rca.REWRITTEN_TEXT: ("the push review's rewrite of a fixed text it refused twice. Sent by rca.py fixed;"
+                         + " sessions run rca.py, not this."),
     "nate.adhoc": "an update the user asked for with /nate adhoc; see /nate.",
 }
 AUTO_MODE_REPORT = re.compile(r"\bauto[\s-]mode\b", re.IGNORECASE)
 AUTO_MODE_REFUSAL = re.compile(r"\b(refused|denied|stopped)\b", re.IGNORECASE)
 # The rca.py pushes tell of a session that stopped, and a cause can say auto mode refused a command.
-RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT})
+RCA_TEXTS = frozenset({rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT})
 AUTO_MODE_HELD = ("not sent: this push reports an auto-mode refusal. Send it with the auto_mode.refused template: "
                   + AUTO_MODE_CALL)
 PERMISSION_MODE = "auto"
@@ -1270,7 +1277,8 @@ def default_sender() -> str:
 
 def auto_mode_values(values: dict[str, str], commands: list[str], sender: str) -> dict[str, str]:
     """The auto_mode.refused values: the session gives the facts and each refused command, in order.
-    This fills the sender and the grammar, and shows the commands on the Refused line."""
+    This fills the sender, the kind of action (rca.action_of), the waits sentence and the grammar,
+    and shows each command on its own line."""
     if not sender:
         raise ValueError(AUTO_MODE_TEXT + " is sent by a Claude session: its sender is that session's name,"
                          + " and this run has no session record")
@@ -1291,9 +1299,37 @@ def auto_mode_values(values: dict[str, str], commands: list[str], sender: str) -
     one = len(shown) == 1
     rule = values.get("rule", "").strip()
     return {"sender": sender, "session": values["session"], "machine": values["machine"],
-            "refused": " " + shown[0] if one else "\n" + "\n".join(shown),
+            "action": rca.action_of(commands), "refused": "\n".join(shown),
             "noun": "command" if one else "commands", "this": "this" if one else "these",
-            "waits": waits, "rule_line": " The rule: " + rule if rule else ""}
+            "waits_line": rca.waits_line(waits), "rule_line": " The rule: " + rule if rule else ""}
+
+
+def auto_mode_key(session: str, commands: tuple[str, ...]) -> str:
+    """The key an auto_mode.refused alert goes with when the session gives none: one per session and set of
+    commands, as rca.py joins its cases, so `send.py retire` finds the alert of a fixed case."""
+    joined = "\n".join(sorted({rca.one_line(command) for command in commands}))
+    return f"auto-mode:{session}:{hashlib.sha256(joined.encode()).hexdigest()[:12]}"
+
+
+def reviewed_waits(options: Options) -> Options:
+    """An auto_mode.refused alert keeps its waits sentence, a value the session writes, only when the
+    cold-read review passes the alert within WAITS_REVIEW_SECONDS. A timeout, a failure or no reviewer
+    sends the alert without it: a slow review never holds the alert back longer."""
+    values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
+    if not values.get("waits_line") or review.switched_off():
+        return options
+    rendered = push_texts.render(AUTO_MODE_TEXT, **values)
+    draft = review.Draft(rendered.sender, CHANNEL_PRIORITY[options.need], rendered.title, rendered.action,
+                         rendered.body, False, rendered.session)
+    outcome = review.review(draft, False, limit=WAITS_REVIEW_SECONDS)
+    if isinstance(outcome, review.Approved):
+        return options
+    why = outcome.why if isinstance(outcome, review.Unreviewed | review.Withheld) else ", ".join(outcome.failed_rules)
+    print(f"send.py: {AUTO_MODE_TEXT} goes without its waits sentence: the review gave {why}", file=sys.stderr)
+    values["waits_line"] = ""
+    rendered = push_texts.render(AUTO_MODE_TEXT, **values)
+    return options._replace(values=tuple(f"{key}={item}" for key, item in values.items()),
+                            text=session_prefix(rendered.session) + rendered.body)
 
 
 def paid_credits_values(text_id: str, values: dict[str, str], session: str, named: str | None) -> dict[str, str]:
@@ -1322,9 +1358,12 @@ def reports_auto_mode_refusal(text: str) -> bool:
 
 
 def refusal_report(options: Options) -> rca.Report:
-    """The facts of an auto_mode.refused push: rca.py opens a case for the stopped session with them."""
+    """The facts of an auto_mode.refused push: rca.py opens a case for the stopped session with them,
+    with the waits sentence the alert showed and the alert's sender and key."""
     values = {key: item for key, _, item in (value.partition("=") for value in options.values)}
-    return rca.Report(values["session"], values["machine"], "auto_mode", options.commands)
+    return rca.Report(values["session"], values["machine"], "auto_mode", options.commands,
+                      waits=values["waits_line"].strip().removesuffix("."), source=options.sender or "",
+                      key=options.key or "")
 
 
 def wrong_template(options: Options, shown: str) -> str | None:
@@ -1435,6 +1474,8 @@ def parse(argv: list[str]) -> Options:
         args.action = rendered.action.text if isinstance(rendered.action, ActionRequired) else None
         args.no_action = isinstance(rendered.action, NoActionRequired)
         args.sender = optional_str(attr(args, "sender")) or rendered.sender
+        if text_id == AUTO_MODE_TEXT and attr(args, "key") is None:
+            args.key = auto_mode_key(values["session"], tuple(commands))
     elif raw_values:
         parser.error("--value needs --text-id")
     priority = optional_str(attr(args, "priority"))
@@ -1527,6 +1568,8 @@ def delivered_text(message: Message, entry_id: str) -> str:
 def send(options: Options) -> Result:
     if options.to == USER:
         options = options._replace(timeout=max(options.timeout, review.user_send_seconds()))
+    if options.text_id == AUTO_MODE_TEXT:
+        options = reviewed_waits(options)
     text = body_text(options).rstrip("\n")
     if not text.strip():
         usage_error("the message is empty")
@@ -1639,6 +1682,8 @@ def main(argv: list[str]) -> int:
             removed = retire(request.to, request.sender, request.key)
             print(f"retired {removed} queued message{'s' if removed != 1 else ''}")
             if request.to == USER:
+                dropped = silence.drop(request.sender, request.key)
+                print(f"dropped {dropped} kept push{'es' if dropped != 1 else ''}")
                 code, line = cancel_user_push(request.sender, request.key)
                 print(line)
                 return code

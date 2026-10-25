@@ -1,5 +1,28 @@
 {
   "auto_mode.refused": {
+    "file_change_no_waits": {
+      "objections": [
+        {
+          "quote": "hana: auto mode stopped demo",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "write phases/34h/delegated_phase_reservation_state.json",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Allow rule: the work goes on now, and auto mode lets this command run from then on.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Auto mode refused a file change in the demo session.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:25.542816-04:00"
+    },
     "one_with_rule": {
       "objections": [
         {
@@ -7,25 +30,21 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "Approve: it goes on now, but this command can stop it again.",
+          "quote": "approve the prompt or add an allow rule",
           "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "Refused: git push origin build-followups-messaging",
+          "quote": "The merge of the messaging work waits for it.",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Refused: git push origin build-followups-messaging",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "Refused: git push origin build-followups-messaging\nThe merge of that work waits for it.",
-          "rule": "first-150-stand-alone"
+          "quote": "Session: messaging\nAction: On natedev, in the messaging pane, approve the prompt or add an allow rule\nAuto mode refused a git push in the messaging session, so its work cannot merge until you answer. The command:\ngit push origin build-followups-messaging\n\nApprove (recommended): this push runs now. Auto mode still checks later pushes, so a wrong push can still be stopped.\n\nAllow rule: this push runs now, and every git push from any session runs without a check after this. The rule: Bash(git push:*)",
+          "rule": "push-body-under-500"
         }
       ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): 'i don't know what is the command that failed - this is still too verbose'. Each refused command is named and the prose is cut; the title and the Approve then Allow rule order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
-      "sha256": "fab1360d2a53ef4c3ccde57b8ed617e1e572de49c7f63d634a444dd05820bc88",
-      "time": "2026-10-23T09:30:40.307302-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:14.182975-04:00"
     },
     "typical": {
       "objections": [
@@ -34,21 +53,17 @@
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "The P542 build waits for them.",
+          "quote": "implement.sh --to modules-impl\nreview.sh --to modules-test",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "Allow rule: it never stops on these commands again.",
+          "quote": "Approve: the work goes on now, and auto mode can stop it on these commands again.\n\nAllow rule: the work goes on now, and auto mode lets these commands run from then on.",
           "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "Refused:",
-          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): 'i don't know what is the command that failed - this is still too verbose'. Each refused command is named and the prose is cut; the title and the Approve then Allow rule order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
-      "sha256": "fab1360d2a53ef4c3ccde57b8ed617e1e572de49c7f63d634a444dd05820bc88",
-      "time": "2026-10-23T09:30:22.441144-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:00.398996-04:00"
     }
   },
   "codex.reset_ready": {
@@ -123,95 +138,100 @@
     }
   },
   "permission.rca_fixed": {
-    "two_commands": {
+    "prompt": {
       "objections": [
         {
-          "quote": "Fix: the work order uses the allowed launcher call (a73d0f18).",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "Cause: a work order told the seat to run the launchers directly.",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "cargo-liner-style: fixed why modules stopped",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Cause: a work order told the seat to run the launchers directly.",
-          "rule": "what-happened-why-what-you-do"
-        }
-      ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
-      "sha256": "5ca6396ff857332c7bbec7a5d91c0cd0502044bbb93a776e2a72d9c8dcee84f9",
-      "time": "2026-10-23T09:52:22.171287-04:00"
-    },
-    "typical": {
-      "objections": [
-        {
-          "quote": "Cause: a helper ran a raw cargo build.\nFix: the builds unit added a verify.sh build verb (5e2b9c41).",
+          "quote": "Now: helpers use the build command that is always allowed.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
           "quote": "cargo-liner: fixed why handler stopped",
           "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "the builds unit added a verify.sh build verb (5e2b9c41)",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Fix: the builds unit added a verify.sh build verb (5e2b9c41).",
-          "rule": "before-and-after"
-        },
-        {
-          "quote": "Cause: a helper ran a raw cargo build.",
-          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
-      "sha256": "5ca6396ff857332c7bbec7a5d91c0cd0502044bbb93a776e2a72d9c8dcee84f9",
-      "time": "2026-10-23T09:52:10.889466-04:00"
-    }
-  },
-  "permission.rca_started": {
-    "two_commands": {
-      "objections": [
-        {
-          "quote": "The style unit finds why modules asked for implement.sh --to modules-impl and review.sh --to modules-test and fixes the source. A second push comes when it is fixed.",
-          "rule": "push-only-what-the-user-must-do"
-        },
-        {
-          "quote": "cargo-liner-style: fixing why modules stops",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "implement.sh --to modules-impl and review.sh --to modules-test",
-          "rule": "reader-starts-cold"
-        }
-      ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
-      "sha256": "250fdb0653693ff195ae1411cccd28ccbd81190de97adaa62a7d9da57def932b",
-      "time": "2026-10-23T09:51:57.218924-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
+      "time": "2026-10-23T19:48:49.400678-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "The builds unit finds why handler asked for cargo build -p cargo-handler and fixes the source. A second push comes when it is fixed.",
+          "quote": "Now: a script writes that file, so the session never has to.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "why handler asked for cargo build -p cargo-handler",
+          "quote": "hana: fixed why demo stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "hana",
           "rule": "reader-starts-cold"
         },
         {
-          "quote": "cargo-liner: fixing why handler stops",
+          "quote": "14:23 AST",
+          "rule": "times-carry-zone"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
+      "time": "2026-10-23T19:48:41.507782-04:00"
+    }
+  },
+  "permission.rca_fixed_rewritten": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "Now: a script writes that file.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: fixed why demo stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "hana",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "717774694cd697ec398b79e979644b1c57255df845acbfa2655d3e438a55d07f",
+      "time": "2026-10-23T19:49:18.647629-04:00"
+    }
+  },
+  "permission.rca_started": {
+    "prompt": {
+      "objections": [
+        {
+          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "cargo-liner: finding why handler stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "The handler session",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
+      "time": "2026-10-23T19:47:30.202480-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: finding why demo stopped",
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: the user, 2026-10-23 09:27 AST (via natedev): 'a second message should be sent when the rca starts and another message sent when it is fixed - so i know that this is resolved'. The push asks nothing by the user's request; the remaining objections ask to drop it or add text (recorded, not applied).; reviewer: opus",
-      "sha256": "250fdb0653693ff195ae1411cccd28ccbd81190de97adaa62a7d9da57def932b",
-      "time": "2026-10-23T09:51:43.982536-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
+      "time": "2026-10-23T19:47:21.747732-04:00"
     }
   },
   "quota.claude_next_move": {
@@ -685,51 +705,50 @@
     }
   },
   "silence.auto_off": {
-    "none_kept": {
+    "none_held": {
       "objections": [
         {
-          "quote": "You are back; 0 kept.",
+          "quote": "No pushes were held while you were away.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "natedev auto silence off",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "natedev auto silence off",
+          "quote": "natedev: you are back",
           "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "You are back; 0 kept.",
-          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
-      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
-      "time": "2026-10-20T16:21:05.918014-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:55.849524-04:00"
+    },
+    "one_held": {
+      "objections": [
+        {
+          "quote": "The push held while you were away comes next.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev: you are back",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:50.284447-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "You are back; 3 kept.",
+          "quote": "The 3 pushes held while you were away come next.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "3 kept",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "natedev auto silence off",
+          "quote": "natedev: you are back",
           "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "You are back; 3 kept.",
-          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
-      "sha256": "f370945eb2338ffe16eee40c37e9c6521d3851f5f4b494d25ddeee13959e0f29",
-      "time": "2026-10-20T16:20:58.301946-04:00"
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:43.273058-04:00"
     }
   },
   "silence.auto_on": {
