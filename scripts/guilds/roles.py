@@ -546,7 +546,8 @@ def _validate_binding(binding: Binding, repository: str, role: Role) -> None:
                 raise RoleRefused('output path escapes repository') from error
         from scripts.direct import phase_reservation
         phases = phase_reservation.open_phases(Path(binding.run_directory))
-        phase = next((phase for phase in phases if phase.phase == binding.phase), None)
+        name = phase_reservation.phase_directory_name(binding.phase)
+        phase = next((phase for phase in phases if phase.phase == name), None)
         if phase is None:
             raise RoleRefused('phase reservation ledger is unreadable or phase is not open')
         _ = _read(phase.directory / 'delegated_phase_reservation_state.json')
@@ -1347,7 +1348,8 @@ def check_patch(design_id: str, generation: int, cwd: Path, paths: list[str]) ->
             _ = candidate.relative_to(root)
         except ValueError as error:
             raise RoleRefused('output path escapes repository: ' + path) from error
-    ledger = Path(binding.run_directory) / 'phases' / binding.phase / 'delegated_phase_reservation_state.json'
+    from scripts.direct import phase_reservation
+    ledger = phase_reservation.phase_directory(Path(binding.run_directory), binding.phase) / phase_reservation.STATE_FILE
     _ = _read(ledger)
     return binding
 

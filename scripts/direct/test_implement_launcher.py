@@ -328,7 +328,8 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", home_lib / "py")
-        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py", "board.sh"):
+        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py",
+                     "recorder_state.py", "findings.py", "board.sh"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         launcher = direct_dir / "implement.sh"
         _ = launcher.write_text(
