@@ -66,6 +66,7 @@ PushNotification (built-in) ── PreToolUse gate ── allowed only with that
   - **Account:** `reviewer_environment()` removes the caller's `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY` and `CLAUDE_CONFIG_DIR`, then applies `accounts.prepared_account(accounts.role_account("unit").label)`.
   - **Model:** `agents_resolve_print message_review.reviewer` sets the model, with a 2 s cap on that lookup. When it resolves nothing, the reviewer uses opus at medium effort. `config/agents.conf` has no `message_review` entry today, so the fallback is what runs.
   - **System prompt:** the guide filtered by tag, followed by an instruction. Pushes use `push,all` and `reviewer_prompt.md`. Replies use `reply,all` and an inline prompt. Questions use `question,all` and an inline prompt.
+  - **Zone:** the draft prompt of each review (push, reply and question) starts with `zone_line()`: `User zone: AST (America/Curacao). Today: 2026-10-25.`, from `scripts/lib/user_zone.py`. Each system prompt says times are in that zone. The reviewer never assumes a zone (2026-10-25: a reviewer refused AST times as not EDT).
   - **Flags:** `--json-schema SCHEMA --output-format json --tools "" --no-session-persistence --setting-sources ""`.
   - **Time:** the whole call shares one budget of `review_timeout_seconds()`.
 - The schema returns `verdict` (`send|rewrite|ask|withhold`), `title`, `action` (string or null), `body`, `questions` (at most 3) and `failed_rules` (a list of `{rule, quote}`).
