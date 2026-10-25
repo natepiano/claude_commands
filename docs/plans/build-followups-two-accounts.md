@@ -2410,3 +2410,17 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - One repair round: the pass first used the clock from before the probe, and `stored_reading` refused the renewed reading as future-dated.
 - The probe holds the refusal-watch lock for up to 120 s per expired account.
+
+### Phase 86 — The login renewal finds claude by its full path  · status: done
+
+#### As-built
+
+- `accounts.resolve_program("claude"|"codex")` returns an absolute path: `shutil.which` on the PATH in use, then `~/.local/bin/<tool>` (the install place on natedev and the Mac, from nix `claude-code.nix` and darwin `shell.nix`). It raises `FileNotFoundError("<tool> program not found (looked in PATH and <path>)")`.
+- Claude `exec` (the probe and supervised relaunch included), Codex `exec`, and `lib/relaunch.py` for a bare `claude`/`codex` command all start the resolved path.
+- `renew_login` turns a probe exit 2 with no program found into `LoginRenewalFailed("claude program not found (…)")`.
+
+**Files:**
+- `scripts/accounts/accounts.py`, `scripts/lib/relaunch.py`; tests in `scripts/accounts/test_accounts.py`, `test_cutover_home.py`, `test_role_map.py`, `scripts/lib/test_relaunch.py`; `docs/accounts.md`.
+
+**Gotchas:**
+- A test that mocks `execvpe` for a Claude or Codex start needs a scratch executable on its PATH or in its scratch `~/.local/bin`; the gate caught two that had none.

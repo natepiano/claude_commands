@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The nightly review's open candidates, as one Markdown table in the order /efficiency_next ranks them.
+"""The nightly review's open candidates, as one Markdown table in the order /next efficiency ranks them.
 
 Usage: candidates.py                   print the table
        candidates.py next              print the one candidate /next efficiency shows, and pin it
@@ -13,7 +13,7 @@ The ledger is the one record, and every candidate is a line of its own:
 
 A line is open while it ends `— proposed` or `— deferred`. The gain is measured user-visible time
 (`38 min waiting`, `2.5 h red CI`) or a share of tokens (`3.1% of tokens`); a line with no tag is
-unmeasured. Time ranks before tokens and unmeasured comes last, as /efficiency_next ranks them;
+unmeasured. Time ranks before tokens and unmeasured comes last, as /next efficiency ranks them;
 candidates that rank alike go oldest night first. The table and `next` follow urgency.py under the
 queue name `efficiency`: the candidate `next` showed leads until its outcome is written, and one the
 user moved to the end goes last.

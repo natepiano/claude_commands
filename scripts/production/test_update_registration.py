@@ -821,7 +821,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
             "open: ok — 1 due, 0 deferred, 1 unreadable",
         ])
 
-    def test_open_below_a_root_lists_only_its_own_items(self) -> None:
+    def test_open_below_a_root_lists_its_own_items_and_those_below_it_never_above(self) -> None:
         for slug in ("top", "example", "kid"):
             self.timer(slug)
         self.attach("example", "top")
@@ -830,8 +830,9 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?"})
         self.write_open_for("top", {"since": "2026-10-06T07:00", "text": "ship it?"})
         self.assertEqual(self.open_lines(), [
-            "1. example, since Tue Oct 06 09:00: choose layout",
-            "open: ok — 1 due, 0 deferred",
+            "1. kid, since Tue Oct 06 08:00: merge today?",
+            "2. example, since Tue Oct 06 09:00: choose layout",
+            "open: ok — 2 due, 0 deferred",
         ])
 
     def test_open_with_nothing_attached_lists_its_own_items_or_none(self) -> None:

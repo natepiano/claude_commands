@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left
+from collections.abc import Callable, Mapping
 from functools import lru_cache
 import difflib
 import json
@@ -1138,6 +1139,269 @@ def without_trailing_commas(source_tokens: tuple[Token, ...]) -> tuple[Token, ..
     """The tokens without the commas that `trailing_commas` finds, which rustfmt adds or drops when it joins lines."""
     dropped = trailing_commas(tuple(token.value for token in source_tokens))
     return tuple(token for index, token in enumerate(source_tokens) if index not in dropped)
+
+
+@dataclass(frozen=True)
+class OutsideCrate:
+    """The file is not a module file of the renamed file's crate, so its `crate`, `self` and `super` paths do not resolve."""
+
+
+CrateModule = tuple[str, ...] | OutsideCrate
+
+
+@dataclass(frozen=True)
+class UnresolvedPath:
+    """The path does not start at `crate`, `self` or `super`, or its file is outside the crate, so it names no known module."""
+
+
+@dataclass(frozen=True)
+class UseTrees:
+    """The path before each segment and glob of the file's `use` items, and the `use` keyword of each segment and alias."""
+
+    prefixes: Mapping[int, tuple[str, ...]]
+    keywords: Mapping[int, int]
+
+
+# The anchors that start a path the gate resolves from the file's own module.
+PATH_ANCHORS = frozenset({"crate", "self", "super"})
+# The words after which an item keyword can stand, besides an attribute, a `pub(..)` and an `extern` ABI string.
+ITEM_LEADS = frozenset({"{", "}", ";", "pub", "unsafe", "async", "const", "extern", "default"})
+
+
+def item_starts(words: tuple[str, ...]) -> frozenset[int]:
+    """The word indexes where an item keyword can stand: the first word, and the word after a brace, a semicolon, an
+    attribute, a visibility, an item qualifier or an ABI string."""
+    leads = {index for index, word in enumerate(words) if word in ITEM_LEADS and words[index - 1:index] != ("'",)}
+    leads.update(end - 1 for _, end in attribute_spans(words))
+    leads.update(closing(words, index + 1) for index, word in enumerate(words[:-1])
+                 if word == "pub" and words[index + 1] == "(")
+    leads.update(index for index in range(1, len(words)) if words[index - 1] == "extern" and words[index].startswith('"'))
+    return frozenset({0} | {lead + 1 for lead in leads})
+
+
+def crate_module(path: str, root: PurePosixPath) -> CrateModule:
+    """The module path of a Rust file under the crate root folder: `()` for the crate root file."""
+    file = PurePosixPath(path)
+    if file.suffix != ".rs" or not file.is_relative_to(root):
+        return OutsideCrate()
+    folders = file.relative_to(root).parent.parts
+    if folders[:1] == ("bin",):
+        # Each file in `bin` is the root of a crate of its own.
+        return OutsideCrate()
+    if not folders and file.stem in {"lib", "main"}:
+        return ()
+    return folders if file.stem == "mod" else (*folders, file.stem)
+
+
+def resolved_module(prefix: tuple[str, ...], module: CrateModule) -> tuple[str, ...] | UnresolvedPath:
+    """The module that a path starting at `crate`, `self` or `super` names from module."""
+    if isinstance(module, OutsideCrate) or not prefix or prefix[0] not in PATH_ANCHORS:
+        return UnresolvedPath()
+    rest = prefix[1:]
+    base = () if prefix[0] == "crate" else module
+    if prefix[0] == "super":
+        rest = prefix
+        while rest and rest[0] == "super":
+            if not base:
+                return UnresolvedPath()
+            base, rest = base[:-1], rest[1:]
+    return UnresolvedPath() if PATH_ANCHORS & set(rest) else base + rest
+
+
+def code_item_starts(words: tuple[str, ...]) -> frozenset[int]:
+    """The item starts outside every macro token tree: a macro reads the words in its tree as tokens, not as items."""
+    in_macros = {index for start, end in macro_spans(words, delimiter_ends(words))
+                 for index in range(start + 1, end)}
+    return item_starts(words) - in_macros
+
+
+def use_trees(words: tuple[str, ...], starts: frozenset[int]) -> UseTrees:
+    prefixes: dict[int, tuple[str, ...]] = {}
+    keywords: dict[int, int] = {}
+    for keyword, word in enumerate(words):
+        if word != "use" or keyword not in starts:
+            continue
+        groups: list[tuple[str, ...]] = [()]
+        path: list[str] = []
+        cursor = keyword + 1
+        while cursor < len(words) and words[cursor] != ";":
+            part = words[cursor]
+            if part == "{":
+                groups.append(groups[-1] + tuple(path))
+                path = []
+            elif part in {"}", ","}:
+                if part == "}" and len(groups) > 1:
+                    _ = groups.pop()
+                path = []
+            elif part == "as":
+                cursor += 1
+                keywords[cursor] = keyword
+            elif part != "::":
+                prefixes[cursor] = groups[-1] + tuple(path)
+                keywords[cursor] = keyword
+                path.append(part)
+            cursor += 1
+    return UseTrees(prefixes, keywords)
+
+
+def sorted_use_groups(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The words of a use tree with the entries of each brace group in sorted order, no word dropped."""
+    result: list[str] = []
+    cursor = 0
+    while cursor < len(words):
+        if words[cursor] != "{":
+            result.append(words[cursor])
+            cursor += 1
+            continue
+        end = closing(words, cursor)
+        entries: list[tuple[str, ...]] = []
+        start = inner = cursor + 1
+        while inner < end:
+            if words[inner] == "{":
+                inner = closing(words, inner)
+            elif words[inner] == ",":
+                entries.append(sorted_use_groups(words[start:inner]))
+                start = inner + 1
+            inner += 1
+        entries.append(sorted_use_groups(words[start:end]))
+        result.append("{")
+        for position, entry in enumerate(sorted(entries)):
+            result.extend((",", *entry) if position else entry)
+        result.append("}")
+        cursor = end + 1
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class ModuleItem:
+    """A `use` item or `mod <name>;` item: its first word (attributes and visibility included), its keyword and its `;`."""
+
+    start: int
+    keyword: int
+    end: int
+
+
+def module_items(words: tuple[str, ...]) -> tuple[ModuleItem, ...]:
+    """Each `use` item and `mod <name>;` item, in order.
+
+    An item with a `macro_use` attribute is left out: its place decides where its macros can be used.
+    """
+    starts = code_item_starts(words)
+    attributes = {end: start for start, end in attribute_spans(words)}
+    visibilities = {closing(words, index + 1) + 1: index for index, word in enumerate(words[:-1])
+                    if word == "pub" and words[index + 1] == "("}
+    items: list[ModuleItem] = []
+    for keyword, word in enumerate(words):
+        if keyword not in starts:
+            continue
+        if word == "use":
+            end = next((index for index in range(keyword, len(words)) if words[index] == ";"), len(words))
+        elif word == "mod" and words[keyword + 2:keyword + 3] == (";",):
+            end = keyword + 2
+        else:
+            continue
+        start = visibilities.get(keyword, keyword - 1 if words[keyword - 1:keyword] == ("pub",) else keyword)
+        while start in attributes:
+            start = attributes[start]
+        if end < len(words) and "macro_use" not in words[start:keyword]:
+            items.append(ModuleItem(start, keyword, end))
+    return tuple(items)
+
+
+def module_runs(words: tuple[str, ...]) -> tuple[tuple[ModuleItem, ...], ...]:
+    """The runs of adjacent module items, in order."""
+    runs: list[list[ModuleItem]] = []
+    for item in module_items(words):
+        if runs and runs[-1][-1].end + 1 == item.start:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return tuple(tuple(run) for run in runs)
+
+
+def comment_gaps(text: str, spans: tuple[TokenSpan, ...],
+                 renamed: Callable[[str], str]) -> tuple[tuple[str, ...], ...]:
+    """The stripped lines of the comments before each code token, then after the last one, each passed through renamed."""
+    ends = (0, *(span.end for span in spans))
+    starts = (*(span.start for span in spans), len(text))
+    return tuple(tuple(renamed(line.strip()) for line in text[end:start].splitlines() if line.strip())
+                 for end, start in zip(ends, starts, strict=True))
+
+
+def outer_doc(line: str) -> bool:
+    """Whether the stripped comment line starts an outer doc comment, an attribute of the item after it."""
+    return ((line.startswith("///") and not line.startswith("////"))
+            or (line.startswith("/**") and not line.startswith(("/***", "/**/"))))
+
+
+# A comment line, keyed by the count of the words of its piece before it.
+CommentLine = tuple[int, str]
+# The code words of one place in the code, and the comment lines before them and inside them.
+CodePiece = tuple[tuple[str, ...], tuple[CommentLine, ...]]
+
+
+def run_items(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...], run: tuple[ModuleItem, ...],
+              dropped: frozenset[int]) -> tuple[tuple[str, ...], tuple[CodePiece, ...]]:
+    """The comment lines before a run of module items that stay in place, and each item of the run with its comments.
+
+    An item has its words without the dropped commas, the entries of a `use` tree sorted, and the lines of the gap
+    before its first word and of the gaps inside it, each keyed by the count of the item's words before it. Only the
+    use tree sorts: an attribute, the visibility and a `mod` item keep their words. The gap before the run stays in
+    place up to its first outer doc comment, as rustfmt leaves it there.
+    """
+    first = gaps[run[0].start]
+    doc = next((index for index, line in enumerate(first) if outer_doc(line)), len(first))
+
+    def kept(start: int, end: int) -> tuple[str, ...]:
+        return tuple(words[index] for index in range(start, end) if index not in dropped)
+
+    items: list[CodePiece] = []
+    for item in run:
+        tree = kept(item.keyword + 1, item.end)
+        code = (*kept(item.start, item.keyword + 1), *(sorted_use_groups(tree) if words[item.keyword] == "use" else tree),
+                words[item.end])
+        lines: list[CommentLine] = []
+        key = 0
+        for gap in range(item.start, item.end + 1):
+            lines.extend((key, line) for line in (first[doc:] if gap == run[0].start else gaps[gap]))
+            key += gap not in dropped
+        items.append((code, tuple(lines)))
+    return first[:doc], tuple(items)
+
+
+def canonical_code(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...]) -> tuple[CodePiece, ...]:
+    """The code in canonical order: each word with the comment lines before it, and each item of a run of adjacent
+    module items with its comment lines, the run's items sorted.
+
+    A trailing comma drops, and its comment lines go to the next piece; no other word drops. Use tree entries and the
+    items of a run sort, and a comment moves with its item. None of these changes the code, and rustfmt makes them when
+    a rename changes a name's sort order or line length. A comment line keeps its place among the words of its piece, so
+    a comment that moves to another place in the code changes the pieces.
+    """
+    dropped = trailing_commas(words)
+    pieces: list[CodePiece] = []
+    lines: list[str] = []
+
+    def place(index: int) -> None:
+        """Add word index, or after the last word the comment lines left, as the next piece."""
+        lines.extend(gaps[index])
+        if (index not in dropped and index < len(words)) or (index == len(words) and lines):
+            pieces.append((words[index:index + 1], tuple((0, line) for line in lines)))
+            lines.clear()
+
+    cursor = 0
+    for run in module_runs(words):
+        for index in range(cursor, run[0].start):
+            place(index)
+        before, items = run_items(words, gaps, run, dropped)
+        if lines or before:
+            pieces.append(((), tuple((0, line) for line in (*lines, *before))))
+            lines.clear()
+        pieces.extend(sorted(items))
+        cursor = run[-1].end + 1
+    for index in range(cursor, len(gaps)):
+        place(index)
+    return tuple(pieces)
 
 
 def cfg_attribute(words: tuple[str, ...]) -> bool:
