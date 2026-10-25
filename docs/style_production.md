@@ -407,8 +407,21 @@ Apply a fix without asking only when all mechanical criteria hold:
    meaning, and no serialized, reflected or configured name changes (serde and
    reflect names, config keys, documented usage).
 
+A pure move inside one crate is mechanical, also where criteria 1 and 3 bar it.
+A pure move takes one item (a const, static, fn, struct, enum, type alias or
+impl) to its owning module or to a named shared owner (`constants.rs`, the
+type's module). Its uses are re-pointed, and a re-export keeps every old path.
+No behavior changes, and no new type, trait or abstraction appears.
+`style_footprint.py check` proves it: its `prove_item_moves` proof finds that
+only paths and `use` lines changed. The move is still held when the finding
+names no destination, when the move makes an import cycle or crosses crates,
+or when the footprint check refuses it. The user never approves a pure move.
+
 An uncertain result goes to review. Every tier D finding and every
-`mode: propose` rule is held. Remove non-mechanical findings and all dependent
+`mode: propose` rule is held, except a pure move that a tier D rule asks for
+and the footprint check proves: apply it. A `mode: propose` rule stays held.
+The tier D rules that give move findings are `module-structure`,
+`types-live-with-their-behavior` and `split-by-type-ownership`. Remove non-mechanical findings and all dependent
 edits from the applied diff; merge the remainder after its gate passes.
 Record each held finding with `style_ledger.py held add` and its cell with
 `record --verdict held`.

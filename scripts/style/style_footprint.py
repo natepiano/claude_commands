@@ -2310,6 +2310,11 @@ NO_NAMES: frozenset[str] = frozenset()
 # The attributes a moved item can carry: none of them reads the item's module path or decides whether it exists.
 INERT_ATTRIBUTES = frozenset({"doc", "allow", "warn", "deny", "expect", "forbid", "must_use", "inline", "cold", "repr",
                               "non_exhaustive", "default"})
+# The attributes any other item of the files of a move can hold: the inert ones, a `cfg`, which only removes the item,
+# and `test`.
+ITEM_ATTRIBUTES = INERT_ATTRIBUTES | {"cfg", "test"}
+# The inner attributes the files of a move can hold: lint levels and doc, which change no name and no lookup.
+INNER_ATTRIBUTES = frozenset({"doc", "allow", "warn", "deny", "expect", "forbid"})
 # The standard derives, which expand the same in every module.
 STANDARD_DERIVES = frozenset({"Debug", "Clone", "Copy", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash", "Default"})
 # The paths a standard derive can be written behind: bare, or straight from the root of `std` or `core`.
@@ -2535,6 +2540,41 @@ def crate_manifest(sources: RevisionTree, crate: str) -> dict[str, object]:
     return data
 
 
+def dependency_names(manifest: dict[str, object]) -> frozenset[str]:
+    """The names the crate's code uses for its dependencies: the keys of each dependency table, also under `target`."""
+    tables: list[object] = [manifest]
+    target = manifest.get("target")
+    if isinstance(target, dict):
+        tables.extend(cast(dict[str, object], target).values())
+    names: set[str] = set()
+    for table in tables:
+        if not isinstance(table, dict):
+            continue
+        for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
+            dependencies = cast(dict[str, object], table).get(kind)
+            if isinstance(dependencies, dict):
+                names.update(key.replace("-", "_") for key in cast(dict[str, object], dependencies))
+    return frozenset(names)
+
+
+def bound_standard_names(sources: RevisionTree, crate: str, names: frozenset[str], befores: Mapping[str, MoveText],
+                         afters: Mapping[str, MoveText]) -> frozenset[str]:
+    """The names that a file of the crate, before or after the change, holds anywhere but before `::`: there a use
+    leaf, a `use ... as`, an item or a `mod` can bind one of them."""
+    pattern = re.compile(rf"\b(?:{'|'.join(sorted(names))})\b(?!\s*::)")
+    found: set[str] = set()
+    for path in crate_files(sources, crate, ()).keys() | afters.keys():
+        if path in afters:
+            sides = (befores[path].words, afters[path].words)
+        elif pattern.search(sources.text(path)):
+            sides = (tuple(token.value.removeprefix("r#") for token in tokens(sources.text(path))),)
+        else:
+            continue
+        found.update(word for words in sides for index, word in enumerate(words)
+                     if word in names and words[index + 1:index + 2] != ("::",))
+    return frozenset(found)
+
+
 def library_name(manifest: dict[str, object]) -> str | None:
     """The name other crates of the package use for the library: `[lib] name`, else the package name."""
     tables = cast(dict[str, dict[str, object]], manifest)
@@ -2715,7 +2755,8 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
     if len(crates) != 1:
         raise MoveRefused("the change crosses crates")
     crate = crates.pop()
-    library = library_name(crate_manifest(sources, crate))
+    manifest = crate_manifest(sources, crate)
+    library = library_name(manifest)
     for change in changes:
         if change.status not in {FileStatus.MODIFIED, FileStatus.ADDED} or not change.path.endswith(".rs"):
             raise MoveRefused(f"{change.path}: not a modified or added Rust file")
@@ -2764,6 +2805,20 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
     if isinstance(module_a, OutsideCrate) or isinstance(module_b, OutsideCrate):
         raise MoveRefused("an item moves to or from a file outside the crate's module tree")
     before_a, after_a, before_b, after_b = befores[path_a], afters[path_a], befores[path_b], afters[path_b]
+    # A path from std, core or alloc, such as `std::Clone` in a derive, names the standard library only while no
+    # dependency and no file of the crate gives the name to another crate or module.
+    sides = (before_a, after_a, before_b, after_b)
+    named = STANDARD_CRATES & {word for text in sides for word in text.words}
+    rebound = named and (named & dependency_names(manifest)
+                         | bound_standard_names(sources, crate, named, befores, afters))
+    if rebound:
+        raise MoveRefused(f"{path_a} or {path_b} names {min(rebound)}, and the crate gives the name to another "
+                          + "crate or module")
+    # A use can give the name of a standard derive or an allowed attribute to a macro of another crate.
+    for text in sides:
+        for name, paths in text.scope.imports.items():
+            if name in STANDARD_DERIVES | ITEM_ATTRIBUTES and any(path[0] not in STANDARD_CRATES for path in paths):
+                raise MoveRefused(f"{text.path} imports {name}, the name of a standard derive or attribute")
 
     # Each moved item keeps its words and its comments.
     moved: list[tuple[SourceItem, SourceItem, FileSpan, FileSpan]] = []
@@ -2795,6 +2850,14 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
     source_cut = frozenset(index for _, _, span, _ in moved for index in word_range(before_a, span))
     destination_cut = frozenset(index for _, _, _, span in moved for index in word_range(after_b, span))
     moved_names = frozenset[str]().union(*(scope_names(before_a, item.start, item.end) for item, _, _, _ in moved))
+    # A macro or an attribute macro outside a fn body can define a name that a moved item looks up, and expand it
+    # differently in A and in B, and an inner attribute such as `no_implicit_prelude` changes how names resolve. The
+    # checks above and below read the moved items.
+    for text, cut in ((before_a, source_cut), (after_a, frozenset[int]()), (before_b, frozenset[int]()),
+                      (after_b, destination_cut)):
+        expansion = item_level_expansion(text.words, cut)
+        if expansion is not None:
+            raise MoveRefused(f"{text.path} has {expansion}")
 
     # A new module file holds only moved items and uses, and its one added `mod` line is no more visible than they are.
     module_lines: list[FileSpan] = []
@@ -2862,6 +2925,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
 
     # B's added uses import only what the moved items name, and nothing from A.
     added_uses: list[FileSpan] = []
+    own_leaves: set[str] = set()  # The names that the moved items' own use lines in A and in B import.
     before_b_names = bare_names(before_b.words, frozenset())
     destination_use_cut: set[int] = set()
     for item in use_changes(before_b, after_b):
@@ -2878,6 +2942,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                 raise MoveRefused(f"{path_b} gains a use of {leaf}, and no moved item names it")
             if leaf in before_b_names:
                 raise MoveRefused(f"{path_b} already names {leaf}, and its added use can shadow it")
+            own_leaves.add(leaf)
         added_uses.append(word_span(after_b, item.start, item.end))
         destination_use_cut.update(range(item.start, item.end))
 
@@ -2892,6 +2957,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
         leaves = {path[-2] if path[-1] == "self" else path[-1] for path in paths}
         if before_a.words[item.start] != "use" or not leaves <= moved_names or leaves & kept_names:
             continue  # The canonical comparison refuses a use that leaves for another reason.
+        own_leaves.update(leaves)
         removed_uses.append(word_span(before_a, item.start, item.end))
         removed_use_cut.update(range(item.start, item.end))
 
@@ -2935,8 +3001,8 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                 and (IDENTIFIER.fullmatch(words[index - 1]) or words[index - 1] == ">"))
                or (IDENTIFIER.fullmatch(words[index]) and words[index - 1] == "." and words[index + 1] in {"(", "::"})
                for index in range(1, len(words) - 1)):
-            in_scope = {name for text in (before_a, after_b) for name in text.scope.traits} | {
-                name for text in (before_a, after_b) for name in text.scope.imports if name[:1].isupper()}
+            in_scope = {name for text in (before_a, after_b) for name in (*text.scope.traits, *text.scope.imports)
+                        } - own_leaves
             for name in sorted(in_scope):
                 if mapped(bound_path(name, before_a.scope)) != mapped(bound_path(name, after_b.scope)):
                     raise MoveRefused(f"{name} is in scope in only one of {path_a} and {path_b}: a method call or an "
@@ -3055,6 +3121,37 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
     return proof
 
 
+def item_level_expansion(words: tuple[str, ...], cut: frozenset[int]) -> str | None:
+    """What first outside cut and outside a fn body can expand to code or change how names resolve, or None: a macro
+    call, a `macro_rules!` definition, an attribute outside ITEM_ATTRIBUTES or an inner one outside INNER_ATTRIBUTES."""
+    ends = delimiter_ends(words)
+    attributes = dict(attribute_spans(words))
+    index = 0
+    while index < len(words) - 2:
+        word = words[index]
+        if index in cut:
+            index += 1
+            continue
+        if index in attributes:
+            inner = words[index + 1] == "!"
+            name = macro_attribute(words[index:attributes[index]], INNER_ATTRIBUTES if inner else ITEM_ATTRIBUTES)
+            if name is not None:
+                return f"an {'inner ' if inner else ''}attribute outside a fn body: {name}"
+            index = attributes[index]
+            continue
+        if word == "fn" and IDENTIFIER.fullmatch(words[index + 1]):
+            end = item_end(words, ends, index + 1, body=True)
+            if end is not None and words[end - 1] == "}":
+                index = end
+                continue
+        if (word == "macro_rules" and words[index + 1] == "!") or (
+                IDENTIFIER.fullmatch(word) and word not in RUST_KEYWORDS and words[index + 1] == "!"
+                and words[index + 2] in {"(", "[", "{"}):
+            return f"a macro outside a fn body: {word}"
+        index += 1
+    return None
+
+
 def untouched_copy(sources: RevisionTree, crate: str, touched: Mapping[str, MoveText],
                    key: tuple[str, str, tuple[str, ...]]) -> bool:
     """Whether a file of the crate the change does not touch has an item with the key."""
@@ -3082,14 +3179,40 @@ def crate_files(sources: RevisionTree, crate: str, changes: tuple[FileChange, ..
 def refuse_crate_words(sources: RevisionTree, crate: str, changes: tuple[FileChange, ...],
                        afters: Mapping[str, MoveText]) -> None:
     """Raise MoveRefused for a file of the crate after the change with a `path` attribute, which moves a module away
-    from the file the proof reads for it, or with a caller location, which reads the file and line of moved code
-    through any chain of `track_caller` functions."""
+    from the file the proof reads for it, with a caller location, which reads the file and line of moved code
+    through any chain of `track_caller` functions, or with a `macro_use` that can bring a macro named like a standard
+    derive or an allowed attribute, or with an `extern crate` that takes another name, such as `std`. Rust reads
+    `r#track_caller` as `track_caller`, so the scan reads each word without its `r#`."""
     for path in crate_files(sources, crate, changes):
-        words = afters[path].words if path in afters else tuple(token.value for token in tokens(sources.text(path)))
-        if any(word.removeprefix("r#") == "path" for begin, end in attribute_spans(words) for word in words[begin:end]):
+        words = tuple(word.removeprefix("r#") for word in (
+            afters[path].words if path in afters else tuple(token.value for token in tokens(sources.text(path)))))
+        attributes = attribute_spans(words)
+        if any(word == "path" for begin, end in attributes for word in words[begin:end]):
             raise MoveRefused(f"{path}: a `path` attribute")
         if {"Location", "track_caller"} & set(words):
             raise MoveRefused(f"{path} reads a caller location")
+        for index in range(len(words) - 3):
+            if words[index:index + 2] == ("extern", "crate") and words[index + 3] == "as":
+                raise MoveRefused(f"{path}: an `extern crate` that takes another name")
+        for begin, end in attributes:
+            if attribute_name(words, begin) != "macro_use" or words[begin + 1] == "!":
+                continue
+            # A list names the macros it brings. Without one, only an extern crate can bring a derive.
+            listed = words[begin + 3:begin + 4] == ("(",)
+            if (listed and (STANDARD_DERIVES | ITEM_ATTRIBUTES) & set(words[begin:end])) or (
+                    not listed and extern_crate_follows(words, end, dict(attributes))):
+                raise MoveRefused(f"{path}: a `macro_use` can bring a macro named like a standard derive or attribute")
+
+
+def extern_crate_follows(words: tuple[str, ...], cursor: int, attributes: dict[int, int]) -> bool:
+    """Whether the item at cursor, after its other attributes and its visibility, is an `extern crate`."""
+    while cursor in attributes:
+        cursor = attributes[cursor]
+    if words[cursor:cursor + 1] == ("pub",):
+        cursor += 1
+        if words[cursor:cursor + 1] == ("(",):
+            cursor = words.index(")", cursor) + 1
+    return words[cursor:cursor + 2] == ("extern", "crate")
 
 
 def attribute_name(words: tuple[str, ...], begin: int) -> str:
@@ -3105,15 +3228,15 @@ def attribute_comment(text: str, spans: tuple[TokenSpan, ...], begin: int, end: 
     return any(text[spans[index].end:spans[index + 1].start].strip() for index in range(begin, end - 1))
 
 
-def macro_attribute(words: tuple[str, ...]) -> str | None:
+def macro_attribute(words: tuple[str, ...], allowed: frozenset[str] = INERT_ATTRIBUTES) -> str | None:
     """The path in the attribute words that a macro or a cfg can read, or None for an attribute that reads nothing:
-    a doc, a lint level, a code generation hint, or a derive of standard traits only."""
+    one allowed name (by default a doc, a lint level or a code generation hint), or a derive of standard traits only."""
     start = end = 3 if words[1] == "!" else 2
     while end < len(words) - 1 and (words[end] == "::" or IDENTIFIER.fullmatch(words[end])):
         end += 1
     path = words[start:end]
     if path != ("derive",):
-        return None if len(path) == 1 and path[0] in INERT_ATTRIBUTES else "".join(path)
+        return None if len(path) == 1 and path[0] in allowed else "".join(path)
     if words[end:end + 1] != ("(",) or words[-2] != ")":
         return "derive"
     for derive in " ".join(words[end + 1:-2]).split(","):
@@ -3149,6 +3272,12 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
             words = tuple(span.token.value for span in spans)
             if size and configured(words, 0, len(words), inner=True):
                 return f"{path}: a cfg attribute on the path to {module_path(module)}"
+            # An inner attribute such as `no_implicit_prelude` reaches the child modules. The crate root's reach A
+            # and B alike.
+            for begin, end in attribute_spans(words) if size else ():
+                name = macro_attribute(words[begin:end], INNER_ATTRIBUTES) if words[begin + 1] == "!" else None
+                if name is not None:
+                    return f"{path}: the inner attribute {name} on the path to {module_path(module)}"
             if size == len(module):
                 continue
             items = source_items(words)
@@ -3235,13 +3364,33 @@ def path_sites(text: MoveText, name: str,
 
 
 def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
+    return judge_changes(finding.changes, before, prove_item_moves(finding.changes, before))
+
+
+def moved_files(changes: tuple[FileChange, ...], before: RevisionTree) -> frozenset[str]:
+    """The files of the change that a proven item move explains, when `judge` finds the change mechanical: each file
+    with a span of the move. A file with no span is not the move's, and any edit that judge refuses keeps them all out.
+    """
+    moves = prove_item_moves(changes, before)
+    if isinstance(moves, NoItemMoves) or isinstance(judge_changes(changes, before, moves), Review):
+        return frozenset()
+    return frozenset(change.path for change in changes
+                     if moves.spans(change.path, False) or moves.spans(change.path, True))
+
+
+def judge_changes(changes: tuple[FileChange, ...], before: RevisionTree,
+                  moves: ItemMoves | NoItemMoves) -> Mechanical | Review:
     reasons: list[str] = []
-    semantic_changes = {change.path: erase_proven_parameters(change) for change in finding.changes}
+    # A proven item move is mechanical at any size: the checks judge only what is left once its spans are taken out.
+    if isinstance(moves, ItemMoves):
+        changes = tuple(change for change in (unmoved_change(change, moves) for change in changes)
+                        if change.before != change.after)
+    semantic_changes = {change.path: erase_proven_parameters(change) for change in changes}
     proofs = normalizations(tuple(semantic_changes.values()), before)
-    if len(finding.changes) > 10 or len({before.crate(change.path) for change in finding.changes}) > 1:
-        if any(tokens(change.before) != tokens(change.after) for change in finding.changes):
+    if len(changes) > 10 or len({before.crate(change.path) for change in changes}) > 1:
+        if any(tokens(change.before) != tokens(change.after) for change in changes):
             reasons.append("check 4: rename exceeds one crate or 10 files")
-    for change in finding.changes:
+    for change in changes:
         if sum(len(hunk.removed) + len(hunk.added) for hunk in change.hunks) >= FILE_CHANGED_LINE_LIMIT:
             reasons.append(f"check 5: {change.path}: {FILE_CHANGED_LINE_LIMIT} or more changed lines (size only)")
         proof = proofs[change.path]
@@ -3277,6 +3426,15 @@ def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
         if not change.hunks:
             reasons.append("check 6: binary or metadata-only change requires review")
     return Review(tuple(dict.fromkeys(reasons))) if reasons else Mechanical()
+
+
+def unmoved_change(change: FileChange, moves: ItemMoves) -> FileChange:
+    """The change with the spans the moves explain taken out of both sides: a modified change from what is left before
+    to what is left after. A new file that holds only moved items and their uses is left with no code."""
+    old = edited_text(change.before, moves.spans(change.path, False))
+    new = edited_text(change.after, moves.spans(change.path, True))
+    patch = "\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(), lineterm="", n=0))
+    return FileChange(FileStatus.MODIFIED, change.old_path, change.path, old, new, parse_hunks(patch))
 
 
 def worktree_commit(repo: Path) -> str:
