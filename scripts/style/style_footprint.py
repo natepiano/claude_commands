@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_left
+from collections import Counter
 from collections.abc import Callable, Mapping
 from functools import lru_cache
 import difflib
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -2203,6 +2205,1033 @@ def changed_text_without_lint_attributes(change: FileChange, proof: LintAttribut
                          for index in range(count))
         offset += len(hunk.added) - hunk.old_count
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class FileSpan:
+    """A character span of one side of a changed file, and the text that replaces it: empty text removes the span."""
+
+    path: str
+    after: bool
+    start: int
+    end: int
+    text: str = ""
+
+
+@dataclass(frozen=True)
+class ItemMove:
+    """One item that moves unchanged from file A to file B.
+
+    The source is its span in A's before text and the destination its span in B's after text, each with the comment
+    lines right above it and a comment that ends its last line. The source use is A's added `use` of the item in B: a
+    re-export or an import for A's own uses. An impl has no name.
+    """
+
+    kind: str
+    name: str
+    source: FileSpan
+    destination: FileSpan
+    source_use: FileSpan | None
+
+
+@dataclass(frozen=True)
+class ItemMoves:
+    """The proven moves, and every other span the moves explain: A's removed uses, B's added uses, the added `mod`
+    line and each re-pointed path, which is respelled to the path of B in both texts."""
+
+    moves: tuple[ItemMove, ...]
+    removed_uses: tuple[FileSpan, ...]
+    added_uses: tuple[FileSpan, ...]
+    module_lines: tuple[FileSpan, ...]
+    sites: tuple[FileSpan, ...]
+
+    def spans(self, path: str, after: bool) -> tuple[FileSpan, ...]:
+        """The spans of one side of one file, in order."""
+        every = (*(span for move in self.moves for span in (move.source, move.destination, move.source_use) if span),
+                 *self.removed_uses, *self.added_uses, *self.module_lines, *self.sites)
+        return tuple(sorted((span for span in every if span.path == path and span.after == after),
+                            key=lambda span: span.start))
+
+
+@dataclass(frozen=True)
+class NoItemMoves:
+    reason: str
+
+
+class MoveRefused(Exception):
+    """The change is not a proven item move; the message says why."""
+
+
+@dataclass(frozen=True)
+class SourceItem:
+    """A module-level item: its first word (attributes included), its keyword and the word after its end."""
+
+    kind: str
+    name: str
+    title: str
+    visibility: str
+    start: int
+    keyword: int
+    end: int
+
+
+@dataclass(frozen=True)
+class MoveScope:
+    """The names a file's module binds at module level: its items, its child modules and its `use` items."""
+
+    module: CrateModule
+    library: str | None
+    definitions: frozenset[str]
+    types: frozenset[str]
+    traits: frozenset[str]
+    modules: frozenset[str]
+    imports: Mapping[str, tuple[tuple[str, ...], ...]]
+    blocks: frozenset[str]
+
+
+@dataclass(frozen=True)
+class MoveText:
+    path: str
+    after: bool
+    text: str
+    words: tuple[str, ...]
+    spans: tuple[TokenSpan, ...]
+    items: tuple[SourceItem, ...]
+    scope: MoveScope
+
+
+# The item kinds that can move.
+MOVABLE_KINDS = frozenset({"const", "static", "fn", "struct", "enum", "type", "impl"})
+# The kinds whose name a path can name as a type, not as a module.
+TYPE_KINDS = frozenset({"struct", "enum", "union", "trait", "type"})
+VISIBILITY_RANKS = {"": 0, "pub(crate)": 1, "pub": 2}
+VISIBILITY_SPELLINGS: dict[tuple[str, ...], str] = {(): "", ("pub",): "pub", ("pub", "(", "crate", ")"): "pub(crate)"}
+NO_NAMES: frozenset[str] = frozenset()
+# The attributes a moved item can carry: none of them reads the item's module path or decides whether it exists.
+INERT_ATTRIBUTES = frozenset({"doc", "allow", "warn", "deny", "expect", "forbid", "must_use", "inline", "cold", "repr",
+                              "non_exhaustive", "default"})
+# The standard derives, which expand the same in every module.
+STANDARD_DERIVES = frozenset({"Debug", "Clone", "Copy", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash", "Default"})
+# The paths a standard derive can be written behind: bare, or straight from the root of `std` or `core`.
+STANDARD_DERIVE_PREFIXES = frozenset({(), ("std", "::"), ("core", "::"), ("::", "std", "::"), ("::", "core", "::")})
+# The crates every glob of the standard library starts at.
+STANDARD_CRATES = frozenset({"std", "core", "alloc"})
+
+
+def visibility_of(words: tuple[str, ...]) -> str:
+    """The visibility that words spell: private, `pub(crate)`, `pub` or other."""
+    return VISIBILITY_SPELLINGS.get(words, "other")
+
+
+def item_end(words: tuple[str, ...], ends: dict[int, int], cursor: int, body: bool) -> int | None:
+    """The word after an item that ends at its first `;`, or, with body, at its first brace group, outside groups."""
+    while cursor < len(words) and words[cursor] != ";" and not (body and words[cursor] == "{"):
+        if words[cursor] in {"(", "[", "{"}:
+            if cursor not in ends:
+                return None
+            cursor = ends[cursor]
+        cursor += 1
+    if cursor == len(words):
+        return None
+    return cursor + 1 if words[cursor] == ";" else ends[cursor] + 1 if cursor in ends else None
+
+
+def source_items(words: tuple[str, ...]) -> tuple[SourceItem, ...] | None:
+    """Each module-level item of a file, or None when a word does not start a known item."""
+    ends = delimiter_ends(words)
+    openings = {end: start for start, end in ends.items()}
+    attributes = dict(attribute_spans(words))
+    items: list[SourceItem] = []
+    cursor = 0
+    while cursor < len(words):
+        if cursor in attributes and words[cursor + 1] == "!":
+            cursor = attributes[cursor]  # An inner attribute belongs to the module, not to an item.
+            continue
+        start = cursor
+        while cursor in attributes:
+            cursor = attributes[cursor]
+        visibility = ""
+        if words[cursor:cursor + 1] == ("pub",):
+            close = ends.get(cursor + 1, cursor) if words[cursor + 1:cursor + 2] == ("(",) else cursor
+            visibility = visibility_of(words[cursor:close + 1])
+            cursor = close + 1
+        while cursor + 1 < len(words):
+            word, following = words[cursor], words[cursor + 1]
+            if word in {"unsafe", "async", "auto", "default"} or (
+                    word == "const" and following in {"fn", "unsafe", "async", "extern"}):
+                cursor += 1
+            elif word == "extern" and following.startswith('"') and words[cursor + 2:cursor + 3] != ("{",):
+                cursor += 2
+            else:
+                break
+        if cursor >= len(words):
+            return None
+        keyword, word = cursor, words[cursor]
+        following = words[keyword + 1] if keyword + 1 < len(words) else ""
+        name, kind = following, word
+        if word in {"use", "type", "const", "static"} or (word == "extern" and following == "crate"):
+            end = item_end(words, ends, keyword, body=False)
+            if word == "use":
+                name = ""
+            elif word == "static" and following == "mut":
+                name = words[keyword + 2]
+            elif word == "extern":
+                kind, name = "extern crate", words[keyword + 2]
+        elif word in {"fn", "struct", "enum", "union", "trait", "impl"} or (word == "extern" and following != "crate"):
+            end = item_end(words, ends, keyword + 1, body=True)
+            if word in {"impl", "extern"}:
+                name = ""
+        elif word == "mod":
+            end = keyword + 3 if words[keyword + 2:keyword + 3] == (";",) else item_end(words, ends, keyword, body=True)
+        elif word == "macro_rules" and following == "!":
+            name, end = words[keyword + 2], item_end(words, ends, keyword + 3, body=True)
+        elif IDENTIFIER.fullmatch(word):
+            bang = keyword
+            while words[bang + 1:bang + 3] and words[bang + 1] == "::" and IDENTIFIER.fullmatch(words[bang + 2]):
+                bang += 2
+            if words[bang + 1:bang + 2] != ("!",) or bang + 2 not in ends:
+                return None
+            kind, name = "macro", word
+            end = ends[bang + 2] + 1
+            if words[bang + 2] != "{":
+                end = end + 1 if words[end:end + 1] == (";",) else None
+        else:
+            return None
+        if end is None or not IDENTIFIER.fullmatch(name or "_"):
+            return None
+        title = " ".join(words[keyword:openings.get(end - 1, end)]) if kind == "impl" else f"{kind} {name}"
+        items.append(SourceItem(kind, name, title, visibility, start, keyword, end))
+        cursor = end
+    return tuple(items)
+
+
+def move_scope(words: tuple[str, ...], items: tuple[SourceItem, ...], module: CrateModule,
+               library: str | None) -> MoveScope:
+    """The module-level names of a file; raises MoveRefused for a `use` item it cannot read."""
+    imports: dict[str, list[tuple[str, ...]]] = {}
+    item_uses = {item.start for item in items if item.kind == "use"}
+    for item in items:
+        if item.kind != "use":
+            continue
+        paths = use_paths(words[item.keyword + 1:item.end - 1])
+        if not paths:
+            raise MoveRefused(f"cannot read the use item `{' '.join(words[item.start:item.end])}`")
+        for path in paths:
+            if path[-1] == "self":
+                path = path[:-1]
+            imports.setdefault(path[-1], []).append(path)
+    # A block can declare a `use` that shadows a module-level name for a path inside it.
+    blocks = frozenset(path[-1] for use in use_items(words) if use.start not in item_uses for path in use.paths)
+    named = [item for item in items if item.name and item.kind not in {"use", "mod", "macro"}]
+    return MoveScope(
+        module, library,
+        frozenset(item.name for item in named),
+        frozenset(item.name for item in named if item.kind in TYPE_KINDS),
+        frozenset(item.name for item in named if item.kind == "trait"),
+        frozenset(item.name for item in items if item.kind == "mod"),
+        {name: tuple(paths) for name, paths in imports.items()},
+        blocks,
+    )
+
+
+def scoped_path(prefix: tuple[str, ...], scope: MoveScope, inline: tuple[str, ...] = (),
+                seen: frozenset[str] = NO_NAMES) -> tuple[str, ...] | UnresolvedPath:
+    """What a path names from the scope: `("crate", *module)`, `("extern", *path)`, or `("item", *path)` for a path
+    that starts at a type. Inline names the inline modules the path is written in."""
+    if not prefix:
+        return UnresolvedPath()
+    head = prefix[0]
+    if head in PATH_ANCHORS:
+        module = scope.module if isinstance(scope.module, OutsideCrate) else (*scope.module, *inline)
+        resolved = resolved_module(prefix, module)
+        return resolved if isinstance(resolved, UnresolvedPath) else ("crate", *resolved)
+    if inline or head in scope.blocks:
+        return UnresolvedPath()
+    # A path's head is in the type namespace: a module or a type declared here wins over an import of a value of
+    # the same name, as two names in one namespace do not compile.
+    if head in scope.modules:
+        return UnresolvedPath() if isinstance(scope.module, OutsideCrate) else ("crate", *scope.module, *prefix)
+    if head in scope.types or head == "Self":
+        return ("item", *prefix)
+    targets = scope.imports.get(head, ())
+    if targets:
+        if len(targets) != 1 or head in seen:
+            return UnresolvedPath()
+        target = scoped_path(targets[0], scope, seen=seen | {head})
+        return target if isinstance(target, UnresolvedPath) else (*target, *prefix[1:])
+    if head in scope.definitions:
+        return UnresolvedPath()
+    if isinstance(scope.module, OutsideCrate) and head == scope.library:
+        return ("crate", *prefix[1:])
+    return ("extern", *prefix)
+
+
+def bound_path(name: str, scope: MoveScope) -> tuple[str, ...] | UnresolvedPath:
+    """What a bare name binds to at module level: an item, an import, or `("free", name)` for a name the module does
+    not bind (a prelude name or a local name)."""
+    defined = name in scope.definitions or name in scope.modules
+    targets = scope.imports.get(name, ())
+    if (defined and targets) or len(targets) > 1:
+        return UnresolvedPath()
+    if defined:
+        return UnresolvedPath() if isinstance(scope.module, OutsideCrate) else ("crate", *scope.module, name)
+    if targets:
+        return scoped_path(targets[0], scope, seen=frozenset({name}))
+    return ("free", name)
+
+
+def scope_names(text: MoveText, start: int, end: int) -> frozenset[str]:
+    """The names words start..end look up in the module scope: each identifier that is not a keyword and does not
+    follow `::`, `.` or `'`, and each name a format literal captures."""
+    names: set[str] = set()
+    for index in range(start, end):
+        token = text.spans[index].token
+        if token.kind == "literal" and "{" in token.value:
+            names.update(match[2] for match in re.finditer(r"(\{+)([A-Za-z_][A-Za-z0-9_]*)", token.value)
+                         if len(match[1]) % 2)
+        elif (token.kind == "identifier" and token.value not in RUST_KEYWORDS
+              and text.words[index - 1:index] not in {("::",), (".",), ("'",)}):
+            names.add(token.value)
+    return frozenset(names)
+
+
+def bare_names(words: tuple[str, ...], cut: frozenset[int]) -> frozenset[str]:
+    """The words outside cut that do not follow `::` or `.`."""
+    return frozenset(word for index, word in enumerate(words)
+                     if index not in cut and words[index - 1:index] not in {("::",), (".",)})
+
+
+def file_module(path: str, crate: str, sources: RevisionTree) -> CrateModule:
+    """The module of a file of the crate; `src/main.rs` is the root of its own crate when `src/lib.rs` exists."""
+    root = PurePosixPath(crate) / "src"
+    if path == str(root / "main.rs") and str(root / "lib.rs") in sources.paths:
+        return OutsideCrate()
+    return crate_module(path, root)
+
+
+def crate_manifest(sources: RevisionTree, crate: str) -> dict[str, object]:
+    """The crate's Cargo.toml. Raises MoveRefused when it is missing or unreadable, when it sets a target `path`, and
+    when `src/main.rs` declares a module beside `src/lib.rs`: each moves a file of the crate into a module tree the
+    proof does not read."""
+    root = PurePosixPath(crate)
+    manifest = str(root / "Cargo.toml")
+    if manifest not in sources.paths:
+        raise MoveRefused(f"{manifest} is missing")
+    try:
+        data = cast(dict[str, object], tomllib.loads(sources.text(manifest)))
+    except tomllib.TOMLDecodeError:
+        raise MoveRefused(f"cannot read {manifest}") from None
+    targets = [data.get("lib")]
+    for kind in ("bin", "example", "test", "bench"):
+        entries = data.get(kind)
+        if isinstance(entries, list):
+            targets.extend(cast(list[object], entries))
+    if any(isinstance(target, dict) and "path" in target for target in targets):
+        raise MoveRefused(f"{manifest} sets a target path")
+    main = str(root / "src" / "main.rs")
+    if (str(root / "src" / "lib.rs") in sources.paths and main in sources.paths
+            and any(token.value == "mod" for token in tokens(sources.text(main)))):
+        raise MoveRefused(f"{main} declares a module beside src/lib.rs")
+    return data
+
+
+def library_name(manifest: dict[str, object]) -> str | None:
+    """The name other crates of the package use for the library: `[lib] name`, else the package name."""
+    tables = cast(dict[str, dict[str, object]], manifest)
+    name = tables.get("lib", {}).get("name", tables.get("package", {}).get("name"))
+    return name.replace("-", "_") if isinstance(name, str) else None
+
+
+def move_text(path: str, after: bool, text: str, module: CrateModule, library: str | None,
+              touched: bool = True) -> MoveText:
+    """The words, items and scope of one side of a file. A touched file refuses a glob use, a use with an attribute,
+    which can switch the use off, and a raw identifier, which names what its plain spelling names."""
+    if any(token.kind == "unknown" for token in tokens(text)):
+        raise MoveRefused(f"{path}: an unknown token")
+    spans = token_spans(text)
+    words = tuple(span.token.value for span in spans)
+    items = source_items(words)
+    if items is None:
+        raise MoveRefused(f"{path}: cannot read its items")
+    if touched:
+        uses = use_items(words)
+        if any("*" in words[use.start:use.end] for use in uses):
+            raise MoveRefused(f"{path}: a glob use")
+        if any(use.attributed for use in uses):
+            raise MoveRefused(f"{path}: a use with an attribute")
+        if any(span.token.kind == "identifier" and span.token.value.startswith("r#") for span in spans):
+            raise MoveRefused(f"{path}: a raw identifier")
+        if any(attribute_comment(text, spans, begin, end) for begin, end in attribute_spans(words)):
+            raise MoveRefused(f"{path}: a comment in an attribute")
+    return MoveText(path, after, text, words, spans, items, move_scope(words, items, module, library))
+
+
+def word_span(text: MoveText, start: int, end: int, replacement: str = "") -> FileSpan:
+    """The characters of words start..end."""
+    return FileSpan(text.path, text.after, text.spans[start].start, text.spans[end - 1].end, replacement)
+
+
+def item_region(text: MoveText, item: SourceItem) -> FileSpan:
+    """An item's span with the whole comment lines right above it, up to a blank line or a module doc line, and a
+    `//` comment that ends its last line."""
+    source = text.text
+    start = text.spans[item.start].start
+    end = text.spans[item.end - 1].end
+    floor = text.spans[item.start - 1].end if item.start else 0
+    begin = source.rfind("\n", 0, start) + 1
+    if begin >= floor and not source[begin:start].strip():
+        start = begin
+        while start > floor:
+            previous = source.rfind("\n", 0, start - 1) + 1
+            line = source[previous:start].strip()
+            if previous < floor or not line or line.startswith(("//!", "/*!")):
+                break
+            start = previous
+    line_end = source.find("\n", end)
+    line_end = len(source) if line_end < 0 else line_end
+    if source[end:line_end].strip().startswith("//"):
+        end = line_end
+    return FileSpan(text.path, text.after, start, end)
+
+
+def region_shape(text: str) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """The words of a span and the comment lines around them."""
+    spans = token_spans(text)
+    return tuple(span.token.value for span in spans), comment_gaps(text, spans, lambda line: line)
+
+
+def item_key(text: MoveText, item: SourceItem) -> tuple[str, str, tuple[str, ...]]:
+    return item.kind, item.title, text.words[item.start:item.end]
+
+
+def word_range(text: MoveText, span: FileSpan) -> range:
+    """The word indexes inside a character span."""
+    starts = [token.start for token in text.spans]
+    return range(bisect_left(starts, span.start), bisect_left(starts, span.end))
+
+
+def private_members(text: MoveText, items: tuple[SourceItem, ...]) -> dict[str, str]:
+    """The private fields of each struct and union and the private members of each inherent impl, by name, with the
+    title of their item. A tuple field is named by its index."""
+    words = text.words
+    ends = delimiter_ends(words)
+    openings = {end: start for start, end in ends.items()}
+    result: dict[str, str] = {}
+
+    def entries(open_index: int) -> list[int]:
+        """The first word of each comma-separated entry of a group, outside nested groups and angle brackets."""
+        firsts = [open_index + 1]
+        cursor, angles = open_index + 1, 0
+        while cursor < ends[open_index]:
+            word = words[cursor]
+            if word in {"(", "[", "{"} and cursor in ends:
+                cursor = ends[cursor]
+            angles += (word == "<") - (word == ">")
+            if word == "," and not angles:
+                firsts.append(cursor + 1)
+            cursor += 1
+        return [first for first in firsts if first < ends[open_index]]
+
+    def member_visibility(first: int) -> tuple[str, int]:
+        while words[first] == "#" and first + 1 in ends:
+            first = ends[first + 1] + 1
+        if words[first] != "pub":
+            return "", first
+        close = ends.get(first + 1, first) if words[first + 1] == "(" else first
+        return visibility_of(words[first:close + 1]), close + 1
+
+    for item in items:
+        last = item.end - 1
+        if item.kind in {"struct", "union"} and words[last] == "}" and last in openings:
+            for first in entries(openings[last]):
+                visibility, name = member_visibility(first)
+                if visibility not in {"pub", "pub(crate)"} and words[name + 1:name + 2] == (":",):
+                    result[words[name]] = item.title
+        elif item.kind == "struct" and words[last] == ";":
+            group = next((index for index in range(item.keyword, last) if words[index] == "(" and index in ends), None)
+            for position, first in enumerate(entries(group) if group is not None else ()):
+                if member_visibility(first)[0] not in {"pub", "pub(crate)"}:
+                    result[str(position)] = item.title
+        elif item.kind == "impl" and words[last] == "}" and last in openings:
+            header = words[item.keyword:openings[last]]
+            if any(word == "for" and header[index + 1:index + 2] != ("<",) for index, word in enumerate(header)):
+                continue  # A trait impl's members are as visible as the trait.
+            cursor = openings[last] + 1
+            while cursor < last:
+                word = words[cursor]
+                if word in {"fn", "const", "type"} and words[cursor + 1] not in {"fn", "unsafe", "async", "extern"}:
+                    lead = cursor - 1
+                    while words[lead] in {"const", "unsafe", "async", "default", "extern"} or words[lead].startswith('"'):
+                        lead -= 1
+                    visibility = "pub" if words[lead] == "pub" else (
+                        visibility_of(words[openings[lead] - 1:lead + 1]) if words[lead] == ")" and lead in openings
+                        else "")
+                    if visibility not in {"pub", "pub(crate)"}:
+                        result[words[cursor + 1]] = item.title
+                if word in {"(", "[", "{"} and cursor in ends:
+                    cursor = ends[cursor]
+                cursor += 1
+    return result
+
+
+def edited_text(text: str, spans: tuple[FileSpan, ...]) -> str:
+    """The text with each span replaced; raises MoveRefused when two spans overlap."""
+    pieces: list[str] = []
+    cursor = 0
+    for span in spans:
+        if span.start < cursor:
+            raise MoveRefused("two edits of the move overlap")
+        pieces.extend((text[cursor:span.start], span.text))
+        cursor = span.end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def canonical_text(text: str) -> tuple[CodePiece, ...]:
+    spans = token_spans(text)
+    if any(token.kind == "unknown" for token in tokens(text)) or len(spans) != len(tokens(text)):
+        raise MoveRefused("an edited text has an unknown token")
+    return canonical_code(tuple(span.token.value for span in spans), comment_gaps(text, spans, lambda line: line))
+
+
+def module_path(module: tuple[str, ...]) -> str:
+    return "::".join(("crate", *module))
+
+
+def prove_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves | NoItemMoves:
+    """Prove that the change only moves items from one module file to another of the same crate.
+
+    Each moved item keeps its words and comments, and every other edit re-points a path from the old module to the
+    new one or adds or removes a `use` line the move needs. The proof refuses whenever it is not sure.
+    """
+    try:
+        return proven_item_moves(changes, sources)
+    except MoveRefused as refusal:
+        return NoItemMoves(str(refusal))
+
+
+def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves:
+    crates = {sources.crate(path) for change in changes for path in (change.old_path, change.path)}
+    if len(crates) != 1:
+        raise MoveRefused("the change crosses crates")
+    crate = crates.pop()
+    library = library_name(crate_manifest(sources, crate))
+    for change in changes:
+        if change.status not in {FileStatus.MODIFIED, FileStatus.ADDED} or not change.path.endswith(".rs"):
+            raise MoveRefused(f"{change.path}: not a modified or added Rust file")
+    modules = {change.path: file_module(change.path, crate, sources) for change in changes}
+    befores = {change.path: move_text(change.path, False, change.before, modules[change.path], library)
+               for change in changes}
+    afters = {change.path: move_text(change.path, True, change.after, modules[change.path], library)
+              for change in changes}
+
+    # Pair each item that leaves one file with its one copy in another.
+    def keys(text: MoveText) -> Counter[tuple[str, str, tuple[str, ...]]]:
+        return Counter(item_key(text, item) for item in text.items if item.kind != "use" and not (
+            item.kind == "mod" and text.words[item.end - 1] == ";"))
+
+    removed = {path: keys(befores[path]) - keys(afters[path]) for path in befores}
+    added = {path: keys(afters[path]) - keys(befores[path]) for path in afters}
+    pairs: list[tuple[str, str, tuple[str, str, tuple[str, ...]]]] = []
+    for source, keyed in removed.items():
+        for key, count in keyed.items():
+            copies = [path for path in added if path != source and added[path][key]]
+            if count > 1 or len(copies) > 1 or any(added[path][key] > 1 for path in copies):
+                raise MoveRefused(f"two copies of {key[1]}")
+            if copies:
+                pairs.append((source, copies[0], key))
+                added[copies[0]][key] -= 1
+                keyed[key] = 0
+    if len({(source, destination) for source, destination, _ in pairs}) > 1:
+        raise MoveRefused("items move between more than one pair of files")
+    titles = {path: {(kind, title) for kind, title, _ in +keyed} for path, keyed in removed.items()}
+    for path, keyed in added.items():
+        for key in +keyed:
+            if any(other != path and key[:2] in titles[other] for other in titles):
+                raise MoveRefused(f"{key[1]} changes during the move")
+            if any(key in keys(text) for text in befores.values()) or untouched_copy(sources, crate, befores, key):
+                raise MoveRefused(f"two copies of {key[1]}")
+            if pairs and path == pairs[0][1]:
+                raise MoveRefused(f"{path} gains another item: {key[1]}")
+    for path, keyed in removed.items():
+        for key in +keyed:
+            if key[:2] not in {(kind, title) for kind, title, _ in +added[path]}:
+                raise MoveRefused(f"{path} loses {key[1]}")
+    if not pairs:
+        raise MoveRefused("no item moves")
+    path_a, path_b = pairs[0][0], pairs[0][1]
+    module_a, module_b = modules[path_a], modules[path_b]
+    if isinstance(module_a, OutsideCrate) or isinstance(module_b, OutsideCrate):
+        raise MoveRefused("an item moves to or from a file outside the crate's module tree")
+    before_a, after_a, before_b, after_b = befores[path_a], afters[path_a], befores[path_b], afters[path_b]
+
+    # Each moved item keeps its words and its comments.
+    moved: list[tuple[SourceItem, SourceItem, FileSpan, FileSpan]] = []
+    for _, _, key in pairs:
+        source_item = next(item for item in before_a.items if item_key(before_a, item) == key)
+        destination_item = next(item for item in after_b.items if item_key(after_b, item) == key)
+        if source_item.kind not in MOVABLE_KINDS:
+            raise MoveRefused(f"a {source_item.kind} moves: {source_item.title}")
+        if source_item.visibility == "other":
+            raise MoveRefused(f"{source_item.title} has a visibility the proof cannot read")
+        source, destination = item_region(before_a, source_item), item_region(after_b, destination_item)
+        if region_shape(change_text(before_a, source)) != region_shape(change_text(after_b, destination)):
+            raise MoveRefused(f"the doc comment of {source_item.title} is left behind or changed")
+        moved.append((source_item, destination_item, source, destination))
+    # A derive or an attribute macro can read the module path, as bevy's `Reflect` does for a type path, and a cfg
+    # decides whether code exists, so a moved item carries only attributes that read nothing.
+    for item, _, _, _ in moved:
+        for begin, end in attribute_spans(before_a.words[item.start:item.end]):
+            name = macro_attribute(before_a.words[item.start + begin:item.start + end])
+            if name is not None:
+                raise MoveRefused(f"{item.title} has an attribute a macro can read: {name}")
+    for module, texts in ((module_a, befores), (module_b, afters)):
+        problem = module_chain(module, sources, crate, texts)
+        if problem is not None:
+            raise MoveRefused(problem)
+    names = [item.name for item, _, _, _ in moved if item.kind != "impl"]
+    if len(names) != len(set(names)):
+        raise MoveRefused("two moved items have one name")
+    source_cut = frozenset(index for _, _, span, _ in moved for index in word_range(before_a, span))
+    destination_cut = frozenset(index for _, _, _, span in moved for index in word_range(after_b, span))
+    moved_names = frozenset[str]().union(*(scope_names(before_a, item.start, item.end) for item, _, _, _ in moved))
+
+    # A new module file holds only moved items and uses, and its one added `mod` line is no more visible than they are.
+    module_lines: list[FileSpan] = []
+    change_b = next(change for change in changes if change.path == path_b)
+    if change_b.status == FileStatus.ADDED:
+        if not module_b:
+            raise MoveRefused(f"{path_b} is a new crate root")
+        parents = [path for path, module in modules.items() if module == module_b[:-1]
+                   and next(change for change in changes if change.path == path).status == FileStatus.MODIFIED]
+        if len(parents) != 1:
+            raise MoveRefused(f"no one changed parent file declares {path_b}")
+        parent_before, parent_after = befores[parents[0]], afters[parents[0]]
+        declared = Counter(parent_before.words[item.start:item.end] for item in parent_before.items if item.kind == "mod")
+        lines = [item for item in parent_after.items if item.kind == "mod" and item.name == module_b[-1]
+                 and parent_after.words[item.end - 1] == ";"
+                 and not declared[parent_after.words[item.start:item.end]]]
+        if len(lines) != 1 or parent_after.words[lines[0].start] == "#":
+            raise MoveRefused(f"{parents[0]} does not gain exactly one plain `mod {module_b[-1]};` line")
+        rank = min((VISIBILITY_RANKS.get(item.visibility, 0) if item.kind != "impl" else 0) for item, _, _, _ in moved)
+        if VISIBILITY_RANKS.get(lines[0].visibility, 3) > rank:
+            raise MoveRefused(f"`mod {module_b[-1]};` is more visible than the items it holds")
+        module_lines.append(word_span(parent_after, lines[0].start, lines[0].end))
+
+    # B has no other binding of a moved name.
+    for name in names:
+        if name in bare_names(before_b.words, frozenset()):
+            raise MoveRefused(f"name collision: {path_b} already has {name}")
+
+    def use_counts(text: MoveText) -> Counter[tuple[str, ...]]:
+        return Counter(text.words[item.start:item.end] for item in text.items if item.kind == "use")
+
+    def use_changes(old: MoveText, new: MoveText) -> list[SourceItem]:
+        """The `use` items of new whose words old does not have."""
+        extra = use_counts(new) - use_counts(old)
+        result: list[SourceItem] = []
+        for item in new.items:
+            words = new.words[item.start:item.end]
+            if item.kind == "use" and extra[words]:
+                extra[words] -= 1
+                result.append(item)
+        return result
+
+    # A's added use of a moved item: a re-export as visible as the item, or a plain import for A's own uses.
+    source_uses: dict[str, SourceItem] = {}
+    for item in use_changes(before_a, after_a):
+        paths = use_paths(after_a.words[item.keyword + 1:item.end - 1])
+        if len(paths) != 1 or paths[0][-1] not in names or scoped_path(paths[0][:-1], after_a.scope) != (
+                "crate", *module_b):
+            continue
+        if paths[0][-1] in source_uses:
+            raise MoveRefused(f"{path_a} gains more than one plain use of {paths[0][-1]}")
+        source_uses[paths[0][-1]] = item
+    reexported: set[str] = set()
+    for item, _, _, _ in moved:
+        use = source_uses.get(item.name)
+        if use is None:
+            continue
+        visibility = visibility_of(after_a.words[use.start:use.keyword])
+        if visibility and visibility != item.visibility:
+            raise MoveRefused(f"the re-export of {item.name} in {path_a} is `{visibility}`, and the item is "
+                              + f"`{item.visibility or 'private'}`")
+        if visibility:
+            reexported.add(item.name)
+    source_use_cut = frozenset(index for use in source_uses.values() for index in range(use.start, use.end))
+
+    # B's added uses import only what the moved items name, and nothing from A.
+    added_uses: list[FileSpan] = []
+    before_b_names = bare_names(before_b.words, frozenset())
+    destination_use_cut: set[int] = set()
+    for item in use_changes(before_b, after_b):
+        if after_b.words[item.start] != "use":
+            raise MoveRefused(f"{path_b} gains a use that is not a plain `use`")
+        for path in use_paths(after_b.words[item.keyword + 1:item.end - 1]):
+            target = scoped_path(path, after_b.scope)
+            if isinstance(target, UnresolvedPath):
+                raise MoveRefused(f"{path_b}: cannot resolve the added use of {'::'.join(path)}")
+            if target[:len(module_a) + 1] == ("crate", *module_a):
+                raise MoveRefused(f"{path_b} imports {'::'.join(path)} from {path_a}: an import cycle")
+            leaf = path[-2] if path[-1] == "self" else path[-1]
+            if leaf not in moved_names:
+                raise MoveRefused(f"{path_b} gains a use of {leaf}, and no moved item names it")
+            if leaf in before_b_names:
+                raise MoveRefused(f"{path_b} already names {leaf}, and its added use can shadow it")
+        added_uses.append(word_span(after_b, item.start, item.end))
+        destination_use_cut.update(range(item.start, item.end))
+
+    # A's removed uses served only the moved items.
+    removed_uses: list[FileSpan] = []
+    removed_use_cut: set[int] = set()
+    kept_cut = source_cut | frozenset(index for item in before_a.items if item.kind == "use"
+                                      for index in range(item.start, item.end))
+    kept_names = bare_names(before_a.words, kept_cut)
+    for item in use_changes(after_a, before_a):
+        paths = use_paths(before_a.words[item.keyword + 1:item.end - 1])
+        leaves = {path[-2] if path[-1] == "self" else path[-1] for path in paths}
+        if before_a.words[item.start] != "use" or not leaves <= moved_names or leaves & kept_names:
+            continue  # The canonical comparison refuses a use that leaves for another reason.
+        removed_uses.append(word_span(before_a, item.start, item.end))
+        removed_use_cut.update(range(item.start, item.end))
+
+    # Every name a moved item looks up binds the same in A before and in B after.
+    def mapped(target: tuple[str, ...] | UnresolvedPath) -> tuple[str, ...] | UnresolvedPath:
+        if isinstance(target, UnresolvedPath):
+            return target
+        for name in names:
+            if target in {("crate", *module_a, name), ("crate", *module_b, name)}:
+                return ("moved", name)
+        return target
+
+    for name in sorted(moved_names):
+        old, new = mapped(bound_path(name, before_a.scope)), mapped(bound_path(name, after_b.scope))
+        if isinstance(old, UnresolvedPath) or isinstance(new, UnresolvedPath) or old != new:
+            raise MoveRefused(f"{name} does not bind the same in {path_a} and in {path_b}")
+    refuse_crate_words(sources, crate, changes, afters)
+    untouched_globs(sources, crate, afters, {module_a, module_b})
+    # A type name reads the module path of a type the move takes to B. Outside the touched files it stays diagnostic
+    # text, as the file and line in the text of a `panic` or an `unwrap` do.
+    for text in (*befores.values(), *afters.values()):
+        if {"type_name", "type_name_of_val"} & set(text.words):
+            raise MoveRefused(f"{text.path} reads a type name")
+    for item, _, _, _ in moved:
+        words = before_a.words[item.start:item.end]
+        for index, word in enumerate(words):
+            if word in {"self", "super"} and words[index + 1:index + 2] == ("::",):
+                raise MoveRefused(f"{item.title} has a `{word}::` path")
+            if word == "crate" and words[index + 1:index + 2] == ("::",) and tuple(
+                    words[index + 2:index + 2 * len(module_a) + 1:2]) == module_a:
+                raise MoveRefused(f"{item.title} names {path_a} by its path: an import cycle")
+            if word == "use":
+                raise MoveRefused(f"{item.title} has a use inside")
+            if IDENTIFIER.fullmatch(word) and words[index + 1:index + 2] == ("!",) and words[index + 2:index + 3] in {
+                    ("(",), ("[",), ("{",)}:
+                # A macro reads its tokens and its context, such as `module_path!()`, which names the module.
+                raise MoveRefused(f"{item.title} invokes the macro {word}")
+        # A method call or an associated path, `u8::WIDTH`, can find its item through a trait in scope. Only an
+        # anchor surely names a module, so a `::` after any other name or after `>` counts as a type's.
+        if any((words[index] == "::" and words[index - 1] not in PATH_ANCHORS
+                and (IDENTIFIER.fullmatch(words[index - 1]) or words[index - 1] == ">"))
+               or (IDENTIFIER.fullmatch(words[index]) and words[index - 1] == "." and words[index + 1] in {"(", "::"})
+               for index in range(1, len(words) - 1)):
+            in_scope = {name for text in (before_a, after_b) for name in text.scope.traits} | {
+                name for text in (before_a, after_b) for name in text.scope.imports if name[:1].isupper()}
+            for name in sorted(in_scope):
+                if mapped(bound_path(name, before_a.scope)) != mapped(bound_path(name, after_b.scope)):
+                    raise MoveRefused(f"{name} is in scope in only one of {path_a} and {path_b}: a method call or an "
+                                      + f"associated path in {item.title} can change")
+
+    # A still binds each name its other code uses.
+    a_names = bare_names(after_a.words, source_use_cut)
+    for item, _, _, _ in moved:
+        if item.kind == "impl":
+            continue
+        if item.name in a_names and item.name not in source_uses:
+            raise MoveRefused(f"{path_a} still names {item.name}, and no use brings it")
+        if item.visibility == "" and item.name in source_uses:
+            raise MoveRefused(f"the private item {item.name} is still used outside {path_b}")
+        if item.visibility == "pub" and item.name not in reexported and sources.externally_reachable(path_a):
+            raise MoveRefused(f"the public item {item.name} leaves {path_a} without a re-export, and other crates "
+                              + f"can reach {path_a}")
+
+    # Private members change who can see them.
+    files = crate_files(sources, crate, changes)
+    owned = private_members(before_a, tuple(item for item, _, _, _ in moved))
+    for path, module in files.items():
+        if isinstance(module, OutsideCrate) or (module[:len(module_a)] == module_a) == (
+                module[:len(module_b)] == module_b):
+            continue
+        words = afters[path].words if path in afters else tuple(token.value for token in tokens(sources.text(path)))
+        cut = destination_cut if path == path_b else frozenset[int]()
+        for index in range(1, len(words)):
+            if words[index] in owned and words[index - 1] in {".", "::"} and index not in cut:
+                raise MoveRefused(f"the private member {words[index]} of {owned[words[index]]} changes who can see it")
+    lineage_a = {module_a[:size] for size in range(len(module_a) + 1)}
+    lineage_b = {module_b[:size] for size in range(len(module_b) + 1)}
+    members = {before_a.words[index] for index in source_cut if before_a.words[index - 1] in {".", "::"}}
+    for path, module in files.items():
+        if isinstance(module, OutsideCrate) or module not in lineage_a ^ lineage_b:
+            continue
+        text = befores[path] if path in befores else move_text(path, False, sources.text(path), module, library,
+                                                               touched=False)
+        kept = tuple(item for item in text.items if path != path_a or item.start not in source_cut)
+        for member, title in private_members(text, kept).items():
+            if member in members:
+                raise MoveRefused(f"the private member {member} of {title} changes who can see it")
+
+    # Every path to a moved item names A before and B after, or A through its re-export.
+    sites: list[FileSpan] = []
+    heads: set[str] = set()
+    cuts = {(path_a, False): source_cut | removed_use_cut, (path_a, True): source_use_cut,
+            (path_b, True): destination_cut | frozenset(destination_use_cut)}
+    for line in module_lines:
+        parent = afters[line.path]
+        cuts[(line.path, True)] = cuts.get((line.path, True), frozenset()) | frozenset(word_range(parent, line))
+    for item, _, _, _ in moved:
+        if item.kind == "impl":
+            continue
+        for path, module in files.items():
+            if path in befores:
+                sides = (befores[path], afters[path])
+            elif re.search(rf"\b{re.escape(item.name)}\b", sources.text(path)):
+                sides = (move_text(path, False, sources.text(path), module, library, touched=False),)
+            else:
+                continue
+            for text in sides:
+                blocked: tuple[tuple[int, int], ...] | None = None
+                for first, index, target in path_sites(text, item.name, cuts.get((path, text.after), frozenset())):
+                    if target not in {("crate", *module_a), ("crate", *module_b)}:
+                        continue
+                    if item.visibility == "":
+                        raise MoveRefused(f"the private item {item.name} is still used outside {path_b}")
+                    if text.after or path not in befores:
+                        if target == ("crate", *module_a) and item.name not in reexported:
+                            raise MoveRefused(f"{item.name} leaves {path_a} without a re-export, and {path} still "
+                                              + f"uses its old path")
+                    elif target != ("crate", *module_a):
+                        raise MoveRefused(f"{path}: a path to {item.name} names {path_b} before the move")
+                    if path not in befores:
+                        continue
+                    if blocked is None:
+                        blocked = (*attribute_spans(text.words), *macro_spans(text.words, delimiter_ends(text.words)))
+                    if any(start <= index < end for start, end in blocked):
+                        raise MoveRefused(f"{path}: a path to {item.name} is inside a macro or an attribute")
+                    if isinstance(module, OutsideCrate) and library is None:
+                        raise MoveRefused(f"{path}: cannot read the library name")
+                    spelled = module_path(module_b) if not isinstance(module, OutsideCrate) else "::".join(
+                        (library or "", *module_b))
+                    sites.append(word_span(text, first, index - 1, spelled))
+                    heads.add(text.words[first])
+    # A re-pointed path's head names the same module only while no touched file holds the name in a place that can
+    # bind it, such as a block item, a generic parameter or `extern crate self as`. The name can stand before `::`,
+    # in a use, in a `mod <name>;` line, or after `fn`, which binds in the value namespace only.
+    for head in sorted(heads - PATH_ANCHORS):
+        for text in (*befores.values(), *afters.values()):
+            words = text.words
+            in_use = {index for use in use_items(words) for index in range(use.start, use.end)}
+            for index, word in enumerate(words):
+                if word == head and index not in in_use and words[index + 1:index + 2] != ("::",) and words[
+                        index - 1:index] != ("fn",) and (words[index - 1:index], words[index + 1:index + 2]) != (
+                        ("mod",), (";",)):
+                    raise MoveRefused(f"{text.path}: {head} is declared or bound outside a path")
+
+    proof = ItemMoves(
+        tuple(ItemMove(item.kind, item.name, source, destination,
+                       word_span(after_a, source_uses[item.name].start, source_uses[item.name].end)
+                       if item.name in source_uses else None)
+              for item, _, source, destination in moved),
+        tuple(removed_uses), tuple(added_uses), tuple(module_lines), tuple(sites))
+
+    # No other edit: each file is the same once the moves are taken out.
+    for change in changes:
+        old = edited_text(change.before, proof.spans(change.path, False))
+        new = edited_text(change.after, proof.spans(change.path, True))
+        if change.status == FileStatus.ADDED:
+            if tokens(new) or re.search(r"^\s*(?://!|/\*!)", new, re.MULTILINE):
+                raise MoveRefused(f"{change.path}: a new file holds more than the moved items and their uses")
+        elif canonical_text(old) != canonical_text(new):
+            raise MoveRefused(f"{change.path}: an edit is not a moved item, a re-pointed path or a use line")
+    return proof
+
+
+def untouched_copy(sources: RevisionTree, crate: str, touched: Mapping[str, MoveText],
+                   key: tuple[str, str, tuple[str, ...]]) -> bool:
+    """Whether a file of the crate the change does not touch has an item with the key."""
+    for path in crate_files(sources, crate, ()):
+        source = sources.text(path)
+        if path in touched or key[1].split()[-1] not in source:
+            continue
+        words = tuple(token.value for token in tokens(source))
+        if any((item.kind, item.title, words[item.start:item.end]) == key for item in source_items(words) or ()):
+            return True
+    return False
+
+
+def change_text(text: MoveText, span: FileSpan) -> str:
+    return text.text[span.start:span.end]
+
+
+def crate_files(sources: RevisionTree, crate: str, changes: tuple[FileChange, ...]) -> dict[str, CrateModule]:
+    """Each Rust file of the crate after the change, with its module."""
+    paths = {path for path in sources.paths if path.endswith(".rs") and sources.crate(path) == crate}
+    paths.update(change.path for change in changes)
+    return {path: file_module(path, crate, sources) for path in sorted(paths)}
+
+
+def refuse_crate_words(sources: RevisionTree, crate: str, changes: tuple[FileChange, ...],
+                       afters: Mapping[str, MoveText]) -> None:
+    """Raise MoveRefused for a file of the crate after the change with a `path` attribute, which moves a module away
+    from the file the proof reads for it, or with a caller location, which reads the file and line of moved code
+    through any chain of `track_caller` functions."""
+    for path in crate_files(sources, crate, changes):
+        words = afters[path].words if path in afters else tuple(token.value for token in tokens(sources.text(path)))
+        if any(word.removeprefix("r#") == "path" for begin, end in attribute_spans(words) for word in words[begin:end]):
+            raise MoveRefused(f"{path}: a `path` attribute")
+        if {"Location", "track_caller"} & set(words):
+            raise MoveRefused(f"{path} reads a caller location")
+
+
+def attribute_name(words: tuple[str, ...], begin: int) -> str:
+    """The first path word of the attribute that starts at begin, without an `r#` prefix: Rust reads `#[r#cfg]` as
+    `#[cfg]`."""
+    name = words[begin + 3] if words[begin + 1] == "!" else words[begin + 2]
+    return name.removeprefix("r#")
+
+
+def attribute_comment(text: str, spans: tuple[TokenSpan, ...], begin: int, end: int) -> bool:
+    """Whether a comment sits between the tokens begin..end of an attribute, where a reader of the raw text can take
+    it for code or miss the code after it."""
+    return any(text[spans[index].end:spans[index + 1].start].strip() for index in range(begin, end - 1))
+
+
+def macro_attribute(words: tuple[str, ...]) -> str | None:
+    """The path in the attribute words that a macro or a cfg can read, or None for an attribute that reads nothing:
+    a doc, a lint level, a code generation hint, or a derive of standard traits only."""
+    start = end = 3 if words[1] == "!" else 2
+    while end < len(words) - 1 and (words[end] == "::" or IDENTIFIER.fullmatch(words[end])):
+        end += 1
+    path = words[start:end]
+    if path != ("derive",):
+        return None if len(path) == 1 and path[0] in INERT_ATTRIBUTES else "".join(path)
+    if words[end:end + 1] != ("(",) or words[-2] != ")":
+        return "derive"
+    for derive in " ".join(words[end + 1:-2]).split(","):
+        entry = tuple(derive.split())
+        if entry and (entry[-1] not in STANDARD_DERIVES or entry[:-1] not in STANDARD_DERIVE_PREFIXES):
+            return "".join(entry)
+    return None
+
+
+def configured(words: tuple[str, ...], start: int, end: int, inner: bool) -> bool:
+    """Whether words start..end hold a `cfg` or `cfg_attr` attribute: an inner one with inner, else an outer one."""
+    return any(start <= begin < end and (words[begin + 1] == "!") == inner
+               and attribute_name(words, begin) in {"cfg", "cfg_attr"} for begin, _ in attribute_spans(words))
+
+
+def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
+                 texts: Mapping[str, MoveText]) -> str | None:
+    """Why the crate does not compile the module's file plainly in the tree of texts, or None.
+
+    Each module on the path from the crate root needs a `mod <name>;` line in its parent's file whose attributes are
+    all inert and hold no comment, and no file below the crate root on the path may hold an inner `cfg` or
+    `cfg_attr`.
+    """
+    files = crate_files(sources, crate, tuple())
+    files.update({path: text.scope.module for path, text in texts.items()})
+    for size in range(len(module) + 1):
+        declared = False
+        for path, file_module in files.items():
+            if file_module != module[:size]:
+                continue
+            text = texts[path].text if path in texts else sources.text(path)
+            spans = texts[path].spans if path in texts else token_spans(text)
+            words = tuple(span.token.value for span in spans)
+            if size and configured(words, 0, len(words), inner=True):
+                return f"{path}: a cfg attribute on the path to {module_path(module)}"
+            if size == len(module):
+                continue
+            items = source_items(words)
+            if items is None:
+                return f"{path}: cannot read its items"
+            for item in items:
+                if item.kind == "mod" and item.name == module[size] and words[item.end - 1] == ";":
+                    if configured(words, item.start, item.keyword, inner=False):
+                        return f"{path}: a cfg attribute on the path to {module_path(module)}"
+                    for begin, end in attribute_spans(words[item.start:item.keyword]):
+                        name = macro_attribute(words[item.start + begin:item.start + end])
+                        if name is not None:
+                            return f"{path}: the attribute {name} on the path to {module_path(module)}"
+                        if attribute_comment(text, spans, item.start + begin, item.start + end):
+                            return f"{path}: a comment in an attribute on the path to {module_path(module)}"
+                    declared = True
+        if size < len(module) and not declared:
+            return f"no file declares `mod {module[size]};` on the path to {module_path(module)}"
+    return None
+
+
+def untouched_globs(sources: RevisionTree, crate: str, afters: Mapping[str, MoveText],
+                    modules: set[tuple[str, ...]]) -> None:
+    """Raise MoveRefused for a glob use in a file the change does not touch that can import from one of modules.
+
+    A glob of the standard library, or of a crate the file does not bind as a module, imports nothing of the crate.
+    A file outside the crate's module tree cannot name its modules through an anchor.
+    """
+    for path, module in crate_files(sources, crate, ()).items():
+        source = sources.text(path)
+        if path in afters or not re.search(r"\buse\b[^;]*\*", source):
+            continue
+        words = tuple(token.value for token in tokens(source))
+        context = import_context(words)
+        trees = use_trees(words, code_item_starts(words))
+        bound = {used[-1] for use in use_items(words) for used in use.paths} | {
+            words[index + 1] for index in range(len(words) - 1) if words[index] in {"mod", "as"}}
+        for index, prefix in trees.prefixes.items():
+            if words[index] != "*" or prefix[:1] and prefix[0] in STANDARD_CRATES:
+                continue
+            if prefix[:1] and prefix[0] in PATH_ANCHORS:
+                if isinstance(module, OutsideCrate):
+                    continue
+                inline = tuple(name.split("@")[0] for name in context.scopes[index].module)
+                target = resolved_module(prefix, (*module, *inline))
+                if isinstance(target, UnresolvedPath) or target not in modules:
+                    if isinstance(target, UnresolvedPath):
+                        raise MoveRefused(f"{path}: a glob use the proof cannot resolve")
+                    continue
+                raise MoveRefused(f"{path}: a glob use of a module the move changes")
+            if not prefix or prefix[0] in bound:
+                raise MoveRefused(f"{path}: a glob use the proof cannot resolve")
+
+
+def path_sites(text: MoveText, name: str,
+               cut: frozenset[int]) -> tuple[tuple[int, int, tuple[str, ...] | UnresolvedPath], ...]:
+    """Each module path written before `::name` outside cut: its first word, the word of the name and what it names.
+
+    A path in a use group, or a path in an inline module that does not start at an anchor, raises MoveRefused.
+    """
+    words = text.words
+    found = [index for index, word in enumerate(words) if word == name and index not in cut and index >= 2
+             and words[index - 1] == "::" and words[index + 1:index + 2] != ("!",)]
+    if not found:
+        return ()
+    context = import_context(words)
+    trees = use_trees(words, code_item_starts(words))
+    result: list[tuple[int, int, tuple[str, ...] | UnresolvedPath]] = []
+    for index in found:
+        first = index
+        while first >= 2 and words[first - 1] == "::" and IDENTIFIER.fullmatch(words[first - 2]):
+            first -= 2
+        if first and words[first - 1] == "::":
+            continue  # A path after a type, `<T>::name`, or after `::`, an extern crate.
+        prefix = words[first:index - 1:2]
+        if index in trees.prefixes and trees.prefixes[index] != prefix:
+            raise MoveRefused(f"{text.path}: a use group names {name}")
+        inline = tuple(module.split("@")[0] for module in context.scopes[index].module)
+        target = scoped_path(prefix, text.scope, inline)
+        if isinstance(target, UnresolvedPath):
+            raise MoveRefused(f"{text.path}: cannot resolve the path {'::'.join(prefix)}::{name}")
+        result.append((first, index, target))
+    return tuple(result)
 
 
 def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
