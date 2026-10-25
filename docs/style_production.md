@@ -229,7 +229,14 @@ use `--reads <files>` to name each other file the verdict rests on. The fingerpr
 uses the cell's own file plus those named files, so only a change to one of them
 brings the cell back. Without `--reads`, the fingerprint uses the whole crate or
 module. Each named file must exist at the checked commit. The manifest scope covers the workspace root and member
-manifests; crate `.` covers only its own files. Exceptions expire with their
+manifests; crate `.` covers only its own files. A `modules` family judgment
+also stays current when only comments changed: the same input files at the checked
+commit and at the tip, and each changed `.rs` file has the same mode, the same code
+tokens and the same inner docs (`//!` and `/*! */`, each at the same place in the code). A change to an ordinary comment or
+to an outer `///` or `/** */` doc does not bring it back. A changed non-`.rs` input
+(a `Cargo.toml` in crate scope), a changed file mode or submodule, an added or
+removed file, or a file that does not tokenize brings it back. Every other family compares bytes, because names rules
+judge comment text. Exceptions expire with their
 inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 `exception` (reviewed allowed case), `held` (proposal deferred) and `waived`
 (change declined). Held and waived judgments count as current while their
