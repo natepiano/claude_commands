@@ -1003,8 +1003,9 @@ push notifications:
 On the Mac, add `--machine natedev`; the keys exist only on natedev. The
 message is the one action or fact, under 500 characters, per the message guide. Every message says
 what the user does with `--action`, or says nothing is needed with
-`--no-action`. Emergency (`--need blocked`) is only for an action the user must
-take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
+`--no-action`. An update to an earlier user push on the same subject reuses that
+push's `--key`, so silence keeps only the newest. Emergency (`--need blocked`) is
+only for an action the user must take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
 with the `fallback text:` that `send.py` printed, and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.
@@ -1061,7 +1062,7 @@ phase that has been through more than two repair rounds. First apply
 repair, unless the waiting unit needs the fix in repair.
 
 Otherwise, read the gating unit director's pane and the findings files in its
-delegate session directory. If its latest round fixes only new edge cases, as the
+unit session directory. If its latest round fixes only new edge cases, as the
 landing rule in <ProductionUnit/> defines them, send:
 
 `From the showrunner: <waiting unit> waits on your phase <N> (G<k>). Apply the landing rule: finish this round, move the new edge cases to a follow-up phase, checkpoint.`

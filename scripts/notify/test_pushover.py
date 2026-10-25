@@ -206,6 +206,60 @@ class PushoverTests(unittest.TestCase):
         self.assert_log("2", "Hana: blocked", "Action: run github-warmup\nGitHub credentials are cold.",
                         "sent, receipt r1")
 
+    def test_keyed_emergency_carries_the_tag_of_its_key(self) -> None:
+        code, form = self.run_send(["--priority", "2", "--key", "handler-prompt", "--action", "answer the prompt",
+                                    "handler needs your answer", "The prompt waits."])
+        self.assertEqual(code, 0)
+        self.assertEqual(form["tags"], [pushover.push_tag("handler-prompt")])
+        self.assertRegex(pushover.push_tag("handler prompt/1"), r"^[A-Za-z0-9_-]+$")
+        self.assertEqual(pushover.push_tag("a"), pushover.push_tag("a"))
+        self.assertNotEqual(pushover.push_tag("a"), pushover.push_tag("b"))
+
+    def test_no_tag_without_a_key_or_below_emergency(self) -> None:
+        for argv in (["--priority", "2", "--action", "check the UPS", "Power is out", "The UPS is on battery."],
+                     ["--priority", "1", "--key", "k", "--action", "choose a branch", "Build stopped", "Choose."],
+                     ["--key", "k", "--no-action", "Build done", "The build passed."]):
+            with self.subTest(argv=argv), redirect_stdout(io.StringIO()):
+                code, form = self.run_send(argv)
+            self.assertEqual(code, 0)
+            self.assertNotIn("tags", form)
+
+    def run_cancel(self, argv: list[str], status: int = 200,
+                   body: bytes = b'{"status":1,"canceled":1}') -> tuple[int, list[tuple[str, dict[str, list[str]]]], str]:
+        posted: list[tuple[str, dict[str, list[str]]]] = []
+
+        def post(url: str, data: bytes) -> tuple[int, bytes]:
+            posted.append((url, urllib.parse.parse_qs(data.decode())))
+            return status, body
+
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            code = pushover.cancel(argv, self.keys, post)
+        return code, posted, output.getvalue()
+
+    def test_cancel_posts_cancel_by_tag_with_the_token_and_logs(self) -> None:
+        code, posted, output = self.run_cancel(["--source", "stall_watch", "handler-prompt"])
+        tag = pushover.push_tag("handler-prompt")
+        self.assertEqual(code, 0)
+        self.assertEqual(posted, [(f"https://api.pushover.net/1/receipts/cancel_by_tag/{tag}.json", {"token": ["a456"]})])
+        self.assertEqual(output, "pushover: cancelled 1\n")
+        self.assert_log("2", "cancel emergency push", f"key handler-prompt, tag {tag}", "cancel: cancelled 1",
+                        source="stall_watch")
+
+    def test_cancel_with_nothing_repeating_says_so(self) -> None:
+        code, _posted, output = self.run_cancel(["k"], body=b'{"status":1,"canceled":0}')
+        self.assertEqual((code, output), (0, "pushover: nothing to cancel\n"))
+        self.assertEqual(self.log_lines()[-1]["outcome"], "cancel: nothing to cancel")
+
+    def test_cancel_failure_exits_one_and_bad_usage_two(self) -> None:
+        code, _posted, _output = self.run_cancel(["k"], status=400, body=b'{"status":0,"errors":["application token is invalid"]}')
+        self.assertEqual(code, 1)
+        self.assertEqual(self.log_lines()[-1]["outcome"], "cancel: refused: application token is invalid")
+        for argv in ([], ["--source", "x"], ["a", "b"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.run_cancel(argv)[:2], (2, []))
+        _ = self.keys.write_text("PUSHOVER_USER=u123\n")
+        self.assertEqual(self.run_cancel(["k"])[:2], (2, []))
+
     def test_missing_keys_send_nothing(self) -> None:
         _ = self.keys.write_text("PUSHOVER_USER=u123\nPUSHOVER_TOKEN=\n")
         code, form = self.run_send(["--no-action", "t", "m"])
@@ -484,6 +538,33 @@ class PushoverTests(unittest.TestCase):
         self.assertEqual(self.reviews()[0]["verdict"], "rewrite")
         self.assertEqual(cast(dict[str, object], self.reviews()[0]["sent"])["body"], rendered.body)
 
+    def test_approved_registered_text_skips_the_live_review(self) -> None:
+        approved = push_texts.approval_date("nixos.ups_battery")
+        self.assertRegex(approved, r"^\d{4}-\d{2}-\d{2}$")
+        entry = next(item for item in push_texts.catalog() if item.id == "nixos.ups_battery")
+        values = entry.examples[0].values
+        argv = ["--text-id", entry.id, *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
+        with (mock.patch.object(review, "review", side_effect=AssertionError("live review of an approved text")),
+              redirect_stdout(io.StringIO()) as output):
+            code, form = self.run_send(argv)
+        self.assertEqual(code, 0)
+        self.assertEqual(form["priority"], ["2"])
+        detail = f"registered text, approved {approved}"
+        self.assertEqual(self.reviews()[0]["detail"], detail)
+        self.assertEqual(self.log_lines()[-1]["outcome"], "sent, " + detail)
+        self.assertNotIn("failed review", output.getvalue())
+
+    def test_unapproved_registered_text_is_still_reviewed(self) -> None:
+        entry = push_texts.PushText("test", "script", "decision", "Choose retry", push_texts.ActionTemplate("Choose retry."),
+                                   "The build stopped.", (push_texts.PushExample("typical", {}),), purpose="Test.")
+        with (mock.patch.object(push_texts, "catalog", return_value=(entry,)),
+              mock.patch.object(review, "review", side_effect=approve) as read,
+              redirect_stdout(io.StringIO())):
+            code, _form = self.run_send(["--text-id", "test"])
+        self.assertEqual(code, 0)
+        read.assert_called_once()
+        self.assertEqual(push_texts.approval_date("test"), "")
+
     def test_nate_adhoc_is_sent_exactly_as_rendered_even_when_review_rewrites_it(self) -> None:
         description = "You asked to be told when the /nate skill is ready. It is ready now."
         values = {"sender": "natedev", "title": "the /nate skill is ready", "description": description}
@@ -491,6 +572,7 @@ class PushoverTests(unittest.TestCase):
         rewrite = review.Draft("natedev", "0", "The /nate skill is ready", NoActionRequired(), "Rewritten body", False)
         for outcome in (review.Rewritten(rewrite, ["reader-starts-cold"]), review.Failed(rewrite, ["reader-starts-cold"])):
             with (self.subTest(outcome=type(outcome).__name__),
+                  mock.patch.object(push_texts, "approval_date", return_value=""),
                   mock.patch.object(review, "review", return_value=outcome),
                   redirect_stdout(io.StringIO()) as output):
                 code, form = self.run_send(argv)
@@ -648,6 +730,14 @@ class PushoverTests(unittest.TestCase):
         self.assertIn("pushover: kept: silence until off\n", output.getvalue())
         self.assertEqual([push["title"] for push in silence.read_kept()], ["Build done"])
         self.assertEqual(self.log_lines()[-1]["outcome"], "kept: silence until off")
+
+    def test_key_reaches_the_kept_push_and_a_newer_push_with_it_replaces_the_older(self) -> None:
+        self.silence_on()
+        with redirect_stdout(io.StringIO()):
+            for title in ("Old note", "New note"):
+                code, _form = self.run_send(["--source", "hana", "--key", "subject", "--no-action", title, f"{title} body."])
+                self.assertEqual(code, 0)
+        self.assertEqual([(push["title"], push["key"]) for push in silence.read_kept()], [("New note", "subject")])
 
     def test_silence_never_keeps_a_blocked_push(self) -> None:
         self.silence_on()

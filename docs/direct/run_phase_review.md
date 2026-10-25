@@ -2,7 +2,7 @@
 
 Read at the point of use from `/unit:direct`. Defines `<RunPhaseReview/>` and
 `<RunPhaseShrink/>` in full.
-Phase-end order: `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
+Phase-end order: `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
 **Read when:** at the phase review or shrink step; in `single`, after smoke and
 `<UXReview/>`.
@@ -53,7 +53,7 @@ have their writer read them cold and argue against its choices. Post the
 <ReviewPromptContract/>, and use `review.sh --to <full-worker-name>`, this
 session, and the next review index.
 If every open worker is busy, open and retain a role-named worker with `review.sh
---slot review`. Only a phase review outside a delegate run omits both `--to`
+--slot review`. Only a phase review outside a unit run omits both `--to`
 and `--slot`. The prompt keeps the inline Three Gods sentence and Type Design
 Contract or its follow-up pointer. Ad hoc work skips this section.
 </RunPhaseReview>

@@ -220,7 +220,7 @@ class ClaudeWorkersTarget:
 
 
 @dataclass(frozen=True)
-class DelegateToClaude:
+class WorkersToClaude:
     """Route future workers work to Claude until the source weekly reset."""
 
     account: ClaudeWorkersTarget | DefaultClaudeAccount = DefaultClaudeAccount()
@@ -230,7 +230,7 @@ class DelegateToClaude:
 class WorkersMove:
     id: str
     at_percent: float
-    to: CodexWorkersTarget | DelegateToClaude
+    to: CodexWorkersTarget | WorkersToClaude
     added_at: datetime
 
     @property
@@ -298,8 +298,8 @@ def decode_next_moves(text: str) -> tuple[NextMove, ...]:
             if group == "workers":
                 if hold != 0 or mode != "fixed":
                     raise NextMoveError("next: workers entries cannot hold minutes")
-                destination = (DelegateToClaude() if target == "claude" else
-                               DelegateToClaude(ClaudeWorkersTarget(target)) if target.startswith("claude") else
+                destination = (WorkersToClaude() if target == "claude" else
+                               WorkersToClaude(ClaudeWorkersTarget(target)) if target.startswith("claude") else
                                CodexWorkersTarget(target))
                 entry = WorkersMove(name, float(percent), destination, datetime.fromisoformat(added))
             else:

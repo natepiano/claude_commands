@@ -76,7 +76,7 @@ Identify the existing directory submodules under `${SCOPE}` (immediate children 
 <Pass1Discovery>
 **Goal:** Three agents evaluate the structure along three lenses, with the Rust style guide loaded.
 
-Launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode. Readonly mode is the delegate-review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
+Launch **3 external CLI agents in parallel** through `~/.claude/scripts/agents/agent_exec.sh` using the `module_review.reviewer` registry task and `readonly` mode. Readonly mode is the readonly review contract: codex uses `--sandbox read-only`; claude uses `--permission-mode plan`.
 
 Create an absolute `${SESSION_DIR}` under `/tmp/claude/module_review/<uuid>/`. Set `${WORKING_DIR}` to the repo root containing `${SCOPE}`; never use `~/.claude` unless it is itself that repo. Create `${WAVE_DIR}=${SESSION_DIR}/pass1`. Before backgrounding any reviewer:
 

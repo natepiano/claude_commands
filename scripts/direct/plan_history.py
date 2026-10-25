@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
-import os
 import re
+import sys
 import time
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import unit_runs  # noqa: E402
 
 
 # How far the percentage beside an ETA is assumed to be off when no calibration
@@ -19,7 +22,7 @@ DEFAULT_PERCENT_SPREAD = 10.0
 # the work is half as far along as it says, at best twice.
 RATE_FACTOR_LIMIT = 2.0
 STATE_FILENAME = "progress_history_state.json"
-# Every phase heading in a delegate plan, in all three forms it takes over a
+# Every phase heading in a worker plan, in all three forms it takes over a
 # plan's life. `· status: todo` and `· status: done` are the live-zone forms;
 # a shrunk or as-built phase drops the status marker and usually carries a
 # commit annotation instead. Counting on the status marker alone silently
@@ -63,14 +66,11 @@ class EtaProjectionUnavailable(NamedTuple):
 
 
 def history_root() -> Path:
-    configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".local" / "state" / "plan-delegate"
+    return unit_runs.history_root()
 
 
 def now_epoch() -> float:
-    configured = os.environ.get("PLAN_DELEGATE_NOW_EPOCH")
+    configured = unit_runs.environ("NOW_EPOCH")
     if configured:
         return float(configured)
     return time.time()

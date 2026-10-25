@@ -16,7 +16,7 @@ Everything below is the contract.
 ---
 
 <StyleReview>
-Perform the diff scan and checklist walk inline; do not delegate this review.
+Perform the diff scan and checklist walk inline; do not worker this review.
 
 1. Read the operation switches with:
 

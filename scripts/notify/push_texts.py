@@ -147,11 +147,14 @@ def shown(entry: PushText) -> str:
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",
-                   priority: str = "", timeout: float = 0) -> list[str]:
+                   priority: str = "", timeout: float = 0, key: str = "") -> list[str]:
+    """The send.py argv; a `key` lets `send.py retire --to user --key KEY` stop a blocked push's repeats."""
     command = [sys.executable, str(SEND_SCRIPT), "--to", "user", "--from", sender or rendered.sender,
                "--need", rendered.need, "--text-id", rendered.id]
-    for key, value in sorted(rendered.values.items()):
-        command.extend(["--value", f"{key}={value}"])
+    if key:
+        command.extend(["--key", key])
+    for name, value in sorted(rendered.values.items()):
+        command.extend(["--value", f"{name}={value}"])
     if machine:
         command.extend(["--machine", machine])
     if priority:
@@ -159,6 +162,11 @@ def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "
     if timeout:
         command.extend(["--timeout", str(timeout)])
     return command
+
+
+def user_retire_argv(sender: str, key: str) -> list[str]:
+    """The send.py argv that stops the repeats of the emergency push `user_send_argv` sent with `key`."""
+    return [sys.executable, str(SEND_SCRIPT), "retire", "--to", "user", "--from", sender, "--key", key]
 
 
 class FilledExampleRecord(TypedDict):
@@ -195,6 +203,30 @@ def user_specified(text_id: str) -> bool:
         return False
     return all(isinstance(approval, dict) and str(cast(dict[str, object], approval).get("reviewer", "")).startswith("user-spec:")
                for approval in cast(dict[str, object], entry).values())
+
+
+def approval_date(text_id: str) -> str:
+    """The date (YYYY-MM-DD) of the newest approval when every example of the entry has a current
+    approval in REVIEWED_FILE; "" when one is missing or its template changed since."""
+    entry = next((item for item in catalog() if item.id == text_id), None)
+    try:
+        approvals = cast(object, json.loads(REVIEWED_FILE.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return ""
+    examples = cast(dict[str, object], approvals).get(text_id) if isinstance(approvals, dict) else None
+    if entry is None or not isinstance(examples, dict):
+        return ""
+    digest, times = fingerprint(entry), list[str]()
+    for example in entry.examples:
+        approval = cast(dict[str, object], examples).get(example.name)
+        if not isinstance(approval, dict):
+            return ""
+        record = cast(dict[str, object], approval)
+        time = record.get("time")
+        if record.get("sha256") != digest or not isinstance(time, str):
+            return ""
+        times.append(time)
+    return max(times)[:10]
 
 
 def fingerprint(entry: PushText) -> str:

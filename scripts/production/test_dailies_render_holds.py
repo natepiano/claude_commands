@@ -210,7 +210,7 @@ class DailiesHoldTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "UNIT_ACTIVE_DIR": str(self.scratch / "active"),
             "TZ": ZONE, "USER_ZONE": ZONE,
         }))
         _ = self.write_mac_block(reason="the tester handoff")
@@ -316,7 +316,7 @@ class DailiesHoldTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "UNIT_ACTIVE_DIR": str(self.scratch / "active"),
             "TZ": ZONE, "USER_ZONE": ZONE,
         }))
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
@@ -344,7 +344,7 @@ class DailiesHoldTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "UNIT_ACTIVE_DIR": str(self.scratch / "active"),
             "TZ": ZONE, "USER_ZONE": ZONE,
         }))
         _ = self.write_holder("worker", "2026-10-04T10:56:00-07:00", "the focused test")
@@ -410,7 +410,7 @@ class DailiesHoldTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
             "MAC_TEST_STATE_DIR": str(self.mac_state),
             "NOTIFIER_SESSIONS_DIR": str(self.scratch / "sessions"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.scratch / "active"),
+            "UNIT_ACTIVE_DIR": str(self.scratch / "active"),
             "TZ": ZONE, "USER_ZONE": ZONE,
         }))
         _ = self.write_holder("first", "2026-10-04T10:50:00-07:00", "the first test")

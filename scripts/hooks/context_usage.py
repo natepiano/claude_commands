@@ -13,8 +13,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import agents_registry  # noqa: E402
 
 # Auto-compaction does NOT wait for the window. Reconstructed from the 2.1.220
 # binary (`Hds`/`Sfo`/`CSe`, still `W9`/`Bye`/`SQo` in 2.1.233), the trigger is
@@ -262,13 +266,13 @@ def read_context_rules() -> tuple[int, dict[str, ContextRule]]:
     """
     path = Path(os.environ.get(AGENTS_CONFIG_ENV) or DEFAULT_AGENTS_CONFIG_PATH)
     try:
-        text = path.read_text(encoding="utf-8")
+        text = agents_registry.registry_text(path)
     except OSError:
         # An override that has gone away -- a deleted scratch copy a long-lived
         # `--bg` daemon still names -- falls back to the default registry, not
         # to the small window.
         try:
-            text = DEFAULT_AGENTS_CONFIG_PATH.read_text(encoding="utf-8")
+            text = agents_registry.registry_text(DEFAULT_AGENTS_CONFIG_PATH)
         except OSError:
             return FALLBACK_CONTEXT_TOKENS, {}
     default = FALLBACK_CONTEXT_TOKENS

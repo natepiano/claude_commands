@@ -14,7 +14,7 @@
 # Removes every claude worker those runs launched, and any a dead run left
 # alive (remove_workers.py). Also stops each run's codex app-server, if one was
 # started. That server is detached on purpose -- it has to outlive each
-# delegate so a peer can still reach a thread between turns -- so the end of
+# worker so a peer can still reach a thread between turns -- so the end of
 # the run is the only point that knows nobody needs it any more.
 #
 # Deletes each run's scratch copies (remove_run_scratch.py): its verify.sh pass
@@ -23,12 +23,14 @@
 # the run folder, at any depth. Gate copies and before/after builds otherwise
 # stay in /tmp until the disk fills.
 #
-# PLAN_DELEGATE_RUN_ROOT, set by tests, replaces both run roots for the scan.
+# UNIT_RUN_ROOT, set by tests, replaces both run roots for the scan.
 #
 # Safe to run when no run is active. The rest of the session directory is left
-# alone; ledgers, heartbeat and delegate logs stay readable after the run.
+# alone; ledgers, heartbeat and worker logs stay readable after the run.
 
 set -euo pipefail
+UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+[[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -43,8 +45,8 @@ if [[ -z "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
 fi
 
 # The marker is under unit/, or delegate/ for a run started before the rename.
-if [[ -n "${PLAN_DELEGATE_ACTIVE_DIR:-}" ]]; then
-  MARKER="${PLAN_DELEGATE_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
+if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
+  MARKER="${UNIT_ACTIVE_DIR}/${CLAUDE_CODE_SESSION_ID}"
 else
   MARKER="/tmp/claude/unit/active/${CLAUDE_CODE_SESSION_ID}"
   if [[ ! -f "${MARKER}" && -f "/tmp/claude/delegate/active/${CLAUDE_CODE_SESSION_ID}" ]]; then
@@ -65,11 +67,11 @@ if [[ -n "${SESSION_DIR}" ]]; then
   RUNS+=("${SESSION_DIR}")
 fi
 HELD_ARGS=(held "${CLAUDE_CODE_SESSION_ID}")
-if [[ -n "${PLAN_DELEGATE_RUN_ROOT:-}" ]]; then
-  HELD_ARGS+=(--root "${PLAN_DELEGATE_RUN_ROOT}")
+if [[ -n "${UNIT_RUN_ROOT:-}" ]]; then
+  HELD_ARGS+=(--root "${UNIT_RUN_ROOT}")
 fi
-if [[ -n "${PLAN_DELEGATE_ACTIVE_DIR:-}" ]]; then
-  HELD_ARGS+=(--active "${PLAN_DELEGATE_ACTIVE_DIR}")
+if [[ -n "${UNIT_ACTIVE_DIR:-}" ]]; then
+  HELD_ARGS+=(--active "${UNIT_ACTIVE_DIR}")
 fi
 HELD="$("$PY" "${SCRIPT_DIR}/../lib/unit_runs.py" "${HELD_ARGS[@]}" || true)"
 while IFS= read -r run; do
