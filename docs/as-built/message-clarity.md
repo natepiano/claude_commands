@@ -291,7 +291,7 @@ The user asked for this on 2026-10-23: each permission alert starts a root cause
   - Replies with asks are not reviewed. They count as having an unregistered question when any sentence matches nothing in `registered_questions(since)` (current outstanding plus history lines after the cutoff, fields `text`, `reviewed` and `question`), or when a choices-only reply contains no registered item.
   - It dry-reviews up to `limit` of the newest remaining replies with `reply,all`, logs `sample: true` and posts and holds nothing.
   - It prints `sample: N replies; passed; failed; unreviewed; replies with unregistered questions; unreadable transcripts` and `sample failed rules: …`. It exits 1 only when a transcript was unreadable.
-- The nightly pass proposes at most one new guide rule, through `DIR/messages.md` and the ledger, which leads to `/efficiency_next`.
+- The nightly pass proposes at most one new guide rule, through `DIR/messages.md` and the ledger, which leads to `/next efficiency`.
 
 ### State and config
 
