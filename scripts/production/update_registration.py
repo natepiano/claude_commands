@@ -457,7 +457,7 @@ def open_lists(production: Production) -> OpenLists:
 
 
 def open_items(production: Production) -> None:
-    """Print in full what waits on the user: this production's items and, for a root, every lower one's.
+    """Print in full what waits on the user: this production's items and those of every production below it.
 
     Replies show only the count, so this list is what the showrunner gives when the user asks what
     the open questions are. Each line is led by the production that owns the item.

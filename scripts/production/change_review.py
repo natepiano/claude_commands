@@ -65,6 +65,7 @@ from user_zone import user_zone  # noqa: E402
 # The merge gate imports this module as scripts.production.change_review; its siblings still resolve.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
+from proposals_folder import slug_of  # noqa: E402
 
 TRAILER = "Change-Review"
 LIST_HEADER = "- **Change review:**"
@@ -72,6 +73,8 @@ SECTION = "## To review"
 REVIEWED = "## Reviewed"
 CHECK = "How to check"
 URGENCY = "Urgency"
+# The production a row's change is from: its slug. A row from before the column is the root's.
+PRODUCTION = "Production"
 NOT_YET = "not yet"
 FORM = "<what changed for you> | <how to try it: where and what to type> | <what you see>"
 SEPARATOR = " | "
@@ -496,7 +499,8 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
 
     `merged` is the merge's hash, or empty for a change no merge names. The Mac build column is
     written only when the table has one. `production` is the doc whose change the rows are.
-    `rank` is the rows' Urgency cell; empty is a normal row.
+    `rank` is the rows' Urgency cell; empty is a normal row. The Production column takes the
+    production's slug, so /next in a showrunner below the root shows only its own rows.
     """
     if not changes:
         return []
@@ -504,11 +508,13 @@ def append_rows(path: Path, changes: list[Visible], day: date, merged: str, prod
     def write(lines: list[str]) -> list[str]:
         if rank:
             _add_column(path, lines, SECTION, URGENCY)
+        _add_column(path, lines, SECTION, PRODUCTION)
         columns, _, end = _table(path, lines, SECTION)
         number = next_number("".join(lines))
         when = f"{day.isoformat()} · {_cell(merged)}" if merged else day.isoformat()
         rows = [_row(path, columns, {"#": f"C{number + offset}", "Change": _cell(item.change), "Merged": when,
-                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank)})
+                                     "On the Mac build": NOT_YET, CHECK: _cell(item.how()), URGENCY: _cell(rank),
+                                     PRODUCTION: _cell(row_production(production))})
                 for offset, item in enumerate(changes)]
         _insert(lines, end, rows)
         return rows
@@ -528,6 +534,11 @@ def pending(path: Path) -> list[dict[str, str]]:
     lines = read(path).splitlines(keepends=True)
     columns, first, end = _table(path, lines, SECTION)
     return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+
+
+def row_production(production: Path) -> str:
+    """The Production cell for a change of the production doc `production`: its slug."""
+    return slug_of(production)
 
 
 def describe(row: dict[str, str]) -> str:

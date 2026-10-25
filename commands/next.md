@@ -25,8 +25,10 @@ when the answer settles it or more items wait: the user asks for the next one
 when they want it (user, 2026-10-20). The user can also move the shown item to
 the end of its list (user, 2026-10-22).
 
-No kind, change, proposal and question run in the showrunner session. Efficiency
-runs in any session.
+Every kind is scoped to one showrunner: the items of its production and of
+each production below it, at any depth, never of one above it or beside it
+(user, 2026-10-25). The user runs `/next` in the showrunner whose work they
+want. Run it in the showrunner session, or pass that production's doc.
 
 ## Order
 
@@ -51,14 +53,14 @@ current until it has its answer, also when a more urgent item arrives.
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show
 [--kind <kind>] [--order oldest|newest]`. Outside the showrunner session add
-`--production <doc>`. It prints the item's kind on the first line, then the
+`--production <doc>`, for every kind. It prints the item's kind on the first line, then the
 item, or a line that nothing waits. Present the item by its kind's section
 below.
 
 ## To the end
 
 When the user says to move the shown item to the end of its list, run
-`next_item.py move-to-end --kind <its kind>`. Say it moved, and stop: do not
+`next_item.py move-to-end --kind <its kind>`, with the same `--production`. Say it moved, and stop: do not
 show the next item.
 
 ## Important
@@ -68,8 +70,9 @@ kind's script (below).
 
 ## change
 
-The next change for the user to check, from the top-level showrunner's change
-review list: its row. Mark: `change_review.py mark-important --row C<n>`. Say
+The next change for the user to check, from the change review list of the
+production's root: its row. A row belongs to the production its Production
+cell names, and a row without one to the root. Mark: `change_review.py mark-important --row C<n>`. Say
 what changed, how to try it and what the user sees, in plain words. Record the
 user's verdict through `/change_review` → verdict.
 
@@ -84,7 +87,9 @@ answer through `/showrunner:proposal`.
 
 ## efficiency
 
-The open nightly-review proposal: its ledger line. Present and record it by
+The open nightly-review proposal: its line in the ledger that the `Efficiency
+ledger` line names, of the production doc and of each production below it. A
+production with no such line has no efficiency items. Present and record it by
 `/efficiency_next` steps 3 and 4.
 
 ## question
