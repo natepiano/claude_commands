@@ -66,7 +66,8 @@ class StylePlanTests(unittest.TestCase):
         _ = self.git("config", "user.email", "planner@example.invalid")
         self.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\n')
         for crate in ("alpha", "beta"):
-            self.write(f"crates/{crate}/Cargo.toml", f'[package]\nname = "{crate}"\nversion = "0.1.0"\n')
+            self.write(f"crates/{crate}/Cargo.toml",
+                       f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n')
         for path in self.sources:
             self.write(path, "pub fn value() {}\n")
         self.tip = self.commit()
