@@ -66,6 +66,7 @@
       "Bash(~/.claude/scripts/berth_fix/*)",
       "Bash(zsh ~/.claude/scripts/direct/unit_notifier.sh *)",
       "Bash(bash ~/.claude/scripts/direct/verify.sh *)",
+      "Bash(bash ~/.claude/scripts/direct/implement.sh *)",
       "Bash(bash ~/.claude/scripts/direct/progress_timer.sh *)",
       "Bash(zsh ~/.claude/scripts/message/notifier.sh *)",
       "Bash(\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/conversation_pause.py\" *)",
@@ -97,7 +98,9 @@
       "Bash(pwd)",
       "Bash(date)",
       "Bash(true)",
-      "Bash(git ls-files)"
+      "Bash(git ls-files)",
+      "Bash(python3 ~/.claude/scripts/direct/progress_history.py *)",
+      "Bash(~/.claude/scripts/lib/py ~/.claude/scripts/style/style_plan.py *)"
     ],
     "deny": [
       "Bash(git stash)",
