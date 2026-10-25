@@ -1203,6 +1203,115 @@ class StyleFootprintTests(unittest.TestCase):
                 else:
                     self.assert_mechanical(base)
 
+    def test_import_rewrite_with_joined_calls_that_drop_trailing_commas_is_mechanical(self) -> None:
+        self.write("src/lib.rs", "mod constants;\nmod error;\n")
+        self.write("src/constants.rs", "".join(f"pub(super) const {name}: &str = \"{name}\";\n" for name in (
+            "GIT_PATHSPEC_SEPARATOR", "LSOF_BINARY", "LSOF_PROCESS_IDS_ARG", "PROCESS_DESCRIPTORS_DIRECTORY",
+            "PROCESS_DIRECTORY")))
+        before = ("use std::path::Path;\n\n"
+                  "#[cfg(target_os = \"linux\")]\n"
+                  "fn git_lock_holders(path: &Path) -> u32 {\n"
+                  "    inspect_git_lock_holders(\n"
+                  "        Path::new(super::constants::PROCESS_DIRECTORY),\n"
+                  "        path,\n"
+                  "        metadata.uid(),\n"
+                  "    )\n"
+                  "}\n\n"
+                  "#[cfg(target_os = \"linux\")]\n"
+                  "fn inspect_git_lock_holders(root: &Path, path: &Path, owner: u32) -> u32 {\n"
+                  "    let Ok(descriptors) = std::fs::read_dir(\n"
+                  "        root\n"
+                  "            .join(path)\n"
+                  "            .join(super::constants::PROCESS_DESCRIPTORS_DIRECTORY),\n"
+                  "    ) else {\n"
+                  "        return owner;\n"
+                  "    };\n"
+                  "    consume(descriptors)\n"
+                  "}\n\n"
+                  "#[cfg(not(target_os = \"linux\"))]\n"
+                  "fn git_lock_holders(path: &Path) -> u32 {\n"
+                  "    let Ok(output) = std::process::Command::new(super::constants::LSOF_BINARY)\n"
+                  "        .args([\n"
+                  "            super::constants::LSOF_PROCESS_IDS_ARG,\n"
+                  "            super::constants::GIT_PATHSPEC_SEPARATOR,\n"
+                  "        ])\n"
+                  "        .arg(path)\n"
+                  "        .output()\n"
+                  "    else {\n"
+                  "        return owner;\n"
+                  "    };\n"
+                  "    consume(output)\n"
+                  "}\n")
+        self.write("src/error.rs", before)
+        base = self.commit()
+        imports = ("use std::path::Path;\n\n"
+                   "#[cfg(not(target_os = \"linux\"))]\nuse super::constants::GIT_PATHSPEC_SEPARATOR;\n"
+                   "#[cfg(not(target_os = \"linux\"))]\nuse super::constants::LSOF_BINARY;\n"
+                   "#[cfg(not(target_os = \"linux\"))]\nuse super::constants::LSOF_PROCESS_IDS_ARG;\n"
+                   "#[cfg(target_os = \"linux\")]\nuse super::constants::PROCESS_DESCRIPTORS_DIRECTORY;\n"
+                   "#[cfg(target_os = \"linux\")]\nuse super::constants::PROCESS_DIRECTORY;\n")
+        joins = (
+            (("inspect_git_lock_holders(\n        Path::new(super::constants::PROCESS_DIRECTORY),\n"
+              "        path,\n        metadata.uid(),\n    )"),
+             "inspect_git_lock_holders(Path::new(PROCESS_DIRECTORY), path, metadata.uid())"),
+            (("std::fs::read_dir(\n        root\n            .join(path)\n"
+              "            .join(super::constants::PROCESS_DESCRIPTORS_DIRECTORY),\n    ) else {"),
+             "std::fs::read_dir(root.join(path).join(PROCESS_DESCRIPTORS_DIRECTORY))\n    else {"),
+            ("super::constants::LSOF_BINARY", "LSOF_BINARY"),
+            ((".args([\n            super::constants::LSOF_PROCESS_IDS_ARG,\n"
+              "            super::constants::GIT_PATHSPEC_SEPARATOR,\n        ])"),
+             ".args([LSOF_PROCESS_IDS_ARG, GIT_PATHSPEC_SEPARATOR])"),
+        )
+        body = before[len("use std::path::Path;\n"):]
+        for old, new in joins:
+            self.assertIn(old, body)
+            body = body.replace(old, new)
+        self.write("src/error.rs", imports + body)
+        _ = self.commit()
+        self.assert_mechanical(base)
+
+    def test_each_joined_call_that_drops_its_trailing_comma_is_mechanical(self) -> None:
+        cases = (
+            ("    consume(\n        columns::COL_DISK,\n        input,\n    );\n", "    consume(COL_DISK, input);\n"),
+            (("    reader\n        .args([\n            columns::COL_DISK,\n            input,\n        ])\n"
+              "        .output();\n"), "    reader.args([COL_DISK, input]).output();\n"),
+            ("    let Ok(value) = read(\n        columns::COL_DISK,\n    ) else {\n        return;\n    };\n",
+             "    let Ok(value) = read(COL_DISK) else {\n        return;\n    };\n"),
+        )
+        for body, joined in cases:
+            with self.subTest(joined=joined):
+                self.write("src/lib.rs", "mod columns;\nmod reader;\n")
+                self.write("src/columns.rs", "pub(crate) const COL_DISK: usize = 1;\n")
+                self.write("src/reader.rs", "use crate::columns;\nfn read(input: usize) {\n" + body + "}\n")
+                base = self.commit()
+                self.write("src/reader.rs", "use crate::columns::COL_DISK;\nfn read(input: usize) {\n" + joined + "}\n")
+                _ = self.commit()
+                self.assert_mechanical(base)
+
+    def test_a_dropped_comma_in_a_tuple_macro_or_attribute_requires_review(self) -> None:
+        cases = (
+            ("fn read(x: u8) { let t = (x,); consume(t); }\n", "(x,)", "(x)"),
+            ("fn read(v: (u8,)) { let (a,) = v; consume(a); }\n", "(a,)", "(a)"),
+            ("fn read(x: u8) -> (u8,) { make(x) }\n", "(u8,)", "(u8)"),
+            ("fn read(a: u8, b: u8) { assert_eq!(a, b,); }\n", "b,)", "b)"),
+            ("#[cfg(any(unix, windows,))]\nfn read() {}\n", "windows,)", "windows)"),
+        )
+        for before, old, new in cases:
+            with self.subTest(before=before):
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace(old, new))
+                _ = self.commit()
+                self.assertIn("check 6", self.assert_review(base))
+
+    def test_an_added_trailing_comma_is_mechanical(self) -> None:
+        before = "fn read(input: usize) {\n    consume(input);\n}\n"
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace("consume(input);", "consume(\n        input,\n    );"))
+        _ = self.commit()
+        self.assert_mechanical(base)
+
     def test_import_rewrite_can_remove_an_unused_qualifier_import(self) -> None:
         self.write("src/lib.rs", "mod columns;\nmod reader;\n")
         self.write("src/columns.rs", "pub(crate) const COL_DISK: usize = 1;\n")

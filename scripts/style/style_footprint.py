@@ -32,6 +32,13 @@ PRELUDE_NAMES = frozenset({
     "drop", "bool", "char", "str", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize",
     "u8", "u16", "u32", "u64", "u128", "usize", "self", "super", "crate",
 })
+# The Rust keywords, strict and reserved in any edition: a name with one of these needs `r#`.
+RUST_KEYWORDS = frozenset({
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
+    "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
+    "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract", "become",
+    "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
+})
 
 
 class FootprintError(Exception):
@@ -1063,6 +1070,76 @@ def macro_spans(words: tuple[str, ...], ends: dict[int, int]) -> tuple[tuple[int
     return tuple(spans)
 
 
+def closes_named_generics(words: tuple[str, ...], close: int, openers: dict[int, int]) -> bool:
+    """Whether the `>` at close ends the generics of a turbofish (`f::<T>`) or of a `fn` or `struct` name.
+
+    Any other `>` before a paren can be a comparison, as in `a > (b,)`.
+    """
+    depth = 0
+    cursor = close
+    while cursor >= 0:
+        word = words[cursor]
+        if word in {")", "]", "}"}:
+            if cursor not in openers:
+                return False
+            cursor = openers[cursor] - 1
+            continue
+        if word in {"(", "[", "{", ";"}:
+            return False
+        depth += (word == ">") - (word == "<")
+        if not depth:
+            return words[cursor - 1:cursor] == ("::",) or (cursor >= 2 and words[cursor - 2] in {"fn", "struct"})
+        cursor -= 1
+    return False
+
+
+def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
+    """The indexes of the commas that end a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
+
+    A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
+    does not change the code, so a reformat that adds or drops one leaves the code the same. Any other paren list can be
+    a tuple, where `(x,)` and `(x)` differ, so its comma stays. A comma inside a macro token tree or an attribute stays
+    too: a macro arm or an attribute macro can tell `[1,]` from `[1]`.
+
+    Some of those leads can come before a tuple, so they do not count: a lifetime or label (`&'a (u8,)`,
+    `break 'a (1,)`), the `]` that ends an attribute (`#[cfg(x)] (a,) =>`), the `)` that ends a visibility
+    (`pub(crate) (u8,)`), and a `>` that does not end named generics (`closes_named_generics`).
+    """
+    ends = delimiter_ends(words)
+    openers = {close: opening for opening, close in ends.items()}
+    attributes = attribute_spans(words)
+    attribute_ends = {end for _, end in attributes}
+    in_macros = {index for start, end in (*macro_spans(words, ends), *attributes) for index in range(start + 1, end)}
+
+    def call_lead(index: int) -> bool:
+        """Whether the word before the paren at index makes its list the arguments of a call or a parameter list."""
+        lead = words[index - 1] if index else ""
+        if lead == ">":
+            return closes_named_generics(words, index - 1, openers)
+        if lead == "]":
+            return index not in attribute_ends
+        if lead == ")":
+            return words[openers[index - 1] - 1:openers[index - 1]] != ("pub",) if index - 1 in openers else True
+        return (IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS
+                and words[index - 2:index - 1] != ("'",))
+
+    droppable: list[bool] = []
+    dropped: set[int] = set()
+    for index, word in enumerate(words):
+        if word in {"(", "[", "{"}:
+            droppable.append(word != "(" or call_lead(index))
+        elif (word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",)
+              and index - 1 not in in_macros):
+            dropped.add(index - 1)
+    return frozenset(dropped)
+
+
+def without_trailing_commas(source_tokens: tuple[Token, ...]) -> tuple[Token, ...]:
+    """The tokens without the commas that `trailing_commas` finds, which rustfmt adds or drops when it joins lines."""
+    dropped = trailing_commas(tuple(token.value for token in source_tokens))
+    return tuple(token for index, token in enumerate(source_tokens) if index not in dropped)
+
+
 def cfg_attribute(words: tuple[str, ...]) -> bool:
     return (words[:4] == ("#", "[", "cfg", "(") and words[-2:] == (")", "]")
             and closing(words, 1) == len(words) - 1 and closing(words, 3) == len(words) - 2)
@@ -1897,8 +1974,9 @@ def judge(finding: Finding, before: RevisionTree) -> Mechanical | Review:
             reasons.append("check 6: macro invocation requires review")
         if documented_text(change.before) != documented_text(change.after) or re.search(r"#\s*\[\s*(?:serde|reflect)|\brename\s*=", lines):
             reasons.append("check 6: serialized, reflected, configured or documented name flagged")
-        old_tokens = without_derives(normalized)
-        new_tokens = without_derives(rewrite_tokens(tokens(change.after), proof.rewrites.after))
+        old_tokens = without_trailing_commas(without_derives(normalized))
+        new_tokens = without_trailing_commas(without_derives(
+            rewrite_tokens(tokens(change.after), proof.rewrites.after)))
         if old_tokens != new_tokens or any(token.kind == "unknown" for token in (*old_tokens, *new_tokens)):
             reasons.append("check 6: call target, method or other change not proven equivalent")
         if not change.path.endswith(".rs") and change.before != change.after:

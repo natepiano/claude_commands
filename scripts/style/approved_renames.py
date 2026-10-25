@@ -63,13 +63,6 @@ NEGATED_NOUN = re.compile(rf"\s*{NO_LEAD}(?:\s+[\w-]+){{0,3}}\s*", re.IGNORECASE
 NOUN_MOVE_END = re.compile(r"\s+(?:is|are|was|were)\b", re.IGNORECASE)
 # The file stems that are their folder's module or a crate root, not a module of their own name.
 ROOT_STEMS = frozenset({"mod", "lib", "main"})
-# The Rust keywords, strict and reserved in any edition: a module with one of these names needs `r#`.
-RUST_KEYWORDS = frozenset({
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
-    "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
-    "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract", "become",
-    "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
-})
 
 
 @dataclass(frozen=True)
@@ -217,7 +210,7 @@ def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
     named_old, named_new = PurePosixPath(match[1]), PurePosixPath(match[2])
     stems = {named_old.stem, named_new.stem}
     if ((path != match[1] and not path.endswith("/" + match[1])) or named_old.parent != named_new.parent
-            or len(stems) == 1 or stems & ROOT_STEMS or stems & RUST_KEYWORDS):
+            or len(stems) == 1 or stems & ROOT_STEMS or stems & style_footprint.RUST_KEYWORDS):
         return NoFileRename()
     return FileRename(path, path.removesuffix(match[1]) + match[2])
 

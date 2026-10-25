@@ -29,7 +29,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
 import coverage_report
-from approved_renames import (RUST_KEYWORDS, AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
+from approved_renames import (AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, declaration_sites, enclosing, file_rename, inline_modules, item_starts)
 from add_style import StandingStyleProduction, standing_style_production
@@ -774,30 +774,6 @@ class RenamedModuleScan:
         return False
 
 
-def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
-    """The indexes of the commas that end a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
-
-    A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
-    does not change the code, so a reformat that adds or drops one leaves the code the same. Any other paren list can be
-    a tuple, where `(x,)` and `(x)` differ, so its comma stays. A comma inside a macro token tree or an attribute stays
-    too: a macro arm or an attribute macro can tell `[1,]` from `[1]`.
-    """
-    trees = (*style_footprint.macro_spans(words, style_footprint.delimiter_ends(words)),
-             *style_footprint.attribute_spans(words))
-    in_macros = {index for start, end in trees for index in range(start + 1, end)}
-    droppable: list[bool] = []
-    dropped: set[int] = set()
-    for index, word in enumerate(words):
-        if word in {"(", "[", "{"}:
-            lead = words[index - 1] if index else ""
-            droppable.append(word != "(" or lead in {">", ")", "]"} or (
-                style_footprint.IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS))
-        elif (word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",)
-              and index - 1 not in in_macros):
-            dropped.add(index - 1)
-    return frozenset(dropped)
-
-
 def sorted_use_groups(words: tuple[str, ...]) -> tuple[str, ...]:
     """The words of a use tree with the entries of each brace group in sorted order, no word dropped."""
     result: list[str] = []
@@ -932,7 +908,7 @@ def canonical_code(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...]) ->
     a rename changes a name's sort order or line length. A comment line keeps its place among the words of its piece, so
     a comment that moves to another place in the code changes the pieces.
     """
-    dropped = trailing_commas(words)
+    dropped = style_footprint.trailing_commas(words)
     pieces: list[CodePiece] = []
     lines: list[str] = []
 
