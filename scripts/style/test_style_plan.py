@@ -3799,6 +3799,17 @@ class StylePlanTests(unittest.TestCase):
                     + "Change nothing else in those files.")
         self.assertIn("Apply the approved findings. " + sentence, self.plan.read_text())
 
+    def test_a_proposal_phase_lists_each_widened_path_under_its_files(self) -> None:
+        ticket = self.approved_reference_ticket()
+        extra = "crates/alpha/src/extra.rs"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", extra,
+                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
+        self.write_approved_phase()
+        at = self.ledger().ticket_open("names-unit")[0]["widened"][0]["widened_at"]
+        self.assertIn(f"**Files:**\n- `{self.sources[0]}`\n"
+                      + f"- widened: {extra} — the move needs a new file (showrunner, {at})\n", self.plan.read_text())
+
     def test_a_proposal_phase_names_each_qualified_pair_and_keeps_a_bare_rename_in_its_own_file(self) -> None:
         _ = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"), ("helper", "assistant")))
         self.write_approved_phase()
@@ -4007,6 +4018,28 @@ class StylePlanTests(unittest.TestCase):
                     self.assertEqual(name + " (change" in output, name in refused, output)
                 self.write(lib, moved)
                 self.write(extra, "pub(crate) fn more() -> usize { 2 }\n")
+
+    def test_approved_proposal_gate_allows_a_widened_file_and_only_it(self) -> None:
+        ticket = self.approved_reference_ticket()
+        outside, other = self.sources[3], self.sources[2]
+        self.write(outside, "pub fn moved() -> usize { 1 }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        refusal = "files outside approved findings: {} (change is not an approved rename reference)"
+        self.assertIn(refusal.format(outside), output)
+        widened = io.StringIO()
+        with redirect_stdout(widened):
+            self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", outside,
+                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
+        line = widened.getvalue()
+        self.assertTrue(line.startswith(f"widened: {outside} — the move needs a new file (showrunner, ")
+                        and line.endswith(")\n") and line.count("\n") == 1, line)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        self.write(other, "pub fn other() -> usize { 2 }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(refusal.format(other) + "\n", output)
+        self.assertNotIn(outside, output)
 
     def test_approved_rename_refuses_unqualified_or_unapproved_names(self) -> None:
         ticket = self.approved_reference_ticket()

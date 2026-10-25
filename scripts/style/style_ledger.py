@@ -374,6 +374,7 @@ class ApprovedProposal:
     issue: Path
     unit: str
     finding_ids: tuple[str, ...]
+    widened: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1183,19 @@ class StyleLedgerSummary:
         }
 
 
+class WidenedPath(TypedDict):
+    """A path that a person added to an approved proposal ticket outside its findings, with the reason."""
+
+    path: str
+    reason: str
+    widened_by: str
+    widened_at: str
+
+
+def widened_line(widened: WidenedPath) -> str:
+    return f"widened: {widened['path']} — {widened['reason']} ({widened['widened_by']}, {widened['widened_at']})"
+
+
 class TicketRecord(TypedDict):
     id: str
     unit: str
@@ -1202,6 +1216,7 @@ class TicketRecord(TypedDict):
     checkpoint: str
     created_at: str
     updated_at: str
+    widened: tuple[WidenedPath, ...]
 
 
 @dataclass(frozen=True)
@@ -1611,6 +1626,14 @@ MIGRATIONS = {
     18: "ALTER TABLE judgments ADD COLUMN read_files TEXT NOT NULL DEFAULT 'null';",
     19: "ALTER TABLE held_findings ADD COLUMN waive_provenance TEXT NOT NULL DEFAULT 'unrecorded';",
     20: "ALTER TABLE held_findings ADD COLUMN waived_by TEXT NOT NULL DEFAULT '';",
+    # A path that `style_plan.py widen` adds to an approved proposal ticket outside its findings, with the reason.
+    21: """
+        CREATE TABLE ticket_widened_paths (
+            ticket TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL,
+            widened_by TEXT NOT NULL, widened_at TEXT NOT NULL,
+            PRIMARY KEY(ticket, path)
+        );
+    """,
 }
 
 
@@ -1781,6 +1804,10 @@ class Ledger:
         if not rows:
             raise LedgerError(f"unknown ticket {ticket_id}")
         row = rows[0]
+        widened = cast(list[tuple[str, str, str, str]], self._connection.execute(
+            "SELECT path,reason,widened_by,widened_at FROM ticket_widened_paths WHERE ticket=? ORDER BY path",
+            (ticket_id,),
+        ).fetchall())
         return {
             "id": row[0], "unit": row[1], "kind": row[2], "family": row[3], "rule": row[4], "crate": row[5],
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
@@ -1788,6 +1815,8 @@ class Ledger:
             "state": row[10], "branch": row[11], "checkpoint": row[12], "created_at": row[13], "updated_at": row[14],
             "base": row[15], "proposal": row[16], "cells": cast(list[list[str]], json.loads(row[17])),
             "finding_ids": cast(list[str], json.loads(row[18])),
+            "widened": tuple(WidenedPath(path=path, reason=reason, widened_by=by, widened_at=at)
+                             for path, reason, by, at in widened),
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -1955,6 +1984,40 @@ class Ledger:
                 "DELETE FROM held_findings WHERE ticket=? AND path=? AND state='unfiled'", (id, path),
             )
             _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, _now()))
+
+    def ticket_widen(self, id: str, paths: tuple[str, ...], reason: str, by: str,
+                     approved: Callable[[], frozenset[str]]) -> tuple[WidenedPath, ...]:
+        """Add paths outside the findings to an open proposal ticket, and return the ticket's widened paths.
+
+        approved reads the decision and returns the paths that its findings and approved renames already allow; it
+        raises when the decision is not approved. A path widened again with the same reason changes nothing.
+        """
+        reason, by = reason.strip(), by.strip()
+        if not reason:
+            raise LedgerError(f"{id}: widen requires a reason")
+        if not by:
+            raise LedgerError(f"{id}: widen requires --by")
+        normalized = tuple(dict.fromkeys(self._path(path) for path in paths))
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if ticket["kind"] != "proposal":
+                raise LedgerError(f"{id}: only a proposal ticket widens; this is a {ticket['kind']} ticket")
+            if ticket["state"] in FINAL_TICKET_STATES:
+                raise LedgerError(f"{id}: cannot widen a {ticket['state']} ticket")
+            allowed = approved()
+            previous = {widened["path"]: widened["reason"] for widened in ticket["widened"]}
+            for path in normalized:
+                if path in allowed:
+                    raise LedgerError(f"{id}: {path} is already allowed by the approved findings")
+                if path in previous and previous[path] != reason:
+                    raise LedgerError(f"{id}: {path} is already widened for another reason: {previous[path]}")
+            now = _now()
+            _ = self._connection.executemany(
+                "INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
+                [(id, path, reason, by, now) for path in normalized if path not in previous],
+            )
+            return self._ticket(id)["widened"]
 
     def applied_check(self, finding: HeldFinding, commit: str) -> AppliedCheck:
         """Whether the finding's change is in the code at commit."""
@@ -2203,7 +2266,8 @@ class Ledger:
         ticket = self._ticket(id)
         if ticket["kind"] != "proposal":
             return SelectedByCoverage(ticket["base"])
-        return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(ticket["finding_ids"]))
+        return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(ticket["finding_ids"]),
+                                tuple(widened["path"] for widened in ticket["widened"]))
 
     def proposal_tickets(self) -> tuple[TicketRecord, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
