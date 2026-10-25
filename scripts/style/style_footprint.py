@@ -2236,8 +2236,9 @@ class ItemMove:
 
 @dataclass(frozen=True)
 class ItemMoves:
-    """The proven moves, and every other span the moves explain: A's removed uses, B's added uses, the added `mod`
-    line and each re-pointed path, which is respelled to the path of B in both texts."""
+    """The proven moves, which can go between several pairs of files, and every other span the moves explain: each
+    A's removed uses, each B's added uses, the added `mod` lines and each re-pointed path, which is respelled to the
+    path of its item's B in both texts."""
 
     moves: tuple[ItemMove, ...]
     removed_uses: tuple[FileSpan, ...]
@@ -2321,6 +2322,8 @@ STANDARD_DERIVES = frozenset({"Debug", "Clone", "Copy", "PartialEq", "Eq", "Part
 STANDARD_DERIVE_PREFIXES = frozenset({(), ("std", "::"), ("core", "::"), ("::", "std", "::"), ("::", "core", "::")})
 # The crates every glob of the standard library starts at.
 STANDARD_CRATES = frozenset({"std", "core", "alloc"})
+# The crates of the sysroot, which a path can name without a dependency.
+SYSROOT_CRATES = STANDARD_CRATES | {"proc_macro", "test"}
 
 
 def visibility_of(words: tuple[str, ...]) -> str:
@@ -2418,7 +2421,10 @@ def move_scope(words: tuple[str, ...], items: tuple[SourceItem, ...], module: Cr
     for item in items:
         if item.kind != "use":
             continue
-        paths = use_paths(words[item.keyword + 1:item.end - 1])
+        body = words[item.keyword + 1:item.end - 1]
+        if body[-2:] == ("::", "*") and use_paths(body[:-2]):
+            continue  # A glob binds no name the scope can read; `refuse_globs` reads it.
+        paths = use_paths(body)
         if not paths:
             raise MoveRefused(f"cannot read the use item `{' '.join(words[item.start:item.end])}`")
         for path in paths:
@@ -2575,6 +2581,31 @@ def bound_standard_names(sources: RevisionTree, crate: str, names: frozenset[str
     return frozenset(found)
 
 
+def refuse_old_edition(sources: RevisionTree, crate: str, manifest: dict[str, object]) -> None:
+    """Raise MoveRefused for a crate older than Rust 2018, where a path such as `use writer::*;` starts at the crate
+    root, not at an extern crate. A missing `edition` means 2015, and `edition.workspace = true` reads the edition of
+    the nearest workspace root manifest."""
+    package = manifest.get("package")
+    edition = cast(dict[str, object], package).get("edition", "2015") if isinstance(package, dict) else "2015"
+    if isinstance(edition, dict) and cast(dict[str, object], edition).get("workspace") is True:
+        edition = None
+        for directory in (PurePosixPath(crate), *PurePosixPath(crate).parents):
+            path = str(directory / "Cargo.toml")
+            if path not in sources.paths:
+                continue
+            try:
+                root = cast(dict[str, object], tomllib.loads(sources.text(path)))
+            except tomllib.TOMLDecodeError:
+                raise MoveRefused(f"cannot read {path}") from None
+            workspace = root.get("workspace")
+            if isinstance(workspace, dict):
+                table = cast(dict[str, object], workspace).get("package")
+                edition = cast(dict[str, object], table).get("edition") if isinstance(table, dict) else None
+                break
+    if not isinstance(edition, str) or not edition.isdigit() or int(edition) < 2018:
+        raise MoveRefused(f"the crate's edition is {edition or 'unknown'}, older than 2018 or unreadable")
+
+
 def library_name(manifest: dict[str, object]) -> str | None:
     """The name other crates of the package use for the library: `[lib] name`, else the package name."""
     tables = cast(dict[str, dict[str, object]], manifest)
@@ -2584,8 +2615,9 @@ def library_name(manifest: dict[str, object]) -> str | None:
 
 def move_text(path: str, after: bool, text: str, module: CrateModule, library: str | None,
               touched: bool = True) -> MoveText:
-    """The words, items and scope of one side of a file. A touched file refuses a glob use, a use with an attribute,
-    which can switch the use off, and a raw identifier, which names what its plain spelling names."""
+    """The words, items and scope of one side of a file. A touched file refuses a use with an attribute, which can
+    switch the use off, and a raw identifier, which names what its plain spelling names. `refuse_globs` reads its glob
+    uses."""
     if any(token.kind == "unknown" for token in tokens(text)):
         raise MoveRefused(f"{path}: an unknown token")
     spans = token_spans(text)
@@ -2594,10 +2626,7 @@ def move_text(path: str, after: bool, text: str, module: CrateModule, library: s
     if items is None:
         raise MoveRefused(f"{path}: cannot read its items")
     if touched:
-        uses = use_items(words)
-        if any("*" in words[use.start:use.end] for use in uses):
-            raise MoveRefused(f"{path}: a glob use")
-        if any(use.attributed for use in uses):
+        if any(use.attributed for use in use_items(words)):
             raise MoveRefused(f"{path}: a use with an attribute")
         if any(span.token.kind == "identifier" and span.token.value.startswith("r#") for span in spans):
             raise MoveRefused(f"{path}: a raw identifier")
@@ -2739,7 +2768,8 @@ def module_path(module: tuple[str, ...]) -> str:
 
 
 def prove_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) -> ItemMoves | NoItemMoves:
-    """Prove that the change only moves items from one module file to another of the same crate.
+    """Prove that the change only moves items between module files of the same crate: from each file A to one or
+    more files B, and no file is both an A and a B.
 
     Each moved item keeps its words and comments, and every other edit re-points a path from the old module to the
     new one or adds or removes a `use` line the move needs. The proof refuses whenever it is not sure.
@@ -2756,6 +2786,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
         raise MoveRefused("the change crosses crates")
     crate = crates.pop()
     manifest = crate_manifest(sources, crate)
+    refuse_old_edition(sources, crate, manifest)
     library = library_name(manifest)
     for change in changes:
         if change.status not in {FileStatus.MODIFIED, FileStatus.ADDED} or not change.path.endswith(".rs"):
@@ -2783,8 +2814,10 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                 pairs.append((source, copies[0], key))
                 added[copies[0]][key] -= 1
                 keyed[key] = 0
-    if len({(source, destination) for source, destination, _ in pairs}) > 1:
-        raise MoveRefused("items move between more than one pair of files")
+    sources_of = {source for source, _, _ in pairs}
+    destinations = {destination for _, destination, _ in pairs}
+    if sources_of & destinations:
+        raise MoveRefused(f"{min(sources_of & destinations)} is both a source and a destination of the move")
     titles = {path: {(kind, title) for kind, title, _ in +keyed} for path, keyed in removed.items()}
     for path, keyed in added.items():
         for key in +keyed:
@@ -2792,7 +2825,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                 raise MoveRefused(f"{key[1]} changes during the move")
             if any(key in keys(text) for text in befores.values()) or untouched_copy(sources, crate, befores, key):
                 raise MoveRefused(f"two copies of {key[1]}")
-            if pairs and path == pairs[0][1]:
+            if path in destinations:
                 raise MoveRefused(f"{path} gains another item: {key[1]}")
     for path, keyed in removed.items():
         for key in +keyed:
@@ -2800,69 +2833,99 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                 raise MoveRefused(f"{path} loses {key[1]}")
     if not pairs:
         raise MoveRefused("no item moves")
-    path_a, path_b = pairs[0][0], pairs[0][1]
-    module_a, module_b = modules[path_a], modules[path_b]
-    if isinstance(module_a, OutsideCrate) or isinstance(module_b, OutsideCrate):
+    if any(isinstance(modules[path], OutsideCrate) for path in sources_of | destinations):
         raise MoveRefused("an item moves to or from a file outside the crate's module tree")
-    before_a, after_a, before_b, after_b = befores[path_a], afters[path_a], befores[path_b], afters[path_b]
+    # Each pair of files moves its items by the rules of one move; a file is the source or the destination of any
+    # number of pairs. The source of a pair is A and its destination B.
+    module_of = {path: module for path, module in modules.items() if not isinstance(module, OutsideCrate)}
+    groups: dict[tuple[str, str], list[tuple[str, str, tuple[str, ...]]]] = {}
+    for source, destination, key in pairs:
+        groups.setdefault((source, destination), []).append(key)
     # A path from std, core or alloc, such as `std::Clone` in a derive, names the standard library only while no
     # dependency and no file of the crate gives the name to another crate or module.
-    sides = (before_a, after_a, before_b, after_b)
-    named = STANDARD_CRATES & {word for text in sides for word in text.words}
-    rebound = named and (named & dependency_names(manifest)
-                         | bound_standard_names(sources, crate, named, befores, afters))
+    sides = (*(befores[path] for path in sorted(sources_of | destinations)),
+             *(afters[path] for path in sorted(sources_of | destinations)))
+    standard = (STANDARD_CRATES & dependency_names(manifest)
+                | bound_standard_names(sources, crate, STANDARD_CRATES, befores, afters))
+    rebound = STANDARD_CRATES & {word for text in sides for word in text.words} & standard
+    # A glob's first name names another crate only while it is a dependency or a sysroot crate that no file binds.
+    candidates = dependency_names(manifest) | SYSROOT_CRATES
+    externs = candidates - bound_standard_names(sources, crate, candidates, befores, afters)
     if rebound:
-        raise MoveRefused(f"{path_a} or {path_b} names {min(rebound)}, and the crate gives the name to another "
-                          + "crate or module")
+        named = " or ".join(dict.fromkeys(path for pair in groups for path in pair))
+        raise MoveRefused(f"{named} names {min(rebound)}, and the crate gives the name to another crate or module")
     # A use can give the name of a standard derive or an allowed attribute to a macro of another crate.
     for text in sides:
         for name, paths in text.scope.imports.items():
             if name in STANDARD_DERIVES | ITEM_ATTRIBUTES and any(path[0] not in STANDARD_CRATES for path in paths):
                 raise MoveRefused(f"{text.path} imports {name}, the name of a standard derive or attribute")
 
-    # Each moved item keeps its words and its comments.
+    # Each moved item keeps its words and its comments. The spans carry the paths of A and B.
     moved: list[tuple[SourceItem, SourceItem, FileSpan, FileSpan]] = []
-    for _, _, key in pairs:
-        source_item = next(item for item in before_a.items if item_key(before_a, item) == key)
-        destination_item = next(item for item in after_b.items if item_key(after_b, item) == key)
-        if source_item.kind not in MOVABLE_KINDS:
-            raise MoveRefused(f"a {source_item.kind} moves: {source_item.title}")
-        if source_item.visibility == "other":
-            raise MoveRefused(f"{source_item.title} has a visibility the proof cannot read")
-        source, destination = item_region(before_a, source_item), item_region(after_b, destination_item)
-        if region_shape(change_text(before_a, source)) != region_shape(change_text(after_b, destination)):
-            raise MoveRefused(f"the doc comment of {source_item.title} is left behind or changed")
-        moved.append((source_item, destination_item, source, destination))
+    for (path_a, path_b), group in groups.items():
+        before_a, after_b = befores[path_a], afters[path_b]
+        for key in group:
+            source_item = next(item for item in before_a.items if item_key(before_a, item) == key)
+            destination_item = next(item for item in after_b.items if item_key(after_b, item) == key)
+            if source_item.kind not in MOVABLE_KINDS:
+                raise MoveRefused(f"a {source_item.kind} moves: {source_item.title}")
+            if source_item.visibility == "other":
+                raise MoveRefused(f"{source_item.title} has a visibility the proof cannot read")
+            source, destination = item_region(before_a, source_item), item_region(after_b, destination_item)
+            if region_shape(change_text(before_a, source)) != region_shape(change_text(after_b, destination)):
+                raise MoveRefused(f"the doc comment of {source_item.title} is left behind or changed")
+            moved.append((source_item, destination_item, source, destination))
     # A derive or an attribute macro can read the module path, as bevy's `Reflect` does for a type path, and a cfg
     # decides whether code exists, so a moved item carries only attributes that read nothing.
-    for item, _, _, _ in moved:
-        for begin, end in attribute_spans(before_a.words[item.start:item.end]):
-            name = macro_attribute(before_a.words[item.start + begin:item.start + end])
+    for item, _, source, _ in moved:
+        words = befores[source.path].words
+        for begin, end in attribute_spans(words[item.start:item.end]):
+            name = macro_attribute(words[item.start + begin:item.start + end])
             if name is not None:
                 raise MoveRefused(f"{item.title} has an attribute a macro can read: {name}")
-    for module, texts in ((module_a, befores), (module_b, afters)):
-        problem = module_chain(module, sources, crate, texts)
+    for path, texts in (*((path, befores) for path in sorted(sources_of)),
+                        *((path, afters) for path in sorted(destinations))):
+        problem = module_chain(module_of[path], sources, crate, texts)
         if problem is not None:
             raise MoveRefused(problem)
     names = [item.name for item, _, _, _ in moved if item.kind != "impl"]
     if len(names) != len(set(names)):
         raise MoveRefused("two moved items have one name")
-    source_cut = frozenset(index for _, _, span, _ in moved for index in word_range(before_a, span))
-    destination_cut = frozenset(index for _, _, _, span in moved for index in word_range(after_b, span))
-    moved_names = frozenset[str]().union(*(scope_names(before_a, item.start, item.end) for item, _, _, _ in moved))
+    # The pair of each moved name, and the cuts of its words: by pair, and by file over all its pairs.
+    pair_of = {item.name: (source.path, destination.path) for item, _, source, destination in moved
+               if item.kind != "impl"}
+    pair_moves = {pair: [move for move in moved if (move[2].path, move[3].path) == pair] for pair in groups}
+    pair_source_cuts = {pair: frozenset(index for _, _, span, _ in pair_moves[pair]
+                                        for index in word_range(befores[pair[0]], span)) for pair in groups}
+    pair_destination_cuts = {pair: frozenset(index for _, _, _, span in pair_moves[pair]
+                                             for index in word_range(afters[pair[1]], span)) for pair in groups}
+    source_cuts = {path: frozenset[int]().union(*(cut for pair, cut in pair_source_cuts.items() if pair[0] == path))
+                   for path in sources_of}
+    destination_cuts = {path: frozenset[int]().union(*(cut for pair, cut in pair_destination_cuts.items()
+                                                       if pair[1] == path)) for path in destinations}
+    pair_names = {pair: frozenset[str]().union(*(scope_names(befores[pair[0]], item.start, item.end)
+                                                 for item, _, _, _ in pair_moves[pair])) for pair in groups}
+    out_names = {path: frozenset[str]().union(*(names for pair, names in pair_names.items() if pair[0] == path))
+                 for path in sources_of}
+    in_names = {path: frozenset[str]().union(*(names for pair, names in pair_names.items() if pair[1] == path))
+                for path in destinations}
     # A macro or an attribute macro outside a fn body can define a name that a moved item looks up, and expand it
     # differently in A and in B, and an inner attribute such as `no_implicit_prelude` changes how names resolve. The
     # checks above and below read the moved items.
-    for text, cut in ((before_a, source_cut), (after_a, frozenset[int]()), (before_b, frozenset[int]()),
-                      (after_b, destination_cut)):
+    for text, cut in (*((befores[path], source_cuts[path]) for path in sorted(sources_of)),
+                      *((afters[path], frozenset[int]()) for path in sorted(sources_of)),
+                      *((befores[path], frozenset[int]()) for path in sorted(destinations)),
+                      *((afters[path], destination_cuts[path]) for path in sorted(destinations))):
         expansion = item_level_expansion(text.words, cut)
         if expansion is not None:
             raise MoveRefused(f"{text.path} has {expansion}")
 
     # A new module file holds only moved items and uses, and its one added `mod` line is no more visible than they are.
     module_lines: list[FileSpan] = []
-    change_b = next(change for change in changes if change.path == path_b)
-    if change_b.status == FileStatus.ADDED:
+    for path_b in sorted(destinations):
+        module_b = module_of[path_b]
+        if next(change for change in changes if change.path == path_b).status != FileStatus.ADDED:
+            continue
         if not module_b:
             raise MoveRefused(f"{path_b} is a new crate root")
         parents = [path for path, module in modules.items() if module == module_b[:-1]
@@ -2870,20 +2933,23 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
         if len(parents) != 1:
             raise MoveRefused(f"no one changed parent file declares {path_b}")
         parent_before, parent_after = befores[parents[0]], afters[parents[0]]
-        declared = Counter(parent_before.words[item.start:item.end] for item in parent_before.items if item.kind == "mod")
+        declared = Counter(parent_before.words[item.start:item.end] for item in parent_before.items
+                           if item.kind == "mod")
         lines = [item for item in parent_after.items if item.kind == "mod" and item.name == module_b[-1]
                  and parent_after.words[item.end - 1] == ";"
                  and not declared[parent_after.words[item.start:item.end]]]
         if len(lines) != 1 or parent_after.words[lines[0].start] == "#":
             raise MoveRefused(f"{parents[0]} does not gain exactly one plain `mod {module_b[-1]};` line")
-        rank = min((VISIBILITY_RANKS.get(item.visibility, 0) if item.kind != "impl" else 0) for item, _, _, _ in moved)
+        rank = min((VISIBILITY_RANKS.get(item.visibility, 0) if item.kind != "impl" else 0)
+                   for item, _, _, destination in moved if destination.path == path_b)
         if VISIBILITY_RANKS.get(lines[0].visibility, 3) > rank:
             raise MoveRefused(f"`mod {module_b[-1]};` is more visible than the items it holds")
         module_lines.append(word_span(parent_after, lines[0].start, lines[0].end))
 
     # B has no other binding of a moved name.
     for name in names:
-        if name in bare_names(before_b.words, frozenset()):
+        path_b = pair_of[name][1]
+        if name in bare_names(befores[path_b].words, frozenset()):
             raise MoveRefused(f"name collision: {path_b} already has {name}")
 
     def use_counts(text: MoveText) -> Counter[tuple[str, ...]]:
@@ -2900,95 +2966,144 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                 result.append(item)
         return result
 
-    # A's added use of a moved item: a re-export as visible as the item, or a plain import for A's own uses.
+    # A's added use of a moved item: a re-export as visible as the item, or a plain import for A's own uses. It
+    # names the B the item moves to.
     source_uses: dict[str, SourceItem] = {}
-    for item in use_changes(before_a, after_a):
-        paths = use_paths(after_a.words[item.keyword + 1:item.end - 1])
-        if len(paths) != 1 or paths[0][-1] not in names or scoped_path(paths[0][:-1], after_a.scope) != (
-                "crate", *module_b):
-            continue
-        if paths[0][-1] in source_uses:
-            raise MoveRefused(f"{path_a} gains more than one plain use of {paths[0][-1]}")
-        source_uses[paths[0][-1]] = item
+    source_use_cuts: dict[str, frozenset[int]] = {}
     reexported: set[str] = set()
-    for item, _, _, _ in moved:
-        use = source_uses.get(item.name)
-        if use is None:
-            continue
-        visibility = visibility_of(after_a.words[use.start:use.keyword])
-        if visibility and visibility != item.visibility:
-            raise MoveRefused(f"the re-export of {item.name} in {path_a} is `{visibility}`, and the item is "
-                              + f"`{item.visibility or 'private'}`")
-        if visibility:
-            reexported.add(item.name)
-    source_use_cut = frozenset(index for use in source_uses.values() for index in range(use.start, use.end))
+    for path_a in sorted(sources_of):
+        after_a = afters[path_a]
+        uses: dict[str, SourceItem] = {}
+        for item in use_changes(befores[path_a], after_a):
+            paths = use_paths(after_a.words[item.keyword + 1:item.end - 1])
+            if len(paths) != 1 or pair_of.get(paths[0][-1], ("", ""))[0] != path_a or scoped_path(
+                    paths[0][:-1], after_a.scope) != ("crate", *module_of[pair_of[paths[0][-1]][1]]):
+                continue
+            if paths[0][-1] in uses:
+                raise MoveRefused(f"{path_a} gains more than one plain use of {paths[0][-1]}")
+            uses[paths[0][-1]] = item
+        for item, _, source, _ in moved:
+            use = uses.get(item.name)
+            if use is None or source.path != path_a:
+                continue
+            visibility = visibility_of(after_a.words[use.start:use.keyword])
+            if visibility and visibility != item.visibility:
+                raise MoveRefused(f"the re-export of {item.name} in {path_a} is `{visibility}`, and the item is "
+                                  + f"`{item.visibility or 'private'}`")
+            if visibility:
+                reexported.add(item.name)
+        source_uses.update(uses)
+        source_use_cuts[path_a] = frozenset(index for use in uses.values() for index in range(use.start, use.end))
 
-    # B's added uses import only what the moved items name, and nothing from A.
+    # B's added uses import only what the moved items name, and nothing from an A of B.
     added_uses: list[FileSpan] = []
-    own_leaves: set[str] = set()  # The names that the moved items' own use lines in A and in B import.
-    before_b_names = bare_names(before_b.words, frozenset())
-    destination_use_cut: set[int] = set()
-    for item in use_changes(before_b, after_b):
-        if after_b.words[item.start] != "use":
-            raise MoveRefused(f"{path_b} gains a use that is not a plain `use`")
-        for path in use_paths(after_b.words[item.keyword + 1:item.end - 1]):
-            target = scoped_path(path, after_b.scope)
-            if isinstance(target, UnresolvedPath):
-                raise MoveRefused(f"{path_b}: cannot resolve the added use of {'::'.join(path)}")
-            if target[:len(module_a) + 1] == ("crate", *module_a):
-                raise MoveRefused(f"{path_b} imports {'::'.join(path)} from {path_a}: an import cycle")
-            leaf = path[-2] if path[-1] == "self" else path[-1]
-            if leaf not in moved_names:
-                raise MoveRefused(f"{path_b} gains a use of {leaf}, and no moved item names it")
-            if leaf in before_b_names:
-                raise MoveRefused(f"{path_b} already names {leaf}, and its added use can shadow it")
-            own_leaves.add(leaf)
-        added_uses.append(word_span(after_b, item.start, item.end))
-        destination_use_cut.update(range(item.start, item.end))
+    added_leaves: dict[str, set[str]] = {}  # The names that B's added use lines import.
+    destination_use_cuts: dict[str, frozenset[int]] = {}
+    for path_b in sorted(destinations):
+        before_b, after_b = befores[path_b], afters[path_b]
+        before_b_names = bare_names(before_b.words, frozenset())
+        leaves_b: set[str] = set()
+        use_cut: set[int] = set()
+        for item in use_changes(before_b, after_b):
+            if after_b.words[item.start] != "use":
+                raise MoveRefused(f"{path_b} gains a use that is not a plain `use`")
+            for path in use_paths(after_b.words[item.keyword + 1:item.end - 1]):
+                target = scoped_path(path, after_b.scope)
+                if isinstance(target, UnresolvedPath):
+                    raise MoveRefused(f"{path_b}: cannot resolve the added use of {'::'.join(path)}")
+                for path_a in sorted(source for source, destination in groups if destination == path_b):
+                    if target[:len(module_of[path_a]) + 1] == ("crate", *module_of[path_a]):
+                        raise MoveRefused(f"{path_b} imports {'::'.join(path)} from {path_a}: an import cycle")
+                leaf = path[-2] if path[-1] == "self" else path[-1]
+                if leaf not in in_names[path_b]:
+                    raise MoveRefused(f"{path_b} gains a use of {leaf}, and no moved item names it")
+                if leaf in before_b_names:
+                    raise MoveRefused(f"{path_b} already names {leaf}, and its added use can shadow it")
+                leaves_b.add(leaf)
+            added_uses.append(word_span(after_b, item.start, item.end))
+            use_cut.update(range(item.start, item.end))
+        added_leaves[path_b] = leaves_b
+        destination_use_cuts[path_b] = frozenset(use_cut)
 
-    # A's removed uses served only the moved items.
+    # A's removed uses served only the items that leave it.
     removed_uses: list[FileSpan] = []
-    removed_use_cut: set[int] = set()
-    kept_cut = source_cut | frozenset(index for item in before_a.items if item.kind == "use"
-                                      for index in range(item.start, item.end))
-    kept_names = bare_names(before_a.words, kept_cut)
-    for item in use_changes(after_a, before_a):
-        paths = use_paths(before_a.words[item.keyword + 1:item.end - 1])
-        leaves = {path[-2] if path[-1] == "self" else path[-1] for path in paths}
-        if before_a.words[item.start] != "use" or not leaves <= moved_names or leaves & kept_names:
-            continue  # The canonical comparison refuses a use that leaves for another reason.
-        own_leaves.update(leaves)
-        removed_uses.append(word_span(before_a, item.start, item.end))
-        removed_use_cut.update(range(item.start, item.end))
+    removed_leaves: dict[str, set[str]] = {}  # The names that A's removed use lines imported.
+    removed_use_cuts: dict[str, frozenset[int]] = {}
+    for path_a in sorted(sources_of):
+        before_a = befores[path_a]
+        kept_cut = source_cuts[path_a] | frozenset(index for item in before_a.items if item.kind == "use"
+                                                   for index in range(item.start, item.end))
+        kept_names = bare_names(before_a.words, kept_cut)
+        leaves_a: set[str] = set()
+        removed_cut: set[int] = set()
+        for item in use_changes(afters[path_a], before_a):
+            paths = use_paths(before_a.words[item.keyword + 1:item.end - 1])
+            leaves = {path[-2] if path[-1] == "self" else path[-1] for path in paths}
+            if before_a.words[item.start] != "use" or not leaves <= out_names[path_a] or leaves & kept_names:
+                continue  # The canonical comparison refuses a use that leaves for another reason.
+            leaves_a.update(leaves)
+            removed_uses.append(word_span(before_a, item.start, item.end))
+            removed_cut.update(range(item.start, item.end))
+        removed_leaves[path_a] = leaves_a
+        removed_use_cuts[path_a] = frozenset(removed_cut)
 
-    # Every name a moved item looks up binds the same in A before and in B after.
-    def mapped(target: tuple[str, ...] | UnresolvedPath) -> tuple[str, ...] | UnresolvedPath:
-        if isinstance(target, UnresolvedPath):
+    # Every name a moved item looks up binds the same in A before and in B after. After the move, the path of an A
+    # names a moved item only through its re-export.
+    moved_paths: dict[tuple[tuple[str, ...], bool], str] = {}
+    for name, (path_a, path_b) in pair_of.items():
+        moved_paths[(("crate", *module_of[path_a], name), False)] = name
+        moved_paths[(("crate", *module_of[path_b], name), False)] = name
+        moved_paths[(("crate", *module_of[path_b], name), True)] = name
+        if name in reexported:
+            moved_paths[(("crate", *module_of[path_a], name), True)] = name
+
+    def mapped(target: tuple[str, ...] | UnresolvedPath, after: bool) -> tuple[str, ...] | UnresolvedPath:
+        if isinstance(target, UnresolvedPath) or (target, after) not in moved_paths:
             return target
-        for name in names:
-            if target in {("crate", *module_a, name), ("crate", *module_b, name)}:
-                return ("moved", name)
-        return target
+        return ("moved", moved_paths[(target, after)])
 
-    for name in sorted(moved_names):
-        old, new = mapped(bound_path(name, before_a.scope)), mapped(bound_path(name, after_b.scope))
-        if isinstance(old, UnresolvedPath) or isinstance(new, UnresolvedPath) or old != new:
-            raise MoveRefused(f"{name} does not bind the same in {path_a} and in {path_b}")
+    refuse_globs(sources, crate, befores, afters, frozenset(module_of[path] for path in sources_of | destinations),
+                 library, externs)
+
+    # A glob at module level gives a moved item every name it imports and does not shadow, so A before and B after
+    # glob the same modules and crates.
+    def module_globs(text: MoveText) -> frozenset[tuple[str, ...]]:
+        used = {index for item in text.items if item.kind == "use" for index in range(item.start, item.end)}
+        return frozenset(target for index, target in file_globs(text.path, text.words, text.scope.module, library,
+                                                                externs).items() if index in used)
+
+    # A glob in A or B can bring a macro named like a standard derive or an allowed attribute, so only a glob of the
+    # standard library or of a crate module that `refuse_globs` accepted stands there.
+    for text in sides:
+        for target in file_globs(text.path, text.words, text.scope.module, library, externs).values():
+            if target[0] != "crate" and target[1] not in STANDARD_CRATES - standard:
+                raise MoveRefused(f"{text.path}: a glob use of the crate {target[1]}")
+    for path_a, path_b in groups:
+        if module_globs(befores[path_a]) != module_globs(afters[path_b]):
+            raise MoveRefused(f"{path_a} and {path_b} glob different modules or crates")
+        for name in sorted(pair_names[(path_a, path_b)]):
+            old = mapped(bound_path(name, befores[path_a].scope), False)
+            new = mapped(bound_path(name, afters[path_b].scope), True)
+            if isinstance(old, UnresolvedPath) or isinstance(new, UnresolvedPath) or old != new:
+                raise MoveRefused(f"{name} does not bind the same in {path_a} and in {path_b}")
     refuse_crate_words(sources, crate, changes, afters)
-    untouched_globs(sources, crate, afters, {module_a, module_b})
     # A type name reads the module path of a type the move takes to B. Outside the touched files it stays diagnostic
     # text, as the file and line in the text of a `panic` or an `unwrap` do.
     for text in (*befores.values(), *afters.values()):
         if {"type_name", "type_name_of_val"} & set(text.words):
             raise MoveRefused(f"{text.path} reads a type name")
-    for item, _, _, _ in moved:
-        words = before_a.words[item.start:item.end]
+    for item, _, source, destination in moved:
+        path_a, path_b = source.path, destination.path
+        words = befores[path_a].words[item.start:item.end]
         for index, word in enumerate(words):
             if word in {"self", "super"} and words[index + 1:index + 2] == ("::",):
                 raise MoveRefused(f"{item.title} has a `{word}::` path")
             if word == "crate" and words[index + 1:index + 2] == ("::",) and tuple(
-                    words[index + 2:index + 2 * len(module_a) + 1:2]) == module_a:
+                    words[index + 2:index + 2 * len(module_of[path_a]) + 1:2]) == module_of[path_a]:
                 raise MoveRefused(f"{item.title} names {path_a} by its path: an import cycle")
+            # The text of a moved item stays the same, so a path in it to a moved item keeps the old module.
+            if word in pair_of and words[index - 1:index] == ("::",):
+                raise MoveRefused(f"{item.title} names the moved item {word} by a path")
             if word == "use":
                 raise MoveRefused(f"{item.title} has a use inside")
             if IDENTIFIER.fullmatch(word) and words[index + 1:index + 2] == ("!",) and words[index + 2:index + 3] in {
@@ -3001,70 +3116,85 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                 and (IDENTIFIER.fullmatch(words[index - 1]) or words[index - 1] == ">"))
                or (IDENTIFIER.fullmatch(words[index]) and words[index - 1] == "." and words[index + 1] in {"(", "::"})
                for index in range(1, len(words) - 1)):
+            before_a, after_b = befores[path_a], afters[path_b]
+            # The names the moved items' own use lines in A and in B import bind the same: the check above reads them.
+            own_leaves = (removed_leaves[path_a] | added_leaves[path_b]) & pair_names[(path_a, path_b)]
             in_scope = {name for text in (before_a, after_b) for name in (*text.scope.traits, *text.scope.imports)
                         } - own_leaves
             for name in sorted(in_scope):
-                if mapped(bound_path(name, before_a.scope)) != mapped(bound_path(name, after_b.scope)):
+                if mapped(bound_path(name, before_a.scope), False) != mapped(bound_path(name, after_b.scope), True):
                     raise MoveRefused(f"{name} is in scope in only one of {path_a} and {path_b}: a method call or an "
                                       + f"associated path in {item.title} can change")
 
     # A still binds each name its other code uses.
-    a_names = bare_names(after_a.words, source_use_cut)
-    for item, _, _, _ in moved:
-        if item.kind == "impl":
-            continue
-        if item.name in a_names and item.name not in source_uses:
-            raise MoveRefused(f"{path_a} still names {item.name}, and no use brings it")
-        if item.visibility == "" and item.name in source_uses:
-            raise MoveRefused(f"the private item {item.name} is still used outside {path_b}")
-        if item.visibility == "pub" and item.name not in reexported and sources.externally_reachable(path_a):
-            raise MoveRefused(f"the public item {item.name} leaves {path_a} without a re-export, and other crates "
-                              + f"can reach {path_a}")
+    for path_a in sorted(sources_of):
+        a_names = bare_names(afters[path_a].words, source_use_cuts[path_a])
+        for item, _, source, _ in moved:
+            if item.kind == "impl" or source.path != path_a:
+                continue
+            if item.name in a_names and item.name not in source_uses:
+                raise MoveRefused(f"{path_a} still names {item.name}, and no use brings it")
+            if item.visibility == "" and item.name in source_uses:
+                raise MoveRefused(f"the private item {item.name} is still used outside {pair_of[item.name][1]}")
+            if item.visibility == "pub" and item.name not in reexported and sources.externally_reachable(path_a):
+                raise MoveRefused(f"the public item {item.name} leaves {path_a} without a re-export, and other "
+                                  + f"crates can reach {path_a}")
 
-    # Private members change who can see them.
+    # Private members change who can see them. The kept code of A holds the items of A's other pairs.
     files = crate_files(sources, crate, changes)
-    owned = private_members(before_a, tuple(item for item, _, _, _ in moved))
-    for path, module in files.items():
-        if isinstance(module, OutsideCrate) or (module[:len(module_a)] == module_a) == (
-                module[:len(module_b)] == module_b):
-            continue
-        words = afters[path].words if path in afters else tuple(token.value for token in tokens(sources.text(path)))
-        cut = destination_cut if path == path_b else frozenset[int]()
-        for index in range(1, len(words)):
-            if words[index] in owned and words[index - 1] in {".", "::"} and index not in cut:
-                raise MoveRefused(f"the private member {words[index]} of {owned[words[index]]} changes who can see it")
-    lineage_a = {module_a[:size] for size in range(len(module_a) + 1)}
-    lineage_b = {module_b[:size] for size in range(len(module_b) + 1)}
-    members = {before_a.words[index] for index in source_cut if before_a.words[index - 1] in {".", "::"}}
-    for path, module in files.items():
-        if isinstance(module, OutsideCrate) or module not in lineage_a ^ lineage_b:
-            continue
-        text = befores[path] if path in befores else move_text(path, False, sources.text(path), module, library,
-                                                               touched=False)
-        kept = tuple(item for item in text.items if path != path_a or item.start not in source_cut)
-        for member, title in private_members(text, kept).items():
-            if member in members:
-                raise MoveRefused(f"the private member {member} of {title} changes who can see it")
+    for (path_a, path_b), group in pair_moves.items():
+        module_a, module_b = module_of[path_a], module_of[path_b]
+        before_a = befores[path_a]
+        owned = private_members(before_a, tuple(item for item, _, _, _ in group))
+        for path, module in files.items():
+            if isinstance(module, OutsideCrate) or (module[:len(module_a)] == module_a) == (
+                    module[:len(module_b)] == module_b):
+                continue
+            words = afters[path].words if path in afters else tuple(token.value for token in tokens(sources.text(path)))
+            cut = pair_destination_cuts[(path_a, path_b)] if path == path_b else frozenset[int]()
+            for index in range(1, len(words)):
+                if words[index] in owned and words[index - 1] in {".", "::"} and index not in cut:
+                    raise MoveRefused(f"the private member {words[index]} of {owned[words[index]]} changes who can "
+                                      + "see it")
+        lineage_a = {module_a[:size] for size in range(len(module_a) + 1)}
+        lineage_b = {module_b[:size] for size in range(len(module_b) + 1)}
+        pair_cut = pair_source_cuts[(path_a, path_b)]
+        members = {before_a.words[index] for index in pair_cut if before_a.words[index - 1] in {".", "::"}}
+        for path, module in files.items():
+            if isinstance(module, OutsideCrate) or module not in lineage_a ^ lineage_b:
+                continue
+            text = befores[path] if path in befores else move_text(path, False, sources.text(path), module, library,
+                                                                   touched=False)
+            kept = tuple(item for item in text.items if path != path_a or item.start not in pair_cut)
+            for member, title in private_members(text, kept).items():
+                if member in members:
+                    raise MoveRefused(f"the private member {member} of {title} changes who can see it")
 
     # Every path to a moved item names A before and B after, or A through its re-export.
     sites: list[FileSpan] = []
     heads: set[str] = set()
-    cuts = {(path_a, False): source_cut | removed_use_cut, (path_a, True): source_use_cut,
-            (path_b, True): destination_cut | frozenset(destination_use_cut)}
+    cuts: dict[tuple[str, bool], frozenset[int]] = {}
+    for path in sources_of:
+        cuts[(path, False)] = source_cuts[path] | removed_use_cuts[path]
+        cuts[(path, True)] = source_use_cuts[path]
+    for path in destinations:
+        cuts[(path, True)] = destination_cuts[path] | destination_use_cuts[path]
     for line in module_lines:
         parent = afters[line.path]
         cuts[(line.path, True)] = cuts.get((line.path, True), frozenset()) | frozenset(word_range(parent, line))
-    for item, _, _, _ in moved:
+    for item, _, source, destination in moved:
         if item.kind == "impl":
             continue
+        path_a, path_b = source.path, destination.path
+        module_a, module_b = module_of[path_a], module_of[path_b]
         for path, module in files.items():
             if path in befores:
-                sides = (befores[path], afters[path])
+                texts = (befores[path], afters[path])
             elif re.search(rf"\b{re.escape(item.name)}\b", sources.text(path)):
-                sides = (move_text(path, False, sources.text(path), module, library, touched=False),)
+                texts = (move_text(path, False, sources.text(path), module, library, touched=False),)
             else:
                 continue
-            for text in sides:
+            for text in texts:
                 blocked: tuple[tuple[int, int], ...] | None = None
                 for first, index, target in path_sites(text, item.name, cuts.get((path, text.after), frozenset())):
                     if target not in {("crate", *module_a), ("crate", *module_b)}:
@@ -3104,8 +3234,8 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
 
     proof = ItemMoves(
         tuple(ItemMove(item.kind, item.name, source, destination,
-                       word_span(after_a, source_uses[item.name].start, source_uses[item.name].end)
-                       if item.name in source_uses else None)
+                       word_span(afters[source.path], source_uses[item.name].start, source_uses[item.name].end)
+                       if item.kind != "impl" and item.name in source_uses else None)
               for item, _, source, destination in moved),
         tuple(removed_uses), tuple(added_uses), tuple(module_lines), tuple(sites))
 
@@ -3195,13 +3325,18 @@ def refuse_crate_words(sources: RevisionTree, crate: str, changes: tuple[FileCha
             if words[index:index + 2] == ("extern", "crate") and words[index + 3] == "as":
                 raise MoveRefused(f"{path}: an `extern crate` that takes another name")
         for begin, end in attributes:
-            if attribute_name(words, begin) != "macro_use" or words[begin + 1] == "!":
+            # A `cfg_attr` can hold a `macro_use` at any depth, so each `macro_use` word of the attribute counts.
+            if words[begin + 1] == "!":
                 continue
-            # A list names the macros it brings. Without one, only an extern crate can bring a derive.
-            listed = words[begin + 3:begin + 4] == ("(",)
-            if (listed and (STANDARD_DERIVES | ITEM_ATTRIBUTES) & set(words[begin:end])) or (
-                    not listed and extern_crate_follows(words, end, dict(attributes))):
-                raise MoveRefused(f"{path}: a `macro_use` can bring a macro named like a standard derive or attribute")
+            for index in range(begin + 2, end):
+                if words[index] != "macro_use":
+                    continue
+                # A list names the macros it brings. Without one, only an extern crate can bring a derive.
+                listed = words[index + 1:index + 2] == ("(",)
+                if (listed and (STANDARD_DERIVES | ITEM_ATTRIBUTES) & set(words[begin:end])) or (
+                        not listed and extern_crate_follows(words, end, dict(attributes))):
+                    raise MoveRefused(f"{path}: a `macro_use` can bring a macro named like a standard derive or "
+                                      + "attribute")
 
 
 def extern_crate_follows(words: tuple[str, ...], cursor: int, attributes: dict[int, int]) -> bool:
@@ -3299,37 +3434,103 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
     return None
 
 
-def untouched_globs(sources: RevisionTree, crate: str, afters: Mapping[str, MoveText],
-                    modules: set[tuple[str, ...]]) -> None:
-    """Raise MoveRefused for a glob use in a file the change does not touch that can import from one of modules.
+def refuse_globs(sources: RevisionTree, crate: str, befores: Mapping[str, MoveText], afters: Mapping[str, MoveText],
+                 modules: frozenset[tuple[str, ...]], library: str | None, externs: frozenset[str]) -> None:
+    """Raise MoveRefused for a glob use in a file of the crate, before or after the change, that can import from one
+    of modules, the modules the items move from and to.
 
-    A glob of the standard library, or of a crate the file does not bind as a module, imports nothing of the crate.
-    A file outside the crate's module tree cannot name its modules through an anchor.
+    One rule holds for touched and untouched files: a glob is accepted only when it imports from the standard
+    library, from another crate, or from a module of the crate that exports only its own items, which the move does
+    not change (`glob_module_problem`).
     """
-    for path, module in crate_files(sources, crate, ()).items():
-        source = sources.text(path)
-        if path in afters or not re.search(r"\buse\b[^;]*\*", source):
+    files = {**crate_files(sources, crate, ()), **{path: text.scope.module for path, text in afters.items()}}
+    problems: dict[tuple[str, ...], str | None] = {}
+    for path, module in files.items():
+        if path in afters:
+            sides = (befores[path].words, afters[path].words)
+        elif GLOB_USE.search(sources.text(path)):
+            sides = (tuple(token.value.removeprefix("r#") for token in tokens(sources.text(path))),)
+        else:
             continue
-        words = tuple(token.value for token in tokens(source))
-        context = import_context(words)
-        trees = use_trees(words, code_item_starts(words))
-        bound = {used[-1] for use in use_items(words) for used in use.paths} | {
-            words[index + 1] for index in range(len(words) - 1) if words[index] in {"mod", "as"}}
-        for index, prefix in trees.prefixes.items():
-            if words[index] != "*" or prefix[:1] and prefix[0] in STANDARD_CRATES:
-                continue
-            if prefix[:1] and prefix[0] in PATH_ANCHORS:
-                if isinstance(module, OutsideCrate):
+        for words in sides:
+            for target in file_globs(path, words, module, library, externs).values():
+                if target[0] != "crate":
                     continue
-                inline = tuple(name.split("@")[0] for name in context.scopes[index].module)
-                target = resolved_module(prefix, (*module, *inline))
-                if isinstance(target, UnresolvedPath) or target not in modules:
-                    if isinstance(target, UnresolvedPath):
-                        raise MoveRefused(f"{path}: a glob use the proof cannot resolve")
-                    continue
-                raise MoveRefused(f"{path}: a glob use of a module the move changes")
-            if not prefix or prefix[0] in bound:
+                if target[1:] not in problems:
+                    problems[target[1:]] = glob_module_problem(target[1:], files, sources, afters, modules)
+                problem = problems[target[1:]]
+                if problem is not None:
+                    raise MoveRefused(f"{path}: a glob use of {module_path(target[1:])}, {problem}")
+
+
+# A use with a `*` before its `;`, which the glob rule reads.
+GLOB_USE = re.compile(r"\buse\b[^;]*\*")
+
+
+def file_globs(path: str, words: tuple[str, ...], module: CrateModule, library: str | None,
+               externs: frozenset[str]) -> dict[int, tuple[str, ...]]:
+    """What each glob use of a file imports from, by the index of its `*`: `("crate", *module)`, `("extern", *path)`
+    for the standard library or another crate, or `("outside", *path)` for an anchored path in a file outside the
+    crate's module tree, which cannot name the crate's modules. Raises MoveRefused for a glob it cannot resolve.
+
+    Another first name names a crate only when it is in externs: a dependency key or a sysroot crate that no file of
+    the crate, before or after, holds anywhere but right before `::`, where an item, a use, a `mod`, an `as` or a
+    `macro_rules!` body can bind it. A glob inside a macro is refused: a macro reads it as tokens.
+    """
+    trees = use_trees(words, code_item_starts(words))
+    for index, word in enumerate(words):
+        if word == "use":
+            end = next((cursor for cursor in range(index, len(words)) if words[cursor] == ";"), len(words))
+            if any(words[star] == "*" and star not in trees.prefixes for star in range(index, end)):
+                raise MoveRefused(f"{path}: a glob use the proof cannot read")
+    context = import_context(words)
+    globs: dict[int, tuple[str, ...]] = {}
+    for index, prefix in trees.prefixes.items():
+        if words[index] != "*":
+            continue
+        head = prefix[0] if prefix else ""
+        if head in PATH_ANCHORS and isinstance(module, OutsideCrate):
+            globs[index] = ("outside", *prefix)
+        elif head in PATH_ANCHORS and not isinstance(module, OutsideCrate):
+            inline = tuple(name.split("@")[0] for name in context.scopes[index].module)
+            target = resolved_module(prefix, (*module, *inline))
+            if isinstance(target, UnresolvedPath):
                 raise MoveRefused(f"{path}: a glob use the proof cannot resolve")
+            globs[index] = ("crate", *target)
+        elif isinstance(module, OutsideCrate) and head == library:
+            globs[index] = ("crate", *prefix[1:])
+        elif head in externs:
+            globs[index] = ("extern", *prefix)
+        else:
+            raise MoveRefused(f"{path}: a glob use the proof cannot resolve")
+    return globs
+
+
+def glob_module_problem(target: tuple[str, ...], files: Mapping[str, CrateModule], sources: RevisionTree,
+                        afters: Mapping[str, MoveText], modules: frozenset[tuple[str, ...]]) -> str | None:
+    """Why a glob of the crate module target can import from one of modules, or None.
+
+    The module must not be one of modules or a parent of one, whose glob brings the child module's name. Its file must
+    be its own and untouched, and hold no glob use, no public use and no macro, which can each export another module's
+    items, and no visibility but private, `pub(crate)` and `pub`, which A and B can see alike.
+    """
+    if any(moved[:len(target)] == target for moved in modules):
+        return "a module the move changes or a parent of one"
+    paths = [path for path, module in files.items() if module == target]
+    if len(paths) != 1:
+        return "which has no file of its own"
+    if paths[0] in afters:
+        return "which the change touches"
+    words = tuple(token.value.removeprefix("r#") for token in tokens(sources.text(paths[0])))
+    if any("*" in words[use.start:use.end] or "pub" in words[use.start:use.end] for use in use_items(words)):
+        return "which holds a glob use or a public use"
+    if any(words[index:index + 2] == ("pub", "(") and words[index + 2:index + 4] != ("crate", ")")
+           for index in range(len(words))):
+        return "which holds a restricted visibility"
+    expansion = item_level_expansion(words, frozenset())
+    if expansion is not None:
+        return f"which has {expansion}"
+    return None
 
 
 def path_sites(text: MoveText, name: str,

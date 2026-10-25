@@ -2055,7 +2055,8 @@ class StyleFootprintTests(unittest.TestCase):
 
     def test_an_item_move_is_refused_when_a_touched_file_has_a_glob_use(self) -> None:
         after = {**self.LIMIT_MOVED, "src/reader.rs": "use crate::constants::*;\n\npub(crate) fn read() -> usize { LIMIT }\n"}
-        self.assert_move_refused("src/reader.rs: a glob use", self.LIMIT_FILES, after)
+        self.assert_move_refused("src/reader.rs: a glob use of crate::constants, a module the move changes",
+                                 self.LIMIT_FILES, after)
 
     def test_a_trait_move_is_refused(self) -> None:
         trait = "\npub(crate) trait Limited {\n    fn limit(&self) -> usize;\n}\n"
@@ -2191,7 +2192,8 @@ class StyleFootprintTests(unittest.TestCase):
     def test_an_item_move_is_refused_when_an_untouched_file_globs_the_source(self) -> None:
         before = {**self.LIMIT_FILES, "src/lib.rs": "mod constants;\nmod reader;\nmod report;\nmod writer;\n",
                   "src/report.rs": "use crate::writer::*;\n\npub(crate) fn report() -> usize { write() }\n"}
-        self.assert_move_refused("src/report.rs: a glob use of a module the move changes", before, self.LIMIT_MOVED)
+        self.assert_move_refused("src/report.rs: a glob use of crate::writer, a module the move changes", before,
+                                 self.LIMIT_MOVED)
 
     def test_a_function_move_is_refused_when_it_gains_sight_of_a_private_field(self) -> None:
         size = "\npub(crate) fn size(rows: &Rows) -> usize { rows.count }\n"
@@ -2548,6 +2550,224 @@ class StyleFootprintTests(unittest.TestCase):
         after = {path: text.replace("Debug, Clone", "Debug, std::Clone") for path, text in self.SHAPE_MOVED.items()}
         result = self.prove_move(before, after)
         assert isinstance(result, style_footprint.ItemMoves), result
+
+    def test_an_item_move_is_refused_when_a_conditional_macro_use_brings_its_macros(self) -> None:
+        for attribute in ("#[cfg_attr(all(), macro_use)]", "#[cfg_attr(all(), allow(unused), macro_use)]",
+                          "#[cfg_attr(unix, cfg_attr(all(), macro_use))]", "#[cfg_attr(all(), macro_use(Clone))]",
+                          "#[cfg_attr(all(), r#macro_use)]"):
+            with self.subTest(attribute=attribute):
+                lib = f"{attribute}\nextern crate custom_derives;\n\n" + self.SHAPE_FILES["src/lib.rs"]
+                self.assert_move_refused("src/lib.rs: a `macro_use` can bring a macro named like a standard derive",
+                                         {**self.SHAPE_FILES, "src/lib.rs": lib}, self.SHAPE_MOVED)
+
+    def test_an_item_move_is_refused_when_a_rebound_std_hides_a_glob(self) -> None:
+        before = {**self.LIMIT_FILES, "src/lib.rs": "mod constants;\nmod reader;\nmod report;\nmod writer;\n",
+                  "src/report.rs": "use crate::writer as std;\nuse std::*;\n\n"
+                                   + "pub(crate) fn report() -> usize { write() }\n"}
+        self.assert_move_refused("src/report.rs: a glob use the proof cannot resolve", before, self.LIMIT_MOVED)
+
+    def test_an_item_move_is_refused_when_a_or_b_globs_another_crate(self) -> None:
+        manifest = ('[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                    + '[dependencies]\ncustom_derives = { path = "../custom_derives" }\n')
+        glob = "use custom_derives::*;\n\n"
+        files = ("src/draw.rs", "src/shape.rs")
+        before = {**self.SHAPE_FILES, "Cargo.toml": manifest,
+                  **{path: glob + self.SHAPE_FILES[path] for path in files}}
+        after = {path: glob + text for path, text in self.SHAPE_MOVED.items()}
+        self.assert_move_refused("src/draw.rs: a glob use of the crate custom_derives", before, after)
+
+    def test_an_item_move_is_refused_when_a_macro_binds_a_glob_head(self) -> None:
+        lib = ("macro_rules! bind_bridge {\n    () => { use crate::writer as bridge; };\n}\n\n"
+               + "mod constants;\nmod reader;\nmod report;\nmod writer;\n")
+        before = {**self.LIMIT_FILES, "src/lib.rs": lib,
+                  "src/report.rs": "bind_bridge!();\nuse bridge::*;\n\npub(crate) fn report() -> usize { write() }\n"}
+        self.assert_move_refused("src/report.rs: a glob use the proof cannot resolve", before, self.LIMIT_MOVED)
+
+    def test_an_item_move_is_refused_in_a_crate_older_than_rust_2018(self) -> None:
+        package = '[package]\nname = "sample"\nversion = "0.1.0"\n'
+        workspace = '[workspace]\n\n[workspace.package]\nedition = "2021"\n\n' + package + "edition.workspace = true\n"
+        for manifest, reason in ((package, "the crate's edition is 2015"),
+                                 (package + 'edition = "2015"\n', "the crate's edition is 2015"),
+                                 (workspace.replace('edition = "2021"\n', ""), "the crate's edition is unknown")):
+            with self.subTest(manifest=manifest):
+                self.assert_move_refused(reason, {**self.LIMIT_FILES, "Cargo.toml": manifest}, self.LIMIT_MOVED)
+        result = self.prove_move({**self.LIMIT_FILES, "Cargo.toml": workspace}, self.LIMIT_MOVED)
+        assert isinstance(result, style_footprint.ItemMoves), result
+
+    # Two consts leave src/writer.rs: LIMIT for the existing src/constants.rs, WIDTH for the new src/sizes.rs.
+    SPLIT_FILES: dict[str, str] = {
+        "src/lib.rs": "mod constants;\nmod reader;\nmod writer;\n",
+        "src/constants.rs": "pub(crate) const OTHER: usize = 1;\n",
+        "src/writer.rs": "/// The most rows one write takes.\npub(crate) const LIMIT: usize = 4;\n\n"
+                         + "/// The widest row.\npub(crate) const WIDTH: usize = 8;\n\n"
+                         + "pub(crate) fn write() -> usize { LIMIT + WIDTH }\n",
+        "src/reader.rs": "use crate::writer::LIMIT;\nuse crate::writer::WIDTH;\n\n"
+                         + "pub(crate) fn read() -> usize { LIMIT + WIDTH }\n",
+    }
+    SPLIT_MOVED: dict[str, str] = {
+        "src/lib.rs": "mod constants;\nmod reader;\nmod sizes;\nmod writer;\n",
+        "src/constants.rs": "pub(crate) const OTHER: usize = 1;\n\n/// The most rows one write takes.\n"
+                            + "pub(crate) const LIMIT: usize = 4;\n",
+        "src/sizes.rs": "/// The widest row.\npub(crate) const WIDTH: usize = 8;\n",
+        "src/writer.rs": "use crate::constants::LIMIT;\nuse crate::sizes::WIDTH;\n\n"
+                         + "pub(crate) fn write() -> usize { LIMIT + WIDTH }\n",
+        "src/reader.rs": "use crate::constants::LIMIT;\nuse crate::sizes::WIDTH;\n\n"
+                         + "pub(crate) fn read() -> usize { LIMIT + WIDTH }\n",
+    }
+
+    def test_two_items_moved_from_one_file_to_an_existing_and_a_new_module_are_proven(self) -> None:
+        result = self.prove_move(self.SPLIT_FILES, self.SPLIT_MOVED)
+        assert isinstance(result, style_footprint.ItemMoves), result
+        self.assertEqual({(move.name, move.destination.path) for move in result.moves},
+                         {("LIMIT", "src/constants.rs"), ("WIDTH", "src/sizes.rs")})
+        [line] = result.module_lines
+        self.assertEqual(self.SPLIT_MOVED["src/lib.rs"][line.start:line.end], "mod sizes;")
+        self.assertEqual(len([span for span in result.spans("src/writer.rs", False)
+                              if span in {move.source for move in result.moves}]), 2)
+        self.assertEqual({site.text for site in result.sites}, {"crate::constants", "crate::sizes"})
+
+    # Two pairs with different sources: WIDTH leaves src/reader.rs for src/sizes.rs, and LIMIT leaves src/writer.rs
+    # for src/constants.rs. The writer pair comes second.
+    PAIRS_FILES: dict[str, str] = {
+        "src/lib.rs": "mod caller;\nmod constants;\nmod reader;\nmod sizes;\nmod writer;\n",
+        "src/caller.rs": "pub(crate) fn call() -> usize { 3 }\n",
+        "src/constants.rs": "pub(crate) const OTHER: usize = 1;\n",
+        "src/sizes.rs": "pub(crate) const HEIGHT: usize = 2;\n",
+        "src/writer.rs": "/// The most rows one write takes.\npub(crate) const LIMIT: usize = 4;\n\n"
+                         + "pub(crate) fn write() -> usize { LIMIT + 1 }\n",
+        "src/reader.rs": "use crate::writer::LIMIT;\n\n/// The widest row.\npub(crate) const WIDTH: usize = 8;\n\n"
+                         + "pub(crate) fn read() -> usize { LIMIT + WIDTH }\n",
+    }
+    PAIRS_MOVED: dict[str, str] = {
+        "src/constants.rs": "pub(crate) const OTHER: usize = 1;\n\n/// The most rows one write takes.\n"
+                            + "pub(crate) const LIMIT: usize = 4;\n",
+        "src/sizes.rs": "pub(crate) const HEIGHT: usize = 2;\n\n/// The widest row.\n"
+                        + "pub(crate) const WIDTH: usize = 8;\n",
+        "src/writer.rs": "use crate::constants::LIMIT;\n\npub(crate) fn write() -> usize { LIMIT + 1 }\n",
+        "src/reader.rs": "use crate::constants::LIMIT;\nuse crate::sizes::WIDTH;\n\n"
+                         + "pub(crate) fn read() -> usize { LIMIT + WIDTH }\n",
+    }
+
+    def test_two_pairs_with_different_sources_are_proven(self) -> None:
+        result = self.prove_move(self.PAIRS_FILES, self.PAIRS_MOVED)
+        assert isinstance(result, style_footprint.ItemMoves), result
+        self.assertEqual({(move.source.path, move.name, move.destination.path) for move in result.moves},
+                         {("src/writer.rs", "LIMIT", "src/constants.rs"), ("src/reader.rs", "WIDTH", "src/sizes.rs")})
+        self.assertEqual({(site.path, site.text) for site in result.sites}, {("src/reader.rs", "crate::constants")})
+
+    def test_an_item_move_is_refused_when_a_file_is_a_source_and_a_destination(self) -> None:
+        before = {**self.LIMIT_FILES, "src/constants.rs": "/// One more.\npub(crate) const OTHER: usize = 1;\n"}
+        after = {**self.LIMIT_MOVED, "src/constants.rs": "/// The most rows one write takes.\n"
+                                                         + "pub(crate) const LIMIT: usize = 4;\n",
+                 "src/writer.rs": "use crate::constants::LIMIT;\n\n/// One more.\n"
+                                  + "pub(crate) const OTHER: usize = 1;\n\n"
+                                  + "pub(crate) fn write() -> usize { LIMIT + 1 }\n"}
+        self.assert_move_refused("src/constants.rs is both a source and a destination of the move", before, after)
+
+    def test_an_item_move_is_refused_when_one_item_moves_to_two_files(self) -> None:
+        after = {**self.SPLIT_MOVED, "src/sizes.rs": self.SPLIT_MOVED["src/sizes.rs"] + "\n/// The most rows one write "
+                                                     + "takes.\npub(crate) const LIMIT: usize = 4;\n"}
+        self.assert_move_refused("two copies of const LIMIT", self.SPLIT_FILES, after)
+
+    def test_an_item_move_is_refused_when_the_second_pair_changes_a_literal(self) -> None:
+        after = {**self.PAIRS_MOVED, "src/constants.rs": self.PAIRS_MOVED["src/constants.rs"].replace("= 4", "= 5")}
+        self.assert_move_refused("LIMIT changes during the move", self.PAIRS_FILES, after)
+
+    def test_an_item_move_is_refused_when_the_second_pair_misses_a_reexport(self) -> None:
+        caller = "pub(crate) fn call() -> usize { crate::writer::LIMIT }\n"
+        self.assert_move_refused("LIMIT leaves src/writer.rs without a re-export, and src/caller.rs still uses its old "
+                                 + "path", {**self.PAIRS_FILES, "src/caller.rs": caller}, self.PAIRS_MOVED)
+
+    def test_an_item_move_is_refused_when_a_use_in_b_names_another_pairs_item_by_its_old_path(self) -> None:
+        # LIMIT reads WIDTH, which leaves src/reader.rs with no re-export, so `crate::reader::WIDTH` names nothing.
+        before = {**self.PAIRS_FILES, "src/writer.rs": "use crate::reader::WIDTH;\n\n"
+                                                       + self.PAIRS_FILES["src/writer.rs"].replace("= 4", "= WIDTH")}
+        after = {**self.PAIRS_MOVED,
+                 "src/constants.rs": "use crate::reader::WIDTH;\n\n"
+                                     + self.PAIRS_MOVED["src/constants.rs"].replace("= 4", "= WIDTH"),
+                 "src/writer.rs": self.PAIRS_MOVED["src/writer.rs"]}
+        self.assert_move_refused("WIDTH does not bind the same in src/writer.rs and in src/constants.rs", before, after)
+        reexport = self.PAIRS_MOVED["src/reader.rs"].replace("use crate::sizes", "pub(crate) use crate::sizes")
+        result = self.prove_move(before, {**after, "src/reader.rs": reexport})
+        assert isinstance(result, style_footprint.ItemMoves), result
+
+    def test_an_item_move_is_refused_when_a_moved_item_names_a_moved_item_by_a_path(self) -> None:
+        before = {"src/lib.rs": "mod constants;\nmod outer;\n",
+                  "src/constants.rs": "pub(crate) const OTHER: usize = 1;\n",
+                  "src/outer/mod.rs": "pub(crate) mod writer;\n",
+                  "src/outer/writer.rs": "use crate::outer;\n\npub(crate) const BASE: usize = 2;\n\n"
+                                         + "pub(crate) const LIMIT: usize = outer::writer::BASE * 2;\n\n"
+                                         + "pub(crate) fn write() -> usize { 1 }\n"}
+        after = {"src/constants.rs": "use crate::outer;\n\npub(crate) const OTHER: usize = 1;\n\n"
+                                     + "pub(crate) const BASE: usize = 2;\n\n"
+                                     + "pub(crate) const LIMIT: usize = outer::writer::BASE * 2;\n",
+                 "src/outer/writer.rs": "pub(crate) fn write() -> usize { 1 }\n"}
+        self.assert_move_refused("LIMIT names the moved item BASE by a path", before, after)
+
+    # src/reader.rs, which the move touches, globs src/helpers.rs, which it does not.
+    GLOB_FILES: dict[str, str] = {
+        **LIMIT_FILES, "src/lib.rs": "mod constants;\nmod helpers;\nmod reader;\nmod writer;\n",
+        "src/helpers.rs": "pub(crate) fn help() -> usize { 2 }\n",
+        "src/reader.rs": "use crate::helpers::*;\nuse crate::writer::LIMIT;\n\n"
+                         + "pub(crate) fn read() -> usize { LIMIT + help() }\n",
+    }
+    GLOB_MOVED: dict[str, str] = {
+        **LIMIT_MOVED, "src/reader.rs": "use crate::helpers::*;\nuse crate::constants::LIMIT;\n\n"
+                                        + "pub(crate) fn read() -> usize { LIMIT + help() }\n",
+    }
+
+    def test_a_move_is_proven_beside_a_glob_of_a_module_that_exports_only_its_own_items(self) -> None:
+        result = self.prove_move(self.GLOB_FILES, self.GLOB_MOVED)
+        assert isinstance(result, style_footprint.ItemMoves), result
+
+    def test_a_move_is_refused_beside_a_glob_that_can_import_from_a_or_b(self) -> None:
+        helpers = self.GLOB_FILES["src/helpers.rs"]
+        tests = "\n#[cfg(test)]\nmod tests {\n    use super::*;\n}\n"
+        reader, moved = self.GLOB_FILES["src/reader.rs"], self.GLOB_MOVED["src/reader.rs"]
+        cases: tuple[tuple[str, dict[str, str], dict[str, str]], ...] = (
+            ("a glob use of crate::helpers, which holds a glob use or a public use",
+             {"src/helpers.rs": "pub(crate) use crate::writer::write;\n\n" + helpers}, {}),
+            ("a glob use of crate::helpers, which holds a glob use or a public use",
+             {"src/helpers.rs": "use std::fmt::*;\n\n" + helpers}, {}),
+            ("a glob use of crate::helpers, which holds a restricted visibility",
+             {"src/helpers.rs": helpers.replace("pub(crate)", "pub(super)")}, {}),
+            ("a glob use of crate::helpers, which has a macro outside a fn body: rows",
+             {"src/helpers.rs": "rows!();\n\n" + helpers}, {}),
+            ("a glob use of crate::helpers, which the change touches",
+             {"src/helpers.rs": "pub(crate) fn help() -> usize { crate::writer::LIMIT }\n"},
+             {"src/helpers.rs": "pub(crate) fn help() -> usize { crate::constants::LIMIT }\n"}),
+            ("a glob use of crate::helpers::inner, which has no file of its own",
+             {"src/helpers.rs": "pub(crate) mod inner {\n    pub(crate) fn help() -> usize { 2 }\n}\n",
+              "src/reader.rs": reader.replace("helpers::*", "helpers::inner::*")},
+             {"src/reader.rs": moved.replace("helpers::*", "helpers::inner::*")}),
+            ("src/reader.rs: a glob use of crate, a module the move changes or a parent of one",
+             {"src/reader.rs": reader.replace("helpers::*", "*")}, {"src/reader.rs": moved.replace("helpers::*", "*")}),
+            ("src/writer.rs: a glob use of crate::writer, a module the move changes",
+             {"src/writer.rs": self.LIMIT_FILES["src/writer.rs"] + tests},
+             {"src/writer.rs": self.LIMIT_MOVED["src/writer.rs"] + tests}),
+            ("src/reader.rs: a glob use the proof cannot read",
+             {"src/reader.rs": "macro_rules! globs {\n    () => { use crate::writer::*; };\n}\n\n" + reader},
+             {"src/reader.rs": "macro_rules! globs {\n    () => { use crate::writer::*; };\n}\n\n" + moved}),
+            ("src/report.rs: a glob use the proof cannot resolve",
+             {"src/lib.rs": "mod constants;\nmod helpers;\nmod reader;\nmod report;\nmod writer;\n",
+              "src/report.rs": "use crate::writer as tools;\nuse tools::*;\n\n"
+                               + "pub(crate) fn report() -> usize { write() }\n"},
+             {}),
+        )
+        for reason, before, after in cases:
+            with self.subTest(reason=reason):
+                self.assert_move_refused(reason, {**self.GLOB_FILES, **before}, {**self.GLOB_MOVED, **after})
+
+    def test_a_move_between_files_that_glob_the_same_crate_is_proven_and_refused_when_only_one_does(self) -> None:
+        glob = "use std::fmt::*;\n\n"
+        files = ("src/writer.rs", "src/constants.rs")
+        before = {**self.LIMIT_FILES, **{path: glob + self.LIMIT_FILES[path] for path in files}}
+        after = {**self.LIMIT_MOVED, **{path: glob + self.LIMIT_MOVED[path] for path in files}}
+        result = self.prove_move(before, after)
+        assert isinstance(result, style_footprint.ItemMoves), result
+        self.assert_move_refused("src/writer.rs and src/constants.rs glob different modules or crates",
+                                 {**before, "src/constants.rs": self.LIMIT_FILES["src/constants.rs"]},
+                                 {**after, "src/constants.rs": self.LIMIT_MOVED["src/constants.rs"]})
 
     P635_FILES: dict[str, str] = {
         "src/lib.rs": "mod reader;\nmod writer;\n\npub use writer::LIMIT;\n",
