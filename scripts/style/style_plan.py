@@ -820,6 +820,54 @@ def worktree_check(repo: Path, finding: style_ledger.HeldFinding) -> AppliedChec
     return applied_check(finding.kind, finding.before, finding.after, finding.path, lambda path: worktree_file(repo, path))
 
 
+@dataclass(frozen=True)
+class ApprovedTicket:
+    """The findings of a proposal ticket whose decision is approved, their approved file renames, and the paths that
+    the findings and renames allow."""
+
+    findings: tuple[style_ledger.HeldFinding, ...]
+    moves: tuple[FileRename, ...]
+    allowed: frozenset[str]
+
+
+def approved_ticket(
+    ledger: style_ledger.Ledger, ticket_id: str, origin: style_ledger.ApprovedProposal,
+) -> ApprovedTicket:
+    """Read the ticket's decision; raise unless it is open, approved for the ticket's unit, and still holds the ticket's
+    filed findings. The gate and `widen` both read approval here."""
+    fields = frontmatter(origin.issue)
+    decision = Issue(origin.issue, fields)
+    answer = decision_answer(decision)
+    if not origin.finding_ids:
+        raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
+    by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
+    if any(identity not in by_id for identity in origin.finding_ids):
+        raise style_ledger.LedgerError("proposal ticket findings changed")
+    findings = tuple(by_id[identity] for identity in origin.finding_ids)
+    if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
+            or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
+            or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
+                   or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
+        raise style_ledger.LedgerError("proposal approval or filed findings changed")
+    moves = approved_file_renames(findings)
+    allowed = frozenset({finding.path for finding in findings} | {moved.new for moved in moves})
+    return ApprovedTicket(findings, moves, allowed)
+
+
+def widen(repo: Path, ticket_id: str, paths: tuple[str, ...], reason: str, by: str) -> None:
+    """Allow paths outside the findings of an approved proposal ticket, and print the ticket's widened paths."""
+    with style_ledger.open_ledger(repo) as ledger:
+
+        def allowed() -> frozenset[str]:
+            origin = ledger.ticket_origin(ticket_id)
+            if isinstance(origin, style_ledger.SelectedByCoverage):
+                raise style_ledger.LedgerError(f"{ticket_id}: only a proposal ticket widens")
+            return approved_ticket(ledger, ticket_id, origin).allowed
+
+        for widened in ledger.ticket_widen(ticket_id, paths, reason, by, allowed):
+            print(style_ledger.widened_line(widened))
+
+
 def gate(repo: Path, ticket_id: str) -> int:
     """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
@@ -835,23 +883,10 @@ def gate(repo: Path, ticket_id: str) -> int:
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
                 return result.returncode if result.returncode in (0, 2) else 1
-            fields = frontmatter(origin.issue)
-            decision = Issue(origin.issue, fields)
-            answer = decision_answer(decision)
-            if not origin.finding_ids:
-                raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
-            by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
-            if any(identity not in by_id for identity in origin.finding_ids):
-                raise style_ledger.LedgerError("proposal ticket findings changed")
-            findings = tuple(by_id[identity] for identity in origin.finding_ids)
-            if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
-                    or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
-                    or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
-                           or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
-                raise style_ledger.LedgerError("proposal approval or filed findings changed")
-            moves = approved_file_renames(findings)
-            allowed = {finding.path for finding in findings} | {moved.new for moved in moves}
-            outside = changed_files(repo) - allowed
+            approved = approved_ticket(ledger, ticket_id, origin)
+            findings, moves, allowed = approved.findings, approved.moves, set(approved.allowed)
+            # A widened path is allowed as it is; the rename and move checks below do not read it.
+            outside = changed_files(repo) - allowed - set(origin.widened)
             pairs = approved_rename_pairs(findings)
             if outside:
                 outside -= item_move_files(repo)
@@ -1272,6 +1307,8 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             line += " — " + ("lines " + ", ".join(f"{window.start}-{window.end}" for window in windows)
                               if windows else "empty file")
         files.append(line)
+    # A path that `widen` added is the ticket's work too; the line names who added it and why.
+    files.extend(f"- {style_ledger.widened_line(widened)}" for widened in ticket["widened"])
     authorization = (
         f"This ticket builds the approved proposal `{ticket['proposal']}`: its approved findings are this ticket's work. "
         + "Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required."
@@ -1771,10 +1808,19 @@ def main(argv: list[str]) -> int:
     queue = sub.add_parser("queue")
     _ = queue.add_argument("--repo", type=Path, required=True)
     _ = queue.add_argument("--unit")
+    ticket_widen = sub.add_parser("widen")
+    _ = ticket_widen.add_argument("--repo", type=Path, required=True)
+    _ = ticket_widen.add_argument("--ticket", required=True)
+    _ = ticket_widen.add_argument("--files", nargs="+", required=True)
+    _ = ticket_widen.add_argument("--reason", required=True)
+    _ = ticket_widen.add_argument("--by", required=True)
     args = cast(PlanArguments, parser.parse_args(argv))
     try:
         if args.command == "gate":
             return gate(args.repo, args.ticket)
+        if args.command == "widen":
+            widen(args.repo, args.ticket, tuple(args.files), args.reason, args.by)
+            return 0
         if args.command == "queue":
             board = berth_board.read_board(args.repo)
             if isinstance(board, berth_board.BoardUnavailable):
@@ -1839,6 +1885,9 @@ class PlanArguments(argparse.Namespace):
     repo: Path = Path()
     unit: str = ""
     plan: Path = Path()
+    files: list[str] = []
+    reason: str = ""
+    by: str = ""
 
 
 if __name__ == "__main__":

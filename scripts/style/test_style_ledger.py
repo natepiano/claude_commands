@@ -17,7 +17,7 @@ import unittest
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from typing import TypedDict, cast, final, override
 from unittest import mock
@@ -724,6 +724,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection, connection:
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waive_provenance")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waived_by")
+            _ = connection.execute("DROP TABLE ticket_widened_paths")
             _ = connection.execute("UPDATE schema_version SET version=18")
         migrated = self.ledger()
         finding, = migrated.named_held((finding_id,))
@@ -1041,6 +1042,96 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.BuildTicket("names-2"))
         self.assertEqual(ledger.ticket_origin("names-1"), style_ledger.ApprovedProposal(issue, "names", ids[:1]))
 
+    def widen_ticket(self) -> tuple[style_ledger.Ledger, Path]:
+        """An approved proposal ticket names-1 that builds the finding in the first source, and its ledger."""
+        rule, issue, ids = self.decision_findings()
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names\nplan: approved\n"
+                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\n"
+                             + f"style_rule_blob: {self.blob(rule)}\n---\n")
+        ledger = self.ledger()
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=ids[:1])
+        return ledger, issue
+
+    def widen(self, *paths: str, ticket: str = "names-1", reason: str = "the move needs a new file",
+              by: str = "showrunner") -> tuple[int, str]:
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            result = style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", *paths,
+                                      "--reason", reason, "--by", by])
+        return result, output.getvalue()
+
+    def widened_rows(self, ledger: style_ledger.Ledger) -> list[tuple[str, ...]]:
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            return cast(list[tuple[str, ...]], connection.execute(
+                "SELECT * FROM ticket_widened_paths ORDER BY ticket,path").fetchall())
+
+    def test_widen_records_each_path_with_its_reason_name_and_time(self) -> None:
+        ledger, issue = self.widen_ticket()
+        extra, more = "crates/alpha/src/extra.rs", "crates/alpha/src/more.rs"
+        result, output = self.widen(extra, more)
+        self.assertEqual(result, 0, output)
+        ledger.ticket_assign("names-1", "main")
+        opened, = (cast(style_ledger.TicketRecord, json.loads(line))
+                   for line in self.cli("ticket", "open", "--unit", "names").stdout.splitlines())
+        widened = opened["widened"]
+        self.assertEqual([(item["path"], item["reason"], item["widened_by"]) for item in widened],
+                         [(path, "the move needs a new file", "showrunner") for path in (extra, more)])
+        at = widened[0]["widened_at"]
+        self.assertEqual(datetime.fromisoformat(at).utcoffset(), timezone.utc.utcoffset(None))
+        self.assertEqual(output, "".join(f"widened: {path} — the move needs a new file (showrunner, {at})\n"
+                                         for path in (extra, more)))
+        self.assertEqual(ledger.ticket_origin("names-1"), style_ledger.ApprovedProposal(
+            issue, "names", tuple(opened["finding_ids"]), (extra, more)))
+        rows = self.widened_rows(ledger)
+        self.assertEqual(self.widen(extra), (0, output))
+        self.assertEqual(self.widened_rows(ledger), rows)
+
+    def test_widen_refuses_tickets_paths_and_reasons_it_cannot_record(self) -> None:
+        ledger, issue = self.widen_ticket()
+        self.add_ticket("read-1", [self.rule("read")])
+        extra, more = "crates/alpha/src/extra.rs", "crates/alpha/src/more.rs"
+        approved = issue.read_text()
+        refusals: tuple[tuple[str, tuple[str, ...], dict[str, str], str], ...] = (
+            ("unknown ticket", (extra,), {"ticket": "names-9"}, "unknown ticket names-9"),
+            ("coverage ticket", (extra,), {"ticket": "read-1"},
+             "read-1: only a proposal ticket widens; this is a read ticket"),
+            ("empty reason", (extra,), {"reason": "  "}, "names-1: widen requires a reason"),
+            ("empty name", (extra,), {"by": " "}, "names-1: widen requires --by"),
+            ("absolute path", ("/etc/hosts",), {}, "path must be relative to the repository: /etc/hosts"),
+            ("parent path", ("crates/../extra.rs",), {}, "path must be relative to the repository: crates/../extra.rs"),
+            ("allowed path", (self.sources[0],), {},
+             f"names-1: {self.sources[0]} is already allowed by the approved findings"),
+        )
+        for name, paths, options, message in refusals:
+            with self.subTest(name):
+                result, output = self.widen(*paths, **options)
+                self.assertEqual((result, output), (2, f"style_plan: {message}\n"))
+                self.assertEqual(self.widened_rows(ledger), [])
+        with self.subTest("decision not approved"):
+            _ = issue.write_text(approved.replace("status: open", "status: closed"))
+            self.assertEqual(self.widen(extra), (2, "style_plan: proposal approval or filed findings changed\n"))
+            self.assertEqual(self.widened_rows(ledger), [])
+            _ = issue.write_text(approved)
+        with self.subTest("another reason"):
+            self.assertEqual(self.widen(extra)[0], 0)
+            rows = self.widened_rows(ledger)
+            self.assertEqual(self.widen(extra, reason="another reason"), (
+                2, f"style_plan: names-1: {extra} is already widened for another reason: the move needs a new file\n"))
+            self.assertEqual(self.widened_rows(ledger), rows)
+        with self.subTest("merged ticket"):
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='names-1'")
+                connection.commit()
+            self.assertEqual(self.widen(more), (2, "style_plan: names-1: cannot widen a merged ticket\n"))
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                _ = connection.execute("UPDATE tickets SET state='queued' WHERE id='names-1'")
+                connection.commit()
+        with self.subTest("dropped ticket"):
+            ledger.ticket_drop("names-1")
+            self.assertEqual(self.widen(more), (2, "style_plan: names-1: cannot widen a dropped ticket\n"))
+        self.assertEqual([row[1] for row in self.widened_rows(ledger)], [extra])
+
     def test_decision_ticket_claim_is_atomic_and_refuses_other_issues_and_live_claims(self) -> None:
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()
@@ -1128,7 +1219,7 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual(finding.state, style_ledger.Filed(issue))
             self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn")), ())
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (20,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
             self.assertEqual(connection.execute("SELECT withdrawn_by FROM held_findings").fetchone(), (0,))
 
     def test_person_read_migration_fourteen_keeps_version_thirteen_findings_not_read_by_a_person(self) -> None:
@@ -1149,7 +1240,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.reading), (style_ledger.Built(issue), style_ledger.NotReadByPerson()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (20,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
             self.assertEqual(connection.execute("SELECT person_read_by FROM held_findings").fetchone(), ("",))
 
     def test_an_unfiled_finding_withdrawn_by_a_newer_judgment_reads_and_lists_as_judged_again(self) -> None:
@@ -1184,7 +1275,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual(finding.state, style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (20,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
             self.assertEqual(connection.execute("SELECT withdrawn_by,duplicate_of FROM held_findings").fetchone(), (7, ""))
 
     def test_unwaive_migration_sixteen_keeps_version_fifteen_waived_findings_not_unwaived(self) -> None:
@@ -1205,7 +1296,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.waive_undo), (style_ledger.Waived(), style_ledger.NoWaiveUndo()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (20,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
             self.assertEqual(connection.execute("SELECT unwaived_by FROM held_findings").fetchone(), ("",))
 
     def test_follow_migration_seventeen_keeps_version_sixteen_findings_not_followed(self) -> None:
@@ -1227,7 +1318,7 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual((finding.state, finding.follow),
                              (style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)), style_ledger.NotFollowed()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (20,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
             self.assertEqual(connection.execute("SELECT followed_from,followed_from_line,followed_at,declaration_gone_at "
                                                 + "FROM held_findings").fetchone(), ("", 0, "", ""))
 
@@ -3887,7 +3978,7 @@ class StyleLedgerTests(unittest.TestCase):
             connection.commit()
         with style_ledger.Ledger(self.repo, database) as ledger:
             with closing(sqlite3.connect(database)) as connection:
-                self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (20,))
+                self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
             ledger.set_tip(self.initial_tip)
             self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[self.sources[0]], "current")
             self.write(self.sources[1], "pub fn changed() {}\n")
@@ -3915,7 +4006,7 @@ class StyleLedgerTests(unittest.TestCase):
                 rows = cast(list[tuple[str, str, str]], connection.execute(
                     "SELECT path,declared_scope,verdict_detail FROM judgments ORDER BY id").fetchall())
                 version = cast(tuple[int], connection.execute("SELECT version FROM schema_version").fetchone())
-            self.assertEqual(version, (20,))
+            self.assertEqual(version, (21,))
             self.assertEqual(rows, [(path, "rule", "original detail") for path in self.sources[:2]])
             self.write(self.sources[1], "pub fn sibling_changed() {}\n")
             ledger.set_tip(self.commit("Change sibling after migration"))
@@ -4275,6 +4366,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN declaration_gone_at")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
+            _ = connection.execute("DROP TABLE ticket_widened_paths")
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
@@ -4823,7 +4915,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(20,)])
+        self.assertEqual(versions, [(21,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -6262,7 +6354,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(20,)])
+        self.assertEqual(versions, [(21,)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -6686,7 +6778,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(20,)])
+        self.assertEqual(versions, [(21,)])
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
         ledger = self.ledger()
@@ -6745,6 +6837,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection:
             _ = connection.execute("DROP TABLE IF EXISTS sync_waits")
             _ = connection.execute("DROP TABLE IF EXISTS ticket_yields")
+            _ = connection.execute("DROP TABLE IF EXISTS ticket_widened_paths")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN cells")
             _ = connection.execute("ALTER TABLE judgments DROP COLUMN declared_scope")
             _ = connection.execute("ALTER TABLE judgments DROP COLUMN read_files")
