@@ -27,6 +27,11 @@ PUNCTUATION = re.compile(r"::|->|=>|==|!=|<=|>=|&&|\|\||[{}()\[\];:,.<>!&|+*/%=\
 FILE_CHANGED_LINE_LIMIT = 200
 # The std traits whose derives add no names to the item they decorate.
 STD_DERIVES = frozenset({"Clone", "Copy", "PartialEq", "Eq", "Hash", "PartialOrd", "Ord", "Default", "Debug"})
+# Snake-case names a bare word reaches without an import: prelude functions, primitive types and path keywords.
+PRELUDE_NAMES = frozenset({
+    "drop", "bool", "char", "str", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize",
+    "u8", "u16", "u32", "u64", "u128", "usize", "self", "super", "crate",
+})
 
 
 class FootprintError(Exception):
@@ -1198,6 +1203,26 @@ def scoped_import_sites(source: tuple[Token, ...], uses: tuple[UseItem, ...],
     return tuple(replacements)
 
 
+def removed_name_stays_bound(words: tuple[str, ...], uses: tuple[UseItem, ...], use_indices: set[int],
+                             path: tuple[str, ...], children: set[tuple[str, ...]]) -> bool:
+    # A bare word resolves through local bindings, same-module items, globs or the prelude. With no
+    # glob and no prelude name, it names the same thing after the import goes, or the build fails.
+    # A snake-case path with a child imported in the same module is a module, never a pattern or value.
+    # Macro token trees are refused: a macro can take the word into another namespace.
+    name = path[-1]
+    sites = [index for index, word in enumerate(words) if word == name and index not in use_indices]
+    if not sites:
+        return True
+    if (name in PRELUDE_NAMES or not re.fullmatch(r"[a-z][a-z0-9_]*", name)
+            or not any(child[:len(path)] == path and len(child) > len(path) for child in children)
+            or any("*" in words[item.start:item.end] for item in uses)):
+        return False
+    spans = attribute_spans(words) + macro_spans(words, delimiter_ends(words))
+    hidden = {index for begin, end in spans for index in range(begin, end)}
+    return all(index not in hidden and (index == 0 or words[index - 1] != "::")
+               and (index + 1 == len(words) or words[index + 1] not in {"::", "!"}) for index in sites)
+
+
 def prove_imports(change: FileChange) -> ImportProof:
     old, new = tokens(change.before), tokens(change.after)
     before, after = tuple(t.value for t in old), tuple(t.value for t in new)
@@ -1231,7 +1256,7 @@ def prove_imports(change: FileChange) -> ImportProof:
         return ImportProof()
     old_paths = {path for item in old_uses for path in item.paths}
     new_paths = {path for item in new_uses for path in item.paths}
-    added, removed = new_paths - old_paths, old_paths - new_paths
+    added = new_paths - old_paths
     candidates = [item for item in candidates if item.path in added]
     replaced_paths = {path for item in removed_items for path in item.paths}
     if any(not re.fullmatch(r"[A-Z][A-Z0-9_]*", path[-1]) for item in added_items for path in item.paths
@@ -1241,8 +1266,19 @@ def prove_imports(change: FileChange) -> ImportProof:
         return ImportProof()
     old_use_indices = {i for item in old_uses for i in range(item.start, item.end)}
     new_use_indices = {i for item in new_uses for i in range(item.start, item.end)}
-    for path in removed:
-        if any(word == path[-1] and i not in new_use_indices for i, word in enumerate(after)):
+    # A removed path stays imported only where a module-level plain use in its module still names it.
+    kept: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+    for item in new_uses:
+        scope = new_context.scopes[item.start]
+        if plain_use(after, item) and (scope.block == -1 or scope.block in new_context.module_blocks):
+            kept.update((scope.module, path) for path in item.paths)
+    for item in removed_items:
+        # A block can redefine a path, so a removed block-level use keeps the strict rule: no bare word left.
+        scope = old_context.scopes[item.start]
+        module_level = scope.block == -1 or scope.block in old_context.module_blocks
+        children = {other.path for other in candidates if module_level and other.module == scope.module}
+        if any(not (module_level and (scope.module, path) in kept)
+               and not removed_name_stays_bound(after, new_uses, new_use_indices, path, children) for path in item.paths):
             return ImportProof()
     for path in added:
         name = path[-1]

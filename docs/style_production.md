@@ -449,6 +449,7 @@ The gate shortens constant paths only when the added import and each site share 
 A glob is allowed in a module, but not in a block around a changed site.
 An added import may carry one `#[cfg]` if each site's item carries the same condition.
 An external crate name counts as a root only when the file uses it only as a path root.
+An edit may remove a module-level import whose name stays in the file as a plain word (for example a closure `|line|` after `use ratatui::symbols::line;` goes), only when the removed path is the parent of an import added in the same module, the name is snake case and not `drop`, a primitive type or a path keyword, no `use` is a glob, and each remaining word is outside attributes and macro token trees, with no `::` beside it and no `!` after it. The parent rule shows a module, which is never a pattern or a value, so the word names the same thing after the removal or the build fails. Residual: one `use` brings in every item with that name, so a module and a constant of the same name in one module make a pattern word a binding without a build error.
 It proves `Mode::Old` and `Self::Old` variant renames only when no other item has the enum's name.
 Attributes or unsupported derives that observe variant names prevent proof.
 It proves a local `let` rename only when its name is used after the statement, in its own block.
