@@ -71,11 +71,10 @@ whose cargo locks a build holds is never touched. One sweep holds the floor at
 a time and keeps every idle target's cargo locks while scanning and removing,
 so a build starting there waits.
 --floor-only skips the workspace sweep for disk-floor.nix's 2-minute timer.
-Each floor pass, over the floor or under it, first deletes Claude Code session
-scratch: a /tmp/claude-<uid>/<project>/<session id>/ folder (scratchpad/,
-tasks/) whose session no running process holds and where nothing changed in
-the last 24 hours. Gate copies and scratch builds there had stayed until the
-disk filled.
+Each such pass first runs tmp_sweep.py once an hour, which deletes agent
+scratch under /tmp/claude and /tmp/claude-<uid>/<project>/ that no process
+uses and where nothing changed in 4 hours, before the floor takes any build
+cache. Gate copies and scratch builds there had stayed until the disk filled.
 CI's targets are outside FLOOR_ROOTS, and its accounts cannot read lint.conf.
 By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
 used a median 3.0 h earlier. In a 60 GiB shortfall simulation, target-first order spared the
@@ -142,7 +141,6 @@ import fcntl
 import json
 import math
 import os
-import re
 import shutil
 import socket
 import subprocess
@@ -158,8 +156,12 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
+    from . import tmp_sweep
     from ..notify.push_texts import RenderedPush
     from ..notify import review
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import tmp_sweep
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -214,9 +216,6 @@ SCRATCH_ROOTS = ("/tmp", "~/.cache/trace-targets")
 FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
 # Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
 # where <project> is the session's working directory with every / as -.
-SESSION_SCRATCH_ROOT = os.path.join("/tmp", f"claude-{os.getuid()}")
-SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-SESSION_SCRATCH_IDLE_SECONDS = DAY_SECONDS
 FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
 CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
@@ -1440,109 +1439,6 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
     return delivered
 
 
-def running_session_ids() -> frozenset[str] | None:
-    """The id of every session whose process runs; None when a session record cannot be read, since
-    that session can be live."""
-    if TYPE_CHECKING:
-        from ..message import sessions
-    else:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
-        import sessions
-    registry = sessions.read_registry()
-    if registry.unreadable:
-        return None
-    return frozenset(entry.record["sessionId"] for entry in registry.entries
-                     if sessions.running_session(entry.record))
-
-
-def scratch_change(directory: str, since: float) -> tuple[float, int] | None:
-    """The newest change in directory and its disk blocks; None when something in it changed at or
-    after since, or could not be read. A change is the newer of mtime and ctime: a copy made with
-    its times kept (cp -a) still sets ctime. Symbolic links are never followed."""
-    seen: set[InodeKey] = set()
-    try:
-        top = os.lstat(directory)
-    except OSError:
-        return None
-    newest = max(top.st_mtime, top.st_ctime)
-    if newest >= since:
-        return None
-    total = 0
-    frontier = [directory]
-    while frontier:
-        try:
-            with os.scandir(frontier.pop()) as entries:
-                listed = list(entries)
-            for entry in listed:
-                info = entry.stat(follow_symlinks=False)
-                newest = max(newest, info.st_mtime, info.st_ctime)
-                if newest >= since:
-                    return None
-                if entry.is_dir(follow_symlinks=False):
-                    frontier.append(entry.path)
-                elif (info.st_dev, info.st_ino) not in seen:
-                    seen.add((info.st_dev, info.st_ino))
-                    total += info.st_blocks * 512
-        except OSError:
-            return None
-    return newest, total
-
-
-def delete_tree(path: str) -> None:
-    """shutil.rmtree, then once more after making each folder writable: a copy of a read-only tree
-    (a nix store path, a Go module cache) keeps its modes, and rmtree cannot empty such a folder."""
-    try:
-        shutil.rmtree(path)
-    except PermissionError:
-        for folder, _, _ in os.walk(path):
-            os.chmod(folder, 0o700)
-        shutil.rmtree(path)
-
-
-def remove_session_scratch(dry_run: bool, root: str = SESSION_SCRATCH_ROOT, now: float | None = None) -> int:
-    """Delete each Claude Code session's scratch under root once its session has ended and nothing
-    in it has changed for SESSION_SCRATCH_IDLE_SECONDS, then each project folder that left empty."""
-    projects = [entry.path for entry in listing(root)
-                if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False)]
-    if not projects:
-        return 0
-    live = running_session_ids()
-    if live is None:
-        print("lint sweep: a session record cannot be read; all session scratch kept")
-        return 0
-    since = (time.time() if now is None else now) - SESSION_SCRATCH_IDLE_SECONDS
-    verb = "would delete" if dry_run else "deleted"
-    failures = 0
-    for project in projects:
-        deleted = False
-        for entry in listing(project):
-            if (SESSION_ID.fullmatch(entry.name) is None or entry.name in live
-                    or not entry.is_dir(follow_symlinks=False)):
-                continue
-            change = scratch_change(entry.path, since)
-            if change is None:
-                continue
-            newest, size = change
-            if not dry_run:
-                try:
-                    delete_tree(entry.path)
-                except OSError as error:
-                    # Another sweep can delete the same folder first.
-                    if os.path.lexists(entry.path):
-                        failures += 1
-                        print(f"lint sweep: could not delete {entry.path}: {error}", file=sys.stderr)
-                    continue
-                deleted = True
-            print(f"lint sweep: {verb} {entry.path} ({gib(size)}), scratch of an ended session,"
-                  + f" last changed {when(newest)}")
-        if deleted:
-            try:
-                os.rmdir(project)
-            except OSError:
-                pass
-    return 1 if failures else 0
-
-
 def hold_floor(
     floor: int,
     dry_run: bool,
@@ -1777,8 +1673,9 @@ def main(argv: list[str]) -> int:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
     status = 0 if floor_only else sweep_workspace(target_dir, config, dry_run)
+    if floor_only:
+        status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
-        status = remove_session_scratch(dry_run) or status
         status = hold_floor(floor, dry_run) or status
     return status
 
