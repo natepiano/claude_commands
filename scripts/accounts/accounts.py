@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -1239,13 +1240,25 @@ def _prepared_account(label: str, *, resume: bool, repair: bool) -> PreparedAcco
     return PreparedAccount(account.named_account_environment(selected.dir), remove)
 
 
+def resolve_program(tool: Literal["claude", "codex"]) -> str:
+    """Find an executable on PATH, then in the installer directory on both machines."""
+    found = shutil.which(tool)
+    if found:
+        return str(Path(found).absolute())
+    installed = accounts_home() / ".local" / "bin" / tool
+    if installed.is_file() and os.access(installed, os.X_OK):
+        return str(installed.absolute())
+    raise FileNotFoundError(f"{tool} program not found (looked in PATH and {installed})")
+
+
 def _exec_codex_account(label: str, arguments: list[str]) -> None:
     """Launch Codex on a checked account, including the stored workers selection."""
     selected_label = role_account("workers").label if label == "workers" else label
     target = check_codex_target(selected_label, accounts_home() / ".codex")
     environment = {**os.environ, "CODEX_HOME": str(target.home)}
     try:
-        os.execvpe("codex", ["codex", *arguments], environment)
+        program = resolve_program("codex")
+        os.execvpe(program, [program, *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start codex: {error}") from error
 
@@ -1306,6 +1319,12 @@ def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
     except OSError:
         return LoginRenewalFailed("probe could not start")
     if probe.returncode != 0:
+        # The exec wrapper uses status 2 when it cannot find the program.
+        if probe.returncode == 2:
+            try:
+                _ = resolve_program("claude")
+            except FileNotFoundError as error:
+                return LoginRenewalFailed(str(error))
         return LoginRenewalFailed(f"probe exited with status {probe.returncode}")
     try:
         report = agent_accounts.claude_live(directory)
@@ -1340,11 +1359,12 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         for name in UNIT_MARKS:
             _ = environment.pop(name, None)
     try:
+        program = resolve_program("claude")
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
-                                      "run", "--", "claude", *arguments], environment)
+                                      "run", "--", program, *arguments], environment)
         else:
-            os.execvpe("claude", ["claude", *arguments], environment)
+            os.execvpe(program, [program, *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error
 

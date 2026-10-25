@@ -2410,3 +2410,27 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Gotchas:**
 - One repair round: the pass first used the clock from before the probe, and `stored_reading` refused the renewed reading as future-dated.
 - The probe holds the refusal-watch lock for up to 120 s per expired account.
+
+### Phase 86 — The login renewal finds claude by its full path  · status: done
+
+**Depends on:** Phase 85
+
+#### Work Order
+
+**Goal:** The notes-pass login renewal (Phase 85) failed for claude1 and claude2 on 10-23 and again on 10-25 at 09:30 AST, because the service PATH has no `claude`. The accounts table then said "log in on it by hand". `hello.sh` works because it runs from a login shell. Showrunner, user go 10-25 ~10:2x AST: resolve `claude` by its full path, so an expired login renews by itself within minutes.
+
+**Constraints:** `accounts.exec_account` (~1347) calls `os.execvpe("claude", ...)`, and the relaunch path (~1344) starts `lib/relaunch.py`, which can also start `claude` by name. Codex (~1248) uses `os.execvpe("codex", ...)`. `renew_login` runs `accounts.py exec --probe <label> -p hello` with stdin from DEVNULL, under the notes service's PATH.
+
+**Spec:**
+1. One resolver gives the full path of the `claude` program: first `shutil.which("claude")` on the PATH in use, then the install places a login shell's PATH has on natedev and the Mac (find them in the nix and home config, or in what `hello.sh`'s shell finds; for example `~/.local/bin/claude`). The probe and every Claude `exec` start that path. If it finds none, the error names the places it checked. Use the same resolver wherever this launch path starts `claude` by name (relaunch included), and for `codex` if its start has the same fault.
+2. `renew_login` gives `LoginRenewalFailed("claude program not found (looked in …)")` when the resolver finds nothing. Before, this case read as "probe exited with status N".
+3. Tests (scratch HOME; never start a real program): a PATH with no `claude` and an install place that has one resolves it; nothing found gives the error; the probe argv and `execvpe` get the full path.
+4. Docs: one line in `docs/accounts.md` beside the Phase 85 renewal text.
+
+**Files:** `scripts/accounts/accounts.py`, `scripts/lib/relaunch.py` (only if it starts claude by name), `scripts/accounts/test_accounts.py`, `scripts/accounts/test_launch_accounts.py`, `docs/accounts.md`
+
+**Workers:** 1 writer. impl owns all files.
+
+**Verification:** `scripts.accounts.test_accounts scripts.accounts.test_launch_accounts scripts.accounts.test_refusal_watch` (and the relaunch tests, if touched) with a scratch HOME; basedpyright 0/0 on changed Python files.
+
+**Acceptance gate:** the probe finds claude with a service PATH; suites pass; basedpyright 0/0; merge gate passes.
