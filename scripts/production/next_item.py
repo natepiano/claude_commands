@@ -80,10 +80,18 @@ def _doc(production: Path | None) -> Path:
 
 
 def change_queue(doc: Path) -> Queue:
-    """The change rows of the production and the productions below it, from its root's list."""
-    path = change_review.production_list(str(doc))
+    """The change rows of the production and the productions below it, from its root's list.
+
+    A child whose doc has no Change review line of its own reads its root's list.
+    """
     slug = proposals_folder.slug_of(doc)
     root = showrunners.root_of(slug)
+    try:
+        path = change_review.production_list(str(doc))
+    except change_review.ChangeReviewError:
+        if slug == root:
+            raise
+        path = change_review.production_list(str(showrunners.timer_docs().get(root, doc)))
     scope = {proposals_folder.slug_of(each) for each in proposals_folder.owner_docs(doc)}
     rows = [row for row in change_review.pending(path) if (row.get(change_review.PRODUCTION) or root) in scope]
     # The root shows the whole list and keeps the list's own pin; a lower showrunner pins its own row.

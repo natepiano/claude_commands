@@ -199,5 +199,24 @@ class NextItemTests(unittest.TestCase):
                              ["- 2026-10-12 rust/kid: kid gain — proposed"])
 
 
+    def test_a_child_with_no_change_review_line_reads_its_roots_list(self) -> None:
+        path = self.root / "change-review - top.md"
+        _ = change_review.append_rows(path, [Visible("kid change", "Run it", "It works")], date(2026, 10, 15), "",
+                                      self.root / "kid-production.md")
+        top, kid = self.root / "top-production.md", self.root / "kid-production.md"
+
+        def the_list(production: str) -> Path:
+            if Path(production) == kid:
+                raise change_review.ChangeReviewError(f"{kid} has no line")
+            return path
+
+        with mock.patch.object(change_review, "production_list", the_list), \
+                mock.patch.object(showrunners, "root_of", return_value="top"), \
+                mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
+                mock.patch.object(proposals_folder, "owner_docs", return_value=[kid]):
+            self.assertEqual([entry.item.splitlines()[0] for entry in next_item.change_queue(kid).entries],
+                             ["C1 kid change"])
+
+
 if __name__ == "__main__":
     _ = unittest.main()

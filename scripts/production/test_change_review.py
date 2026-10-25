@@ -568,5 +568,67 @@ class RepositoryTest(unittest.TestCase):
                                              "2026-10-01"), [])
 
 
+    def merged(self, branch: str, message: str) -> str:
+        """Merge `branch` into the merge branch, move origin/merge there and return the merge's short hash."""
+        _ = self.git("checkout", "-q", "merge")
+        _ = self.git("merge", "-q", "--no-ff", "-m", message, branch)
+        _ = self.git("update-ref", "refs/remotes/origin/merge", "HEAD")
+        return self.git("rev-parse", "--short=8", "HEAD")
+
+    def test_drift_knows_a_settled_merge_by_its_reviewed_row_and_leaves_out_another_trees_checkpoint(self) -> None:
+        _ = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        short = self.merged("unit", "Merge u")
+        self.assertEqual(len(change_review.drift(self.repo, "merge", LIST, "2026-10-01")), 1)
+        # A reviewed row keeps no Merged cell; its change still names the merge.
+        settled = LIST + f"\n## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n| C81 | {GRID.change} | works | 2026-10-16 |\n"
+        self.assertEqual(change_review.drift(self.repo, "merge", settled, "2026-10-01"), [])
+        # A merge of main brings in another production's checkpoint: that row is in another list.
+        self.assertEqual(change_review.drift(self.repo, "merge", LIST, "2026-10-01", {"u"}), [])
+        self.assertNotIn(short, LIST)
+
+    def test_backfill_fills_older_rows_from_their_merges_and_names_a_row_it_cannot_trace(self) -> None:
+        _ = self.commit("a.py", f"checkpoint(u): grid\n\n{SEE}")
+        unit_merge = self.merged("unit", "Merge u")
+        _ = self.git("checkout", "-q", "-b", "side", "merge")
+        _ = self.commit("b.py", "a plain commit")
+        side_merge = self.merged("side", "Merge side")
+        folder = self.repo / "docs"
+        folder.mkdir()
+        top = folder / "top-production.md"
+        _ = top.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** merge\n\n## Units\n\n", encoding="utf-8")
+        kid = folder / "kid-production.md"
+        _ = kid.write_text(f"- **Repository:** {self.repo}\n- **Merge branch:** kid\n\n## Units\n\n"
+                           + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+                           + "| u-unit | docs/u-plan.md | /nowhere/u | `u` (deleted) |\n", encoding="utf-8")
+        path = folder / "change-review - top.md"
+        _ = path.write_text("## To review\n\n| # | Change | Merged | How to check |\n| --- | --- | --- | --- |\n"
+                            + f"| C1 | {GRID.change} | 2026-10-15 · {unit_merge} | x |\n"
+                            + f"| C2 | side change | 2026-10-15 · {side_merge} | x |\n"
+                            + "| C3 | no hash | 2026-10-15 | x |\n\n"
+                            + "## Reviewed\n\n| # | Change | Verdict | Date |\n| --- | --- | --- | --- |\n", encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+        tree = change_review.Tree([top, kid])
+        expected = ({"C1": "kid", "C2": "top"}, {"C3": "no merge hash"})
+        self.assertEqual(change_review.backfill(path, tree, write=False), expected)
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual(change_review.backfill(path, tree, write=True), expected)
+        rows = {row["#"]: row[change_review.PRODUCTION] for row in change_review.pending(path)}
+        self.assertEqual(rows, {"C1": "kid", "C2": "top", "C3": ""})
+        # A second run finds nothing left to fill.
+        self.assertEqual(change_review.backfill(path, tree, write=False), ({}, {"C3": "no merge hash"}))
+
+    def test_a_root_merge_stamps_each_change_with_the_production_of_its_checkpoints_unit(self) -> None:
+        folder = self.repo / "docs"
+        folder.mkdir()
+        top, kid = folder / "top-production.md", folder / "kid-production.md"
+        _ = kid.write_text("## Units\n\n| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+                           + "| u-unit | docs/u-plan.md | /nowhere/u | u |\n", encoding="utf-8")
+        _ = top.write_text("## Units\n\n", encoding="utf-8")
+        commits = [change_review.Commit("1", "checkpoint(u-plan): grid", f"checkpoint(u-plan): grid\n\n{SEE}", ()),
+                   change_review.Commit("2", "checkpoint(own): grid", f"checkpoint(own): grid\n\n{SEE}", ())]
+        with mock.patch.object(change_review, "owner_docs", return_value=[top, kid]):
+            self.assertEqual(change_review.visible_owners(commits, top), [top, kid])
+
+
 if __name__ == "__main__":
     _ = unittest.main()
