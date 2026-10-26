@@ -684,6 +684,16 @@ def prompt_for(request: UnitLaunch) -> str:
             f"approval before you run /unit:direct {plan}.")
 
 
+def attach_hint(request: UnitLaunch) -> str:
+    """Where the user finds the unit: its tab in the production's workspace of the shared session."""
+    import herdr
+
+    production = request.production
+    tab = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
+           else request.identity.session)
+    return herdr.attach_hint(showrunners.herdr_space(production.slug, str(production.doc)), tab)
+
+
 def host_session_name(request: UnitLaunch) -> str:
     """The destination name, limited to characters supported by named herdr sessions.
 
@@ -713,7 +723,7 @@ def launch_session(
     model: str = "",
     autocompact_window: str = "",
 ) -> herdr.PromptSubmitOutcome:
-    """Start Claude in its own herdr session carrying this unit's marks."""
+    """Start Claude in a tab of the shared herdr session, carrying this unit's marks."""
     import herdr
     from scripts.accounts import accounts
     from scripts.whoami.account import named_account_environment
@@ -749,20 +759,14 @@ def launch_session(
     if isinstance(request.launch_kind, UnitRestoreLaunch) and request.launch_kind.probe:
         environment[PROBE_ENV] = "1"
     arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
-    name = host_session_name(request)
     timeout_ms = int(request.timeout * 1000)
     host = herdr.shared_session()
-    if host:
-        _ = herdr.start_server(host, timeout_ms)
-        production = request.production
-        pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
-                              session_name, str(request.session_cwd), environment)
-    else:
-        host = name
-        herdr.start_new_server(host, timeout_ms)
-        pane = herdr.open_pane(host, name, str(request.session_cwd), environment)
+    _ = herdr.start_server(host, timeout_ms)
+    production = request.production
+    pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
+                          session_name, str(request.session_cwd), environment)
     try:
-        outcome = herdr.start_agent(host, pane, kind="claude", agent=name, agent_arguments=arguments,
+        outcome = herdr.start_agent(host, pane, kind="claude", agent=host_session_name(request), agent_arguments=arguments,
             opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
             timeout_ms=timeout_ms)
         return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
@@ -866,7 +870,7 @@ def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.MarkedUnit:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             tail = "\n".join(pane.splitlines()[-15:])
-            raise RuntimeError(f"{launched.place.session}: /remote-control did not become active\n{tail}")
+            raise RuntimeError(f"{request.identity.unit} (herdr {launched.place.session}:{launched.place.pane}): /remote-control did not become active\n{tail}")
         time.sleep(min(0.5, remaining))
 
 
@@ -1110,16 +1114,6 @@ def main(argv: list[str]) -> int:
                     except herdr.HerdrFailure as error:
                         raise Refusal(f"cannot end session {unit.place.session}: {error}") from error
                     marked_unit = NoMarkedUnit()
-            name = host_session_name(request)
-            if isinstance(marked_unit, NoMarkedUnit):
-                try:
-                    running = not herdr.shared_session() and any(
-                        entry["name"] == name for entry in herdr.live_sessions())
-                except herdr.HerdrFailure as error:
-                    raise Refusal(str(error)) from error
-                if running:
-                    raise Refusal(f"herdr session {name} is already live and is not marked as "
-                                  + request.identity.unit)
             write_stub(request)
             append_row(request, ready.row)
             commit_unit(request)
@@ -1142,19 +1136,14 @@ def main(argv: list[str]) -> int:
             if isinstance(outcome, herdr.PromptNotSubmitted):
                 raise RuntimeError(f"{request.identity.unit}: restart prompt not submitted: {outcome.reason}")
             record(request)
-            attach = f"herdr session attach {host_session_name(request)}"
-            if isinstance(marked_unit, MarkedUnitFound):
-                unit = marked_unit.unit
-                attach = f"herdr session attach {unit.place.session}"
-            print(f"{request.identity.unit} restore launched: {attach}")
+            print(f"{request.identity.unit} restore launched: {attach_hint(request)}")
             return 0
         if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(marked_unit, NoMarkedUnit):
             raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}"
                                + close_untyped_session(request, outcome))
-        launched = wait_for_remote_control(request)
+        _ = wait_for_remote_control(request)
         record(request)
-        attach = f"herdr session attach {launched.place.session}"
-        print(f"{request.identity.unit} started: {attach}")
+        print(f"{request.identity.unit} started: {attach_hint(request)}")
         return 0
     except herdr.AgentNotReady as error:
         print(f"add_unit: the session is not ready:\n{error.screen}", file=sys.stderr)

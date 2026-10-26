@@ -2,7 +2,7 @@
 
 ## What it is
 
-Every showrunner, unit director and standalone Claude session runs in its own named herdr session, on natedev and on the Mac. The user opens any of them with `herdr session attach <name>` (`hsa <name>`), or one on the other machine with `herdr_sessions.py attach-remote <host> <name>`. Codex workers stay headless as `codex app-server` threads. The one exception is crash recovery, which reopens an interactive Codex conversation in its own herdr session. tmux no longer hosts anything. Its only remaining traces are old shutdown records and snapshots, which parse into manual-restart states. Everything here sits in `scripts/herdr/`, with callers in `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. The trial evidence behind the design is in [herdr-trial.md](herdr-trial.md).
+Every showrunner, unit director and standalone Claude session runs as a tab of one herdr session, `agents` (`shared_session()`), on natedev and on the Mac: one workspace per production, one tab per Claude session, and an `ad-hoc` workspace for standalone sessions. No launcher starts a herdr session of its own (user, 2026-10-26), and `start_server`, `start_new_server` and `restore_server` refuse any other name. The user opens `agents` with `herdr session attach agents` (`hsa agents`), or a tab on the other machine with `herdr_sessions.py attach-remote <host> <tab>`. Codex workers stay headless as `codex app-server` threads. Crash recovery reopens an interactive Codex conversation as a tab of `agents` too. tmux no longer hosts anything. Its only remaining traces are old shutdown records and snapshots, which parse into manual-restart states. Everything here sits in `scripts/herdr/`, with callers in `scripts/production/`, `scripts/message/roster.py` and `scripts/shutdown/`. The trial evidence behind the design is in [herdr-trial.md](herdr-trial.md).
 
 ## How it works
 
@@ -11,7 +11,8 @@ Every showrunner, unit director and standalone Claude session runs in its own na
 | File | Role |
 | --- | --- |
 | `scripts/herdr/herdr.py` | The library: `Herdr` client, session names, server start and stop per platform, panes and agents, process placement, attached clients, server environment, Claude trust. |
-| `scripts/herdr/herdr_sessions.py` | CLI: `list`, `attach`, `start`, `resume`, `list --on`, `attach-remote`. |
+| `scripts/herdr/herdr_sessions.py` | CLI: `list`, `attach`, `focus`, `start`, `resume`, `list --on`, `attach-remote`. |
+| `scripts/herdr/test_one_session.py` | The check that fails when code outside `herdr.py` starts a herdr session or names one other than `agents`. |
 | `scripts/herdr/trust_survey.py` | Read-only survey of trust keys in every account file. |
 | `scripts/herdr/fake_herdr.py` | Test double for the herdr CLI. |
 | `scripts/production/unit_lookup.py` | Units found by marks on herdr panes. |
@@ -31,6 +32,8 @@ Outside this repo, `/etc/nixos/modules/common/shell.nix` defines `herdr-claude` 
 **Binary and client.** `herdr_binary()` is `HERDR_BIN`, else `shutil.which("herdr")`, else `HerdrMissing`. `Herdr(session)` targets one session with `argv(*args) = [binary, "--session", session, *args]`. `run` returns stdout. `result` decodes the JSON `result` object. A non-zero exit raises `HerdrFailure(message, code)` carrying herdr's `error.code` and `error.message`, and a subprocess timeout (10 s default in `run_program`) becomes `HerdrFailure` too. Subclasses: `HerdrMissing`, `SessionTaken(name)`, `AgentBlocked` (herdr's `agent_blocked`, never retried), `AgentNotReady(screen)`, `AgentExited(session, pane)`, `MacDesktopUnavailable`, `MacDesktopTerminalRequired`. `Herdr` methods: `panes`, `lookup(label) -> PaneFound | NoPane | SeveralPanes`, `pane_id`, `pane_activity(pane) -> PaneAtShell | PaneRunning(commands)`, `open_pane`, `focus_workspace`, `close_startup_workspaces`, `start_agent`, `readiness`, `prompt`, `wait_until(pane, state, timeout_ms) -> ObservedAgentState | WaitTimedOut` (a `blocked` state raises `AgentBlocked`), `read(pane, lines, *, joined, ansi)` (`pane read --source recent|recent-unwrapped`), `send_keys`, `close_pane`, `agents`. Every herdr JSON schema has a `TypedDict`. Every timeout a caller passes is integer milliseconds. The library reads no account variables, so callers pass the pane environment.
 
 **Session names.** A name matches `[A-Za-z0-9_.-]{1,64}` and is never `.` or `..`. `_validate_session_name` raises `ValueError` before any server starts or stops. `server_unit(name)` is `herdr-<name>.service`. `generated_session_name(text, suffix="")` maps other characters to `-` and fits `-<suffix>` inside 64 bytes. A session's socket is `$XDG_CONFIG_HOME/herdr/herdr.sock` for `default`, else `.../herdr/sessions/<name>/herdr.sock`. `live_sessions() -> list[SessionEntry]` returns only running sessions from `herdr session list --json`.
+
+**The one session.** `shared_session()` is the name in `$XDG_CONFIG_HOME/herdr/shared-session`, else `SHARED_SESSION` (`agents`). It is never empty. `_require_shared(name)` raises `HerdrFailure("herdr session <n>: every Claude session runs as a tab in herdr session agents; …")` for any other name, and the three server starts below call it first. `attach_hint(space, tab)` is the line launchers print: `herdr session attach agents, workspace <space>, tab <tab>`. `Herdr.focus_tab_of(pane)` shows that pane's workspace and tab in the attached clients.
 
 **Server start, exclusive or adopting.** A server is answering when `herdr --session <n> status server` exits 0 and prints `status: running`.
 
@@ -80,17 +83,17 @@ Direct starts outside the desktop (`herdr_sessions.py start` and `resume`) refus
 
 `scripts/herdr/herdr_sessions.py`:
 
-- `list` prints `<name>\t<role>\t<claude name>` per running session. Role is `unit <slug>/<unit>` from pane marks, `showrunner` when the Claude name is a registered showrunner session, else `standalone`. The Claude name is the newest live session record that `herdr_place_of` places there. Exit 0 done, 1 not found, 2 usage, 3 herdr unreadable.
-- `attach <name>` execs `herdr session attach <name>`. A name that is not running exits 1 and lists the running ones.
-- `list --on <host>` runs `ssh <host> ~/.claude/scripts/lib/py ~/.claude/scripts/herdr/herdr_sessions.py list` within `REMOTE_LIST_TIMEOUT` (15 s). A timeout, `OSError` or non-zero ssh exit prints one stderr line naming the host and returns 1. `attach-remote <host> <name>` execs `herdr --remote <host> --session <name>`. `RemoteHost(target)` refuses an empty, `-`-leading or whitespace-bearing target with `ValueError`, exit 2. Nothing is saved or synced between machines.
+- `list` prints `<tab>\t<role>\t<claude name>` per pane of the shared session (nothing when it is not running). Role is `unit <slug>/<unit>` from pane marks, `showrunner` when the Claude name is a registered showrunner session, else `standalone`. The Claude name is the newest live session record that `herdr_place_of` places in that pane. Exit 0 done, 1 not found, 2 usage, 3 herdr unreadable.
+- `attach <tab>` focuses that tab (`focus_tab_of`) and execs `herdr session attach agents`. `focus <tab>` only focuses it and prints the shared session's name. A tab that is not open exits 1 and lists the open ones.
+- `list --on <host>` runs `ssh <host> ~/.claude/scripts/lib/py ~/.claude/scripts/herdr/herdr_sessions.py list` within `REMOTE_LIST_TIMEOUT` (15 s). A timeout, `OSError` or non-zero ssh exit prints one stderr line naming the host and returns 1. `attach-remote <host> <tab>` runs `focus <tab>` on the host over ssh, then execs `herdr --remote <host> --session <the name it printed>`. `RemoteHost(target)` refuses an empty, `-`-leading or whitespace-bearing target with `ValueError`, exit 2. Nothing is saved or synced between machines.
 - `start [--name N] [--cwd D] [-- <claude args>]` and `resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]` run these steps:
   1. Refuse outside the Mac desktop.
   2. Resolve the folder and validate the name.
   3. Pick the account with `accounts.account_for_unscoped_launch`. A `LegacyHomeLaunch` uses `~/.claude.json` and unsets the named-account variables. Otherwise the pane gets `named_account_environment(dir)`.
   4. Check trust.
   5. Take `launch_permission.launch_barrier()` and `launch_permission(...)` with `NewWorkLaunchPurpose`, or `RecordedSessionRestoreLaunchPurpose(session_id)` under `--restore`.
-  6. Run `start_new_server(name, 90_000)`. Without `--name`, the name is `generated_session_name(<folder>, "1")`, and the suffix rises on each `SessionTaken`.
-  7. Open the pane and refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` (or the named-account variables for a legacy home).
+  6. Run `start_server(agents, 90_000)`, and refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` (or the named-account variables for a legacy home), since a new tab inherits it.
+  7. Open a tab in the `ad-hoc` workspace (`open_tab`). A `--name` that an open tab already has refuses. Without `--name`, the name is `generated_session_name(<folder>, "1")`, and the suffix rises past each name an open tab has.
   8. Run `start_agent` with `[--resume ID] -n <name>` and an `OpeningPrompt` from `--prompt-file`, else `NoOpeningPrompt`.
   9. `start` and `--attach` then exec the attach.
 
@@ -135,26 +138,25 @@ Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). T
 
 ### Launchers
 
-**Units.** `add_unit.launch_session(request, director, prompt, selected, *, target="", model="")` starts every new or restored unit in its own herdr session:
+**Units.** `add_unit.launch_session(request, director, prompt, selected, *, target="", model="")` starts every new or restored unit as a tab of the shared session:
 
 - Pane environment: both marks, `ENABLE_TOOL_SEARCH=true`, and the account variables. A resume uses `accounts.prepared_account(selected.label, resume=True)` variables minus its `remove` names, and refuses a `target` other than the selected group account. Other launches use `named_account_environment(selected.dir)`. `PROBE_ENV=1` is added only for a `--probe` restore. The caller's `CLAUDE_*` never reaches the pane.
 - Claude arguments: `--model`, `--effort` when set, `--resume <id>` on a resume, `--remote-control <session name> -n <session name>`, then the profile's flags or `--settings '{"disableAgentView": true}'`.
-- The host name is `host_session_name(request)`: `generated_session_name` of `--host-session` on a restore when it leads with `<slug>-`, else `<slug>-<session name>` (a session name already leading with `<slug>-` is not prefixed twice). Each production's `review-unit` gets its own session (`build-followups-review`, `hana-review`), and a record from before the prefix cannot reach another production's live session.
-- It runs `start_new_server(name, --timeout * 1000)` (default 90 s), `open_pane(name, name, session_cwd, env)`, and `start_agent(..., opening=OpeningPrompt(prompt))`. On `AgentExited` it runs `stop_session(name)`.
+- The agent name is `host_session_name(request)`: `generated_session_name` of `--host-session` on a restore when it leads with `<slug>-`, else `<slug>-<session name>` (a session name already leading with `<slug>-` is not prefixed twice), so each production's `review-unit` has its own name (`build-followups-review`, `hana-review`).
+- It runs `start_server(agents, --timeout * 1000)` (default 90 s), `open_tab(agents, herdr_space(<slug>, <doc>), <session name>, session_cwd, env)`, and `start_agent(agents, pane, ..., agent=<agent name>, opening=OpeningPrompt(prompt))`. On `AgentExited` it closes that tab (`close_agent`).
 
 `add_unit.main` does this:
 
 - It picks the account with `accounts.account_for_group_launch("unit", ...)`, checks it with `accounts.check`, and takes the launch barrier and permission (`RecordedSessionRestoreLaunchPurpose` for a restore). Then it runs `preflight`.
-- On a resume of a marked unit, `ClaudeUnknown` refuses, and `ClaudeNotRunning` ends that place's session with `stop_session` before the relaunch.
-- A live herdr session of the destination name that is not marked as this unit refuses.
+- On a resume of a marked unit, `ClaudeUnknown` refuses, and `ClaudeNotRunning` closes that place's tab with `close_agent` before the relaunch.
 - A restore records its prompt as scheduled (`record_scheduled_restore_prompt`). The resumed model is the transcript's last real assistant model unless `--model` is given.
 - A new unit waits until `read_place` shows `/remote-control is active`.
-- It prints `<unit> started: herdr session attach <session>` or `<unit> restore launched: herdr session attach <session>`.
+- It prints `<unit> started: <attach_hint>` or `<unit> restore launched: <attach_hint>`, the unit's tab in its production's workspace.
 - Exit 1 on `AgentNotReady` (prints the screen), 2 on a refusal or `SessionTaken`, 1 on other failures.
 
-**Lower showrunners.** `add_showrunner.launch(child, model, effort, resume, cwd, selected)` uses no marks. The pane gets `ENABLE_TOOL_SEARCH=true` and the account variables. Arguments are `--model --effort [--resume] --remote-control <slug> -n <slug> --settings '{"disableAgentView": true}'`. It runs `start_new_server(slug, 90_000)` and sends the prompt `/showrunner:produce <doc>[ resume]`. `checked` refuses a live herdr session named for the slug. Exit 2 on `SessionTaken`, 3 (`SESSION_NOT_READY`) on `AgentNotReady`. It prints `started <slug>: herdr session attach <slug>`, then waits up to `ADD_SHOWRUNNER_WAIT_S` (180 s, poll 2 s) for the showrunner to appear before attaching it to the caller.
+**Lower showrunners.** `add_showrunner.launch(child, model, effort, resume, cwd, selected)` uses no marks. The pane gets `ENABLE_TOOL_SEARCH=true` and the account variables. Arguments are `--model --effort [--resume] --remote-control <slug> -n <slug> --settings '{"disableAgentView": true}'`. It runs `start_server(agents, 90_000)`, opens a tab titled `<slug>` in `herdr_space(<slug>, <doc>)` and sends the prompt `/showrunner:produce <doc>[ resume]`. `checked` refuses when a tab of the shared session already has the slug's title (`herdr_tab_open`). Exit 3 (`SESSION_NOT_READY`) on `AgentNotReady`. It prints `started <slug>: <attach_hint>`, then waits up to `ADD_SHOWRUNNER_WAIT_S` (180 s, poll 2 s) for the showrunner to appear before attaching it to the caller.
 
-**Promotion.** `promote_showrunner.stop` types `/exit` with `type_place`. It waits up to `PROMOTE_STOP_WAIT_S` (60 s) for the Claude pid to go, then runs `stop_session(place.session)`. `add_showrunner.main --resume <id> --cwd <worktree> --config-dir <showrunners account dir>` then resumes the same conversation as the child's showrunner. A failed start prints the `add_unit.py --resume` line that brings the unit back.
+**Promotion.** `promote_showrunner.stop` types `/exit` with `type_place`. It waits up to `PROMOTE_STOP_WAIT_S` (60 s) for the Claude pid to go, then closes its tab with `close_agent(place.session, place.pane)`. `add_showrunner.main --resume <id> --cwd <worktree> --config-dir <showrunners account dir>` then resumes the same conversation as the child's showrunner. A failed start prints the `add_unit.py --resume` line that brings the unit back.
 
 ### Roster
 
@@ -237,7 +239,7 @@ Run the nine suites on the Mac with a scratch home. Run the command from the roo
 - One prompt per launch, never sent twice. `agent start` carries no prompt; the opening prompt goes through `agent prompt` once the agent is ready. Callers choose `OpeningPrompt` or `NoOpeningPrompt` explicitly.
 - The prompt goes in only when the composer is empty. Every composer check reads `pane read --source visible --format ansi` and drops faint text (SGR 2, until 22 or 0; colour arguments of 38/48/58 are skipped), because a new session shows a faint hint such as `Try "fix lint errors"` in its empty composer. Read as plain text, that hint looked like input, and add_unit's efficiency launch waited out its limit twice (2026-10-19).
 - `start_agent` gets the agent's arguments only, never the binary. Every herdr launcher builds from structured parts (`ResumeParts`, argument lists), never a shell string.
-- `start_new_server` is exclusive and raises `SessionTaken` on a taken name. Launchers that create a session use it. Adopting starts are only for restoring into a recorded server.
+- One herdr session, `agents` (user, 2026-10-26). Every launcher opens a tab there with `start_server(shared_session())` and `open_tab`. Probes and live checks run as tabs there too, never in a server of their own. `_require_shared` refuses a server start under any other name, and `test_one_session.py` fails on code that starts one or tells the user to attach to one.
 - Restored workspaces are cleared on every server spawn. Restart closes only workspaces that pass the untouched startup-shell test, never one it did not create.
 - Kill nothing by pattern. Stop a named herdr session, a systemd unit by its recorded name, or, on the Mac, only our own detached child. `stop_created_server` never stops an adopted or window-started server.
 - Session identity comes from the listening socket's owner. Handoff survivors come from the server's unit cgroup or the shell pids it reports. Never use argv or an inherited `HERDR_SESSION` for server identity, and never match pane ids across environments.
