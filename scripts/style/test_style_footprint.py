@@ -1305,12 +1305,15 @@ class StyleFootprintTests(unittest.TestCase):
                 self.assertIn("check 6", self.assert_review(base))
 
     def test_an_added_trailing_comma_is_mechanical(self) -> None:
-        before = "fn read(input: usize) {\n    consume(input);\n}\n"
-        self.write("src/lib.rs", before)
-        base = self.commit()
-        self.write("src/lib.rs", before.replace("consume(input);", "consume(\n        input,\n    );"))
-        _ = self.commit()
-        self.assert_mechanical(base)
+        # The check reads no edition, and before 2024 `gen` is a name, so `gen(input)` is a call.
+        for call in ("consume", "gen"):
+            with self.subTest(call=call):
+                before = f"fn read(input: usize) {{\n    {call}(input);\n}}\n"
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", before.replace(f"{call}(input);", f"{call}(\n        input,\n    );"))
+                _ = self.commit()
+                self.assert_mechanical(base)
 
     def test_import_rewrite_can_remove_an_unused_qualifier_import(self) -> None:
         self.write("src/lib.rs", "mod columns;\nmod reader;\n")
@@ -1663,14 +1666,19 @@ class StyleFootprintTests(unittest.TestCase):
                          "review: check 6: serialized, reflected, configured or documented name flagged")
 
     def test_definition_rename_cannot_certify_a_glob_import_call_in_another_file(self) -> None:
-        self.write("src/lib.rs", "mod a;\nmod b;\n")
-        self.write("src/a.rs", "pub(crate) fn min(input: usize) -> usize { input }\n")
-        self.write("src/b.rs", "use std::cmp::*;\nfn pick(left: usize, right: usize) -> usize { min(left, right) }\n")
-        base = self.commit()
-        for path in ("src/a.rs", "src/b.rs"):
-            self.write(path, (self.repo / path).read_text().replace("min", "max"))
-        _ = self.commit()
-        self.assertIn("check 6: call target, method or other change not proven equivalent", self.assert_review(base))
+        # A string in a macro call does not end the `use` the macro reads.
+        macro = "macro_rules! open {\n    (use $note:literal $($path:tt)*) => { use $($path)*; };\n}\n"
+        for lib, glob in (("", "use std::cmp::*;\n"), (macro, 'open!(use "a;" std::cmp::*);\n')):
+            with self.subTest(glob=glob):
+                self.write("src/lib.rs", lib + "mod a;\nmod b;\n")
+                self.write("src/a.rs", "pub(crate) fn min(input: usize) -> usize { input }\n")
+                self.write("src/b.rs", glob + "fn pick(left: usize, right: usize) -> usize { min(left, right) }\n")
+                base = self.commit()
+                for path in ("src/a.rs", "src/b.rs"):
+                    self.write(path, (self.repo / path).read_text().replace("min", "max"))
+                _ = self.commit()
+                self.assertIn("check 6: call target, method or other change not proven equivalent",
+                              self.assert_review(base))
 
     def test_definition_rename_cannot_certify_a_glob_import_call_in_an_inline_module(self) -> None:
         before = (
@@ -2130,6 +2138,32 @@ class StyleFootprintTests(unittest.TestCase):
                  "src/constants.rs": self.LIMIT_FILES["src/constants.rs"] + self.WIDE}
         self.assert_move_refused("max does not bind the same in src/writer.rs and in src/constants.rs", before, after)
 
+    def test_a_function_move_reads_gen_as_a_name_before_edition_2024(self) -> None:
+        # `gen` is a keyword only from 2024, so before it `value()` calls the `gen` of the file it is in.
+        value = "pub(crate) fn value() -> usize { gen() }\n"
+        before = {**self.LIMIT_FILES, "src/writer.rs": "fn gen() -> usize { 1 }\n\n" + value,
+                  "src/constants.rs": "fn gen() -> usize { 2 }\n",
+                  "src/reader.rs": "use crate::writer::value;\n\npub(crate) fn read() -> usize { value() }\n"}
+        after = {"src/writer.rs": "pub(crate) use crate::constants::value;\n\nfn gen() -> usize { 1 }\n",
+                 "src/constants.rs": "fn gen() -> usize { 2 }\n\n" + value}
+        package = '[package]\nname = "sample"\nversion = "0.1.0"\n'
+        self.assert_move_refused("gen does not bind the same in src/writer.rs and in src/constants.rs",
+                                 {**before, "Cargo.toml": package + 'edition = "2021"\n'}, after)
+        result = self.prove_move({**before, "Cargo.toml": package + 'edition = "2024"\n'}, after)
+        assert isinstance(result, style_footprint.ItemMoves), result
+
+    def test_an_item_move_drops_the_trailing_comma_of_a_gen_call_before_edition_2024(self) -> None:
+        # Before 2024 `gen(LIMIT,)` is a call, whose trailing comma rustfmt drops. From 2024 `gen` is a keyword.
+        write = "fn gen(a: usize) -> usize { a }\n\npub(crate) fn write() -> usize { gen(LIMIT,) }\n"
+        before = {**self.LIMIT_FILES, "src/writer.rs": "/// The most rows one write takes.\n"
+                  + "pub(crate) const LIMIT: usize = 4;\n\n" + write}
+        after = {**self.LIMIT_MOVED, "src/writer.rs": "use crate::constants::LIMIT;\n\n" + write.replace(",)", ")")}
+        package = '[package]\nname = "sample"\nversion = "0.1.0"\n'
+        result = self.prove_move({**before, "Cargo.toml": package + 'edition = "2021"\n'}, after)
+        assert isinstance(result, style_footprint.ItemMoves), result
+        self.assert_move_refused("src/writer.rs: an edit is not a moved item",
+                                 {**before, "Cargo.toml": package + 'edition = "2024"\n'}, after)
+
     def test_a_function_move_is_refused_when_its_added_use_can_shadow_a_name(self) -> None:
         pick = "pub(crate) fn pick(max: usize) -> usize { max }\n"
         before = {**self.LIMIT_FILES, "src/writer.rs": "use std::cmp::max;\n\n" + self.LIMIT_FILES["src/writer.rs"] + self.WIDE,
@@ -2194,6 +2228,20 @@ class StyleFootprintTests(unittest.TestCase):
                   "src/report.rs": "use crate::writer::*;\n\npub(crate) fn report() -> usize { write() }\n"}
         self.assert_move_refused("src/report.rs: a glob use of crate::writer, a module the move changes", before,
                                  self.LIMIT_MOVED)
+        for name, glob in self.HIDDEN_GLOBS:
+            with self.subTest(name=name):
+                report = glob.format(path="crate::writer") + "\npub(crate) fn report() -> usize { write() }\n"
+                self.assert_move_refused("src/report.rs: a glob use of crate::writer, a module the move changes",
+                                         {**before, "src/report.rs": report}, self.LIMIT_MOVED)
+
+    # Glob uses with a `;` in a comment or a string before the `*`. A text search for `use`, then `*` before a `;`,
+    # does not find the line comment forms. A block comment opens with `/*`, which that search reads as the glob.
+    HIDDEN_GLOBS: tuple[tuple[str, str], ...] = (
+        ("a line comment", "use {path}:: // compatibility;\n    *;\n"),
+        ("a line comment in a use group", "use {path}::{{\n    write, // a; b\n    *,\n}};\n"),
+        ("a block comment", "use {path}:: /* a; b */ *;\n"),
+        ("a string before the use", 'const NOTE: &str = "use a; *";\n\nuse {path}:: // a;\n    *;\n'),
+    )
 
     def test_a_function_move_is_refused_when_it_gains_sight_of_a_private_field(self) -> None:
         size = "\npub(crate) fn size(rows: &Rows) -> usize { rows.count }\n"
@@ -2210,6 +2258,13 @@ class StyleFootprintTests(unittest.TestCase):
                  "src/constants.rs": "//! Shared limits.\n\n/// The most rows one write takes.\n"
                                      + "pub(crate) const LIMIT: usize = 4;\n"}
         self.assert_move_refused("src/constants.rs: a new file holds more", before, after)
+        # A block comment before the module doc on its line does not hide it.
+        for doc in ("/* Notes. */ //! Shared limits.\n", "/* Notes. */ /*! Shared limits. */\n"):
+            with self.subTest(doc=doc):
+                (self.repo / "src/constants.rs").unlink()
+                constants = after["src/constants.rs"].replace("//! Shared limits.\n", doc)
+                self.assert_move_refused("src/constants.rs: a new file holds more", before,
+                                         {**after, "src/constants.rs": constants})
 
     def test_an_item_move_is_refused_when_a_touched_file_has_a_use_alias(self) -> None:
         after = {**self.LIMIT_MOVED, "src/reader.rs": "use crate::constants::LIMIT as MOST;\n\n"
@@ -2749,6 +2804,12 @@ class StyleFootprintTests(unittest.TestCase):
                           + self.LIMIT_FILES["src/lib.rs"]}
                 self.assert_move_refused("src/lib.rs: a macro call the proof cannot resolve: concat!", before,
                                          self.LIMIT_MOVED)
+        for name, glob in self.HIDDEN_GLOBS:
+            with self.subTest(name=f"a glob after {name}"):
+                before = {**self.LIMIT_FILES, "src/lib.rs": glob.format(path="provider")
+                          + "\nconst NAME: &str = concat!(\"a\");\n\n" + self.LIMIT_FILES["src/lib.rs"]}
+                self.assert_move_refused("src/lib.rs: a macro call the proof cannot resolve: concat!", before,
+                                         self.LIMIT_MOVED)
         with self.subTest(name="a glob the change adds"):
             after = {**self.LIMIT_MOVED, "src/reader.rs": "use provider::*;\n\n" + self.LIMIT_MOVED["src/reader.rs"]}
             before = {**self.LIMIT_FILES, "src/lib.rs": "const NAME: &str = concat!(\"a\");\n\n"
@@ -2770,6 +2831,11 @@ class StyleFootprintTests(unittest.TestCase):
                                  self.LIMIT_MOVED)
         assert isinstance(result, style_footprint.ItemMoves), result
         self.assertEqual([(move.kind, move.name) for move in result.moves], [("const", "LIMIT")])
+        # A glob in a comment or a string opens no name.
+        code = '// use provider::*;\nconst NOTE: &str = "use provider::*;";\n\nconst NAME: &str = concat!("a");\n\n'
+        result = self.prove_move({**self.LIMIT_FILES, "src/lib.rs": code + self.LIMIT_FILES["src/lib.rs"]},
+                                 self.LIMIT_MOVED)
+        assert isinstance(result, style_footprint.ItemMoves), result
 
     def test_an_item_move_is_refused_in_a_crate_older_than_rust_2018(self) -> None:
         package = '[package]\nname = "sample"\nversion = "0.1.0"\n'

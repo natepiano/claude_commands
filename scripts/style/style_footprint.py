@@ -43,6 +43,9 @@ RUST_KEYWORDS = frozenset({
     "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract", "become",
     "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
 })
+# The keywords of editions 2018 to 2021, where `gen` is a name. A scan with no crate, so no edition, reads these: a
+# scan that reads a name too often refuses, and one that misses a name can pass a change it does not read.
+KEYWORDS_BEFORE_2024 = RUST_KEYWORDS - {"gen"}
 
 
 class FootprintError(Exception):
@@ -1097,7 +1100,7 @@ def closes_named_generics(words: tuple[str, ...], close: int, openers: dict[int,
     return False
 
 
-def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
+def trailing_commas(words: tuple[str, ...], keywords: frozenset[str]) -> frozenset[int]:
     """The indexes of the commas that end a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
 
     A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
@@ -1107,7 +1110,8 @@ def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
 
     Some of those leads can come before a tuple, so they do not count: a lifetime or label (`&'a (u8,)`,
     `break 'a (1,)`), the `]` that ends an attribute (`#[cfg(x)] (a,) =>`), the `)` that ends a visibility
-    (`pub(crate) (u8,)`), and a `>` that does not end named generics (`closes_named_generics`).
+    (`pub(crate) (u8,)`), and a `>` that does not end named generics (`closes_named_generics`). A word of keywords,
+    the keywords of the crate's edition, is not a name, so before 2024 `gen(1,)` is a call.
     """
     ends = delimiter_ends(words)
     openers = {close: opening for opening, close in ends.items()}
@@ -1124,7 +1128,7 @@ def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
             return index not in attribute_ends
         if lead == ")":
             return words[openers[index - 1] - 1:openers[index - 1]] != ("pub",) if index - 1 in openers else True
-        return (IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS
+        return (IDENTIFIER.fullmatch(lead) is not None and lead not in keywords
                 and words[index - 2:index - 1] != ("'",))
 
     droppable: list[bool] = []
@@ -1139,8 +1143,9 @@ def trailing_commas(words: tuple[str, ...]) -> frozenset[int]:
 
 
 def without_trailing_commas(source_tokens: tuple[Token, ...]) -> tuple[Token, ...]:
-    """The tokens without the commas that `trailing_commas` finds, which rustfmt adds or drops when it joins lines."""
-    dropped = trailing_commas(tuple(token.value for token in source_tokens))
+    """The tokens without the commas that `trailing_commas` finds, which rustfmt adds or drops when it joins lines. The
+    check reads no manifest, so it reads the keywords before 2024: from 2024 on `gen (` is not Rust code."""
+    dropped = trailing_commas(tuple(token.value for token in source_tokens), KEYWORDS_BEFORE_2024)
     return tuple(token for index, token in enumerate(source_tokens) if index not in dropped)
 
 
@@ -1372,16 +1377,18 @@ def run_items(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...], run: tu
     return first[:doc], tuple(items)
 
 
-def canonical_code(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...]) -> tuple[CodePiece, ...]:
+def canonical_code(words: tuple[str, ...], gaps: tuple[tuple[str, ...], ...],
+                   keywords: frozenset[str] = KEYWORDS_BEFORE_2024) -> tuple[CodePiece, ...]:
     """The code in canonical order: each word with the comment lines before it, and each item of a run of adjacent
     module items with its comment lines, the run's items sorted.
 
-    A trailing comma drops, and its comment lines go to the next piece; no other word drops. Use tree entries and the
-    items of a run sort, and a comment moves with its item. None of these changes the code, and rustfmt makes them when
-    a rename changes a name's sort order or line length. A comment line keeps its place among the words of its piece, so
-    a comment that moves to another place in the code changes the pieces.
+    A trailing comma drops (`trailing_commas`, which reads keywords, the keywords of the crate's edition; a caller with
+    no manifest gets those before 2024), and its comment lines go to the next piece; no other word drops. Use tree
+    entries and the items of a run sort, and a comment moves with its item. None of these changes the code, and rustfmt
+    makes them when a rename changes a name's sort order or line length. A comment line keeps its place among the words
+    of its piece, so a comment that moves to another place in the code changes the pieces.
     """
-    dropped = trailing_commas(words)
+    dropped = trailing_commas(words, keywords)
     pieces: list[CodePiece] = []
     lines: list[str] = []
 
@@ -2069,7 +2076,7 @@ def prove_renames(changes: tuple[FileChange, ...], sources: RevisionTree,
         words = tuple(t.value for t in old)
         attributes = attribute_spans(words)
         decorated = decorated_items(words)
-        has_glob = re.search(r"\buse\b[^;]*\*", " ".join(words)) is not None
+        has_glob = holds_glob_use(words)
         replacements: list[TokenRewrite] = []
         for index, (left, right) in enumerate(zip(old, new)):
             if left == right:
@@ -2493,16 +2500,17 @@ def bound_path(name: str, scope: MoveScope) -> tuple[str, ...] | UnresolvedPath:
     return ("free", name)
 
 
-def scope_names(text: MoveText, start: int, end: int) -> frozenset[str]:
-    """The names words start..end look up in the module scope: each identifier that is not a keyword and does not
-    follow `::`, `.` or `'`, and each name a format literal captures."""
+def scope_names(text: MoveText, start: int, end: int, keywords: frozenset[str]) -> frozenset[str]:
+    """The names words start..end look up in the module scope: each identifier that is not one of keywords, the
+    keywords of the crate's edition, and does not follow `::`, `.` or `'`, and each name a format literal captures.
+    Before 2024 `gen()` calls the `gen` of the module."""
     names: set[str] = set()
     for index in range(start, end):
         token = text.spans[index].token
         if token.kind == "literal" and "{" in token.value:
             names.update(match[2] for match in re.finditer(r"(\{+)([A-Za-z_][A-Za-z0-9_]*)", token.value)
                          if len(match[1]) % 2)
-        elif (token.kind == "identifier" and token.value not in RUST_KEYWORDS
+        elif (token.kind == "identifier" and token.value not in keywords
               and text.words[index - 1:index] not in {("::",), (".",), ("'",)}):
             names.add(token.value)
     return frozenset(names)
@@ -2704,7 +2712,7 @@ def refuse_binding_macros(sources: RevisionTree, crate: str, befores: Mapping[st
                                            for _, text in texts if "!" in text))
     pattern = re.compile(r"\b(?:macro(?:_rules)?|" + "|".join(sorted(map(re.escape, names))) + r")\b")
     opened = any(opens_macro_names(plain_words(text), standard) for _, text in texts
-                 if "macro_use" in text or GLOB_USE.search(text))
+                 if "macro_use" in text or ("*" in text and holds_glob_use(plain_words(text))))
     # A bare call is accepted while no file opens a bare name, and one from `std` or `core` while standard is empty.
     prefixes = frozenset(prefix for prefix in STANDARD_PATH_PREFIXES if not (standard if prefix else opened))
     for path, text in texts:
@@ -2742,7 +2750,7 @@ def crate_edition(sources: RevisionTree, crate: str, manifest: dict[str, object]
 def edition_keywords(edition: int) -> frozenset[str]:
     """The strict and reserved keywords of an edition from 2018 on: RUST_KEYWORDS, without `gen` before 2024. The weak
     keywords, such as `union`, `macro_rules`, `raw` and `safe`, are names."""
-    return RUST_KEYWORDS if edition >= 2024 else RUST_KEYWORDS - {"gen"}
+    return RUST_KEYWORDS if edition >= 2024 else KEYWORDS_BEFORE_2024
 
 
 def library_name(manifest: dict[str, object]) -> str | None:
@@ -2895,11 +2903,12 @@ def edited_text(text: str, spans: tuple[FileSpan, ...]) -> str:
     return "".join(pieces)
 
 
-def canonical_text(text: str) -> tuple[CodePiece, ...]:
+def canonical_text(text: str, keywords: frozenset[str]) -> tuple[CodePiece, ...]:
     spans = token_spans(text)
     if any(token.kind == "unknown" for token in tokens(text)) or len(spans) != len(tokens(text)):
         raise MoveRefused("an edited text has an unknown token")
-    return canonical_code(tuple(span.token.value for span in spans), comment_gaps(text, spans, lambda line: line))
+    return canonical_code(tuple(span.token.value for span in spans), comment_gaps(text, spans, lambda line: line),
+                          keywords)
 
 
 def module_path(module: tuple[str, ...]) -> str:
@@ -2925,7 +2934,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
         raise MoveRefused("the change crosses crates")
     crate = crates.pop()
     manifest = crate_manifest(sources, crate)
-    edition = crate_edition(sources, crate, manifest)
+    keywords = edition_keywords(crate_edition(sources, crate, manifest))
     library = library_name(manifest)
     for change in changes:
         if change.status not in {FileStatus.MODIFIED, FileStatus.ADDED} or not change.path.endswith(".rs"):
@@ -2939,7 +2948,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
     # dependency and no file of the crate gives the name to another crate or module.
     standard = (STANDARD_CRATES & dependency_names(manifest)
                 | bound_standard_names(sources, crate, STANDARD_CRATES, befores, afters))
-    refuse_binding_macros(sources, crate, befores, afters, standard, edition_keywords(edition))
+    refuse_binding_macros(sources, crate, befores, afters, standard, keywords)
 
     # Pair each item that leaves one file with its one copy in another.
     def keys(text: MoveText) -> Counter[tuple[str, str, tuple[str, ...]]]:
@@ -3043,7 +3052,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                    for path in sources_of}
     destination_cuts = {path: frozenset[int]().union(*(cut for pair, cut in pair_destination_cuts.items()
                                                        if pair[1] == path)) for path in destinations}
-    pair_names = {pair: frozenset[str]().union(*(scope_names(befores[pair[0]], item.start, item.end)
+    pair_names = {pair: frozenset[str]().union(*(scope_names(befores[pair[0]], item.start, item.end, keywords)
                                                  for item, _, _, _ in pair_moves[pair])) for pair in groups}
     out_names = {path: frozenset[str]().union(*(names for pair, names in pair_names.items() if pair[0] == path))
                  for path in sources_of}
@@ -3056,7 +3065,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                       *((afters[path], frozenset[int]()) for path in sorted(sources_of)),
                       *((befores[path], frozenset[int]()) for path in sorted(destinations)),
                       *((afters[path], destination_cuts[path]) for path in sorted(destinations))):
-        expansion = item_level_expansion(text.words, cut)
+        expansion = item_level_expansion(text.words, cut, keywords)
         if expansion is not None:
             raise MoveRefused(f"{text.path} has {expansion}")
 
@@ -3203,7 +3212,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
         return ("moved", moved_paths[(target, after)])
 
     refuse_globs(sources, crate, befores, afters, frozenset(module_of[path] for path in sources_of | destinations),
-                 library, externs)
+                 library, externs, keywords)
 
     # A glob at module level gives a moved item every name it imports and does not shadow, so A before and B after
     # glob the same modules and crates.
@@ -3384,16 +3393,18 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
         old = edited_text(change.before, proof.spans(change.path, False))
         new = edited_text(change.after, proof.spans(change.path, True))
         if change.status == FileStatus.ADDED:
-            if tokens(new) or re.search(r"^\s*(?://!|/\*!)", new, re.MULTILINE):
+            # Any `//!` or `/*!` refuses, also one after a block comment on its line, such as `/* a */ //! b`.
+            if tokens(new) or re.search(r"//!|/\*!", new):
                 raise MoveRefused(f"{change.path}: a new file holds more than the moved items and their uses")
-        elif canonical_text(old) != canonical_text(new):
+        elif canonical_text(old, keywords) != canonical_text(new, keywords):
             raise MoveRefused(f"{change.path}: an edit is not a moved item, a re-pointed path or a use line")
     return proof
 
 
-def item_level_expansion(words: tuple[str, ...], cut: frozenset[int]) -> str | None:
+def item_level_expansion(words: tuple[str, ...], cut: frozenset[int], keywords: frozenset[str]) -> str | None:
     """What first outside cut and outside a fn body can expand to code or change how names resolve, or None: a macro
-    call, a `macro_rules!` definition, an attribute outside ITEM_ATTRIBUTES or an inner one outside INNER_ATTRIBUTES."""
+    call, a `macro_rules!` definition, an attribute outside ITEM_ATTRIBUTES or an inner one outside INNER_ATTRIBUTES.
+    A word before `!` that is not one of keywords, the keywords of the crate's edition, is a macro call."""
     ends = delimiter_ends(words)
     attributes = dict(attribute_spans(words))
     index = 0
@@ -3415,7 +3426,7 @@ def item_level_expansion(words: tuple[str, ...], cut: frozenset[int]) -> str | N
                 index = end
                 continue
         if (word == "macro_rules" and words[index + 1] == "!") or (
-                IDENTIFIER.fullmatch(word) and word not in RUST_KEYWORDS and words[index + 1] == "!"
+                IDENTIFIER.fullmatch(word) and word not in keywords and words[index + 1] == "!"
                 and words[index + 2] in {"(", "[", "{"}):
             return f"a macro outside a fn body: {word}"
         index += 1
@@ -3575,21 +3586,22 @@ def module_chain(module: tuple[str, ...], sources: RevisionTree, crate: str,
 
 
 def refuse_globs(sources: RevisionTree, crate: str, befores: Mapping[str, MoveText], afters: Mapping[str, MoveText],
-                 modules: frozenset[tuple[str, ...]], library: str | None, externs: frozenset[str]) -> None:
+                 modules: frozenset[tuple[str, ...]], library: str | None, externs: frozenset[str],
+                 keywords: frozenset[str]) -> None:
     """Raise MoveRefused for a glob use in a file of the crate, before or after the change, that can import from one
     of modules, the modules the items move from and to.
 
     One rule holds for touched and untouched files: a glob is accepted only when it imports from the standard
     library, from another crate, or from a module of the crate that exports only its own items, which the move does
-    not change (`glob_module_problem`).
+    not change (`glob_module_problem`, which reads keywords, the keywords of the crate's edition).
     """
     files = {**crate_files(sources, crate, ()), **{path: text.scope.module for path, text in afters.items()}}
     problems: dict[tuple[str, ...], str | None] = {}
     for path, module in files.items():
         if path in afters:
             sides = (befores[path].words, afters[path].words)
-        elif GLOB_USE.search(sources.text(path)):
-            sides = (tuple(token.value.removeprefix("r#") for token in tokens(sources.text(path))),)
+        elif "*" in sources.text(path) and holds_glob_use(plain_words(sources.text(path))):
+            sides = (plain_words(sources.text(path)),)
         else:
             continue
         for words in sides:
@@ -3597,14 +3609,24 @@ def refuse_globs(sources: RevisionTree, crate: str, befores: Mapping[str, MoveTe
                 if target[0] != "crate":
                     continue
                 if target[1:] not in problems:
-                    problems[target[1:]] = glob_module_problem(target[1:], files, sources, afters, modules)
+                    problems[target[1:]] = glob_module_problem(target[1:], files, sources, afters, modules,
+                                                               keywords)
                 problem = problems[target[1:]]
                 if problem is not None:
                     raise MoveRefused(f"{path}: a glob use of {module_path(target[1:])}, {problem}")
 
 
-# A use with a `*` before its `;`, which the glob rule reads.
-GLOB_USE = re.compile(r"\buse\b[^;]*\*")
+def holds_glob_use(words: tuple[str, ...]) -> bool:
+    """Whether a `use` of words has a `*` before its `;`. It reads words, so a comment or a string cannot hide the
+    glob: in `use provider:: // a;` and the next line ` *;`, a text search stops at the `;` of the comment. A caller
+    can skip a text with no `*`, as each `*` word is in the text."""
+    in_use = False
+    for word in words:
+        if word in {"use", ";"}:
+            in_use = word == "use"
+        elif word == "*" and in_use:
+            return True
+    return False
 
 
 def file_globs(path: str, words: tuple[str, ...], module: CrateModule, library: str | None,
@@ -3647,7 +3669,8 @@ def file_globs(path: str, words: tuple[str, ...], module: CrateModule, library: 
 
 
 def glob_module_problem(target: tuple[str, ...], files: Mapping[str, CrateModule], sources: RevisionTree,
-                        afters: Mapping[str, MoveText], modules: frozenset[tuple[str, ...]]) -> str | None:
+                        afters: Mapping[str, MoveText], modules: frozenset[tuple[str, ...]],
+                        keywords: frozenset[str]) -> str | None:
     """Why a glob of the crate module target can import from one of modules, or None.
 
     The module must not be one of modules or a parent of one, whose glob brings the child module's name. Its file must
@@ -3667,7 +3690,7 @@ def glob_module_problem(target: tuple[str, ...], files: Mapping[str, CrateModule
     if any(words[index:index + 2] == ("pub", "(") and words[index + 2:index + 4] != ("crate", ")")
            for index in range(len(words))):
         return "which holds a restricted visibility"
-    expansion = item_level_expansion(words, frozenset())
+    expansion = item_level_expansion(words, frozenset(), keywords)
     if expansion is not None:
         return f"which has {expansion}"
     return None
