@@ -4032,7 +4032,8 @@ class RestartTests(ShutdownTestCase):
         self.configure_groups(showrunners="claude3")
         _ = self.recovery([showrunner("held-group")])
         record.set_account_hold(record.AccountHold(login="third@example.invalid", label="claude3", machine="natedev",
-            requested_at=STOPPED, request_id="target-hold", requested_by=record.FromTerminal(kind="terminal"), then="stop"))
+            requested_at=STOPPED, request_id="target-hold", requested_by=record.FromTerminal(kind="terminal"), then="stop",
+            registration="in progress"))
         with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),

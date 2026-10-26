@@ -34,7 +34,7 @@ After four minutes without a ready reply, a waiting owner sends one push naming 
 
 To finish a failed move from its shutdown record, run `restart` with the record's source account and `--only` the session: restart starts it on the record's target account, never on the source. Restart alerts follow the selected records' saved policy on both machines; --here reads no peer. If the peer is unavailable, account-wide restart uses all local records: no local record or any alerts=user allows the alert. A selected restart uses only chosen records. The Remote Control fixer runs quietly for each restarted local session still missing it; outcomes stay in the service log. Probe records always use alerts=none, preserved through restart and move. Partial stops and incomplete restores name what needs attention.
 
-A selected shutdown holds only its sessions; an account-wide shutdown also blocks new launches and scheduled work. Other accounts remain isolated. Legacy record migration conflicts write nothing: report the diagnostic and preserve the files for repair.
+A selected shutdown holds only its sessions; an account-wide shutdown also blocks new launches and scheduled work until it is finished, then the account opens again. Other accounts remain isolated. Legacy record migration conflicts write nothing: report the diagnostic and preserve the files for repair.
 
 A session with no recorded conversation starts fresh under its recorded id and prints a plain line explaining that. On the Mac, a `terminal` host restarts into herdr in an attached Ghostty window.
 
