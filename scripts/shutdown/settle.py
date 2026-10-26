@@ -726,7 +726,7 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
     else:
         message = ""
     lines = [f"  {record['session']['name']}: {progress}{message}"]
-    if record["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(record):
+    if store.legacy_tmux_leftovers(record):
         from restart import legacy_resume_command
         lines.append(f"    manual restart: {legacy_resume_command(record)}")
     for step in record.get("trail", []):
@@ -1195,10 +1195,9 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
             continue
         if (not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"}
                 and not store.stop_incomplete(saved)
-                and saved["session"]["host"]["kind"] not in {"legacy tmux", "legacy tmux unit"}
                 and not store.legacy_tmux_leftovers(saved)):
             continue
-        if saved["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(saved):
+        if store.legacy_tmux_leftovers(saved):
             from restart import legacy_resume_command
             print(f"manual restart {saved['session']['name']}: {legacy_resume_command(saved)}")
             for issue in store.legacy_tmux_leftovers(saved):
@@ -1676,7 +1675,7 @@ def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
 def _holdout_host(saved: SessionShutdown) -> str:
     host = saved["session"]["host"]
     if host["kind"] == "legacy tmux" or host["kind"] == "legacy tmux unit":
-        return f"legacy host {host['session_name']}; manual recovery required"
+        return f"legacy host {host['session_name']}"
     if host["kind"] == "unit":
         return f"unit {host['production']}/{host['unit']}"
     if host["kind"] == "ghostty" or host["kind"] == "zed":

@@ -166,35 +166,36 @@ Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). T
 
 - **Hosts.** `inventory._host` checks `TMUX_PANE` first (non-empty means `UnknownHost`). A marked unit with a live Claude is `UnitHost{production, unit, doc, session_name, session_host: "herdr", plan}`. A placed pid is `HerdrHost{herdr_session, pane_id, presentation}`, where `presentation` is `"attached window"` when `attached_clients` finds one and `"detached"` otherwise (a record without it reads as detached). Everything else is a window or terminal host. The snapshot pass (`_snapshot_host`) fails when a `HERDR_PANE_ID` process cannot be placed or a session's clients are unreadable. On Darwin, inventory reads environments through `herdr.darwin_process_environment` and the snapshot reads no `/proc`.
 - **Stop.** `stop._stop_unit_session` runs `herdr.stop_session(<session_name>)` after the Claude exits. It judges the session stopped only when `live_sessions()` no longer lists it. Otherwise the record keeps `unit session left running{host: "herdr", session_name, cause}`.
-- **Restart destinations.** `_herdr_launch(parts: ResumeParts, destination: NewHerdrSession(name) | RecordedHerdrPane(name, pane_id), session, *, dry_run, session_kind) -> ServerCreated | ServerAdopted | WindowServerCreated`.
+- **Restart destinations.** Every restart lands as a tab in the one shared session, `shared_session()` (`agents`); no restart opens a herdr session of its own. `_herdr_launch(parts: ResumeParts, destination: RecordedHerdrPane(name, pane_id) | SharedHerdrTab(name), session, *, dry_run, session_kind) -> HerdrLaunch`.
   - Units restart only through `add_unit.py ... --host-session <session_name>` (`_unit_argv`), never `_herdr_launch`.
-  - A `HerdrHost` restarts into `RecordedHerdrPane`.
-  - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `NewHerdrSession(generated_session_name(<Claude name>))`, with no suffix retry. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <name>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window.
+  - A `HerdrHost` recorded in the shared session restarts through `RecordedHerdrPane`; one recorded in any other session restarts into `SharedHerdrTab` and leaves its recorded session (`_leave_recorded_session`). The leave runs after the launch. A leave that fails (`HerdrFailure`, `OSError` or `SubprocessError`) prints `<name> restart issue: herdr session <recorded> left open: <error>` and the launch stands; the old session stays for the user to close.
+  - A legacy tmux host restarts into `SharedHerdrTab`, with no window step.
+  - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
 - **`_herdr_launch` steps.**
   1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
   2. Check trust.
-  3. Call `restore_server(name, 90_000, exclusive=<NewHerdrSession>)`.
+  3. Call `restore_server(name, 90_000, exclusive=False)`.
   4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
-  5. Refuse a live agent: any agent for a new session, or one in the recorded pane. A recorded pane left at its shell is closed; one running a command is refused.
-  6. Record the scheduled prompt, open a pane, and start Claude with `OpeningPrompt(parts.opening_prompt)`. `AgentExited` stops only a created server.
+  5. Refuse a live agent in the recorded pane. A recorded pane left at its shell is closed; one running a command is left open, with a printed line, because the session resumes in a new tab.
+  6. Record the scheduled prompt, open a tab in the session's workspace (`herdr_space`: its production's, else `ad-hoc`), and start Claude with `OpeningPrompt(parts.opening_prompt)`. `AgentExited` closes that tab (`close_agent`); the shared server keeps running.
   7. An adopted or window-started server gets its restored workspace focused. After a successful focus, a window-started server also gets `close_startup_workspaces`. A failed focus or close prints `<name> restart issue: ...` and the restore stands.
   8. `StartFreshConversation` prints `<name>: no conversation to resume; started a new one`.
 
   `SessionTaken` becomes `HerdrDestinationTaken`, and `MacDesktopUnavailable` passes through.
 - **Windows after launch.** A `WindowServerCreated` restore needs nothing more. An `"attached window"` host gets a window only when `attached_clients` is `NoClientAttached`. Unreadable clients, or a `"detached"` host, print `herdr session attach <name>`. A failed window open appends to the record's `restart_issues` and leaves the agent running. Mac windows open `Ghostty.app` with `-e herdr session attach <name>`, spaced `WINDOW_DELAY_SECONDS` (1.2 s) apart.
-- **Codex snapshots.** `_launch_codex_snapshot` uses `generated_session_name(<cwd name>-codex, <16 hex of sha256(session id)>)`, `restore_server(..., exclusive=True)`, a pane with `CODEX_HOME`, and `start_agent(kind="codex", ["resume", <id>?], NoOpeningPrompt())`. A failed start stops a created server.
+- **Codex snapshots.** `_launch_codex_snapshot` uses the shared session, `restore_server(..., exclusive=False)`, a tab titled `<owner name>-codex` in the owner's workspace with `CODEX_HOME`, and `start_agent(kind="codex", ["resume", <id>?], NoOpeningPrompt())`. A failed start closes that tab. A legacy tmux owner restores the same way.
 - **Detached starts on the Mac.** `detached.start_detached(argv, *, ready, within, output: DiscardOutput | AppendLog, environment: InheritEnvironment | ExplicitEnvironment) -> pid` starts the child in its own session with stdin closed. It returns only once `ready()` passes while the child lives, and leaves a thread to reap it. Failure raises `DetachedChildExited(pid)` or `DetachedStartFailure`, and a child that never became ready has its process group stopped (SIGTERM, then SIGKILL after 0.5 s). The conductor and the fixer start this way, with the caller's environment plus `DETACHED_STARTUP_SIGNAL=1` (`ExplicitEnvironment`). Each is ready when its log holds `shutdown conductor started` or `Remote Control fixer started`, within 15 s. They print that line only when `DETACHED_STARTUP_SIGNAL=1` is in their environment, and they pop it at once. Their start errors end `; log: <path>`, with logs under `shutdown_state_root()/logs`. Linux uses systemd.
 
 ### Legacy tmux records
 
-Old records and snapshots still parse, and they never become herdr destinations. Do not remove this parsing.
+Old records and snapshots still parse. Do not remove this parsing.
 
 - `session_types._parse_host`:
   - A unit host whose `session_host` is absent or `"tmux"`, or whose kind is `legacy tmux unit`, becomes `LegacyTmuxUnitHost{kind: "legacy tmux unit", production, unit, doc, session_name}`. The old key `tmux_session` is read.
   - A `tmux` or `legacy tmux` host becomes `LegacyTmuxHost{kind: "legacy tmux", session_name}`.
   - Any `session_host` other than `tmux` or `herdr` raises `InvalidInventory`. `UnitHost.session_host` is `Literal["herdr"]`.
 - `record.py`: the old left-running kinds parse as `LegacyTmuxSessionLeftRunning{kind, at, session_name, cause}`. `legacy_tmux_leftovers(record)` returns every one, whatever its cause.
-- `restart.py`: a legacy host is `ManualRestartRequired(legacy_resume_command(record))`, which is `tmux kill-session -t =<name>` per leftover, `&&` the resume shell from `_resume_command`. A legacy Codex entry prints `legacy_codex_command(entry)` (`cd <cwd> && CODEX_HOME=<home> codex resume [<id>]`) and stays unacknowledged. Such records are never archived (`clear_running_on_target` refuses first) and never retried as cleanup. `status`, `now` and restart show them as manual restarts. They count in `MachineRestartResult.manual_sessions`, so restart reports `partial` and exits 1.
+- `restart.py`: tmux is gone, so a legacy host restarts as a tab in the shared session like a desktop host (see Restart destinations). Only a record with legacy tmux leftovers (`legacy_tmux_leftovers`) is `ManualRestartRequired(legacy_resume_command(record))`, which is `tmux kill-session -t =<name>` per leftover, `&&` the resume shell from `_resume_command`. Such a record is never archived (`clear_running_on_target` refuses first) and never retried as cleanup. `status` and restart show it as a manual restart. It counts in `MachineRestartResult.manual_sessions`, so restart reports `partial` and exits 1.
 - Other `tmux` text that stays on purpose: `sessions.SessionRecord.tmux`, the `/exit` guard in `pre-tool-use-showrunner-move-guard.py`, the old log line form in `waiting.py`, and user quotes in commands and `herdr-trial.md`.
 
 ### Test doubles
