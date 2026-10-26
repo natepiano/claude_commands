@@ -71,6 +71,10 @@ whose cargo locks a build holds is never touched. One sweep holds the floor at
 a time and keeps every idle target's cargo locks while scanning and removing,
 so a build starting there waits.
 --floor-only skips the workspace sweep for disk-floor.nix's 2-minute timer.
+Each such pass first runs tmp_sweep.py once an hour, which deletes agent
+scratch under /tmp/claude and /tmp/claude-<uid>/<project>/ that no process
+uses and where nothing changed in 4 hours, before the floor takes any build
+cache. Gate copies and scratch builds there had stayed until the disk filled.
 CI's targets are outside FLOOR_ROOTS, and its accounts cannot read lint.conf.
 By 15:23 PDT on 2026-10-06 that timer had taken 801 GiB, from units last
 used a median 3.0 h earlier. In a 60 GiB shortfall simulation, target-first order spared the
@@ -152,8 +156,12 @@ from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
+    from . import tmp_sweep
     from ..notify.push_texts import RenderedPush
     from ..notify import review
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import tmp_sweep
 
 GIB = 1 << 30
 MIB = 1 << 20
@@ -175,6 +183,12 @@ MERGE_DIRS = ("search.index", "trait.impl", "type.impl")
 TARGET_DIR_FLAG = "--target-dir"
 LOCK_NAMES = (".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock")
 PROC_DIR = "/proc"
+PROC_LOCKS = "/proc/locks"
+# The kernel writes /proc/locks one page per read and drops its lock between pages; a lock freed earlier in the
+# list moves the next page past one line. Each extra read gives a skipped line another chance to show.
+PROC_LOCKS_READS = 3
+# The kernel adds this to an exe, cwd or maps path whose file was removed.
+DELETED_SUFFIX = " (deleted)"
 # cargo runs a subcommand as `cargo-nextest nextest …`; a wrapper may rename argv[0].
 NEXTEST_ARG = "nextest"
 CARGO_TARGET_DIR_ENV = "CARGO_TARGET_DIR"
@@ -192,17 +206,27 @@ MAX_TREE_DEPTH = 3
 FLOOR_KEY = "sweep_free_floor_gib"
 FLOOR_ONLY_FLAG = "--floor-only"
 USE_STAMP = ".lint-sweep-used"
-# Every cargo target directory on natedev was under one of these (2026-10-03).
-FLOOR_ROOTS = ("~/rust", "~/.local/state", "/tmp")
+# Every cargo target directory on natedev was under one of these (2026-10-21). ~/.cache came in when
+# 421 GiB of idle targets under ~/.cache/trace-targets, where hana_catalyst agents point
+# CARGO_TARGET_DIR, had stayed unseen. ~/.cache/sccache holds no .rustc_info.json and no cargo
+# cache tag, so is_cargo_target never takes it.
+FLOOR_ROOTS = ("~/rust", "~/.local/state", "~/.cache", "/tmp")
 # Targets under these roots are scratch builds: below the floor they lose output before any other target.
-SCRATCH_ROOTS = ("/tmp",)
+SCRATCH_ROOTS = ("/tmp", "~/.cache/trace-targets")
 FLOOR_LOCK = os.path.join("~", ".local", "state", "lint-sweep", "floor.lock")
+# Claude Code keeps each session's scratch (scratchpad/, tasks/) in <root>/<project>/<session id>/,
+# where <project> is the session's working directory with every / as -.
 FLOOR_STATE_ENV = "LINT_SWEEP_STATE_DIR"
 BUILDLOG_DIR_ENV = "BUILDLOG_DIR"
 CI_TARGETS = ("/var/lib/hana-ci/hana-linux-1", "/var/lib/hana-ci/hana-linux-2")
 GROWTH_WINDOW_SECONDS = 30 * 60
 SNAPSHOT_MAX_AGE_SECONDS = 15 * 60
 ALERT_INTERVAL_SECONDS = 60 * 60
+# A phone push stays under this many characters (test_push_texts pins it for every catalog example).
+PUSH_TEXT_LIMIT = 500
+# The page names at most this many paths.
+PAGE_PATHS = 4
+NO_PAGE_PATHS = "No path is known: the disk measurement names no folder."
 # Three trace-driven sweeps on 2026-10-04 followed about 30 GiB of unexplained
 # loss each; their smallest removal was 35.2 GiB, versus 29.2 GiB at most otherwise.
 UNEXPLAINED_FALL_BYTES = 10 * GIB
@@ -444,6 +468,38 @@ class TargetUse:
     how: str
 
 
+@dataclass(frozen=True)
+class LockHeld:
+    """A cargo lock a build holds in a target."""
+
+    lock: str
+
+
+@dataclass(frozen=True)
+class FloorHolder:
+    """A busy target the floor cannot take: its size, and the process and session that hold it when known."""
+
+    path: str
+    bytes: int
+    pid: int | None
+    how: str
+    session: str | None
+
+
+def mapped_files(maps: bytes, prefix: str) -> list[str]:
+    """Each file under prefix that a /proc/<pid>/maps listing maps."""
+    # A maps line ends in the mapped file's path, after a space.
+    needle = b" " + os.fsencode(prefix)
+    files: list[str] = []
+    start = maps.find(needle)
+    while start >= 0:
+        end = maps.find(b"\n", start)
+        end = len(maps) if end < 0 else end
+        files.append(maps[start + 1:end].decode(errors="replace"))
+        start = maps.find(needle, end)
+    return files
+
+
 def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, TargetUse]:
     """Each target a live process uses, with one such process: its exe, its working directory or a
     file it maps lies under the target, or it is a cargo-nextest run whose workspace owns the target.
@@ -451,6 +507,11 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
     nextest's run phase holds none of cargo's locks: it executes test binaries straight from
     deps/, and between two of them no child may be running from the target, so the nextest
     process itself counts. Without /proc (the Mac) no use can be seen.
+
+    An exe or mapped file that reads "(deleted)" is not a use: its blocks come back only when the
+    process exits, and the sweep can neither take nor break it. So a stale process whose exe and
+    mappings under a target are all deleted, working outside it, does not keep the target busy: a
+    hung cargo-berth resolve held 26 GiB of cargo-liner's target that way for three days (2026-10-21).
     """
     prefixes = {target: os.path.realpath(target) + os.sep for target in targets}
     found: dict[str, TargetUse] = {}
@@ -475,19 +536,82 @@ def process_uses(targets: Sequence[str], proc: str = PROC_DIR) -> dict[str, Targ
         pid = int(name)
         for target in left:
             prefix = prefixes[target]
-            # A maps line ends in the mapped file's path, after a space.
-            mapped = maps.find(b" " + os.fsencode(prefix)) + 1
-            if exe.startswith(prefix):
+            if exe.startswith(prefix) and not exe.endswith(DELETED_SUFFIX):
                 found[target] = TargetUse(pid, f"runs {exe}")
             elif (cwd + os.sep).startswith(prefix):
                 found[target] = TargetUse(pid, f"works in {cwd}")
-            elif mapped:
-                path = maps[mapped:maps.find(b"\n", mapped)].decode(errors="replace")
-                found[target] = TargetUse(pid, f"maps {path}")
+            else:
+                path = next((path for path in mapped_files(maps, prefix) if not path.endswith(DELETED_SUFFIX)), None)
+                if path is not None:
+                    found[target] = TargetUse(pid, f"maps {path}")
         if NEXTEST_ARG in argv[1:2] or (argv and os.path.basename(argv[0]) == f"cargo-{NEXTEST_ARG}"):
             for target in nextest_targets(argv, cwd, os.path.join(base, "environ"), left):
                 _ = found.setdefault(target, TargetUse(pid, f"runs cargo-nextest in {cwd}"))
     return found
+
+
+def lock_holder(lock: str, locks: str = PROC_LOCKS) -> int | None:
+    """The pid that holds flock() on lock, read from /proc/locks; None without /proc or holder.
+
+    A read under load can skip a line (PROC_LOCKS_READS), so no holder is the answer only after every read agrees.
+    """
+    try:
+        stat = os.stat(lock)
+    except OSError:
+        return None
+    # "1: FLOCK  ADVISORY  WRITE <pid> <major>:<minor>:<inode> 0 EOF"; a waiter's line has "->".
+    device = f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+    for _ in range(PROC_LOCKS_READS):
+        try:
+            with open(locks, encoding="ascii", errors="replace") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            fields = line.split()
+            if len(fields) > 5 and fields[1] == "FLOCK" and fields[5] == device and fields[4].isdigit():
+                return int(fields[4])
+    return None
+
+
+def holder_sessions(pids: Sequence[int]) -> dict[int, str]:
+    """The live Claude session each pid runs under: the nearest ancestor a session record names."""
+    if not pids:
+        return {}
+    if TYPE_CHECKING:
+        from ..message import process_table
+        from ..message.sessions import live_sessions
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+        import process_table
+        from sessions import live_sessions
+    try:
+        table = process_table.snapshot()
+    except (OSError, subprocess.CalledProcessError):
+        return {}
+    names = {record["pid"]: record["name"] for record in live_sessions() if record["name"]}
+    found: dict[int, str] = {}
+    for pid in pids:
+        process = table.get(pid)
+        name = process_table.nearest_named(process, table, names) if process is not None else None
+        if name is not None:
+            found[pid] = name
+    return found
+
+
+def floor_holders(busy: dict[str, TargetUse | LockHeld], sizes: dict[str, int],
+                  locks: str = PROC_LOCKS) -> list[FloorHolder]:
+    """Each busy target, largest first, with the pid that holds it and that pid's session when known."""
+    uses: list[tuple[str, int | None, str]] = []
+    for root, use in busy.items():
+        if isinstance(use, LockHeld):
+            uses.append((root, lock_holder(use.lock, locks), f"holds the cargo lock {use.lock}"))
+        else:
+            uses.append((root, use.pid, use.how))
+    sessions = holder_sessions([pid for _, pid, _ in uses if pid is not None])
+    holders = [FloorHolder(root, sizes.get(root, 0), pid, how, sessions.get(pid) if pid is not None else None)
+               for root, pid, how in uses]
+    return sorted(holders, key=lambda holder: (-holder.bytes, holder.path))
 
 
 def nextest_targets(argv: list[str], cwd: str, environ: str, targets: list[str]) -> list[str]:
@@ -1168,21 +1292,67 @@ def floor_alert_text(now: float, removed: int, previous: NoFloorRecord | FloorRe
     return message
 
 
+def holder_text(holder: FloorHolder, path_limit: int = 256) -> str:
+    """One busy target: its path and size, and what holds it."""
+    who = f"pid {holder.pid}" if holder.pid is not None else "a process"
+    return f"{alert_path(holder.path, path_limit)} ({gib(holder.bytes)}): {who} {holder.how}"
+
+
 def floor_out_of_reach_text(now: float, removed: int, free: int, floor: int,
-                            held_count: int, held_bytes: int, ci_bytes: int,
+                            holders: Sequence[FloorHolder], told: frozenset[str], ci_bytes: int,
                             measurement: DiskMeasurement, failures: int) -> str:
-    held = f"{held_count} target dirs a build or test run uses ({gib(held_bytes)}), which the sweep takes once those end; " if held_count else ""
+    """The natedev report when no idle build output is left: what holds the space, and who was told."""
+    def holder_line(holder: FloorHolder, path_limit: int) -> str:
+        if holder.path in told:
+            outcome = f"session {holder.session} was told"
+        elif holder.session is not None:
+            outcome = f"the message to session {holder.session} failed"
+        else:
+            outcome = "no session found"
+        return f"- {holder_text(holder, path_limit)}; {outcome}"
+
+    if told:
+        closing = ["Each session above was told. The user gets no page while a session can end a use."]
+    elif holders:
+        closing = ["No session above could be told, so the user also gets a page with these paths."]
+    else:
+        closing = ["No target is in use, so the user also gets a page with the largest paths below."]
     for path_limit in (256, 128, 96, 72, 56, 40, 24, 16):
         message = "\n".join([
-            f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No build cache is left to remove.",
-            f"Free {gib(floor - free)} outside build caches in a terminal on natedev.",
-            f"Not swept: {held}CI's targets ({gib(ci_bytes)}).",
+            f"Build cache cleanup removed {gib(removed)}, but natedev still has only {gib(free)} free. Builds need {gib(floor)} free. No idle build cache is left to remove.",
+            *(["These target dirs are in use; the sweep removes their output when that use ends:"] if holders else []),
+            *(holder_line(holder, path_limit) for holder in holders),
+            f"Not swept: CI's targets ({gib(ci_bytes)}).",
             *([f"Could not remove {failures} {'path' if failures == 1 else 'paths'} this sweep; the next sweep tries again."] if failures else []),
+            *closing,
             *disk_measurement_lines(measurement, 0, 0, now, False, path_limit),
         ])
         if len(message) <= 1024:
             return message
     return message
+
+
+def holder_message_text(holder: FloorHolder, free: int, floor: int) -> str:
+    """The message to the session whose process holds a target the floor needs."""
+    return "\n".join([
+        f"natedev has {gib(free)} free, and builds need {gib(floor)} free. The disk floor sweep removed all idle build output.",
+        f"{holder_text(holder)}. This process is in your session, so the sweep cannot remove that output.",
+        "When the process ends, the next sweep removes the output. If the process is stale, stop it.",
+    ])
+
+
+def page_paths(holders: Sequence[FloorHolder], measurement: DiskMeasurement) -> list[str]:
+    """What holds the space, for the page: each busy target, then the largest measured folders
+    outside build caches. A folder that holds another listed folder is left out, so each path is exact."""
+    paths = [f"{holder.path}: frees {gib(holder.bytes)}. Process {holder.pid} uses it now and can fail." if holder.pid is not None
+             else f"{holder.path}: frees {gib(holder.bytes)}. A build uses it now and can fail." for holder in holders]
+    if isinstance(measurement, AvailableDiskMeasurement):
+        names = [item.path for item in measurement.directories]
+        leaves = [item for item in measurement.directories
+                  if not any(name.startswith(item.path.rstrip(os.sep) + os.sep) for name in names)]
+        paths.extend(f"{item.path}: frees {gib(item.bytes)}."
+                     for item in sorted(leaves, key=lambda item: item.bytes, reverse=True))
+    return paths
 
 
 @dataclass(frozen=True)
@@ -1193,15 +1363,45 @@ class NoPhoneAlert:
 NO_PHONE_ALERT = NoPhoneAlert()
 
 
-def disk_floor_push(removed: int, free: int, floor: int) -> RenderedPush:
+def disk_floor_push(removed: int, free: int, floor: int, paths: Sequence[str]) -> RenderedPush:
+    """The page sent when nothing else is left: as many of paths, in order, as fit one push."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     if TYPE_CHECKING:
         from ..notify.push_texts import render
     else:
         from push_texts import render
 
-    return render("sweep.disk_floor", removed=gib(removed), free=gib(free), floor=gib(floor),
-                  shortfall=gib(max(0, floor - free)))
+    def page(listed: str) -> RenderedPush:
+        return render("sweep.disk_floor", removed=gib(removed), free=gib(free), floor=gib(floor),
+                      shortfall=gib(max(0, floor - free)), paths=listed)
+
+    for count in range(min(len(paths), PAGE_PATHS), 0, -1):
+        push = page("\n\n".join(paths[:count]))
+        if len(push.message) < PUSH_TEXT_LIMIT:
+            return push
+    return page(paths[0] if paths else NO_PAGE_PATHS)
+
+
+def session_send_argv(to: str) -> list[str]:
+    """send.py's argv for a disk floor message to the session named to; the text goes on stdin."""
+    return [sys.executable, str(Path(__file__).resolve().parents[1] / "message/send.py"),
+            "--to", to, "--from", "disk_floor", "--timeout", "30"]
+
+
+def send_holder_message(session: str, message: str) -> bool:
+    """Tell a session that its process holds a target the floor needs; True when send.py delivered
+    the message or queued it (exit 1)."""
+    try:
+        result = subprocess.run(session_send_argv(session), input=message, text=True, capture_output=True, timeout=40)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        print(f"lint sweep: message to {session} failed: {error}", file=sys.stderr)
+        return False
+    if result.returncode in (0, 1):
+        print(f"lint sweep: message to {session} {'queued' if result.returncode == 1 else 'delivered'}")
+        return True
+    print(f"lint sweep: message to {session} failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}",
+          file=sys.stderr)
+    return False
 
 
 def send_floor_alert(message: str, channels: FloorAlertChannels, *,
@@ -1211,9 +1411,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
         # Imported here, so modules that only read sweep's config never load the reviewer.
         sys.path.insert(0, str(scripts / "notify"))
         import review
-    commands = [
-        ("message", [sys.executable, str(scripts / "message/send.py"), "--to", "natedev", "--from", "disk_floor", "--timeout", "30"]),
-    ]
+    commands = [("message", session_send_argv("natedev"))]
     if channels is FloorAlertChannels.NATEDEV_AND_PHONE:
         if TYPE_CHECKING:
             from ..notify.push_texts import RenderedPush, user_send_argv
@@ -1266,18 +1464,18 @@ def hold_floor(
         idle: list[str] = []
         trees: list[str] = []
         tree_targets: dict[str, str] = {}
-        busy: list[str] = []
+        busy: dict[str, TargetUse | LockHeld] = {}
         targets = target_dirs(roots)
         uses = process_uses(targets)
         for root in targets:
             if root in uses:
                 print(f"lint sweep: pid {uses[root].pid} {uses[root].how}; {root} left alone")
-                busy.append(root)
+                busy[root] = uses[root]
                 continue
             root_trees = build_trees(root)
             root_held, blocked = lock_trees(root_trees)
             if blocked is not None:
-                busy.append(root)
+                busy[root] = LockHeld(blocked)
                 continue
             held.extend(root_held)
             idle.append(root)
@@ -1290,27 +1488,41 @@ def hold_floor(
         target_uses = {root: target_last_use(root, groups) for root, groups in target_groups.items()}
         scratch_targets = {root: is_scratch_target(root, scratch_roots) for root in idle}
         total = sum(scan.blocks.values())
-        held_bytes = sum(directory_blocks(path) for path in busy)
+        busy_bytes = {path: directory_blocks(path) for path in busy}
+        held_bytes = sum(busy_bytes.values())
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
         unchanged_caches = held_bytes + ci_bytes
         before_caches = total + unchanged_caches
+        # The growth check compares this pair with the previous record. The scan takes minutes, so
+        # free is read again after it: a target another process deletes during the scan is then out
+        # of both figures, not out of before_caches alone. On 2026-10-25 the read from before the
+        # scan reported a 122.6 GiB fall while 123 GiB was freed.
+        scanned_free = free_bytes(home)
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
             + f" target dirs ({gib(total)}), {len(busy)} left alone while a build or test run uses them"
         )
-        budget = total - (floor - free)
-        ordered_at = time.time()
-        left, failures, chosen = shrink(
-            scan,
-            total,
-            budget,
-            dry_run,
-            lambda group: (
-                0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
-                target_uses[tree_targets[group.build_tree]],
-                *unit_age(group, ordered_at),
-            ),
-        )
+        # The shortfall comes from the read after the scan too: on 2026-10-25 the read from before it
+        # took 6.5 GiB of cache while another process had lifted free from 293.5 to 416 GiB.
+        budget = total - max(0, floor - scanned_free)
+        left, failures = total, 0
+        chosen: list[tuple[Group, int]] = []
+        if scanned_free < floor:
+            ordered_at = time.time()
+            left, failures, chosen = shrink(
+                scan,
+                total,
+                budget,
+                dry_run,
+                lambda group: (
+                    0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
+                    target_uses[tree_targets[group.build_tree]],
+                    *unit_age(group, ordered_at),
+                ),
+            )
+        else:
+            print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
+                  + " nothing taken")
         taken: dict[str, int] = {}
         for group, freed in chosen:
             root = tree_targets[group.build_tree]
@@ -1324,20 +1536,33 @@ def hold_floor(
         print(f"lint sweep: {gib(after_free)} free")
         if not dry_run:
             now = time.time()
+            # The record's free is read before its caches and the next sweep's free after its scan,
+            # so a deletion during either walk can only make the computed fall smaller.
             after_caches = sum(directory_blocks(path) for path in idle) + unchanged_caches
             removed = max(0, before_caches - after_caches)
             history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
             push_history = previous.push_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
             push_due = isinstance(push_history, NoDeliveredAlert) or now - push_history.at >= ALERT_INTERVAL_SECONDS
             # (user, 2026-10-05) Only an exhausted sweep still under the floor reaches the phone; other alerts reach natedev alone.
+            # (2026-10-21) It never asks the user to free space by hand. Each session whose process
+            # holds a busy target is told; the user gets a page, with exact paths, only when no
+            # session could be told.
             if left > budget and after_free < floor and push_due:
-                message = floor_out_of_reach_text(now, removed, after_free, floor, len(busy),
-                                                   held_bytes, ci_bytes, read_disk_measurement(), failures)
-                if send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE,
-                                    phone=disk_floor_push(removed, after_free, floor)):
+                holders = floor_holders(busy, busy_bytes)
+                told = frozenset(holder.path for holder in holders if holder.session is not None
+                                 and send_holder_message(holder.session, holder_message_text(holder, after_free, floor)))
+                measurement = read_disk_measurement()
+                message = floor_out_of_reach_text(now, removed, after_free, floor, holders, told,
+                                                  ci_bytes, measurement, failures)
+                if told:
+                    delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV)
+                else:
+                    page = disk_floor_push(removed, after_free, floor, page_paths(holders, measurement))
+                    delivered = send_floor_alert(message, FloorAlertChannels.NATEDEV_AND_PHONE, phone=page)
+                if delivered or told:
                     push_history = DeliveredAlert(time.time())
             elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
-                free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0
+                free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
                 cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
                 recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
                 growth_fired = recent and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES
@@ -1463,6 +1688,8 @@ def main(argv: list[str]) -> int:
         print(f"lint sweep: {floor_key} in {config} must be a non-negative number of GiB", file=sys.stderr)
         return 2
     status = 0 if floor_only else sweep_workspace(target_dir, config, dry_run)
+    if floor_only:
+        status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
         status = hold_floor(floor, dry_run) or status
     return status

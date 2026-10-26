@@ -264,11 +264,11 @@ class NewAccountTests(unittest.TestCase):
 
     def test_exhausted_distinct_colors_fall_back_to_role_colors_then_leave_the_account_uncolored(self) -> None:
         _ = self.colors.write_text(
-            "# Only the role colors remain unused by accounts.\n"
-            + "role.showrunner=bright-magenta\nrole.unit-director=bright-blue\nrole.worker=bright-cyan\n"
-            + "role.unassigned=purple\n"
+            "# Only the role color purple and three unused colors remain for accounts.\n"
+            + "role.showrunner=purple\nrole.unit-director=yellow\n"
             + "account.claude1=blue\naccount.claude2=magenta\naccount.claude3=cyan\n"
-            + "account.claude4=orange\naccount.claude10=pink\naccount.claude11=teal\naccount.claude12=brown\n",
+            + "account.claude4=orange\naccount.claude10=pink\naccount.claude11=teal\naccount.claude12=brown\n"
+            + "account.claude13=mauve\n",
             encoding="utf-8")
         for label, color in (("claude5", "bright-blue"), ("claude6", "bright-magenta"),
                              ("claude7", "bright-cyan"), ("claude8", "purple")):

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+from importlib import import_module
 import json
 import math
 import os
@@ -32,15 +33,22 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
 
+# These readers retain their names for callers that already use them.
+__all__ = [
+    "_arg", "_duration", "_emit", "_events", "_integer", "_meta", "_number",
+    "_require_rows", "_since_epoch", "_skills", "_status_filter", "_string", "_warn",
+]
+
+
 SPINE_VERSION = 1
 
-# Delegate pass kinds and activity labels onto the stage vocabulary the spine
+# Worker pass kinds and activity labels onto the stage vocabulary the spine
 # defines. Any label not listed is `other` rather than being forced into a
 # stage: an unrecognised activity is unclassified data, not a final step.
 PASS_STAGE: dict[str, str] = {
@@ -115,7 +123,7 @@ def _clean_task(task: str) -> str:
     questions and neither could be read off a name. On 2026-08-30 the tier axis
     was removed from the config and the 6141 events carrying a retired name were
     rewritten in place to the kind each had actually run under; the pre-migration
-    logs are at `~/.local/state/plan-delegate/backup-runs-2026-08-30-four-kinds`.
+    logs are at `~/.local/state/unit-history/backup-runs-2026-08-30-four-kinds`.
     Nothing is mapped at read time, so a retired name appearing here again means
     a writer was missed, not a log to translate.
     """
@@ -241,6 +249,16 @@ def _object(text: str) -> dict[str, object] | None:
     if not isinstance(parsed, dict):
         return None
     return cast(dict[str, object], parsed)
+
+
+# Unit runs recorded `plan-delegate` as their skill until the history folder moved to `unit-history`.
+FORMER_SKILLS = {"plan-delegate": "unit-history"}
+
+
+def _skill(event: dict[str, object], default: str) -> str:
+    """The event's skill under its current name, so one skill reads as one across its rename."""
+    skill = _string(event.get("skill"), default)
+    return FORMER_SKILLS.get(skill, skill)
 
 
 def _string(value: object, default: str = "") -> str:
@@ -395,7 +413,7 @@ def _normalize(
         task = _clean_task(_string(event.get("called_task")))
         result = _string(event.get("activity_result"))
     elif event_type == "stage_finished":
-        # The spine's own event, for skills instrumented after delegate. It
+        # The spine's own event, for skills instrumented after /unit:direct. It
         # arrives unvalidated, so every field is coerced the way the branches
         # above build theirs.
         label = _string(event.get("label")).strip().lower()
@@ -416,7 +434,7 @@ def _normalize(
         # stamp files each one a whole duration late in a `--since` window.
         started = _number(event.get("timestamp_epoch")) - float(seconds)
     return StageRow(
-        skill=_string(event.get("skill"), store_skill),
+        skill=_skill(event, store_skill),
         spine=_spine_of(event),
         schema=_integer(event.get("schema_version")),
         run=_string(event.get("run_id")),
@@ -787,7 +805,7 @@ def _cmd_runs(args: argparse.Namespace) -> None:
         _ = started.setdefault(run, _number(event.get("run_started_at"), stamp))
         last[run] = max(last.get(run, 0.0), stamp)
         branch[run] = _string(event.get("branch"), branch.get(run, ""))
-        skill[run] = _string(event.get("skill"), skill.get(run, store_skill))
+        skill[run] = _skill(event, skill.get(run, store_skill))
         if _string(event.get("event_type")) == "run_finished":
             # `delegate_session.jsonl` reuses one run id across sessions, so
             # the longest close is the run rather than the last line written.
@@ -853,7 +871,7 @@ def _cmd_versions(args: argparse.Namespace) -> None:
     events, tally = _events(_skills(args))
     counts: dict[tuple[str, str, str], int] = defaultdict(int)
     for store_skill, event in events:
-        skill = _string(event.get("skill"), f"{store_skill} (from store)")
+        skill = _skill(event, f"{store_skill} (from store)")
         spine = str(_spine_of(event)) if "spine_version" in event else "0 (pre-spine)"
         counts[(skill, spine, str(_integer(event.get("schema_version"))))] += 1
     table = [
@@ -1084,11 +1102,20 @@ def _cmd_summary(args: argparse.Namespace) -> None:
             weight = f"{_count(len(heavy), 'phase', 'phases')} ({heavy_share:.0f}%)"
             print(f"{weight} with >={FIX_PASS_THRESHOLD} fix passes {held}")
         print("\nNext:")
-        print("  history.py phases --sort fix_passes        the phases holding the tail")
+        print("  history.py rounds                         phases ranked by repair rounds")
         print("  history.py stages --stage review --group agent   cost per agent")
         print("  history.py compare --on <date>             did a change help")
     _warn(tally)
     _require_rows(table, "summary")
+
+
+class RoundReporter(Protocol):
+    def run(self, args: argparse.Namespace) -> None: ...
+
+
+def _cmd_rounds(args: argparse.Namespace) -> None:
+    rounds = cast(RoundReporter, cast(object, import_module("scripts.history.rounds")))
+    rounds.run(args)
 
 
 def main() -> None:
@@ -1143,6 +1170,14 @@ def main() -> None:
     status(phases)
     _ = phases.add_argument("--sort", default="total", choices=["fix_passes", "total"])
     phases.set_defaults(handler=_cmd_phases)
+
+    rounds = subparsers.add_parser("rounds", help="repair rounds and causes per phase instance")
+    shared(rounds, filters=False)
+    status(rounds)
+    _ = rounds.add_argument("--until", default="", help="upper bound; same forms as --since")
+    _ = rounds.add_argument("--top", type=int, default=25, help="maximum rows (default: 25)")
+    _ = rounds.add_argument("--plan", default="", help="plan basename substring")
+    rounds.set_defaults(handler=_cmd_rounds)
 
     compare = subparsers.add_parser("compare", help="before and after one change")
     _ = compare.add_argument("--on", default="", help="the date the change landed")

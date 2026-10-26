@@ -23,6 +23,20 @@ RuleOrigin = Literal["global", "local"]
 
 
 @dataclass(frozen=True)
+class NotStyleUnit:
+    """The unit id does not name a style family."""
+
+
+def style_family(unit: str) -> Family | NotStyleUnit:
+    families: tuple[Family, ...] = ("names", "values", "types", "modules")
+    for family in families:
+        suffix = f"{family}-unit"
+        if unit == suffix or unit.endswith("-" + suffix):
+            return family
+    return NotStyleUnit()
+
+
+@dataclass(frozen=True)
 class RepoReach:
     """The rule governs the entire repository."""
 
@@ -212,6 +226,12 @@ def _member_reach(repo_root: Path, member: str, rule_path: Path) -> MemberReach:
     raise RuleValidationError(rule_path, f"member-local rule names no workspace member {member}")
 
 
+def global_rule_paths() -> tuple[Path, ...]:
+    """The file of each global rule, in name order. A rule's name is its file stem."""
+    global_dir = style_rules.NATE_STYLE_DIR.resolve() / "rust"
+    return tuple(path.resolve() for path in sorted(global_dir.glob("*.md")) if path.is_file())
+
+
 def load_rules(repo_root: Path | None) -> tuple[Rule, ...]:
     """Read every global rule, then root and member rules in a repository.
 
@@ -221,11 +241,7 @@ def load_rules(repo_root: Path | None) -> tuple[Rule, ...]:
     this registry includes tool-enforced and Bevy rules for every repository.
     """
     global_root = style_rules.NATE_STYLE_DIR.resolve()
-    global_dir = global_root / "rust"
-    rules = [
-        _load_rule(path.resolve(), "global", global_root, RepoReach())
-        for path in sorted(global_dir.glob("*.md")) if path.is_file()
-    ]
+    rules = [_load_rule(path, "global", global_root, RepoReach()) for path in global_rule_paths()]
     if repo_root is not None:
         repo_root = repo_root.expanduser().resolve()
         docs = repo_root / "docs"

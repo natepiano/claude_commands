@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check delegate lint scope with synthetic Cargo metadata and real lint policy."""
+"""Check worker lint scope with synthetic Cargo metadata and real lint policy."""
 
 from __future__ import annotations
 
@@ -216,7 +216,7 @@ class VerifyLintScopeTests(unittest.TestCase):
         }
         self.environment = {
             name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "PLAN_DELEGATE_", "LINT_", "MAC_TEST_",
+            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
                                     "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
         }
         self.environment.update({
@@ -258,7 +258,7 @@ class VerifyLintScopeTests(unittest.TestCase):
     def enable_cache(self) -> Path:
         session = self.root / "session"
         session.mkdir()
-        self.environment["PLAN_DELEGATE_SESSION_DIR"] = str(session)
+        self.environment["UNIT_SESSION_DIR"] = str(session)
         return session / "verify_cache"
 
     def isolate_path_without_taplo(self) -> None:

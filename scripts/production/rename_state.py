@@ -6,11 +6,12 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import cast
 
 import tidy_wrapped
+from unit_rename_sweep import token_pattern
 
 JsonObject = dict[str, object]
 
@@ -117,6 +118,73 @@ def _rename_unit_rows(value: object, old: str, new: str) -> bool:
     return changed
 
 
+# Old and new names, the id first, rewritten as whole tokens in free text.
+Words = Sequence[tuple[str, str]]
+
+
+def _reworded(text: str, words: Words) -> str:
+    """`text` with each old name as a whole token taking its new name: `per-unit` stays."""
+    for old, new in words:
+        text = token_pattern((old,)).sub(new, text)
+    return text
+
+
+def _reword_items(items: object, fields: tuple[str, ...], words: Words) -> bool:
+    """Reword a list of texts, or of objects whose `fields` are text."""
+    if not isinstance(items, list):
+        return False
+    changed = False
+    entries = cast(list[object], items)
+    for index, item in enumerate(entries):
+        if isinstance(item, str):
+            if (updated := _reworded(item, words)) != item:
+                entries[index], changed = updated, True
+            continue
+        if not isinstance(item, dict):
+            continue
+        entry = cast(JsonObject, item)
+        for field in fields:
+            value = entry.get(field)
+            if isinstance(value, str) and (updated := _reworded(value, words)) != value:
+                entry[field], changed = updated, True
+    return changed
+
+
+def _reword_lists(value: object, words: Words) -> bool:
+    """The live lists `next` and `open_for_user` take the new names in their text: they are what the
+    showrunner still has to do, not history."""
+    if not isinstance(value, dict):
+        return False
+    state = cast(JsonObject, value)
+    changed = _reword_items(state.get("next"), (), words)
+    return _reword_items(state.get("open_for_user"), ("text", "question"), words) | changed
+
+
+def _rename_showrunner_state(value: object, words: Words) -> bool:
+    """The unit rows take the new id, and the live lists the new names."""
+    changed = bool(words) and _rename_unit_rows(value, words[0][0], words[0][1])
+    return _reword_lists(value, words) | changed
+
+
+def reword_showrunner_lists(path: Path, words: Words) -> bool:
+    """Another production's showrunner state, such as the parent's: the unit is not one of its rows,
+    but its live lists can name the unit."""
+    try:
+        return _rename_json(path, lambda value: _reword_lists(value, words))
+    except (OSError, ValueError) as error:
+        raise RenameRefused(str(error)) from error
+
+
+def rename_outstanding(slug: str, words: Words) -> bool:
+    """Reword OUTSTANDING as `open_for_user` is reworded, so the next `questions` run finds each item
+    stored and asks no new review."""
+    path = tidy_wrapped.owned_paths(slug)[2]
+    try:
+        return _rename_json(path, lambda value: _reword_items(value, ("text", "question", "reviewed"), words))
+    except (OSError, ValueError) as error:
+        raise RenameRefused(str(error)) from error
+
+
 def _rename_top_level_key(value: object, old: str, new: str) -> bool:
     if not isinstance(value, dict):
         return False
@@ -189,7 +257,7 @@ SCRATCH_FILES = ("dailies_input_state/eta_seen.json", "unit_status/decisions_see
                  "showrunner_state.json", "dailies_judgment.json", "dailies_state.json")
 
 
-def _rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
+def _rename_scratch(old: str, new: str, scratch: Path, words: Words) -> list[str]:
     changed: list[str] = []
     eta = scratch / "dailies_input_state" / "eta_seen.json"
     if _rename_json(eta, lambda value: _rename_eta_keys(value, old, new)):
@@ -203,7 +271,7 @@ def _rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
         changed.append("unit_status/blocks_open")
 
     showrunner = scratch / "showrunner_state.json"
-    if _rename_json(showrunner, lambda value: _rename_unit_rows(value, old, new)):
+    if _rename_json(showrunner, lambda value: _rename_showrunner_state(value, [(old, new), *words])):
         changed.append("showrunner_state.json")
     judgment = scratch / "dailies_judgment.json"
     if _rename_json(judgment, lambda value: _rename_unit_rows(value, old, new)):
@@ -214,10 +282,11 @@ def _rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
     return changed
 
 
-def rename_scratch(old: str, new: str, scratch: Path) -> list[str]:
-    """Move a showrunner's saved report state from one unit key to another."""
+def rename_scratch(old: str, new: str, scratch: Path, words: Words = ()) -> list[str]:
+    """Move a showrunner's saved report state from one unit key to another. `words` are more old and
+    new names, such as the branch and the worktree, that free text takes too."""
     try:
-        return _rename_scratch(old, new, scratch)
+        return _rename_scratch(old, new, scratch, words)
     except RenameRefused:
         raise
     except (OSError, ValueError) as error:

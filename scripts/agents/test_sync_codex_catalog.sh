@@ -66,9 +66,9 @@ medium
 high
 
 [assignments]
-delegate=codex
+direct=codex
 
-[delegate.codex]
+[direct.codex]
 impl=gpt-new:high
 
 [codex.agents]
@@ -131,9 +131,9 @@ medium
 high
 
 [assignments]
-delegate=codex
+direct=codex
 
-[delegate.codex]
+[direct.codex]
 impl=gpt-new:high
 
 [codex.agents]
@@ -164,9 +164,9 @@ stderr_text="$(<"$STDERR_FILE")"
 
 cat > "$AGENTS" <<'EOF'
 [assignments]
-delegate=codex
+direct=codex
 
-[delegate.codex]
+[direct.codex]
 impl=gpt-new:high
 
 [codex.agents]
@@ -196,9 +196,9 @@ fi
 
 cat > "$AGENTS" <<'EOF'
 [assignments]
-delegate=codex
+direct=codex
 
-[delegate.codex]
+[direct.codex]
 impl=gpt-retired:high
 test=gpt-retired:medium
 
@@ -219,13 +219,13 @@ cat > "$MODELS_CACHE" <<'EOF'
 EOF
 run_sync >/dev/null 2>"$STDERR_FILE"
 stderr_text="$(<"$STDERR_FILE")"
-assert_contains "$stderr_text" "delegate.impl is assigned to 'gpt-retired'" \
+assert_contains "$stderr_text" "direct.impl is assigned to 'gpt-retired'" \
     "stale impl row warning did not name the row"
-assert_contains "$stderr_text" "/agent delegate.impl <agent>[:<effort>]" \
+assert_contains "$stderr_text" "/agent direct.impl <agent>[:<effort>]" \
     "stale row warning did not name the task reconfiguration command"
-assert_contains "$stderr_text" "/agent delegate <family>" \
+assert_contains "$stderr_text" "/agent worker <family>" \
     "stale row warning did not name the family reconfiguration command"
-assert_contains "$stderr_text" "delegate.test is assigned to 'gpt-retired'" \
+assert_contains "$stderr_text" "direct.test is assigned to 'gpt-retired'" \
     "sync did not warn once for each stale assigned row"
 [[ "$(grep -c "is assigned to 'gpt-retired'" "$STDERR_FILE")" -eq 2 ]] \
     || fail "sync emitted the wrong number of stale-row warnings"
@@ -234,9 +234,9 @@ assert_contains "$stderr_text" "delegate.test is assigned to 'gpt-retired'" \
 
 cat > "$AGENTS" <<'EOF'
 [assignments]
-delegate=codex
+direct=codex
 
-[delegate.codex]
+[direct.codex]
 impl=gpt-current:high
 
 [codex.agents]
@@ -310,9 +310,9 @@ cmp "$before" "$AGENTS" || fail "invalid cache changed the registry"
 # built in, and must not let either `stat` spelling's diagnostics reach chmod.
 cat > "$AGENTS" <<'EOF'
 [assignments]
-delegate=codex
+direct=codex
 
-[delegate.codex]
+[direct.codex]
 impl=gpt-current:high
 
 [codex.agents]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Report the time verify.sh pass records saved, for any span and workspace.
 
-Reads the build log's calls table (`buildlog query`), one row per delegate
+Reads the build log's calls table (`buildlog query`), one row per worker
 `test`/`lint` call that could use a pass record: ran, failed, interrupted,
 reused (a recorded pass) or replayed (a recorded lint failure), with saved_s,
 the recorded run's wall time minus cargo's build time. Both machines' calls

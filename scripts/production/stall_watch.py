@@ -2,7 +2,12 @@
 """Bump idle unit directors and tell their running showrunners once per stretch.
 
 A unit that herdr reports `blocked` waits at a permission, trust or question prompt: no bump can
-move it, so after PROMPT_ALERT_SECONDS the user gets one phone alert per prompt instead.
+move it, so after PROMPT_ALERT_SECONDS the user gets one phone alert per prompt instead. The alert's
+request and wait start come from the session's transcript when it holds the pending tool call.
+Once that alert is sent, rca.py opens a case so the cause of the prompt is found and fixed, and each
+pass reminds the owner of a case still open after 30 minutes (`rca.remind`). The alert is an emergency
+push that repeats until the user acknowledges it, so when its prompt is gone `send.py retire` cancels it
+by its per-unit key.
 """
 
 from __future__ import annotations
@@ -28,7 +33,10 @@ import unit_lookup
 from session_pane import HerdrFailure, agent_status, read_place
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 import push_texts  # noqa: E402
+import rca  # noqa: E402
+import sessions  # noqa: E402
 
 import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
 
@@ -52,6 +60,8 @@ WORK = {"zsh", "bash", "sh", "implement.sh", "review.sh", "verify.sh"}
 BLOCKED = "blocked"
 PROMPT_ALERT_SECONDS = 60
 PROMPT_TEXT_ID = "stall_watch.permission_prompt"
+# The prompt alert's sender, which its retire names too.
+SENDER = "stall-watch"
 # The question of a Claude Code permission prompt: "Do you want to make this edit to panes.py?"
 PROMPT_QUESTION = re.compile(r"Do you want to (?P<ask>[^?\n]{1,160})\?")
 # "make this edit to panes.py" reads as "edit panes.py".
@@ -62,8 +72,29 @@ BASH_PROMPT_TITLE = "Bash command"
 AUTO_DENY_BANNER = re.compile(r"^⚠ Claude Code will automatically deny this request in \d+:\d{2}\b")
 # A permission prompt fits in the pane's bottom 40 lines.
 PROMPT_LINES = 40
+# A request that reads "{unit} asks to go on with its work" when neither the transcript nor the screen names one.
 UNKNOWN_REQUEST = "go on with its work"
+# A Bash request shows its command cut to 89 characters and "…", as send.py and rca.py cut a refused command.
+COMMAND_LENGTH = 90
 FRAME = " \t│┃|╭╮╰╯─"
+# Claude Code's warning under a command that reaches a path outside the session's folders:
+# "<path>, which is outside the allowed working directories".
+OUTSIDE_WARNING = ", which is outside the allowed working directories"
+OUTSIDE_TARGET = re.compile(r"(\S+)" + re.escape(OUTSIDE_WARNING))
+# A path with a folder, shown on the phone by its file name: "/tmp/claude/saved.txt" reads as "saved.txt".
+LONG_PATH = re.compile(r"(?<![\w.~/])(?:~|\.{1,2})?/[^\s,;:'\"()]*")
+# The first line of a Bash prompt's description is a sentence: "Read lines 5 to the end of a saved output".
+SENTENCE_START = re.compile(r"[A-Z][a-z]+ ")
+# A wrapped description goes on in lowercase words, with none of a command's shell characters.
+SENTENCE_REST = re.compile(r"[a-z0-9][^|;&<>$'\"=/`]*")
+COMMAND_BREAK = re.compile(r"\n|;|&&|\|\||\|")
+# What a command does to the file outside the session's folders; any other program is "use".
+OUTSIDE_VERBS = {"rm": "delete", "cp": "copy", "mv": "move"}
+# Claude Code keeps a large tool output in the session's tool-results folder.
+SAVED_OUTPUT_FOLDER = "tool-results"
+# A file tool's request: its verb and the input that names its file.
+FILE_TOOLS = {"Edit": ("edit", "file_path"), "MultiEdit": ("edit", "file_path"),
+              "NotebookEdit": ("edit", "notebook_path"), "Write": ("write", "file_path")}
 
 
 class Process(NamedTuple):
@@ -83,17 +114,27 @@ class Stretch(TypedDict):
 class PromptWait(TypedDict):
     since: float
     alerted: bool
+    # The pending tool call the prompt holds, or empty when the transcript names none.
+    tool: str
+    # The prompt is gone after its alert went out: the alert is retired before the unit gets a new one.
+    retiring: bool
 
 
 class Delivery(NamedTuple):
     state_path: Path
     kind: str
     command: list[str]
+    # The prompt alert's facts: once the alert is sent, rca.py opens a case to fix why the prompt came up.
+    report: rca.Report | None = None
 
 
 class ContentBlock(TypedDict, total=False):
     type: str
     text: str
+    id: str
+    name: str
+    input: dict[str, object]
+    tool_use_id: str
 
 
 class TranscriptMessage(TypedDict, total=False):
@@ -102,7 +143,16 @@ class TranscriptMessage(TypedDict, total=False):
 
 class TranscriptEntry(TypedDict, total=False):
     type: str
+    timestamp: str
     message: TranscriptMessage
+
+
+class PendingTool(NamedTuple):
+    """A tool call in the session's transcript with no result yet, and the time the session made it."""
+    id: str
+    name: str
+    input: dict[str, object]
+    started: float
 
 
 def command_output(command: list[str]) -> str:
@@ -222,10 +272,10 @@ def transcript_turn_end(session_id: str) -> re.Match[str] | None:
     means the turn went on, so there is no turn-end line.
     """
     try:
-        transcripts = sorted(PROJECTS_DIR.glob(f"*/{session_id}.jsonl"), key=lambda path: path.stat().st_mtime)
-        if not transcripts:
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
+        if transcript is None:
             return None
-        for line in lines_from_end(transcripts[-1]):
+        for line in lines_from_end(transcript):
             if b'"assistant"' not in line:
                 continue
             try:
@@ -240,6 +290,64 @@ def transcript_turn_end(session_id: str) -> re.Match[str] | None:
             if text:
                 turns = list(TURN_END.finditer(text))
                 return turns[-1] if turns else None
+    except OSError:
+        return None
+    return None
+
+
+def blocks_of(entry: TranscriptEntry) -> list[ContentBlock]:
+    content = entry.get("message", {}).get("content")
+    return content if isinstance(content, list) else []
+
+
+def pending_tool(session_id: str) -> PendingTool | None:
+    """The newest unanswered tool call in the session's transcript or in one of its helpers' transcripts.
+
+    A helper (subagent) writes to <session id>/subagents/agent-*.jsonl, and its prompt shows in the
+    session's pane, so its call is the one the prompt holds when it is the newest.
+    """
+    try:
+        paths = [path for directory in PROJECTS_DIR.glob(f"*/{session_id}/subagents")
+                 for path in directory.glob("agent-*.jsonl")]
+        main = sessions.latest_transcript(session_id, PROJECTS_DIR)
+    except OSError:
+        return None
+    calls = [call for path in ([main] if main else []) + paths if (call := transcript_pending(path)) is not None]
+    return max(calls, key=lambda call: call.started, default=None)
+
+
+def transcript_pending(transcript: Path) -> PendingTool | None:
+    """The tool call that ends the transcript and has no result yet.
+
+    A permission prompt holds the call from the moment the session makes it, so the call's time is
+    when the prompt came up, also when herdr sees the prompt later.
+    """
+    try:
+        answered: set[str] = set()
+        for line in lines_from_end(transcript):
+            if b'"tool_result"' not in line and b'"assistant"' not in line:
+                continue
+            try:
+                entry = cast(TranscriptEntry, json.loads(line))
+            except ValueError:
+                continue
+            if entry.get("type") == "user":
+                answered.update(block.get("tool_use_id", "") for block in blocks_of(entry)
+                                if block.get("type") == "tool_result")
+                continue
+            if entry.get("type") != "assistant":
+                continue
+            calls = [block for block in blocks_of(entry) if block.get("type") == "tool_use"]
+            if not calls or calls[-1].get("id", "") in answered:
+                return None
+            call = calls[-1]
+            try:
+                started = datetime.fromisoformat(entry.get("timestamp", "").replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+            arguments = call.get("input")
+            return PendingTool(call.get("id", ""), call.get("name", ""),
+                               arguments if isinstance(arguments, dict) else {}, started)
     except OSError:
         return None
     return None
@@ -287,19 +395,62 @@ def prompt_path(slug: str, unit: str) -> Path:
     return stretch_path(slug, unit).with_suffix(".prompt.json")
 
 
-def forget(slug: str, unit: str) -> None:
+def prompt_key(slug: str, unit: str) -> str:
+    """The key of the unit's prompt alert, which `send.py retire` cancels it by."""
+    return f"stall-watch:prompt:{slug}:{unit}"
+
+
+def retire_alert(slug: str, unit: str) -> Delivery:
+    """Cancel the repeats of the unit's prompt alert; once that succeeds, its prompt state is removed."""
+    command = push_texts.user_retire_argv(SENDER, prompt_key(slug, unit))
+    return Delivery(prompt_path(slug, unit), "retire", [sys.executable, str(SEND), *command[2:]])
+
+
+def end_prompt(slug: str, unit: str) -> Delivery | None:
+    """The prompt is gone: retire its alert when one went out, else remove its state."""
+    path = prompt_path(slug, unit)
+    saved = saved_prompt(path)
+    if saved is None or not saved["alerted"]:
+        path.unlink(missing_ok=True)
+        return None
+    saved["retiring"] = True
+    save_prompt(path, saved)
+    return retire_alert(slug, unit)
+
+
+def forget(slug: str, unit: str) -> Delivery | None:
     stretch_path(slug, unit).unlink(missing_ok=True)
-    prompt_path(slug, unit).unlink(missing_ok=True)
+    return end_prompt(slug, unit)
 
 
-def read_prompt(path: Path, now: float) -> PromptWait:
-    """The wait at the prompt on screen now: the saved one while the unit stays blocked, else a new one."""
+def saved_prompt(path: Path) -> PromptWait | None:
     try:
         old = cast(PromptWait, json.loads(path.read_text(encoding="utf-8")))
-        return PromptWait(since=float(old["since"]), alerted=old["alerted"] is True)
+        return PromptWait(since=float(old["since"]), alerted=old["alerted"] is True, tool=str(old.get("tool", "")),
+                          retiring=old.get("retiring") is True)
     except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return PromptWait(since=now, alerted=False)
+        return None
+
+
+def read_prompt(path: Path, now: float, pending: PendingTool | None = None) -> PromptWait:
+    """The wait at the prompt on screen now: the saved one while the unit stays blocked, else a new one.
+
+    A pending tool call in the transcript starts the wait when the session made the call, which can be
+    long before herdr first reports the pane blocked. A different pending call is a new prompt; when the
+    old one alerted, that alert is retired first, since both alerts have the unit's one key.
+    """
+    saved = saved_prompt(path)
+    if saved is not None and saved["retiring"]:
+        return saved
+    if pending is None:
+        return saved or PromptWait(since=now, alerted=False, tool="", retiring=False)
+    if saved is not None and saved["tool"] in ("", pending.id):
+        return PromptWait(since=min(saved["since"], pending.started), alerted=saved["alerted"], tool=pending.id,
+                          retiring=False)
+    if saved is not None and saved["alerted"]:
+        saved["retiring"] = True
+        return saved
+    return PromptWait(since=min(now, pending.started), alerted=False, tool=pending.id, retiring=False)
 
 
 def save_prompt(path: Path, prompt: PromptWait) -> None:
@@ -313,41 +464,158 @@ def auto_denied(pane: str) -> bool:
     return any(AUTO_DENY_BANNER.match(line.strip(FRAME)) for line in pane.splitlines()[-PROMPT_LINES:])
 
 
-def prompt_request(pane: str) -> str:
-    """What the permission prompt at the pane's bottom asks to do, worded to follow "asks permission to"."""
-    lines = [line.strip(FRAME) for line in pane.splitlines()[-PROMPT_LINES:]]
-    asked = [(index, found) for index, line in enumerate(lines) if (found := PROMPT_QUESTION.search(line))]
-    if not asked:
-        return UNKNOWN_REQUEST
-    index, question = asked[-1]
-    ask = question["ask"].strip()
+def file_name(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1] or path
+
+
+def short_path(found: re.Match[str]) -> str:
+    path = found.group(0)
+    # "/tmp" alone names a top folder; "/tmp/x" and "~/x" read as "x".
+    return path if path.count("/") == 1 and path.startswith("/") else file_name(path)
+
+
+def short_paths(text: str) -> str:
+    """The text with each path that has a folder shown by its file name, so it fits a phone screen."""
+    return LONG_PATH.sub(short_path, text)
+
+
+def described(description: str) -> str:
+    """A Bash description worded to follow "run a shell command to": "Write X; read Y." reads "write X and read Y"."""
+    text = " ".join(description.split()).rstrip(".").replace("; ", " and ")
+    if text[:1].isupper() and text[1:2].islower():
+        text = text[:1].lower() + text[1:]
+    return f"run a shell command to {text}"
+
+
+def program_words(segment: str) -> list[str]:
+    """A command segment's words from its program on, past any leading variable settings."""
+    words = segment.split()
+    return words[next((index for index, word in enumerate(words) if "=" not in word), len(words)):]
+
+
+def tool_request(pending: PendingTool) -> str | None:
+    """What a pending Bash, edit or write call asks to do, read from its transcript entry."""
+    arguments = pending.input
+    if pending.name == "Bash":
+        # The command itself, never its description: the user decides on what runs.
+        command = arguments.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return "run a shell command"
+        shown = short_paths(" ".join(command.split()))
+        return "run " + (shown if len(shown) <= COMMAND_LENGTH else shown[:COMMAND_LENGTH - 1] + "…")
+    if pending.name not in FILE_TOOLS:
+        return None
+    verb, key = FILE_TOOLS[pending.name]
+    path = arguments.get(key)
+    return f"{verb} {file_name(path)}" if isinstance(path, str) else None
+
+
+def bash_paragraphs(above: list[str]) -> list[list[str]] | None:
+    """The paragraphs of the Bash prompt above the question, without its warning; None for another prompt."""
+    above = [line for line in above if not AUTO_DENY_BANNER.match(line)]
+    if BASH_PROMPT_TITLE not in above:
+        return None
+    paragraphs: list[list[str]] = [[]]
+    for line in above[len(above) - above[::-1].index(BASH_PROMPT_TITLE):]:
+        if line:
+            paragraphs[-1].append(line)
+        elif paragraphs[-1]:
+            paragraphs.append([])
+    return [paragraph for paragraph in paragraphs if paragraph and OUTSIDE_WARNING not in " ".join(paragraph)]
+
+
+def screen_request(above: list[str], ask: str) -> str:
+    """What the prompt on screen asks to do, read from its question, or from the Bash prompt above it."""
     edit = EDIT_ASK.fullmatch(ask)
     if edit is not None:
         return f"edit {edit['file']}"
     if ask != "proceed":
         return ask
-    above = [line for line in lines[:index] if line and not AUTO_DENY_BANNER.match(line)]
-    if BASH_PROMPT_TITLE not in above:
+    paragraphs = bash_paragraphs(above)
+    if paragraphs is None:
         return UNKNOWN_REQUEST
-    # Claude Code shows the command below the title, then its description, if it has one.
-    shown = above[len(above) - above[::-1].index(BASH_PROMPT_TITLE):]
-    if len(shown) < 2:
-        return "run a shell command"
-    description = shown[-1]
-    return f"run a shell command to {description[:1].lower()}{description[1:]}"[:200]
+    # The description is the sentence among the command lines; a wrapped one goes on in the lines after it.
+    for paragraph in paragraphs:
+        start = next((number for number, line in enumerate(paragraph) if SENTENCE_START.match(line)), None)
+        if start is None:
+            continue
+        sentence = [paragraph[start]]
+        for line in paragraph[start + 1:]:
+            if not SENTENCE_REST.fullmatch(line):
+                break
+            sentence.append(line)
+        return described(" ".join(sentence))
+    return "run a shell command"
+
+
+def outside_request(above: list[str], command: str) -> str | None:
+    """A command the prompt's warning flags, named by what it does to the file outside the session's folders.
+
+    That file is why the prompt asks, so it is what the user decides on.
+    """
+    found = OUTSIDE_TARGET.search(" ".join(above))
+    if found is None:
+        return None
+    path = found.group(1)
+    name = file_name(path)
+    segment = next((part for part in COMMAND_BREAK.split(command) if name in part), "")
+    words = program_words(segment)
+    verb = OUTSIDE_VERBS.get(file_name(words[0]), "use") if words else "use"
+    kind = "its saved tool output " if file_name(path.rsplit("/", 1)[0]) == SAVED_OUTPUT_FOLDER else ""
+    return f"{verb} {kind}{name}, which is outside its allowed folders"
+
+
+def prompt_request(pane: str, pending: PendingTool | None = None) -> str:
+    """What the permission prompt asks to do, worded to follow "asks to".
+
+    The pending tool call in the transcript names the request best; the prompt at the pane's bottom is
+    read when there is none. A long path shows as its file name, and a Bash command is cut at COMMAND_LENGTH.
+    """
+    lines = [line.strip(FRAME) for line in pane.splitlines()[-PROMPT_LINES:]]
+    asked = [(index, found) for index, line in enumerate(lines) if (found := PROMPT_QUESTION.search(line))]
+    above = lines[:asked[-1][0]] if asked else []
+    paragraphs = bash_paragraphs(above)
+    if pending is None and paragraphs is not None:
+        outside = outside_request(above, " ".join(line for paragraph in paragraphs for line in paragraph))
+    else:
+        outside = None
+    request = outside or (tool_request(pending) if pending is not None else None)
+    if request is None:
+        if not asked:
+            return UNKNOWN_REQUEST
+        request = screen_request(above, asked[-1][1]["ask"].strip())
+    return short_paths(request)
 
 
 def machine_name() -> str:
     return gethostname().split(".", 1)[0]
 
 
-def prompt_alert(path: Path, unit: str, pane: str, since: float, zone: ZoneInfo) -> Delivery:
+def prompt_report(slug: str, unit: str, session_id: str, pending: PendingTool | None, since: float) -> rca.Report:
+    """The facts rca.py opens its case with: the pending Bash call's command, else the pending tool's name,
+    when the wait started, and the alert's sender and key."""
+    command = pending.input.get("command") if pending is not None else None
+    if pending is None:
+        commands: tuple[str, ...] = ()
+    else:
+        commands = (command,) if pending.name == "Bash" and isinstance(command, str) else (pending.name,)
+    try:
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
+    except OSError:
+        transcript = None
+    return rca.Report(unit, machine_name(), "prompt", commands, str(transcript or ""), slug,
+                      stopped=datetime.fromtimestamp(since, ZoneInfo("UTC")).isoformat(), source=SENDER,
+                      key=prompt_key(slug, unit))
+
+
+def prompt_alert(slug: str, unit: str, pane: str, since: float, zone: ZoneInfo,
+                 pending: PendingTool | None = None, report: rca.Report | None = None) -> Delivery:
     rendered = push_texts.render(PROMPT_TEXT_ID, unit=unit.removesuffix("-unit"), machine=machine_name(),
                                  since=datetime.fromtimestamp(since, zone).strftime("%H:%M %Z"),
-                                 request=prompt_request(pane))
-    command = push_texts.user_send_argv(rendered, sender="stall-watch")
+                                 request=prompt_request(pane, pending))
+    command = push_texts.user_send_argv(rendered, sender=SENDER, key=prompt_key(slug, unit))
     # The send script is the one this watcher is set to use, so a test's stands in for it.
-    return Delivery(path, "alert", [sys.executable, str(SEND), *command[2:]])
+    return Delivery(prompt_path(slug, unit), "alert", [sys.executable, str(SEND), *command[2:]], report)
 
 
 def read_stretch(path: Path, pane_hash: str, now: float) -> Stretch:
@@ -374,9 +642,14 @@ def delivery(path: Path, kind: str, socket: str, key: str, text: str) -> Deliver
                                  "--key", key, "--text", text])
 
 
-def send_all(pending: list[Delivery]) -> None:
-    """Start every relay, then give the entire batch one 90-second deadline."""
+def send_all(pending: list[Delivery], now: float) -> None:
+    """Start every relay and alert retire, then give the entire batch one 90-second deadline.
+
+    After the batch, each prompt alert that went out opens its rca.py case. A retire that fails keeps
+    its prompt state, so the next tick tries it again and sends no new alert.
+    """
     started: list[tuple[Delivery, subprocess.Popen[str]]] = []
+    reports: list[rca.Report] = []
     for item in pending:
         try:
             started.append((item, subprocess.Popen(item.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -395,10 +668,15 @@ def send_all(pending: list[Delivery]) -> None:
         if process.returncode != 0:
             print(f"stall-watch: {item.kind}: {err.strip() or out.strip() or process.returncode}", file=sys.stderr)
             continue
+        if item.kind == "retire":
+            item.state_path.unlink(missing_ok=True)
+            continue
         if item.kind == "alert":
             prompt = read_prompt(item.state_path, 0)
             prompt["alerted"] = True
             save_prompt(item.state_path, prompt)
+            if item.report is not None:
+                reports.append(item.report)
             continue
         stretch = cast(Stretch, json.loads(item.state_path.read_text(encoding="utf-8")))
         if item.kind == "bump":
@@ -406,6 +684,8 @@ def send_all(pending: list[Delivery]) -> None:
         else:
             stretch["tell_sent"] = True
         save_stretch(item.state_path, stretch)
+    for report in reports:
+        print(rca.open_case(report, datetime.fromtimestamp(now, ZoneInfo("UTC"))))
 
 
 def tick(now: float) -> None:
@@ -440,12 +720,16 @@ def tick(now: float) -> None:
                 print(f"stall-watch: {name}: its run state is unknown: {error}", file=sys.stderr)
                 continue
             if not running:
-                forget(slug, name)
+                if (retire := forget(slug, name)) is not None:
+                    pending.append(retire)
                 continue
             claude = unit.claude
             if not isinstance(claude, unit_lookup.LiveClaude):
                 if isinstance(claude, unit_lookup.ClaudeUnknown):
                     print(f"stall-watch: {name}: {claude.reason}", file=sys.stderr)
+                # A prompt is not on screen without its Claude.
+                elif (retire := end_prompt(slug, name)) is not None:
+                    pending.append(retire)
                 continue
             try:
                 pane = read_place(unit.place, 400, joined=True).strip()
@@ -455,25 +739,33 @@ def tick(now: float) -> None:
             pid, session_id, socket = claude.pid, claude.session_id, claude.socket
             path = stretch_path(slug, name)
             waiting = prompt_path(slug, name)
+            # None: herdr cannot say, so the unit is watched as not blocked, and its prompt is not ended.
+            blocked: bool | None
             try:
                 blocked = agent_status(unit.place) == BLOCKED
             except (OSError, HerdrFailure) as error:
                 print(f"stall-watch: {name}: its herdr state is unknown: {error}", file=sys.stderr)
-                blocked = False
+                blocked = None
             if blocked:
                 # It waits on the user, not on itself: the idle clock starts again after the prompt.
                 save_stretch(path, Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                            bump_sent=False, tell_sent=False, reported_status=""))
                 # Claude Code denies a prompt with the auto-deny banner by itself: the user gets no alert.
                 if auto_denied(pane):
-                    waiting.unlink(missing_ok=True)
+                    if (retire := end_prompt(slug, name)) is not None:
+                        pending.append(retire)
                     continue
-                prompt = read_prompt(waiting, now)
+                call = pending_tool(session_id)
+                prompt = read_prompt(waiting, now, call)
                 save_prompt(waiting, prompt)
-                if not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
-                    pending.append(prompt_alert(waiting, name, pane, prompt["since"], zone))
+                if prompt["retiring"]:
+                    pending.append(retire_alert(slug, name))
+                elif not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
+                    pending.append(prompt_alert(slug, name, pane, prompt["since"], zone, call,
+                                                prompt_report(slug, name, session_id, call, prompt["since"])))
                 continue
-            waiting.unlink(missing_ok=True)
+            if blocked is not None and (retire := end_prompt(slug, name)) is not None:
+                pending.append(retire)
             stretch = read_stretch(path, hashlib.sha256(pane.encode()).hexdigest(), now)
             turns = list(TURN_END.finditer(pane))
             turn = turns[-1] if turns else transcript_turn_end(session_id)
@@ -508,7 +800,7 @@ def tick(now: float) -> None:
             if not stretch["tell_sent"] and showrunner_socket:
                 text = f"{name} idle since {since_text}, nothing running; bumped. Last status: {last}"
                 pending.append(delivery(path, "tell", showrunner_socket, f"{key}:tell", text))
-    send_all(pending)
+    send_all(pending, now)
 
 
 def main() -> int:
@@ -520,6 +812,8 @@ def main() -> int:
             return 0
         now = float(os.environ.get("STALL_WATCH_NOW_EPOCH") or time.time())
         tick(now)
+        # The pass also reminds the owner of each permission case still open after 30 minutes.
+        rca.remind(datetime.fromtimestamp(now, ZoneInfo("UTC")))
     return 0
 
 

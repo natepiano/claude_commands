@@ -42,6 +42,7 @@ from inventory import (
 import inventory as inventory_work
 import record as recovery_store
 from launch_permission import (
+    RELEASED_HOLD_PREFIX,
     LaunchPurpose,
     NewWorkLaunchPurpose,
     RecordedSessionRestoreLaunchPurpose,
@@ -51,14 +52,16 @@ from record import (
     InvalidRecord,
     SessionShutdown,
     ShutdownContinuation,
-    AccountHeld,
+    AccountOpen,
+    HoldReleased,
+    RequestOrigin,
     ShutdownFound,
     ConductorRunning,
     ConductorNotRunning,
     ConductorUnavailable,
     conductor_status,
-    lookup_account_hold,
     lookup_session,
+    release_finished_account_hold,
     all_account_holds,
     all_session_records,
     parse_account_holds,
@@ -311,16 +314,27 @@ def _shutdown_hold_time(value: str) -> str:
     ).strftime("%Y-%m-%d %H:%M %Z")
 
 
+def _requester(origin: RequestOrigin) -> str:
+    match origin["kind"]:
+        case "session":
+            return f"requested by session {origin['session_id'][:8]}"
+        case "terminal":
+            return "requested in a terminal"
+        case "snapshot":
+            return "requested by a recovery snapshot"
+
+
 def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
     """Permit recorded restorable progress, even while the account is held.
 
     Stopped, already gone, process identity lost, restarting, restart failed
     and manual restart permit restore. Other recorded progress blocks it.
     Without a record, only the account hold decides, as for new work.
-    The restore purpose alone does not authorize a launch."""
+    The restore purpose alone does not authorize a launch. A finished
+    account hold is removed and the launch permitted, with one
+    `released account hold: <JSON>` line."""
     try:
         _ = session_records(selected.login)
-        hold = lookup_account_hold(selected.login)
         if isinstance(purpose, RecordedSessionRestoreLaunchPurpose):
             found = lookup_session(selected.login, purpose.session_id)
             if isinstance(found, ShutdownFound):
@@ -333,13 +347,17 @@ def launch_blocked(selected: Account, purpose: LaunchPurpose) -> int:
                 hold_time = _shutdown_hold_time(restoring["requested_at"])
                 print(f"{restoring['session']['name']} is held by a shutdown (since {hold_time})")
                 return 0
+        outcome = release_finished_account_hold(selected.login)
     except (InvalidRecord, OSError, ValueError) as error:
         print(f"shutdown state unreadable: {error}", file=sys.stderr)
         return 3
-    if not isinstance(hold, AccountHeld):
+    if isinstance(outcome, HoldReleased):
+        print(RELEASED_HOLD_PREFIX + json.dumps(outcome.hold, sort_keys=True))
         return 1
-    hold_time = _shutdown_hold_time(hold.hold["requested_at"])
-    print(f"{hold.hold['label']} is held by a shutdown (since {hold_time})")
+    if isinstance(outcome, AccountOpen):
+        return 1
+    hold_time = _shutdown_hold_time(outcome.hold["requested_at"])
+    print(f"{outcome.hold['label']} is held by a shutdown (since {hold_time}), {_requester(outcome.hold['requested_by'])}")
     return 0
 
 
@@ -1039,7 +1057,7 @@ class TerminalAccountSelection:
 
 
 def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
-    """Terminal restarts cover records and holds; other verbs cover configured logins."""
+    """Terminal restarts cover records and holds; other verbs cover configured logins, and `now` also record logins."""
     selected: dict[str, Account] = {}
     unavailable: list[str] = []
     if options.command == "restart":
@@ -1072,6 +1090,10 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
             login = note.get("login")
             if note.tool == "claude" and login:
                 selected[login.casefold()] = Account("claude", login, note.label)
+        if options.command == "now":
+            # A paused stop may sit on an account that is no longer configured here.
+            for saved in all_session_records():
+                _ = selected.setdefault(saved["login"].casefold(), Account("claude", saved["login"], saved["label"]))
         if options.command == "status":
             for snapshot in recovery_store.all_snapshots():
                 if snapshot["sessions"]:
@@ -1181,8 +1203,8 @@ def _dispatch(options: CommandLine) -> int:
         except (InvalidRecord, InvalidInventory, OSError, ValueError) as error:
             print(f"shutdown: {error}", file=sys.stderr)
             return 1
-    if (options.command in {"down", "restart", "status"} and options.account is None
-            and not os.environ.get("CLAUDE_CODE_SESSION_ID")):
+    if ((options.command in {"down", "restart", "status"} or (options.command == "now" and options.only is not None))
+            and options.account is None and not os.environ.get("CLAUDE_CODE_SESSION_ID")):
         return _all_accounts(options)
 
     if options.command == "remote-control":

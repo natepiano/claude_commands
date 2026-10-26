@@ -21,6 +21,8 @@ message_arrived(
 
 `PromptSource` is `TYPED`, `PEER`, `SCHEDULED` or `NOTICE`. Only a typed prompt pauses, and only its own session (`pauses(source)`). A peer message, a tick or a relay never pauses, and a peer's answer to the return question changes nothing: until 2026-10-13 a peer message paused a unit director, and a review unit's hourly health tick, relayed by another session, paused its timer and put the return question on screen six times while the user never typed in that pane. Scheduled prompts, notifier senders, task notices and system reminders do not pause anything; `JOB_SENDERS` includes `shutdown`, so `/shutdown` messages never pause a session. `/shutdown restart` and `add_unit.py` record a restored session's first prompt with `record_scheduled_prompts` before launch, so it is read as scheduled. The Stop hook records `session_crons[].prompt`; the prompt hook recognizes the next scheduled prompt by exact text or its recorded clipped prefix. These records expire after `SCHEDULED_PROMPT_RETENTION_SECONDS`, eight days.
 
+**Only the user's own prompt is `TYPED`** (2026-10-22). A `TYPED` prompt in a showrunner or unit director also runs `auto_silence.py active`, which ends an auto silence. At 04:34 AST on 2026-10-22 a Claude Code `[Cross-session idle notice]` in the style showrunner ended one and pushed "You are back" while the user slept; four of the seven ends from 2026-10-20 20:21 to 2026-10-22 08:26 followed such a notice. Two rules now hold. Claude Code's own prompts, `[Cross-session <kind> notice]` (`HARNESS_NOTICE`) and the usage-reset continuation, are `NOTICE`. `Herdr.prompt`, the one call every script types a prompt through (`session_pane.py type`, launch and restore opening prompts), first records the pane and the words in `scripts/lib/script_prompts.py`; the prompt hook reads its own `HERDR_PANE_ID` and reads a recorded prompt as `SCHEDULED` for `KEEP_SECONDS`, six hours. The hook input cannot tell the user's keys from a script's: Claude Code sends only `prompt` and `session_title`, and a prompt typed into the pane is `promptSource: typed` in the transcript too.
+
 `scripts/hooks/user-prompt-submit-conversation-pause.py` classifies the prompt, stamps typed activity through `escalate.typed()`, and calls `message_arrived`. `scripts/hooks/stop-conversation-pause.py` calls:
 
 ```python
@@ -43,7 +45,7 @@ PauseRecord(
 
 `PausePhase` is `Replying | Quiet | QuestionPending | Asked | KeptOff | Returned`. `Asked` contains `QuestionNotRead | QuestionRead(replies_ended)`. The record lists only notifier instances that this pause switched off. A record written while reply footers existed (before 2026-10-18) also has `footers`, which nothing reads now.
 
-`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `delegate-*` status reports, `showrunner-*` dailies, and other scheduled reports. The pause stops enabled instances with `notifier.sh stop`.
+`session_reports(session_id)` finds every notifier instance whose `conf` has `TARGET=session:<id>` and no `RUN=`. That rule covers `unit-*` and `worker-*` status reports, `showrunner-*` dailies, and other scheduled reports. The pause stops enabled instances with `notifier.sh stop`.
 
 `ensure_watcher()` creates or repairs the run-only `conversation-pause` notifier instance:
 
@@ -96,7 +98,7 @@ A unit's run state is stored nowhere. `unit_lookup.run_state(worktree) -> UnitSt
 
 ### As-built corrections and phone alerts
 
-`docs/production_format.md`, `commands/showrunner/produce.md` and `docs/delegate/final_gate_commit.md` allow any unit or showrunner to correct a file under `docs/as-built/` when it contradicts the code. No approval from the user, showrunner or owning unit is required. A unit still names the file as `also touches` in its checkpoint notice, and the showrunner does not delay a merge because of that correction.
+`docs/production_format.md`, `commands/showrunner/produce.md` and `docs/direct/final_gate_commit.md` allow any unit or showrunner to correct a file under `docs/as-built/` when it contradicts the code. No approval from the user, showrunner or owning unit is required. A unit still names the file as `also touches` in its checkpoint notice, and the showrunner does not delay a merge because of that correction.
 
 Every repository phone alert goes through `send.py --to user`. A session writes its own text:
 
@@ -115,7 +117,7 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 ## Invariants
 
 - A pause affects only the session that received the prompt.
-- Typed input always pauses. Peer input pauses a unit director but not a showrunner. Scheduled prompts and automated notices never pause.
+- Typed input always pauses. Peer input, scheduled prompts, prompts a script typed and automated notices never pause.
 - The record contains only items this pause switched off, and resume restores only those items that nobody stopped, started or switched since.
 - `notifier.sh resume` and `unpause` never move an instance's schedule.
 - The pause question is recognized by sender identity, never by copied or relayed text.

@@ -1,4 +1,4 @@
-"""The tool-output read guard refuses a sed or awk read of saved tool output that would prompt."""
+"""The tool-output read guard refuses a sed or awk read, or a change or copy, of saved tool output that would prompt."""
 
 from __future__ import annotations
 
@@ -46,6 +46,16 @@ class ToolOutputReadTests(unittest.TestCase):
         for rewrite in ("the Read tool", "grep -n PATTERN FILE", "tail -n +N FILE", "sed -n 'N,Mp' FILE"):
             self.assertIn(rewrite, reason)
 
+    def assert_change_refused(self, command: str, program: str) -> None:
+        result = run_hook(bash_call(command))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = cast(HookResponse, json.loads(result.stdout))["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        reason = decision["permissionDecisionReason"]
+        self.assertIn(f"this {program} on saved tool output asks for permission", reason)
+        self.assertIn("Leave saved output alone", reason)
+        self.assertIn("`cat <file> > /tmp/claude/<name>`", reason)
+
     def assert_allowed(self, payload: str) -> None:
         result = run_hook(payload)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -62,6 +72,20 @@ class ToolOutputReadTests(unittest.TestCase):
         self.assert_refused(f"awk 'NR>=5' {SAVED}", "awk")
         self.assert_refused(f"cat {SAVED} | /usr/bin/gawk '{{print $1}}'", "gawk")
         self.assert_refused(f"wc -l {SAVED}\nawk 'NR>=5' {SAVED}", "awk")
+
+    def test_changes_and_copies_of_saved_output_are_refused(self) -> None:
+        for command, program in ((f"rm {SAVED}", "rm"), (f"/bin/rm -f {SAVED}", "rm"),
+                                 (f"cp {SAVED} /tmp/claude/board.json", "cp"), (f"mv {SAVED} /tmp/x", "mv"),
+                                 (f"echo x | tee -a {SAVED}", "tee"), (f"echo x > {SAVED}", ">"),
+                                 (f"echo x>>{SAVED}", ">>"), (f"ls; date &> {SAVED}", "&>")):
+            with self.subTest(command=command):
+                self.assert_change_refused(command, program)
+
+    def test_a_copy_through_cat_and_other_writes_pass(self) -> None:
+        for command in (f"cat {SAVED} > /tmp/claude/board.json", f"grep -n x {SAVED} >> /tmp/claude/hits",
+                        f"wc -l {SAVED}; rm /tmp/claude/old", f"cp {SAVED.replace('tool-results', 'notes')} /tmp/x"):
+            with self.subTest(command=command):
+                self.assert_allowed(bash_call(command))
 
     def test_reads_that_run_with_no_prompt_pass(self) -> None:
         for command in (f"sed -n '1,5p' {SAVED}", f"sed -n 12p {SAVED}", f"sed -n -e '3,9p' {SAVED}",

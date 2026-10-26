@@ -83,7 +83,7 @@ class IsolatedTargetTest(unittest.TestCase):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "CLAUDE_CODE_SESSION_ID": "",
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
         _ = self.enterContext(mock.patch.object(build_hold, "record_hold_event"))

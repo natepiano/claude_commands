@@ -15,7 +15,7 @@ of every improvement the nightly review found that is still open: each line of
   failed runs) first, then share of tokens. A candidate with no measured gain
   comes after every measured one, in the ledger's order.
 - **Pick**: the first row reads `recommended` when its gain is measured. It is
-  the candidate `/efficiency_next` presents first.
+  the candidate `/next efficiency` presents first.
 - **Area**: `config` or `rust/<target>`. `, also found` and `, noted` mark a
   smaller finding of that night.
 
@@ -23,4 +23,4 @@ With nothing open it prints `no open candidates`. The script rewrites
 `~/rust/hanadocs/nightly improvement list.md` (`NIGHTLY_REVIEW_NOTE` replaces
 the path) and changes nothing else. The ledger is kept on natedev, so run it
 there. To act on a row, use
-`/efficiency_next`.
+`/next efficiency`.

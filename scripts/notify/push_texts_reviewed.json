@@ -1,4 +1,71 @@
 {
+  "auto_mode.refused": {
+    "file_change_no_waits": {
+      "objections": [
+        {
+          "quote": "hana: auto mode stopped demo",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "write phases/34h/delegated_phase_reservation_state.json",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Allow rule: the work goes on now, and auto mode lets this command run from then on.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Auto mode refused a file change in the demo session.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:25.542816-04:00"
+    },
+    "one_with_rule": {
+      "objections": [
+        {
+          "quote": "build-followups: auto mode stopped messaging",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "approve the prompt or add an allow rule",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "The merge of the messaging work waits for it.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Session: messaging\nAction: On natedev, in the messaging pane, approve the prompt or add an allow rule\nAuto mode refused a git push in the messaging session, so its work cannot merge until you answer. The command:\ngit push origin build-followups-messaging\n\nApprove (recommended): this push runs now. Auto mode still checks later pushes, so a wrong push can still be stopped.\n\nAllow rule: this push runs now, and every git push from any session runs without a check after this. The rule: Bash(git push:*)",
+          "rule": "push-body-under-500"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:14.182975-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "cargo-liner-style: auto mode stopped modules",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "implement.sh --to modules-impl\nreview.sh --to modules-test",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Approve: the work goes on now, and auto mode can stop it on these commands again.\n\nAllow rule: the work goes on now, and auto mode lets these commands run from then on.",
+          "rule": "every-choice-says-what-it-does"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "4a6d862354e77ee8ef1d3762a1600b50d1e7fba9f5e0bfdbb532dec2914b5365",
+      "time": "2026-10-23T19:45:00.398996-04:00"
+    }
+  },
   "codex.reset_ready": {
     "long_machine": {
       "reviewer": "opus",
@@ -9,6 +76,34 @@
       "reviewer": "opus",
       "sha256": "1f065b1a5dcd7b40a7239274d3d8c502bfbcb27763417405c9b8168bea52fd46",
       "time": "2026-10-14T04:25:55.369515-04:00"
+    }
+  },
+  "nate.adhoc": {
+    "long_sender": {
+      "objections": [
+        {
+          "quote": "cargo-liner-style renames",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "both units run under their new names",
+          "rule": "before-and-after"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:23:00.784022-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "natedev the /nate skill is ready",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: /nate adhoc, Title: {sender} {short title}, Description: {description}, then {template-name}; reviewer: opus",
+      "sha256": "390381a8d16ef457ffe8a43abbbec0900086c06dee156e1c8a0ec8312fe3a1dd",
+      "time": "2026-10-20T14:22:51.437039-04:00"
     }
   },
   "nixos.disk_low": {
@@ -42,6 +137,103 @@
       "time": "2026-10-14T04:27:02.640947-04:00"
     }
   },
+  "permission.rca_fixed": {
+    "prompt": {
+      "objections": [
+        {
+          "quote": "Now: helpers use the build command that is always allowed.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "cargo-liner: fixed why handler stopped",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
+      "time": "2026-10-23T19:48:49.400678-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "Now: a script writes that file, so the session never has to.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: fixed why demo stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "hana",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "14:23 AST",
+          "rule": "times-carry-zone"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "c820c26f01ce0c1ac8eb92e79c43137c8ead7c6824519ebcbbc67ce5f2f1a8d9",
+      "time": "2026-10-23T19:48:41.507782-04:00"
+    }
+  },
+  "permission.rca_fixed_rewritten": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "Now: a script writes that file.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: fixed why demo stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "hana",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "717774694cd697ec398b79e979644b1c57255df845acbfa2655d3e438a55d07f",
+      "time": "2026-10-23T19:49:18.647629-04:00"
+    }
+  },
+  "permission.rca_started": {
+    "prompt": {
+      "objections": [
+        {
+          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "cargo-liner: finding why handler stopped",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "The handler session",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
+      "time": "2026-10-23T19:47:30.202480-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "A session now finds the cause and fixes it, so it does not stop there again. A second push comes when the fix is in.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "hana: finding why demo stopped",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "891ad01d3b6bf3b11e35d6a68309c44ba5e96f2f5d011a60e80d9429f9f802c5",
+      "time": "2026-10-23T19:47:21.747732-04:00"
+    }
+  },
   "quota.claude_next_move": {
     "uncovered_empty": {
       "reviewer": "opus; user-spec: Phase 81 renames the slash command to /account_moves; command name only",
@@ -58,17 +250,21 @@
     "codex_one": {
       "objections": [
         {
-          "quote": "When credits run out, workers move to codex2 (97% weekly usage left).",
+          "quote": "Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 AST. When credits run out, workers move to codex2 (97% weekly usage left).",
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "codex1: paid credits until Fri 13:05 EDT",
+          "quote": "codex1: paid credits until Fri 13:05 AST",
           "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Fri 2026-10-16 13:05 AST",
+          "rule": "times-carry-zone"
         }
       ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "d9837bf53f57aad788b47c8fad247962805bbbba0ba5ff3bec921b8a94bec99d",
-      "time": "2026-10-17T13:46:48.538465-04:00"
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
+      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
+      "time": "2026-10-25T13:40:05.384571-04:00"
     },
     "codex_two": {
       "objections": [
@@ -77,17 +273,17 @@
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "codex2: paid credits until Fri 12:51 EDT",
+          "quote": "codex2: paid credits until Fri 12:51 AST",
           "rule": "title-names-the-stake"
         },
         {
-          "quote": "its 2,114 credits last until about Fri 2026-10-16 12:51 EDT",
-          "rule": "what-happened-why-what-you-do"
+          "quote": "last until about Fri 2026-10-16 12:51 AST",
+          "rule": "times-carry-zone"
         }
       ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "d9837bf53f57aad788b47c8fad247962805bbbba0ba5ff3bec921b8a94bec99d",
-      "time": "2026-10-17T13:46:57.813122-04:00"
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
+      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
+      "time": "2026-10-25T13:40:15.596550-04:00"
     },
     "queued": {
       "objections": [
@@ -96,13 +292,17 @@
           "rule": "push-only-what-the-user-must-do"
         },
         {
-          "quote": "codex1: paid credits until Fri 13:05 EDT",
+          "quote": "codex1: paid credits until Fri 13:05 AST",
           "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Fri 2026-10-16 13:05 AST",
+          "rule": "times-carry-zone"
         }
       ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "d9837bf53f57aad788b47c8fad247962805bbbba0ba5ff3bec921b8a94bec99d",
-      "time": "2026-10-17T13:48:05.868953-04:00"
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
+      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
+      "time": "2026-10-25T13:41:03.144212-04:00"
     },
     "unknown_balance": {
       "objections": [
@@ -115,14 +315,14 @@
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "d9837bf53f57aad788b47c8fad247962805bbbba0ba5ff3bec921b8a94bec99d",
-      "time": "2026-10-17T13:47:34.995533-04:00"
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
+      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
+      "time": "2026-10-25T13:40:41.369421-04:00"
     },
     "unknown_use": {
       "objections": [
         {
-          "quote": "Coding workers on Codex account codex2 remain on paid usage. Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.",
+          "quote": "Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
@@ -134,9 +334,9 @@
           "rule": "short-plain-sentences"
         }
       ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "d9837bf53f57aad788b47c8fad247962805bbbba0ba5ff3bec921b8a94bec99d",
-      "time": "2026-10-17T13:47:50.008086-04:00"
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
+      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
+      "time": "2026-10-25T13:40:52.986779-04:00"
     },
     "unlimited": {
       "objections": [
@@ -149,14 +349,14 @@
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "d9837bf53f57aad788b47c8fad247962805bbbba0ba5ff3bec921b8a94bec99d",
-      "time": "2026-10-17T13:47:14.859521-04:00"
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
+      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
+      "time": "2026-10-25T13:40:30.684456-04:00"
     },
     "zero_use": {
       "objections": [
         {
-          "quote": "Workers on Codex account codex1 used no credits in the last hour; 6,370 paid credits left. When credits run out, workers move to codex2 (97% weekly usage left).",
+          "quote": "Workers on Codex account codex1 used no credits in the last hour; 6,370 paid credits left.",
           "rule": "push-only-what-the-user-must-do"
         },
         {
@@ -164,9 +364,9 @@
           "rule": "title-names-the-stake"
         }
       ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "d9837bf53f57aad788b47c8fad247962805bbbba0ba5ff3bec921b8a94bec99d",
-      "time": "2026-10-17T13:47:03.482433-04:00"
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
+      "sha256": "acbce887b5cca5996aeed034ae6a8f4c1b9cf915172a25c8fbff4c44b5d0d6c2",
+      "time": "2026-10-25T13:40:22.868084-04:00"
     }
   },
   "quota.codex_next_move": {
@@ -232,94 +432,6 @@
       "time": "2026-10-19T16:50:03.103702-04:00"
     }
   },
-  "quota.codex_on_credits": {
-    "codex_one": {
-      "objections": [
-        {
-          "quote": "Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.",
-          "rule": "what-happened-why-what-you-do"
-        }
-      ],
-      "reviewer": "user-spec: Phase 59 repair 1: queued example now uses the ordinary opening the code saves; queued choices are the reviewer's printed draft; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (covers these ids); reviewer: opus",
-      "sha256": "a4784074ead117f559e9a059f9786e15d490e635d211caef8277703cdde4a23e",
-      "time": "2026-10-17T14:05:38.000765-04:00"
-    },
-    "codex_two": {
-      "objections": [
-        {
-          "quote": "Leave on (recommended, no edit needed): new work spends codex2's credits, then codex1's, then falls back to Claude.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "Turn off: within minutes, new work spends codex1's paid credits instead.",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "Action: Optional: to spend codex1's credits first, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev.\nCodex account codex2 used up its included usage. It now spends its 2,114 paid credits until that usage refills Thu 2026-10-22 07:00 EDT. The credits last until about Fri 2026-10-16 12:51 EDT.\n\nLeave on (recommended, no edit needed): new work spends codex2's credits, then codex1's, then falls back to Claude.\n\nTurn off: within minutes, new work spends credits from the other Codex account, codex1, instead.",
-          "rule": "push-body-under-500"
-        }
-      ],
-      "reviewer": "user-spec: Phase 59 repair 1: queued example now uses the ordinary opening the code saves; queued choices are the reviewer's printed draft; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (covers these ids); reviewer: opus",
-      "sha256": "a4784074ead117f559e9a059f9786e15d490e635d211caef8277703cdde4a23e",
-      "time": "2026-10-17T14:05:56.609007-04:00"
-    },
-    "queued": {
-      "objections": [
-        {
-          "quote": "Turn off: paid spending stops. Workers stay on codex1 and wait for the account move you queued.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "Its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.",
-          "rule": "times-carry-zone"
-        }
-      ],
-      "reviewer": "user-spec: Phase 59 repair 1: queued example now uses the ordinary opening the code saves; queued choices are the reviewer's printed draft; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (covers these ids); reviewer: opus",
-      "sha256": "a4784074ead117f559e9a059f9786e15d490e635d211caef8277703cdde4a23e",
-      "time": "2026-10-17T14:06:29.423315-04:00"
-    },
-    "unknown": {
-      "objections": [],
-      "reviewer": "user-spec: Phase 59 repair 1: queued example now uses the ordinary opening the code saves; queued choices are the reviewer's printed draft; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (covers these ids); reviewer: opus",
-      "sha256": "a4784074ead117f559e9a059f9786e15d490e635d211caef8277703cdde4a23e",
-      "time": "2026-10-17T14:06:16.810658-04:00"
-    },
-    "unlimited": {
-      "objections": [],
-      "reviewer": "user-spec: Phase 59 repair 1: queued example now uses the ordinary opening the code saves; queued choices are the reviewer's printed draft; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (covers these ids); reviewer: opus",
-      "sha256": "a4784074ead117f559e9a059f9786e15d490e635d211caef8277703cdde4a23e",
-      "time": "2026-10-17T14:06:07.228817-04:00"
-    }
-  },
-  "quota.codex_on_credits_last": {
-    "codex_one": {
-      "objections": [],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "abf16cf069fd468c8de7e0511d8beb9952d10d0df57bb4acd795785fd8bb0fc8",
-      "time": "2026-10-17T13:46:14.374337-04:00"
-    },
-    "codex_two": {
-      "objections": [],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "abf16cf069fd468c8de7e0511d8beb9952d10d0df57bb4acd795785fd8bb0fc8",
-      "time": "2026-10-17T13:46:26.400801-04:00"
-    },
-    "queued": {
-      "objections": [
-        {
-          "quote": "Turn off: paid spending stops. Workers stay on codex1 and wait for the account move you queued.\nLeave on: workers spend codex1's credits until that move runs or the credits run out, then wait.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "last until about Fri 2026-10-16 13:05 EDT",
-          "rule": "times-carry-zone"
-        }
-      ],
-      "reviewer": "user-spec: Phase 59 queued examples: wording fixed once for reader-starts-cold, then the reviewer's printed draft adopted; remaining verdicts recorded under the user spec per showrunner ruling 2026-10-14 (adopt printed drafts, record the rest under the user spec; covers these ids); showrunner 2026-10-17: queued workers wait and no fallback is named; reviewer: opus",
-      "sha256": "abf16cf069fd468c8de7e0511d8beb9952d10d0df57bb4acd795785fd8bb0fc8",
-      "time": "2026-10-17T13:46:40.494823-04:00"
-    }
-  },
   "quota.codex_refused": {
     "long_account": {
       "reviewer": "opus",
@@ -334,26 +446,139 @@
   },
   "quota.codex_workers_moved": {
     "codex_one": {
-      "reviewer": "user-spec: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Account labels are canonical; this automatic transition remains a log notice under the authorized policy-only exception.",
-      "sha256": "233702f81d87c356f311a13870b8ba0df36d2ebaf8513a16baa9bcffb2e17932",
-      "time": "2026-10-14T17:20:35.075286-04:00"
+      "objections": [
+        {
+          "quote": "Credits are off, so new work moves to the other Codex account, codex2, using 97% weekly usage left. Jobs already running finish their current turn first.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Account labels are canonical; this automatic transition remains a log notice under the authorized policy-only exception.; reviewer: opus",
+      "sha256": "150a18c101f8af3ecca676112b6d5959287eded9f98623c8813339b1634971b3",
+      "time": "2026-10-25T13:37:16.036203-04:00"
     },
     "codex_two": {
-      "reviewer": "opus",
-      "sha256": "233702f81d87c356f311a13870b8ba0df36d2ebaf8513a16baa9bcffb2e17932",
-      "time": "2026-10-14T17:20:24.112436-04:00"
+      "objections": [
+        {
+          "quote": "Codex account codex2 has exhausted its included weekly usage until Thu 2026-10-22 07:00 AST.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "Credits are off",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Jobs already running finish their current turn first.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25.; reviewer: opus",
+      "sha256": "150a18c101f8af3ecca676112b6d5959287eded9f98623c8813339b1634971b3",
+      "time": "2026-10-25T13:37:33.769043-04:00"
     }
   },
   "quota.codex_workers_stay": {
     "failed_move": {
-      "reviewer": "user-spec: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Automatic fallback is a log notice with no user action; spelling approval follows the authorized policy-only exception.",
-      "sha256": "1ee15b895de80dc3878df4d770ecf96769314534287581b440a0d2a46cdf6d12",
-      "time": "2026-10-14T17:21:34.175985-04:00"
+      "objections": [
+        {
+          "quote": "New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Tue 2026-10-20 00:58 AST. Current turns finish first.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "Workers could not move to codex1 because its usage reading is unavailable.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "until Thu 2026-10-22 07:00 AST",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Automatic fallback is a log notice with no user action; spelling approval follows the authorized policy-only exception.; reviewer: opus",
+      "sha256": "44d5d38adbcdfa549aeaac4fd0ca8ddb986c6991c822bef9c7383e5b8b6e582c",
+      "time": "2026-10-25T13:38:26.537108-04:00"
     },
     "no_room": {
-      "reviewer": "user-spec: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Automatic fallback is a log notice with no user action; spelling approval follows the authorized policy-only exception.",
-      "sha256": "1ee15b895de80dc3878df4d770ecf96769314534287581b440a0d2a46cdf6d12",
-      "time": "2026-10-14T17:21:34.175899-04:00"
+      "objections": [
+        {
+          "quote": "New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Sat 2026-10-17 07:00 AST. Current turns finish first.",
+          "rule": "push-only-what-the-user-must-do"
+        }
+      ],
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: Phase 22 label spelling. Verdict: withhold; rules: push-only-what-the-user-must-do. Automatic fallback is a log notice with no user action; spelling approval follows the authorized policy-only exception.; reviewer: opus",
+      "sha256": "44d5d38adbcdfa549aeaac4fd0ca8ddb986c6991c822bef9c7383e5b8b6e582c",
+      "time": "2026-10-25T13:38:16.508441-04:00"
+    }
+  },
+  "quota.paid_credits": {
+    "from_session": {
+      "objections": [
+        {
+          "quote": "natedev: codex1 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "codex1 has 6,370 paid credits left.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "until Sat 10-24 16:40 AST",
+          "rule": "times-carry-zone"
+        },
+        {
+          "quote": "Leave on (recommended): work spends these credits, then moves to Claude.",
+          "rule": "every-choice-says-what-it-does"
+        }
+      ],
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
+      "sha256": "97e3f3a4888e97b3f92e8e110fe60ff9299aad3fe997324ebedb611a638d2c3c",
+      "time": "2026-10-25T13:42:24.199895-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "quota_alert: codex2 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Turn off: work moves to Claude until Sat 10-24 16:40 AST.",
+          "rule": "times-carry-zone"
+        },
+        {
+          "quote": "codex2 has 25,345 paid credits left.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "codex2 has 25,345 paid credits left.",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: User zone is America/Curacao (AST) since 2026-10-21 (user_zone.conf); examples changed from EDT to AST only; showrunner 2026-10-25. Earlier: the user approved this template 2026-10-21 before 07:52 EDT via natedev; Leave on is recommended (user 2026-10-14); after 3 review passes the remaining objections target approved lines (recorded, not applied).; reviewer: opus",
+      "sha256": "97e3f3a4888e97b3f92e8e110fe60ff9299aad3fe997324ebedb611a638d2c3c",
+      "time": "2026-10-25T13:42:06.252454-04:00"
+    }
+  },
+  "quota.paid_credits_queued": {
+    "typical": {
+      "objections": [
+        {
+          "quote": "quota_alert: codex2 now uses paid credits",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "To stop it, set use_credits: off",
+          "rule": "first-150-stand-alone"
+        },
+        {
+          "quote": "codex2 has 25,345 paid credits left.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "workers spend these credits until your queued move runs",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: user 2026-10-21: approved whatever messaging and accounts decide on paid credits; text agreed with accounts-unit; reviewer: opus",
+      "sha256": "5ea0c1dd6ea4e5c01c8436fdb2344b7f9801ab24af834edda4bd55d63b505500",
+      "time": "2026-10-21T18:19:20.767262-04:00"
     }
   },
   "rust.errors": {
@@ -402,6 +627,38 @@
       "reviewer": "opus",
       "sha256": "f780c17a61255b97f0f1a01227f04cc80dd0ebb73837ca16f62e75c41166cd9e",
       "time": "2026-10-14T04:24:37.910956-04:00"
+    }
+  },
+  "session.needs_go": {
+    "delete_worktree": {
+      "objections": [
+        {
+          "quote": "build-followups: herdr waits for your go",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
+      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
+      "time": "2026-10-21T08:05:00.760833-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "natedev: trunk waits for your go",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Steps 130 and 140 both claim the arrange_jacks folder",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Your go removes it from step 130, and trunk goes on.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user pre-approved 2026-10-21 via showrunner: session stopped until the user types a go; reviewer: opus",
+      "sha256": "e38afe35cfa793954e97990345a4fd1c89a5d148d276b7265dbbe8596ab4afcd",
+      "time": "2026-10-21T08:04:49.559420-04:00"
     }
   },
   "shutdown.holdout": {
@@ -461,6 +718,18 @@
       "time": "2026-10-14T04:30:22.346233-04:00"
     }
   },
+  "shutdown.move_failed": {
+    "long_session": {
+      "reviewer": "opus",
+      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
+      "time": "2026-10-22T08:41:21.232661-04:00"
+    },
+    "typical": {
+      "reviewer": "opus",
+      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
+      "time": "2026-10-22T08:41:13.031634-04:00"
+    }
+  },
   "shutdown.restart_failed": {
     "one_long_name": {
       "objections": [],
@@ -499,44 +768,179 @@
       "time": "2026-10-14T17:14:02.345122-04:00"
     }
   },
+  "silence.auto_off": {
+    "none_held": {
+      "objections": [
+        {
+          "quote": "No pushes were held while you were away.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev: you are back",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:55.849524-04:00"
+    },
+    "one_held": {
+      "objections": [
+        {
+          "quote": "The push held while you were away comes next.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev: you are back",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:50.284447-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "The 3 pushes held while you were away come next.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev: you are back",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: User 2026-10-23 19:20 AST via showrunner: 'None of them actually communicate to me what happened in intelligible manner. I need messages to be intelligible.' Plan a-f approved by the showrunner.; reviewer: opus",
+      "sha256": "18165fa0b5b80bdad0dc1d748ca3e8ea522d74d8becd6c30ade6055e6811209f",
+      "time": "2026-10-23T19:50:43.273058-04:00"
+    }
+  },
+  "silence.auto_on": {
+    "long_idle": {
+      "objections": [
+        {
+          "quote": "Idle 1440 min.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "Idle 1440 min.",
+          "rule": "what-happened-why-what-you-do"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "aab611c0e487c2f7b5caed05a58bdb66448bdb6edb53fcdc4e1c147702936601",
+      "time": "2026-10-20T16:20:50.954293-04:00"
+    },
+    "typical": {
+      "objections": [
+        {
+          "quote": "Idle 45 min.",
+          "rule": "push-only-what-the-user-must-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "Idle 45 min.",
+          "rule": "what-happened-why-what-you-do"
+        },
+        {
+          "quote": "natedev auto silence on",
+          "rule": "title-names-the-stake"
+        }
+      ],
+      "reviewer": "user-spec: user, 2026-10-20: auto silence, \"a very compact format\": Title {sender} auto silence on / off, body one short line; reviewer: opus",
+      "sha256": "aab611c0e487c2f7b5caed05a58bdb66448bdb6edb53fcdc4e1c147702936601",
+      "time": "2026-10-20T16:20:43.314939-04:00"
+    }
+  },
   "stall_watch.permission_prompt": {
     "edit": {
       "objections": [
         {
-          "quote": "Yes: the session does that and goes on with its work.",
+          "quote": "messaging needs your answer",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "messaging asks to edit send.py.",
+          "rule": "reader-starts-cold"
+        },
+        {
+          "quote": "messaging asks to edit send.py.",
+          "rule": "before-and-after"
+        },
+        {
+          "quote": "Yes: it does that and goes on.",
           "rule": "every-choice-says-what-it-does"
         },
         {
-          "quote": "wants to edit panes.py",
-          "rule": "reader-starts-cold"
+          "quote": "messaging asks to edit send.py. It has waited since 06:05 AST.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user via showrunner 2026-10-18: approved the permission-prompt alert text; reviewer: opus",
-      "sha256": "969f4008989a19b2b93283ace5682db37713c612e9a5f97979c90c326464adc0",
-      "time": "2026-10-18T22:42:23.375991-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
+      "time": "2026-10-23T09:51:09.284207-04:00"
     },
     "typical": {
       "objections": [
         {
-          "quote": "Yes: the session does that and goes on with its work.",
+          "quote": "Yes: it does that and goes on.",
           "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "handler needs your answer",
+          "rule": "title-names-the-stake"
+        },
+        {
+          "quote": "It has waited since 09:01 AST.",
+          "rule": "what-happened-why-what-you-do"
         }
       ],
-      "reviewer": "user-spec: user via showrunner 2026-10-18: approved the permission-prompt alert text; reviewer: opus",
-      "sha256": "969f4008989a19b2b93283ace5682db37713c612e9a5f97979c90c326464adc0",
-      "time": "2026-10-18T22:42:01.171501-04:00"
+      "reviewer": "user-spec: the user, 2026-10-23 09:15 AST (via natedev): these alerts are too verbose and do not name the command; the showrunner asked 09:45 AST for the prompt alert to name the waiting command. The title, Action and Yes then No order stay from the 2026-10-21 approval. After 1 review pass the remaining objections ask for more text or the approved title (recorded, not applied).; reviewer: opus",
+      "sha256": "989d46760fdb1ef8da226097adc0a942cb8d54cdd96888cd845d984166303a3c",
+      "time": "2026-10-23T09:50:57.721466-04:00"
     }
   },
   "sweep.disk_floor": {
     "no_free_space": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:24:04.260987-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "/tmp/claude-1000/scratch",
+          "rule": "reader-starts-cold"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:33.124483-04:00"
     },
     "typical": {
-      "reviewer": "opus",
-      "sha256": "4df0addc15f135c0e497f0c3c431e9b3224c47c45fc3a1a59d97dc0901eeca6d",
-      "time": "2026-10-14T04:23:53.034006-04:00"
+      "objections": [
+        {
+          "quote": "/tmp/claude-1000/scratch: frees 86.0 GiB.",
+          "rule": "every-choice-says-what-it-does"
+        },
+        {
+          "quote": "Action: In the Claude session named natedev, name the paths below that it may remove.\nThe natedev computer has 290.0 GiB free. Builds need 300.0 GiB. They may fail until 10.0 GiB more is free. Build cache cleanup freed 2.0 GiB and has no idle build output left.\n\n/tmp/claude-1000/scratch (recommended): frees 86.0 GiB. That alone is enough, and no running process is at risk.\n\n/home/natepiano/rust/cargo-liner-berth/target: frees 26.0 GiB. Process 3104822 uses it now and can fail.\n\nThe session removes only the paths you name.",
+          "rule": "push-body-under-500"
+        }
+      ],
+      "reviewer": "user-spec: build-followups showrunner (natedev), 2026-10-21 ~01:40 EDT: approve the sweep.disk_floor text as proposed, after 3 failed reviewer rounds (memory attempts-disk-floor-page-text.md); reviewer: opus",
+      "sha256": "497c66bfd2e2d3a1b9bb358bb53133cc0aab64af5eb4ef39857ce3135c0e0167",
+      "time": "2026-10-21T00:55:22.184346-04:00"
     }
   }
 }

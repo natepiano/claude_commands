@@ -439,18 +439,18 @@ class RestartTests(ShutdownTestCase):
                 # Shell parsing preserves every original argument, including spaces.
                 self.assertIn(shlex.join(expected), work_line)
                 # Seats with no readable launcher get every launcher argument, ready to run as pasted.
-                idle_line = next(line for line in lines if line.startswith("review (review, idle):"))
-                self.assertTrue(idle_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "direct" / "review.sh"), "--to", "review", str(run), owner["cwd"],
-                    str(run / "review.resume-prompt.md"), "review", "resume after a move", "resuming after a move"])))
+                # An idle seat gets no command: it resumes with --to at the next dispatch, and a pass now needs an open phase.
+                self.assertIn("review (review, idle): paused on its thread; nothing to run now. "
+                              + "Your next dispatch with --to review resumes it.", lines)
                 unread_line = next(line for line in lines if line.startswith("test (test, was working):"))
                 self.assertTrue(unread_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
+                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "test", str(run), owner["cwd"],
                     str(run / "test.resume-prompt.md"), "test", "resume after a move", "test", "resuming after a move", "0", "test"])))
-                repaired_line = next(line for line in lines if line.startswith("project-impl (fix, idle):"))
-                self.assertTrue(repaired_line.endswith(shlex.join([
-                    str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
-                    str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"])))
+                self.assertIn("project-impl (fix, idle): paused on its thread; nothing to run now. "
+                              + "Your next dispatch with --to project-impl resumes it.", lines)
+                self.assertEqual(restart._resume_worker_command(seats[3], owner["cwd"]), shlex.join([  # pyright: ignore[reportPrivateUsage]
+                    "bash", str(restart.SCRIPTS / "direct" / "implement.sh"), "--to", "project-impl", str(run), owner["cwd"],
+                    str(run / "project-impl.resume-prompt.md"), "impl", "resume after a move", "impl", "resuming after a move", "0", "impl"]))
                 self.assertNotIn("usual arguments", text)
                 self.assertIn(owner["cwd"], text)
                 self.assertNotIn(old_prompt, text)
@@ -471,7 +471,7 @@ class RestartTests(ShutdownTestCase):
         sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0][sends[0].index("--to") + 1], "session:" + owner["session_id"])
-        self.assertIn("implement.sh --to impl", sends[0][sends[0].index("--text") + 1])
+        self.assertIn("Your next dispatch with --to impl resumes it.", sends[0][sends[0].index("--text") + 1])
 
     def test_move_on_the_source_account_receives_no_worker_resume_message(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
@@ -911,8 +911,8 @@ class RestartTests(ShutdownTestCase):
             settle.report_stop([self.stored_record()])
         self.assertEqual(alert.call_count, 2)
         push = cast(RenderedPush, alert.call_args.args[0])
-        self.assertEqual(push.id, "shutdown.restart_failed")
-        self.assertEqual(push.values["stopped"], "One session (moved-owner)")
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["session"], push.values["target"]), ("moved-owner", "claude3"))
 
     def home_cutover_evidence(self) -> None:
         configuration = accounts.accounts_config_file()
@@ -2429,11 +2429,25 @@ class RestartTests(ShutdownTestCase):
         self.write_herdr_responses(responses, [{
             "pane_id": "w1:p1", "agent": "claude", "agent_status": "idle",
         }], pane_present=True)
-        with self.assertRaisesRegex(OSError, "pane still holds a live agent"):
+        with (patch.object(restart, "AGENT_EXIT_SECONDS", 0.0),
+              self.assertRaisesRegex(OSError, "pane still holds a live agent")):
             _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         calls = self.herdr_calls(log)
         self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"],
                                         ["agent", "prompt"], ["pane", "close"]) for row in calls))
+
+    def test_herdr_restart_waits_for_herdr_to_see_its_stopped_agent_exit(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        self.write_herdr_responses(responses, [], pane_present=True)
+        stale: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle"}]
+        exited: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "exited"}]
+        with (patch.object(herdr.Herdr, "agents", side_effect=[stale, stale, exited]) as agents,
+              patch.object(restart, "SESSION_POLL_SECONDS", 0.0)):
+            _ = restart._herdr_launch(restart._resume_parts(owner, "restart"), restart.RecordedHerdrPane("writing", "w1:p1"), owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(agents.call_count, 3)
+        calls = self.herdr_calls(log)
+        self.assertIn(["--session", "writing", "pane", "close", "w1:p1"], calls)
+        self.assertTrue(any(row[2:4] == ["workspace", "create"] for row in calls))
 
     def test_herdr_restart_replaces_a_pane_at_its_shell_with_no_live_agent(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
@@ -3674,6 +3688,17 @@ class RestartTests(ShutdownTestCase):
         # The new failure is marked, so the next identical retry stays quiet.
         self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
 
+    def test_failed_move_push_names_both_accounts_and_never_a_restart_onto_the_source(self) -> None:
+        saved = entry(top_level("ups-id", name="ups"))
+        saved["target"], saved["source_label"], saved["label"] = "claude3", "claude1", "claude1"
+        push = restart.move_failed_push(saved)
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["source"], push.values["target"], push.values["session"]), ("claude1", "claude3", "ups"))
+        action = cast(ActionRequired, push.action).text
+        self.assertIn("to claude3", action)
+        self.assertNotIn("claude1", action)
+        self.assertNotIn("restart", action)
+
     def test_restart_failure_push_names_the_failed_session_and_machine(self) -> None:
         push, = restart.restart_push("claude2", ["Beta"], machine="natedev")
         self.assertEqual(push.id, "shutdown.restart_failed")
@@ -4007,7 +4032,8 @@ class RestartTests(ShutdownTestCase):
         self.configure_groups(showrunners="claude3")
         _ = self.recovery([showrunner("held-group")])
         record.set_account_hold(record.AccountHold(login="third@example.invalid", label="claude3", machine="natedev",
-            requested_at=STOPPED, request_id="target-hold", requested_by=record.FromTerminal(kind="terminal"), then="stop"))
+            requested_at=STOPPED, request_id="target-hold", requested_by=record.FromTerminal(kind="terminal"), then="stop",
+            registration="in progress"))
         with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),

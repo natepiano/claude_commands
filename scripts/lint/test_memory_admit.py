@@ -265,6 +265,30 @@ class LedgerTests(unittest.TestCase):
         self.assertFalse((directory / "999999999.reservation").exists())
         self.assertFalse((directory / f"{self.pid}.reservation").exists())
 
+    def held_reservation(self, sidecar: str, admitted: datetime) -> None:
+        """A live reservation of this process, admitted at admitted, for 12 GiB."""
+        row: gate.Reservation = {"pid": self.pid, "start_time": gate.process_start_time(self.pid) or "",
+                                 "need": 12 * GIB, "repo": "hana", "step": "clippy", "worktree": "old",
+                                 "admitted_at": store.utc_iso(admitted.timestamp()), "sidecar": sidecar,
+                                 "test_threads": None, "call_id": None}
+        _ = (gate.admission_dir(self.root) / f"{self.pid}-held.reservation").write_text(json.dumps(row))
+
+    def test_a_reservation_with_no_scope_after_the_grace_time_promises_nothing(self) -> None:
+        # Old verify.sh runs held reservations through the token wait and never started a scope.
+        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.SCOPE_GRACE_SECONDS))
+        self.assertEqual(self.check(12 * GIB)[0].promised, 0)
+
+    def test_a_reservation_inside_the_grace_time_or_with_its_scope_still_promises(self) -> None:
+        self.held_reservation(str(self.sidecar), NOW - timedelta(seconds=gate.SCOPE_GRACE_SECONDS - 1))
+        self.assertEqual(self.check(12 * GIB)[0].promised, 12 * GIB)
+        _ = self.sidecar.write_text(str(self.root / "no-scope") + "\n")
+        self.held_reservation(str(self.sidecar), NOW - timedelta(hours=1))
+        self.assertEqual(self.check(12 * GIB)[0].promised, 12 * GIB)
+
+    def test_a_step_with_no_scope_at_all_always_promises(self) -> None:
+        self.held_reservation("", NOW - timedelta(hours=1))
+        self.assertEqual(self.check(12 * GIB)[0].promised, 12 * GIB)
+
     def test_forced_admission_still_reserves(self) -> None:
         decision, path = self.check(0, force=True)
         self.assertEqual(decision.state, "hold")
@@ -324,7 +348,7 @@ class ShellTests(unittest.TestCase):
             environment = {**os.environ,
                            "BUILD_HOLD_DIR": str(root / "holders"),
                            "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                           "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                           "UNIT_ACTIVE_DIR": str(root / "active"),
                            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -351,7 +375,7 @@ class ShellTests(unittest.TestCase):
                 env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -386,7 +410,7 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -410,7 +434,7 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -440,7 +464,7 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -471,7 +495,7 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -495,7 +519,7 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -520,7 +544,7 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -545,7 +569,7 @@ class ShellTests(unittest.TestCase):
                         env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -569,7 +593,7 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                                          "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                                          "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
@@ -611,7 +635,7 @@ class QueueLeaveTests(unittest.TestCase):
         self.environment = {**os.environ,
                             "BUILD_HOLD_DIR": str(self.root / "holders"),
                             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-                            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+                            "UNIT_ACTIVE_DIR": str(self.root / "active"),
                             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
                             "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",

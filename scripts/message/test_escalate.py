@@ -78,9 +78,20 @@ class EscalateTests(unittest.TestCase):
         self.assertEqual(self.run_script("due").stdout, "disk: sent to the user\n")
         self.assertEqual(self.run_script("due").stdout, "")
         self.assertEqual(self.log().count(
-            "send --to user --from escalate --summary Disk --need decision --action free disk space "
+            "send --to user --from escalate --key escalate-disk --summary Disk --need decision --action free disk space "
             + "--text Disk is full.\n"), 1)
         self.assertEqual(self.run_script("list").stdout, "disk - sent - Disk\n")
+
+    def test_closing_a_sent_blocked_push_stops_its_repeats_and_other_closes_do_not(self) -> None:
+        _ = self.run_script("hold", "power", "--summary", "Power", "--text", "Power is out.",
+                            "--action", "save your work", "--minutes", "0", "--need", "blocked")
+        _ = self.hold()
+        self.assertEqual(self.run_script("due").stdout, "disk: sent to the user\npower: sent to the user\n")
+        self.assertEqual(self.run_script("close", "disk").stdout, "disk: closed\n")
+        self.assertNotIn("send retire", self.log())
+        closed = self.run_script("close", "power")
+        self.assertEqual((closed.stdout, closed.stderr), ("power: closed\n", ""))
+        self.assertEqual(self.log().count("send retire --to user --from escalate --key escalate-power\n"), 1)
 
     def test_typing_in_a_terminal_after_the_hold_stops_it(self) -> None:
         _ = self.hold()

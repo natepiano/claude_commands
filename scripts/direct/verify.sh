@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# verify.sh — The only build/test/lint commands a delegate may run.
+# verify.sh — The only build/test/lint commands a worker may run.
 #
-# Work Orders list exact invocations of this script; the delegate composes no
+# Work Orders list exact invocations of this script; the worker composes no
 # cargo flags and makes no scope choices. `check` pins lib and bin targets;
 # `test` selects the package's test targets, including examples with test = true.
+# `build` builds one package's binaries, or one bin or example, so a smoke run
+# or live shot can launch it, and prints each binary's path.
 # `lint` runs clippy with --all-targets --all-features to match CI, and mend
 # also uses --all-targets. It checks TOML formatting with taplo at the workspace
 # root. `example` runs clippy on one named example while
 # iterating. `final` is the plan-final full gate, run by the unit director,
-# never by a phase delegate.
+# never by a phase worker.
 #
 # Package selection is always --workspace. Commands use default features unless
 # the Work Order supplies --features; `lint`'s clippy always uses all features.
@@ -26,7 +28,7 @@
 # when the package has a lib.
 #
 # rustdoc is the exception: `lint` documents only the members that differ from
-# HEAD, found here rather than named by the delegate (CHANGED_MEMBERS_PY). A
+# HEAD, found here rather than named by the worker (CHANGED_MEMBERS_PY). A
 # workspace rustdoc starts one process per member at 1 to 5 GB each, and
 # overlapping runs ran natedev out of memory on 2026-09-30. Each distinct member
 # set pays its own dependency compile for that; the push gate still documents
@@ -34,7 +36,7 @@
 #
 # The lint stages — mend, fmt, clippy fix, fmt, clippy judgment, doc — use
 # config/lint.conf (edit it with /lint_config). One switch controls a check in
-# the lint CLI and every delegate phase. `lint` also always runs taplo fmt --check at the
+# the lint CLI and every worker phase. `lint` also always runs taplo fmt --check at the
 # workspace root, using its taplo.toml. A phase runs all five; its unit director
 # runs the style review in the main review. A gated-off check
 # prints a SKIPPED line and the command still exits 0. Scope is never
@@ -42,8 +44,8 @@
 # correctness and cache constraints, not preferences. cargo check and cargo
 # nextest are never gated — a phase that compiles nothing has verified nothing.
 #
-# A delegate session remembers passes. With PLAN_DELEGATE_BOARD_DIR or
-# PLAN_DELEGATE_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
+# A worker session remembers passes. With UNIT_RUN_DIR or
+# UNIT_SESSION_DIR set, a `test` or `lint` that exits 0 is recorded in
 # <session>/verify_cache/, keyed by the working tree its verdict was judged on,
 # the arguments, rustc -vV, lint.conf, verify.sh, invoke.sh and the
 # RUST*/CARGO_*/NEXTEST_* environment. A plain `lint <package>` leaves the package out of the key:
@@ -67,15 +69,16 @@
 # for clippy judgment and rustdoc. A run that ends on any other tree (for `test`,
 # any other part of it the package is built from) records nothing: an edit
 # landed while it ran, and its verdict belongs to neither tree.
-# A run outside a delegate session is never cached.
+# A run outside a worker session is never cached.
 # end_session.sh deletes the records when the run ends.
 #
 # Each record carries what a repeat would cost: the run's wall time minus
 # cargo's own "Finished … in" build times, since a repeat on the same tree
-# builds nothing. Every call, of every verb, in a delegate session or not,
+# builds nothing. Every call, of every verb, in a worker session or not,
 # leaves one call record in the build log (~/.local/state/buildlog; `buildlog
-# schema` lists its fields): ran, failed, interrupted, reused (a pass) or
-# replayed (a lint failure), with the seconds saved and the repo, worktree,
+# schema` lists its fields): ran, failed, interrupted, reused (a pass),
+# replayed (a lint failure) or superseded (exit 76: a newer call of the same
+# verb from the same worker replaced it in the token queue), with the seconds saved and the repo, worktree,
 # branch and commit. The steps it ran carry the same call id. The build log
 # outlives the records; /verify_saved reports the time saved.
 #
@@ -94,7 +97,7 @@
 #                                          under its own words, so it never
 #                                          answers `test <package>`. Repeat
 #                                          --filter to run a change's tests in
-#                                          one call; in a delegate session the
+#                                          one call; in a worker session the
 #                                          same names, in any order, on an
 #                                          unchanged tree print one line and
 #                                          build nothing
@@ -128,15 +131,22 @@
 #                                          does not answer --local
 #   verify.sh example <package> <name>     clippy one example (only when the
 #                                          phase changed that example)
+#   verify.sh build <package> [--bin <name> | --example <name>] [--release]
+#                                          build the package's binaries, or the
+#                                          one named bin or example, for a smoke
+#                                          run or a live shot, and print each
+#                                          binary's path (`binary: <path>`);
+#                                          an example's required features are
+#                                          turned on. Accepts --features <list>
 #   verify.sh final                        full workspace gate; refuse examples
 #                                          that hold a test (unit director only)
-#   verify.sh --session-dir <dir> …        any of the above inside a delegate
+#   verify.sh --session-dir <dir> …        any of the above inside a worker
 #                                          session; same as setting
-#                                          PLAN_DELEGATE_SESSION_DIR=<dir>
+#                                          UNIT_SESSION_DIR=<dir>
 #
 # Invocation policy — canonical flags, lint.conf gating, sandbox-failure
 # detection — lives in scripts/lint/invoke.sh, the
-# single bottom layer, sourced below. This file adds only delegate scope rules
+# single bottom layer, sourced below. This file adds only worker scope rules
 # on top. Shell aliases, validate_ci and release checks use the lint CLI in that
 # directory instead of this script.
 #
@@ -148,6 +158,8 @@ BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
 source "$BUILD_OVERRIDE_GUARD_DIR/../build_hold/override_guard.sh" || exit 2
 build_override_refusal "${BASH_SOURCE[0]}" direct/verify.sh || exit 2
+UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+[[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 # python3 goes through the repo shim, which picks an interpreter by VERSION
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
@@ -276,6 +288,33 @@ for package in meta["packages"]:
     sys.exit(2)
 print("verify.sh: package " + package_name + " not found in workspace", file=sys.stderr)
 sys.exit(2)
+'
+
+# The cargo words that select what `build` builds, then the binaries it makes:
+# `select <word>` lines, `features <list>` for an example's required features,
+# and `binary <path under the profile folder>` lines. Bin and example names
+# are unique across the workspace, so --workspace --bin builds the one target
+# under the workspace's feature set, the set `test` already compiled.
+BUILD_TARGETS_PY='
+import json
+import sys
+
+package_name, kind, name = sys.argv[1], sys.argv[2], sys.argv[3]
+meta = json.load(sys.stdin)
+package = next(package for package in meta["packages"] if package["name"] == package_name)
+wanted = [target for target in package["targets"] if (kind or "bin") in target["kind"] and name in ("", target["name"])]
+if not wanted:
+    what = f"{kind} {name}" if name else "binary"
+    advice = "" if name else "; name an example with --example <name>"
+    print(f"verify.sh: package {package_name} has no {what}{advice}", file=sys.stderr)
+    sys.exit(2)
+for target in wanted:
+    print("select --" + (kind or "bin"))
+    print("select " + target["name"])
+    if kind == "example" and target.get("required-features"):
+        print("features " + ",".join(target["required-features"]))
+    print(("binary examples/" if kind == "example" else "binary ") + target["name"])
+print("target " + meta["target_directory"])
 '
 
 # Select the named package's test targets. Named targets with unavailable
@@ -595,7 +634,7 @@ qualify_features() {
 }
 
 # Optional trailing `--features <list>` on check, test, and lint. The Work Order
-# names the exact list; the delegate still composes no flags of its own. Any
+# names the exact list; the worker still composes no flags of its own. Any
 # other leftover argument is a usage error rather than something to pass through.
 # The caller sets PKG before calling this.
 FEATURE_FLAGS=()
@@ -608,6 +647,74 @@ take_features() {
         usage
         exit 2
     fi
+}
+
+# `build` arguments: at most one of --bin or --example, --release, and
+# --features in any order. An example's required features join the list.
+BUILD_ARGS=()
+BUILD_BINARIES=()
+BUILD_PROFILE_DIR=debug
+BUILD_TARGET_DIR=""
+take_build_args() {
+    local kind="" name="" features="" line words
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --bin|--example)
+                if [[ -n "$kind" || -z "${2:-}" || "${2:-}" == --* ]]; then
+                    usage
+                    exit 2
+                fi
+                kind=${1#--}
+                name=$2
+                shift 2
+                ;;
+            --release)
+                BUILD_PROFILE_DIR=release
+                shift
+                ;;
+            --features)
+                if [[ -z "${2:-}" ]]; then
+                    usage
+                    exit 2
+                fi
+                features=$2
+                shift 2
+                ;;
+            *)
+                usage
+                exit 2
+                ;;
+        esac
+    done
+    words="$(read_metadata | "$PY" -c "$BUILD_TARGETS_PY" "$PKG" "$kind" "$name")" || exit 2
+    while IFS= read -r line; do
+        case "$line" in
+            "select "*) BUILD_ARGS+=("${line#select }") ;;
+            "features "*) features="${features:+$features,}${line#features }" ;;
+            "binary "*) BUILD_BINARIES+=("${line#binary }") ;;
+            "target "*) BUILD_TARGET_DIR="${line#target }" ;;
+        esac
+    done <<< "$words"
+    if [[ "$BUILD_PROFILE_DIR" == release ]]; then
+        BUILD_ARGS+=(--release)
+    fi
+    if [[ -n "$features" ]]; then
+        BUILD_ARGS+=(--features "$(qualify_features "$PKG" "$features")")
+    fi
+}
+
+# One `binary: <path>` line per binary the build made, for the caller to launch.
+print_built_binaries() {
+    local binary path
+    for binary in "${BUILD_BINARIES[@]}"; do
+        path="${BUILD_TARGET_DIR}/${BUILD_PROFILE_DIR}/${binary}"
+        if [[ -x "$path" ]]; then
+            echo "binary: $path"
+        else
+            echo "verify.sh: cargo build passed but made no ${path}" >&2
+            exit 1
+        fi
+    done
 }
 
 NEXTEST_ARGS=()
@@ -679,7 +786,7 @@ VERIFY_ORIGINAL_ARGS=("$@")
 # A flag, not an env prefix, so a call stays one plain command that the
 # settings.json allow rule matches.
 if [[ "${1:-}" == "--session-dir" ]]; then
-    export PLAN_DELEGATE_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
+    export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
 fi
 
@@ -688,9 +795,9 @@ fi
 # runs this same call under a supervisor outside the worker's process group,
 # returns at once, and sends the result to the worker as its next message.
 # Exit 3 means the caller is not a mesh worker; this call then runs attached.
-# The detached run sets PLAN_DELEGATE_DETACHED_RUN, so it does not detach again.
+# The detached run sets UNIT_DETACHED_RUN, so it does not detach again.
 MESH_RUNS_SCRIPT="${VERIFY_MESH_RUNS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../agents" && pwd)/mesh_runs.py}"
-if [[ -z "${PLAN_DELEGATE_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
+if [[ -z "${UNIT_DETACHED_RUN:-}" && -n "${CODEX_THREAD_ID:-}" ]]; then
     VERIFY_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     DETACH_STATUS=0
     "$PY" "$MESH_RUNS_SCRIPT" start --label "verify.sh ${VERIFY_ORIGINAL_ARGS[*]-}" -- \
@@ -804,9 +911,9 @@ finish_hold_wait() {
 }
 
 # Pass records (see the header): on for `test` and `lint` in a
-# delegate session. --no-cache turns off the lookup; its result is still
+# worker session. --no-cache turns off the lookup; its result is still
 # recorded, so a flake hunt that passes clears a recorded lint failure.
-CACHE_SESSION_DIR="${PLAN_DELEGATE_BOARD_DIR:-${PLAN_DELEGATE_SESSION_DIR:-}}"
+CACHE_SESSION_DIR="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
 CACHE_DIR=""
 if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
     CACHE_DIR="${CACHE_SESSION_DIR}/verify_cache"
@@ -1372,6 +1479,11 @@ build_seconds() {
 # on the same tree. A third word `mac` marks a pass the Mac ran (`host=mac`),
 # which a --local call does not reuse. Fails when there is nothing to record,
 # or when the tree has changed since that verdict.
+# The time in the user's zone setting, with its label; UTC (labeled) when the setting cannot be read.
+user_clock() {
+    TZ="$(python3 "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
+}
+
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
     key="$(tree_key)"
@@ -1388,8 +1500,8 @@ cache_record() {
     mv -f "${RUN_LOG}" "${CACHE_DIR}/${key}.log"
     {
         printf '`verify.sh %s` %s %s, run by %s\nsaved_s=%d\nstatus=%d\n' \
-            "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(date '+%Y-%m-%d %H:%M:%S')" \
-            "${PLAN_DELEGATE_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
+            "$CMD${ARGS[*]:+ ${ARGS[*]}}" "${verb}" "$(user_clock)" \
+            "${UNIT_TEAM_ROLE:-the unit director}" "${repeat}" "${EXIT_STATUS}"
         if [[ "${host}" == mac ]]; then
             printf 'host=mac\n'
         fi
@@ -1513,31 +1625,31 @@ if ! build_hold_nothing_held; then
 fi
 trap - INT TERM HUP
 
-# Open a progress window for the duration of this run when a delegate session is
+# Open a progress window for the duration of this run when a worker session is
 # in scope. This is what the unit director's progress header reports against
 # while it runs verification itself: an activity, not a pass, so findings.py
 # never counts it toward convergence. The launcher-owns-its-own-pass
 # rule applies here too — the thing that runs the work opens the window.
 PROGRESS_HISTORY="${HOME}/.claude/scripts/direct/progress_history.py"
-ACTIVITY_SESSION_DIR="${PLAN_DELEGATE_SESSION_DIR:-}"
+ACTIVITY_SESSION_DIR="${UNIT_SESSION_DIR:-}"
 
-# A phase runs two delegates against one target/ directory and one Cargo lock,
+# A phase runs two workers against one target/ directory and one Cargo lock,
 # so every cargo run below has to be serialized against its peers. Taking the
-# token here rather than asking each delegate's prompt to take it is deliberate:
+# token here rather than asking each worker's prompt to take it is deliberate:
 # a rule that lives only in a prompt is a rule an agent can drop, and dropping
 # this one blocks the whole team behind a lock nobody announced.
 #
-# PLAN_DELEGATE_BOARD_DIR is deliberately not PLAN_DELEGATE_SESSION_DIR: that
+# UNIT_RUN_DIR is deliberately not UNIT_SESSION_DIR: that
 # variable also opens a progress activity window, and concurrent windows
 # would collide in a recorder that keeps one.
 BOARD_HELPER="${HOME}/.claude/scripts/direct/board.sh"
-BOARD_DIR="${PLAN_DELEGATE_BOARD_DIR:-}"
-BOARD_SLOT="${PLAN_DELEGATE_TEAM_ROLE:-}"
+BOARD_DIR="${UNIT_RUN_DIR:-}"
+BOARD_SLOT="${UNIT_TEAM_ROLE:-}"
 # The unit director's own run (a session dir, no board, no team role) takes the
 # token too, as slot `director` on the session's board, so it queues with the
 # workers' detached runs instead of building beside them.
-if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${PLAN_DELEGATE_SESSION_DIR:-}" ]]; then
-    BOARD_DIR="${PLAN_DELEGATE_SESSION_DIR}"
+if [[ -z "${BOARD_DIR}" && -z "${BOARD_SLOT}" && -n "${UNIT_SESSION_DIR:-}" ]]; then
+    BOARD_DIR="${UNIT_SESSION_DIR}"
     BOARD_SLOT=director
 fi
 # TOKEN_USED: this run takes the token. TOKEN_HELD: it holds the token now. The
@@ -1548,8 +1660,8 @@ TOKEN_WAITER_PID=""
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
     # the real board. Normal calls retain Bash's elapsed-seconds clock.
-    if [[ -n "${PLAN_DELEGATE_TOKEN_CLOCK_FILE:-}" ]]; then
-        read -r TOKEN_CLOCK_NOW < "$PLAN_DELEGATE_TOKEN_CLOCK_FILE"
+    if [[ -n "${UNIT_TOKEN_CLOCK_FILE:-}" ]]; then
+        read -r TOKEN_CLOCK_NOW < "$UNIT_TOKEN_CLOCK_FILE"
     else
         TOKEN_CLOCK_NOW=$SECONDS
     fi
@@ -1565,16 +1677,147 @@ token_wait_interrupted() {
         wait "$TOKEN_WAITER_PID" 2>/dev/null || true
     fi
     bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
+    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
     eval "$TOKEN_CALLER_TRAPS"
     kill -s "$signal_name" "${BASHPID:-$$}"
 }
+# A newer call from the same worker, with the same verb and arguments in the
+# same worktree, ends this one while it still waits for its first token: the
+# newer call checks a newer tree, so this verdict is no longer wanted (one
+# worker queued 27 such calls on 2026-10-21, and peers waited 20 h behind
+# them). A lint key leaves out its package, since every lint covers the
+# workspace. A waiting call keeps a file named <slot>.<key>.<start>.<pid> in
+# the board's token_waiters folder; a newer call sends SIGUSR1 to each older one that still
+# runs verify.sh. A call that holds the token runs to the end, and a signal
+# that lands after the wait does nothing.
+#
+# The same files make one queue: a call tries for the token only while no
+# older call that still runs verify.sh waits. Before, any poller took a freed
+# token, and with about 25 calls on one board two calls waited 3 and 3.5 h
+# behind newer ones (2026-10-22). A call that gives the token back for a memory
+# or hold wait waits again under its first start, in a file with an `.again`
+# suffix: it keeps its place, and a newer call does not supersede it, since it
+# already took the token once.
+VERIFY_SUPERSEDED_STATUS=76
+TOKEN_WAITERS_DIR=""
+TOKEN_WAITER_PREFIX=""
+TOKEN_WAITER_FILE=""
+TOKEN_WAITER_OWN_STAMP=0
+TOKEN_WAIT_ENTRY=""
+TOKEN_FIRST_WAIT_DONE=0
+TOKEN_WAITERS_AHEAD=0
+TOKEN_SUPERSEDED=0
+# Minutes between the "still waiting for the cargo token" lines.
+TOKEN_WAIT_NOTE_MIN=5
+trap ':' USR1
+token_waiters_key() {
+    local key_args=(${ARGS[@]+"${ARGS[@]}"})
+    if [[ "$CMD" == lint && ${#key_args[@]} -gt 0 && "${key_args[0]}" != --* ]]; then
+        key_args=("${key_args[@]:1}")
+    fi
+    "$PY" -c 'import hashlib, sys; print(hashlib.sha256("\0".join(sys.argv[1:]).encode()).hexdigest()[:16])' \
+        "$(pwd -P)" "$CMD" ${key_args[@]+"${key_args[@]}"}
+}
+supersede_older_waiters() {
+    local file name pid stamp own=${TOKEN_WAITER_FILE%.*}
+    own=${own##*.}
+    for file in "$TOKEN_WAITERS_DIR/$TOKEN_WAITER_PREFIX".*.*; do
+        [[ -f "$file" ]] || continue
+        name=${file##*/}
+        pid=${name##*.}
+        stamp=${name%.*}
+        stamp=${stamp##*.}
+        [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$file"
+        elif (( 10#$stamp < 10#$own )) \
+            && ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'; then
+            kill -USR1 "$pid" 2>/dev/null || true
+        fi
+    done
+}
+token_waiter_runs_verify() {
+    local pid=$1 args=()
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+        mapfile -d '' args < "/proc/$pid/cmdline" 2>/dev/null || return 1
+        [[ "${args[*]}" == *verify.sh* ]]
+    else
+        ps -p "$pid" -o args= 2>/dev/null | grep -q 'verify\.sh'
+    fi
+}
+# Sets TOKEN_WAITERS_AHEAD to the waiting calls that started before this one,
+# and removes the files of calls that no longer run.
+count_token_waiters_ahead() {
+    local file name pid stamp
+    TOKEN_WAITERS_AHEAD=0
+    [[ -n "$TOKEN_WAITERS_DIR" ]] || return 0
+    for file in "$TOKEN_WAITERS_DIR"/*; do
+        [[ -f "$file" ]] || continue
+        name=${file##*/}
+        name=${name%.again}
+        pid=${name##*.}
+        stamp=${name%.*}
+        stamp=${stamp##*.}
+        [[ "$pid" =~ ^[0-9]+$ && "$stamp" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+        if ! token_waiter_runs_verify "$pid"; then
+            rm -f "$file"
+        elif (( 10#$stamp < 10#$TOKEN_WAITER_OWN_STAMP )); then
+            TOKEN_WAITERS_AHEAD=$(( TOKEN_WAITERS_AHEAD + 1 ))
+        fi
+    done
+}
+# Prints the token wait to the log: a line when it starts, one every
+# TOKEN_WAIT_NOTE_MIN minutes, and one when the token is taken. Before, a step
+# that gave the token back for memory waited again with no line, and its log
+# ended on "starting anyway" for hours (2026-10-22).
+token_wait_note() {
+    local kind=$1 waited_min=$2 holder="" who
+    read -r holder < "${BOARD_DIR}/locks/cargo.d/holder" 2>/dev/null || holder=""
+    if [[ -n "$holder" ]]; then
+        who="$holder holds it"
+    elif (( TOKEN_WAITERS_AHEAD > 0 )); then
+        who="it is free and goes to an earlier call"
+    else
+        who="it came free just now"
+    fi
+    case "$kind" in
+        first) printf 'waiting for the cargo token since %s: %s; calls ahead of this one: %d\n' \
+            "$(TZ="$(buildlog_memory_python "$USER_ZONE_SCRIPT" 2>/dev/null)" date '+%H:%M %Z')" \
+            "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
+        still) printf 'still waiting for the cargo token (%d min): %s; calls ahead of this one: %d\n' \
+            "$waited_min" "$who" "$TOKEN_WAITERS_AHEAD" >&2 ;;
+        taken) printf 'took the cargo token after %d min\n' "$waited_min" >&2 ;;
+    esac
+}
+# Ends a call that a newer one replaced. Its caller reads this as no verdict,
+# never as a failure to repair: the newer call's result answers instead.
+# A step whose call is gone has no one to give a result to, and the token
+# never comes: board.sh answers a dead --pid with "gone" (exit 4). On
+# 2026-10-20 a step a test left behind tried again here for 45 h.
+token_wait_orphaned() {
+    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
+    trap - INT TERM HUP
+    echo "verify.sh: the call that started this step is gone, so the step stops waiting for the cargo token." >&2
+    exit 1
+}
+token_wait_superseded() {
+    bash "${BOARD_HELPER}" release "${BOARD_DIR}" "${BOARD_SLOT}" cargo --pid $$ >/dev/null 2>&1 || true
+    rm -f "$TOKEN_WAIT_ENTRY"
+    trap - INT TERM HUP
+    TOKEN_WAIT_S=$TOKEN_WAITED
+    printf 'verify.sh: superseded by a newer %s call; this call ran nothing. Read the newer call'"'"'s result: nothing failed and nothing needs a repair.\n' "$CMD"
+    note_event superseded "$SECONDS" 0 "" 0 "$VERIFY_SUPERSEDED_STATUS"
+    exit "$VERIFY_SUPERSEDED_STATUS"
+}
 # Waits until this run holds the token, with no time limit: the pid reclaim and
-# the 3600 s hold already free a dead or stuck holder, and board.sh stops the
-# wait when this run's pid is gone. Sets TOKEN_WAITED to the seconds it waited.
+# the 3600 s hold already free a dead or stuck holder, and the queue above
+# drops a waiter whose verify.sh ended. Sets TOKEN_WAITED to the seconds it
+# waited.
 acquire_token() {
     TOKEN_WAITED=0
     [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
-    local started
+    local started noted=-1 waited pause
     # A step's subshell has no traps of its own, though trap -p there prints
     # the parent's: restoring those would run the parent's cleanup in the step.
     TOKEN_CALLER_TRAPS=""
@@ -1586,25 +1829,83 @@ acquire_token() {
     trap 'token_wait_interrupted HUP' HUP
     token_wait_clock
     started=$TOKEN_CLOCK_NOW
+    TOKEN_WAIT_ENTRY=""
+    if [[ -n "$TOKEN_WAITER_FILE" ]]; then
+        TOKEN_WAIT_ENTRY=$TOKEN_WAITER_FILE
+        (( TOKEN_FIRST_WAIT_DONE == 0 )) || TOKEN_WAIT_ENTRY="${TOKEN_WAITER_FILE}.again"
+        : > "$TOKEN_WAIT_ENTRY"
+    fi
+    local status
     while :; do
-        bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-            --pid $$ --hold 3600 --wait 60 >/dev/null 2>&1 &
-        TOKEN_WAITER_PID=$!
-        if wait "$TOKEN_WAITER_PID"; then
-            break
+        if (( TOKEN_SUPERSEDED )); then
+            token_wait_clock
+            TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
+            token_wait_superseded
         fi
-        sleep 1
+        kill -0 "$$" 2>/dev/null || token_wait_orphaned
+        count_token_waiters_ahead
+        # The line goes out before the first try when the token is not free.
+        if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
+            token_wait_note first 0
+            noted=0
+        fi
+        status=1
+        pause=3
+        if (( TOKEN_WAITERS_AHEAD == 0 )); then
+            # Two tries 3 s apart, then the queue is read again.
+            pause=1
+            bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+                --pid $$ --hold 3600 --wait 3 >/dev/null 2>&1 &
+            TOKEN_WAITER_PID=$!
+            status=0
+            wait "$TOKEN_WAITER_PID" || status=$?
+            # SIGUSR1 ends the wait builtin early; the acquire may have won first.
+            if (( status != 0 && TOKEN_SUPERSEDED )); then
+                kill "$TOKEN_WAITER_PID" 2>/dev/null || true
+                status=0
+                wait "$TOKEN_WAITER_PID" 2>/dev/null || status=$?
+            fi
+            if (( status == 0 )); then
+                TOKEN_SUPERSEDED=0
+                break
+            fi
+            TOKEN_WAITER_PID=""
+            (( status != 4 )) || token_wait_orphaned
+        fi
+        token_wait_clock
+        waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
+        if (( noted < 0 )); then
+            token_wait_note first 0
+            noted=0
+        elif (( waited >= noted + TOKEN_WAIT_NOTE_MIN )); then
+            token_wait_note still "$waited"
+            noted=$waited
+        fi
+        (( TOKEN_SUPERSEDED )) || sleep "$pause"
     done
     TOKEN_WAITER_PID=""
     TOKEN_HELD=1
+    TOKEN_FIRST_WAIT_DONE=1
+    [[ -z "$TOKEN_WAIT_ENTRY" ]] || rm -f "$TOKEN_WAIT_ENTRY"
+    TOKEN_WAIT_ENTRY=""
     trap - INT TERM HUP
     eval "$TOKEN_CALLER_TRAPS"
     token_wait_clock
     TOKEN_WAITED=$(( TOKEN_CLOCK_NOW - started ))
+    (( noted < 0 )) || token_wait_note taken $(( TOKEN_WAITED / 60 ))
 }
 if [[ -n "${BOARD_DIR}" && -n "${BOARD_SLOT}" && -f "${BOARD_HELPER}" ]]; then
     TOKEN_USED=1
+    TOKEN_WAITERS_DIR="${BOARD_DIR}/token_waiters"
+    TOKEN_WAITER_PREFIX="${BOARD_SLOT}.$(token_waiters_key)"
+    mkdir -p "$TOKEN_WAITERS_DIR"
+    TOKEN_WAITER_STAMP=${EPOCHREALTIME:-$(date +%s).000000}
+    TOKEN_WAITER_OWN_STAMP=${TOKEN_WAITER_STAMP/[.,]/}
+    TOKEN_WAITER_FILE="${TOKEN_WAITERS_DIR}/${TOKEN_WAITER_PREFIX}.${TOKEN_WAITER_OWN_STAMP}.$$"
+    trap 'TOKEN_SUPERSEDED=1' USR1
+    supersede_older_waiters
     acquire_token
+    trap ':' USR1
     TOKEN_WAIT_S=$TOKEN_WAITED
 fi
 
@@ -1704,22 +2005,85 @@ release_token() {
     TOKEN_HELD=0
 }
 
+# One try for the token, with no wait. Status 0 when it is held. A call that
+# waits ahead of this one in the queue makes it a wait.
+try_token_now() {
+    [[ "${TOKEN_USED}" -eq 1 && "${TOKEN_HELD}" -eq 0 ]] || return 0
+    count_token_waiters_ahead
+    (( TOKEN_WAITERS_AHEAD == 0 )) || return 1
+    bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+        --pid $$ --hold 3600 --wait 0 >/dev/null 2>&1 || return 1
+    TOKEN_HELD=1
+}
+
 # The token is for natedev cargo only. A step gives it back while it waits for
 # memory, and takes it again once the gate admits it; a step that leaves the
-# wait for the Mac does not. The step runs in run()'s subshell, so its token
-# wait reaches the call record through TOKEN_WAIT_FILE.
+# wait for the Mac does not. A token that is not free at once means a wait,
+# and a reservation kept through it promises memory that no build uses: the
+# gate then holds every other step back (257 GiB promised on 2026-10-20). So
+# the step gives the reservation back, waits for the token, and passes the
+# gate again with the token held. The step runs in run()'s subshell, so its
+# token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
 buildlog_wait_for_memory() {
+    local memory_wait limit
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
     buildlog_wait_for_memory_only "$@"
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
+    TOKEN_WAITED=0
+    if ! try_token_now; then
+        buildlog_release_memory 0
+        acquire_token
+        memory_wait=$BUILDLOG_MEM_WAIT_S
+        # The forced start counts the step's whole memory wait: a new full
+        # limit here made one step wait 15 min twice (2026-10-21).
+        limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
+        [[ "$limit" =~ ^[0-9]+$ ]] || limit=900
+        BUILDLOG_MEM_WAIT_LIMIT_S=$(( limit > memory_wait ? limit - memory_wait : 0 )) \
+            buildlog_wait_for_memory_only "$@"
+        BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+        if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+            if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
+                : > "${TOKEN_WAIT_FILE}.given_back"
+            fi
+            return 0
+        fi
+    fi
+    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
+    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    fi
+}
+
+# A build hold stops every natedev build, so a step gives the token back while
+# it waits out a hold too, and takes it again after the release; a step that
+# leaves the hold wait for the Mac (status LINT_LEFT_QUEUE_STATUS) does not. The
+# hold time stays in the hold wait record; only the time to take the token
+# again counts as token wait. With no hold present, nothing is given back.
+eval "$(declare -f build_hold_wait_local | sed '1s/build_hold_wait_local/build_hold_wait_local_only/')"
+build_hold_wait_local() {
+    local status=0
+    if ! build_hold_applies || build_hold_nothing_held; then
+        return 0
+    fi
+    # A step without the token (before the first take, or after a Mac trip) only waits.
+    if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
+        build_hold_wait_local_only "$@"
+        return
+    fi
+    if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        : > "${TOKEN_WAIT_FILE}.given_back"
+    fi
+    build_hold_wait_local_only "$@" || status=$?
+    [[ "$status" != "$LINT_LEFT_QUEUE_STATUS" ]] || return "$status"
     acquire_token
     [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
     if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
         printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
     fi
+    return "$status"
 }
 
 # Again with the token held: a peer running this same call on this tree held
@@ -1824,6 +2188,14 @@ case "$CMD" in
         take_features "$@"
         require_member "$PKG"
         run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
+        ;;
+    build)
+        PKG="${1:?verify.sh build <package> [--bin <name> | --example <name>] [--release] [--features <list>]}"
+        shift
+        require_member "$PKG"
+        take_build_args "$@"
+        run cargo build --workspace "${BUILD_ARGS[@]}"
+        print_built_binaries
         ;;
     test)
         run_local_test

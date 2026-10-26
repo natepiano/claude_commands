@@ -191,10 +191,12 @@ def resolved(refusal: AccountRefusal, reading: FreshReading | StaleReading | NoR
         return True
     if not isinstance(reading, FreshReading):
         return False
-    if isinstance(refusal.window, KnownWindow) and isinstance(refusal.reset, KnownReset):
+    if isinstance(refusal.window, KnownWindow):
         window = reading.weekly if refusal.window.name == "weekly" else reading.five_hour
         return (isinstance(window, ReadingWindow) and window.at > refusal.at
-                and isinstance(window.reset, KnownReset) and window.reset.at > refusal.reset.at)
+                and (window.left > 0 and (isinstance(window.reset, NoResetKnown) or window.reset != refusal.reset)
+                     or isinstance(window.reset, KnownReset)
+                     and isinstance(refusal.reset, KnownReset) and window.reset.at > refusal.reset.at))
     windows = ((reading.weekly,) if isinstance(reading.five_hour, NoWindow)
                else (reading.weekly, reading.five_hour))
     return all(window.at > refusal.at and window.left > 0 for window in windows)

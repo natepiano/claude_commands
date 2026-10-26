@@ -20,6 +20,23 @@ must not drift from it:
 
 ## Words
 
+<GuildHeads>
+For Words and <ProductionUnit/> below, production `guilds` has four unit
+directors with the exact IDs `designers`, `reviewers`, `showrunners`, `units`,
+without `-unit`. The guilds showrunner is top-level on natedev; these heads
+are its units, not showrunners, and belong to the units guild. Other unit
+names and worker IDs keep their current rules.
+
+A plan headed `> **Standing:** guild-head` runs its report/evidence/tip/reply
+loop and daily read instead of a phased build. It dispatches no worker, runs
+no phase or gate, and makes no checkpoint or shrink. It may write and publish
+its owned guild tips directly. The production row still gives its identity,
+plan, worktree and ownership. It owns no assignments, acceptance, model
+choices or gates; process proposals go through guilds to sdlc for
+guild-process-unit. Ordinary phased and standing style contracts retain their
+current behavior.
+</GuildHeads>
+
 - **Production** — the whole effort: its units, its merge branch, and its
   production doc.
 - **Executive producer** — the user. Every product, scope and irreversible
@@ -28,7 +45,7 @@ must not drift from it:
   plans and splits them into a production doc and unit plans.
 - **Showrunner** — the session running `/showrunner:produce`. It merges, tests, pushes,
   makes the visual choices, clears waits between units, relays the user's words
-  and reports on a schedule. It writes no implementation code.
+  and reports when asked. It writes no implementation code.
 - **Unit** — one `/unit:direct` run on one unit plan, in its own worktree and
   branch. A unit is named `<area>-unit`, e.g. `widget-unit`. Its plan, worktree,
   branch, phases, checkpoints and ETA are the unit's.
@@ -38,7 +55,7 @@ must not drift from it:
   reports. It writes no implementation code.
 - **Worker** — a Codex worker thread the unit director dispatches. Implementation
   workers open once per run, continue across phases and repairs in whatever role
-  is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
+  is needed, attempt compaction above `UNIT_COMPACT_ABOVE_TOKENS` but
   continue after a failed attempt, press on after context overflow with
   `Continue where you stopped.`, open anew only when no open worker can take the
   work, and end at `end_session.sh`. Reviews run on the unit's workers, or on the
@@ -256,7 +273,7 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    `From the user (via the showrunner):`.
 3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
    notice after each final-gate and as-built commit. Timing:
-   `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
+   `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.

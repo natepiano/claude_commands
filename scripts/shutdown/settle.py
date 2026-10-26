@@ -1376,11 +1376,7 @@ def _stop_retry_pending(saved: SessionShutdown) -> bool:
 
 
 def _done(saved: SessionShutdown) -> bool:
-    if _stop_retry_pending(saved):
-        return False
-    progress = saved["progress"]["kind"]
-    return progress in {"restarted", "stop failed", "restart failed", "manual restart", "timers pending"} or (
-        progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "stop")
+    return store.shutdown_finished(saved)
 
 
 def shutdown_in_progress(saved: SessionShutdown) -> bool:
@@ -1482,10 +1478,12 @@ def report_stop(records: list[SessionShutdown]) -> None:
         due = stop_due or [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
         for machine in dict.fromkeys(saved["machine"] for saved in due):
             items = [saved for saved in due if saved["machine"] == machine]
+            # A failed move names both accounts; a restart onto its source could never start it.
+            restarted = [saved["session"]["name"] for saved in items if not saved.get("target")]
             pushes = ((render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
                            stopped=stopped_sessions_text(len(items))),) if stop_due else
-                    restart_work.restart_push(first["label"], [saved["session"]["name"] for saved in items],
-                                              machine=machine))
+                    (*(restart_work.restart_push(first["label"], restarted, machine=machine) if restarted else ()),
+                     *(restart_work.move_failed_push(saved) for saved in items if saved.get("target"))))
             for push in pushes:
                 alert_user(push, machine=route)
             if not stop_due:
@@ -1782,13 +1780,8 @@ def _complete_stop_action(saved: SessionShutdown) -> None:
         pass
 
 
-def _clear_finished_hold(login: str, seen: dict[str, SessionShutdown]) -> None:
-    outcome = store.lookup_account_hold(login)
-    if isinstance(outcome, store.AccountHeld) and (outcome.hold["then"] == "restart" or any(
-        saved["request_id"] == outcome.hold["request_id"] and saved["progress"]["kind"] == "restarted"
-        for saved in seen.values()
-    )):
-        store.clear_finished_account_hold(login)
+def _clear_finished_hold(login: str) -> None:
+    _ = store.release_finished_account_hold(login, conducting=True)
 
 
 @dataclass(frozen=True)
@@ -1998,7 +1991,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
 
                 records = store.session_records(login)
                 handled_requests.update(saved["request_id"] for saved in records if not _done(saved))
-                _clear_finished_hold(login, archived)
+                _clear_finished_hold(login)
                 drained = not pending and not confirmations and not launched and not messages and not sends
                 if drained and (isinstance(reload_state, _ReloadRequested) or not records or all(_done(saved) for saved in records)):
                     for saved in records:
@@ -2069,7 +2062,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                     _ = wait(futures, timeout=delay, return_when=FIRST_COMPLETED)
                 else:
                     time.sleep(delay)
-        _clear_finished_hold(login, archived)
+        _clear_finished_hold(login)
         return reload_state if isinstance(reload_state, _ReloadRequested) else _ConductorFinished()
     finally:
         desktop.restore(dry_run=False)
