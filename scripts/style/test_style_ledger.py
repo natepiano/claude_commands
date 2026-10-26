@@ -1626,6 +1626,69 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual((finding.path, finding.line, finding.follow),
                          (MOVED_FILE, 2, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip)))
 
+    def follow_statement(self, moved: dict[str, str | None]) -> style_ledger.DeclarationOutcome:
+        """A filed finding on the statement `let rgba = convert(2, 16);` of fn check in a.rs, read after moved."""
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn keep() {}\n\nfn check() {\n    let bytes = [0];\n    let rgba = convert(2, 16);\n}\n"})
+        _, (finding,) = self.judge_parent(ledger, ((5, "let rgba = convert(2, 16);"),), kind="restructure")
+        _ = self.commit_tip(ledger, moved)
+        outcome, = self.follow_approved(ledger, [finding])
+        return outcome
+
+    def test_a_statement_follows_its_whole_moved_function_to_the_one_line_that_holds_its_text(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn other() {}\n\nfn check() {\n    let bytes = [0];\n\n    let rgba = convert(2, 16);\n}\n"})
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual((cast(style_ledger.DeclarationMoved, outcome).path, cast(style_ledger.DeclarationMoved, outcome).line),
+                         (MOVED_FILE, 6))
+
+    def test_a_statement_whose_text_is_twice_in_the_moved_function_is_left(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    let rgba = convert(2, 16);\n    let rgba = convert(2, 16);\n}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE, declarations.StatementRefusal.TEXT_REPEATED))
+
+    def test_a_statement_whose_text_changed_in_the_moved_function_is_left(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    let rgba = convert(WIDTH, STRIDE);\n}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE, declarations.StatementRefusal.TEXT_NOT_FOUND))
+
+    def test_a_statement_whose_text_is_only_in_a_function_nested_in_the_moved_function_is_left(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    fn inner() {\n        let rgba = convert(2, 16);\n    }\n}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE, declarations.StatementRefusal.TEXT_NOT_FOUND))
+
+    def test_a_statement_whose_text_is_only_in_a_comment_or_string_of_the_moved_function_is_left(self) -> None:
+        body = ("    // let rgba = convert(2, 16);\n    /* let rgba = convert(2, 16); */\n"
+                + "    let note = \"let rgba = convert(2, 16);\";\n")
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n", MOVED_FILE: "fn check() {\n" + body + "}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE,
+            declarations.StatementRefusal.TEXT_NOT_FOUND))
+
+    def test_a_statement_follows_to_its_code_line_past_a_commented_copy(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    // let rgba = convert(2, 16);\n    let rgba = convert(2, 16);\n}\n"})
+        self.assertEqual((type(outcome), cast(style_ledger.DeclarationMoved, outcome).line), (style_ledger.DeclarationMoved, 3))
+
+    def test_a_statement_with_a_trailing_comment_follows_its_unchanged_moved_function(self) -> None:
+        ledger = self.ledger()
+        source = "fn check() {\n    let bytes = [0];\n    let rgba = convert(2, 16); // RGBA stride\n    let alpha = convert(3, 8); /* alpha */\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn keep() {}\n\n" + source})
+        _, ids = self.judge_parent(ledger, ((5, "let rgba = convert(2, 16); // RGBA stride"),
+                                            (6, "let alpha = convert(3, 8); /* alpha */")), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn keep() {}\n", MOVED_FILE: "fn other() {}\n\n" + source})
+        outcomes = self.follow_approved(ledger, list(ids))
+        self.assertEqual([(type(outcome), cast(style_ledger.DeclarationMoved, outcome).line) for outcome in outcomes],
+                         [(style_ledger.DeclarationMoved, 5), (style_ledger.DeclarationMoved, 6)])
+
+    def test_a_statement_whose_function_went_to_two_files_is_left(self) -> None:
+        body = "fn check() {\n    let rgba = convert(2, 16);\n}\n"
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n", MOVED_FILE: body, TWIN_FILE: body})
+        self.assertIsInstance(outcome, style_ledger.DeclaredInSeveralFiles)
+
     def test_the_declaration_step_reads_each_commit_and_file_once_and_its_recheck_sees_another_writer(self) -> None:
         ledger = self.ledger()
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
