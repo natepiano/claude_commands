@@ -1615,11 +1615,19 @@ class StylePlanTests(unittest.TestCase):
 
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
         merged = self.git("rev-parse", "HEAD", cwd=self.unit)
+        # The unit base holds the unit's own lib.rs commit, which the synced tip lacks, so the ticket waits for the sync.
+        waiting = (f"waiting for sync: read crates/alpha: {self.sources[0]} changed in {unit_tip[:7]}, "
+                   + f"not in the synced tip {self.tip[:7]}\n")
+        self.assertEqual(self.run_next(), (3, waiting + waiting + "waiting for sync\n", ""))
+        _ = self.git("merge", "-q", "--ff-only", "style/main")
+        self.tip = merged
+        self.sync()
         self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
         ticket = self.ledger().ticket_open("names-unit")[0]
-        self.assertEqual((ticket["files"], ticket["base"]), ([self.sources[0]], merged))
+        # The synced change to other.rs makes its crate-scope cell stale too.
+        self.assertEqual((ticket["files"], ticket["base"]), (list(self.sources[:2]), merged))
         self.record(read, self.sources[0], merged, ticket="names-unit-1")
-        self.assertEqual(self.cell_state(read, self.sources[0]), "awaiting merge")
+        self.assertEqual(self.cell_state(read, self.sources[0]), "current")
 
     def test_refill_issues_a_stale_cell_whose_inputs_at_the_unit_tip_changed_since_its_judgment(self) -> None:
         read, _ = self.judged_at_unit_tip_then_style_moves()
@@ -4695,6 +4703,97 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual((code, errors), (3, ""))
         self.assertIn("discarded names-unit-1: dropped", output)
         self.assertNotIn("### Phase 1 — names-unit-1", self.plan.read_text())
+
+    def unit_commit(self, path: str, text: str) -> str:
+        """Commit path on the style branch, and merge it into the names unit, so the unit base holds a commit that the
+        synced tip lacks while no unit holds the file."""
+        _ = (self.style / path).write_text(text)
+        _ = self.git("commit", "-qam", "Style change", cwd=self.style)
+        _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
+        return self.git("rev-parse", "HEAD", cwd=self.unit)
+
+    def only_first_source_open(self) -> str:
+        """A read rule synced at the tip, with every source but the first judged clean."""
+        read = self.rule("read")
+        self.sync()
+        for path in self.sources[1:]:
+            self.record(read, path, self.tip)
+        return read
+
+    def test_refill_builds_no_ticket_on_a_file_the_unit_base_changed_after_the_synced_tip(self) -> None:
+        _ = self.only_first_source_open()
+        unit_change = self.unit_commit(self.sources[0], "pub fn unit() {}\n")
+        waiting = (f"waiting for sync: read crates/alpha: {self.sources[0]} changed in {unit_change[:7]}, "
+                   + f"not in the synced tip {self.tip[:7]}\n")
+        self.assertEqual(self.run_next(), (3, waiting + waiting + "waiting for sync\n", ""))
+        self.assertEqual(self.count_tickets(), 0)
+
+    def test_refill_builds_a_ticket_when_the_unit_base_changed_only_other_files(self) -> None:
+        _ = self.only_first_source_open()
+        _ = self.unit_commit(self.sources[1], "pub fn unit() {}\n")
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [self.sources[0]])
+
+    def test_refill_builds_a_ticket_when_the_unit_base_is_behind_the_synced_tip(self) -> None:
+        _ = self.only_first_source_open()
+        self.write(self.sources[0], "pub fn synced() {}\n")
+        self.tip = self.commit()
+        self.sync()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [self.sources[0]])
+
+    def test_a_decision_builds_no_ticket_on_a_file_the_unit_base_changed_after_the_synced_tip(self) -> None:
+        rule = self.only_first_source_open()
+        folder = self.root / "issues"
+        folder.mkdir()
+        issue = folder / "approved.md"
+        ledger = self.ledger()
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        finding = ledger.hold(rule, self.sources[0], 1, "value", "rename", "old", "new", blob, "outside")
+        ledger.file_held(finding.finding_id, issue)
+        _ = issue.write_text('---\nstatus: open\nstage: backlog\ntags: [issue, proposal, style]\n'
+                             + f'unit: names-unit\nplan: "{self.plan} Phase 1"\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n')
+        _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        unit_change = self.unit_commit(self.sources[0], "pub fn value() { unit(); }\n")
+        with mock.patch.object(style_proposals, "proposal_command") as start:
+            code, output, _ = self.run_next()
+        self.assertEqual(code, 3)
+        self.assertIn(f"waiting {issue}: {self.sources[0]} changed in {unit_change[:7]}, not in the synced tip {self.tip[:7]}\n",
+                      output)
+        start.assert_not_called()
+        self.assertEqual(self.count_tickets(), 0)
+
+
+class UnsyncedChangeTests(unittest.TestCase):
+    def test_a_base_commit_not_in_the_synced_tip_names_each_file_it_changed_and_its_newest_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            repo = Path(folder)
+
+            def commit(path: str, text: str) -> str:
+                _ = (repo / path).write_text(text)
+                for arguments in (("add", path), ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", path)):
+                    _ = subprocess.run(["git", "-C", folder, *arguments], check=True)
+                return subprocess.run(["git", "-C", folder, "rev-parse", "HEAD"], check=True, capture_output=True,
+                                      text=True).stdout.strip()
+
+            _ = subprocess.run(["git", "init", "-q", folder], check=True)
+            tip = commit("a.rs", "fn a() {}\n")
+            first = commit("b.rs", "fn b() {}\n")
+            newest = commit("b.rs", "fn b() { c(); }\n")
+            changes = style_plan.unsynced_changes(repo, style_plan.UnitBranchTip(newest), tip)
+            self.assertEqual(dict(changes), {"b.rs": style_plan.UnsyncedChange("b.rs", newest)})
+            self.assertNotEqual(first, newest)
+            self.assertEqual(changes["b.rs"].line(tip), f"b.rs changed in {newest[:7]}, not in the synced tip {tip[:7]}")
+            # Only the first path of a commit loses the newline that `-z` puts before it; a tab path sorts first.
+            for path in ("\tfirst.rs", "\nline.rs"):
+                _ = (repo / path).write_text("text\n")
+            for arguments in (("add", "--all"), ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "two")):
+                _ = subprocess.run(["git", "-C", folder, *arguments], check=True)
+            both = subprocess.run(["git", "-C", folder, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+            self.assertEqual(set(style_plan.unsynced_changes(repo, style_plan.UnitBranchTip(both), newest)), {"\tfirst.rs", "\nline.rs"})
+            # A base inside the synced tip, and no unit branch, change no file.
+            self.assertEqual(dict(style_plan.unsynced_changes(repo, style_plan.UnitBranchTip(tip), newest)), {})
+            self.assertEqual(dict(style_plan.unsynced_changes(repo, style_plan.NoUnitBranch(), tip)), {})
 
 
 if __name__ == "__main__":
