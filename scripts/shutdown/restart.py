@@ -110,6 +110,10 @@ RestartMessageDelivery = RestartMessageSent | RestartMessageQueued
 
 class ShutdownServices(Protocol):
     NOTIFIER: Path
+    SHOWRUNNER_TOLD_BACK: str
+
+    def _unit_showrunner(self, saved: SessionShutdown) -> str: ...
+    def _reserve_showrunner_line(self, saved: SessionShutdown, told: str) -> bool: ...
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
@@ -756,7 +760,7 @@ class HerdrDestinationTaken(OSError):
     """An exclusive launch found an occupied destination, before opening a pane."""
 
 
-def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "", probe: bool = False) -> ResumeParts:
+def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "", probe: bool = False, source_fallback: bool = False) -> ResumeParts:
     from scripts.accounts import accounts
 
     config_dir = Path(session.get("config_dir", str(accounts.main_config_dir()))).expanduser()
@@ -765,7 +769,7 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
         if not isinstance(resolved, accounts.ResolvedHistoryLabel):
             raise accounts.AccountsError("home account unresolved in shutdown record")
         config_dir = accounts.claude_account_dir(resolved.label)
-    if session["kind"] in ("unit", "showrunner"):
+    if session["kind"] in ("unit", "showrunner") and not source_fallback:
         role = "unit" if session["kind"] == "unit" else "showrunner"
         selected = accounts.account_for_group_launch(role, resume=True, target=target)
         target = selected.label
@@ -964,7 +968,7 @@ def _units_row_plan(doc: str, unit: str) -> str | None:
     return production_units.cell_value(rows[0]["Plan"])
 
 
-def _unit_argv(record: SessionShutdown) -> list[str]:
+def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> list[str]:
     session = record["session"]
     host = session["host"]
     if session["kind"] != "unit" or (host["kind"] != "unit" and host["kind"] != "legacy tmux unit"):
@@ -1009,8 +1013,11 @@ def _unit_argv(record: SessionShutdown) -> list[str]:
         argv.extend(("--model", model["name"]))
     from scripts.accounts import accounts
 
-    selected = accounts.account_for_group_launch("unit", resume=True, target=record.get("target", ""))
+    selected = accounts.account_for_group_launch("unit", resume=True, target=record.get("target", ""),
+                                                 source_fallback=source_fallback)
     argv.extend(("--account", selected.label))
+    if source_fallback:
+        argv.append("--source-fallback")
     if record["probe"]:
         argv.append("--probe")
     return argv
@@ -1296,6 +1303,7 @@ def _launch_session(
     desktop_state: DesktopLaunchState,
     *,
     dry_run: bool,
+    source_fallback: bool = False,
 ) -> SessionLaunched | ManualRestartRequired:
     """Launch an entry or return its explicit manual-restart requirement."""
     from scripts.accounts import accounts
@@ -1310,7 +1318,7 @@ def _launch_session(
     if session["kind"] == "unit":
         if host["kind"] != "unit" and host["kind"] != "legacy tmux unit":
             raise ValueError("unit session has no unit host")
-        argv = _unit_argv(record)
+        argv = _unit_argv(record, source_fallback=source_fallback)
         note_path = _note_path(record, session["session_id"])
         _write_note(note_path, note, dry_run)
         try:
@@ -1330,7 +1338,7 @@ def _launch_session(
     if session["kind"] == "showrunner" and ("target" in record or record["requested_by"]["kind"] == "snapshot"):
         prompt += " " + note
     parts = _resume_parts(session, prompt, record.get("target", ""), login=record["login"],
-                          at=record["requested_at"], probe=record.get("probe", False))
+                          at=record["requested_at"], probe=record.get("probe", False), source_fallback=source_fallback)
     if host["kind"] == "herdr":
         # Every restart lands in the shared session; one recorded elsewhere moves there.
         shared = herdr.shared_session()
@@ -1783,6 +1791,93 @@ def _launch_recovery_record(
         return _launch_session(launch_record, note, desktop_state, dry_run=False)
 
 
+def _retarget_move_claim(saved: SessionShutdown, target: str) -> None:
+    def change(current: SessionShutdown) -> None:
+        if (current["request_id"] != saved["request_id"]
+                or current["progress"] != saved["progress"]):
+            raise OSError("restart claim changed before source fallback")
+        current["target"] = target
+    _ = update_session(saved["login"], saved["session"]["session_id"], change)
+    saved["target"] = target
+
+
+@dataclass(frozen=True)
+class SourceFallbackUnavailable:
+    """The session has no distinct source or may already be live."""
+
+
+@dataclass(frozen=True)
+class SourceFallbackSettled:
+    """The source was tried once and its result is recorded."""
+
+
+def _try_source_fallback(saved: SessionShutdown, error: BaseException,
+                         desktop_state: DesktopLaunchState) -> SourceFallbackUnavailable | SourceFallbackSettled:
+    """Start the source once, only after the target is known not to be live."""
+    target = saved.get("target", "")
+    source = saved.get("source_label", saved["label"])
+    if not target or target == source or not isinstance(_session_liveness(saved["session"]["session_id"]), SessionNotLive):
+        return SourceFallbackUnavailable()
+    reason = _error_reason(error)
+    _retarget_move_claim(saved, source)
+    line = f"{saved['session']['name']} came back on {source}: {target} refused ({reason})"
+    note = restart_note(saved, saved["progress"].get("at", settle.record_time())) + " " + line
+    try:
+        from scripts.accounts import accounts
+
+        prepared = accounts.prepared_account(source, resume=True)
+        if isinstance(prepared, accounts.AccountRefused):
+            raise OSError(prepared.reason)
+        environment = {**os.environ, **prepared.variables}
+        for key in prepared.remove:
+            _ = environment.pop(key, None)
+        permission = restore_permission.launch_permission(environment,
+            restore_permission.RecordedSessionRestoreLaunchPurpose(saved["session"]["session_id"]))
+        if isinstance(permission, restore_permission.BlockedByShutdown):
+            raise OSError(permission.reason)
+        if isinstance(permission, restore_permission.ShutdownStateUnreadable):
+            raise OSError("shutdown state unreadable: " + permission.detail)
+        launch = _launch_session(saved, note, desktop_state, dry_run=False, source_fallback=True)
+        if isinstance(launch, ManualRestartRequired):
+            raise OSError("source needs a manual restart: " + launch.command)
+        outcome = launch.prompt_outcome
+        if not isinstance(outcome, herdr.PromptSubmitted):
+            reason_text = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "no submit proof"
+            raise OSError("restart prompt not submitted: " + reason_text)
+        _save_prompt_outcome(saved, outcome)
+        confirmation = wait_for_confirmation(frozenset({saved["session"]["session_id"]}), SESSION_WAIT_SECONDS)
+        if saved["session"]["session_id"] not in confirmation.live_ids:
+            raise OSError(f"session not live after {SESSION_WAIT_SECONDS:g} seconds")
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as source_error:
+        _retarget_move_claim(saved, target)
+        both = f"{target} refused ({reason}); {source} also failed ({_error_reason(source_error)})"
+        mark_restart_failed(saved, both)
+        # Both move kinds need one retry alert when neither account can start it.
+        settle.alert_user(move_failed_push(saved))
+        settle.mark_not_back_pushed(saved)
+        return SourceFallbackSettled()
+    def remember(current: SessionShutdown) -> None:
+        if not _same_relaunch_claim(saved, current):
+            raise OSError("restart claim changed after source fallback")
+        current.setdefault("restart_issues", []).append(line)
+    _ = update_session(saved["login"], saved["session"]["session_id"], remember)
+    saved.setdefault("restart_issues", []).append(line)
+    _journal_move_failure(saved, line)
+    print(line)
+    confirm_entry(saved, saved["progress"].get("at", settle.record_time()), True)
+    return SourceFallbackSettled()
+
+
+def _tell_source_fallback(saved: SessionShutdown) -> None:
+    lines = [line for line in saved.get("restart_issues", []) if " came back on " in line]
+    if not lines or "showrunner_told" not in saved or saved["showrunner_told"] == settle.SHOWRUNNER_TOLD_BACK:
+        return
+    showrunner = settle._unit_showrunner(saved)  # pyright: ignore[reportPrivateUsage]
+    if showrunner and settle._reserve_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK):  # pyright: ignore[reportPrivateUsage]
+        _ = settle.send_message(showrunner, lines[-1], lines[-1], key=f"shutdown-unit-{saved['session']['session_id']}")
+        saved["showrunner_told"] = settle.SHOWRUNNER_TOLD_BACK
+
+
 def _host_needs_manual_restart(host: Host) -> bool:
     """True for a host `_launch_session` cannot start: an unknown host, or a terminal off the Mac.
 
@@ -1901,14 +1996,17 @@ def launch_entry(
         else:
             mark_restart_failed(record, str(error))
         return EntrySettled()
-    except accounts.AccountsError as error:
+    except (accounts.AccountsError, OSError, subprocess.SubprocessError) as error:
         if dry_run:
-            print(f"{session['name']} restart failed: {_error_reason(error)}")
-        else:
-            mark_restart_failed(record, _error_reason(error))
-        return EntrySettled()
-    except (OSError, subprocess.CalledProcessError, subprocess.SubprocessError) as error:
-        if dry_run or not _launch_failure_left_session_live(record, error):
+            print(f"cannot restart {session['name']}: {_error_reason(error)}")
+            return EntrySettled()
+        fallback = _try_source_fallback(record, error, desktop_state)
+        if isinstance(fallback, SourceFallbackSettled):
+            return EntrySettled()
+        if isinstance(error, accounts.AccountsError):
+            mark_restart_failed(record, str(error))
+            return EntrySettled()
+        if not _launch_failure_left_session_live(record, error):
             return EntrySettled()
         launch = SessionLaunched(_prompt_outcome(record))
     if isinstance(launch, ManualRestartRequired):
@@ -1925,7 +2023,10 @@ def launch_entry(
         outcome = herdr.PromptNotSubmitted("restart launcher supplied no submit proof")
     _save_prompt_outcome(record, outcome)
     if isinstance(outcome, herdr.PromptNotSubmitted):
-        mark_restart_failed(record, "restart prompt not submitted")
+        reason = "restart prompt not submitted: " + outcome.reason
+        fallback = _try_source_fallback(record, OSError(reason), desktop_state)
+        if isinstance(fallback, SourceFallbackUnavailable):
+            mark_restart_failed(record, "restart prompt not submitted")
         return EntrySettled()
     return EntryLaunched(relaunching_pending_timers)
 
@@ -2015,10 +2116,14 @@ def confirm_entry(
     elif current["progress"]["kind"] in {"restarting", "stopping"}:
         return
     if not live:
-        mark_restart_failed(
-            record,
-            f"session not live after {SESSION_WAIT_SECONDS:g} seconds",
-        )
+        reason = f"session not live after {SESSION_WAIT_SECONDS:g} seconds"
+        desktop_state = DesktopLaunchState()
+        try:
+            fallback = _try_source_fallback(record, OSError(reason), desktop_state)
+            if isinstance(fallback, SourceFallbackUnavailable):
+                mark_restart_failed(record, reason)
+        finally:
+            desktop_state.restore(dry_run=False)
         return
     if not _prove_move(record):
         return
@@ -2029,6 +2134,7 @@ def confirm_entry(
     _send_worker_resume(current)
     timer_failures = _restore_timers(record["timers"], dry_run=False)
     _record_timer_restore_progress(record, timer_failures)
+    _tell_source_fallback(record)
 
 
 def _machine_result(records: list[SessionShutdown], machine: str, label: str) -> MachineRestartResult:
