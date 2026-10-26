@@ -538,6 +538,18 @@
       "time": "2026-10-14T04:30:22.346233-04:00"
     }
   },
+  "shutdown.move_failed": {
+    "long_session": {
+      "reviewer": "opus",
+      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
+      "time": "2026-10-22T08:41:21.232661-04:00"
+    },
+    "typical": {
+      "reviewer": "opus",
+      "sha256": "13f27f4f212294a61bffbc5e3c8c13a2f57f8dda3012be9c7a248127efb65b6a",
+      "time": "2026-10-22T08:41:13.031634-04:00"
+    }
+  },
   "shutdown.restart_failed": {
     "one_long_name": {
       "objections": [],

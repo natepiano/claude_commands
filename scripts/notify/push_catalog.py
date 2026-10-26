@@ -63,6 +63,15 @@ ENTRIES = (
          PushExample("one_long_name", {"account": '"claude-team-build-followups-12"', "machine": "Mac",
              "stopped": "One session (build-followups-two-accounts-unit-director)"})),
         purpose="A restart did not start all stopped sessions again."),
+    PushText("shutdown.move_failed", "shutdown", "decision", "A Claude session did not finish its move",
+        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Finish moving the Claude session named {session} to {target} from its shutdown record."'),
+        "The Claude session {session} on {machine} stopped on account {source} to move to account {target}. "
+        + "It did not start on {target}, so its work stays paused. "
+        + "Its shutdown record starts it on {target}, not on {source}.",
+        (PushExample("typical", {"session": "ups", "machine": "natedev", "source": "claude1", "target": "claude3"}),
+         PushExample("long_session", {"session": "build-followups-message-clarity-unit-director-session-12",
+             "machine": "Mac", "source": "claude2", "target": "claude4"})),
+        purpose="A session stopped for an account move did not start on its new account."),
     PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
         "The restart of Claude account {account} could not be confirmed on {machine}. "
