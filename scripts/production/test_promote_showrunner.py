@@ -280,7 +280,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
         self.assertIn("demo-unit is open as the session child, but its showrunner prompt is not proven to have run; "
                       + "its Units row is retired.", out)
-        self.assertIn("herdr session attach child", out)
+        self.assertIn("herdr session attach agents, workspace child, tab child", out)
         self.assertIn(f"/showrunner:produce {self.child_doc} resume", out)
         self.assertNotIn("add_unit.py", out)
 

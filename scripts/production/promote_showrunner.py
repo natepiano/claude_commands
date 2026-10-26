@@ -267,7 +267,7 @@ def finish(promotion: Promotion, started: int, moved: str) -> int:
         retired, row = False, f"its Units row was not retired and is owed: {error}"
     if started == add_showrunner.SESSION_NOT_READY:
         print(f"{unit} is open as the session {slug}, but its showrunner prompt is not proven to have run; {row}. "
-              + f"Look at it with `herdr session attach {slug}`; unless it runs the production, type: "
+              + f"Look at it with `{herdr.attach_hint(showrunners.herdr_space(slug, str(promotion.child.doc)), slug)}`; unless it runs the production, type: "
               + f"/showrunner:produce {promotion.child.doc} resume")
         return 1
     if not retired:
