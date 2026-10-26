@@ -2424,3 +2424,57 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:**
 - A test that mocks `execvpe` for a Claude or Codex start needs a scratch executable on its PATH or in its scratch `~/.local/bin`; the gate caught two that had none.
+
+### Phase 87 — A move never strands units: target check, source fallback, restart skips the running  · status: todo
+
+**Depends on:** Phase 86; shutdown-unit's hold API (its 10-26 19:30 AST checkpoint)
+
+#### Work Order
+
+**Goal:** On 10-26 at 16:37 AST the auto move of the units group claude4 → claude2 (auto 90e7f9e1) stopped about 45 units, and none came back: claude2 had a stop hold from 10-18 whose requesting session (b1f5ca98) was gone. The units stayed down 20+ minutes until the user restarted them by hand, and `restart --only` refused all 28 names because one was already back. Showrunner, user go 10-26: a move checks the target before it stops anyone, a unit that cannot start on the target starts on its source, and a restart list never refuses because some names already run. User: "I should not have to ask you to fix it. You should just fix it."
+
+**Constraints:**
+- Root cause: a move keeps its stop records under the **source** login, but the restart's `launch_blocked` asks about the **target** login, finds no record there, and the target's account hold decides. Nothing checks the target's hold before the move: `accounts.check_move_target` (~3105) checks only usage, and the auto mover's preflight in `refusal_watch._run_auto_moves_locked` (~1069-1107) checks readings, login and refusals. The refusal-driven move (`refusal_watch._run` ~869-917) and "complete committed group" (~930-968) have no hold check either.
+- `accounts.move_group` (~3195) calls `set_group_account` before `move_sessions`. The check must come before both, so a refused target changes nothing.
+- Hold API (shutdown-unit, accepted 10-26): `scripts/shutdown/launch_permission.launch_permission(environment, NewWorkLaunchPurpose())` with `CLAUDE_CONFIG_DIR` set to the target account's dir returns `AllowedByShutdownState(released: AccountHold | None)`, `BlockedByShutdown(reason)` or `ShutdownStateUnreadable`. It removes a finished hold itself (its only write) and returns it in `released` (keys `then`, `requested_by`, `requested_at`, `label`, `request_id`). The reason reads "<label> is held by a shutdown (since <time>), requested by session <8 chars>". Until that checkpoint merges, `released` may not exist: read it with `getattr(..., "released", None)` only if the type lacks it at build time, and tests use fakes of the three results.
+- A failed target start today: `restart._launch_session` (~1296) raises `CalledProcessError`, `_launch_failure_left_session_live` (~1700) calls `mark_restart_failed`, and the record keeps `target`. The record also has `source_label`. A unit's start goes through `_unit_argv` (~980) → `add_unit` with `--account <target>`.
+- `shutdown.py restart <login> --only a,b,…` → `resolve_sessions` (~446): a name that matches no session raises `SessionSelectionError`, and the CLI (~1261) returns 2 before any restart. A name already restored has its record archived and runs on another account, so it matches nothing. `_all_accounts` (~1088-1122) has the same whole-list refusal.
+
+**Spec:**
+1. **Target check before any stop.** One function in `accounts.py`, used by `check_move_target` (so the hand group move, single move and dry run) and by every `refusal_watch` path that moves a group or session (auto rule, refusal-driven, complete committed group). It calls `launch_permission` for the target account.
+   - Blocked or unreadable: the move stops nobody and writes nothing. The hand move returns `MoveRefused("accounts: <reason>; no session was stopped")`. The auto paths record a blocked head the way Phase 85's `TargetLoginRenewalFailed` does: a new `quota_alert` reason `TargetHeldByShutdown(reason)` with its line in `blocked_next_move_line`, so the showrunners get it through `notify_blocked_next_move`. The refusal-driven move records it so the existing no-room notice to the showrunners names the hold reason.
+   - Allowed with a `released` hold: the move goes on, and its outcome text (the hand move's output and the showrunner notice of the auto move) adds one line: "cleared a finished <then> hold on <label> from <requested_at local> (session <8>)".
+   - A dry run reports what the check found and writes nothing (it does not call the removing check: use the read-only path if the API offers one, else report "would check the shutdown hold").
+2. **Source fallback.** When a moved session (record with a `target` different from its source login) fails to start on the target, the restart starts it once on its source account, then marks it restarted and journals the fallback: the showrunner outcome reads "<name> came back on <source>: <target> refused (<reason>)". Only when the source start also fails does the record become `restart failed`. An auto move's suppressed phone alert (`alerts="none"`) stays suppressed for a successful fallback; when both fail, the user push `shutdown.restart_failed` goes out even for an auto move (reuse the existing push id; add no new push text).
+3. **Restart skips the running.** `restart --only` (one account and `_all_accounts`): a name that matches no record but is a live session (session registry, any account) prints "<name>: already running; skipped" and the others go on. A name that matches nothing and is not live prints its existing error line, the others still restart, and the exit code is 1. Never refuse the whole list for one name. A name matching more than one session keeps its error line for that name only.
+4. Tests (scratch HOME, `ShutdownTestCase` / the `test_refusal_watch` fixtures; fakes for `launch_permission` and every launch; never a real session or real state):
+   - a held target: hand group move, single move and the auto rule stop nobody, write no group account, and the auto rule's blocked-head notice names the hold reason;
+   - a released finished hold: the move goes on and the outcome names the cleared hold;
+   - an unreadable state refuses like a held target;
+   - a moved unit whose target start fails starts on its source, marked restarted with the fallback line; both failing gives `restart failed` and one user push, also for an auto move;
+   - `restart --only` with one already-running name, one unknown name and two stopped names: the two restart, the running one is skipped, the unknown one gets its line, exit 1.
+5. Docs: `docs/accounts.md` (the move section: the target hold check, the source fallback) and the restart text in the shutdown guide if it names the whole-list refusal.
+
+**Files:** `scripts/accounts/accounts.py`, `scripts/accounts/refusal_watch.py`, `scripts/whoami/quota_alert.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/shutdown.py`, tests: `scripts/shutdown/test_account_move.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/whoami/test_quota_alert.py`; `docs/accounts.md`. Do not edit `scripts/shutdown/launch_permission.py`, `record.py` or `settle.py` (shutdown-unit is changing them).
+
+**Workers:** 1 writer. impl owns all files.
+
+**Verification:** `scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.shutdown.test_account_move scripts.shutdown.test_restart scripts.shutdown.test_shutdown_cli scripts.whoami.test_quota_alert` with a scratch HOME; basedpyright 0/0 on changed Python files.
+
+**Acceptance gate:** suites pass; basedpyright 0/0; merge gate passes.
+
+### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: todo
+
+**Depends on:** Phase 87; shutdown-unit's 10-26 19:30 AST checkpoint merged
+
+#### Work Order
+
+**Goal:** Whatever stops a unit (a move, a crash, a stale hold), it comes back with no user step. Showrunner, user go 10-26: a watchdog on a timer restarts a unit whose session is down without a stop the user asked for, on the group account, else the source; a phone alert goes only when both fail. A gate test rebuilds today's case and passes only when every unit runs again with no manual step. User: "Anything you have to use a memory for is not viable."
+
+**Spec (outline; details written at phase start from Phase 87's as-built):**
+1. A watchdog pass in `refusal_watch.run()` (the notes timer, every 2 min on natedev), after the move passes. Units that should run: each registered showrunner's production doc Units rows that are not retired, whose run is in progress (`production/live_units.py`, `unit_lookup.run_state`).
+2. A unit is down when no live session holds it. Skip it when a shutdown record or hold is in progress for it (stopping, waiting, restarting), when a user-asked stop holds it (`then: "stop"` record with a session or terminal origin that is live, or a stopped record of a stop the user asked for), or when it was first seen down less than one pass ago (state file under `~/.local/state/accounts/`).
+3. Restart: on the group account through the same launch path `agents restart` uses (record or recovery snapshot); if that fails, on the source account. Both failing: one `shutdown.restart_failed` user push per outage (not per pass), and the showrunner gets a line each time.
+4. Gate test: a scratch production with units on claude4 and a stale stop hold on claude2 (requesting session gone), then the auto group move claude4 → claude2: every unit runs again, on claude2, with no manual step. A second case with a hold still in use: the move stops nobody, and units whose sessions die are restarted by the watchdog on claude4.
+
+**Files:** `scripts/accounts/refusal_watch.py`, a new `scripts/accounts/unit_watchdog.py` if the pass is over ~100 lines, tests in `scripts/accounts/`, `docs/accounts.md`.
