@@ -2581,6 +2581,46 @@ def bound_standard_names(sources: RevisionTree, crate: str, names: frozenset[str
     return frozenset(found)
 
 
+# A word that can start a macro definition or an `include!`. A file without one is not read as tokens.
+MACRO_WORD = re.compile(r"\b(?:macro(?:_rules)?|include)\b")
+# The words with which a macro expansion can make a binding, or define a macro that makes one.
+BINDING_WORDS = frozenset({"use", "extern", "mod", "as", "macro", "macro_rules"})
+# The macro fragments that can carry a keyword or a whole item into an expansion. A `use` that an `expr`, a `block`
+# or another fragment carries binds only inside its block.
+KEYWORD_FRAGMENTS = frozenset({"tt", "ident", "item", "stmt", "meta", "vis"})
+
+
+def refuse_binding_macros(sources: RevisionTree, crate: str, befores: Mapping[str, MoveText],
+                          afters: Mapping[str, MoveText]) -> None:
+    """Raise MoveRefused for a file of the crate, before or after the change, that defines a macro whose expansion
+    can make a binding: any `macro` item, and a `macro_rules!` whose rules hold a `use`, `extern`, `mod`, `as`,
+    `macro` or `macro_rules` token or a fragment in KEYWORD_FRAGMENTS. Such a macro can bind a name from its
+    arguments, as `use crate::$source as $alias;` does, take the keyword itself as an argument, as `$u:tt` can, or
+    emit a glob, and no other scan reads the expansion. It also refuses any `include!`, in a macro or not: the
+    proof reads only .rs files, and the included file can bind a name. `include_str!` and `include_bytes!` give only
+    data. A raw word such as `r#use` counts as its plain spelling, so the scan reads each word without its `r#`."""
+    for path in sorted(crate_files(sources, crate, ()).keys() | afters.keys()):
+        texts = (befores[path].text, afters[path].text) if path in afters else (sources.text(path),)
+        for text in texts:
+            if not MACRO_WORD.search(text):
+                continue
+            words = tuple(token.value.removeprefix("r#") for token in tokens(text))
+            for index, word in enumerate(words):
+                body = index + 3
+                if word == "include" and words[index + 1:index + 2] == ("!",):
+                    raise MoveRefused(f"{path}: an include! brings code the proof cannot read")
+                if word == "macro_rules" and words[index + 1:index + 2] == ("!",) and words[body:body + 1] in {
+                        ("{",), ("(",), ("[",)}:
+                    rules = words[body + 1:closing(words, body)]
+                    if BINDING_WORDS & set(rules) or any(
+                            rules[cursor] == "$" and rules[cursor + 2:cursor + 3] == (":",)
+                            and rules[cursor + 3:cursor + 4] in {(fragment,) for fragment in KEYWORD_FRAGMENTS}
+                            for cursor in range(len(rules))):
+                        raise MoveRefused(f"{path}: a macro that can emit a use or a module")
+                elif word == "macro":
+                    raise MoveRefused(f"{path}: a macro that can emit a use or a module")
+
+
 def refuse_old_edition(sources: RevisionTree, crate: str, manifest: dict[str, object]) -> None:
     """Raise MoveRefused for a crate older than Rust 2018, where a path such as `use writer::*;` starts at the crate
     root, not at an extern crate. A missing `edition` means 2015, and `edition.workspace = true` reads the edition of
@@ -2796,6 +2836,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                for change in changes}
     afters = {change.path: move_text(change.path, True, change.after, modules[change.path], library)
               for change in changes}
+    refuse_binding_macros(sources, crate, befores, afters)
 
     # Pair each item that leaves one file with its one copy in another.
     def keys(text: MoveText) -> Counter[tuple[str, str, tuple[str, ...]]]:
