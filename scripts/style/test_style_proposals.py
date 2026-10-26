@@ -2929,6 +2929,24 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertIn(f"followed from {path}:7 at {tip[:7]}", self.held_list())
             self.assertEqual(self.follow(), (0, "totals: follow 0, built 0, withdraw 0, left 0, kept 0, close 0\n"))
 
+    def test_follow_moves_a_statement_with_its_function_only_to_the_one_body_line_that_holds_its_text(self) -> None:
+        with self.ledger() as ledger:
+            path, destination = "alpha/src/a.rs", "alpha/src/b.rs"
+            _ = self.commit_tip(ledger, {path: "pub fn keep() {}\n\nfn check() {\n    let rgba = convert(2, 16);\n}\n"})
+            finding, = self.judge(ledger, ((path, 4, "let rgba = convert(2, 16);"),), kind="restructure")
+            issue, = self.file(ledger)
+            self.approve(issue)
+            _ = self.commit_tip(ledger, {path: "pub fn keep() {}\n",
+                                         destination: "fn check() {\n    let rgba = convert(2, 16);\n    let rgba = convert(2, 16);\n}\n"})
+            self.assertEqual(self.follow("--dry-run"), (
+                1, f"left {finding.finding_id} {self.rename} {path}:4: fn check moved to {destination}; "
+                + "text on more than one line of the moved function's body\n"
+                + "totals: follow 0, built 0, withdraw 0, left 1, kept 0, close 0\n"))
+            _ = self.commit_tip(ledger, {destination: "fn check() {\n    let bytes = [0];\n    let rgba = convert(2, 16);\n}\n"})
+            self.assertEqual(self.follow(), (
+                0, f"follow {finding.finding_id} {self.rename} {path}:4 -> {destination}:3: fn check\n"
+                + "totals: follow 1, built 0, withdraw 0, left 0, kept 0, close 0\n"))
+
     def test_a_built_trait_member_site_without_qualified_tokens_follows_from_its_header(self) -> None:
         with self.ledger() as ledger:
             path = "alpha/src/a.rs"
