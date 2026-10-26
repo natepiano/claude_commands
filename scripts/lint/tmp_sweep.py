@@ -12,7 +12,8 @@ in nixos modules/darwin/tmp-sweep.nix runs `tmp_sweep.py` every hour.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
-folder of each /tmp/claude-<uid> this user owns. In a temp folder (/tmp, $TMPDIR
+folder of each /tmp/claude-<uid> this user owns, or the scratch root of scripts/lib/scratch.py
+(/tmp/claude/scratch), where each task's folder is an entry. In a temp folder (/tmp, $TMPDIR
 and the Mac's per-user temp folder) only a tempfile folder is an entry: ".tmp"
 and 6 letters or digits, the name Rust's tempfile crate gives, which test runs
 leave behind. Roots are real paths on both machines. An entry is deleted when
@@ -33,7 +34,8 @@ dispatched in yet stays too; a session folder named
 for a running session, though an entry of SESSION_ENTRY_MIN_BYTES or more in
 its folders (scratchpad/, tasks/) is judged like any other: a live session
 keeps small files there that it only reads, and a read does not move mtime;
-each of those when a session record cannot be read;
+each of those when a session record cannot be read; a scratch folder of a change review
+row, which its verdict removes (the user can take days to check a row);
 and an entry that cannot be read. Links are never followed, a read-only folder
 is made writable and deleted, and a project folder left empty goes. With
 neither /proc nor lsof nothing goes.
@@ -62,6 +64,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import scratch  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from ..lib import unit_runs
@@ -104,6 +107,7 @@ DRY_RUN_FLAG = "--dry-run"
 ROOT = "a root or a run-marker folder"
 SESSION_RUNS = "its session runs"
 DIRECTOR_RUNS = "its unit director runs"
+ROW_WAITS = "its change review row waits for a verdict"
 NO_SESSIONS = "a session record cannot be read"
 IN_USE = "a process uses it"
 RECENT = "changed in the last 4 h"
@@ -142,9 +146,10 @@ class Roots:
     runs: tuple[str, ...]
     projects: tuple[str, ...]
     temp: tuple[str, ...] = ()
+    scratch: tuple[str, ...] = ()
 
     def all(self) -> tuple[str, ...]:
-        return self.plain + self.runs + self.projects + self.temp
+        return self.plain + self.runs + self.projects + self.temp + self.scratch
 
     def entries(self, root: str) -> list[os.DirEntry[str]]:
         """The entries of root the sweep judges."""
@@ -167,15 +172,18 @@ class Sweep:
 
 
 def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS,
-                  session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None) -> Roots:
+                  session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
+                  scratch_roots: Sequence[str] | None = None) -> Roots:
     """The same roots on natedev and the Mac, each by its real path: the Mac's /tmp is a link to
     /private/tmp, and lsof prints real paths."""
     sessions_at = session_scratch_roots() if session_roots is None else session_roots
     projects = tuple(entry.path for root in sessions_at for entry in listing(os.path.realpath(root))
                      if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False))
     temp = temp_folders() if temp_roots is None else temp_roots
+    task_roots = (str(scratch.root()),) if scratch_roots is None else scratch_roots
     return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in run_roots), projects,
-                 tuple(os.path.realpath(root) for root in temp))
+                 tuple(os.path.realpath(root) for root in temp),
+                 tuple(os.path.realpath(root) for root in task_roots if os.path.isdir(root)))
 
 
 def session_scratch_roots() -> tuple[str, ...]:
@@ -373,6 +381,9 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
     owns it by the entry's own record."""
     if entry.path in roots.all() or (root in roots.runs and entry.name == RUN_MARKERS):
         return ROOT
+    if root in roots.scratch:
+        task = scratch.task_of(Path(entry.path))
+        return ROW_WAITS if task is not None and task.startswith("row:") else None
     if root in roots.projects:
         if live is None:
             return NO_SESSIONS
