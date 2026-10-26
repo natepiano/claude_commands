@@ -24,7 +24,7 @@ from unittest import mock
 
 import rules
 import style_ledger
-from approved_renames import AppliedInCode, Folder, NoAppliedCheck, RenameNotApplied
+from approved_renames import AppliedCheck, AppliedInCode, Folder, NoAppliedCheck, RenameNotApplied
 import style_plan
 import style_rules
 import berth_board
@@ -921,6 +921,147 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(result.stdout, f"built {finding.finding_id} at {self.initial_tip[:7]}, read by nate\n")
         held = next(item for item in self.ledger().proposal_findings(issue) if item.finding_id == finding.finding_id)
         self.assertEqual((held.state, held.reading), (style_ledger.Built(issue), style_ledger.ReadByPerson("nate")))
+
+    def checkpointed_type_findings(self) -> tuple[style_ledger.Ledger, str, str, str]:
+        """Two filed type findings; names-1 holds the first and merged at a checkpoint after the initial tip."""
+        rule, issue, _ = self.decision_findings()
+        self.write(self.sources[2], "pub fn checkpoint() {}\n")
+        checkpoint = self.commit("Build the type change")
+        ledger = self.ledger()
+        ledger.set_tip(checkpoint, "main")
+        built, other = (ledger.hold(rule, self.sources[2], line, "value", "type", "u32", "u64", self.blob(rule),
+                                    "outside") for line in (1, 2))
+        for finding in (built, other):
+            ledger.file_held(finding.finding_id, issue)
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/beta", [self.sources[2]], [rule],
+                          proposal=str(issue), finding_ids=(built.finding_id,))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET state='merged',checkpoint=? WHERE id='names-1'", (checkpoint,))
+        return ledger, built.finding_id, other.finding_id, checkpoint
+
+    def test_held_built_at_a_merge_refuses_a_merge_without_the_build_ticket_checkpoint(self) -> None:
+        ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET finding_ids='[]' WHERE id='names-1'")
+        before = self.held_rows(ledger.database)
+        result = self.cli("held", "built", "--id", finding_id, "--commit", self.initial_tip, "--by", "nate",
+                          success=False)
+        self.assertEqual((result.returncode, result.stderr.strip()),
+                         (2, f"style_ledger: {finding_id}: {self.initial_tip} does not contain names-1's checkpoint "
+                          + checkpoint[:7]))
+        self.assertEqual(self.held_rows(ledger.database), before)
+        result = self.cli("held", "built", "--id", finding_id, "--commit", checkpoint, "--by", "nate")
+        self.assertEqual(result.stdout, f"built {finding_id} at {checkpoint[:7]}, read by nate\n")
+
+    def test_held_built_at_a_merge_refuses_a_merge_without_a_listing_ticket_checkpoint(self) -> None:
+        ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket='' WHERE finding_id=?", (finding_id,))
+        before = self.held_rows(ledger.database)
+        result = self.cli("held", "built", "--id", finding_id, "--commit", self.initial_tip, "--by", "nate",
+                          success=False)
+        self.assertEqual((result.returncode, result.stderr.strip()),
+                         (2, f"style_ledger: {finding_id}: {self.initial_tip} does not contain names-1's checkpoint "
+                          + checkpoint[:7]))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def assert_refused_after_a_write_during_the_check(self, ledger: style_ledger.Ledger, finding_id: str,
+                                                      update: str, parameters: tuple[str, ...], error: str) -> None:
+        """Another writer runs update during the first applied check; the next attempt refuses and writes nothing."""
+        before = self.held_rows(ledger.database)
+        check = style_ledger.Ledger.applied_check
+        calls = 0
+
+        def check_while_another_writer_runs(self_: style_ledger.Ledger, finding: style_ledger.HeldFinding,
+                                            commit: str) -> AppliedCheck:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute(update, parameters)
+            return check(self_, finding, commit)
+
+        with (mock.patch.object(style_ledger.Ledger, "applied_check", check_while_another_writer_runs),
+              self.assertRaisesRegex(style_ledger.LedgerError, re.escape(error))):
+            _ = ledger.mark_built_at_merge((finding_id,), self.initial_tip, style_ledger.ReadByPerson("nate"))
+        self.assertEqual(calls, 1)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_held_built_at_a_merge_rereads_the_linked_tickets_under_the_write_lock(self) -> None:
+        ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET state='assigned',checkpoint='' WHERE id='names-1'")
+            _ = connection.execute("UPDATE held_findings SET build_ticket='' WHERE finding_id=?", (finding_id,))
+        # Another writer checkpoints and merges the linked ticket after the checkpoint check read it.
+        self.assert_refused_after_a_write_during_the_check(
+            ledger, finding_id, "UPDATE tickets SET state='merged',checkpoint=? WHERE id='names-1'", (checkpoint,),
+            f"{finding_id}: {self.initial_tip} does not contain names-1's checkpoint {checkpoint[:7]}",
+        )
+
+    def judged_type_finding(self) -> tuple[style_ledger.Ledger, str, str]:
+        """A filed type finding judged by the read ticket names-1, which starts at the initial tip; and a later tip."""
+        rule, issue, _ = self.decision_findings()
+        self.write(self.sources[2], "pub fn judged() {}\n")
+        judged = self.commit("Judge the finding")
+        ledger = self.ledger()
+        ledger.set_tip(judged, "main")
+        finding = ledger.hold(rule, self.sources[2], 1, "value", "type", "u32", "u64", self.blob(rule), "outside")
+        ledger.file_held(finding.finding_id, issue)
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base=? WHERE id='names-1'", (self.initial_tip,))
+            _ = connection.execute("UPDATE held_findings SET ticket='names-1' WHERE finding_id=?",
+                                   (finding.finding_id,))
+        return ledger, finding.finding_id, judged
+
+    def test_held_built_at_a_merge_rereads_the_judging_ticket_under_the_write_lock(self) -> None:
+        ledger, finding_id, judged = self.judged_type_finding()
+        # The judging ticket checkpoints at a later commit after the judged-commit check read its start.
+        self.assert_refused_after_a_write_during_the_check(
+            ledger, finding_id, "UPDATE tickets SET checkpoint=? WHERE id='names-1'", (judged,),
+            f"{finding_id}: {self.initial_tip} is older than {judged[:7]}, where the finding was judged",
+        )
+
+    def test_held_built_at_a_merge_decides_from_the_rows_it_read(self) -> None:
+        ledger, finding_id, judged = self.judged_type_finding()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET checkpoint=? WHERE id='names-1'", (judged,))
+        before = self.held_rows(ledger.database)
+        judged_commit = style_ledger.Ledger.judged_commit
+
+        def judged_while_another_writer_flips(self_: style_ledger.Ledger, finding: style_ledger.HeldFinding,
+                                              ) -> style_ledger.JudgedCommit | style_ledger.NoJudgedCommit:
+            # Another writer clears the checkpoint for this one read and puts it back before the write lock.
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE tickets SET checkpoint='' WHERE id='names-1'")
+            try:
+                return judged_commit(self_, finding)
+            finally:
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute("UPDATE tickets SET checkpoint=? WHERE id='names-1'", (judged,))
+
+        with (mock.patch.object(style_ledger.Ledger, "judged_commit", judged_while_another_writer_flips),
+              self.assertRaisesRegex(style_ledger.LedgerError, re.escape(
+                  f"{finding_id}: {self.initial_tip} is older than {judged[:7]}, where the finding was judged"))):
+            _ = ledger.mark_built_at_merge((finding_id,), self.initial_tip, style_ledger.ReadByPerson("nate"))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_held_built_at_a_merge_ignores_the_checkpoint_of_a_dropped_ticket(self) -> None:
+        ledger, finding_id, _, _ = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET state='dropped' WHERE id='names-1'")
+        result = self.cli("held", "built", "--id", finding_id, "--commit", self.initial_tip, "--by", "nate")
+        self.assertEqual(result.stdout, f"built {finding_id} at {self.initial_tip[:7]}, read by nate\n")
+
+    def test_held_built_at_a_merge_writes_no_id_when_one_lacks_a_checkpoint(self) -> None:
+        ledger, finding_id, other_id, checkpoint = self.checkpointed_type_findings()
+        before = self.held_rows(ledger.database)
+        result = self.cli("held", "built", "--id", finding_id, "--id", other_id, "--commit", self.initial_tip,
+                          "--by", "nate", success=False)
+        self.assertEqual((result.returncode, result.stderr.strip()),
+                         (2, f"style_ledger: {finding_id}: {self.initial_tip} does not contain names-1's checkpoint "
+                          + checkpoint[:7]))
+        self.assertEqual(self.held_rows(ledger.database), before)
 
     def test_unwaive_moves_waived_findings_to_unfiled_with_no_move_and_the_held_list_shows_who(self) -> None:
         _, issue, ids = self.decision_findings()

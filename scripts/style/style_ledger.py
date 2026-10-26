@@ -443,6 +443,35 @@ class BuildTicket:
     ticket: str
 
 
+# The id, state and checkpoint of a ticket that built or holds a finding.
+LinkedTicket = tuple[str, TicketState, str]
+# The checkpoint and base of the ticket that judged a finding; empty when there is no such ticket.
+JudgingTicket = tuple[tuple[str, str], ...]
+
+
+def _refuse_open_ticket(finding_id: str, ticket: str, state: TicketState) -> None:
+    if state not in FINAL_TICKET_STATES:
+        raise LedgerError(f"{finding_id}: build ticket {ticket} still holds the finding")
+
+
+@dataclass(frozen=True)
+class BuiltAtMergeRows:
+    """Every ledger row that decides whether a merge builds a finding, as read before the write lock."""
+
+    finding: HeldFinding
+    linked: tuple[LinkedTicket, ...]
+    judging: JudgingTicket
+
+    def refuse_open_build_ticket(self) -> None:
+        """Refuse the finding while its build ticket, as read, is not merged or dropped."""
+        if isinstance(self.finding.build_ticket, BuildTicket):
+            ticket = self.finding.build_ticket.ticket
+            states: dict[str, TicketState] = {id: state for id, state, _ in self.linked}
+            if ticket not in states:
+                raise LedgerError(f"unknown ticket {ticket}")
+            _refuse_open_ticket(self.finding.finding_id, ticket, states[ticket])
+
+
 @dataclass(frozen=True)
 class NotReadByPerson:
     """No person read the code for the built finding; the applied check decides whether its change is in."""
@@ -2455,10 +2484,16 @@ class Ledger:
                            FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed(), provenance, actor)
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
-        rows = cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT checkpoint,base FROM tickets WHERE id=?", (finding.ticket,),
-        ).fetchall())
-        for commit in (commit for commit in (rows[0] if rows else ()) if commit):
+        return self._judged_from(self._judging_ticket(finding.ticket))
+
+    def _judging_ticket(self, ticket_id: str) -> JudgingTicket:
+        return tuple(cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT checkpoint,base FROM tickets WHERE id=?", (ticket_id,),
+        ).fetchall()))
+
+    def _judged_from(self, judging: JudgingTicket) -> JudgedCommit | NoJudgedCommit:
+        """The judging ticket's checkpoint, else its start, from its row as read; reads git and not the ledger."""
+        for commit in (commit for commit in (judging[0] if judging else ()) if commit):
             if commit not in self._resolved_commits:
                 resolved = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
                                           capture_output=True, text=True, check=False)
@@ -3991,35 +4026,38 @@ class Ledger:
         """Mark filed findings built after a plain merge put their change in the code, with no build ticket.
 
         Each name is a finding id or a unique prefix of one. The merge must be on the synced branch and must not be
-        older than the commit each finding was judged at, and the applied check runs at the merge. A rename that is not applied is refused. A finding that the check cannot prove needs
-        a person's reading, and the row keeps it; a proven rename clears it. Every refusal comes before the write.
-        The git work runs before the write lock; if a finding changes before the lock, it starts again.
+        older than the commit each finding was judged at. It must contain the checkpoint of each ticket that built or
+        holds a finding, except a dropped ticket. The applied check runs at the merge. A rename that is not applied is
+        refused. A finding that the check cannot prove needs a person's reading, and the row keeps it; a proven rename
+        clears it. Every refusal comes before the write.
+        The git work runs before the write lock. If the synced tip or a row that decides a finding changes before the
+        lock, it starts again.
         """
         try:
             commit = _git(self.repo, "rev-parse", "--verify", f"{merge}^{{commit}}")
         except CheckCouldNotRun as error:
             raise LedgerError(f"{merge}: no such commit") from error
-        tip = self.synced_commit()
-        if not self._is_ancestor(commit, tip):
-            raise LedgerError(f"{merge} is not on the synced branch at {tip[:7]}")
-
-        def named(name: str, identities: list[str]) -> HeldFinding:
-            """The one filed finding that name names; refuses a name that is not one."""
-            finding = self._named_finding(name, identities)
-            if not isinstance(finding.state, Filed):
-                raise LedgerError(f"{finding.finding_id}: cannot mark a {held_state_name(finding.state)} finding built")
-            self._refuse_open_build_ticket(finding)
-            return finding
 
         def attempt() -> tuple[BuiltAtMerge, ...]:
+            tip = self.synced_commit()
+            if not self._is_ancestor(commit, tip):
+                raise LedgerError(f"{merge} is not on the synced branch at {tip[:7]}")
             identities = self._held_identities()
-            findings = {finding.finding_id: finding for finding in (named(name, identities) for name in names)}
+            finding_ids = sorted({self._named_finding(name, identities).finding_id for name in names})
+            read = {finding_id: self._built_at_merge_rows(finding_id) for finding_id in finding_ids}
+            for rows in read.values():
+                if not isinstance(rows.finding.state, Filed):
+                    raise LedgerError(f"{rows.finding.finding_id}: cannot mark a "
+                                      + f"{held_state_name(rows.finding.state)} finding built")
+                rows.refuse_open_build_ticket()
             built: list[BuiltAtMerge] = []
-            for finding_id, finding in sorted(findings.items()):
+            for finding_id, rows in read.items():
+                finding = rows.finding
                 # A merge older than the finding's judgment cannot hold its change.
-                judged = self.judged_commit(finding)
+                judged = self._judged_from(rows.judging)
                 if isinstance(judged, JudgedCommit) and judged.commit != commit and self._is_ancestor(commit, judged.commit):
                     raise LedgerError(f"{finding_id}: {merge} is older than {judged.commit[:7]}, where the finding was judged")
+                self._refuse_merge_without_checkpoints(finding_id, rows.linked, commit, merge)
                 check = self.applied_check(finding, commit)
                 match check:
                     case AppliedInCode():
@@ -4033,8 +4071,10 @@ class Ledger:
                         built.append(BuiltAtMerge(finding_id, commit, reading))
             with self._connection:
                 _ = self._connection.execute("BEGIN IMMEDIATE")
-                if any(self._held(finding_id) != finding for finding_id, finding in findings.items()):
-                    raise ChangedBeforeLock(f"{', '.join(sorted(findings))}: a finding changed while it was marked built; rerun")
+                if self.synced_commit() != tip or any(self._built_at_merge_rows(finding_id) != rows
+                                                      for finding_id, rows in read.items()):
+                    raise ChangedBeforeLock(f"{', '.join(finding_ids)}: a finding or its tickets changed "
+                                            + "while it was marked built; rerun")
                 now = _now()
                 for item in built:
                     by = item.reading.by if isinstance(item.reading, ReadByPerson) else ""
@@ -4061,8 +4101,31 @@ class Ledger:
     def _refuse_open_build_ticket(self, finding: HeldFinding) -> None:
         if isinstance(finding.build_ticket, BuildTicket):
             ticket = self._ticket(finding.build_ticket.ticket)
-            if ticket["state"] not in FINAL_TICKET_STATES:
-                raise LedgerError(f"{finding.finding_id}: build ticket {ticket['id']} still holds the finding")
+            _refuse_open_ticket(finding.finding_id, ticket["id"], ticket["state"])
+
+    def _linked_tickets(self, finding: HeldFinding) -> tuple[LinkedTicket, ...]:
+        """The tickets that built or hold the finding: its build ticket and each ticket whose finding ids list it."""
+        build_ticket = finding.build_ticket.ticket if isinstance(finding.build_ticket, BuildTicket) else ""
+        return tuple(cast(list[LinkedTicket], self._connection.execute(
+            "SELECT id,state,checkpoint FROM tickets "
+            + "WHERE id=? OR EXISTS(SELECT 1 FROM json_each(finding_ids) WHERE value=?) ORDER BY id",
+            (build_ticket, finding.finding_id),
+        ).fetchall()))
+
+    def _built_at_merge_rows(self, finding_id: str) -> BuiltAtMergeRows:
+        """The finding's held row, its linked tickets and its judging ticket, as they are now."""
+        finding = self._held(finding_id)
+        return BuiltAtMergeRows(finding, self._linked_tickets(finding), self._judging_ticket(finding.ticket))
+
+    def _refuse_merge_without_checkpoints(self, finding_id: str, linked: tuple[LinkedTicket, ...], commit: str,
+                                          merge: str) -> None:
+        """Refuse a merge that does not contain the checkpoint of a linked ticket of the finding.
+
+        A dropped ticket's checkpoint is not merged work, so it does not count.
+        """
+        for ticket, state, checkpoint in linked:
+            if state != "dropped" and checkpoint and not self._is_ancestor(checkpoint, commit):
+                raise LedgerError(f"{finding_id}: {merge} does not contain {ticket}'s checkpoint {checkpoint[:7]}")
 
     def named_held(self, names: Iterable[str]) -> tuple[HeldFinding, ...]:
         """The held findings that the names name, each once and in finding-id order; refuses a name that is not one."""
