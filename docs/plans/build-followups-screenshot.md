@@ -239,7 +239,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 - `commands/shot_report.md` — first run starts `hourly` once in the background, no polling; states the Mac read state and coverage
 
 **Binds later work:**
-- Mac candidates are priced from Codex transcripts and timings only, because Mac Claude transcripts are out; the first Mac catch-up takes about five scans.
+- Mac candidates are priced from Claude transcripts, Codex transcripts and timings; Mac Claude transcripts are included since the report says "Mac Claude transcripts: included" (re-rank 2026-10-26). The first Mac catch-up took about five scans.
 - The saved scan status and the report text are what a proposal cites for the Mac read state and coverage.
 - An approved proposal appends a `ProductChange` to `changes.json`; a `MeasurementChange` is listed separately and never counted as a speed gain.
 - The hourly bound stays at least 300 s above `MAC_SSH_TIMEOUT_SECONDS`; the test fails when a raised read budget leaves the job bound behind.
@@ -283,7 +283,7 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 - A declined one is recorded here with the user's reason. The next proposal goes only when natedev asks.
 - After each approved phase merges, re-rank with fresh data before proposing again.
 - Price a candidate only from its eligible weekly count. The weekly trend and the mode and crop tables combine hosts, so read the saved `episodes.jsonl` and `invocations.jsonl` in `~/.local/state/screenshot-analysis/` by name, and show each candidate's eligible weekly count and its host coverage. A candidate whose eligible count is unavailable stays unpriced, and when none can be priced the proposal says so.
-- Carry the Mac's source limits into every estimate that uses Mac data: say which Mac sources are in (Codex transcripts and timings) and which are out (Claude transcripts), and whether the Mac read is still catching up.
+- Carry the Mac's source limits into every estimate that uses Mac data: say which Mac sources are in (Claude transcripts, Codex transcripts and timings since the 2026-10-26 re-rank) and which are out, and whether the Mac read is still catching up.
 - Each approved phase appends its product change to `changes.json` with its effective time and affected hosts before the by-change table is used to assess it.
 
 **Files:**
@@ -305,6 +305,40 @@ Measured 2026-10-06/07 on the build machine, 300 s split, Sep 9 PDT to 2026-10-0
 5. Dropped: the fit-timeout text. All nine timeouts fell on 2026-10-07 and 08, and there have been none since 2026-10-08 12:48 EDT.
 
 **Deferred:** the shot tool's refusals fix (help text for `--margin` 0–0.45 and a fix hint in the "pose needs focus and radius" and "not inside a git worktree; pass --views-file" refusals) — the user, 2026-10-07: "wait a week on the screenshot refusal fix". Deferred, not declined: when G1 clears, re-rank every candidate, this one included, from a week of data and send natedev the top one. Built as Phase 10 (540c062) after the 2026-10-14 re-rank.
+
+**Re-rank 2026-10-26 (after G1):** report from the 17:10 AST scan (`scan_status.json` → `last_success` 2026-10-26T21:10:47Z). Host coverage: natedev through 17:10 AST (Claude transcripts, Codex transcripts, timings); Mac through 14:06 AST (Claude transcripts, Codex transcripts, timings). Both hosts are covered past G1 (2026-10-22 11:07:01 AST). Mac sources: all three are in, and the report says "Mac Claude transcripts: included", so the 100-file / 100 MB limit no longer keeps them out. The Mac read state is `unavailable`: the 17:10 AST read did not finish, so Mac coverage stays at its last finished read (14:06 AST). The read is not catching up; it is stopped at that time. The Mac gave 0 shot records and 0 episodes in the window (its newest saved episode is 2026-08-20), so every number below is natedev data. Window: 2026-10-19 17:10 to 2026-10-26 17:10 AST (7.00 days), command `shot_report.py report --since 2026-10-19T21:10:47Z`.
+
+Volume fell again. Shot records: 2,071 in the week before Phase 10 (2026-10-08 to 10-15 11:07 AST), 778 in the week after it, 471 in this window (427 successes, 44 failures, 0 stop-signal exits). `/hana_shot` episodes: n=47 at the 5-min split (3.40 h, median 3.8 min, p90 10.1) and n=44 at the 15-min split (median 3.9, p90 11.2). By hand: n=37 at both splits (2.52 h). Kept-shot evidence in the window is mostly inferred from images (exact ordered captures in 3 of 47 `/hana_shot` episodes); no candidate below uses kept shots.
+
+Failure pricing method: each failure costs the time to the same session's next record, counted only when the session reaches a successful shot within 15 min. This counts a run of failures once. (The 2026-10-14 method, time from each failure to the next success, counts a run once per failure; with it the window gives 36.7 min, against 149 min a week on 2026-10-14.) All 44 failures carry `error`, so every text is classified (44 classified, 0 unclassified). The week before Phase 10 has 127 failures, all without `error` (0 classified, 127 unclassified), so text categories are not compared across the measurement change. Totals only: before, 84.4 min over 120 recovered failures (42 s each); the week after (it holds Phase 10 and Phase 11), 44.0 min over 74 (36 s each); this window, 23.9 min over 36 (40 s each). The failure rate went from 6.1% to 10.3% to 9.3% of shot records. The fall in failure minutes comes from the fall in volume; the cost per failure did not change.
+
+Saving rule, as on 2026-10-14: a failure text that names its next step leaves about 10 s of recovery. Saving per failure = max(0, recovery − 10 s).
+
+Ranked by agent-minutes saved per week:
+
+1. **Next-step text for the three failures that still name none.** The window has 15 such failures (all natedev): "the camera did not settle within 5 s" (`hana_shot.py:841`), n=9 in 2 sessions, 156 s; "the target has no visible mesh bounds to crop to" (`hana_shot.py:1242`), n=4 in 1 session, 147 s; "setup X ran but Y did not appear within 5 s" (`hana_shot.py:1078`), n=2 in 2 sessions, 80 s. Cost today: 6.3 min a week. Saving: (156 − 85) + (147 − 13) + (80 − 10) = 70 + 134 + 69 s = 273 s, about 4.6 agent-minutes a week. Over the 11.25 days since Phase 10 the same three give n=46 (settle 23 in 8 sessions, crop bounds 21 in 3, setup 2) and 11.4 min a week. Constraint note: Phase 10's goal was that every failure names its next step, and these three were left out. This is not a new text for a failure Phase 10 already covers. The showrunner decides if this counts as a proposal or as a repair of Phase 10.
+2. **The parked speed plan.** 584 successful attempts in the window, total_ms median 321 ms (n=584), 6.5 min of in-tool time in all. A 30% cut saves at most 6.5 × 0.3 = 2.0 agent-minutes a week. This is per-shot time only, not episode minutes.
+3. **Not proposed again (Phase 10 texts), for the record:** rejected fits n=10 (median recovery 15 s), view-name, margin and selector refusals n=5, stale `entity:` ids n=2. Together they cost 3.3 min and could save 1.3 min a week. Rejected fits now recover in about 15 s each with the Phase 10 hint.
+4. **Hana-frame settle:** n=1 attempt (settle 774 ms). Removing the whole settle saves 0.01 min a week.
+5. **Magick crops moved to extras' rect:** n=0. All 92 rect crops in the window used extras (crop_ms 0, n=92); no attempt used magick. Saving 0.
+6. **Dropped again: the fit-timeout text.** `failure_reason: timeout` n=0 in the window; none since 2026-10-08 12:48 EDT.
+
+Unpriced (below every priced one):
+
+7. **Other BRP calls in long `/hana_shot` episodes.** The report gives them 28.8 min, 25.0% of long minutes at the 5-min split (n=12 long episodes), and 33.5 min, 23.8% at the 15-min split. That number is too high. `parsed_tool_event_category` (`scripts/shot_report/transcripts.py:45`) tests `\b(?:world\.|bevy/|hana/|brp_extras/)` before it tests file commands. Paths such as `crates/hana/src` match, so `grep` and `ls` over the Hana tree count as BRP calls. A pass over the transcripts moved those calls to file work. Long episodes, 5-min split: other BRP falls to 19.6 min (17%) and file work rises from 11.2 to 20.4 min (18%). At the 15-min split: 20.4 min (14%) and 27.0 min (19%). Agent time stays the largest category, 54–56%. The same pass names the remaining BRP time (27.3 min over all 47 episodes, 5-min split): scripted input with `sleep` (mouse moves, clicks, `hana/invoke_command`), `world.query` and `world.get_components` look-ups, and by-hand `brp_extras_screenshot` calls inside `/hana_shot` episodes. No single change has a measured effect on this time, so it stays unpriced. The regex is a defect in this unit's report and is fixed where it lives, as a measurement change. It is not a speed gain.
+8. **New: TUI screenshots in cargo-liner.** 26 by-hand episodes in the window (source `import`, natedev Claude), 1.51 h at both splits, median 2.7 min. The cargo-liner shot subagents start the TUIs in xterm through a pty relay that each agent writes again, send keys through a FIFO, then shoot with ImageMagick `import` and crop by character cell. No tool exists for this, so the report has no measured per-episode gain to apply. This week the Hana split gives none: `/hana_shot` median 3.9 min (n=35) against 3.4 min by hand (n=9). The setup before each subagent's first shot is not in the report (median about 1.5 min over 19 subagents, from transcripts). The newest episode is from the "ashots-32-final" subagent on 2026-10-25, so this work may be ending.
+9. **New: agent-written drivers that import `hana_shot` and raise its `Failure`.** n=3 in 1 session ("Chooser did not open without a device pick", `output_crowded`). They cost 13.4 min, and one 13.1 min gap is most of it. The text comes from the agent's own script, so no tool change applies.
+10. **By-hand Hana interaction shots.** 11 episodes (1.01 h): curl or MCP `brp_extras` input followed by a screenshot. `/hana_shot` shows no measured per-episode gain over them this week (see 8).
+
+**Declined, still declined:** one shot tool for any BRP app. The window has 0 by-hand episodes in a BRP app other than Hana, so about 0 minutes a week.
+
+**Not proposed again (Constraints):** failure logging, Codex scanning, kept-shot detection, long-episode attribution, scale-aware `--window`, the window-level restore, the Phase 10 failure texts, `face`, the launch warning.
+
+**Measurement notes (not candidates; never counted as speed gains):**
+- `transcripts.py:45` counts Hana source paths as BRP calls (item 7).
+- Failure invocation records carry no top-level `mode`, `target` or `view`. All 44 in the window have them empty, and only the attempt `label` names the shot. Per-mode failure pricing has to read the label.
+- This unit's re-rank session (e6ea3318) added 15 shot records and 4 `.claude` `/hana_shot` episodes (13.7 min) on 2026-10-26. They are counted like any other use.
+- The plan's Constraints still say that Mac Claude transcripts stay out above 100 files / 100 MB. The report now says they are included. Correct that text.
 
 ### Phase 7 — We know what fills a long `/hana_shot` episode, and its fix comes back priced · status: done
 
