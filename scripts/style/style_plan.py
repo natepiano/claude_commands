@@ -882,7 +882,9 @@ def gate(repo: Path, ticket_id: str) -> int:
                 base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
-                return result.returncode if result.returncode in (0, 2) else 1
+                if result.returncode != 0:
+                    return 2 if result.returncode == 2 else 1
+                return format_check(repo)
             approved = approved_ticket(ledger, ticket_id, origin)
             findings, moves, allowed = approved.findings, approved.moves, set(approved.allowed)
             # A widened path is allowed as it is; the rename and move checks below do not read it.
@@ -914,6 +916,8 @@ def gate(repo: Path, ticket_id: str) -> int:
                 for finding in unapplied:
                     print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
                 return 1
+            if format_check(repo):
+                return 1
             print("approved proposal")
             return 0
     except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun, style_footprint.CheckCouldNotRun) as error:
@@ -922,6 +926,135 @@ def gate(repo: Path, ticket_id: str) -> int:
     except ValueError as error:
         print(f"review: {error}")
         return 1
+
+
+CARGO_FMT_CHECK = ("cargo", "+nightly", "fmt", "--all", "--check", "--verbose", "--message-format", "short",
+                   "--", "--verbose")
+RUSTFMT_CHECK = ("rustfmt", "+nightly", "--check", "--files-with-diff")
+FMT_ERROR = re.compile(r"(?im)^error\b")
+
+
+@dataclass(frozen=True)
+class CargoFormat:
+    """What one `cargo +nightly fmt --all --check` run read: every file its module walk visited, and the visited files
+    it would change. All paths are resolved."""
+
+    visited: frozenset[Path]
+    listed: frozenset[Path]
+
+
+def format_check(repo: Path) -> int:
+    """Print each changed .rs file of the worktree that is not formatted, and return 1 if there is one, else 0.
+
+    `cargo +nightly fmt --all --check` judges each changed file that its module walk visits. Each other changed file
+    (an orphan, a file in no workspace package, a file under a `mod` that rustfmt skips) goes to
+    `rustfmt +nightly --check` by name with its package's edition. Both sides compare resolved paths, and a refusal
+    names each changed path and the command that judged it. The check never writes a file, and a change with no .rs
+    file runs neither command."""
+    root = repo.resolve()
+    changed: defaultdict[Path, list[str]] = defaultdict(list)
+    for path in sorted(changed_files(repo)):
+        if path.endswith(".rs") and (repo / path).is_file():
+            target = (root / path).resolve()
+            if not target.is_relative_to(root):
+                raise style_ledger.CheckCouldNotRun(f"{path} resolves to {target}, outside the repo")
+            changed[target].append(path)
+    if not changed:
+        return 0
+    cargo = cargo_format(root)
+    by_edition: defaultdict[str, list[Path]] = defaultdict(list)
+    for target in changed:
+        if target not in cargo.visited:
+            by_edition[package_edition(root, target.relative_to(root).as_posix())].append(target)
+    named = set[Path]().union(*(files_with_diff(root, edition, targets)
+                                for edition, targets in sorted(by_edition.items())))
+    judges = (("cargo +nightly fmt", cargo.listed), ("rustfmt +nightly", named))
+    refusals = sorted((path, judge) for judge, listed in judges for target in listed & changed.keys()
+                      for path in changed[target])
+    for path, judge in refusals:
+        print(f"review: not formatted ({judge}): {path}")
+    return 1 if refusals else 0
+
+
+def format_output(command: list[str], root: Path, label: str) -> tuple[int, list[str]]:
+    """The exit code and the stdout lines of a format check run in root.
+
+    Exit 0 passes whatever stderr holds (rustup info lines, config warnings). Exit 1 lists the files with a diff; an
+    error line on stderr with it, such as a parse error, is a failure to run, and so is any other exit code."""
+    try:
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise style_ledger.CheckCouldNotRun(f"{label} could not run: {error}") from error
+    error = FMT_ERROR.search(result.stderr) if result.returncode == 1 else None
+    if result.returncode not in (0, 1) or error:
+        detail = result.stderr[error.start():] if error else result.stderr
+        raise style_ledger.CheckCouldNotRun(f"{label} failed: "
+                                            + (detail.strip() or result.stdout.strip() or f"exit {result.returncode}"))
+    return result.returncode, [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def listed_files(code: int, lines: list[str], label: str) -> frozenset[Path]:
+    """The resolved files that a check run lists with a diff: each line that is an absolute .rs path. Every other line
+    (verbose notes, config file lines, timings) is not read. Exit 0 lists no file whatever stdout holds; exit 1 must
+    list one."""
+    if code == 0:
+        return frozenset()
+    listed = frozenset(Path(line).resolve() for line in lines if line.endswith(".rs") and Path(line).is_absolute())
+    if not listed:
+        raise style_ledger.CheckCouldNotRun(f"{label} failed: " + ("\n".join(lines) or f"exit {code}"))
+    return listed
+
+
+def cargo_format(root: Path) -> CargoFormat:
+    """The files that `cargo +nightly fmt --all --check` visits, from rustfmt's `Formatting <path>` lines, and the
+    files it lists with a diff."""
+    label = "cargo +nightly fmt --check"
+    code, lines = format_output(list(CARGO_FMT_CHECK), root, label)
+    visited = frozenset((root / line.removeprefix("Formatting ")).resolve()
+                        for line in lines if line.startswith("Formatting "))
+    return CargoFormat(visited, listed_files(code, lines, label))
+
+
+def files_with_diff(root: Path, edition: str, targets: list[Path]) -> frozenset[Path]:
+    """The resolved files that `rustfmt +nightly --check` lists for targets, read with edition."""
+    label = "rustfmt +nightly --check"
+    code, lines = format_output([*RUSTFMT_CHECK, "--edition", edition, *map(str, targets)], root, label)
+    return listed_files(code, lines, label)
+
+
+def package_edition(root: Path, path: str) -> str:
+    """The edition cargo gives the package that holds path: the nearest Cargo.toml with a `[package]` table, its
+    `edition`, the workspace's `[workspace.package]` edition under `edition.workspace = true`, else 2015."""
+    manifests: list[dict[str, object]] = []
+    for folder in (root / path).parents:
+        if not folder.is_relative_to(root):
+            break
+        if (folder / "Cargo.toml").is_file():
+            try:
+                manifests.append(tomllib.loads((folder / "Cargo.toml").read_text()))
+            except (UnicodeError, tomllib.TOMLDecodeError) as error:
+                raise style_ledger.CheckCouldNotRun(f"{folder / 'Cargo.toml'}: {error}") from error
+    for index, manifest in enumerate(manifests):
+        package = manifest.get("package")
+        if not isinstance(package, dict):
+            continue
+        edition = cast(dict[str, object], package).get("edition", "2015")
+        if isinstance(edition, dict) and cast(dict[str, object], edition).get("workspace") is True:
+            edition = workspace_edition(manifests[index:])
+        if isinstance(edition, str):
+            return edition
+        raise style_ledger.CheckCouldNotRun(f"{path}: its package has no edition that rustfmt can take")
+    raise style_ledger.CheckCouldNotRun(f"{path} is in no package, so rustfmt has no edition for it")
+
+
+def workspace_edition(manifests: list[dict[str, object]]) -> object:
+    """The `[workspace.package]` edition of the first manifest with a `[workspace]` table, or None."""
+    for manifest in manifests:
+        workspace = manifest.get("workspace")
+        if isinstance(workspace, dict):
+            shared = cast(dict[str, object], workspace).get("package")
+            return cast(dict[str, object], shared).get("edition") if isinstance(shared, dict) else None
+    return None
 
 
 def item_move_files(repo: Path) -> frozenset[str]:

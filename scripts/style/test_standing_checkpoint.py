@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock
 from typing import cast, final, override
 
+import fake_fmt
 import style_ledger
 import style_rules
 
@@ -55,7 +56,9 @@ class StandingCheckpointTests(unittest.TestCase):
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.catalog.parent),
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
+            fake_fmt.STATE: str(self.root / "fmt"),
         }
+        fake_fmt.install(self.bin, self.root / "fmt")
         board = self.bin / "cargo-berth"
         _ = board.write_text(
             f"#!{sys.executable}\nimport json\n"
@@ -113,6 +116,13 @@ class StandingCheckpointTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPTS / script), *args], cwd=self.unit,
                               env=self.env, capture_output=True, text=True, check=False)
 
+    def rustfmt_calls(self) -> list[str]:
+        return fake_fmt.calls(self.root / "fmt", "rustfmt")
+
+    def rustfmt_call(self, path: str) -> str:
+        """The fake rustfmt call of the format check for one changed file; the fixture packages have no edition."""
+        return f"+nightly --check --files-with-diff --edition 2015 {self.unit.resolve() / path}"
+
     def production(self, branch: str, checkout: Path) -> str:
         return "\n".join([
             "# Production", f"- **Merge branch:** {branch}", f"- **Showrunner checkout:** {checkout}",
@@ -168,6 +178,7 @@ class StandingCheckpointTests(unittest.TestCase):
         _ = source.write_text(source.read_text().replace("    1\n", "    2\n"))
         work_order = self.gate()
         self.assertEqual(work_order.returncode, 0, work_order.stdout + work_order.stderr)
+        self.assertEqual(self.rustfmt_calls(), [self.rustfmt_call(path)])
         checkpoint_gate = self.cli("style_plan.py", "gate", "--repo", ".", "--ticket", ticket["id"])
         self.assertEqual(checkpoint_gate.returncode, 0, checkpoint_gate.stdout + checkpoint_gate.stderr)
         outside = self.unit / "unexpected.rs"
@@ -190,6 +201,7 @@ class StandingCheckpointTests(unittest.TestCase):
         self.record_ticket_verdicts(ticket)
         gate = self.gate()
         self.assertEqual((gate.returncode, gate.stdout), (0, "mechanical\n"), gate.stderr)
+        self.assertEqual(self.rustfmt_calls(), [self.rustfmt_call(path)])
         # Retain the status columns while extracting the code paths to stage.
         raw = subprocess.run(["git", "-C", str(self.unit), "status", "--porcelain"], env=self.env,
                              capture_output=True, text=True, check=True).stdout
