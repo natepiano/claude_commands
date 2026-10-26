@@ -477,7 +477,7 @@ Unpriced (below every priced one):
 - The mtime test is a heuristic, not proof of what the binary holds. Only `crates/` and the root `Cargo.toml` and `Cargo.lock` are checked (the root files added at e031f5e9).
 - Tests never start Hana: the natedev Hana ban holds, so live launch is untested.
 
-### Phase 13 — The last three `/hana_shot` failures name their next step, and failures can be priced by mode · status: todo
+### Phase 13 — The last three `/hana_shot` failures name their next step, and failures can be priced by mode · status: done
 
 **Source:** the 2026-10-26 re-rank (Phase 6) found 15 failures a week with no next step. The showrunner ruled it a repair of Phase 10's promise, built with no user step, and made the two measurement fixes below current (2026-10-26).
 
