@@ -211,6 +211,29 @@ class OwnerTests(TmpSweepCase):
         self.assertFalse(unowned.exists())
         self.assertEqual(result.kept[tmp_sweep.DIRECTOR_RUNS], [str(live)])
 
+    def test_a_run_folder_a_live_sessions_marker_names_stays_with_no_director_file(self) -> None:
+        """A run no worker has dispatched in has no `director` file; its marker names it."""
+        marked = write(self.unit / "marked" / "progress_history_state.json", "{}").parent
+        _ = write(self.unit / "active" / LIVE_SESSION, f"{marked}\n")
+        ended = write(self.delegate / "ended" / "board.log").parent
+        _ = write(self.delegate / "active" / ENDED_SESSION, f"{ended}\n")
+        result = self.sweep()
+        self.assertTrue(marked.is_dir())
+        self.assertFalse(ended.exists())
+        self.assertEqual(result.kept[tmp_sweep.DIRECTOR_RUNS], [str(marked)])
+
+    def test_a_run_folder_whose_history_opens_with_a_live_session_stays(self) -> None:
+        history = self.tmp.parent / "history"
+        runs = {LIVE_SESSION: self.unit / "started", ENDED_SESSION: self.unit / "started-ended"}
+        for session, run in runs.items():
+            log = write(history / f"{run.name}.jsonl", json.dumps(
+                {"event_type": "run_started", "main_agent": {"session_id": session}}) + "\n")
+            _ = write(run / "progress_history_state.json", json.dumps({"history_file": str(log)}))
+        result = self.sweep()
+        self.assertTrue(runs[LIVE_SESSION].is_dir())
+        self.assertFalse(runs[ENDED_SESSION].exists())
+        self.assertEqual(result.kept[tmp_sweep.DIRECTOR_RUNS], [str(runs[LIVE_SESSION])])
+
     def test_a_running_sessions_folder_stays_and_only_its_large_idle_entries_go(self) -> None:
         """The size line is three 4 KiB files: an entry at it goes, one a file under it stays."""
         live = self.project / LIVE_SESSION
@@ -243,13 +266,16 @@ class OwnerTests(TmpSweepCase):
         self.unreadable_sessions()
         session = write(self.project / ENDED_SESSION / "scratchpad" / "a")
         run = write(self.unit / "run" / "director", f"{ENDED_SESSION}\n")
+        marked = write(self.unit / "marked" / "board.log")
+        _ = write(self.unit / "active" / ENDED_SESSION, f"{marked.parent}\n")
         plain = write(self.tmp / "plain" / "a")
         result = self.sweep()
         self.assertTrue(session.is_file())
         self.assertTrue(run.is_file())
+        self.assertTrue(marked.is_file())
         self.assertFalse(plain.exists())
         self.assertEqual(sorted(result.kept[tmp_sweep.NO_SESSIONS]),
-                         [str(self.project / ENDED_SESSION), str(self.unit / "run")])
+                         [str(self.project / ENDED_SESSION), str(self.unit / "marked"), str(self.unit / "run")])
 
     def test_a_project_folder_left_empty_goes(self) -> None:
         _ = write(self.project / ENDED_SESSION / "scratchpad" / "a")

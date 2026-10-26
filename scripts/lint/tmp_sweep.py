@@ -20,7 +20,10 @@ folder. It is deleted when both are true:
     (one /proc scan per run).
 
 These stay too: the roots and their active/ run-marker folders; a unit run
-folder whose `director` file names a running session; a session folder named
+folder whose own record names a running session: that session's marker in an
+active/ folder, else the folder's `director` file, else the `run_started` event
+that opens its history (unit_runs.director), so an idle run that no worker has
+dispatched in yet stays too; a session folder named
 for a running session, though an entry of SESSION_ENTRY_MIN_BYTES or more in
 its folders (scratchpad/, tasks/) is judged like any other: a live session
 keeps small files there that it only reads, and a read does not move mtime;
@@ -53,8 +56,10 @@ from typing import TYPE_CHECKING, TypedDict, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
+    from ..lib import unit_runs
     from ..message import sessions
 else:
+    import unit_runs
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
 
@@ -69,7 +74,6 @@ TMP_ROOT = "/tmp/claude"
 RUN_ROOTS = (os.path.join(TMP_ROOT, "delegate"), os.path.join(TMP_ROOT, "unit"))
 SESSION_SCRATCH_ROOT = os.path.join("/tmp", f"claude-{os.getuid()}")
 RUN_MARKERS = "active"
-DIRECTOR_FILE = "director"
 PROC_DIR = "/proc"
 DELETED_SUFFIX = " (deleted)"
 STATE_ENV = "LINT_SWEEP_STATE_DIR"
@@ -257,21 +261,30 @@ def delete_tree(path: str) -> None:
         shutil.rmtree(path)
 
 
-def director(run: str) -> str | None:
-    try:
-        with open(os.path.join(run, DIRECTOR_FILE), encoding="utf-8") as handle:
-            return handle.readline().strip() or None
-    except (OSError, UnicodeError):
-        return None
+def marked_runs(roots: Roots) -> dict[str, str]:
+    """Each run folder a run marker names, by its real path, to the marker's session. A marker
+    holds the run folder's path on its first line."""
+    marked: dict[str, str] = {}
+    for root in roots.runs:
+        for marker in listing(os.path.join(root, RUN_MARKERS)):
+            try:
+                with open(marker.path, encoding="utf-8") as handle:
+                    run = handle.readline().strip()
+            except (OSError, UnicodeError):
+                continue
+            if run:
+                marked[os.path.realpath(run)] = marker.name
+    return marked
 
 
 def when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
-def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozenset[str] | None) -> str | None:
+def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozenset[str] | None,
+                 marked: dict[str, str]) -> str | None:
     """Why an entry stays whatever its age: it is a root or run-marker folder, or a running session
-    owns it."""
+    owns it by the entry's own record."""
     if entry.path in roots.all() or (root in roots.runs and entry.name == RUN_MARKERS):
         return ROOT
     if root in roots.projects:
@@ -279,10 +292,11 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
             return NO_SESSIONS
         return SESSION_RUNS if entry.name in live else None
     if root in roots.runs and entry.is_dir(follow_symlinks=False):
-        named = director(entry.path)
-        if named is not None and live is None:
+        names = (marked.get(os.path.realpath(entry.path)), unit_runs.director(Path(entry.path)))
+        owners = {name for name in names if name}
+        if owners and live is None:
             return NO_SESSIONS
-        return DIRECTOR_RUNS if named is not None and live is not None and named in live else None
+        return DIRECTOR_RUNS if live is not None and owners & live else None
     return None
 
 
@@ -310,13 +324,14 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
         return result
     live = running_session_ids()
     inner = session_folders(roots, live)
+    marked = marked_runs(roots)
     judged = roots.all() + inner
     uses = entry_uses(paths, judged)
     since = now - IDLE_SECONDS
     for root in judged:
         emptied = False
         for entry in listing(root):
-            reason = owner_reason(entry, root, roots, live)
+            reason = owner_reason(entry, root, roots, live, marked)
             if reason is None and entry.path in uses:
                 result.keep(f"{entry.path}: {uses[entry.path]}", IN_USE)
                 continue
