@@ -502,9 +502,11 @@ def record_changes(request: MergeRequest, commits: list[change_review.Commit], m
     merged = good(git(request.production.checkout, "rev-parse", f"--short={change_review.SHORT}", merge_head), "push")
     try:
         rows = change_review.append_rows(doc, change_review.visible(commits),
-                                         datetime.now(request.production.zone).date(), merged, request.production.doc)
+                                         datetime.now(request.production.zone).date(), merged, request.production.doc,
+                                         owners=change_review.visible_owners(commits, request.production.doc))
         drifted = change_review.drift(request.production.checkout, request.production.merge_branch,
-                                      change_review.read(doc), change_review.LANDED)
+                                      change_review.read(doc), change_review.LANDED,
+                                      change_review.foreign_units(request.production.doc))
     except (change_review.ChangeReviewError, OSError) as error:
         report("change review", "failed", f"{doc} not written: {error}; add its rows by hand")
         return

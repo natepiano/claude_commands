@@ -24,7 +24,8 @@ from typing import NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.direct import phase_reservation, plan_history  # noqa: E402
+from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
+from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.lib import agents_registry, unit_runs  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
@@ -61,11 +62,6 @@ CALIBRATION_WINDOW = 10
 # marker is presentation-only: it opens no pass, and `findings.py` counts pass
 # events, so convergence never sees it.
 ARMED_REVIEW_KEY = "early_review"
-# A phase stays open until its own finish-phase, however many phases start after
-# it: a unit can run Phase 18 while Phase 6's workers are still working. State
-# holds the most recently started open phase under `phase`, which every reader
-# that needs "the open phase" uses, and the older open ones here, oldest first.
-OPEN_PHASES_KEY = "open_phases"
 # A phase closed by finish-phase takes no more passes, its plan review's included.
 CLOSED_PHASE_RULE = ("A finished phase takes no more passes: run its plan review before its finish-phase "
                      + "(docs/direct/phase_end.md, step 3 before step 5).")
@@ -1006,14 +1002,6 @@ def _open_phase_named(state: dict[str, object], phase_id: str) -> dict[str, obje
     return None
 
 
-def _open_phase_ids(state: dict[str, object]) -> list[str]:
-    current = _object_dict(state.get("phase"))
-    ids = [_string(phase.get("id")) for phase in _parked_phases(state)]
-    if current is not None and _string(current.get("status")) == "active":
-        ids.append(_string(current.get("id")))
-    return ids
-
-
 def _optional_arg(args: argparse.Namespace, name: str) -> str:
     """An option callers added after the recorder's own internal calls were written."""
     value: object = getattr(args, name, "")
@@ -1401,7 +1389,7 @@ def _start_pass(args: argparse.Namespace) -> None:
     phase_id = _optional_arg(args, "phase_id")
     phase = _open_phase_named(state, phase_id) if phase_id else _object_dict(state.get("phase"))
     if phase_id and phase is None:
-        open_ids = ", ".join(_open_phase_ids(state)) or "none"
+        open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
         raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}. {CLOSED_PHASE_RULE}")
     if phase is None or _string(phase.get("status")) != "active":
         raise SystemExit("Start a phase before starting a pass")
@@ -4559,7 +4547,7 @@ def _finish_phase(args: argparse.Namespace) -> None:
     if phase_id:
         phase = _open_phase_named(state, phase_id)
         if phase is None:
-            open_ids = ", ".join(_open_phase_ids(state)) or "none"
+            open_ids = ", ".join(recorder_state.open_phase_ids(state)) or "none"
             raise SystemExit(f"Phase {phase_id} is not open; open phases: {open_ids}")
     elif current is not None and current_open:
         phase = current
@@ -4619,7 +4607,7 @@ def _finish_run(args: argparse.Namespace) -> None:
     run_status = _arg_string(args, "status")
     # Every open phase, newest first: closing the current one makes the next
     # older one current.
-    while _open_phase_ids(state):
+    while recorder_state.open_phase_ids(state):
         finish_args = argparse.Namespace(session_dir=str(session_dir), status=run_status)
         _finish_phase(finish_args)
         state = _read_state(session_dir)

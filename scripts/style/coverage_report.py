@@ -166,7 +166,8 @@ def workspace(ledger: style_ledger.Ledger, tip: str) -> tuple[rules.WorkspaceMem
 
 def ticket_line(ticket: style_ledger.TicketRecord) -> str:
     at = datetime.fromisoformat(ticket["created_at"]).astimezone(user_zone())
-    return f"{ticket['id']} · {ticket['state']} · {ticket['unit']} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
+    line = f"{ticket['id']} · {ticket['state']} · {ticket['unit']} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
+    return "\n".join([line, *(style_ledger.widened_line(widened) for widened in ticket["widened"])])
 
 
 def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") -> str:

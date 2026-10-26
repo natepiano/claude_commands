@@ -13,7 +13,9 @@ alone.
 
 Seats persist across phases and the mesh knows no phase, so each edited path goes to the open
 phase that owns it (`phase_reservation.attribute`): the only open phase, else the one whose
-`files` list covers it. A path no single open phase owns refuses the edit.
+`files` list covers it. A path no single open phase owns refuses the edit. A recorder-open phase
+with no state file and no berth mapping of its own was never enrolled (FinalGate's `final`) and owns
+nothing; an unreadable recorder state leaves the phases whose directories hold a state file.
 
 For a seat it runs `cargo-berth check <paths> --json` from the repository root once per owning
 phase, as that phase's berth session `<director session id>.phase-<phase>`, so two open phases
@@ -102,12 +104,21 @@ def decide(raw: str) -> int:
     scopes = phase_reservation.repository_paths(root, Path(cwd), paths) if root is not None else []
     if root is None or not scopes:
         return 0
-    phases = phase_reservation.open_phases(session_dir)
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    try:
+        phases = phase_reservation.open_phases(session_dir)
+    except ValueError:
+        # An unreadable recorder state gives no recorder list; check as before the recorder listed phases.
+        phases = phase_reservation.held_phases(session_dir)
+    phases = phase_reservation.enrolled_phases(phases, root, session_id)
+    missing = phase_reservation.missing_record_phases(phases, scopes)
+    if missing:
+        commands = "; ".join(phase_reservation.repair_command(session_dir, phase.phase, root) for phase in missing)
+        return _refuse(f"phase reservation record missing; restore it from berth's ledger: {commands}.")
     attribution = phase_reservation.attribute(phases, scopes) if phases else None
     if attribution is not None and attribution.refused:
         return _refuse(phase_reservation.refusal_reason(phases, attribution.refused))
     groups = list(attribution.by_phase.items()) if attribution is not None else [(None, scopes)]
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for phase, phase_scopes in groups:
         berth_session = phase_reservation.phase_session_id(session_id, phase.phase) if phase else session_id
         answer = phase_reservation.check(root, phase_scopes, berth_session)

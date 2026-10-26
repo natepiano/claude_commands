@@ -24,8 +24,6 @@ import style_footprint
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
 # The keywords that declare an item directly in a module, trait or impl body.
 ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})
-# The words after which an item keyword can stand, besides an attribute, a `pub(..)` and an `extern` ABI string.
-ITEM_LEADS = frozenset({"{", "}", ";", "pub", "unsafe", "async", "const", "extern", "default"})
 # The macros that make an item name from other tokens or bring in items from another file.
 NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 # A relative Rust file path: folders of name characters, then a file whose stem can be a module name.
@@ -63,13 +61,6 @@ NEGATED_NOUN = re.compile(rf"\s*{NO_LEAD}(?:\s+[\w-]+){{0,3}}\s*", re.IGNORECASE
 NOUN_MOVE_END = re.compile(r"\s+(?:is|are|was|were)\b", re.IGNORECASE)
 # The file stems that are their folder's module or a crate root, not a module of their own name.
 ROOT_STEMS = frozenset({"mod", "lib", "main"})
-# The Rust keywords, strict and reserved in any edition: a module with one of these names needs `r#`.
-RUST_KEYWORDS = frozenset({
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
-    "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
-    "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract", "become",
-    "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
-})
 
 
 @dataclass(frozen=True)
@@ -217,7 +208,7 @@ def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
     named_old, named_new = PurePosixPath(match[1]), PurePosixPath(match[2])
     stems = {named_old.stem, named_new.stem}
     if ((path != match[1] and not path.endswith("/" + match[1])) or named_old.parent != named_new.parent
-            or len(stems) == 1 or stems & ROOT_STEMS or stems & RUST_KEYWORDS):
+            or len(stems) == 1 or stems & ROOT_STEMS or stems & style_footprint.RUST_KEYWORDS):
         return NoFileRename()
     return FileRename(path, path.removesuffix(match[1]) + match[2])
 
@@ -279,17 +270,6 @@ def type_path(words: tuple[str, ...]) -> tuple[str, ...]:
     readable = len(path) % 2 == 1 and all(
         word == "::" if i % 2 else style_footprint.IDENTIFIER.fullmatch(word) is not None for i, word in enumerate(path))
     return path[::2] if readable else ()
-
-
-def item_starts(words: tuple[str, ...]) -> frozenset[int]:
-    """The word indexes where an item keyword can stand: the first word, and the word after a brace, a semicolon, an
-    attribute, a visibility, an item qualifier or an ABI string."""
-    leads = {index for index, word in enumerate(words) if word in ITEM_LEADS and words[index - 1:index] != ("'",)}
-    leads.update(end - 1 for _, end in style_footprint.attribute_spans(words))
-    leads.update(style_footprint.closing(words, index + 1) for index, word in enumerate(words[:-1])
-                 if word == "pub" and words[index + 1] == "(")
-    leads.update(index for index in range(1, len(words)) if words[index - 1] == "extern" and words[index].startswith('"'))
-    return frozenset({0} | {lead + 1 for lead in leads})
 
 
 def inline_modules(words: tuple[str, ...], starts: frozenset[int]) -> tuple[InlineModule, ...]:
@@ -362,7 +342,7 @@ def std_derives_only(attributes: tuple[str, ...]) -> bool:
 def declaration_sites(words: tuple[str, ...], path: str, rename: ApprovedRename, name: str) -> Declarations | UncertainScan:
     """Where the file at path declares name directly under the rename's parent."""
     parent = rename.parent
-    starts = item_starts(words)
+    starts = style_footprint.item_starts(words)
     modules = inline_modules(words, starts)
     declared = tuple(index for index, word in enumerate(words[:-1])
                      if word in PARENT_KEYWORDS and index in starts and words[index + 1] == parent

@@ -70,10 +70,10 @@ def proposer(issue: Issue) -> str:
     return found["production"].strip() if found else named
 
 
-def open_proposals(doc: Path) -> list[Issue]:
-    """The open proposal issues in the production's folder that are its own."""
+def open_proposals(doc: Path, names: frozenset[str] | None = None) -> list[Issue]:
+    """The open proposal issues in the production's folder that are its own, or that `names` own."""
     folder = issues_folder(doc)
     if folder is None or not folder.is_dir():
         return []
-    names = owners(doc)
+    names = owners(doc) if names is None else names
     return [issue for issue in open_issues(folder, PROPOSAL_TAG) if proposer(issue) in names]

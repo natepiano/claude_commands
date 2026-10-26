@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -28,6 +29,8 @@ import proposal_issue
 from issues import frontmatter
 
 import berth_board
+import fake_fmt
+import mechanical_classes
 import rules
 import style_ledger
 import style_rules
@@ -47,6 +50,9 @@ class StylePlanTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # The shipped class list, checked against the real catalog before the test catalog takes its place.
+        listed = mechanical_classes.classes()
+        _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
@@ -55,10 +61,13 @@ class StylePlanTests(unittest.TestCase):
         self.rule_dir = self.root / "nate_style/rust"
         self.repo.mkdir()
         self.rule_dir.mkdir(parents=True)
+        fake_fmt.install(self.root / "bin", self.root / "fmt")
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "STYLE_HISTORY_NATE_STYLE_DIR": str(self.rule_dir.parent),
+            fake_fmt.STATE: str(self.root / "fmt"),
+            "PATH": str(self.root / "bin") + os.pathsep + os.environ.get("PATH", ""),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", self.rule_dir.parent))
         _ = self.git("init", "-q", "--initial-branch=main")
@@ -66,7 +75,8 @@ class StylePlanTests(unittest.TestCase):
         _ = self.git("config", "user.email", "planner@example.invalid")
         self.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\n')
         for crate in ("alpha", "beta"):
-            self.write(f"crates/{crate}/Cargo.toml", f'[package]\nname = "{crate}"\nversion = "0.1.0"\n')
+            self.write(f"crates/{crate}/Cargo.toml",
+                       f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n')
         for path in self.sources:
             self.write(path, "pub fn value() {}\n")
         self.tip = self.commit()
@@ -882,6 +892,23 @@ class StylePlanTests(unittest.TestCase):
                                  "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertTrue(result.stdout.startswith("error: "), result.stdout)
+
+    def test_coverage_gate_refuses_an_unformatted_changed_file(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.tip)
+        path = self.sources[0]
+        ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha",
+                          [path], [rule], cells=((rule, path),))
+        ledger.ticket_assign("modules-unit-1", "demo-style-names")
+        _ = ledger.ticket_base("modules-unit-1")
+        self.record(rule, path, self.tip, "modules-unit-1")
+        _ = (self.unit / path).write_text("pub fn value()  {}\n")
+        self.unformatted(path)
+        result = subprocess.run([sys.executable, str(Path(style_plan.__file__)), "gate", "--repo", str(self.unit),
+                                 "--ticket", "modules-unit-1"], capture_output=True, text=True, check=False)
+        self.assertEqual((result.returncode, result.stdout, result.stderr),
+                         (1, f"mechanical\nreview: not formatted (rustfmt +nightly): {path}\n", ""))
 
     def test_structure_batches_cover_pending_files_once_keep_directories_and_isolate_large_files(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -2057,10 +2084,34 @@ class StylePlanTests(unittest.TestCase):
         text = plan.read_text()
         self.assertIn("uncovered: Read the crate layout.", text)
         self.assertIn('"line": 1', text)
-        self.assertIn("Every structure finding is held", text)
+        self.assertIn("Every structure finding is held as a proposal, except a finding of a mechanical class below.",
+                      text)
+        self.assertIn("Apply a finding of a mechanical class without asking only when", text)
+        self.assertIn("- `pure-move` (`module-structure`, `types-live-with-their-behavior`, "
+                      + "`split-by-type-ownership`): A pure move takes one item", text)
+        self.assertIn("- `stale-allow-lint` (`test-module-allow-boilerplate`): A stale lint removal", text)
         self.assertNotIn("#uncovered`", text)
         pin = self.ledger().pinned_rule_texts(ticket["id"])[0]
         self.assertIn(str(plan.parent.parent / "rules" / (pin.blob + ".md")), text)
+
+    def test_a_third_listed_class_changes_the_unit_text_with_no_other_edit(self) -> None:
+        listed = self.root / "mechanical_classes.toml"
+        extra = ('\n[[class]]\nname = "third-class"\nproof = "lint_removal"\nrules = ["third-rule"]\n'
+                 + 'summary = "A third change takes out one word."\n')
+        _ = listed.write_text(mechanical_classes.CLASSES.read_text() + extra)
+        catalog = frozenset(rule for entry in mechanical_classes.classes() for rule in entry.rules) | {"third-rule"}
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        with mock.patch.object(mechanical_classes, "classes", return_value=mechanical_classes.load(listed, catalog)):
+            self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+        text = plan.read_text()
+        self.assertIn("- `pure-move` (", text)
+        self.assertIn("- `third-class` (`third-rule`): A third change takes out one word.", text)
 
     def test_only_structure_phases_require_each_file_and_every_distinct_defect(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -3277,7 +3328,7 @@ class StylePlanTests(unittest.TestCase):
             self.assertNotIn("overrides the mechanical-only invariant", first)
             self.assertIn("Apply the approved findings.", first)
             self.assertNotIn("Apply only mechanical fixes", first)
-            self.assertNotIn("Every structure finding is held", first)
+            self.assertNotIn("Every structure finding is held as a proposal", first)
             self.assertIn("style_plan.py gate --repo . --ticket names-unit-1", first)
             _ = self.plan.write_text(self.plan_header())
             result = self.run_next()
@@ -3288,9 +3339,9 @@ class StylePlanTests(unittest.TestCase):
 
     def approved_reference_ticket(
         self, pairs: tuple[tuple[str, str], ...] = (("Outcome::OldName", "Outcome::NewName"),),
-        kinds: tuple[style_ledger.FindingKind, ...] = ("rename",),
+        kinds: tuple[style_ledger.FindingKind, ...] = ("rename",), rule_name: str = "approved-reference",
     ) -> str:
-        rule = self.rule("approved-reference")
+        rule = self.rule(rule_name)
         issue = self.root / "reference-approval.md"
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
@@ -3328,6 +3379,16 @@ class StylePlanTests(unittest.TestCase):
         with redirect_stdout(output):
             result = style_plan.gate(self.repo, ticket)
         return result, output.getvalue()
+
+    def fake_fmt(self, stdout: str = "", stderr: str = "", code: int = 0) -> None:
+        for name, text in (("stdout", stdout), ("stderr", stderr), ("exit", str(code))):
+            _ = (self.root / "fmt/rustfmt" / name).write_text(text)
+
+    def unformatted(self, *paths: str) -> None:
+        self.fake_fmt("".join("{cwd}/" + path + "\n" for path in paths), code=1)
+
+    def rustfmt_calls(self) -> list[str]:
+        return fake_fmt.calls(self.root / "fmt", "rustfmt")
 
     LEDGER_MOD = ("mod handle;\nmod lock;\nmod map;\n\npub use lock::{LockError, MutationLock};\n\n"
                   + "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n"
@@ -3401,10 +3462,10 @@ class StylePlanTests(unittest.TestCase):
                 _ = handle.write_text(renamed)
 
     def test_canonical_code_drops_a_trailing_comma_only_where_it_does_not_change_the_code(self) -> None:
-        def words(text: str) -> tuple[style_plan.CodePiece, ...]:
+        def words(text: str) -> tuple[style_footprint.CodePiece, ...]:
             spans = style_footprint.token_spans(text)
-            return style_plan.canonical_code(tuple(span.token.value for span in spans),
-                                             style_plan.comment_gaps(text, spans, lambda line: line))
+            return style_footprint.canonical_code(tuple(span.token.value for span in spans),
+                                                  style_footprint.comment_gaps(text, spans, lambda line: line))
         # A one-entry tuple is not the grouped expression, even when its entry holds commas.
         self.assertNotEqual(words("let f = (|a: u8, b: u8| a + b,);"), words("let f = (|a: u8, b: u8| a + b);"))
         self.assertNotEqual(words("let m = (HashMap::<u8, u8>::new(),);"), words("let m = (HashMap::<u8, u8>::new());"))
@@ -3797,6 +3858,17 @@ class StylePlanTests(unittest.TestCase):
                     + "Change nothing else in those files.")
         self.assertIn("Apply the approved findings. " + sentence, self.plan.read_text())
 
+    def test_a_proposal_phase_lists_each_widened_path_under_its_files(self) -> None:
+        ticket = self.approved_reference_ticket()
+        extra = "crates/alpha/src/extra.rs"
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", extra,
+                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
+        self.write_approved_phase()
+        at = self.ledger().ticket_open("names-unit")[0]["widened"][0]["widened_at"]
+        self.assertIn(f"**Files:**\n- `{self.sources[0]}`\n"
+                      + f"- widened: {extra} — the move needs a new file (showrunner, {at})\n", self.plan.read_text())
+
     def test_a_proposal_phase_names_each_qualified_pair_and_keeps_a_bare_rename_in_its_own_file(self) -> None:
         _ = self.approved_reference_ticket((("Outcome::OldName", "Outcome::NewName"), ("helper", "assistant")))
         self.write_approved_phase()
@@ -3976,6 +4048,257 @@ class StylePlanTests(unittest.TestCase):
                 self.assertEqual(result, 1, output)
                 self.assertIn("files outside approved findings:", output)
                 self.assertIn(self.sources[1] + " (change is not an approved rename reference)", output)
+
+    def test_approved_proposal_gate_allows_the_files_of_a_pure_move_and_only_them(self) -> None:
+        ticket = self.approved_reference_ticket(rule_name="module-structure")
+        lib, other, extra = self.sources[2], self.sources[3], "crates/beta/src/extra.rs"
+        limit = "/// The most rows.\npub(crate) const LIMIT: usize = 4;\n"
+        text = "\npub fn text() -> &'static str { stringify!(a+b) }\n"
+        self.write(lib, "mod extra;\nmod other;\n\npub fn value() -> usize { crate::other::LIMIT }\n" + text)
+        self.write(other, limit + "\npub(crate) fn read() -> usize { 1 }\n")
+        self.write(extra, "pub(crate) fn more() -> usize { 2 }\n")
+        _ = self.commit()
+        moved = "mod constants;\nmod extra;\nmod other;\n\npub fn value() -> usize { crate::constants::LIMIT }\n" + text
+        self.write(lib, moved)
+        self.write(other, "pub(crate) fn read() -> usize { 1 }\n")
+        self.write("crates/beta/src/constants.rs", limit)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        constants = "crates/beta/src/constants.rs"
+        # The proof reads code without its spacing, and judge also reads the spacing inside a macro.
+        for path, edit, refused in ((lib, moved.replace("LIMIT }", "LIMIT + 1 }"), (lib, other, constants)),
+                                    (lib, moved.replace("a+b", "a + b"), (lib, other, constants)),
+                                    (extra, "pub(crate) fn more() -> usize {  2 }\n", (extra,))):
+            with self.subTest(edit=edit):
+                self.write(path, edit)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn("files outside approved findings:", output)
+                for name in (lib, other, constants, extra):
+                    self.assertEqual(name + " (change" in output, name in refused, output)
+                self.write(lib, moved)
+                self.write(extra, "pub(crate) fn more() -> usize { 2 }\n")
+
+    def test_approved_proposal_gate_allows_a_stale_lint_removal_and_holds_an_added_allow_or_code(self) -> None:
+        ticket = self.approved_reference_ticket(rule_name="test-module-allow-boilerplate")
+        other = self.sources[3]
+        tests = "#[cfg(test)]\n#[allow(clippy::panic, clippy::unwrap_used)]\nmod tests {\n    fn example() {}\n}\n"
+        self.write(other, "pub fn read() -> usize { 1 }\n\n" + tests)
+        _ = self.commit()
+        removed = "pub fn read() -> usize { 1 }\n\n" + tests.replace("clippy::panic, ", "")
+        self.write(other, removed)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for edit in (removed.replace("clippy::unwrap_used", "clippy::unwrap_used, clippy::expect_used"),
+                     removed.replace("#[cfg(test)]", "#[allow(dead_code)]\n#[cfg(test)]"),
+                     removed.replace("{ 1 }", "{ 2 }")):
+            with self.subTest(edit=edit):
+                self.write(other, edit)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"files outside approved findings: {other} (change", output)
+
+    def test_approved_proposal_gate_refuses_a_lint_removal_for_a_ticket_of_another_class(self) -> None:
+        ticket = self.approved_reference_ticket(rule_name="module-structure")
+        tests = "#[cfg(test)]\n#[allow(clippy::panic, clippy::unwrap_used)]\nmod tests {\n    fn example() {}\n}\n"
+        self.write(self.sources[3], "pub fn read() -> usize { 1 }\n\n" + tests)
+        _ = self.commit()
+        self.write(self.sources[3], "pub fn read() -> usize { 1 }\n\n" + tests.replace("clippy::panic, ", ""))
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(f"files outside approved findings: {self.sources[3]} (change", output)
+
+    def test_approved_proposal_gate_reports_a_refused_class_list_as_exit_two(self) -> None:
+        ticket = self.approved_reference_ticket()
+        self.write(self.sources[3], "pub fn moved() -> usize { 1 }\n")
+        refused = mechanical_classes.ClassListError("class pure-move names the unknown proof copy")
+        with mock.patch.object(mechanical_classes, "classes", side_effect=refused):
+            self.assertEqual(self.reference_gate(ticket), (2, "error: class pure-move names the unknown proof copy\n"))
+
+    def test_approved_proposal_gate_allows_a_widened_file_and_only_it(self) -> None:
+        ticket = self.approved_reference_ticket()
+        outside, other = self.sources[3], self.sources[2]
+        self.write(outside, "pub fn moved() -> usize { 1 }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        refusal = "files outside approved findings: {} (change is not an approved rename reference)"
+        self.assertIn(refusal.format(outside), output)
+        widened = io.StringIO()
+        with redirect_stdout(widened):
+            self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", outside,
+                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
+        line = widened.getvalue()
+        self.assertTrue(line.startswith(f"widened: {outside} — the move needs a new file (showrunner, ")
+                        and line.endswith(")\n") and line.count("\n") == 1, line)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        self.write(other, "pub fn other() -> usize { 2 }\n")
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(refusal.format(other) + "\n", output)
+        self.assertNotIn(outside, output)
+
+    def test_approved_proposal_gate_refuses_an_unformatted_changed_file_and_only_checks(self) -> None:
+        ticket = self.approved_reference_ticket()
+        self.unformatted(self.sources[0])
+        self.assertEqual(self.reference_gate(ticket),
+                         (1, f"review: not formatted (rustfmt +nightly): {self.sources[0]}\n"))
+        self.assertEqual(self.rustfmt_calls(),
+                         [f"+nightly --check --files-with-diff --edition 2021 {self.repo.resolve() / self.sources[0]}"])
+
+    def test_approved_proposal_gate_names_each_unformatted_changed_file_sorted(self) -> None:
+        ticket = self.approved_reference_ticket()
+        widened = self.sources[3]
+        self.write(widened, "pub fn moved() -> usize { 1 }\n")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", widened,
+                                              "--reason", "the move needs a new file", "--by", "showrunner"]), 0)
+        self.unformatted(widened, self.sources[0])
+        self.assertEqual(self.reference_gate(ticket), (1, "".join(
+            f"review: not formatted (rustfmt +nightly): {path}\n" for path in (self.sources[0], widened))))
+
+    def test_approved_proposal_gate_passes_an_unformatted_unchanged_file(self) -> None:
+        ticket = self.approved_reference_ticket()
+        self.unformatted(self.sources[2])
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        self.assertEqual(len(self.rustfmt_calls()), 1)
+
+    def test_approved_proposal_gate_runs_no_rustfmt_without_a_changed_rust_file(self) -> None:
+        ticket = self.approved_reference_ticket()
+        _ = self.commit()
+        self.fake_fmt(stderr="error: rustfmt ran\n", code=1)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        self.assertEqual(self.rustfmt_calls(), [])
+
+    def test_format_check_names_every_changed_rust_file_with_the_edition_of_its_package(self) -> None:
+        self.write("Cargo.toml", '[workspace]\nmembers = ["crates/alpha", "crates/beta"]\n'
+                   + '[workspace.package]\nedition = "2024"\n')
+        self.write("crates/beta/Cargo.toml", '[package]\nname = "beta"\nversion = "0.1.0"\nedition.workspace = true\n')
+        self.write("crates/gamma/Cargo.toml", '[package]\nname = "gamma"\nversion = "0.1.0"\n')
+        self.write("crates/gamma/src/lib.rs", "pub fn gamma() {}\n")
+        _ = self.commit()
+        # No module tree reaches the orphan, the example or the build script; a deleted file is not named.
+        changed = ("crates/alpha/src/orphan.rs", "crates/beta/build.rs", "crates/beta/examples/demo.rs",
+                   self.sources[2], "crates/gamma/src/lib.rs")
+        for path in changed:
+            self.write(path, "fn  changed() {}\n")
+        self.write("docs/notes.md", "Not Rust.\n")
+        (self.repo / self.sources[1]).unlink()
+        self.assertEqual(style_plan.format_check(self.repo), 0)
+        root = self.repo.resolve()
+        files = {edition: " ".join(str(root / path) for path in changed if path.startswith(crate))
+                 for edition, crate in (("2015", "crates/gamma"), ("2021", "crates/alpha"), ("2024", "crates/beta"))}
+        self.assertEqual(self.rustfmt_calls(), [f"+nightly --check --files-with-diff --edition {edition} {names}"
+                                                for edition, names in files.items()])
+
+    def test_format_check_refuses_a_changed_file_with_no_edition_as_a_failure_to_run(self) -> None:
+        for path, manifest, message in (
+                ("tools/loose.rs", "", "tools/loose.rs is in no package, so rustfmt has no edition for it"),
+                (self.sources[2], '[package]\nname = "beta"\nedition.workspace = true\n',
+                 f"{self.sources[2]}: its package has no edition that rustfmt can take"),
+                (self.sources[2], '[package\n', "Cargo.toml: ")):
+            with self.subTest(message=message):
+                _ = self.git("checkout", "--", ".")
+                _ = self.git("clean", "-fdq", "--", "crates", "tools")
+                if manifest:
+                    self.write("crates/beta/Cargo.toml", manifest)
+                self.write(path, "fn changed() {}\n")
+                with self.assertRaisesRegex(style_ledger.CheckCouldNotRun, re.escape(message)):
+                    _ = style_plan.format_check(self.repo)
+        self.assertEqual(self.rustfmt_calls(), [])
+
+    def test_approved_proposal_gate_reads_rustfmt_by_exit_code_and_stdout_and_not_by_notes_on_stderr(self) -> None:
+        ticket = self.approved_reference_ticket()
+        notes = ("info: syncing channel updates for 'nightly-x86_64-unknown-linux-gnu'\n"
+                 + 'Warning: the `version` option is deprecated. Use `style_edition="2024"` instead.\n')
+        self.fake_fmt(stderr=notes)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        self.fake_fmt("{cwd}/" + self.sources[0] + "\n", notes, 1)
+        self.assertEqual(self.reference_gate(ticket),
+                         (1, f"review: not formatted (rustfmt +nightly): {self.sources[0]}\n"))
+
+    def test_approved_proposal_gate_reports_a_failed_format_check_as_exit_two(self) -> None:
+        ticket = self.approved_reference_ticket()
+        failed = "error: rustfmt +nightly --check failed: "
+        for stdout, stderr, code, message in (
+                ("", "error: this file contains an unclosed delimiter\n", 1,
+                 failed + "error: this file contains an unclosed delimiter"),
+                # A parse error in one file still lists the other unformatted files.
+                ("{cwd}/" + self.sources[0] + "\n", "Warning: deprecated\nerror: expected item\n", 1,
+                 failed + "error: expected item"),
+                ("", "Error: file `x.rs` does not exist\n", 1, failed + "Error: file `x.rs` does not exist"),
+                ("", "thread 'main' panicked\n", 101, failed + "thread 'main' panicked"),
+                ("", "", 1, failed + "exit 1"),
+                ("Usage: rustfmt\n", "", 1, failed + "Usage: rustfmt")):
+            with self.subTest(message=message):
+                self.fake_fmt(stdout, stderr, code)
+                self.assertEqual(self.reference_gate(ticket), (2, message + "\n"))
+        git = self.root / "git-only/git"
+        git.parent.mkdir()
+        git.symlink_to(cast(str, shutil.which("git")))
+        with mock.patch.dict(os.environ, {"PATH": str(git.parent)}):
+            self.assertEqual(self.reference_gate(ticket), (2, "error: cargo +nightly fmt --check could not run: "
+                                                              + "[Errno 2] No such file or directory: 'cargo'\n"))
+
+    def fake_cargo(self, stdout: str, code: int = 0) -> None:
+        for name, text in (("stdout", stdout), ("exit", str(code))):
+            _ = (self.root / "fmt/cargo" / name).write_text(text)
+
+    # The verbose lines of a real `cargo +nightly fmt --check` run around rustfmt's `Formatting` lines and diff paths.
+    CARGO_NOTES = ('[lib (2021)] "{cwd}/crates/alpha/src/lib.rs"\n'
+                   + "rustfmt --edition 2021 --verbose --check -l {cwd}/crates/alpha/src/lib.rs\n"
+                   + "Using rustfmt config file {cwd}/rustfmt.toml for {cwd}/crates/alpha/src/lib.rs\n")
+
+    def test_format_check_takes_the_cargo_verdict_for_visited_files_and_rustfmt_for_every_other_file(self) -> None:
+        lib, other, orphan = self.sources[0], self.sources[1], "crates/alpha/src/orphan.rs"
+        skipped = ("crates/alpha/src/kept/mod.rs", "crates/alpha/src/skipped.rs", "crates/alpha/src/skipped/deep.rs")
+        self.write(lib, "#[rustfmt::skip]\nmod skipped;\n#[cfg_attr(rustfmt, rustfmt_skip)]\nmod kept;\n"
+                   + "#[rustfmt::skip]\nmod orphan {}\nmod other;\n")
+        _ = self.commit()
+        for path in (other, orphan, *skipped):
+            self.write(path, "fn  changed() {}\n")
+        # cargo visits lib and other and refuses other. It skips the skipped modules and never reaches the orphan, which
+        # an inline module of the same name does not declare, so rustfmt checks all four by name.
+        self.fake_cargo(self.CARGO_NOTES + f"Formatting {{cwd}}/{lib}\nFormatting {{cwd}}/{other}\n{{cwd}}/{other}\n"
+                        + "Spent 0.001 secs\n", 1)
+        self.unformatted(orphan, skipped[1])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_plan.format_check(self.repo), 1)
+        self.assertEqual(output.getvalue(), f"review: not formatted (rustfmt +nightly): {orphan}\n"
+                                            + f"review: not formatted (cargo +nightly fmt): {other}\n"
+                                            + f"review: not formatted (rustfmt +nightly): {skipped[1]}\n")
+        root = self.repo.resolve()
+        self.assertEqual(fake_fmt.calls(self.root / "fmt", "cargo"), [" ".join(style_plan.CARGO_FMT_CHECK[1:])])
+        names = " ".join(str(root / path) for path in (skipped[0], orphan, *skipped[1:]))
+        self.assertEqual(self.rustfmt_calls(), [f"+nightly --check --files-with-diff --edition 2021 {names}"])
+
+    def test_format_check_reads_only_visited_and_listed_lines_and_judges_the_rest_by_exit_code(self) -> None:
+        other = self.sources[1]
+        self.write(other, "fn changed() {}\n")
+        visit = f"Formatting {{cwd}}/{other}\nA line rustfmt may add one day for {{cwd}}/{other}\nSpent 0.001 secs\n"
+        self.fake_cargo(self.CARGO_NOTES + visit)
+        self.assertEqual(style_plan.format_check(self.repo), 0)
+        self.assertEqual(self.rustfmt_calls(), [])
+        self.fake_cargo(self.CARGO_NOTES + visit, 1)
+        message = "cargo +nightly fmt --check failed: [lib (2021)]"
+        with self.assertRaisesRegex(style_ledger.CheckCouldNotRun, re.escape(message)):
+            _ = style_plan.format_check(self.repo)
+        self.assertEqual(self.rustfmt_calls(), [])
+
+    def test_format_check_refuses_a_changed_symlink_by_its_own_path(self) -> None:
+        spare, alias = "crates/alpha/src/spare.rs", "crates/alpha/src/alias.rs"
+        self.write(spare, "fn  spare() {}\n")
+        _ = self.commit()
+        (self.repo / alias).symlink_to("spare.rs")
+        self.fake_cargo(f"Formatting {{cwd}}/{spare}\n{{cwd}}/{spare}\n", 1)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(style_plan.format_check(self.repo), 1)
+        self.assertEqual(output.getvalue(), f"review: not formatted (cargo +nightly fmt): {alias}\n")
+        outside = self.root / "outside.rs"
+        _ = outside.write_text("fn outside() {}\n")
+        (self.repo / alias).unlink()
+        (self.repo / alias).symlink_to(outside)
+        with self.assertRaisesRegex(style_ledger.CheckCouldNotRun, f"{alias} resolves to .*, outside the repo"):
+            _ = style_plan.format_check(self.repo)
 
     def test_approved_rename_refuses_unqualified_or_unapproved_names(self) -> None:
         ticket = self.approved_reference_ticket()
@@ -4163,6 +4486,7 @@ class StylePlanTests(unittest.TestCase):
         with (style_ledger.open_ledger(self.repo) as ledger,
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_plan, "synced_style_branch", return_value=""),
+              mock.patch.object(style_plan, "format_check", return_value=0),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
             self.assertEqual(style_plan.gate(self.repo, "modules-unit-1"), 0)
             footprint.assert_called_once()
@@ -4186,6 +4510,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertEqual({(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}, before)
         with (mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_plan, "synced_style_branch", return_value=""),
+              mock.patch.object(style_plan, "format_check", return_value=0),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as footprint):
             self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
             footprint.assert_called_once()
@@ -4206,6 +4531,7 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_ledger.Ledger, "ticket_origin", return_value=origin),
               mock.patch.object(style_plan, "synced_style_branch", return_value=""),
+              mock.patch.object(style_plan, "format_check", return_value=0),
               mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run):
             self.assertEqual(style_plan.gate(self.repo, "names-unit-1"), 0)
         arguments = cast(list[str], run.call_args.args[0])

@@ -439,10 +439,11 @@ def place_of(slug: str) -> Place:
 def user_facing(slug: str) -> list[str]:
     """The productions whose items for the user `slug`'s showrunner counts and lists.
 
-    A root answers for itself and every production below it. Any other showrunner answers for its
-    own items alone.
+    Every showrunner answers for its own items and those of every production below it, at any
+    depth, never for one above it or beside it (user, 2026-10-25: /next is scoped to the
+    showrunner that runs it and its children).
     """
-    return [slug, *place_of(slug).below]
+    return [slug, *descendants_of(slug)]
 
 
 def root_of(slug: str) -> str:

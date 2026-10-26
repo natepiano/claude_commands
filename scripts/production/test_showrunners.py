@@ -506,7 +506,8 @@ raise SystemExit(1)
             self.assertEqual(showrunners.place_of("alone"), showrunners.Place("", []))
             self.assertEqual(showrunners.descendants_of("mid"), ["leaf"])
             self.assertEqual(showrunners.user_facing("top"), ["top", "mid", "other", "leaf"])
-            self.assertEqual(showrunners.user_facing("mid"), ["mid"])
+            self.assertEqual(showrunners.user_facing("mid"), ["mid", "leaf"])
+            self.assertEqual(showrunners.user_facing("leaf"), ["leaf"])
 
     def test_what_all_must_hear_once_goes_to_the_highest_running_showrunner_of_each_tree(self) -> None:
         def runner(slug: str, *, running: bool) -> showrunners.Showrunner:

@@ -12,9 +12,12 @@ lists (`urgency.top_across`). The order is urgency.py's: `urgent` (the default) 
 `move-to-end` moves the item /next last showed from that list to the end of the list, so the next
 `show` takes another item. It shows nothing after it.
 
-Change, proposal and question need the production: --production, else the calling showrunner's.
-Efficiency needs none. A list that cannot be read is left out of a show with no kind, with one line
-on stderr.
+Every kind needs the production: --production, else the calling showrunner's. Each kind shows the
+items of that production and of every production below it, at any depth, never of one above it or
+beside it (user, 2026-10-25). A change row belongs to the production its Production cell names, and
+a row without one to its list's root. Efficiency reads the Efficiency ledger line of each of those
+docs; a production with none has no efficiency items. A list that cannot be read is left out of a
+show with no kind, with one line on stderr.
 """
 from __future__ import annotations
 
@@ -26,7 +29,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
 
 import change_review
+import proposals_folder
 import proposals_table
+import showrunners
+from footer_counts import efficiency_ledger
 from add_unit import read_production
 from production_units import Refusal
 from proposals_folder import slug_of
@@ -73,14 +79,40 @@ def _doc(production: Path | None) -> Path:
     return production
 
 
+def change_queue(doc: Path) -> Queue:
+    """The change rows of the production and the productions below it, from its root's list.
+
+    A child whose doc has no Change review line of its own reads its root's list.
+    """
+    slug = proposals_folder.slug_of(doc)
+    root = showrunners.root_of(slug)
+    try:
+        path = change_review.production_list(str(doc))
+    except change_review.ChangeReviewError:
+        if slug == root:
+            raise
+        path = change_review.production_list(str(showrunners.timer_docs().get(root, doc)))
+    scope = {proposals_folder.slug_of(each) for each in proposals_folder.owner_docs(doc)}
+    rows = [row for row in change_review.pending(path) if (row.get(change_review.PRODUCTION) or root) in scope]
+    # The root shows the whole list and keeps the list's own pin; a lower showrunner pins its own row.
+    name = change_review.queue(path) if slug == root else f"{change_review.queue(path)}-{slug}"
+    return Queue(name, _as_text(change_review.row_entries(rows), lambda entry: change_review.describe(entry.item)))
+
+
+def efficiency_queue(doc: Path) -> Queue:
+    """The open candidates of each Efficiency ledger the production and the productions below it name."""
+    ledgers = dict.fromkeys(ledger for each in proposals_folder.owner_docs(doc)
+                            if (ledger := efficiency_ledger(each)) is not None)
+    lines = [line for ledger in ledgers for line in candidates.read_lines(ledger)]
+    return Queue(candidates.QUEUE, _as_text(candidates.entries(lines), lambda entry: entry.item.line))
+
+
 def read_queue(kind: str, production: Path | None) -> Queue:
     """The waiting items of one list."""
     try:
         match kind:
             case "change":
-                path = change_review.production_list(str(_doc(production)))
-                rows = change_review.row_entries(change_review.pending(path))
-                return Queue(change_review.queue(path), _as_text(rows, lambda entry: change_review.describe(entry.item)))
+                return change_queue(_doc(production))
             case "proposal":
                 doc = _doc(production)
                 waiting, _ = proposals_table.waiting_entries(doc)
@@ -90,9 +122,8 @@ def read_queue(kind: str, production: Path | None) -> Queue:
                 due = open_lists(found).due
                 return Queue(question_queue(found), _as_text(due, lambda entry: entry.item.line()))
             case _:
-                lines = candidates.read_lines(candidates.ROOT / "ledger.md")
-                return Queue(candidates.QUEUE, _as_text(candidates.entries(lines), lambda entry: entry.item.line))
-    except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError) as error:
+                return efficiency_queue(_doc(production))
+    except (change_review.ChangeReviewError, RegistrationFailure, Refusal, OSError, ValueError) as error:
         raise NextError(f"{kind}: {error}") from None
 
 

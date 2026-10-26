@@ -365,8 +365,8 @@ class ReviewLauncherPassTests(unittest.TestCase):
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         for name in (
-            "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py",
-            "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
+            "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "recorder_state.py",
+            "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py",
         ):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh"):
@@ -1128,6 +1128,8 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             _ = (directory / "delegated_phase_reservation_state.json").write_text(
                 json.dumps({"state": "active", "phase": phase}), encoding="utf-8")
             _ = (directory / "files").write_text(files, encoding="utf-8")
+        # A phase is open while the recorder lists it, so phase 4 starts there beside phase 3.
+        self.recorder("start-phase", "--session-dir", str(session), "--phase-id", "4", "--phase-title", "Parallel writer")
         environment = self.pool_fixture()
         environment["STUB_REVIEW_EDIT"] = str(self.working_dir / edited)
         environment["STUB_REVIEW_WORKING_DIR"] = str(self.working_dir)

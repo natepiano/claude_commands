@@ -481,6 +481,22 @@ class DurableRolesTests(unittest.TestCase):
         with self.assertRaises((ValueError, OSError)):
             _ = roles.check_patch(design.placement.design_id, 2, self.repository, ["design.md"])
 
+    def test_a_binding_to_an_ad_hoc_phase_open_beside_another_accepts_its_patch(self) -> None:
+        phase = self.run_a / "phases/adhoc"
+        phase.mkdir()
+        _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
+            "kind": "enrolled_awaiting_first_touch", "phase": "ad hoc"}))
+        _ = (phase / "files").write_text("design.md\n")
+        state = self.run_a / "progress_history_state.json"
+        recorded = cast(dict[str, object], json.loads(state.read_text()))
+        ad_hoc = {"id": "ad hoc", "instance_id": "instance-ad-hoc", "status": "active"}
+        recorded["open_phases"] = [*cast(list[object], recorded["open_phases"]), ad_hoc]
+        _ = state.write_text(json.dumps(recorded))
+        binding = roles.DesignBoundToPhase(str(self.run_a), "ad hoc", str(self.repository), ("design.md",))
+        design = roles.open_role("fixture-repo", "design.md", "designer", roles.UnitHolder("demo", "design-unit"),
+                                 "design", binding=binding, request_id="open-ad-hoc")
+        self.assertEqual(roles.check_patch(design.placement.design_id, 1, self.repository, ["design.md"]), binding)
+
     def test_patch_cannot_follow_a_symlink_outside_the_reserved_repository(self) -> None:
         design = self.open_designer()
         outside = self.root / "outside.md"
