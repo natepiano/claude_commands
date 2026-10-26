@@ -30,6 +30,7 @@ from issues import frontmatter
 
 import berth_board
 import fake_fmt
+import mechanical_classes
 import rules
 import style_ledger
 import style_rules
@@ -49,6 +50,9 @@ class StylePlanTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        # The shipped class list, checked against the real catalog before the test catalog takes its place.
+        listed = mechanical_classes.classes()
+        _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
@@ -2080,11 +2084,34 @@ class StylePlanTests(unittest.TestCase):
         text = plan.read_text()
         self.assertIn("uncovered: Read the crate layout.", text)
         self.assertIn('"line": 1', text)
-        self.assertIn("Every structure finding other than a pure move is held", text)
-        self.assertIn("Apply a pure move inside one crate", text)
+        self.assertIn("Every structure finding is held as a proposal, except a finding of a mechanical class below.",
+                      text)
+        self.assertIn("Apply a finding of a mechanical class without asking only when", text)
+        self.assertIn("- `pure-move` (`module-structure`, `types-live-with-their-behavior`, "
+                      + "`split-by-type-ownership`): A pure move takes one item", text)
+        self.assertIn("- `stale-allow-lint` (`test-module-allow-boilerplate`): A stale lint removal", text)
         self.assertNotIn("#uncovered`", text)
         pin = self.ledger().pinned_rule_texts(ticket["id"])[0]
         self.assertIn(str(plan.parent.parent / "rules" / (pin.blob + ".md")), text)
+
+    def test_a_third_listed_class_changes_the_unit_text_with_no_other_edit(self) -> None:
+        listed = self.root / "mechanical_classes.toml"
+        extra = ('\n[[class]]\nname = "third-class"\nproof = "lint_removal"\nrules = ["third-rule"]\n'
+                 + 'summary = "A third change takes out one word."\n')
+        _ = listed.write_text(mechanical_classes.CLASSES.read_text() + extra)
+        catalog = frozenset(rule for entry in mechanical_classes.classes() for rule in entry.rules) | {"third-rule"}
+        _ = self.rule("structure", "tier: D\nfamily: modules\n")
+        self.sync()
+        worktree = self.root / "modules"
+        _ = self.git("worktree", "add", "-q", "-b", "demo-style-modules", str(worktree))
+        plan = worktree / "docs/style-production/units/modules-unit.md"
+        plan.parent.mkdir(parents=True)
+        _ = plan.write_text(self.plan_header())
+        with mock.patch.object(mechanical_classes, "classes", return_value=mechanical_classes.load(listed, catalog)):
+            self.assertIsInstance(style_plan.next_phase("modules-unit", plan, self.repo), style_plan.PhaseWritten)
+        text = plan.read_text()
+        self.assertIn("- `pure-move` (", text)
+        self.assertIn("- `third-class` (`third-rule`): A third change takes out one word.", text)
 
     def test_only_structure_phases_require_each_file_and_every_distinct_defect(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
@@ -3301,7 +3328,7 @@ class StylePlanTests(unittest.TestCase):
             self.assertNotIn("overrides the mechanical-only invariant", first)
             self.assertIn("Apply the approved findings.", first)
             self.assertNotIn("Apply only mechanical fixes", first)
-            self.assertNotIn("Every structure finding other than a pure move is held", first)
+            self.assertNotIn("Every structure finding is held as a proposal", first)
             self.assertIn("style_plan.py gate --repo . --ticket names-unit-1", first)
             _ = self.plan.write_text(self.plan_header())
             result = self.run_next()
@@ -3312,9 +3339,9 @@ class StylePlanTests(unittest.TestCase):
 
     def approved_reference_ticket(
         self, pairs: tuple[tuple[str, str], ...] = (("Outcome::OldName", "Outcome::NewName"),),
-        kinds: tuple[style_ledger.FindingKind, ...] = ("rename",),
+        kinds: tuple[style_ledger.FindingKind, ...] = ("rename",), rule_name: str = "approved-reference",
     ) -> str:
-        rule = self.rule("approved-reference")
+        rule = self.rule(rule_name)
         issue = self.root / "reference-approval.md"
         with style_ledger.open_ledger(self.repo) as ledger:
             blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
@@ -4023,7 +4050,7 @@ class StylePlanTests(unittest.TestCase):
                 self.assertIn(self.sources[1] + " (change is not an approved rename reference)", output)
 
     def test_approved_proposal_gate_allows_the_files_of_a_pure_move_and_only_them(self) -> None:
-        ticket = self.approved_reference_ticket()
+        ticket = self.approved_reference_ticket(rule_name="module-structure")
         lib, other, extra = self.sources[2], self.sources[3], "crates/beta/src/extra.rs"
         limit = "/// The most rows.\npub(crate) const LIMIT: usize = 4;\n"
         text = "\npub fn text() -> &'static str { stringify!(a+b) }\n"
@@ -4050,6 +4077,41 @@ class StylePlanTests(unittest.TestCase):
                     self.assertEqual(name + " (change" in output, name in refused, output)
                 self.write(lib, moved)
                 self.write(extra, "pub(crate) fn more() -> usize { 2 }\n")
+
+    def test_approved_proposal_gate_allows_a_stale_lint_removal_and_holds_an_added_allow_or_code(self) -> None:
+        ticket = self.approved_reference_ticket(rule_name="test-module-allow-boilerplate")
+        other = self.sources[3]
+        tests = "#[cfg(test)]\n#[allow(clippy::panic, clippy::unwrap_used)]\nmod tests {\n    fn example() {}\n}\n"
+        self.write(other, "pub fn read() -> usize { 1 }\n\n" + tests)
+        _ = self.commit()
+        removed = "pub fn read() -> usize { 1 }\n\n" + tests.replace("clippy::panic, ", "")
+        self.write(other, removed)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        for edit in (removed.replace("clippy::unwrap_used", "clippy::unwrap_used, clippy::expect_used"),
+                     removed.replace("#[cfg(test)]", "#[allow(dead_code)]\n#[cfg(test)]"),
+                     removed.replace("{ 1 }", "{ 2 }")):
+            with self.subTest(edit=edit):
+                self.write(other, edit)
+                result, output = self.reference_gate(ticket)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"files outside approved findings: {other} (change", output)
+
+    def test_approved_proposal_gate_refuses_a_lint_removal_for_a_ticket_of_another_class(self) -> None:
+        ticket = self.approved_reference_ticket(rule_name="module-structure")
+        tests = "#[cfg(test)]\n#[allow(clippy::panic, clippy::unwrap_used)]\nmod tests {\n    fn example() {}\n}\n"
+        self.write(self.sources[3], "pub fn read() -> usize { 1 }\n\n" + tests)
+        _ = self.commit()
+        self.write(self.sources[3], "pub fn read() -> usize { 1 }\n\n" + tests.replace("clippy::panic, ", ""))
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(f"files outside approved findings: {self.sources[3]} (change", output)
+
+    def test_approved_proposal_gate_reports_a_refused_class_list_as_exit_two(self) -> None:
+        ticket = self.approved_reference_ticket()
+        self.write(self.sources[3], "pub fn moved() -> usize { 1 }\n")
+        refused = mechanical_classes.ClassListError("class pure-move names the unknown proof copy")
+        with mock.patch.object(mechanical_classes, "classes", side_effect=refused):
+            self.assertEqual(self.reference_gate(ticket), (2, "error: class pure-move names the unknown proof copy\n"))
 
     def test_approved_proposal_gate_allows_a_widened_file_and_only_it(self) -> None:
         ticket = self.approved_reference_ticket()
