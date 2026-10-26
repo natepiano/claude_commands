@@ -4981,7 +4981,8 @@ class RestartTests(ShutdownTestCase):
 
     def test_window_hosts_launch_serially_on_the_calling_thread_with_spacing(self) -> None:
         saved = [
-            entry(top_level("c-native", host=inventory.HerdrHost(kind="herdr", herdr_session="c-native", pane_id="w1:p1", presentation="attached window"))),
+            # Recorded in the shared session, so this case spaces windows without a move out of another session.
+            entry(top_level("c-native", host=inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="attached window"))),
             entry(top_level("d-terminal", host=inventory.TerminalHost(kind="terminal"))),
             entry(top_level("b-zed", host=inventory.WindowHost(kind="zed", window_shell=11, desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot")))),
             entry(top_level("a-ghostty", host=inventory.WindowHost(kind="ghostty", window_shell=10, desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot")))),
