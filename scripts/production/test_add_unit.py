@@ -2538,7 +2538,7 @@ class AddUnitTests(ShutdownTestCase):
             self.assertIsNotNone(marked)
             if marked is not None:
                 self.assertEqual(marked.unit, guild)
-                self.assertEqual(marked.place.session, f"guilds-{guild}")
+                self.assertEqual(marked.place.session, "agents")
             self.assertIsNone(unit_lookup.marked_unit("guilds", guild + "-unit"))
 
         note = self.root / "guild-restart.md"
