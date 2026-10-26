@@ -231,6 +231,52 @@ class LintRemovalProofTests(unittest.TestCase):
         inner = {"src/lib.rs": "#[cfg(test)]\nmod tests;\n", "src/tests.rs": "#![allow(clippy::panic)]\nfn f() {}\n"}
         self.assertEqual(self.removal(inner, "src/tests.rs", "#![allow(clippy::panic)]\n"), frozenset())
 
+    def test_an_include_word_or_a_macro_item_in_the_file_holds_the_removal(self) -> None:
+        allow = "    #[allow(clippy::unwrap_used)]\n"
+        tests = "#[cfg(test)]\nmod tests {\n" + allow + "    fn f() {\n        {call}\n    }\n}\n"
+        for head, call, explained in (
+            ("use std::include as load;\n", 'load!("helpers.rs");', False),
+            ("use std::include;\n", "", False),
+            ("macro_rules! open {\n    ($x:expr) => { $x.unwrap() };\n}\n", "open!(Some(1));", False),
+            ("", 'let _ = include_str!("helpers.rs");', True),
+        ):
+            with self.subTest(head=head, call=call):
+                files = {"src/lib.rs": head + tests.replace("{call}", call),
+                         "src/helpers.rs": "fn g() { Some(1).unwrap(); }\n"}
+                self.assertEqual(self.removal(files, "src/lib.rs", allow),
+                                 frozenset({"src/lib.rs"}) if explained else frozenset())
+
+    def test_an_allow_on_an_item_with_unwrap_in_its_signature_is_held(self) -> None:
+        allow = "#[allow(clippy::unwrap_used)]\n"
+        for item in (
+            "fn f() -> [u8; {\n    fn length(value: Option<usize>) -> usize {\n        value.unwrap()\n    }\n"
+            + "    1\n}] {\n    [0]\n}\n",
+            "#[cfg(test)] " + allow.strip() + " fn f() -> [u8; { fn length(value: Option<usize>) -> usize "
+            + "{ value.unwrap() } 1 }] { [0] }\n",
+            "struct S<const N: usize = { Some(3).unwrap() }> {\n    a: [u8; N],\n}\n",
+        ):
+            lib = item if item.startswith("#") else "#[cfg(test)]\n" + allow + item
+            for code, explained in ((lib, False), (lib.replace(".unwrap()", ""), True)):
+                with self.subTest(code=code):
+                    self.assertEqual(self.removal({"src/lib.rs": code}, "src/lib.rs", allow.strip()),
+                                     frozenset({"src/lib.rs"}) if explained else frozenset())
+
+    def test_an_include_word_or_a_macro_item_in_another_file_of_the_crate_holds_the_removal(self) -> None:
+        allow = "#[allow(clippy::unwrap_used)]\n"
+        gated = "#[cfg(test)]\nmod tests;\n"
+        opener = "macro_rules! open {\n    ($x:expr) => { $x.unwrap() };\n}\n"
+        for lib, other, explained in (
+            (opener + gated, "", False),
+            (gated + "mod other;\n", "use std::include as load;\n", False),
+            (gated + "mod other;\n", "// macro_rules! and include! in a comment\n", True),
+        ):
+            with self.subTest(lib=lib, other=other):
+                files = {"src/lib.rs": lib, "src/tests.rs": allow + "fn f() {\n    open!(Some(1));\n}\n"}
+                if other:
+                    files["src/other.rs"] = other
+                self.assertEqual(self.removal(files, "src/tests.rs", allow),
+                                 frozenset({"src/tests.rs"}) if explained else frozenset())
+
     def test_only_a_package_tests_file_or_a_cfg_test_module_file_is_a_test_file(self) -> None:
         allow = "#[allow(clippy::panic)]\n"
         lib = "pub fn read() -> usize { 1 }\n"
@@ -251,6 +297,10 @@ class LintRemovalProofTests(unittest.TestCase):
             ({"src/lib.rs": "#[cfg_attr(any(), cfg(test))]\nmod tests;\n", "src/tests.rs": allow + "fn f() {}\n"},
              "src/tests.rs", False),
             ({"src/lib.rs": gated + 'include!("other.rs");\n', "src/tests.rs": allow + "fn f() {}\n"},
+             "src/tests.rs", False),
+            ({"src/lib.rs": gated + 'use std::include as load;\nload!("other.rs");\n',
+              "src/tests.rs": allow + "fn f() {}\n"}, "src/tests.rs", False),
+            ({"src/lib.rs": gated + "use std::include;\n", "src/tests.rs": allow + "fn f() {}\n"},
              "src/tests.rs", False),
             ({"src/lib.rs": gated + "macro_rules! declare {\n    ($name:ident) => { mod $name; };\n}\ndeclare!(x);\n",
               "src/tests.rs": allow + "fn f() {}\n"}, "src/tests.rs", False),

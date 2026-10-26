@@ -3754,10 +3754,33 @@ def moved_files(changes: tuple[FileChange, ...], before: RevisionTree) -> frozen
 
 def lint_removal_files(changes: tuple[FileChange, ...], before: RevisionTree) -> frozenset[str]:
     """The files of the change whose whole edit is a proven lint name removal (`prove_lint_removals`), when `judge`
-    finds the whole change mechanical. A file that adds an allow or changes code is not one."""
+    finds the whole change mechanical. A file that adds an allow or changes code is not one, and neither is a file
+    of a crate that `crate_emits_unread_code` finds."""
     if isinstance(judge_changes(changes, before, prove_item_moves(changes, before)), Review):
         return frozenset()
-    return frozenset(change.path for change in changes if stale_lint_removal(change, before))
+    crates = {before.crate(change.path) for change in changes}
+    unread = {crate for crate in crates if crate_emits_unread_code(before, crate, changes)}
+    return frozenset(change.path for change in changes
+                     if before.crate(change.path) not in unread and stale_lint_removal(change, before))
+
+
+# The words that can put code the generator does not read into an allow's scope, and a text prefilter for them.
+UNREAD_CODE_WORDS = frozenset({"include", "macro", "macro_rules"})
+UNREAD_CODE_PATTERN = re.compile(r"\b(?:include|macro(?:_rules)?)\b")
+
+
+def crate_emits_unread_code(before: RevisionTree, crate: str, changes: tuple[FileChange, ...]) -> bool:
+    """Whether a Rust file of the crate (`crate_files`), before or after the change, holds an `include`,
+    `macro_rules` or `macro` word, `r#` stripped. A macro defined in any file of the crate, such as one in a parent
+    module that a child module file calls, can emit `.unwrap(` into an allow's scope in another file, and any
+    `include` word (a call, a use leaf, an alias source, a path segment) can bring a file that no scan reads. The
+    generator reads one file, so this crate-wide reading is the gate's. A comment or a string does not count."""
+    changed = {change.path: (change.before, change.after) for change in changes}
+    for path in crate_files(before, crate, changes):
+        texts = changed.get(path) or (before.text(path),)
+        if any(UNREAD_CODE_PATTERN.search(text) and UNREAD_CODE_WORDS & set(plain_words(text)) for text in texts):
+            return True
+    return False
 
 
 # Line breaks other than `\n` would move the generator's lines and columns away from the tokens' offsets.
@@ -3769,9 +3792,10 @@ def stale_lint_removal(change: FileChange, before: RevisionTree) -> bool:
     must be one that the `test_allow_boilerplate` generator reports stale for that attribute in the before text, and
     the attribute must be in a test scope: inside or on an item that `cfg_test_items` finds, or in a file that
     `test_file` finds. A kept attribute keeps its prefix, its other lint names and its reason token for token; only a
-    trailing comma may change. An attribute whose scope can reach another file is not explained: an attribute on an
-    out-of-line `mod x;`, one whose scope declares such a module or calls `include!`, and an inner attribute, which
-    the generator does not read (nor an `expect`). Neither is an attribute in a macro token tree, which the macro can
+    trailing comma may change. An attribute whose scope can reach code the generator does not read is not explained
+    (`BoilerplateAllow.local`): an attribute on an out-of-line `mod x;`, one whose scope declares such a module, one
+    in a file with any `include` word or a `macro_rules!` or `macro` item, and an inner attribute, which the
+    generator does not read (nor an `expect`). Neither is an attribute in a macro token tree, which the macro can
     put anywhere."""
     proof = prove_lint_removals(change)
     if not removes_only_lint_names(change, proof) or OTHER_LINE_BREAKS & set(change.before):
@@ -3847,7 +3871,8 @@ def test_file(sources: RevisionTree, path: str) -> bool:
     `mod` declaring it puts in a `cfg_test_items` item, or in a file that is itself such a module file. A crate root
     and a file under src/bin/ are not. The answer is no when the proof cannot read the package's module tree: the
     manifest is missing or unreadable, sets a target path or a build script (`crate_manifest`), or a file of the
-    package has a `path` attribute, an `include!`, a `macro` item or a `mod` in a macro token tree."""
+    package has a `path` attribute, any `include` word (a call, a use leaf, an alias source or a path segment, as
+    `use std::include as load;` calls it under another name), a `macro` item or a `mod` in a macro token tree."""
     crate = sources.crate(path)
     try:
         manifest = crate_manifest(sources, crate)
@@ -3860,8 +3885,8 @@ def test_file(sources: RevisionTree, path: str) -> bool:
     for words in files.values():
         macros = macro_spans(words, delimiter_ends(words))
         attributes = attribute_spans(words)
-        if ("macro" in words or any(word == "path" for begin, end in attributes for word in words[begin:end])
-                or any(word == "include" and words[index + 1:index + 2] == ("!",) for index, word in enumerate(words))
+        if ("macro" in words or "include" in words
+                or any(word == "path" for begin, end in attributes for word in words[begin:end])
                 or any(words[index] == "mod" for start, end in macros for index in range(start, end))):
             return False
     if PurePosixPath(path).relative_to(crate).parts[:1] == ("tests",):
