@@ -23,7 +23,7 @@ For active process redesigns, as we are currently undergoing with promotions and
   - `scripts/history/test_rounds.py` (new, Phase 1) — its tests.
   - `docs/plans/sdlc-fix-rounds-study.md` (new, Phase 2) — the study and, from Phase 3, the proposals; tracked, and committed with each phase that changes it.
   - `commands/history.md` — the `/history` command doc; lists the subcommands.
-  - `scripts/production/merge_gate.py` :47 — `TEST_SUITES`; `history` is not in it yet.
+  - `scripts/production/merge_gate.py` :47 — `TEST_SUITES`; `history` is in it.
 - **Key files:**
   - `~/.local/state/plan-delegate/runs/*.jsonl` — run records, one file per `/unit:direct` run (206 files, 2026-09-04 to 2026-10-20, 92 MB). One JSON event per line. Events this unit reads:
     - `run_started` — `run_id`, `plan_doc`, `project_plan_doc`, `worktree`, `branch`, `working_dir`, `main_agent`.

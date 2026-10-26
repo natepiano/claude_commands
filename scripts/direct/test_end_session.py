@@ -105,13 +105,14 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 5)
         self.assertTrue(calls[0].endswith(f"guilds/roles.py unbind-run {self.session_dir}"))
         self.assertIn("remove_workers.py --session-dir", calls[1])
         self.assertIn("codex_mesh.py stop --session-dir", calls[2])
         self.assertIn(str(self.session_dir), calls[2])
         self.assertIn("codex_mesh.py sweep --root", calls[3])
         self.assertIn(f"{self.root} --stop", calls[3])
+        self.assertTrue(calls[4].endswith(f"lib/scratch.py end --task run:{self.session_dir.name}"))
         self.assertFalse(self.marker.exists())
 
     def make_run(self, name: str, director: str) -> Path:

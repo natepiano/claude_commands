@@ -18,8 +18,10 @@ from unittest import mock
 
 import tmp_sweep
 if TYPE_CHECKING:
+    from ..lib import scratch
     from ..message import sessions
 else:
+    import scratch  # on the path once tmp_sweep has put scripts/lib there
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
 
@@ -74,7 +76,8 @@ class TmpSweepCase(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(tmp_sweep, "running_session_ids", side_effect=lambda: self.live))
 
     def roots(self) -> tmp_sweep.Roots:
-        return tmp_sweep.default_roots(str(self.tmp), (str(self.delegate), str(self.unit)), str(self.session_root))
+        return tmp_sweep.default_roots(str(self.tmp), (str(self.delegate), str(self.unit)), (str(self.session_root),), (),
+                                       (str(self.tmp / "scratch"),))
 
     def unreadable_sessions(self) -> None:
         self.live = None
@@ -175,13 +178,81 @@ class ProcessUseTests(TmpSweepCase):
             f"{worked}: pid 10 works in it",
         ])
 
-    def test_with_no_proc_nothing_goes(self) -> None:
+    def test_with_no_proc_and_no_lsof_nothing_goes(self) -> None:
         idle = write(self.tmp / "idle" / "a")
         self.proc.rmdir()
-        result = self.sweep()
+        with mock.patch.object(tmp_sweep, "LSOF", (str(self.tmp.parent / "no-lsof"),)):
+            result = self.sweep()
         self.assertTrue(idle.is_file())
         self.assertEqual(result.deleted, [])
         self.assertIn(str(self.tmp / "idle"), result.kept[tmp_sweep.NO_PROC])
+
+
+    def test_with_no_proc_an_lsof_scan_shows_which_processes_use_an_entry(self) -> None:
+        idle = write(self.tmp / "idle" / "a")
+        used = write(self.tmp / "used" / "a")
+        self.proc.rmdir()
+        lines = f"p42\\nfcwd\\nn{used.parent}\\nf3\\nn/elsewhere\\n"
+        with mock.patch.object(tmp_sweep, "LSOF", ("printf", lines)):
+            result = self.sweep()
+        self.assertFalse(idle.exists())
+        self.assertTrue(used.is_file())
+        self.assertEqual(result.kept[tmp_sweep.IN_USE], [f"{used.parent}: pid 42 works in it"])
+
+    def test_lsof_output_names_how_each_process_uses_a_path(self) -> None:
+        text = "p7\nfcwd\nn/tmp/a\nftxt\nn/tmp/b/lib\nf4\nn/tmp/c/log\nf5\nn/var/x\np8\nfmem\nn/tmp/d\n"
+        self.assertEqual(tmp_sweep.parse_lsof(text, "/tmp/"), [
+            ("/tmp/a", 7, "works in it"), ("/tmp/b/lib", 7, "maps a file in it"),
+            ("/tmp/c/log", 7, "holds a file open in it"), ("/tmp/d", 8, "maps a file in it")])
+
+
+class ScratchRootTests(TmpSweepCase):
+    def test_each_task_folder_is_judged_and_a_rows_folder_waits_for_its_verdict(self) -> None:
+        run = write(self.tmp / "scratch" / "run-x-gate-abc123" / "a").parent
+        row = write(self.tmp / "scratch" / "row-natedev-C5-copy-abc123" / "a").parent
+        recent = write(self.tmp / "scratch" / "phase-builds-unit-7-def456" / "a").parent
+        for folder, task in ((run, "run:x"), (row, "row:natedev-C5"), (recent, "phase:builds-unit/7")):
+            scratch.write_record(folder, task, 0.0)
+            os.utime(folder / scratch.RECORD, (0, 0))
+        self.recent(recent / "a")
+        result = self.sweep()
+        self.assertFalse(run.exists())
+        self.assertTrue(row.is_dir())
+        self.assertTrue(recent.is_dir())
+        self.assertEqual(result.kept[tmp_sweep.ROW_WAITS], [str(row)])
+        self.assertIn(str(self.tmp / "scratch"), result.kept[tmp_sweep.ROOT])
+
+
+class TempFolderTests(TmpSweepCase):
+    def test_only_an_idle_unused_tempfile_folder_in_a_temp_folder_goes(self) -> None:
+        temp = self.tmp.parent / "temp"
+        idle = write(temp / ".tmpAb12Cd" / "Cargo.toml").parent
+        recent = write(temp / ".tmpQq11Rr" / "a").parent
+        self.recent(recent / "a")
+        used = write(temp / ".tmpUu22Vv" / "a").parent
+        fake_process(self.proc, 10, cwd=str(used))
+        others = [write(temp / ".tmpAb12Cde" / "a").parent, write(temp / ".tmpXy34Zw"),
+                  write(temp / "notes" / "a").parent, write(temp / ".tmp-b12Cd" / "a").parent]
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(temp),), ())
+        result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
+        self.assertFalse(idle.exists())
+        self.assertTrue(recent.is_dir())
+        self.assertTrue(used.is_dir())
+        for other in others:
+            self.assertTrue(other.exists(), other)
+        self.assertEqual([entry["path"] for entry in result.deleted], [str(idle)])
+        self.assertEqual(result.kept[tmp_sweep.IN_USE], [f"{used}: pid 10 works in it"])
+        kept = [path for paths in result.kept.values() for path in paths]
+        self.assertFalse([path for path in kept if any(str(other) in path for other in others)])
+
+    def test_roots_are_real_paths(self) -> None:
+        """The Mac's /tmp is a link to /private/tmp, and lsof prints real paths."""
+        link = self.tmp.parent / "link"
+        link.symlink_to(self.tmp.parent)
+        roots = tmp_sweep.default_roots(str(link / "claude"), (str(link / "claude" / "unit"),), (), (str(link),), ())
+        self.assertEqual(roots.plain, (str(self.tmp),))
+        self.assertEqual(roots.runs, (str(self.unit),))
+        self.assertEqual(roots.temp, (str(self.tmp.parent),))
 
 
 class OwnerTests(TmpSweepCase):

@@ -96,6 +96,20 @@ The list keeps the order of `/next` (`commands/next.md`): the row `show`
 printed stays first until its verdict. When the user calls a row important,
 run `mark-important <production> --row C<n>`.
 
+## A folder for the user to try
+
+When the user needs a folder to try a change in (a repro, a demo crate, a
+copy), make it after `add` prints the row's number, never by hand:
+
+```sh
+"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/lib/scratch.py" new --task row:<showrunner>-C<n> --name <word> --visible
+```
+
+It prints `~/rust/repro/<showrunner>-C<n>-<word>`, where cargo-port lists it.
+Name that path in the row's How to check cell (`edit`). `adopt <path>` with the
+same options moves a folder that already exists there. Without `--visible`
+the folder goes in `/tmp/claude/scratch`. The row's verdict removes both.
+
 ## verdict
 
 A verdict beginning `works` or `fine` lands the row; any other returns it to
@@ -108,7 +122,8 @@ there leaves the row open. Then:
 ```
 
 It moves the row to `## Reviewed` with the verdict and today's date, and prints
-`C<n> landed` or `C<n> returns to its unit (merged …)`. Send a returning row,
+`C<n> landed` or `C<n> returns to its unit (merged …)`. Either way it removes
+the row's scratch folders and prints `removed <path>` for each. Send a returning row,
 its change and the user's words to the unit that made it: the merge commit it
 names gives the checkpoint, and so the unit. A change outside a unit goes back
 to the session that added it. The fix comes back as a new row.

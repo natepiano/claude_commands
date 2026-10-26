@@ -4,7 +4,8 @@
 A unit checkpoint commit without its Change-Review line is held before the merge. After the push,
 each visible change becomes a row in the change-review list of the production's top-level showrunner
 (`change_review.py`), with the doc stamped into its frontmatter; the first row creates a missing list, and the list commits itself when it sits in a git
-work tree. A refused commit warns and never fails the merge.
+work tree. A refused commit warns and never fails the merge. A recorded code checkpoint ends its
+phase: the scratch folders of task `phase:<unit>/<phase>` (scripts/lib/scratch.py) are removed.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
 import change_review
+import scratch  # on the path once change_review has put scripts/lib there
 from showrunners import canonical_slug
 from add_unit import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
@@ -984,6 +986,20 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
            else f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} logged without review-ledger row")
 
 
+def end_phase_scratch(request: MergeRequest) -> None:
+    """Remove the merged phase's scratch folders; a failure warns and never fails the merge."""
+    if not isinstance(request.kind, CodeCheckpoint):
+        return
+    task = f"phase:{request.unit.name}/{request.phase}"
+    try:
+        removed = scratch.end(task)
+    except (scratch.ScratchError, OSError) as error:
+        report("scratch", "warning", f"{task} not removed: {error}")
+        return
+    if removed:
+        report("scratch", "ok", f"removed {len(removed)} folder(s) of {task}: " + ", ".join(map(str, removed)))
+
+
 def notify_style(checkout: Path, branch: str, tip: str) -> None:
     try:
         script = tool("style_sync.py", Path(__file__).resolve().parents[1] / "style/style_sync.py",
@@ -1046,6 +1062,7 @@ def run(request: MergeRequest) -> int:
              "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
         promote(request, tip)
         record(request, merge_head, tests_green)
+        end_phase_scratch(request)
         print(f"send {request.unit.name}: phase {request.phase} merged and pushed as {merge_head}; continue with the next step")
         return 0
     except Stop as error:
