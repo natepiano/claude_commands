@@ -18,8 +18,10 @@ from unittest import mock
 
 import tmp_sweep
 if TYPE_CHECKING:
+    from ..lib import scratch
     from ..message import sessions
 else:
+    import scratch  # on the path once tmp_sweep has put scripts/lib there
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
 
@@ -74,7 +76,8 @@ class TmpSweepCase(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(tmp_sweep, "running_session_ids", side_effect=lambda: self.live))
 
     def roots(self) -> tmp_sweep.Roots:
-        return tmp_sweep.default_roots(str(self.tmp), (str(self.delegate), str(self.unit)), (str(self.session_root),), ())
+        return tmp_sweep.default_roots(str(self.tmp), (str(self.delegate), str(self.unit)), (str(self.session_root),), (),
+                                       (str(self.tmp / "scratch"),))
 
     def unreadable_sessions(self) -> None:
         self.live = None
@@ -203,6 +206,23 @@ class ProcessUseTests(TmpSweepCase):
             ("/tmp/c/log", 7, "holds a file open in it"), ("/tmp/d", 8, "maps a file in it")])
 
 
+class ScratchRootTests(TmpSweepCase):
+    def test_each_task_folder_is_judged_and_a_rows_folder_waits_for_its_verdict(self) -> None:
+        run = write(self.tmp / "scratch" / "run-x-gate-abc123" / "a").parent
+        row = write(self.tmp / "scratch" / "row-natedev-C5-copy-abc123" / "a").parent
+        recent = write(self.tmp / "scratch" / "phase-builds-unit-7-def456" / "a").parent
+        for folder, task in ((run, "run:x"), (row, "row:natedev-C5"), (recent, "phase:builds-unit/7")):
+            scratch.write_record(folder, task, 0.0)
+            os.utime(folder / scratch.RECORD, (0, 0))
+        self.recent(recent / "a")
+        result = self.sweep()
+        self.assertFalse(run.exists())
+        self.assertTrue(row.is_dir())
+        self.assertTrue(recent.is_dir())
+        self.assertEqual(result.kept[tmp_sweep.ROW_WAITS], [str(row)])
+        self.assertIn(str(self.tmp / "scratch"), result.kept[tmp_sweep.ROOT])
+
+
 class TempFolderTests(TmpSweepCase):
     def test_only_an_idle_unused_tempfile_folder_in_a_temp_folder_goes(self) -> None:
         temp = self.tmp.parent / "temp"
@@ -213,7 +233,7 @@ class TempFolderTests(TmpSweepCase):
         fake_process(self.proc, 10, cwd=str(used))
         others = [write(temp / ".tmpAb12Cde" / "a").parent, write(temp / ".tmpXy34Zw"),
                   write(temp / "notes" / "a").parent, write(temp / ".tmp-b12Cd" / "a").parent]
-        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(temp),))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(temp),), ())
         result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
         self.assertFalse(idle.exists())
         self.assertTrue(recent.is_dir())
@@ -229,7 +249,7 @@ class TempFolderTests(TmpSweepCase):
         """The Mac's /tmp is a link to /private/tmp, and lsof prints real paths."""
         link = self.tmp.parent / "link"
         link.symlink_to(self.tmp.parent)
-        roots = tmp_sweep.default_roots(str(link / "claude"), (str(link / "claude" / "unit"),), (), (str(link),))
+        roots = tmp_sweep.default_roots(str(link / "claude"), (str(link / "claude" / "unit"),), (), (str(link),), ())
         self.assertEqual(roots.plain, (str(self.tmp),))
         self.assertEqual(roots.runs, (str(self.unit),))
         self.assertEqual(roots.temp, (str(self.tmp.parent),))
