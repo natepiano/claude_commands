@@ -3914,6 +3914,36 @@ def removes_only_lint_names(change: FileChange, proof: LintAttributeProof) -> bo
         tokens(change.after), proof.after)
 
 
+def changes_serialized_name(change: FileChange) -> bool:
+    """Whether a removed or an added line holds a word of a `serde` or `reflect` attribute, or a `rename =`."""
+    removed: set[int] = set()
+    added: set[int] = set()
+    offset = 0
+    for hunk in change.hunks:
+        new_start = hunk.old_start + (not hunk.old_count) + offset
+        removed.update(range(hunk.old_start, hunk.old_start + len(hunk.removed)))
+        added.update(range(new_start, new_start + len(hunk.added)))
+        offset += len(hunk.added) - hunk.old_count
+    return serialized_name_on(change.before, removed) or serialized_name_on(change.after, added)
+
+
+def serialized_name_on(text: str, changed: set[int]) -> bool:
+    """Whether a token on a changed line is in an attribute that holds a `serde` or `reflect` word at any depth, as in
+    `#[cfg_attr(feature = "s", serde(skip))]`, or is a `rename` word or the `=` after it. It reads the tokens of the
+    whole text, each word without its `r#`, so a comment cannot hide an attribute and a comment or a string cannot make
+    one: `#/* note */[serde(skip)]` is an attribute, and `// #[serde(skip)]` is not."""
+    if not changed:
+        return False
+    tokenized = tokenized_text(text)
+    words = tuple(token.value.removeprefix("r#") for token in tokenized.tokens)
+    touched = {index for index, (token, line) in enumerate(zip(tokenized.tokens, tokenized.lines))
+               if not changed.isdisjoint(range(line, line + token.value.count("\n") + 1))}
+    if any(words[index:index + 2] == ("rename", "=") and {index, index + 1} & touched for index in range(len(words))):
+        return True
+    return any(not touched.isdisjoint(range(begin, end)) and {"serde", "reflect"} & set(words[begin:end])
+               for begin, end in attribute_spans(words))
+
+
 def judge_changes(changes: tuple[FileChange, ...], before: RevisionTree,
                   moves: ItemMoves | NoItemMoves) -> Mechanical | Review:
     reasons: list[str] = []
@@ -3948,7 +3978,7 @@ def judge_changes(changes: tuple[FileChange, ...], before: RevisionTree,
             reasons.append("check 6: condition, literal or control flow flagged")
         if changes_macro_invocation(semantic_change):
             reasons.append("check 6: macro invocation requires review")
-        if documented_text(change.before) != documented_text(change.after) or re.search(r"#\s*\[\s*(?:serde|reflect)|\brename\s*=", lines):
+        if documented_text(change.before) != documented_text(change.after) or changes_serialized_name(change):
             reasons.append("check 6: serialized, reflected, configured or documented name flagged")
         old_tokens = without_trailing_commas(without_derives(normalized))
         new_tokens = without_trailing_commas(without_derives(
