@@ -534,6 +534,19 @@ def stop_incomplete(saved: SessionShutdown) -> bool:
     })
 
 
+# Progress after which a session's shutdown takes no further step by itself.
+_FINISHED_PROGRESS = frozenset({"restarted", "stop failed", "restart failed", "manual restart", "timers pending"})
+_STOPPED_PROGRESS = frozenset({"stopped", "already gone", "process identity lost"})
+
+
+def shutdown_finished(saved: SessionShutdown) -> bool:
+    """The conductor's done rule: a forced stop still retries, and a restart request restarts its stopped session."""
+    if saved["force"] == "now" and stop_incomplete(saved):
+        return False
+    progress = saved["progress"]["kind"]
+    return progress in _FINISHED_PROGRESS or (progress in _STOPPED_PROGRESS and saved["then"] == "stop")
+
+
 def _legacy_continuation(record: _LegacyShutdownRecord) -> ShutdownContinuation:
     """Legacy records stop; an explicit restart survives conductor launches."""
     return record.get("then", "stop")
@@ -1580,14 +1593,18 @@ def account_hold(login: str) -> AccountHold | None:
             hold = _account_hold(_read_json(path), str(path))
             _check_account(login, hold["login"], path)
             return hold
-        for record in sorted(old, key=lambda item: item["requested_at"]):
-            if record["scope"]["kind"] == "all account sessions" and record["state"] not in {"cancelled", "up"}:
-                return AccountHold(
-                    login=record["login"], label=record["label"], machine=record["machine"],
-                    requested_at=record["requested_at"], requested_by=record["requested_by"],
-                    request_id=f"legacy-{record['machine']}-{record['requested_at']}",
-                    then=_legacy_continuation(record),
-                )
+        return _legacy_hold(old)
+
+
+def _legacy_hold(old: list[_LegacyShutdownRecord]) -> AccountHold | None:
+    for record in sorted(old, key=lambda item: item["requested_at"]):
+        if record["scope"]["kind"] == "all account sessions" and record["state"] not in {"cancelled", "up"}:
+            return AccountHold(
+                login=record["login"], label=record["label"], machine=record["machine"],
+                requested_at=record["requested_at"], requested_by=record["requested_by"],
+                request_id=f"legacy-{record['machine']}-{record['requested_at']}",
+                then=_legacy_continuation(record),
+            )
     return None
 
 
@@ -1962,6 +1979,53 @@ def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()
         if not any(saved["request_id"] in covered
                    for saved in _session_records_in_directory(directory, login)):
             path.unlink()
+
+
+@dataclass(frozen=True)
+class HoldReleased:
+    """A finished account hold was removed; `hold` is what was on disk."""
+
+    hold: AccountHold
+
+
+@dataclass(frozen=True)
+class HoldInUse:
+    """The account hold still covers work in progress, or is an old record's hold."""
+
+    hold: AccountHold
+
+
+def release_finished_account_hold(login: str, *, conducting: bool = False) -> HoldReleased | HoldInUse | AccountOpen:
+    """Remove the account hold once its request has finished, so no hold outlives its shutdown.
+
+    A hold is finished when its registration is complete and no record of a
+    covered request is still live, waiting or stopping. A running conductor
+    keeps the hold until each covered record meets `shutdown_finished`;
+    `conducting` says the caller is that conductor. An old record's hold is
+    never removed here.
+    """
+    if _existing_account_directory(login) is None:
+        return AccountOpen()
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "hold.json"
+        if not _regular_record(path):
+            legacy = _legacy_hold(_legacy_account_records(directory, login))
+            return AccountOpen() if legacy is None else HoldInUse(legacy)
+        held = _account_hold(_read_json(path), str(path))
+        _check_account(login, held["login"], path)
+        if _registering_request_ids(held):
+            return HoldInUse(held)
+        covered = _hold_request_ids(held)
+        records = [saved for saved in _session_records_in_directory(directory, login) if saved["request_id"] in covered]
+        if conducting:
+            finished = all(shutdown_finished(saved) for saved in records)
+        else:
+            finished = isinstance(conductor_status(login), ConductorNotRunning) and all(
+                saved["progress"]["kind"] in _FINISHED_PROGRESS | _STOPPED_PROGRESS for saved in records)
+        if not finished:
+            return HoldInUse(held)
+        path.unlink()
+        return HoldReleased(held)
 
 
 def conductor_status(login: str) -> ConductorRunning | ConductorNotRunning | ConductorUnavailable:

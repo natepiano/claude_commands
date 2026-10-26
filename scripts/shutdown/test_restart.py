@@ -911,8 +911,8 @@ class RestartTests(ShutdownTestCase):
             settle.report_stop([self.stored_record()])
         self.assertEqual(alert.call_count, 2)
         push = cast(RenderedPush, alert.call_args.args[0])
-        self.assertEqual(push.id, "shutdown.restart_failed")
-        self.assertEqual(push.values["stopped"], "One session (moved-owner)")
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["session"], push.values["target"]), ("moved-owner", "claude3"))
 
     def home_cutover_evidence(self) -> None:
         configuration = accounts.accounts_config_file()
@@ -2429,11 +2429,25 @@ class RestartTests(ShutdownTestCase):
         self.write_herdr_responses(responses, [{
             "pane_id": "w1:p1", "agent": "claude", "agent_status": "idle",
         }], pane_present=True)
-        with self.assertRaisesRegex(OSError, "pane still holds a live agent"):
+        with (patch.object(restart, "AGENT_EXIT_SECONDS", 0.0),
+              self.assertRaisesRegex(OSError, "pane still holds a live agent")):
             _ = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         calls = self.herdr_calls(log)
         self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"],
                                         ["agent", "prompt"], ["pane", "close"]) for row in calls))
+
+    def test_herdr_restart_waits_for_herdr_to_see_its_stopped_agent_exit(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        self.write_herdr_responses(responses, [], pane_present=True)
+        stale: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle"}]
+        exited: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "exited"}]
+        with (patch.object(herdr.Herdr, "agents", side_effect=[stale, stale, exited]) as agents,
+              patch.object(restart, "SESSION_POLL_SECONDS", 0.0)):
+            _ = restart._herdr_launch(restart._resume_parts(owner, "restart"), restart.RecordedHerdrPane("writing", "w1:p1"), owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(agents.call_count, 3)
+        calls = self.herdr_calls(log)
+        self.assertIn(["--session", "writing", "pane", "close", "w1:p1"], calls)
+        self.assertTrue(any(row[2:4] == ["workspace", "create"] for row in calls))
 
     def test_herdr_restart_replaces_a_pane_at_its_shell_with_no_live_agent(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
@@ -3674,6 +3688,17 @@ class RestartTests(ShutdownTestCase):
         # The new failure is marked, so the next identical retry stays quiet.
         self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
 
+    def test_failed_move_push_names_both_accounts_and_never_a_restart_onto_the_source(self) -> None:
+        saved = entry(top_level("ups-id", name="ups"))
+        saved["target"], saved["source_label"], saved["label"] = "claude3", "claude1", "claude1"
+        push = restart.move_failed_push(saved)
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["source"], push.values["target"], push.values["session"]), ("claude1", "claude3", "ups"))
+        action = cast(ActionRequired, push.action).text
+        self.assertIn("to claude3", action)
+        self.assertNotIn("claude1", action)
+        self.assertNotIn("restart", action)
+
     def test_restart_failure_push_names_the_failed_session_and_machine(self) -> None:
         push, = restart.restart_push("claude2", ["Beta"], machine="natedev")
         self.assertEqual(push.id, "shutdown.restart_failed")
@@ -4007,7 +4032,8 @@ class RestartTests(ShutdownTestCase):
         self.configure_groups(showrunners="claude3")
         _ = self.recovery([showrunner("held-group")])
         record.set_account_hold(record.AccountHold(login="third@example.invalid", label="claude3", machine="natedev",
-            requested_at=STOPPED, request_id="target-hold", requested_by=record.FromTerminal(kind="terminal"), then="stop"))
+            requested_at=STOPPED, request_id="target-hold", requested_by=record.FromTerminal(kind="terminal"), then="stop",
+            registration="in progress"))
         with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
