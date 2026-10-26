@@ -664,6 +664,8 @@ def gen_bevy_kana_usage(spec: CandidatesSpec, project_root: Path) -> Enumeration
 # ---------------------------------------------------------------------------
 
 _ALLOW_RE = re.compile(r"#\[allow\(([^)]*?)\)\s*\]", re.S)
+# An out-of-line module declaration or an `include!` brings another file's code into a scope.
+_OTHER_FILE_RE = re.compile(r"\bmod\s+(?:r#)?[A-Za-z_]\w*\s*;|\binclude\s*!")
 _BOILERPLATE_LINTS = {
     "clippy::expect_used": ".expect(",
     "clippy::unwrap_used": ".unwrap(",
@@ -705,54 +707,78 @@ def gen_allows_without_reason(spec: CandidatesSpec, project_root: Path) -> Enume
     return Enumeration(candidates=tuple(candidates), source="parse:allow-attrs-without-reason")
 
 
+@dataclass(frozen=True)
+class BoilerplateAllow:
+    """One `#[allow(...)]` attribute that names a tracked lint: where its `#` is, the tracked lints with zero matches
+    of their pattern in the attribute's scope, and whether that scope is all in this file. A scope is not local when
+    the item has no body brace before its `;` (an out-of-line `mod x;`, where the generator reads the rest of the
+    file), or its body declares an out-of-line module or calls `include!`."""
+
+    line: int  # 1-based
+    column: int  # 0-based
+    stale: tuple[str, ...]
+    local: bool
+
+
+def boilerplate_allows(masked: MaskedSource) -> tuple[BoilerplateAllow, ...]:
+    """Each tracked `#[allow(...)]` attribute of one masked file, with its stale lints."""
+    result: list[BoilerplateAllow] = []
+    masked_text = "\n".join(masked.lines)
+    for match in _ALLOW_RE.finditer(masked_text):
+        lints = [part.strip() for part in match.group(1).replace("\n", " ").split(",")]
+        tracked = [lint for lint in lints if lint in _BOILERPLATE_LINTS]
+        if not tracked:
+            continue
+        attr_line = masked_text.count("\n", 0, match.start()) + 1
+        attr_end_line = masked_text.count("\n", 0, match.end()) + 1
+        attr_end_col = match.end() - (masked_text.rfind("\n", 0, match.end()) + 1)
+        opened = _find_brace_after(masked.lines, attr_end_line - 1, attr_end_col)
+        if opened is None:
+            scope_text = masked_text[match.end() :]
+        else:
+            open_line, open_col = opened
+            end_line = open_line
+            depth = 0
+            for j in range(open_line, len(masked.lines)):
+                segment = masked.lines[j][open_col if j == open_line else 0 :]
+                done = False
+                for ch in segment:
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end_line = j
+                            done = True
+                            break
+                if done:
+                    break
+            else:
+                end_line = len(masked.lines) - 1
+            scope_text = "\n".join(masked.lines[open_line : end_line + 1])
+        result.append(BoilerplateAllow(
+            line=attr_line,
+            column=match.start() - (masked_text.rfind("\n", 0, match.start()) + 1),
+            stale=tuple(lint for lint in tracked if _BOILERPLATE_LINTS[lint] not in scope_text),
+            local=opened is not None and not _OTHER_FILE_RE.search(scope_text),
+        ))
+    return tuple(result)
+
+
 def gen_test_allow_boilerplate(spec: CandidatesSpec, project_root: Path) -> Enumeration:
     _ = spec
     candidates: list[Candidate] = []
     for path in rust_files(project_root):
         rel = path.relative_to(project_root).as_posix()
-        masked = read_masked(path)
-        masked_text = "\n".join(masked.lines)
-        for match in _ALLOW_RE.finditer(masked_text):
-            lints = [part.strip() for part in match.group(1).replace("\n", " ").split(",")]
-            tracked = [lint for lint in lints if lint in _BOILERPLATE_LINTS]
-            if not tracked:
-                continue
-            attr_line = masked_text.count("\n", 0, match.start()) + 1
-            attr_end_line = masked_text.count("\n", 0, match.end()) + 1
-            attr_end_col = match.end() - (masked_text.rfind("\n", 0, match.end()) + 1)
-            opened = _find_brace_after(masked.lines, attr_end_line - 1, attr_end_col)
-            if opened is None:
-                scope_text = masked_text[match.end() :]
-            else:
-                open_line, open_col = opened
-                end_line = open_line
-                depth = 0
-                for j in range(open_line, len(masked.lines)):
-                    segment = masked.lines[j][open_col if j == open_line else 0 :]
-                    done = False
-                    for ch in segment:
-                        if ch == "{":
-                            depth += 1
-                        elif ch == "}":
-                            depth -= 1
-                            if depth == 0:
-                                end_line = j
-                                done = True
-                                break
-                    if done:
-                        break
-                else:
-                    end_line = len(masked.lines) - 1
-                scope_text = "\n".join(masked.lines[open_line : end_line + 1])
-            for lint in tracked:
-                if _BOILERPLATE_LINTS[lint] not in scope_text:
-                    candidates.append(
-                        Candidate(
-                            file=rel,
-                            line=attr_line,
-                            text=f"strip {lint} — 0 matches of `{_BOILERPLATE_LINTS[lint]}` in scope",
-                        )
-                    )
+        for allow in boilerplate_allows(read_masked(path)):
+            candidates.extend(
+                Candidate(
+                    file=rel,
+                    line=allow.line,
+                    text=f"strip {lint} — 0 matches of `{_BOILERPLATE_LINTS[lint]}` in scope",
+                )
+                for lint in allow.stale
+            )
     candidates.sort(key=lambda c: (c.file, c.line, c.text))
     return Enumeration(candidates=tuple(candidates), source="parse:allow-lints-vs-scope-matches")
 

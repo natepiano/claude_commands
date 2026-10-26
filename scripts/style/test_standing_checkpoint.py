@@ -17,6 +17,7 @@ from unittest import mock
 from typing import cast, final, override
 
 import fake_fmt
+import mechanical_classes
 import style_ledger
 import style_rules
 
@@ -48,6 +49,10 @@ class StandingCheckpointTests(unittest.TestCase):
         self.unit = self.root / "sample-style-names"
         self.catalog = self.root / "nate_style/rust"
         self.catalog.mkdir(parents=True)
+        # The CLI checks the class list against this catalog, so each listed rule is here as a tier E rule, which has
+        # no cells.
+        for rule in sorted({rule for entry in mechanical_classes.classes() for rule in entry.rules}):
+            self.write(self.catalog / f"{rule}.md", f"---\ntier: E\n---\n# {rule}\n")
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.env = {

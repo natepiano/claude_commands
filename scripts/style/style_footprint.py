@@ -22,6 +22,8 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Literal, TypedDict, cast
 
+from candidate_generators import boilerplate_allows, mask_source
+
 RAW_STRING = re.compile(r'(?:br|cr|r)(#*)"')
 QUOTED_LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|b?'(?:\\.|[^'\\\n])' ''', re.VERBOSE | re.DOTALL)
 NUMBER = re.compile(r"\d[\w.]*(?:[+-]\d+)?")
@@ -765,6 +767,8 @@ class LintAttribute:
 class LintAttributeProof:
     before: tuple[TokenRewrite, ...] = ()
     after: tuple[TokenRewrite, ...] = ()
+    # Each removed attribute with the attribute that replaces it, or None when it goes whole.
+    pairs: tuple[tuple[LintAttribute, LintAttribute | None], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -931,6 +935,7 @@ def prove_lint_removals(change: FileChange) -> LintAttributeProof:
         offset += len(hunk.added) - hunk.old_count
     before: list[TokenRewrite] = []
     after: list[TokenRewrite] = []
+    pairs: list[tuple[LintAttribute, LintAttribute | None]] = []
     for operation, old_start, old_end, new_start, new_end in operations:
         if operation == "equal":
             continue
@@ -941,19 +946,24 @@ def prove_lint_removals(change: FileChange) -> LintAttributeProof:
         ):
             continue
         pending: list[TokenRewrite] = []
+        matched: list[tuple[LintAttribute, LintAttribute | None]] = []
         cursor = 0
         for span in removed:
             previous = old_by_start[span[0]]
+            replacement: LintAttribute | None = None
             if cursor < len(added):
                 following = new_by_start[added[cursor][0]]
                 if (previous.level == following.level and previous.inner == following.inner
                         and following.names <= previous.names and following.reason in {(), previous.reason}):
                     pending.append(TokenRewrite(following.start, following.end, ()))
+                    replacement = following
                     cursor += 1
+            matched.append((previous, replacement))
         if cursor == len(added):
             before.extend(TokenRewrite(start, end, ()) for start, end in removed)
             after.extend(pending)
-    return LintAttributeProof(tuple(dict.fromkeys(before)), tuple(dict.fromkeys(after)))
+            pairs.extend(matched)
+    return LintAttributeProof(tuple(dict.fromkeys(before)), tuple(dict.fromkeys(after)), tuple(dict.fromkeys(pairs)))
 
 
 def original_rewrites(source: tuple[Token, ...], omitted: tuple[TokenRewrite, ...],
@@ -3742,6 +3752,168 @@ def moved_files(changes: tuple[FileChange, ...], before: RevisionTree) -> frozen
                      if moves.spans(change.path, False) or moves.spans(change.path, True))
 
 
+def lint_removal_files(changes: tuple[FileChange, ...], before: RevisionTree) -> frozenset[str]:
+    """The files of the change whose whole edit is a proven lint name removal (`prove_lint_removals`), when `judge`
+    finds the whole change mechanical. A file that adds an allow or changes code is not one."""
+    if isinstance(judge_changes(changes, before, prove_item_moves(changes, before)), Review):
+        return frozenset()
+    return frozenset(change.path for change in changes if stale_lint_removal(change, before))
+
+
+# Line breaks other than `\n` would move the generator's lines and columns away from the tokens' offsets.
+OTHER_LINE_BREAKS = frozenset("\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+
+
+def stale_lint_removal(change: FileChange, before: RevisionTree) -> bool:
+    """Whether the whole edit of the file removes stale lint names from test-scope allow attributes. Each removed name
+    must be one that the `test_allow_boilerplate` generator reports stale for that attribute in the before text, and
+    the attribute must be in a test scope: inside or on an item that `cfg_test_items` finds, or in a file that
+    `test_file` finds. A kept attribute keeps its prefix, its other lint names and its reason token for token; only a
+    trailing comma may change. An attribute whose scope can reach another file is not explained: an attribute on an
+    out-of-line `mod x;`, one whose scope declares such a module or calls `include!`, and an inner attribute, which
+    the generator does not read (nor an `expect`). Neither is an attribute in a macro token tree, which the macro can
+    put anywhere."""
+    proof = prove_lint_removals(change)
+    if not removes_only_lint_names(change, proof) or OTHER_LINE_BREAKS & set(change.before):
+        return False
+    allows = {(allow.line, allow.column): allow for allow in boilerplate_allows(mask_source(change.before))}
+    spans = token_spans(change.before)
+    old, new = tokens(change.before), tokens(change.after)
+    words = tuple(token.value.removeprefix("r#") for token in old)
+    tests = cfg_test_items(words)
+    macros = macro_spans(words, delimiter_ends(words))
+    whole_file: bool | None = None
+    for previous, following in proof.pairs:
+        if not spans:
+            return False
+        offset = spans[previous.start].start
+        line_start = change.before.rfind("\n", 0, offset) + 1
+        allow = allows.get((change.before.count("\n", 0, offset) + 1, offset - line_start))
+        removed = previous.names - (following.names if following else frozenset())
+        if (allow is None or not allow.local or not removed
+                or not {"".join(name) for name in removed} <= set(allow.stale)
+                or any(start < previous.start < end for start, end in macros)):
+            return False
+        if not any(start <= previous.start < end for start, end in tests):
+            whole_file = test_file(before, change.path) if whole_file is None else whole_file
+            if not whole_file:
+                return False
+        if following is not None and lint_arguments(new[following.start:following.end]) != [
+                group for group in lint_arguments(old[previous.start:previous.end])
+                if tuple(token.value for token in group) not in removed]:
+            return False
+        if following is not None and (old[previous.start:previous.start + 4] != new[following.start:following.start + 4]
+                                      or old[previous.end - 2:previous.end] != new[following.end - 2:following.end]):
+            return False
+    return True
+
+
+# The words of the one attribute that gates an item to test builds.
+CFG_TEST = ("#", "[", "cfg", "(", "test", ")", "]")
+
+
+def cfg_test_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
+    """The word range of each item that an outer attribute of exactly `#[cfg(test)]` gates, words without `r#`: from
+    the first outer attribute of the item to the end of its body, or to its `;` when no body comes first. A
+    `cfg(test)` inside `cfg_attr`, `any()`, `all()` or `not()` is another attribute, and an attribute that is not at
+    an item start outside every macro token tree (`code_item_starts`) gates no item that the scan reads."""
+    ends = delimiter_ends(words)
+    starts = code_item_starts(words)
+    outer = [span for span in attribute_spans(words) if words[span[0] + 1] != "!"]
+    result: list[tuple[int, int]] = []
+    index = 0
+    while index < len(outer):
+        first = index
+        while index + 1 < len(outer) and outer[index + 1][0] == outer[index][1]:
+            index += 1
+        stack = outer[first:index + 1]
+        index += 1
+        if stack[0][0] not in starts or all(words[begin:end] != CFG_TEST for begin, end in stack):
+            continue
+        cursor = stack[-1][1]
+        while cursor < len(words) and words[cursor] not in {"{", ";", ")", "]", "}"}:
+            # A `;` or `{` in a paren or bracket, as in `-> [u8; 4]`, is not the item's own.
+            cursor = ends.get(cursor, len(words)) + 1 if words[cursor] in {"(", "["} else cursor + 1
+        if cursor < len(words) and words[cursor] == ";":
+            result.append((stack[0][0], cursor + 1))
+        elif cursor < len(words) and words[cursor] == "{" and cursor in ends:
+            result.append((stack[0][0], ends[cursor] + 1))
+    return tuple(result)
+
+
+def test_file(sources: RevisionTree, path: str) -> bool:
+    """Whether the whole file is test code of its package, the folder of the nearest Cargo.toml when that file has a
+    [package] table: a file under the package's tests/ folder, or a module file under src/ that every out-of-line
+    `mod` declaring it puts in a `cfg_test_items` item, or in a file that is itself such a module file. A crate root
+    and a file under src/bin/ are not. The answer is no when the proof cannot read the package's module tree: the
+    manifest is missing or unreadable, sets a target path or a build script (`crate_manifest`), or a file of the
+    package has a `path` attribute, an `include!`, a `macro` item or a `mod` in a macro token tree."""
+    crate = sources.crate(path)
+    try:
+        manifest = crate_manifest(sources, crate)
+    except MoveRefused:
+        return False
+    package = manifest.get("package")
+    if not isinstance(package, dict) or "build" in package:
+        return False
+    files = {file: plain_words(sources.text(file)) for file in crate_files(sources, crate, ())}
+    for words in files.values():
+        macros = macro_spans(words, delimiter_ends(words))
+        attributes = attribute_spans(words)
+        if ("macro" in words or any(word == "path" for begin, end in attributes for word in words[begin:end])
+                or any(word == "include" and words[index + 1:index + 2] == ("!",) for index, word in enumerate(words))
+                or any(words[index] == "mod" for start, end in macros for index in range(start, end))):
+            return False
+    if PurePosixPath(path).relative_to(crate).parts[:1] == ("tests",):
+        return True
+    declarations: dict[str, list[tuple[str, bool]]] = {}
+    for file, words in files.items():
+        ends = delimiter_ends(words)
+        tests = cfg_test_items(words)
+        inline = [(index, ends[index + 2], words[index + 1]) for index in range(len(words) - 2)
+                  if words[index] == "mod" and words[index + 2] == "{" and index + 2 in ends]
+        folder = PurePosixPath(file).parent
+        for index in range(len(words) - 2):
+            if words[index] != "mod" or words[index + 2] != ";" or not IDENTIFIER.fullmatch(words[index + 1]):
+                continue
+            nesting = [name for start, end, name in inline if start < index < end]
+            # The file can be a crate root or `mod.rs`, whose modules sit beside it, or another module file.
+            for base in (folder, folder / PurePosixPath(file).stem):
+                target = base.joinpath(*nesting, words[index + 1])
+                for loaded in (str(target.with_suffix(".rs")), str(target / "mod.rs")):
+                    declarations.setdefault(loaded, []).append(
+                        (file, any(start <= index < end for start, end in tests)))
+
+    def test_module(file: str, seen: frozenset[str]) -> bool:
+        module = crate_module(file, PurePosixPath(crate) / "src")
+        return (not isinstance(module, OutsideCrate) and bool(module) and file in declarations
+                and all(gated or (parent not in seen and test_module(parent, seen | {parent}))
+                        for parent, gated in declarations[file]))
+
+    return test_module(path, frozenset({path}))
+
+
+def lint_arguments(attribute: tuple[Token, ...]) -> list[tuple[Token, ...]]:
+    """The comma-separated arguments of an outer `#[level(...)]` attribute, with no empty group for a trailing comma."""
+    groups: list[tuple[Token, ...]] = []
+    current: list[Token] = []
+    for token in attribute[4:-2]:
+        if token.value == ",":
+            groups.append(tuple(current))
+            current = []
+        else:
+            current.append(token)
+    if current:
+        groups.append(tuple(current))
+    return groups
+
+
+def removes_only_lint_names(change: FileChange, proof: LintAttributeProof) -> bool:
+    """Whether the proof removes at least one lint name and the two sides match once its rewrites are made."""
+    return bool(proof.before) and rewrite_tokens(tokens(change.before), proof.before) == rewrite_tokens(
+        tokens(change.after), proof.after)
+
+
 def judge_changes(changes: tuple[FileChange, ...], before: RevisionTree,
                   moves: ItemMoves | NoItemMoves) -> Mechanical | Review:
     reasons: list[str] = []
@@ -3761,9 +3933,7 @@ def judge_changes(changes: tuple[FileChange, ...], before: RevisionTree,
         semantic_change = semantic_changes[change.path]
         lines = changed_text_without_lint_attributes(change, proof.lint_attributes)
         words = {token.value for token in tokens(lines)}
-        lint_only = bool(proof.lint_attributes.before) and rewrite_tokens(
-            tokens(change.before), proof.lint_attributes.before,
-        ) == rewrite_tokens(tokens(change.after), proof.lint_attributes.after)
+        lint_only = removes_only_lint_names(change, proof.lint_attributes)
         if change.status is not FileStatus.MODIFIED or ("mod" in words and not lint_only):
             reasons.append("check 1: file or module layout changes")
         glob_reexported = before.has_public_glob(before.crate(change.path))

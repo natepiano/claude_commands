@@ -11,6 +11,8 @@ file is in the user's state folder, never in the issue folder.
 Usage:
   proposal_issue.py approve <issue> --by user|showrunner --showrunner S --unit U --plan P
   proposal_issue.py unapprove <issue> [--dry-run]
+  proposal_issue.py reopen <issue>
+  proposal_issue.py decline-answer <issue> --words W
   proposal_issue.py start <issue>
   proposal_issue.py close <issue> --as-built PATH
   proposal_issue.py rules <issue> --rules URLS
