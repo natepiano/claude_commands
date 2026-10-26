@@ -22,6 +22,7 @@ import re
 import subprocess
 import tomllib
 from dataclasses import dataclass
+from itertools import accumulate
 from pathlib import Path
 from typing import Callable
 from typing import Literal
@@ -345,18 +346,77 @@ _FIELD_RE = re.compile(rf"^\s*{_VIS_RE}(?:r#)?([a-z_]\w*)\s*:\s*(.+?),?\s*$")
 _VARIANT_RE = re.compile(r"^\s*([A-Z]\w*)\s*(?:[,({=]|$)")
 
 
-def _find_body_open(lines: list[str], start_line: int, start_col: int) -> tuple[int, int] | None:
-    """First `{` at/after (start_line, start_col), unless `;` or `(` comes first."""
+_ITEM_TOKEN_RE = re.compile(r"(?:r#)?[A-Za-z_]\w*|\S")
+_CLOSERS = {")": "(", "]": "[", "}": "{", ">": "<"}
+
+
+def _find_item_body(lines: list[str], start_line: int, start_col: int) -> tuple[int, int] | None:
+    """The `{` of an item's body in masked lines, at/after the position: the first `{` outside every `()`, `[]`,
+    `{}` and generic `<>`, so a const block in `-> S<{ N }>`, `[u8; { N }]` or `where T: Tr<{ N }>` is not it. A
+    `>` of `->` or `=>` closes nothing, and in `()` or `[]` no `<` or `>` counts. None when a `;`, `=`, `use` or,
+    before a `where`, a `,` comes first outside them (an item with no body, an initializer, a use group, a field or a
+    variant), when the brackets do not balance, or when `=>`, `|` or `if` follows the braces (a match arm's struct
+    pattern)."""
+    stack: list[str] = []
+    clause = False
     col = start_col
     for idx in range(start_line, len(lines)):
-        segment = lines[idx][col:]
-        for k, ch in enumerate(segment):
-            if ch == "{":
-                return idx, col + k
-            if ch in ";(":
+        line = lines[idx]
+        for match in _ITEM_TOKEN_RE.finditer(line, col):
+            token = match.group()
+            top = stack[-1] if stack else ""
+            if top == "{":
+                if token == "{":
+                    stack.append(token)
+                elif token == "}":
+                    _ = stack.pop()
+            elif token in {"<", ">"} and top in {"(", "["}:
+                continue
+            elif token == ">" and match.start() and line[match.start() - 1] in "-=":
+                continue
+            elif token in _CLOSERS:
+                if top != _CLOSERS[token]:
+                    return None
+                _ = stack.pop()
+            elif token in {"(", "[", "<"} or (token == "{" and stack):
+                stack.append(token)
+            elif token == "{":
+                close = _find_body_close(lines, idx, match.start())
+                if close is not None and _next_token(lines, close[0], close[1] + 1) in {"=", "|", "if"}:
+                    return None
+                return idx, match.start()
+            elif top == "<" and token == ";":
+                return None
+            elif not stack and token == "where":
+                clause = True
+            elif not stack and (token in {";", "=", "use"} or (token == "," and not clause)):
                 return None
         col = 0
     return None
+
+
+def _find_body_close(lines: list[str], open_line: int, open_col: int) -> tuple[int, int] | None:
+    """The position of the `}` that closes the `{` at (open_line, open_col), or None when none does."""
+    depth = 0
+    for idx in range(open_line, len(lines)):
+        start = open_col if idx == open_line else 0
+        for k, ch in enumerate(lines[idx][start:]):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return idx, start + k
+    return None
+
+
+def _next_token(lines: list[str], line: int, col: int) -> str:
+    """The first token at/after the position, or "" at the end of the text."""
+    for idx in range(line, len(lines)):
+        match = _ITEM_TOKEN_RE.search(lines[idx], col if idx == line else 0)
+        if match is not None:
+            return match.group()
+    return ""
 
 
 def _scan_block_fields(lines: list[str], open_line: int, open_col: int) -> list[FieldDef]:
@@ -384,7 +444,7 @@ def scan_structs(lines: list[str]) -> list[StructDef]:
         match = _STRUCT_RE.match(line)
         if match is None:
             continue
-        opened = _find_body_open(lines, idx, match.end())
+        opened = _find_item_body(lines, idx, match.end())
         if opened is None:
             continue
         open_line, open_col = opened
@@ -399,7 +459,7 @@ def scan_enums(lines: list[str]) -> list[EnumDef]:
         match = _ENUM_RE.match(line)
         if match is None:
             continue
-        opened = _find_body_open(lines, idx, match.end())
+        opened = _find_item_body(lines, idx, match.end())
         if opened is None:
             continue
         open_line, open_col = opened
@@ -426,30 +486,23 @@ def scan_enums(lines: list[str]) -> list[EnumDef]:
     return enums
 
 
+_CFG_TEST = "#[cfg(test)]"
+
+
 def test_spans(lines: list[str]) -> list[tuple[int, int]]:
-    """1-based inclusive line ranges of `#[cfg(test)]` items."""
+    """1-based inclusive line ranges of `#[cfg(test)]` items, from the attribute to the `}` of the item's body. The
+    body search starts after the attribute's `]`; an item with no body, such as `mod tests;`, gives no span."""
     spans: list[tuple[int, int]] = []
     for idx, line in enumerate(lines):
-        if "#[cfg(test)]" not in line:
+        col = line.find(_CFG_TEST)
+        if col < 0:
             continue
-        col = line.index("#[cfg(test)]")
-        opened = _find_body_open(lines, idx, col)
+        opened = _find_item_body(lines, idx, col + len(_CFG_TEST))
         if opened is None:
             continue
-        open_line, open_col = opened
-        depth = 0
-        for j in range(open_line, len(lines)):
-            segment = lines[j][open_col if j == open_line else 0 :]
-            for ch in segment:
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        spans.append((idx + 1, j + 1))
-                        break
-            if depth == 0 and spans and spans[-1][0] == idx + 1:
-                break
+        close = _find_body_close(lines, *opened)
+        if close is not None:
+            spans.append((idx + 1, close[0] + 1))
     return spans
 
 
@@ -664,28 +717,17 @@ def gen_bevy_kana_usage(spec: CandidatesSpec, project_root: Path) -> Enumeration
 # ---------------------------------------------------------------------------
 
 _ALLOW_RE = re.compile(r"#\[allow\(([^)]*?)\)\s*\]", re.S)
-# An out-of-line module declaration or an `include!` brings another file's code into a scope.
-_OTHER_FILE_RE = re.compile(r"\bmod\s+(?:r#)?[A-Za-z_]\w*\s*;|\binclude\s*!")
+# An out-of-line module declaration brings another file's code into a scope.
+_OTHER_FILE_RE = re.compile(r"\bmod\s+(?:r#)?[A-Za-z_]\w*\s*;")
+# Any `include` word (a call, a use leaf, an alias source as in `use std::include as load;`, a path segment) can bring
+# another file's code, and a `macro_rules!` or `macro` item outside a scope can emit code into it, so either word
+# anywhere in the file makes no scope of the file local. A raw `r#include` counts; `include_str` is another word.
+_UNREAD_CODE_RE = re.compile(r"\b(?:include|macro|macro_rules)\b")
 _BOILERPLATE_LINTS = {
     "clippy::expect_used": ".expect(",
     "clippy::unwrap_used": ".unwrap(",
     "clippy::panic": "panic!",
 }
-
-
-def _find_brace_after(lines: list[str], start_line: int, start_col: int) -> tuple[int, int] | None:
-    """First `{` at/after the position, stopping only at `;` (parens are fine —
-    the scope owner is usually a fn signature or a mod header)."""
-    col = start_col
-    for idx in range(start_line, len(lines)):
-        segment = lines[idx][col:]
-        for k, ch in enumerate(segment):
-            if ch == "{":
-                return idx, col + k
-            if ch == ";":
-                return None
-        col = 0
-    return None
 
 
 def gen_allows_without_reason(spec: CandidatesSpec, project_root: Path) -> Enumeration:
@@ -710,9 +752,11 @@ def gen_allows_without_reason(spec: CandidatesSpec, project_root: Path) -> Enume
 @dataclass(frozen=True)
 class BoilerplateAllow:
     """One `#[allow(...)]` attribute that names a tracked lint: where its `#` is, the tracked lints with zero matches
-    of their pattern in the attribute's scope, and whether that scope is all in this file. A scope is not local when
-    the item has no body brace before its `;` (an out-of-line `mod x;`, where the generator reads the rest of the
-    file), or its body declares an out-of-line module or calls `include!`."""
+    of their pattern in the attribute's scope, and whether that scope is all in this file. The scope is the whole
+    item after the attribute, through the `}` of its body (`_find_item_body`): its other attributes, signature,
+    generics, where clause and body, so a const block in the signature is in it. A scope is not local when the item
+    has no body (an out-of-line `mod x;`, where the generator reads the rest of the file), the item declares an
+    out-of-line module, or the file holds any `include` word or a `macro_rules!` or `macro` item (`_UNREAD_CODE_RE`)."""
 
     line: int  # 1-based
     column: int  # 0-based
@@ -724,6 +768,8 @@ def boilerplate_allows(masked: MaskedSource) -> tuple[BoilerplateAllow, ...]:
     """Each tracked `#[allow(...)]` attribute of one masked file, with its stale lints."""
     result: list[BoilerplateAllow] = []
     masked_text = "\n".join(masked.lines)
+    unread = _UNREAD_CODE_RE.search(masked_text) is not None
+    line_starts = list(accumulate((len(line) + 1 for line in masked.lines), initial=0))
     for match in _ALLOW_RE.finditer(masked_text):
         lints = [part.strip() for part in match.group(1).replace("\n", " ").split(",")]
         tracked = [lint for lint in lints if lint in _BOILERPLATE_LINTS]
@@ -732,35 +778,16 @@ def boilerplate_allows(masked: MaskedSource) -> tuple[BoilerplateAllow, ...]:
         attr_line = masked_text.count("\n", 0, match.start()) + 1
         attr_end_line = masked_text.count("\n", 0, match.end()) + 1
         attr_end_col = match.end() - (masked_text.rfind("\n", 0, match.end()) + 1)
-        opened = _find_brace_after(masked.lines, attr_end_line - 1, attr_end_col)
-        if opened is None:
-            scope_text = masked_text[match.end() :]
-        else:
-            open_line, open_col = opened
-            end_line = open_line
-            depth = 0
-            for j in range(open_line, len(masked.lines)):
-                segment = masked.lines[j][open_col if j == open_line else 0 :]
-                done = False
-                for ch in segment:
-                    if ch == "{":
-                        depth += 1
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0:
-                            end_line = j
-                            done = True
-                            break
-                if done:
-                    break
-            else:
-                end_line = len(masked.lines) - 1
-            scope_text = "\n".join(masked.lines[open_line : end_line + 1])
+        opened = _find_item_body(masked.lines, attr_end_line - 1, attr_end_col)
+        close = None if opened is None else _find_body_close(masked.lines, *opened)
+        # The whole item after the attribute: its other attributes, signature, generics, where clause and body.
+        end = len(masked_text) if close is None else line_starts[close[0]] + close[1] + 1
+        scope_text = masked_text[match.end() : end]
         result.append(BoilerplateAllow(
             line=attr_line,
             column=match.start() - (masked_text.rfind("\n", 0, match.start()) + 1),
             stale=tuple(lint for lint in tracked if _BOILERPLATE_LINTS[lint] not in scope_text),
-            local=opened is not None and not _OTHER_FILE_RE.search(scope_text),
+            local=opened is not None and not unread and not _OTHER_FILE_RE.search(scope_text),
         ))
     return tuple(result)
 
