@@ -141,6 +141,8 @@ ADD_UNIT = SCRIPTS / "production" / "add_unit.py"
 SEND = SCRIPTS / "message" / "send.py"
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
+# herdr lists a stopped agent as live for a few seconds after its process ends.
+AGENT_EXIT_SECONDS = 15.0
 RESTART_LAUNCH_WORKERS = 6
 REMOTE_CONTROL_WAIT_SECONDS = 10.0
 WINDOW_DELAY_SECONDS = 1.2
@@ -1098,6 +1100,24 @@ def restore_desktop(state: DesktopLaunchState, *, dry_run: bool = False) -> None
     )
 
 
+def _holds_live_agent(client: herdr.Herdr, destination: HerdrDestination) -> bool:
+    """Whether the destination still holds a live agent once herdr has seen the stop.
+
+    herdr reads an agent's exit some seconds after the process ends, so a restart
+    right after its own stop can see the stopped agent still listed as live.
+    """
+    deadline = time.monotonic() + AGENT_EXIT_SECONDS
+    while True:
+        held = any((isinstance(destination, NewHerdrSession)
+                    or (isinstance(destination, RecordedHerdrPane) and row["pane_id"] == destination.pane_id))
+                   and row.get("agent")
+                   and row["agent_status"] not in {"exited", "stopped", "dead"} for row in client.agents())
+        remaining = deadline - time.monotonic()
+        if not held or remaining <= 0:
+            return held
+        time.sleep(min(SESSION_POLL_SECONDS, remaining))
+
+
 def _herdr_launch(
     parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool,
     session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ,
@@ -1159,11 +1179,7 @@ def _herdr_launch(
                 print(f"{name} restart issue: pane restore left panes not resumed{reason}; run "
                       + "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py")
         client = herdr.Herdr(name)
-        agents = client.agents()
-        if any((isinstance(destination, NewHerdrSession)
-                or (isinstance(destination, RecordedHerdrPane) and row["pane_id"] == destination.pane_id))
-               and row.get("agent")
-               and row["agent_status"] not in {"exited", "stopped", "dead"} for row in agents):
+        if _holds_live_agent(client, destination):
             location = (f"{name}:{destination.pane_id}" if isinstance(destination, RecordedHerdrPane)
                         else name)
             raise OSError(f"herdr {location}: pane still holds a live agent")
@@ -2895,6 +2911,12 @@ def _mark_pushed_not_back(login: str, ids: tuple[str, ...], names: set[str]) -> 
             settle.mark_not_back_pushed(saved)
 
 
+def move_failed_push(saved: SessionShutdown) -> RenderedPush:
+    """A move whose session did not start: retrying its record starts it on the target, never the source."""
+    return render("shutdown.move_failed", session=saved["session"]["name"], machine=saved["machine"],
+                  source=saved.get("source_label", saved["label"]), target=saved.get("target", ""))
+
+
 def restart_push(label: str, names: list[str], *, machine: str) -> tuple[RenderedPush, ...]:
     """Render known failed sessions, or the unconfirmed machine when names are unavailable."""
     if not names:
@@ -3032,7 +3054,13 @@ def restart(
                 peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
                     re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+|already running; skipped$)", line)
                     for line in peer["lines"]))
-                if names or not_reached or failed or peer_requires_retry:
+                moved = {saved["session"]["name"]: saved for saved in session_records(selected.login)
+                         if saved.get("target") and saved["machine"] == local.machine
+                         and saved["session"]["name"] in {item.name for item in failed}}
+                for saved in moved.values():
+                    settle.alert_user(move_failed_push(saved))
+                names = [name for name in names if name not in moved]
+                if names or not_reached or peer_requires_retry:
                     for push in restart_push(selected.label, names, machine=" and ".join(machines)):
                         settle.alert_user(push)
                 for item in manual:

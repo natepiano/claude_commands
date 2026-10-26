@@ -2376,6 +2376,21 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(push.values["stopped"], "One session (Beta)")
         self.assertIn("window launch failed", output)
 
+    def test_selected_restart_of_a_failed_move_pushes_the_move_alert_not_a_restart_onto_the_source(self) -> None:
+        _ = self.save_three({"kind": "stopped", "at": OCTOBER})
+        def move(current: record.SessionShutdown) -> None:
+            current["target"], current["source_label"] = "claude3", current["label"]
+        _ = record.update_session(LOGIN, "beta-id", move)
+        with (patch.object(restart_work, "_launch_session", side_effect=OSError("pane still holds a live agent")),
+              patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionNotLive()),
+              patch.object(settle, "alert_user") as alert):
+            status, _output, error = self.action("restart", "beta-id")
+        self.assertEqual((status, error), (1, ""))
+        alert.assert_called_once()
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["session"], push.values["target"]), ("Beta", "claude3"))
+
     def test_selected_now_refuses_in_progress_and_clean_stopped_records_without_work(self) -> None:
         cases: list[record.SessionProgress] = [{"kind": "stopping", "at": OCTOBER}, {"kind": "stopped", "at": OCTOBER}]
         for progress in cases:

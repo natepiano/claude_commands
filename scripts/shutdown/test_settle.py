@@ -3373,6 +3373,25 @@ class SettleTests(ShutdownTestCase):
                 self.assertIsInstance(push.action, ActionRequired)
                 self.assertNotIn("status", cast(ActionRequired, push.action).text)
 
+    def test_failed_move_pushes_its_target_account_and_no_restart_onto_its_source(self) -> None:
+        saved = session_shutdown(top_level("ups-id", "ups"), then="restart",
+            progress={"kind": "restart failed", "at": NOW, "reason": "herdr agents:w1:p1: pane still holds a live agent"})
+        saved["target"], saved["source_label"] = "claude3", saved["label"]
+        self.save(saved)
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(restart_work, "_target_config_dir",
+                           return_value=restart_work.RecordedConfigDir(self.root / ".claude3")),
+              patch.object(settle, "run_remote", return_value=(0, "[]")),
+              patch.object(settle, "send_message"),
+              patch.object(settle, "alert_user") as alert,
+              redirect_stdout(io.StringIO())):
+            settle.report_stop([saved])
+        alert.assert_called_once()
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["session"], push.values["target"]), ("ups", "claude3"))
+        self.assertNotIn("restart", cast(ActionRequired, push.action).text)
+
     def test_automatic_restart_with_an_unsent_prompt_pushes_the_failed_session_name(self) -> None:
         saved = session_shutdown(top_level("unsent-owner", "Unsent owner"), then="restart",
             progress={"kind": "restart failed", "at": NOW, "reason": "restart prompt not submitted"})
