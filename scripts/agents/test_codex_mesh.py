@@ -10733,6 +10733,40 @@ class ServerRecordTests(unittest.TestCase):
         self.assertEqual(roster["project-impl"]["status"], "ended")
         self.assertEqual(roster["project-impl"]["role"], "impl")
 
+    def test_pause_reaps_a_server_that_never_answers_inside_the_shutdown_limit(self) -> None:
+        # The 10-26 move: a hung server kept the pause waiting past the 30 s a
+        # shutdown gives the stop, so the stop died before the reap.
+        silent = socket.socket()
+        self.addCleanup(silent.close)
+        silent.bind(("127.0.0.1", 0))
+        silent.listen()
+        port = cast(int, silent.getsockname()[1])
+        server_pid = self.sleeper()
+        self.write_server(port, server_pid)
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
+            "project-impl": {
+                "thread_id": "thread-impl", "status": "running", "role": "impl",
+                "turn_id": "turn-impl", "port": port,
+            },
+        }), encoding="utf-8")
+
+        started = time.monotonic()
+        with patch.object(codex_mesh, "PAUSE_INTERRUPT_SECS", 0.5), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            code = codex_mesh.command_stop(
+                argparse.Namespace(session_dir=str(self.session_dir), pause=True)
+            )
+
+        self.assertEqual(code, 0)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertIsNotNone(self.spawned[0].wait(timeout=5), "app-server outlived stop --pause")
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+        roster = cast("dict[str, dict[str, object]]", json.loads(
+            (self.session_dir / codex_mesh.ROSTER_FILE).read_text(encoding="utf-8")
+        ))
+        self.assertEqual(roster["project-impl"]["status"], "paused")
+        self.assertIs(roster["project-impl"]["paused_turn"], True)
+
 
 
 class RunFolderNameSweepTests(unittest.TestCase):

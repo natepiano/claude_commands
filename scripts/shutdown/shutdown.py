@@ -653,13 +653,6 @@ def _unresolved_snapshot_lines(login: str, only: tuple[str, ...] = ()) -> list[s
         if item["state"] != "unresolved" or (only and owner["session_id"] not in only):
             continue
         lines.append(f"  {owner['name']}: unresolved; last seen {_local_time(item['last_seen'])}")
-        if owner["host"]["kind"] in {"legacy tmux", "legacy tmux unit"}:
-            if item["agent"] == "codex":
-                command = restart_work.legacy_codex_command(item)
-            else:
-                saved = recovery_store.snapshot_restore_record(snapshot, item)
-                command = restart_work.legacy_resume_command(saved)
-            lines.append(f"    manual restart: {command}")
     return lines
 
 
