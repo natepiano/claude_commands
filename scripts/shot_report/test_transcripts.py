@@ -22,7 +22,8 @@ from scripts.shot_report.episodes import (
 from scripts.shot_report.transcripts import (
     AttemptCountInferredFromImages, AvailableTimingSource, ExactAttemptCountFromOrderedCaptures, ExactOrderedCaptureAttempts,
     FailedCapture, HanaShotDurationUnavailable, MeasuredHanaShotDuration, NamedCaptureView, PersistentScanCache,
-    RememberedScript, SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptScan, TranscriptToolEvent, scan_calls,
+    RememberedScript, SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptScan, TranscriptToolEvent,
+    parsed_tool_event_category, scan_calls,
 )
 from scripts.shot_report.transcripts import _classify, _remember  # pyright: ignore[reportPrivateUsage]
 from scripts.shot_report.transcripts import CachedScanEvidence
@@ -221,6 +222,33 @@ class TranscriptTest(unittest.TestCase):
             "file_reads_searches_and_edits",
             "other_tool_calls",
         ])
+
+    def test_hana_source_paths_are_file_work_and_hana_methods_are_brp_calls(self) -> None:
+        for name, command, expected in (
+            ("Bash", "rg camera crates/hana/src", "file_reads_searches_and_edits"),
+            ("Bash", "cat crates/hana/src/x.rs", "file_reads_searches_and_edits"),
+            ("Bash", "rg -n 'hana/' crates/hana/src", "file_reads_searches_and_edits"),
+            ("Bash", 'cat "/work tree/crates/hana/src/x.rs"', "file_reads_searches_and_edits"),
+            ("Bash", "cat hana/src/x.rs", "file_reads_searches_and_edits"),
+            ("Bash", "cat hana/src.rs", "file_reads_searches_and_edits"),
+            ("Bash", "cat myhana/invoke_command", "file_reads_searches_and_edits"),
+            ("Bash", "cat .hana/invoke_command", "file_reads_searches_and_edits"),
+            ("Bash", "cat my-hana/invoke_command", "file_reads_searches_and_edits"),
+            ("Bash", "curl -d '{\"method\":\"hana/invoke_command\"}' http://localhost:15797", "other_brp"),
+            ("Bash", "curl --data '{\"method\": \"hana/invoke_command\"}' http://localhost:15797", "other_brp"),
+            ("mcp__brp__hana_invoke_command", "", "other_brp"),
+            ("mcp__brp__world_query", "", "other_brp"),
+        ):
+            with self.subTest(name=name, command=command):
+                self.assertEqual(parsed_tool_event_category(name, command), expected)
+
+    def test_hana_methods_with_shell_escapes_or_rpc_calls_remain_brp_work(self) -> None:
+        for command in (
+            r'curl -d "{\"method\":\"hana/invoke_command\"}" http://localhost:15797',
+            """python3 -c 'rpc("hana/invoke_command", {})'""",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(parsed_tool_event_category("Bash", command), "other_brp")
 
     def test_timeline_fixture_extracts_all_tools_and_attributes_exact_minutes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -452,6 +480,28 @@ class TranscriptTest(unittest.TestCase):
             _ = cache.path.write_bytes(b"\x80\x04invalid")
             repaired = scan_calls(root / "claude", root / "codex", cache=cache)
             self.assertEqual((len(repaired), repaired.bytes_read), (1, transcript.stat().st_size))
+
+    def test_previous_cache_version_reparses_hana_source_searches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "claude" / "source-search.jsonl"
+            _claude_case(transcript, [("Bash", "rg camera crates/hana/src", "found camera")])
+            cache = PersistentScanCache(root / "scan.pickle")
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache).bytes_read,
+                             transcript.stat().st_size)
+            state = cast(CachedScanEvidence, pickle.loads(cache.path.read_bytes()))
+            state.format_version = 6
+            for saved_transcript in state.files.values():
+                saved_transcript.evidence.tool_events[:] = [
+                    replace(event, category="other_brp") for event in saved_transcript.evidence.tool_events
+                ]
+            _ = cache.path.write_bytes(pickle.dumps(state))
+
+            rebuilt = scan_calls(root / "claude", root / "codex", cache=cache)
+
+            self.assertEqual([event.category for event in rebuilt.tool_events], ["file_reads_searches_and_edits"])
+            self.assertEqual(rebuilt.bytes_read, transcript.stat().st_size)
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache).bytes_read, 0)
 
     def test_uncached_nonlocal_timing_matches_nonlocal_call(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

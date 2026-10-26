@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import sqlite3
 import subprocess
@@ -20,23 +21,25 @@ from enum import Enum
 from itertools import accumulate
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import cast
+from typing import assert_never, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
-from approved_renames import (RUST_KEYWORDS, AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
+import coverage_report
+import mechanical_classes
+from approved_renames import (AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, RenameNotApplied, UncertainScan, applied_check,
-                              approved_rename, declaration_sites, enclosing, file_rename, inline_modules, item_starts)
+                              approved_rename, declaration_sites, enclosing, file_rename, inline_modules)
 from add_style import StandingStyleProduction, standing_style_production
 import rules
 import style_ledger
 import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
-from production_units import Refusal, production_field
+from production_units import Refusal, cell_value, production_field, unit_table
 from proposal_issue import ApprovedDecision, decision_answer
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 
@@ -118,17 +121,25 @@ class MissingUnitPlan:
     pass
 
 
+def _unit_plan(doc: Path, unit: str, worktree: Path) -> Path:
+    for row in unit_table(doc.read_text().splitlines()):
+        if cell_value(row["Unit"]) == unit:
+            return worktree / Path(cell_value(row["Plan"]))
+    raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
+
+
 def family_plan_texts(doc: Path) -> Mapping[rules.Family, str | MissingUnitPlan]:
     """Read each style unit's own standing plan copy."""
     texts: dict[rules.Family, str | MissingUnitPlan] = {}
     for row in unit_worktrees(doc):
-        for family in FAMILIES:
-            if row.unit == family + "-unit":
-                plan = row.worktree / "docs/style-production/units" / (row.unit + ".md")
-                try:
-                    texts[family] = plan.read_text()
-                except FileNotFoundError:
-                    texts[family] = MissingUnitPlan()
+        family = rules.style_family(row.unit)
+        if isinstance(family, rules.NotStyleUnit):
+            continue
+        plan = _unit_plan(doc, row.unit, row.worktree)
+        try:
+            texts[family] = plan.read_text()
+        except FileNotFoundError:
+            texts[family] = MissingUnitPlan()
     return texts
 
 
@@ -137,7 +148,7 @@ def family_plan_settings(doc: Path, repo: Path, *, unit: str = "") -> Mapping[ru
     return {family: unit_plan_settings(text, repo) if isinstance(text, str)
             else UnitPlanSettings(AllCrates(), frozenset())
             for family, text in family_plan_texts(doc).items()
-            if not unit or unit == family + "-unit"}
+            if not unit or rules.style_family(unit) == family}
 
 
 def family_pilot_scopes(doc: Path, repo: Path) -> Mapping[rules.Family, PilotScope]:
@@ -415,19 +426,32 @@ def approved_reference_tokens(
     return approved_word_swaps(before[old_cursor:], after[new_cursor:], pairs, unique)
 
 
+@dataclass(frozen=True)
+class UnreadableText:
+    """The file is not at HEAD, or the HEAD file or the worktree file is not UTF-8 text the gate can read."""
+
+
+def head_and_worktree(repo: Path, head_path: str, target: Path) -> tuple[str, str] | UnreadableText:
+    """The text of the file at head_path in HEAD, and the text of the worktree file at target."""
+    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{head_path}"], capture_output=True, check=False)
+    if result.returncode:
+        return UnreadableText()
+    try:
+        return result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        return UnreadableText()
+
+
 def approved_reference_file(
     repo: Path, path: str, pairs: tuple[ApprovedRename, ...], unique: frozenset[ApprovedRename],
 ) -> bool:
     target = repo / path
     if not pairs or target.is_symlink() or not target.is_file():
         return False
-    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
-    if result.returncode:
+    texts = head_and_worktree(repo, path, target)
+    if isinstance(texts, UnreadableText):
         return False
-    try:
-        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
-    except (OSError, UnicodeError):
-        return False
+    before, after = texts
     if target.suffix == ".md":
         return before != after and approved_word_swaps(before, after, pairs, unique)
     return target.suffix == ".rs" and approved_reference_tokens(before, after, pairs, unique)
@@ -461,24 +485,11 @@ class NoLibrary:
 
 
 @dataclass(frozen=True)
-class OutsideCrate:
-    """The file is not a module file of the renamed file's crate, so its `crate`, `self` and `super` paths do not resolve."""
+class PathAttributes:
+    """The `mod` keywords whose attributes hold a `path` word, and the string of each one whose path is the renamed file."""
 
-
-CrateModule = tuple[str, ...] | OutsideCrate
-
-
-@dataclass(frozen=True)
-class UnresolvedPath:
-    """The path does not start at `crate`, `self` or `super`, or its file is outside the crate, so it names no known module."""
-
-
-@dataclass(frozen=True)
-class UseTrees:
-    """The path before each segment and glob of the file's `use` items, and the `use` keyword of each segment and alias."""
-
-    prefixes: Mapping[int, tuple[str, ...]]
-    keywords: Mapping[int, int]
+    keywords: frozenset[int]
+    literals: Mapping[int, int]
 
 
 @dataclass(frozen=True)
@@ -494,15 +505,15 @@ class GlobImport:
     """A `*` import in one inline module scope, and the module path it imports from."""
 
     scope: tuple[InlineModule, ...]
-    source: tuple[str, ...] | UnresolvedPath
+    source: tuple[str, ...] | style_footprint.UnresolvedPath
 
 
-# The anchors that start a path the gate resolves from the file's own module.
-PATH_ANCHORS = frozenset({"crate", "self", "super"})
 # The item keywords whose name is in the type namespace, where a module name lives.
 TYPE_ITEM_KEYWORDS = frozenset({"mod", "struct", "enum", "union", "trait", "type"})
 # The words after a `use` leaf.
 USE_LEAF_ENDS = frozenset({";", ",", "}", "as"})
+# A path in a comment that starts at `crate`, as in an intra-doc link `[`crate::ledger::lock`]`.
+CRATE_PATH = re.compile(r"(?<![\w:$])crate(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 
 
 def crate_root(repo: Path, moved: FileRename) -> PurePosixPath | NoCrateRoot:
@@ -528,83 +539,28 @@ def crate_library(repo: Path, root: PurePosixPath) -> Library | NoLibrary:
     return NoLibrary()
 
 
-def crate_module(path: str, root: PurePosixPath) -> CrateModule:
-    """The module path of a Rust file under the crate root folder: `()` for the crate root file."""
-    file = PurePosixPath(path)
-    if file.suffix != ".rs" or not file.is_relative_to(root):
-        return OutsideCrate()
-    folders = file.relative_to(root).parent.parts
-    if folders[:1] == ("bin",):
-        # Each file in `bin` is the root of a crate of its own.
-        return OutsideCrate()
-    if not folders and file.stem in {"lib", "main"}:
-        return ()
-    return folders if file.stem == "mod" else (*folders, file.stem)
-
-
-def resolved_module(prefix: tuple[str, ...], module: CrateModule) -> tuple[str, ...] | UnresolvedPath:
-    """The module that a path starting at `crate`, `self` or `super` names from module."""
-    if isinstance(module, OutsideCrate) or not prefix or prefix[0] not in PATH_ANCHORS:
-        return UnresolvedPath()
-    rest = prefix[1:]
-    base = () if prefix[0] == "crate" else module
-    if prefix[0] == "super":
-        rest = prefix
-        while rest and rest[0] == "super":
-            if not base:
-                return UnresolvedPath()
-            base, rest = base[:-1], rest[1:]
-    return UnresolvedPath() if PATH_ANCHORS & set(rest) else base + rest
-
-
-def use_trees(words: tuple[str, ...], starts: frozenset[int]) -> UseTrees:
-    prefixes: dict[int, tuple[str, ...]] = {}
-    keywords: dict[int, int] = {}
-    for keyword, word in enumerate(words):
-        if word != "use" or keyword not in starts:
-            continue
-        groups: list[tuple[str, ...]] = [()]
-        path: list[str] = []
-        cursor = keyword + 1
-        while cursor < len(words) and words[cursor] != ";":
-            part = words[cursor]
-            if part == "{":
-                groups.append(groups[-1] + tuple(path))
-                path = []
-            elif part in {"}", ","}:
-                if part == "}" and len(groups) > 1:
-                    _ = groups.pop()
-                path = []
-            elif part == "as":
-                cursor += 1
-                keywords[cursor] = keyword
-            elif part != "::":
-                prefixes[cursor] = groups[-1] + tuple(path)
-                keywords[cursor] = keyword
-                path.append(part)
-            cursor += 1
-    return UseTrees(prefixes, keywords)
-
-
 @dataclass(frozen=True)
 class RenamedModuleScan:
-    """One Rust file read at HEAD, and the module file rename whose references the scan finds in it."""
+    """One Rust file at path read at HEAD, and the module file rename whose references the scan finds in it."""
 
+    path: str
     words: tuple[str, ...]
-    module: CrateModule
+    module: style_footprint.CrateModule
     parent: tuple[str, ...]
-    stem: str
+    moved: FileRename
     library: Library | NoLibrary
 
-    def sites(self) -> frozenset[int]:
-        """The words that name the renamed module: its `mod` line and the path segments that name it.
+    def renames(self) -> Mapping[int, str]:
+        """The words that name the renamed module, each with its new word: its `mod` line, the path segments that name
+        it, and the `#[path]` string that names its file.
 
         A word is a site only when the scan is certain; the gate keeps every other word unchanged.
         """
-        words, stem = self.words, self.stem
-        starts = item_starts(words)
+        words, stem = self.words, self.moved.old_stem
+        starts = style_footprint.code_item_starts(words)
         modules = inline_modules(words, starts)
-        trees = use_trees(words, starts)
+        trees = style_footprint.use_trees(words, starts)
+        paths = self.path_attributes(starts, modules)
         depths = (0, *accumulate((word == "{") - (word == "}") for word in words))
         bindings: list[ModuleBinding] = []
         globs: list[GlobImport] = []
@@ -617,9 +573,10 @@ class RenamedModuleScan:
             scope = enclosing(modules, anchor)
             if word == "*":
                 if index in trees.prefixes:
-                    globs.append(GlobImport(scope, resolved_module(trees.prefixes[index], self.scope_module(scope))))
+                    globs.append(GlobImport(scope, style_footprint.resolved_module(trees.prefixes[index],
+                                                                                   self.scope_module(scope))))
                 continue
-            renamed = self.mod_line(index, starts, modules)
+            renamed = self.mod_line(index, starts, modules, paths)
             if index in trees.prefixes and words[index + 1] in {";", ",", "}"}:
                 renamed = self.names_parent(trees.prefixes[index], self.scope_module(scope))
             elif not (renamed or words[index - 1] == "as"
@@ -635,7 +592,7 @@ class RenamedModuleScan:
             if index == 0 or word != stem or words[index - 1] == "." or words[index + 1:index + 3] == ("::", "<"):
                 continue
             scope = enclosing(modules, index)
-            if self.mod_line(index, starts, modules):
+            if self.mod_line(index, starts, modules, paths):
                 found.add(index)
             elif index in trees.prefixes and (trees.prefixes[index] or words[index - 1] == "::"):
                 if (words[index + 1] == "::" or words[index + 1] in USE_LEAF_ENDS) and self.names_parent(
@@ -647,30 +604,60 @@ class RenamedModuleScan:
                         or (not prefix and words[index - 1] != "::" and not block_bindings
                             and self.bound_in(scope, tuple(bindings), tuple(globs)))):
                     found.add(index)
-        return frozenset(found)
+        old_name, new_name = PurePosixPath(self.moved.old).name, PurePosixPath(self.moved.new).name
+        return ({index: self.moved.new_stem for index in found}
+                | {index: words[index].removesuffix(old_name + '"') + new_name + '"' for index in paths.literals.values()})
 
-    def scope_module(self, scope: tuple[InlineModule, ...]) -> CrateModule:
-        if isinstance(self.module, OutsideCrate):
+    def scope_module(self, scope: tuple[InlineModule, ...]) -> style_footprint.CrateModule:
+        if isinstance(self.module, style_footprint.OutsideCrate):
             return self.module
         return self.module + tuple(module.name for module in scope)
 
-    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> bool:
-        """Whether the word at index is the name in the renamed module's `mod <name>;` line."""
-        return (self.words[index - 1:index] == ("mod",) and index - 1 in starts
-                and self.words[index + 1:index + 2] == (";",)
-                and self.scope_module(enclosing(modules, index)) == self.parent)
+    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...], paths: PathAttributes) -> bool:
+        """Whether the word at index is the name in the renamed module's `mod <name>;` line.
 
-    def names_parent(self, prefix: tuple[str, ...], module: CrateModule) -> bool:
+        A line with a `path` attribute declares the renamed module only when the attribute's string names its file.
+        """
+        if not (self.words[index - 1:index] == ("mod",) and index - 1 in starts
+                and self.words[index + 1:index + 2] == (";",)):
+            return False
+        if index - 1 in paths.keywords:
+            return index - 1 in paths.literals
+        return self.scope_module(enclosing(modules, index)) == self.parent
+
+    def path_attributes(self, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> PathAttributes:
+        """The `path` attributes of the file's `mod` items.
+
+        A `#[path = "<string>"]` names the renamed file when it is the only `path` word of a `mod` at an item start
+        outside every inline module, and its string, read from the file's own folder, is the old file and ends with the
+        old file's name. A string with an escape, or a `path` word in any other form, names no file the gate can read.
+        """
+        words, old_name = self.words, PurePosixPath(self.moved.old).name
+        spans = dict(style_footprint.attribute_spans(words))
+        attributes = style_footprint.decorated_items(words)
+        keywords = frozenset(owner for owner, words_of in attributes.items() if words[owner] == "mod" and "path" in words_of)
+        literals: dict[int, int] = {}
+        for start, owner in style_footprint.attribute_owners(words).items():
+            named = words[start + 4][1:-1] if spans[start] == start + 6 else ""
+            if (owner in keywords and owner in starts and attributes[owner].count("path") == 1
+                    and not enclosing(modules, owner)
+                    and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named
+                    and named.rsplit("/", 1)[-1] == old_name
+                    and posixpath.normpath(str(PurePosixPath(self.path).parent / named)) == self.moved.old):
+                literals[owner] = start + 4
+        return PathAttributes(keywords, MappingProxyType(literals))
+
+    def names_parent(self, prefix: tuple[str, ...], module: style_footprint.CrateModule) -> bool:
         """Whether a path prefix read in module names the renamed module's parent.
 
         A plain prefix such as `ledger` names it from a child of module inside the crate, and from the library's name in
         a file outside the crate.
         """
-        if prefix and prefix[0] in PATH_ANCHORS:
-            return resolved_module(prefix, module) == self.parent
-        if not prefix or PATH_ANCHORS & set(prefix):
+        if prefix and prefix[0] in style_footprint.PATH_ANCHORS:
+            return style_footprint.resolved_module(prefix, module) == self.parent
+        if not prefix or style_footprint.PATH_ANCHORS & set(prefix):
             return False
-        if isinstance(module, OutsideCrate):
+        if isinstance(module, style_footprint.OutsideCrate):
             return isinstance(self.library, Library) and prefix == (self.library.name, *self.parent)
         return module + prefix == self.parent
 
@@ -701,170 +688,116 @@ class RenamedModuleScan:
         return False
 
 
-def without_trailing_commas(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The words without a comma that ends a brace or bracket list, or a paren list after a name, `>`, `)` or `]`.
+def renamed_comment(line: str, scans: tuple[RenamedModuleScan, ...]) -> str:
+    """The comment line with each `crate` path segment that names a renamed module changed to the module's new name.
 
-    A paren list there is the arguments of a call, a parameter list or a tuple struct pattern, where a trailing comma
-    does not change the code, so a reformat that adds or drops one leaves the code the same. Any other paren list can be
-    a tuple, where `(x,)` and `(x)` differ, so its comma stays.
+    A segment names a renamed module when it is the old name and the segments before it name the module's parent. A
+    comment has no certain scope, so a `self` or `super` path stays unchanged.
     """
-    droppable: list[bool] = []
-    dropped: set[int] = set()
-    for index, word in enumerate(words):
-        if word in {"(", "[", "{"}:
-            lead = words[index - 1] if index else ""
-            droppable.append(word != "(" or lead in {">", ")", "]"} or (
-                style_footprint.IDENTIFIER.fullmatch(lead) is not None and lead not in RUST_KEYWORDS))
-        elif word in {")", "]", "}"} and droppable and droppable.pop() and words[index - 1:index] == (",",):
-            dropped.add(index - 1)
-    return tuple(word for index, word in enumerate(words) if index not in dropped)
+    def renamed_path(path: re.Match[str]) -> str:
+        segments = path[0].split("::")
+        return "::".join(next((scan.moved.new_stem for scan in scans if segment == scan.moved.old_stem
+                               and scan.names_parent(tuple(segments[:index]), scan.module)), segment)
+                         for index, segment in enumerate(segments))
+    return CRATE_PATH.sub(renamed_path, line)
 
 
-def sorted_use_groups(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The words of a `use` item with the entries of each brace group in sorted order."""
-    result: list[str] = []
-    cursor = 0
-    while cursor < len(words):
-        if words[cursor] != "{":
-            result.append(words[cursor])
-            cursor += 1
-            continue
-        end = style_footprint.closing(words, cursor)
-        entries: list[tuple[str, ...]] = []
-        start = inner = cursor + 1
-        while inner < end:
-            if words[inner] == "{":
-                inner = style_footprint.closing(words, inner)
-            elif words[inner] == ",":
-                entries.append(sorted_use_groups(words[start:inner]))
-                start = inner + 1
-            inner += 1
-        entries.append(sorted_use_groups(words[start:end]))
-        result.append("{")
-        for position, entry in enumerate(sorted(entry for entry in entries if entry)):
-            result.extend((",", *entry) if position else entry)
-        result.append("}")
-        cursor = end + 1
-    return tuple(result)
+@dataclass(frozen=True)
+class RenamedText:
+    """A Rust file's HEAD code and comment lines with the edits of the approved renames made, in canonical order.
 
-
-def module_items(words: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
-    """The first and last word of each `use` item and `mod <name>;` item, attributes and visibility included, in order.
-
-    An item with a `macro_use` attribute is left out: its place decides where its macros can be used.
+    Module sites tells whether the file names a module of an approved file rename, in its code or in a comment.
     """
-    starts = item_starts(words)
-    attributes = {end: start for start, end in style_footprint.attribute_spans(words)}
-    visibilities = {style_footprint.closing(words, index + 1) + 1: index for index, word in enumerate(words[:-1])
-                    if word == "pub" and words[index + 1] == "("}
-    items: list[tuple[int, int]] = []
-    for keyword, word in enumerate(words):
-        if keyword not in starts:
-            continue
-        if word == "use":
-            end = next((index for index in range(keyword, len(words)) if words[index] == ";"), len(words))
-        elif word == "mod" and words[keyword + 2:keyword + 3] == (";",):
-            end = keyword + 2
-        else:
-            continue
-        start = visibilities.get(keyword, keyword - 1 if words[keyword - 1:keyword] == ("pub",) else keyword)
-        while start in attributes:
-            start = attributes[start]
-        if end < len(words) and "macro_use" not in words[start:keyword]:
-            items.append((start, end))
-    return tuple(items)
+
+    code: tuple[style_footprint.CodePiece, ...]
+    module_sites: bool
+
+    def matches(self, after: str) -> bool:
+        """Whether the worktree text has this code and these comment lines in canonical order."""
+        spans = style_footprint.token_spans(after)
+        return (len(spans) == len(style_footprint.tokens(after))
+                and self.code == style_footprint.canonical_code(
+                    tuple(span.token.value for span in spans),
+                    style_footprint.comment_gaps(after, spans, lambda line: line)))
 
 
-def module_runs(words: tuple[str, ...]) -> tuple[tuple[tuple[int, int], ...], ...]:
-    """The runs of adjacent module items, each item by its first and last word, in order."""
-    runs: list[list[tuple[int, int]]] = []
-    for start, end in module_items(words):
-        if runs and runs[-1][-1][1] + 1 == start:
-            runs[-1].append((start, end))
-        else:
-            runs.append([(start, end)])
-    return tuple(tuple(run) for run in runs)
+@dataclass(frozen=True)
+class NoRenamedText:
+    """The HEAD text has a token the gate cannot read, or a renamed file is not in a crate whose modules it can name."""
 
 
-def canonical_order(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The words with trailing commas dropped, use group entries sorted and each run of adjacent module items sorted.
+def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ...],
+                 pairs: tuple[ApprovedRename, ...]) -> RenamedText | NoRenamedText:
+    """The HEAD text of the Rust file at path with the edits of the approved renames made.
 
-    None of these changes the code, and rustfmt makes them when a rename changes a name's sort order or line length.
+    Each module site of an approved file rename takes its new word, then each qualified reference of an approved rename,
+    which reads its parent from the HEAD words. In comments, each `crate` path to a renamed module is renamed.
     """
-    words = without_trailing_commas(words)
-    result: list[str] = []
-    cursor = 0
-    for run in module_runs(words):
-        result.extend(words[cursor:run[0][0]])
-        result.extend(word for item in sorted(sorted_use_groups(words[start:end + 1]) for start, end in run)
-                      for word in item)
-        cursor = run[-1][1] + 1
-    result.extend(words[cursor:])
-    return tuple(result)
-
-
-def comment_lines(text: str, spans: tuple[style_footprint.TokenSpan, ...]) -> tuple[str | tuple[str, ...], ...]:
-    """The stripped lines of the comments between the code tokens, in order.
-
-    The lines from the start of a run of module items to its last word are one sorted entry: canonical_order sorts the
-    run's items, and their comments move with them.
-    """
-    ends = (0, *(span.end for span in spans))
-    starts = (*(span.start for span in spans), len(text))
-    gaps = tuple(tuple(line.strip() for line in text[end:start].splitlines() if line.strip())
-                 for end, start in zip(ends, starts, strict=True))
-    entries: list[str | tuple[str, ...]] = []
-    cursor = 0
-    for run in module_runs(tuple(span.token.value for span in spans)):
-        first, last = run[0][0], run[-1][1]
-        entries.extend(line for gap in gaps[cursor:first] for line in gap)
-        entries.append(tuple(sorted(line for gap in gaps[first:last + 1] for line in gap)))
-        cursor = last + 1
-    entries.extend(line for gap in gaps[cursor:] for line in gap)
-    return tuple(entries)
-
-
-def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
-    """Whether a Rust file outside the findings changes only the `mod` lines and module paths of approved file renames,
-    and the qualified references of approved renames.
-
-    The file's HEAD words with each module site renamed, then each qualified reference, must equal its worktree words in
-    canonical order, and no comment changes. A qualified reference reads its parent from the HEAD words.
-    """
-    target = repo / path
-    if not moves or target.suffix != ".rs" or target.is_symlink() or not target.is_file():
-        return False
-    result = subprocess.run(["git", "-C", str(repo), "show", f"HEAD:{path}"], capture_output=True, check=False)
-    if result.returncode:
-        return False
-    try:
-        before, after = result.stdout.decode("utf-8"), target.read_bytes().decode("utf-8")
-    except (OSError, UnicodeError):
-        return False
-    old, new = style_footprint.token_spans(before), style_footprint.token_spans(after)
-    if len(old) != len(style_footprint.tokens(before)) or len(new) != len(style_footprint.tokens(after)):
-        return False
+    old = style_footprint.token_spans(before)
+    if len(old) != len(style_footprint.tokens(before)):
+        return NoRenamedText()
     words = tuple(span.token.value for span in old)
     renamed = list(words)
+    scans: list[RenamedModuleScan] = []
     for moved in moves:
         root = crate_root(repo, moved)
         if isinstance(root, NoCrateRoot):
-            return False
-        module = crate_module(moved.old, root)
-        if isinstance(module, OutsideCrate):
-            return False
-        scan = RenamedModuleScan(words, crate_module(path, root), module[:-1], moved.old_stem, crate_library(repo, root))
-        for index in scan.sites():
-            renamed[index] = moved.new_stem
-    if tuple(renamed) == words:
-        return False
+            return NoRenamedText()
+        module = style_footprint.crate_module(moved.old, root)
+        if isinstance(module, style_footprint.OutsideCrate):
+            return NoRenamedText()
+        scans.append(RenamedModuleScan(path, words, style_footprint.crate_module(path, root), module[:-1], moved,
+                                       crate_library(repo, root)))
+        for index, word in scans[-1].renames().items():
+            renamed[index] = word
+    comments = style_footprint.comment_gaps(before, old, lambda line: renamed_comment(line, tuple(scans)))
+    module_sites = tuple(renamed) != words or comments != style_footprint.comment_gaps(before, old, lambda line: line)
     use_parents = use_reference_parents(words)
     for index, word in enumerate(words):
         for pair in pairs:
             if word == pair.old and approved_reference_qualifier(words, index, use_parents, pair):
                 renamed[index] = pair.new
-    return (canonical_order(tuple(renamed)) == canonical_order(tuple(span.token.value for span in new))
-            and comment_lines(before, old) == comment_lines(after, new))
+    return RenamedText(style_footprint.canonical_code(tuple(renamed), comments), module_sites)
+
+
+def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
+    """Whether a Rust file outside the findings changes only the `mod` lines, `#[path]` strings and module paths of
+    approved file renames, and the qualified references of approved renames.
+
+    The file must name a renamed module, and its worktree text must be its renamed_text. A file that names no renamed
+    module is judged by approved_reference_file alone.
+    """
+    target = repo / path
+    if not moves or target.suffix != ".rs" or target.is_symlink() or not target.is_file():
+        return False
+    texts = head_and_worktree(repo, path, target)
+    if isinstance(texts, UnreadableText):
+        return False
+    expected = renamed_text(repo, path, texts[0], moves, pairs)
+    return isinstance(expected, RenamedText) and expected.module_sites and expected.matches(texts[1])
+
+
+def approved_renamed_file(repo: Path, moved: FileRename, moves: tuple[FileRename, ...],
+                          pairs: tuple[ApprovedRename, ...]) -> bool:
+    """Whether the new file of an approved file rename is the old file at HEAD with only the edits approved_module_file
+    allows, so no definition moves into or out of it.
+
+    The old file must be gone and no file may be at the new path in HEAD. Self references such as `crate::ledger::lock`
+    take the new name. The file's `use` and `mod` lines may take another order, which moves no definition between files.
+    """
+    target = repo / moved.new
+    in_head = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"HEAD:{moved.new}"],
+                             capture_output=True, check=False).returncode == 0
+    if target.is_symlink() or not target.is_file() or os.path.lexists(repo / moved.old) or in_head:
+        return False
+    texts = head_and_worktree(repo, moved.old, target)
+    if isinstance(texts, UnreadableText):
+        return False
+    # An unchanged file needs no scan, so a file outside every crate root, as in `tests/`, can move too.
+    if texts[0] == texts[1]:
+        return True
+    expected = renamed_text(repo, moved.old, texts[0], moves, pairs)
+    return isinstance(expected, RenamedText) and expected.matches(texts[1])
 
 
 def outside_refusal(path: str, moves: tuple[FileRename, ...]) -> str:
@@ -888,6 +821,54 @@ def worktree_check(repo: Path, finding: style_ledger.HeldFinding) -> AppliedChec
     return applied_check(finding.kind, finding.before, finding.after, finding.path, lambda path: worktree_file(repo, path))
 
 
+@dataclass(frozen=True)
+class ApprovedTicket:
+    """The findings of a proposal ticket whose decision is approved, their approved file renames, and the paths that
+    the findings and renames allow."""
+
+    findings: tuple[style_ledger.HeldFinding, ...]
+    moves: tuple[FileRename, ...]
+    allowed: frozenset[str]
+
+
+def approved_ticket(
+    ledger: style_ledger.Ledger, ticket_id: str, origin: style_ledger.ApprovedProposal,
+) -> ApprovedTicket:
+    """Read the ticket's decision; raise unless it is open, approved for the ticket's unit, and still holds the ticket's
+    filed findings. The gate and `widen` both read approval here."""
+    fields = frontmatter(origin.issue)
+    decision = Issue(origin.issue, fields)
+    answer = decision_answer(decision)
+    if not origin.finding_ids:
+        raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
+    by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
+    if any(identity not in by_id for identity in origin.finding_ids):
+        raise style_ledger.LedgerError("proposal ticket findings changed")
+    findings = tuple(by_id[identity] for identity in origin.finding_ids)
+    if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
+            or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
+            or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
+                   or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
+        raise style_ledger.LedgerError("proposal approval or filed findings changed")
+    moves = approved_file_renames(findings)
+    allowed = frozenset({finding.path for finding in findings} | {moved.new for moved in moves})
+    return ApprovedTicket(findings, moves, allowed)
+
+
+def widen(repo: Path, ticket_id: str, paths: tuple[str, ...], reason: str, by: str) -> None:
+    """Allow paths outside the findings of an approved proposal ticket, and print the ticket's widened paths."""
+    with style_ledger.open_ledger(repo) as ledger:
+
+        def allowed() -> frozenset[str]:
+            origin = ledger.ticket_origin(ticket_id)
+            if isinstance(origin, style_ledger.SelectedByCoverage):
+                raise style_ledger.LedgerError(f"{ticket_id}: only a proposal ticket widens")
+            return approved_ticket(ledger, ticket_id, origin).allowed
+
+        for widened in ledger.ticket_widen(ticket_id, paths, reason, by, allowed):
+            print(style_ledger.widened_line(widened))
+
+
 def gate(repo: Path, ticket_id: str) -> int:
     """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
@@ -902,26 +883,18 @@ def gate(repo: Path, ticket_id: str) -> int:
                 base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
-                return result.returncode if result.returncode in (0, 2) else 1
-            fields = frontmatter(origin.issue)
-            decision = Issue(origin.issue, fields)
-            answer = decision_answer(decision)
-            if not origin.finding_ids:
-                raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
-            by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
-            if any(identity not in by_id for identity in origin.finding_ids):
-                raise style_ledger.LedgerError("proposal ticket findings changed")
-            findings = tuple(by_id[identity] for identity in origin.finding_ids)
-            if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
-                    or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
-                    or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
-                           or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
-                raise style_ledger.LedgerError("proposal approval or filed findings changed")
-            moves = approved_file_renames(findings)
-            allowed = {finding.path for finding in findings} | {moved.new for moved in moves}
-            outside = changed_files(repo) - allowed
+                if result.returncode != 0:
+                    return 2 if result.returncode == 2 else 1
+                return format_check(repo)
+            approved = approved_ticket(ledger, ticket_id, origin)
+            findings, moves, allowed = approved.findings, approved.moves, set(approved.allowed)
+            # A widened path is allowed as it is; the rename and move checks below do not read it.
+            outside = changed_files(repo) - allowed - set(origin.widened)
+            pairs = approved_rename_pairs(findings)
             if outside:
-                pairs = approved_rename_pairs(findings)
+                outside -= mechanical_files(repo, frozenset(PurePosixPath(finding.rule.partition(":")[2]).stem
+                                                            for finding in findings))
+            if outside:
                 unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
                 modified = modified_reference_files(repo)
                 refused = [path for path in sorted(outside)
@@ -930,19 +903,172 @@ def gate(repo: Path, ticket_id: str) -> int:
                 if refused:
                     raise style_ledger.LedgerError("files outside approved findings: " + ", ".join(
                         outside_refusal(path, moves) for path in refused))
+            # A finding path is free, and a renamed file that another finding names moves under that approval.
+            free = {finding.path for finding in findings
+                    if not isinstance(file_rename(finding.kind, finding.path, finding.after), FileRename)}
+            # A rename with its old file still there and no new file is not applied: the check below reports it.
+            changed = [moved for moved in moves if not {moved.old, moved.new} & free
+                       and (os.path.lexists(repo / moved.new) or not os.path.lexists(repo / moved.old))
+                       and not approved_renamed_file(repo, moved, moves, pairs)]
+            if changed:
+                raise style_ledger.LedgerError("renamed files with other changes: " + ", ".join(
+                    f"{moved.new} (renamed from {moved.old}: change is not only the rename)" for moved in changed))
             unapplied = tuple(finding for finding in findings if isinstance(worktree_check(repo, finding), RenameNotApplied))
             if unapplied:
                 for finding in unapplied:
                     print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
                 return 1
+            if format_check(repo):
+                return 1
             print("approved proposal")
             return 0
-    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun, style_footprint.CheckCouldNotRun,
+            mechanical_classes.ClassListError) as error:
         print(f"error: {error}")
         return 2
     except ValueError as error:
         print(f"review: {error}")
         return 1
+
+
+CARGO_FMT_CHECK = ("cargo", "+nightly", "fmt", "--all", "--check", "--verbose", "--message-format", "short",
+                   "--", "--verbose")
+RUSTFMT_CHECK = ("rustfmt", "+nightly", "--check", "--files-with-diff")
+FMT_ERROR = re.compile(r"(?im)^error\b")
+
+
+@dataclass(frozen=True)
+class CargoFormat:
+    """What one `cargo +nightly fmt --all --check` run read: every file its module walk visited, and the visited files
+    it would change. All paths are resolved."""
+
+    visited: frozenset[Path]
+    listed: frozenset[Path]
+
+
+def format_check(repo: Path) -> int:
+    """Print each changed .rs file of the worktree that is not formatted, and return 1 if there is one, else 0.
+
+    `cargo +nightly fmt --all --check` judges each changed file that its module walk visits. Each other changed file
+    (an orphan, a file in no workspace package, a file under a `mod` that rustfmt skips) goes to
+    `rustfmt +nightly --check` by name with its package's edition. Both sides compare resolved paths, and a refusal
+    names each changed path and the command that judged it. The check never writes a file, and a change with no .rs
+    file runs neither command."""
+    root = repo.resolve()
+    changed: defaultdict[Path, list[str]] = defaultdict(list)
+    for path in sorted(changed_files(repo)):
+        if path.endswith(".rs") and (repo / path).is_file():
+            target = (root / path).resolve()
+            if not target.is_relative_to(root):
+                raise style_ledger.CheckCouldNotRun(f"{path} resolves to {target}, outside the repo")
+            changed[target].append(path)
+    if not changed:
+        return 0
+    cargo = cargo_format(root)
+    by_edition: defaultdict[str, list[Path]] = defaultdict(list)
+    for target in changed:
+        if target not in cargo.visited:
+            by_edition[package_edition(root, target.relative_to(root).as_posix())].append(target)
+    named = set[Path]().union(*(files_with_diff(root, edition, targets)
+                                for edition, targets in sorted(by_edition.items())))
+    judges = (("cargo +nightly fmt", cargo.listed), ("rustfmt +nightly", named))
+    refusals = sorted((path, judge) for judge, listed in judges for target in listed & changed.keys()
+                      for path in changed[target])
+    for path, judge in refusals:
+        print(f"review: not formatted ({judge}): {path}")
+    return 1 if refusals else 0
+
+
+def format_output(command: list[str], root: Path, label: str) -> tuple[int, list[str]]:
+    """The exit code and the stdout lines of a format check run in root.
+
+    Exit 0 passes whatever stderr holds (rustup info lines, config warnings). Exit 1 lists the files with a diff; an
+    error line on stderr with it, such as a parse error, is a failure to run, and so is any other exit code."""
+    try:
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise style_ledger.CheckCouldNotRun(f"{label} could not run: {error}") from error
+    error = FMT_ERROR.search(result.stderr) if result.returncode == 1 else None
+    if result.returncode not in (0, 1) or error:
+        detail = result.stderr[error.start():] if error else result.stderr
+        raise style_ledger.CheckCouldNotRun(f"{label} failed: "
+                                            + (detail.strip() or result.stdout.strip() or f"exit {result.returncode}"))
+    return result.returncode, [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def listed_files(code: int, lines: list[str], label: str) -> frozenset[Path]:
+    """The resolved files that a check run lists with a diff: each line that is an absolute .rs path. Every other line
+    (verbose notes, config file lines, timings) is not read. Exit 0 lists no file whatever stdout holds; exit 1 must
+    list one."""
+    if code == 0:
+        return frozenset()
+    listed = frozenset(Path(line).resolve() for line in lines if line.endswith(".rs") and Path(line).is_absolute())
+    if not listed:
+        raise style_ledger.CheckCouldNotRun(f"{label} failed: " + ("\n".join(lines) or f"exit {code}"))
+    return listed
+
+
+def cargo_format(root: Path) -> CargoFormat:
+    """The files that `cargo +nightly fmt --all --check` visits, from rustfmt's `Formatting <path>` lines, and the
+    files it lists with a diff."""
+    label = "cargo +nightly fmt --check"
+    code, lines = format_output(list(CARGO_FMT_CHECK), root, label)
+    visited = frozenset((root / line.removeprefix("Formatting ")).resolve()
+                        for line in lines if line.startswith("Formatting "))
+    return CargoFormat(visited, listed_files(code, lines, label))
+
+
+def files_with_diff(root: Path, edition: str, targets: list[Path]) -> frozenset[Path]:
+    """The resolved files that `rustfmt +nightly --check` lists for targets, read with edition."""
+    label = "rustfmt +nightly --check"
+    code, lines = format_output([*RUSTFMT_CHECK, "--edition", edition, *map(str, targets)], root, label)
+    return listed_files(code, lines, label)
+
+
+def package_edition(root: Path, path: str) -> str:
+    """The edition cargo gives the package that holds path: the nearest Cargo.toml with a `[package]` table, its
+    `edition`, the workspace's `[workspace.package]` edition under `edition.workspace = true`, else 2015."""
+    manifests: list[dict[str, object]] = []
+    for folder in (root / path).parents:
+        if not folder.is_relative_to(root):
+            break
+        if (folder / "Cargo.toml").is_file():
+            try:
+                manifests.append(tomllib.loads((folder / "Cargo.toml").read_text()))
+            except (UnicodeError, tomllib.TOMLDecodeError) as error:
+                raise style_ledger.CheckCouldNotRun(f"{folder / 'Cargo.toml'}: {error}") from error
+    for index, manifest in enumerate(manifests):
+        package = manifest.get("package")
+        if not isinstance(package, dict):
+            continue
+        edition = cast(dict[str, object], package).get("edition", "2015")
+        if isinstance(edition, dict) and cast(dict[str, object], edition).get("workspace") is True:
+            edition = workspace_edition(manifests[index:])
+        if isinstance(edition, str):
+            return edition
+        raise style_ledger.CheckCouldNotRun(f"{path}: its package has no edition that rustfmt can take")
+    raise style_ledger.CheckCouldNotRun(f"{path} is in no package, so rustfmt has no edition for it")
+
+
+def workspace_edition(manifests: list[dict[str, object]]) -> object:
+    """The `[workspace.package]` edition of the first manifest with a `[workspace]` table, or None."""
+    for manifest in manifests:
+        workspace = manifest.get("workspace")
+        if isinstance(workspace, dict):
+            shared = cast(dict[str, object], workspace).get("package")
+            return cast(dict[str, object], shared).get("edition") if isinstance(shared, dict) else None
+    return None
+
+
+def mechanical_files(repo: Path, ticket_rules: frozenset[str]) -> frozenset[str]:
+    """The changed files of the worktree that the proof of a class in `mechanical_classes.toml` explains, for a class
+    with a rule in ticket_rules (the rule names of the ticket's findings). Such a change needs no approval. A proven
+    item move gives the file each item leaves, the file it moves to, the parent file that gains the new `mod` line,
+    and each file with a re-pointed path or a use line of the move. A proven lint removal gives each file whose whole
+    edit removes stale lint names. `style_footprint.judge` must find the whole change mechanical, so the gate and judge
+    read the change the same way, and a changed file that no proof explains stays outside."""
+    changes = style_footprint.changes_between(repo, "HEAD", style_footprint.worktree_commit(repo))
+    return mechanical_classes.explained_files(changes, style_footprint.RevisionTree(repo, "HEAD"), ticket_rules)
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
@@ -1269,11 +1395,21 @@ def _is_two_judge_ticket(ticket: style_ledger.TicketRecord,
             and not any(_is_name_bindings_rule(pinned.rule_id) for pinned in texts))
 
 
+def mechanical_class_lines() -> list[str]:
+    """The unit's lines for the classes of `mechanical_classes.toml`: the apply rule, then one line per class."""
+    return ["Apply a finding of a mechanical class without asking only when `style_footprint.py check` finds the "
+            + "whole change mechanical. Hold it when the change adds an allow or changes code that the proof does not "
+            + "explain:",
+            *(f"- `{entry.name}` ({', '.join(f'`{rule}`' for rule in entry.rules)}): {entry.summary}"
+              for entry in mechanical_classes.classes())]
+
+
 def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
                context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
                file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
                crate_targets: CrateTargets = CrateTargets.LIBRARY,
-               proposal_cells: tuple[style_ledger.ProposalCell, ...] = ()) -> str:
+               proposal_cells: tuple[style_ledger.ProposalCell, ...] = (),
+               waived_findings: tuple[style_ledger.HeldFinding, ...] = ()) -> str:
     ticket_id = ticket["id"]
     number = ticket_id.rsplit("-", 1)[1]
     rule_lines = [f"- `{text.rule_id}`: `{plan.parent.parent / 'rules' / (text.blob + '.md')}` (blob `{text.blob}`)" for text in texts]
@@ -1296,6 +1432,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
     held_lines = (["Already-held findings: do not hold these again; record held for a file whose finding still stands."]
                   + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
                      for finding in held_findings]) if per_file_structure and held_findings else []
+    waived_lines = (["Waived by the user: do not hold these again. Record waived for a cell whose only findings are these."]
+                    + [f"- {finding.finding_id} · {finding.rule} · {finding.path}:{finding.line} · {finding.text}"
+                       for finding in waived_findings]) if per_file_structure and waived_findings else []
     approved = ticket["kind"] == "proposal"
     # The gate takes reference edits in other files only for these pairs, so the text names them.
     pairs = approved_rename_pairs(held_findings)
@@ -1315,16 +1454,24 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             line += " — " + ("lines " + ", ".join(f"{window.start}-{window.end}" for window in windows)
                               if windows else "empty file")
         files.append(line)
+    # A path that `widen` added is the ticket's work too; the line names who added it and why.
+    files.extend(f"- {style_ledger.widened_line(widened)}" for widened in ticket["widened"])
     authorization = (
-        f"Approved proposal `{ticket['proposal']}` overrides the mechanical-only invariant in the copied context "
-        + "and the mechanical-only style Spec for exactly this issue's approved findings. Apply those changes; "
-        + "Read the issue for its sites and before/after changes; hold every other non-mechanical finding. Package verification remains required."
-        if approved else "Every structure finding is held as a proposal. Apply only mechanical findings from other tickets."
+        f"This ticket builds the approved proposal `{ticket['proposal']}`: its approved findings are this ticket's work. "
+        + "Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required."
+        if approved else "Every structure finding is held as a proposal, except a finding of a mechanical class below. "
+        + "Apply only mechanical findings from other tickets."
     )
+    if approved:
+        goal = (f"Apply the approved findings of `{ticket['proposal']}` in {len(ticket['files'])} "
+                + f"{'file' if len(ticket['files']) == 1 else 'files'} of `{ticket['crate']}`.")
+    elif per_file_structure:
+        goal = f"Judge these {len(ticket['files'])} files of `{ticket['crate']}` against every pinned rule below."
+    else:
+        goal = f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below."
     return "\n".join([
         f"### Phase {number} — {ticket_id}  · status: todo", "", "#### Work Order", "", context, "",
-        "**Goal:**", (f"Judge these {len(ticket['files'])} files of `{ticket['crate']}` against every pinned rule below."
-                      if per_file_structure else f"Judge the {ticket['kind']} ticket for {ticket['family']} in `{ticket['crate']}` against every pinned rule below."),
+        "**Goal:**", goal,
         "", "**Spec:**", *rule_lines, *sites, *uncovered, *owned_lines,
         authorization,
         "Read only these pinned rule texts. A #uncovered rule is the parent rule's uncovered read.",
@@ -1375,6 +1522,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
              if per_file_structure else "Record each rule's crate verdict only after every file has been judged against it."),
             *[f"Record `{rule}` once with `--path {ticket['crate']}` after reading the manifests." for rule in manifest_rules],
             *held_lines,
+            *waived_lines,
         ] if ticket["kind"] == "structure" else []),
         *([
             "Judge window by window: take the files under **Files** in order, and each file's windows in order.",
@@ -1421,12 +1569,14 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
           + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
+        *mechanical_class_lines(),
         "Hold a finding only when the cited rule's text requires the change.",
         f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
         *record_lines,
         "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.",
         "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.",
-        "Use `--input-scope rule` when the verdict rests on other files in the crate or module.",
+        "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "
+        + "Without `--reads`, the cell comes back after any change in its crate or module.",
         "", "**Files:**", *files, "", "**Workers:**", workers, "",
         "**Acceptance gate:**", "For each touched package run:",
         "`bash ~/.claude/scripts/direct/verify.sh check <package>`",
@@ -1454,6 +1604,22 @@ def atomic_write(path: Path, data: bytes) -> None:
         staged.unlink(missing_ok=True)
 
 
+def _waived_ticket_findings(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                            rule_paths: Mapping[str, Path]) -> tuple[style_ledger.HeldFinding, ...]:
+    """Map waived sites with the ticket's pinned rules and repository layout."""
+    if ticket["kind"] != "structure":
+        return ()
+    metadata = {rule: frontmatter(path) for rule, path in rule_paths.items()}
+    manifest_rules = {rule for rule, fields in metadata.items()
+                      if fields.get("tier") == ["D"] and fields.get("input_scope") == ["manifest"]}
+    directories = (tuple(member.directory for member in coverage_report.workspace(ledger, ticket["base"]))
+                   if manifest_rules else ())
+    cells = {(rule, path) for rule, path in ticket["cells"]}
+    return tuple(finding for finding in ledger.held_findings(style_ledger.HeldFindingsInState("waived"))
+                 if (finding.rule, style_proposals.crate_for(directories, finding.path)
+                     if finding.rule in manifest_rules else finding.path) in cells)
+
+
 def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, plan: Path, text: str) -> None:
     texts = ledger.pinned_rule_texts(ticket["id"])
     ticket["base"] = ledger.ticket_base(ticket["id"])
@@ -1477,11 +1643,13 @@ def write_phase(ledger: style_ledger.Ledger, ticket: style_ledger.TicketRecord, 
         held = tuple(finding for finding in ledger.proposal_findings(Path(ticket["proposal"]))
                      if finding.finding_id in identities)
     cells = ledger.proposal_cells(ticket["id"]) if ticket["kind"] == "proposal" else ()
-    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells)
+    rule_paths = {pinned.rule_id: plan.parent.parent / "rules" / (pinned.blob + ".md") for pinned in texts}
     for pinned in texts:
-        path = plan.parent.parent / "rules" / (pinned.blob + ".md")
+        path = rule_paths[pinned.rule_id]
         if not path.exists() or git(plan.parent, "hash-object", str(path)).strip() != pinned.blob:
             atomic_write(path, pinned.text)
+    waived = _waived_ticket_findings(ledger, ticket, rule_paths)
+    phase = phase_text(ticket, texts, plan, delegation_context(text), held, file_windows, crate_targets, cells, waived)
     if any(match.group("id") == ticket["id"] for match in PHASE.finditer(text)):
         updated = PHASE.sub(lambda match: phase if match.group("id") == ticket["id"] else match.group(0), text)
         if updated != text:
@@ -1554,8 +1722,8 @@ def _select_phase(
         ledger.ticket_drop(ticket["id"])
         reason = "files busy" if in_scope else "outside pilot scope"
         print(f"dropped {ticket['id']}: {reason}")
-    family = unit.removesuffix("-unit")
-    if family not in FAMILIES:
+    family = rules.style_family(unit)
+    if isinstance(family, rules.NotStyleUnit):
         raise style_ledger.LedgerError(f"{unit}: unknown style family")
     try:
         folder = Path(production_field(doc.read_text().splitlines(), "Proposals")).expanduser()
@@ -1602,11 +1770,21 @@ def _select_phase(
         for finding_id, outcome in left.items():
             match outcome:
                 case style_ledger.DeclaredInSeveralFiles():
-                    where = f"declared in {len(outcome.paths)} files"
+                    where = f"declared in {len(outcome.paths)} files: {', '.join(sorted(outcome.paths))}"
                 case style_ledger.DeclaredInAnotherCrate():
                     where = f"declared in another crate: {outcome.path}"
                 case style_ledger.DeclarationGoneFromFile():
                     where = "declaration gone"
+                case style_ledger.TraitIdentityUncertain():
+                    where = "trait identity uncertain"
+                case style_ledger.OutsideRenameUnresolved():
+                    where = style_ledger.outside_evidence_line(outcome.evidence)
+                case _:
+                    assert_never(outcome)
+            if (isinstance(outcome, (style_ledger.DeclaredInSeveralFiles, style_ledger.DeclaredInAnotherCrate,
+                                     style_ledger.DeclarationGoneFromFile))
+                    and isinstance(outcome.evidence, style_ledger.OutsideRenameNotProven)):
+                where += "; " + style_ledger.outside_evidence_line(outcome.evidence)
             print(f"waiting {issue.path}: {finding_id} {where}")
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
@@ -1628,7 +1806,7 @@ def _select_phase(
         # A finding in a removed file, or whose site a merge moved to another file, can never build at its
         # site, so it is waived and the decision can close.
         for words, finding_ids in sorted(gone.items()):
-            _ = ledger.decline_findings(finding_ids, words)
+            _ = ledger.decline_findings(finding_ids, words, style_ledger.WaiveByLedger())
             print(f"waived {len(finding_ids)} findings in {issue.path}: {words}")
         if (gone or withdrew or built) and style_proposals.close_finished_decision(ledger, issue.path):
             closed = True
@@ -1695,7 +1873,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     row = next((row for row in unit_worktrees(doc) if row.unit == unit), None)
     if row is None:
         raise style_ledger.LedgerError(f"{unit}: no Units row in {doc}")
-    expected = row.worktree.resolve() / "docs/style-production/units" / (unit + ".md")
+    expected = _unit_plan(doc, unit, row.worktree).resolve()
     if plan != expected:
         raise style_ledger.LedgerError(f"--plan must be the unit worktree's own copy: {expected}")
     original = plan.read_text()
@@ -1735,31 +1913,33 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
             return WaitingForBranchPointSync(standing.branch_point, branch_tip, tip)
         if ancestry.returncode:
             raise style_ledger.LedgerError(ancestry.stderr.strip() or "git merge-base --is-ancestor failed")
-        board = berth_board.read_board(repo)
-        if isinstance(board, berth_board.BoardUnavailable):
-            return board
-        # One catalog read serves both refill passes.
+        # One catalog read serves both refill passes; it reads no shared state, so it runs before the lock.
         definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
-        busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                 definitions)
-        # A unit told to merge the style branch acts at once, so it records no sync wait.
-        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
-            ledger.clear_sync_wait(unit)
-            return selected
+        with style_ledger.refill_lock(repo):
+            board = berth_board.read_board(repo)
+            if isinstance(board, berth_board.BoardUnavailable):
+                return board
+            busy = busy_files(repo, doc, ledger, unit, board)
+            selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                     definitions)
+            # A unit told to merge the style branch acts at once, so it records no sync wait.
+            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
+                ledger.clear_sync_wait(unit)
+                return selected
         ledger.wait_for_sync(unit)
-        board = berth_board.read_board(repo)
-        if isinstance(board, berth_board.BoardUnavailable):
-            return board
-        busy = busy_files(repo, doc, ledger, unit, board)
-        selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
-                                 definitions)
-        if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
-            ledger.clear_sync_wait(unit)
-            return selected
-        if isinstance(selected, WaitingForStructure):
-            return selected
-        return WaitingForSync(len(ledger.unclassified_rules()))
+        with style_ledger.refill_lock(repo):
+            board = berth_board.read_board(repo)
+            if isinstance(board, berth_board.BoardUnavailable):
+                return board
+            busy = busy_files(repo, doc, ledger, unit, board)
+            selected = _select_phase(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,
+                                     definitions)
+            if isinstance(selected, PhaseWritten | MergeStyleBranchFirst):
+                ledger.clear_sync_wait(unit)
+                return selected
+            if isinstance(selected, WaitingForStructure):
+                return selected
+            return WaitingForSync(len(ledger.unclassified_rules()))
 
 
 def main(argv: list[str]) -> int:
@@ -1775,10 +1955,19 @@ def main(argv: list[str]) -> int:
     queue = sub.add_parser("queue")
     _ = queue.add_argument("--repo", type=Path, required=True)
     _ = queue.add_argument("--unit")
+    ticket_widen = sub.add_parser("widen")
+    _ = ticket_widen.add_argument("--repo", type=Path, required=True)
+    _ = ticket_widen.add_argument("--ticket", required=True)
+    _ = ticket_widen.add_argument("--files", nargs="+", required=True)
+    _ = ticket_widen.add_argument("--reason", required=True)
+    _ = ticket_widen.add_argument("--by", required=True)
     args = cast(PlanArguments, parser.parse_args(argv))
     try:
         if args.command == "gate":
             return gate(args.repo, args.ticket)
+        if args.command == "widen":
+            widen(args.repo, args.ticket, tuple(args.files), args.reason, args.by)
+            return 0
         if args.command == "queue":
             board = berth_board.read_board(args.repo)
             if isinstance(board, berth_board.BoardUnavailable):
@@ -1789,13 +1978,13 @@ def main(argv: list[str]) -> int:
                 busy = busy_files(args.repo, doc, ledger, args.unit or "", board)
                 settings = family_plan_settings(doc, args.repo, unit=args.unit or "")
                 scopes = family_pilot_scopes(doc, args.repo)
-                branches = {row.unit: row.branch for row in unit_worktrees(doc)}
-                for family in FAMILIES:
-                    unit = family + "-unit"
-                    if args.unit and args.unit != unit:
+                for row in unit_worktrees(doc):
+                    unit = row.unit
+                    family = rules.style_family(unit)
+                    if isinstance(family, rules.NotStyleUnit) or (args.unit and args.unit != unit):
                         continue
                     first_files = settings[family].first_files if family in settings else _NO_FIRST_FILES
-                    base = unit_base(args.repo, branches[unit]) if unit in branches else NoUnitBranch()
+                    base = unit_base(args.repo, row.branch)
                     for ticket in candidate_tickets(args.repo, ledger, busy, family, scopes.get(family, _ALL_CRATES),
                                                     scopes, base=base, first_files=first_files):
                         print(f"{unit}: {ticket.kind} {ticket.crate} {ticket.rule or ','.join(ticket.rules)} — {len(ticket.files)} files: {', '.join(ticket.files)}")
@@ -1843,6 +2032,9 @@ class PlanArguments(argparse.Namespace):
     repo: Path = Path()
     unit: str = ""
     plan: Path = Path()
+    files: list[str] = []
+    reason: str = ""
+    by: str = ""
 
 
 if __name__ == "__main__":

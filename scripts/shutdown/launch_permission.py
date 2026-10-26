@@ -12,6 +12,7 @@ from collections.abc import Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import json
 from typing import cast
 
 
@@ -36,8 +37,21 @@ LaunchPurpose = NewWorkLaunchPurpose | RecordedSessionRestoreLaunchPurpose
 
 
 @dataclass(frozen=True)
+class ReleasedHold:
+    """A finished account hold the launch check removed."""
+
+    label: str
+    then: str
+    requested_at: str
+    # The requesting session's id; None for a terminal or a recovery snapshot.
+    session_id: str | None
+
+
+@dataclass(frozen=True)
 class AllowedByShutdownState:
     """The current shutdown state permits this launch."""
+
+    released: ReleasedHold | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +73,8 @@ LaunchPermission = (
 )
 
 _TIMEOUT_SECONDS = 30
+# launch-blocked prints this before the JSON of a finished hold it removed.
+RELEASED_HOLD_PREFIX = "released account hold: "
 _UNREADABLE_PREFIX = "shutdown state unreadable: "
 
 
@@ -108,6 +124,21 @@ def _unreadable_detail(status: int, stderr: str) -> str:
     return detail or f"launch-blocked exited {status}"
 
 
+def _released_hold(text: str) -> ReleasedHold | None:
+    try:
+        value = cast(object, json.loads(text))
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    fields = cast(dict[str, object], value)
+    label, then, requested_at, origin = (fields.get(key) for key in ("label", "then", "requested_at", "requested_by"))
+    if not (isinstance(label, str) and isinstance(then, str) and isinstance(requested_at, str) and isinstance(origin, dict)):
+        return None
+    session_id = cast(dict[str, object], origin).get("session_id")
+    return ReleasedHold(label, then, requested_at, session_id if isinstance(session_id, str) else None)
+
+
 def launch_permission(
     environment: Mapping[str, str], purpose: LaunchPurpose
 ) -> LaunchPermission:
@@ -137,6 +168,11 @@ def launch_permission(
     if completed.returncode == 1:
         if not completed.stdout and not completed.stderr:
             return AllowedByShutdownState()
+        released = _first_line(completed.stdout)
+        if released.startswith(RELEASED_HOLD_PREFIX) and not completed.stderr:
+            hold = _released_hold(released.removeprefix(RELEASED_HOLD_PREFIX))
+            return (AllowedByShutdownState(hold) if hold is not None
+                    else ShutdownStateUnreadable(f"launch-blocked printed an unreadable hold: {released}"))
         detail = _last_nonempty_line(completed.stderr) or _first_line(
             completed.stdout
         )

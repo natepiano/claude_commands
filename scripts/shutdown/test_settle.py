@@ -2968,13 +2968,13 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(changed["where"], {"kind": "said", "at": NOW, "text": "next test"})
             self.assertEqual(changed["progress"], {"kind": "ready", "at": NOW})
 
-    def test_stop_only_account_with_no_owner_keeps_its_hold_until_restore(self) -> None:
+    def test_stop_only_account_with_no_owner_releases_its_hold_when_its_conductor_ends(self) -> None:
         hold = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
                                   requested_by={"kind": "terminal"}, request_id="empty", then="stop")
         record.set_account_hold(hold)
         with patch.object(settle, "report_stop"):
             self.assertEqual(settle.conduct(LOGIN), 0)
-        self.assertEqual(record.account_hold(LOGIN), hold)
+        self.assertIsNone(record.account_hold(LOGIN))
 
     def test_conductor_releases_empty_accounts_with_restart_continuations(self) -> None:
         for login, label in ((LOGIN, LABEL), ("third@example.com", "claude3")):
@@ -3065,7 +3065,8 @@ class SettleTests(ShutdownTestCase):
         for saved in (done, stopped):
             self.save(saved)
         hold = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
-                                  requested_by={"kind": "terminal"}, request_id="two", then="stop")
+                                  requested_by={"kind": "terminal"}, request_id="two", then="stop",
+                                  registration="in progress")
         record.set_account_hold(hold)
         with patch.object(settle, "report_stop"):
             self.assertEqual(settle.conduct(LOGIN), 0)
@@ -3372,6 +3373,25 @@ class SettleTests(ShutdownTestCase):
                 self.assertNotIn(progress["reason"], push.body)
                 self.assertIsInstance(push.action, ActionRequired)
                 self.assertNotIn("status", cast(ActionRequired, push.action).text)
+
+    def test_failed_move_pushes_its_target_account_and_no_restart_onto_its_source(self) -> None:
+        saved = session_shutdown(top_level("ups-id", "ups"), then="restart",
+            progress={"kind": "restart failed", "at": NOW, "reason": "herdr agents:w1:p1: pane still holds a live agent"})
+        saved["target"], saved["source_label"] = "claude3", saved["label"]
+        self.save(saved)
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(restart_work, "_target_config_dir",
+                           return_value=restart_work.RecordedConfigDir(self.root / ".claude3")),
+              patch.object(settle, "run_remote", return_value=(0, "[]")),
+              patch.object(settle, "send_message"),
+              patch.object(settle, "alert_user") as alert,
+              redirect_stdout(io.StringIO())):
+            settle.report_stop([saved])
+        alert.assert_called_once()
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["session"], push.values["target"]), ("ups", "claude3"))
+        self.assertNotIn("restart", cast(ActionRequired, push.action).text)
 
     def test_automatic_restart_with_an_unsent_prompt_pushes_the_failed_session_name(self) -> None:
         saved = session_shutdown(top_level("unsent-owner", "Unsent owner"), then="restart",
@@ -3740,7 +3760,7 @@ class SettleTests(ShutdownTestCase):
         restore.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "failed"), saved)
 
-    def test_now_only_failed_stop_marks_force_and_delegates_retry_to_conductor(self) -> None:
+    def test_now_only_failed_stop_marks_force_and_workers_retry_to_conductor(self) -> None:
         saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
         other = session_shutdown(top_level("other", "Other"))
         self.save(saved)
@@ -3803,7 +3823,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_selected_cancel_of_another_request_keeps_local_account_hold(self) -> None:
         held = record.AccountHold(login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
-            requested_by={"kind": "terminal"}, request_id="held-request", then="stop")
+            requested_by={"kind": "terminal"}, request_id="held-request", then="stop", registration="in progress")
         record.set_account_hold(held)
         with patch.object(settle, "_retire_shutdown_messages"), redirect_stdout(io.StringIO()):
             added = settle.begin(LOGIN, only=["selected"], request_id="selected-request",
@@ -3819,7 +3839,7 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(shutdown.launch_blocked(Account("claude", LOGIN, LABEL),
                                                     NewWorkLaunchPurpose()), 0)
 
-    def test_cancelling_joined_restart_keeps_stop_only_hold_until_account_restore(self) -> None:
+    def test_cancelling_joined_restart_lets_the_finished_stop_release_its_hold(self) -> None:
         with patch.object(settle, "_retire_shutdown_messages"), redirect_stdout(io.StringIO()):
             self.assertEqual(settle.begin(LOGIN, then="stop", request_id="stop-account",
                                          report=machine_inventory([])), [])
@@ -3829,9 +3849,9 @@ class SettleTests(ShutdownTestCase):
             self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["selected"]), 0)
             with patch.object(settle, "report_stop"):
                 self.assertEqual(settle.conduct(LOGIN), 0)
-            self.assertIsInstance(record.lookup_account_hold(LOGIN), record.AccountHeld)
+            self.assertIsInstance(record.lookup_account_hold(LOGIN), record.AccountOpen)
             self.assertEqual(shutdown.launch_blocked(Account("claude", LOGIN, LABEL),
-                                                    NewWorkLaunchPurpose()), 0)
+                                                    NewWorkLaunchPurpose()), 1)
             _ = restart_work._up(LOGIN, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(record.session_records(LOGIN), [])
         self.assertIsInstance(record.lookup_account_hold(LOGIN), record.AccountOpen)

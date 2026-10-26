@@ -58,7 +58,7 @@ CALLER_LABELS = {
     "brp-launch": "example launches (brp)",
     "unknown": "unknown",
 }
-OUTCOME_ORDER = ["ran", "failed", "interrupted", "reused", "replayed", "deferred"]
+OUTCOME_ORDER = ["ran", "failed", "interrupted", "reused", "replayed", "superseded", "deferred"]
 SCRATCH = "(cwd LIKE '/tmp/%' OR cwd LIKE '/var/folders/%' OR cwd LIKE '/private/var/folders/%')"
 GROUP_AS_SCRATCH = f"({SCRATCH} AND caller != 'brp-launch')"
 SCRATCH_LABEL = "scratch (temp folders)"
@@ -319,7 +319,7 @@ class PackageRebuilds:
 @dataclass(frozen=True)
 class TokenHolder:
     call_id: str
-    delegate_session: str
+    unit_session: str
     worker: str
     starts_at: datetime
     ends_at: datetime
@@ -479,17 +479,17 @@ def call_time(value: object) -> datetime:
 
 def token_holders(rows: list[Row]) -> list[TokenHolder]:
     holders: list[TokenHolder] = []
-    for call_id, started_at, wait_s, ended_at, worker, delegate_session in rows:
+    for call_id, started_at, wait_s, ended_at, worker, unit_session in rows:
         starts_at = call_time(started_at) + timedelta(seconds=wait_seconds(wait_s))
         ends_at = call_time(ended_at)
         if starts_at < ends_at:
-            holders.append(TokenHolder(str(call_id), str(delegate_session), str(worker), starts_at, ends_at))
+            holders.append(TokenHolder(str(call_id), str(unit_session), str(worker), starts_at, ends_at))
     return holders
 
 
 def attribute_token_wait(
     call_id: str,
-    delegate_session: str,
+    unit_session: str,
     worker: str,
     starts_at: datetime,
     wait_s: float,
@@ -500,7 +500,7 @@ def attribute_token_wait(
     wait_starts_at = wait_ends_at - timedelta(seconds=token_wait_s)
     overlapping = [
         holder for holder in holders
-        if holder.call_id != call_id and holder.delegate_session == delegate_session
+        if holder.call_id != call_id and holder.unit_session == unit_session
         and holder.starts_at < wait_ends_at and holder.ends_at > wait_starts_at
     ]
     boundaries = sorted({wait_starts_at, wait_ends_at, *(point for holder in overlapping for point in (holder.starts_at, holder.ends_at))})
@@ -525,29 +525,29 @@ def build_folder_waits(connection: sqlite3.Connection, day: str) -> tuple[WaitMe
     calls = fetch(
         connection,
         "SELECT id, token_wait_s, coalesce(worktree_name, '(unknown worktree)'), started_at,"
-        + " coalesce(wait_s, 0), coalesce(worker, '(unknown worker)'), delegate_session FROM calls"
+        + " coalesce(wait_s, 0), coalesce(worker, '(unknown worker)'), unit_session FROM calls"
         + " WHERE tool = 'verify.sh' AND started_at >= ? AND started_at < ? AND token_wait_s > 0"
         + f" AND {natedev_call_predicate()}",
         start, end,
     )
     holder_rows = fetch(
         connection,
-        "SELECT id, started_at, coalesce(wait_s, 0), ended_at, coalesce(worker, '(unknown worker)'), delegate_session"
-        + " FROM calls WHERE tool = 'verify.sh' AND ended_at IS NOT NULL AND delegate_session IS NOT NULL"
+        "SELECT id, started_at, coalesce(wait_s, 0), ended_at, coalesce(worker, '(unknown worker)'), unit_session"
+        + " FROM calls WHERE tool = 'verify.sh' AND ended_at IS NOT NULL AND unit_session IS NOT NULL"
         + " AND ended_at >= ?"
         + f" AND {natedev_call_predicate()}",
         start,
     ) if any(wait_seconds(row[1]) > 0 and isinstance(row[6], str) for row in calls) else []
     holders_by_session: dict[str, list[TokenHolder]] = {}
     for holder in token_holders(holder_rows):
-        holders_by_session.setdefault(holder.delegate_session, []).append(holder)
+        holders_by_session.setdefault(holder.unit_session, []).append(holder)
     another_waits: list[ReportedWait] = []
     own_waits: list[ReportedWait] = []
-    for call_id, duration, tree, started_at, wait_s, worker, delegate_session in calls:
+    for call_id, duration, tree, started_at, wait_s, worker, unit_session in calls:
         token_wait_s = wait_seconds(duration)
-        attribution = TokenWaitAttribution(token_wait_s, 0.0) if token_wait_s <= 0 or not isinstance(delegate_session, str) else attribute_token_wait(
-            str(call_id), delegate_session, str(worker), call_time(started_at), wait_seconds(wait_s), token_wait_s,
-            holders_by_session.get(delegate_session, []),
+        attribution = TokenWaitAttribution(token_wait_s, 0.0) if token_wait_s <= 0 or not isinstance(unit_session, str) else attribute_token_wait(
+            str(call_id), unit_session, str(worker), call_time(started_at), wait_seconds(wait_s), token_wait_s,
+            holders_by_session.get(unit_session, []),
         )
         identity = (str(tree), str(tree), str(started_at))
         another_waits.append((attribution.behind_another_worker_s, *identity))
@@ -1564,7 +1564,7 @@ def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPe
         " ".join(
             (
                 "SELECT id, started_at, ended_at, date(started_at, 'localtime'),",
-                "coalesce(nullif(delegate_session, ''), nullif(session, '')), verb, status, outcome",
+                "coalesce(nullif(unit_session, ''), nullif(session, '')), verb, status, outcome",
                 "FROM calls WHERE tool = 'verify.sh'",
                 f"AND {natedev_call_predicate()}",
                 "AND started_at < ?",
@@ -1610,7 +1610,7 @@ def tests_per_edit_data(connection: sqlite3.Connection, end_day: str) -> TestsPe
                 recovery.minutes_to_green += minutes
                 recovery.recovery_minutes.append(minutes)
             edits_since_green[worker] = 0
-        elif outcome != "interrupted" and (outcome == "failed" or status is not None and status != 0) and in_window:
+        elif outcome not in ("interrupted", "superseded") and (outcome == "failed" or status is not None and status != 0) and in_window:
             edits = edits_since_green.get(worker, 0)
             bin_index = failure_bin(edits)
             bins[bin_index].failures += 1

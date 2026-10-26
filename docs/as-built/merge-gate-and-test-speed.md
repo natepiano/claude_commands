@@ -2,7 +2,7 @@
 
 ## What it is
 
-`scripts/production/merge_gate.py` is the committed command that merges a checkpoint into a `~/.claude` production's merge branch and tests the result. It refuses unsafe starting states, merges the checkpoint `--no-ff`, then runs every test module of the 22 `~/.claude` Python suites plus basedpyright in parallel under a sampled-memory cap. On green it pushes, and with `--promote` it fast-forwards `~/.claude` main and the Mac. On red it undoes the merge and prints each red suite's failures. Run sequentially, the suites took about 30 minutes; in parallel they take 75–195 s depending on machine load. A set of test rules keeps them at that speed and keeps load from turning them red: no live state, no wall-clock thresholds, no fixed waits in the code under test, few process launches, no trivial tests.
+`scripts/production/merge_gate.py` is the committed command that merges a checkpoint into a `~/.claude` production's merge branch and tests the result. It refuses unsafe starting states, merges the checkpoint `--no-ff`, then runs every test module of the `~/.claude` Python suites in `TEST_SUITES` plus basedpyright in parallel under a sampled-memory cap. On green it pushes, and with `--promote` it fast-forwards `~/.claude` main and the Mac. On red it undoes the merge and prints each red suite's failures. Run sequentially, the suites took about 30 minutes; in parallel they take 75–195 s depending on machine load. A set of test rules keeps them at that speed and keeps load from turning them red: no live state, no wall-clock thresholds, no fixed waits in the code under test, few process launches, no trivial tests.
 
 ## How it works
 
@@ -24,7 +24,7 @@
 **Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
 
 **Suite runner** (`run_suites(repo, memory_cap_mib, type_dirs) -> GateRun`):
-- `TEST_SUITES` (a tuple in the script) is the single list of suites: `lib hooks message accounts whoami agents build_hold mac_test usage bevy_upgrade production delegate buildlog lint nightly_review build_targets shutdown feature_log model_study herdr notify statusline`. Modules are `scripts/<suite>/test_*.py`, found non-recursively: 168 modules today.
+- `TEST_SUITES` (a tuple in the script) is the single list of suites: `lib hooks message accounts whoami agents build_hold mac_test usage bevy_upgrade bevy_migration_plan production direct buildlog lint nightly_review build_targets shutdown feature_log model_study herdr notify statusline astra style history guilds`. Modules are `scripts/<suite>/test_*.py`, found non-recursively: 246 modules in 27 suites on 2026-10-26.
 - Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, a listed suite has no modules, or `/dev/shm` is not writable.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <dir> -p <module>`, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
 - All jobs share one `TMPDIR` under `/dev/shm/merge-gate-*`. Each job's output goes to a log file there, read and deleted when the job ends.
@@ -76,7 +76,7 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 - `wait_until(ready, directory, timeout=300, *, processes=())` arms directory events, checks `ready()`, then blocks in `select` on the inotify fd plus a pidfd per child process. An exited child's pidfd stays readable, so each one is observed once and closed. Without inotify or pidfd it polls every 0.01 s. It raises `TimeoutError` at the hang guard.
 - `wait_for_file(path)` is a wrapper, also callable from the command line.
 
-**Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-3.10`; the key is the version floor `lib/py` requires, not the running version. Delegate fixtures give each temporary HOME an `XDG_CACHE_HOME` with that file pre-written to `sys.executable` and `CLAUDE_PYTHON` unset, since `CLAUDE_PYTHON` bypasses the cache. Without this, each of the roughly 19 helper launches per `verify.sh`/`review.sh`/`implement.sh` run re-resolves Python.
+**Interpreter-cache seeding.** `scripts/lib/py` caches the resolved interpreter path in `$XDG_CACHE_HOME/claude/python3-3.10`; the key is the version floor `lib/py` requires, not the running version. Worker fixtures give each temporary HOME an `XDG_CACHE_HOME` with that file pre-written to `sys.executable` and `CLAUDE_PYTHON` unset, since `CLAUDE_PYTHON` bypasses the cache. Without this, each of the roughly 19 helper launches per `verify.sh`/`review.sh`/`implement.sh` run re-resolves Python.
 
 **Stub app-server shutdown** (`scripts/agents/test_codex_mesh.py`). The accept loop blocks in `select` on the listener and on a socketpair that `close()` writes to, so closing the server wakes it at once.
 
@@ -84,20 +84,22 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 | Override | File | Production default | How tests use it |
 |---|---|---|---|
-| `PLAN_DELEGATE_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
-| `PLAN_DELEGATE_WORKER_POLL_SECS` | `scripts/direct/implement.sh` (worker and turn probes) | `1` (s) | `0.01` |
-| `PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS` | `scripts/direct/implement.sh` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
-| `PLAN_DELEGATE_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
-| `PLAN_DELEGATE_SYNC_WRITES` | `progress_history.py`, `findings.py`, `review_pool.py` | `1` (fsync) | `0`; each has a test with it unset |
+| `UNIT_EARLY_POLL_SECS` | `scripts/direct/review.sh` | `5` (s) | `0.01`; unset-default test sees one `sleep 5` |
+| `UNIT_WORKER_POLL_SECS` | `scripts/direct/implement.sh` (worker and turn probes) | `1` (s) | `0.01` |
+| `UNIT_WORKER_WAIT_ATTEMPTS` | `scripts/direct/implement.sh` | `30` | `30000`; unset-default test sees 30 `sleep 1` in each probe loop |
+| `UNIT_TOKEN_CLOCK_FILE` | `scripts/direct/verify.sh` | unset → `$SECONDS` | a file the test advances; unset-default test measures from `$SECONDS` |
+| `UNIT_SYNC_WRITES` | `progress_history.py`, `findings.py`, `review_pool.py` | `1` (fsync) | `0`; each has a test with it unset |
 | `--durability {full,off}` (`LedgerDurability.DURABLE`/`DISPOSABLE`) | `scripts/usage/collect.py` | `full` → `PRAGMA synchronous=FULL` | `off`; default pinned by an SQL trace |
 | `ADD_SHOWRUNNER_POLL_S` | `scripts/production/add_showrunner.py` (`POLL_S`, read at import) | `2.0` | `0.01`; default test imports with it unset |
 | `leftover_timeout_s` (`OffloadConfig`, settings file) | `scripts/mac_test/offload.py` | `10` s | small or large per case; invalid values fall back to 10 |
 | `RESIDENT_POLL_SECS`, `REAP_WAIT_SECS`, `REAP_POLL_SECS` | `scripts/agents/codex_mesh.py` | `1.0`, `5.0`, `0.2` | patched as module attributes |
-| `PLAN_DELEGATE_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/delegate_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
-| `PLAN_DELEGATE_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
+| `UNIT_ACTIVE_DIR` | `end_session.sh`, `unit_status.sh`, `hooks/direct_run.py`, `build_hold.py`, `promote_showrunner.py`; `prepare_session.sh` writes the fixed directory | `/tmp/claude/delegate/active` | a temp dir |
+| `UNIT_RUN_ROOT` | `end_session.sh` (passed to `unit_runs.py held --root`) | both run roots, `/tmp/claude/unit` then `/tmp/claude/delegate` | a temp dir |
 | `MERGE_GATE_STATE_DIR`, `MERGE_GATE_PYTHON`, `MERGE_GATE_BASEDPYRIGHT`, `MERGE_GATE_UV` | `merge_gate.py` | `~/.local/state/merge-gate`, `sys.executable`, `basedpyright`, `uv` | scratch dir and stubs |
 
-`PLAN_DELEGATE_ACTIVE_DIR` is on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when it, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
+`UNIT_ACTIVE_DIR` and its former name `PLAN_DELEGATE_ACTIVE_DIR` are on the build_hold override guard's list (`scripts/build_hold/override_guard.py` and `.sh`): an installed script under `~/.claude/scripts` exits 2 when one of them, another state override, or a non-real `HOME` is set. Tests therefore run the checkout's copy of a script.
+
+Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN_DIR` was `PLAN_DELEGATE_BOARD_DIR`. A run that started before the rename still exports the former names, so each reader also reads them while such a run can be open. The bash scripts (`implement.sh`, `review.sh`, `verify.sh`, `board.sh`, `end_session.sh`, `agent_bg.sh`, `memory_gate.sh`) source `scripts/lib/unit_env.sh`, which exports each unset `UNIT_*` name from its former name. Python readers use `unit_runs.environ(<name>)` or read the former name after the new one; `statusline.sh`, `statusline.jq` and `unit_status.sh` do the same inline.
 
 ## Invariants
 
@@ -110,13 +112,13 @@ Tests: `scripts/production/test_merge_gate.py`, on scratch repos.
 
 - **Nothing is skipped to save time.** No skipped tests, no weakened assertions, no tier left out of the gate. A red under load is fixed at its source: an event-driven wait, a drained pipe, an injected `TimeoutExpired`, a hang guard.
 
-- **The gate covers only `TEST_SUITES`.** Every new suite joins it, and `run_suites` refuses a listed suite with no modules. Discovery is non-recursive, so `scripts/<suite>/tests/` is not gated. Directories with tests outside the list (berth, fix, prioritize, hana_shot, shot_report, screen_record, exclude, bevy_migration_plan) are not gated today.
+- **The gate covers only `TEST_SUITES`.** Every new suite joins it, and `run_suites` refuses a listed suite with no modules. Discovery is non-recursive, so `scripts/<suite>/tests/` is not gated. Tests outside the list are not gated: `scripts/berth/tests/` and `scripts/prioritize/tests/`, and the top-level tests of exclude, hana_shot, hierarchies, screen_record, settings and shot_report.
 
 - **Override defaults stay as they are.** Each default is pinned by a test that runs the real script or module with the override unset and observes the default through behavior: the sleep argument, the attempt count, the clock source, the fsync/PRAGMA call, the computed module value. No test reads a literal from source. A new override needs the same pin.
 
 - **CLI contract kept.** A script converted to in-process tests keeps one subprocess test for parsing, exit status and launch. A moved test replaces its subprocess form; it never sits beside it with the same inputs and assertion.
 
-- **No trivial tests.** A test is trivial when it cannot fail for a real defect: (1) it asserts a constant, literal or default against itself; (2) it repeats the implementation; (3) it tests the standard library or a mock it configured; (4) it only checks that a name exists or a module imports; (5) it duplicates another test's inputs and assertion. A short test that pins behavior a user or another script depends on is not trivial; when unsure, keep it. `docs/delegate/write_prompt_contract.md` section 6 (`## Work Specification`) carries this as one line copied into every worker prompt that writes tests.
+- **No trivial tests.** A test is trivial when it cannot fail for a real defect: (1) it asserts a constant, literal or default against itself; (2) it repeats the implementation; (3) it tests the standard library or a mock it configured; (4) it only checks that a name exists or a module imports; (5) it duplicates another test's inputs and assertion. A short test that pins behavior a user or another script depends on is not trivial; when unsure, keep it. `docs/direct/write_prompt_contract.md` section 6 (`## Work Specification`) carries this as one line copied into every worker prompt that writes tests.
 
 - **Phone-send guards stay.** `whoami/test_quota_alert.py::test_setup_blocks_real_phone_sends` and `lint/test_sweep.py::test_base_blocks_real_phone_sends` pin the fixture patch that stops real sends.
 
@@ -148,7 +150,7 @@ Representative gate runs on natedev (32 cores):
 | Parallel | about 101 s | 30–58 | 2.54 GiB |
 | Parallel | 150–195 s | 64–123 | 2.3–2.5 GiB |
 
-The largest module peaks near 0.5 GiB. The gate's wall time is its slowest module, currently one of delegate's (`test_verify_mac_offload`, `test_review_launcher`, `test_progress_history`). Times taken at different loads are not comparable; compare at matched load.
+The largest module peaks near 0.5 GiB. The gate's wall time is its slowest module, currently one of worker's (`test_verify_mac_offload`, `test_review_launcher`, `test_progress_history`). Times taken at different loads are not comparable; compare at matched load.
 
 - **Inherited SIGINT.** A suite started in the background of a non-interactive shell inherits SIGINT ignored, and bash cannot forward a signal it ignores. `SUITE_BOOTSTRAP` resets dispositions for gate jobs; a signal test still restores `SIG_DFL` itself.
 
@@ -169,18 +171,18 @@ The largest module peaks near 0.5 GiB. The gate's wall time is its slowest modul
 
 - **Red-suite reruns.** Whether to rerun a red suite is the showrunner's rule, outside the command.
 
-- **fsync on tmpfs is already cheap.** `PLAN_DELEGATE_SYNC_WRITES=0` matters on disk-backed TMPDIRs; `test_progress_history`'s remaining cost is process launches.
+- **fsync on tmpfs is already cheap.** `UNIT_SYNC_WRITES=0` matters on disk-backed TMPDIRs; `test_progress_history`'s remaining cost is process launches.
 
 - **`build_targets` is already at 4 launches per module run.** Further launch cuts belong elsewhere.
 
 ## Why
 
-- **The cost was process launches.** Measured `setUpClass` cost was negligible; production ran about 26,000 execs (about 15,000 git, about 4,000 Python) and delegate about 22,000. Each fix therefore removes launches (in-process CLI, per-class git seeds, shell fakes, interpreter cache) or removes fixed waits, rather than reworking setup.
-- **One job per module, not per suite.** Whole suites in parallel are bounded by delegate (about 7.5 min). Per-module jobs are bounded by the slowest module, so further speed comes from shortening the slowest modules.
+- **The cost was process launches.** Measured `setUpClass` cost was negligible; production ran about 26,000 execs (about 15,000 git, about 4,000 Python) and worker about 22,000. Each fix therefore removes launches (in-process CLI, per-class git seeds, shell fakes, interpreter cache) or removes fixed waits, rather than reworking setup.
+- **One job per module, not per suite.** Whole suites in parallel are bounded by worker (about 7.5 min). Per-module jobs are bounded by the slowest module, so further speed comes from shortening the slowest modules.
 - **Admission on sampled memory with a held reservation.** The measured peak (2.0–2.5 GiB) is well under the 36 GB available. A sampled cap with a per-job reservation keeps the gate within a stated budget without cgroups, and one job always runs, so a cap below one module's size cannot deadlock.
 - **In-process CLI over subprocess.** A `python3 <script>.py` launch cost 380–440 ms, about 150 ms of it import. Running the real `main()` in-process keeps the parser, handlers and child commands real; the one subprocess case per script keeps the launch contract covered.
 - **The interpreter cache is fixed in the fixtures, not in `lib/py`.** The cache misses only because tests point HOME at a temp dir; production resolution was already correct.
-- **One shared restore implementation.** Delegate reuses `scripts.production.cli_fixture.invoke_cli` through `recorder_fixture` rather than keeping its own copy; one implementation of environment, signal and binding restore is simpler to keep correct.
+- **One shared restore implementation.** Worker reuses `scripts.production.cli_fixture.invoke_cli` through `recorder_fixture` rather than keeping its own copy; one implementation of environment, signal and binding restore is simpler to keep correct.
 - **Overrides, not shorter production waits.** The production polls and timeouts are tuned for real agents and machines. Tests set a variable, a module attribute, a config value or a clock file; production behavior stays the same and is pinned by default tests.
 - **Event waits over polls.** inotify and pidfd waits wake on the change itself, so tests are both faster and immune to load, where a fixed poll or deadline gives only one of those.
 - **The phone-send guards are kept.** They look like tests of a mock, but they pin the patch that stops a fixture from sending real phone messages.

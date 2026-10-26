@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
-"""Set a hanadocs issue's proposal fields: approve, start, close or stars.
+"""Set a hanadocs issue's proposal fields: approve, unapprove, start, close or stars.
 
 Each verb edits one issue file's frontmatter in place and reads nothing else, but number and create
-read the folder for the highest P number, and move-approved reads the folder and edits each open
-approved proposal in it. Every verb also sets
+read the folder for the highest P number, move-approved edits each open approved proposal in it,
+and area-style sets the area on current and legacy style proposals. Every verb also sets
 date_modified to today in the user's zone, written "[[YYYY-MM-DD]]" as the vault writes dates.
 Each verb holds an exclusive lock on the issue for its whole read, change and write. The lock
-file is in the user's runtime folder, never in the issue folder.
+file is in the user's state folder, never in the issue folder.
 
 Usage:
-  proposal_issue.py approve <issue> --showrunner S --unit U --plan P
+  proposal_issue.py approve <issue> --by user|showrunner --showrunner S --unit U --plan P
+  proposal_issue.py unapprove <issue> [--dry-run]
+  proposal_issue.py reopen <issue>
+  proposal_issue.py decline-answer <issue> --words W
   proposal_issue.py start <issue>
   proposal_issue.py close <issue> --as-built PATH
   proposal_issue.py rules <issue> --rules URLS
   proposal_issue.py stars <issue> --goal G --alignment A --impact I --urgency U --effort E
+  proposal_issue.py urgency <issue> --level user|blocks|soon|normal|later [--due ISO]
+  proposal_issue.py mark-important <issue>
   proposal_issue.py number <issue>...
   proposal_issue.py move-approved <issues folder> [--dry-run]
+  proposal_issue.py area-style <issues folder> [--dry-run]
 
 `number` gives each proposal without one the next `proposal_id`, P1 up, as change rows are C1 up;
-`create` numbers a new decision the same way.
+`create` numbers a new decision the same way. `urgency` sets where the proposal goes among the ones
+waiting for the user (urgency.py): `review_urgency`, with `review_due` for soon; normal removes them.
+`mark-important` marks a proposal the user called important (`review_urgency: user`, `review_marked`).
+`approve` records who approved (`approved_by`: user, or showrunner when a showrunner approves without
+the user) and the production of the showrunner it runs in (`approved_in`). A user approval replaces
+a showrunner one; a showrunner approval keeps a user one. An approval with no `approved_by` is the
+user's. `unapprove` sets an open proposal that a showrunner approved, in the calling showrunner,
+back to waiting for approval: the approval fields empty, as filing writes them, and stage backlog.
+It refuses a user approval and any other issue; only the user's decline undoes a user approval.
 """
 from __future__ import annotations
 
@@ -34,10 +48,12 @@ from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
+from enum import Enum
 from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 from issues import PROPOSAL_TAG, Issue, frontmatter, open_issues
 
@@ -48,7 +64,7 @@ KEY = re.compile(r"^([A-Za-z_][\w-]*):")
 GOAL = re.compile(r"^\d+ - \S.*$")
 STAR = "⭐"
 # The fields a migrated decision can take from the old issues it merges.
-INHERITED_FIELDS = frozenset({"showrunner", "unit", "plan", "stage", "backlog_goal", "backlog_alignment",
+INHERITED_FIELDS = frozenset({"showrunner", "unit", "plan", "approved_by", "approved_in", "stage", "backlog_goal", "backlog_alignment",
                               "backlog_impact", "backlog_urgency", "backlog_effort"})
 # The fields close adds or changes; reopen removes them and sets status open.
 CLOSE_FIELDS = ("as_built", "reason", "date_closed")
@@ -58,6 +74,7 @@ NUMBER_FIELD = "proposal_id"
 NUMBER = re.compile(r'^proposal_id:\s*"?P(\d+)"?\s*$', re.MULTILINE)
 # The vault keeps closed issues under archive/ beside the issues folder; their numbers stay taken.
 ARCHIVE = "archive"
+STYLE_AREA = "style"
 
 
 class Refusal(ValueError):
@@ -147,7 +164,7 @@ def set_list_fields(text: str, fields: dict[str, list[str]], path: Path) -> tupl
 @contextmanager
 def _issue_lock(path: Path) -> Generator[None]:
     """Hold an exclusive lock on the issue. The lock file is named from the issue's resolved path."""
-    folder = Path(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir())
+    folder = Path.home() / ".local/state/proposal-issue/locks"
     folder.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:32]
     with (folder / f"proposal-issue-{digest}.lock").open("a") as lock:
@@ -263,15 +280,81 @@ def reopen(path: Path, today: date) -> list[str]:
         return [*removed, *changed, *dates]
 
 
+USER = "user"
+SHOWRUNNER = "showrunner"
+APPROVERS = (USER, SHOWRUNNER)
+# The fields approve sets; unapprove writes them empty, as filing does.
+APPROVAL_FIELDS = ("showrunner", "unit", "plan", "approved_by", "approved_in")
+
+
+def calling_showrunner() -> str:
+    """The production slug of the showrunner this session runs, from its update timer."""
+    import showrunners  # only approve and unapprove read the update timers
+
+    doc = showrunners.production_of(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))
+    if doc is None:
+        raise Refusal("this session is no production's showrunner; approve and unapprove run in one")
+    return showrunners.production_slug(str(doc))
+
+
+def approver(issue: Issue) -> str:
+    """Who approved: showrunner only when approved_by says so; an approval without the field is the user's."""
+    return SHOWRUNNER if issue.value("approved_by") == SHOWRUNNER else USER
+
+
+def approve(path: Path, fields: dict[str, str], by: str, approved_in: str, today: date) -> list[str]:
+    """Record the approval and stage active. A showrunner approval keeps the approver of a user one."""
+    with _issue_lock(path):
+        issue = Issue(path, frontmatter(path))
+        kept = by == SHOWRUNNER and isinstance(decision_answer(issue), ApprovedDecision) and approver(issue) == USER
+        actor = {} if kept else {"approved_by": by, "approved_in": approved_in}
+        text, changed = set_fields(_read(path), {**fields, **actor, "stage": IN_PROGRESS_STAGE,
+                                                 "date_modified": _vault_date(today)}, path)
+        if changed:
+            _write(path, text)
+        return changed
+
+
+def unapprove(path: Path, approved_in: str, today: date, *, dry_run: bool) -> list[str]:
+    """Set a proposal a showrunner approved in `approved_in` back to waiting for approval.
+
+    A dry run refuses the same issues and writes nothing.
+    """
+    with _issue_lock(path):
+        issue = Issue(path, frontmatter(path))
+        if issue.value("status") != "open" or PROPOSAL_TAG not in issue.fields.get("tags", []):
+            raise Refusal(f"{path}: not an open proposal")
+        if not isinstance(decision_answer(issue), ApprovedDecision):
+            raise Refusal(f"{path}: no approval is recorded")
+        if approver(issue) == USER:
+            raise Refusal(f"{path}: the user approved it; only the user's decline undoes it")
+        if issue.value("approved_in") != approved_in:
+            raise Refusal(f"{path}: approved in {issue.value('approved_in') or 'no showrunner'}, not in {approved_in}")
+        text, changed = set_fields(_read(path), {**dict.fromkeys(APPROVAL_FIELDS, ""), "stage": "backlog",
+                                                 "date_modified": _vault_date(today)}, path)
+        if not dry_run:
+            _write(path, text)
+        return changed
+
+
+REVIEW_FIELDS = ("review_urgency", "review_due", "review_marked")
+
+
+def set_urgency(path: Path, level: urgency.Urgency, today: date) -> list[str]:
+    """Store the proposal's level for the user's review; normal stores nothing."""
+    with _issue_lock(path):
+        original = _read(path)
+        text, removed = remove_fields(original, REVIEW_FIELDS, path)
+        text, changed = set_fields(text, urgency.fields(level, "review_"), path)
+        if text == original:
+            return []
+        text, dates = set_fields(text, {"date_modified": _vault_date(today)}, path)
+        _write(path, text)
+        return [*dict.fromkeys([*removed, *changed]), *dates]
+
+
 def fields_for(args: argparse.Namespace, today: date) -> dict[str, str]:
     verb = cast(str, args.verb)
-    if verb == "approve":
-        return {
-            "showrunner": cast(str, args.showrunner),
-            "unit": cast(str, args.unit),
-            "plan": cast(str, args.plan),
-            "stage": IN_PROGRESS_STAGE,
-        }
     if verb == "start":
         return {"stage": IN_PROGRESS_STAGE}
     if verb == "close":
@@ -404,6 +487,38 @@ def move_approved(folder: Path, today: date, *, dry_run: bool) -> Iterator[MoveO
             yield _move_one(issue.path, today, dry_run=dry_run)
 
 
+def area_style(folder: Path, today: date, *, dry_run: bool) -> Iterator[Path]:
+    """Set the style area on current and legacy style issues with no area or the unfiled area."""
+    if not folder.is_dir():
+        raise Refusal(f"{folder} is not a folder")
+    for path in sorted(folder.glob("*.md")):
+        if not path.is_file():
+            continue
+        with _issue_lock(path):
+            fields = frontmatter(path)
+            if not ({"style_rule", "style_rules"} & fields.keys()):
+                continue
+            text = _read(path)
+            lines = text.splitlines(keepends=True)
+            span = _key_span(lines, _closing_fence(lines, path), "area")
+            if span is not None and re.fullmatch(
+                r"area:\s*(?:\"\[\[unfiled\]\]\"|'\[\[unfiled\]\]'|\[\[unfiled\]\])\s*",
+                lines[span[0]],
+            ) is None:
+                continue
+            if span is None:
+                text, _ = set_fields(text, {"area": f"[[{STYLE_AREA}]]"}, path)
+            else:
+                start = span[0]
+                newline = lines[start][len(lines[start].rstrip("\r\n")):] or "\n"
+                lines[start] = _value_line("area", f"[[{STYLE_AREA}]]")[:-1] + newline
+                text = "".join(lines)
+            text, _ = set_fields(text, {"date_modified": _vault_date(today)}, path)
+            if not dry_run:
+                _write(path, text)
+        yield path
+
+
 def _generated_span(text: str, path: Path) -> tuple[int, int]:
     start, end = text.find(GENERATED_START), text.find(GENERATED_END)
     if start < 0 or end < start:
@@ -449,6 +564,21 @@ def fill_ranking(path: Path, ranking: str) -> bool:
         return True
 
 
+class DecisionPathState(Enum):
+    AVAILABLE = "available"
+    ALREADY_FILED = "already filed"
+
+
+def _decision_path_state(path: Path, keys: dict[str, str]) -> DecisionPathState:
+    """Read the decision key at the path; refuse a different decision."""
+    if not path.exists():
+        return DecisionPathState.AVAILABLE
+    fields = frontmatter(path)
+    if any(fields.get(key) != [value] for key, value in keys.items()):
+        raise Refusal(f"{path}: different decision key")
+    return DecisionPathState.ALREADY_FILED
+
+
 def create(path: Path, project: str, short: str, proposed_by: str, tags: list[str],
            rule: str, crate: str, rule_blob: str, count: int, body: str, template: Path,
            today: date, proposed_ranking: str = "", rule_urls: tuple[str, ...] = (), *,
@@ -460,12 +590,11 @@ def create(path: Path, project: str, short: str, proposed_by: str, tags: list[st
     inherited = dict(initial_fields)
     if any(key not in INHERITED_FIELDS for key in inherited):
         raise Refusal("invalid inherited fields: " + ", ".join(sorted(set(inherited) - INHERITED_FIELDS)))
-    if path.exists():
-        fields = frontmatter(path)
-        if any(fields.get(key) != [value] for key, value in keys.items()):
-            raise Refusal(f"{path}: different decision key")
+    if _decision_path_state(path, keys) is DecisionPathState.ALREADY_FILED:
         return False
     with _folder_lock(path.parent):
+        if _decision_path_state(path, keys) is DecisionPathState.ALREADY_FILED:
+            return False
         return _create_numbered(path, template, project, short, proposed_by, tags, keys, count, body, today,
                                 proposed_ranking, rule_urls, inherited)
 
@@ -476,7 +605,7 @@ def _create_numbered(path: Path, template: Path, project: str, short: str, propo
     """Write the new decision once, with the next free P number."""
     text = template.expanduser().read_text(encoding="utf-8")
     values = {
-        "AREA": "unfiled", "PROJECT": project, "SHORT": short, "PROPOSED_BY": proposed_by,
+        "AREA": STYLE_AREA, "PROJECT": project, "SHORT": short, "PROPOSED_BY": proposed_by,
         "DATE": today.isoformat(), "CATEGORY": "refactor", "DEPENDS_ON": "[]",
     }
     text = re.sub(r"\{\{([A-Z_]+)\}\}", lambda match: values.get(match[1], ""), text)
@@ -496,7 +625,12 @@ def _create_numbered(path: Path, template: Path, project: str, short: str, propo
         try:
             _ = stream.write(text)
             stream.flush()
-            os.link(temporary, path)
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if _decision_path_state(path, keys) is DecisionPathState.ALREADY_FILED:
+                    return False
+                raise
         finally:
             temporary.unlink(missing_ok=True)
     return True
@@ -538,10 +672,14 @@ def _main_move_approved(folder: Path, today: date, *, dry_run: bool) -> int:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="verb", required=True)
-    approve = verbs.add_parser("approve", help="record the user's approval; stage active (in progress)")
-    _ = approve.add_argument("--showrunner", required=True, help="the showrunner's session name")
-    _ = approve.add_argument("--unit", required=True, help="the unit, as in the production's Units table")
-    _ = approve.add_argument("--plan", required=True, help="'<plan path> Phase N–M'")
+    approving = verbs.add_parser("approve", help="record the approval; stage active (in progress)")
+    _ = approving.add_argument("--by", required=True, choices=APPROVERS,
+                             help="user when the user approved, showrunner when a showrunner approved without the user")
+    _ = approving.add_argument("--showrunner", required=True, help="the showrunner's session name")
+    _ = approving.add_argument("--unit", required=True, help="the unit, as in the production's Units table")
+    _ = approving.add_argument("--plan", required=True, help="'<plan path> Phase N–M'")
+    unapproving = verbs.add_parser("unapprove", help="set an approved proposal back to waiting for approval")
+    _ = unapproving.add_argument("--dry-run", action="store_true", help="print the change and write nothing")
     _ = verbs.add_parser("start", help="stage active")
     close = verbs.add_parser("close", help="set as_built and close")
     closure = close.add_mutually_exclusive_group(required=True)
@@ -562,17 +700,24 @@ def main(argv: list[str]) -> int:
     moving = verbs.add_parser("move-approved", help="move each open approved proposal at backlog to stage active")
     _ = moving.add_argument("folder", type=Path)
     _ = moving.add_argument("--dry-run", action="store_true", help="print the moves and write nothing")
+    styling = verbs.add_parser("area-style", help="set the area on unfiled current and legacy style issues")
+    _ = styling.add_argument("folder", type=Path)
+    _ = styling.add_argument("--dry-run", action="store_true", help="print the changes and write nothing")
     answer = verbs.add_parser("decline-answer", help="store a decision's declined answer")
     _ = answer.add_argument("--words", required=True)
     linking = verbs.add_parser("rules", help="set the rule links")
     _ = linking.add_argument("--rules", required=True)
+    ranking = verbs.add_parser("urgency", help="set where it goes among the proposals waiting for the user")
+    _ = ranking.add_argument("--level", required=True, choices=urgency.LEVELS)
+    _ = ranking.add_argument("--due", default="", help="ISO date or time; only with soon")
+    important = verbs.add_parser("mark-important", help="the user called it important: it goes first")
     stars = verbs.add_parser("stars", help="set the five ranking values")
     numbering = verbs.add_parser("number", help="give each proposal without one its P number")
     _ = numbering.add_argument("issues", type=Path, nargs="+")
     _ = stars.add_argument("--goal", required=True, help="e.g. '1 - Ship Hana'")
     for name in ("alignment", "impact", "urgency", "effort"):
         _ = stars.add_argument(f"--{name}", required=True, help="1 to 5")
-    for verb in (approve, verbs.choices["start"], close, stars, linking, reopening, answer):
+    for verb in (approving, unapproving, verbs.choices["start"], close, stars, linking, reopening, answer, ranking, important):
         _ = verb.add_argument("issue", type=Path)
     args = parser.parse_args(argv)
     verb = cast(str, args.verb)
@@ -586,6 +731,14 @@ def main(argv: list[str]) -> int:
         return 0
     if verb == "move-approved":
         return _main_move_approved(cast(Path, args.folder).expanduser(), today, dry_run=cast(bool, args.dry_run))
+    if verb == "area-style":
+        try:
+            for changed_path in area_style(cast(Path, args.folder).expanduser(), today, dry_run=cast(bool, args.dry_run)):
+                print(f"area-style {changed_path.name}: area [[{STYLE_AREA}]]", flush=True)
+        except (ValueError, OSError, UnicodeError) as error:
+            print(f"proposal_issue: {error}", file=sys.stderr)
+            return 2
+        return 0
     # A plan's Issues line writes `~/rust/hanadocs/issues/<name>.md`, quoted since names hold spaces.
     path = cast(Path, args.issue).expanduser()
     try:
@@ -601,8 +754,18 @@ def main(argv: list[str]) -> int:
             return 0
         if verb == "reopen":
             changed = reopen(path, today)
+        elif verb == "approve":
+            changed = approve(path, {name: cast(str, getattr(args, name)) for name in ("showrunner", "unit", "plan")},
+                              cast(str, args.by), calling_showrunner(), today)
+        elif verb == "unapprove":
+            changed = unapprove(path, calling_showrunner(), today, dry_run=cast(bool, args.dry_run))
         elif verb == "decline-answer":
             changed = edit(path, {"style_answer": "declined", "style_answer_words": cast(str, args.words)}, today)
+        elif verb in ("urgency", "mark-important"):
+            now = datetime.now(user_zone()).replace(tzinfo=None)
+            level = (urgency.mark(now) if verb == "mark-important" or cast(str, args.level) == urgency.USER
+                     else urgency.read(cast(str, args.level), cast(str, args.due)))
+            changed = set_urgency(path, level, today)
         elif verb == "rules":
             changed = edit_rules(path, [url for url in cast(str, args.rules).split(",") if url], today)
         else:

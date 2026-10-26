@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration tests for the plan-delegate findings ledger."""
+"""Integration tests for the unit findings ledger."""
 
 from __future__ import annotations
 
@@ -12,7 +12,9 @@ from unittest.mock import patch
 from pathlib import Path
 from typing import cast, override
 from collections.abc import Callable
-from scripts.direct import findings
+# findings.py reads its limits at import; read them from this checkout, never the live config.
+os.environ["UNIT_CONFIG"] = str(Path(__file__).resolve().parents[2] / "config" / "direct.conf")
+from scripts.direct import findings  # noqa: E402
 
 
 SCRIPT = Path(__file__).with_name("findings.py")
@@ -41,13 +43,13 @@ class FindingsLedgerTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.enterContext(patch.dict(os.environ, {"PLAN_DELEGATE_SYNC_WRITES": "0"}))
+        self.enterContext(patch.dict(os.environ, {"UNIT_SYNC_WRITES": "0"}))
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.session_dir = self.root / "session"
         self.session_dir.mkdir()
         self.history_file = self.root / "history" / "run.jsonl"
-        self.config_file = self.root / "delegate.conf"
+        self.config_file = self.root / "direct.conf"
         self.write_config("")
 
     @override
@@ -55,15 +57,15 @@ class FindingsLedgerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def environment(self, at: int) -> dict[str, str]:
-        """Pin the clock and the config so a machine's own delegate.conf cannot move a limit."""
+        """Pin the clock and the config so a machine's own direct.conf cannot move a limit."""
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(at)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_NOW_EPOCH"] = str(at)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         # The gate reads pass events from the durable stream under this root.
         # Left unset it resolves to the machine's own history, where a phase id
         # this fixture invented would be answered by whatever happens to live
         # there.
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
+        environment["UNIT_HISTORY_DIR"] = str(self.root / "history")
         return environment
 
     def test_event_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
@@ -77,9 +79,9 @@ class FindingsLedgerTests(unittest.TestCase):
         for durable in (True, False):
             with self.subTest(durable=durable), patch.dict(os.environ), patch.object(os, "fsync", side_effect=flushed) as sync:
                 if durable:
-                    _ = os.environ.pop("PLAN_DELEGATE_SYNC_WRITES", None)
+                    _ = os.environ.pop("UNIT_SYNC_WRITES", None)
                 else:
-                    os.environ["PLAN_DELEGATE_SYNC_WRITES"] = "0"
+                    os.environ["UNIT_SYNC_WRITES"] = "0"
                 append(self.session_dir, {}, {"event_type": "probe"})
                 self.assertEqual(sync.call_count, int(durable))
                 self.assertEqual(self.events()[0]["event_type"], "probe")
@@ -155,7 +157,7 @@ class FindingsLedgerTests(unittest.TestCase):
 
     def open_finding(self, severity: str, title: str, *, at: int = 1_000) -> str:
         return self.run_command(
-            "open", "--severity", severity, "--title", title, "--caught-by", "delegate", at=at
+            "open", "--severity", severity, "--title", title, "--caught-by", "worker", at=at
         )
 
     def gate(self, *, at: int = 1_000) -> dict[str, object]:
@@ -212,9 +214,9 @@ class FindingsLedgerTests(unittest.TestCase):
     def test_a_landed_repair_for_the_older_open_phase_touches_only_its_ledger(self) -> None:
         self.write_two_open_phases()
         fifteen = self.run_command("open", "--phase", "15", "--severity", "blocker",
-                                   "--title", "fifteen's finding", "--caught-by", "delegate")
+                                   "--title", "fifteen's finding", "--caught-by", "worker")
         sixteen = self.run_command("open", "--phase", "16", "--severity", "blocker",
-                                   "--title", "sixteen's finding", "--caught-by", "delegate")
+                                   "--title", "sixteen's finding", "--caught-by", "worker")
         _ = self.run_command("dispatch", "--phase", "15", "--covers", fifteen)
         _ = self.run_command("dispatch", "--phase", "16", "--covers", sixteen)
 
@@ -233,7 +235,7 @@ class FindingsLedgerTests(unittest.TestCase):
     def test_a_ledger_call_naming_no_phase_is_refused_while_two_are_open(self) -> None:
         self.write_two_open_phases()
         result = self.run_failing_command("open", "--severity", "blocker", "--title", "which phase",
-                                          "--caught-by", "delegate")
+                                          "--caught-by", "worker")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("2 phases are open (15, 16); name one with --phase", result.stderr)
         self.assertEqual(list(self.session_dir.glob("findings_state*.json")), [])
@@ -254,7 +256,7 @@ class FindingsLedgerTests(unittest.TestCase):
         self.write_progress_state("instance-a")
         _ = self.run_command(
             "open", "--severity", "minor", "--title", "stale caller",
-            "--caught-by", "delegate", "--lens", "contract",
+            "--caught-by", "worker", "--lens", "contract",
         )
         _ = self.open_finding("minor", "main review only")
         findings = cast(list[dict[str, object]], self.status()["findings"])
@@ -262,13 +264,21 @@ class FindingsLedgerTests(unittest.TestCase):
         opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
         self.assertEqual([event["lens"] for event in opened], ["contract", ""])
 
+    def test_the_former_caught_by_name_is_stored_as_worker(self) -> None:
+        self.write_progress_state("instance-a")
+        _ = self.run_command("open", "--severity", "minor", "--title", "old prompt", "--caught-by", "delegate")
+        findings = cast(list[dict[str, object]], self.status()["findings"])
+        self.assertEqual([entry["caught_by"] for entry in findings], ["worker"])
+        opened = [event for event in self.events() if event["event_type"] == "finding_opened"]
+        self.assertEqual([event["caught_by"] for event in opened], ["worker"])
+
     def test_a_finding_names_every_lens_that_raised_it(self) -> None:
         """One lens, several, or the legacy `both`, each stored as the ledger reads it."""
         self.write_progress_state("instance-a")
         for lens in ("craft", "adversary,craft", "ux", "both", "craft, ux,craft"):
             _ = self.run_command(
                 "open", "--severity", "minor", "--title", f"raised by {lens}",
-                "--caught-by", "delegate", "--lens", lens,
+                "--caught-by", "worker", "--lens", lens,
             )
         expected = ["craft", "adversary,craft", "ux", "both", "craft,ux"]
         findings = cast(list[dict[str, object]], self.status()["findings"])
@@ -281,7 +291,7 @@ class FindingsLedgerTests(unittest.TestCase):
         for lens in ("style", "adversary,style", "both,craft", "craft,"):
             result = self.run_failing_command(
                 "open", "--severity", "minor", "--title", "misspelt lens",
-                "--caught-by", "delegate", "--lens", lens,
+                "--caught-by", "worker", "--lens", lens,
             )
             self.assertEqual(result.returncode, 2, lens)
             self.assertIn("argument --lens: unknown lens", result.stderr)
@@ -497,7 +507,7 @@ class FindingsLedgerTests(unittest.TestCase):
         self.assertIn("3 fix rounds have run for 2 original findings", str(payload["advisory"]))
 
     def test_the_repair_budget_floor_is_configurable(self) -> None:
-        """delegate.conf raises the floor, and the extra round is authorized."""
+        """direct.conf raises the floor, and the extra round is authorized."""
         self.write_config("MIN_REPAIR_BUDGET=4\n")
         for index in range(3):
             batch: list[str] = []

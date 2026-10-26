@@ -22,6 +22,9 @@ import merge_checkpoint
 from merge_checkpoint import (ChildHandoffEntry, CodeCheckpoint, LastMerged, MergeEntry, NoMerge, ShrinkCommit,
                               check_parallel, merge_branch_history, merge_history, promote, request_from)
 
+# Importable once merge_checkpoint has put scripts/lib on the path.
+import scratch
+
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
@@ -35,12 +38,12 @@ REAL_OWNS = ("`docs/plans/build-followups-enh-showrunner.md`; `scripts/productio
              "`commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, "
              "`scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests "
              "(hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): "
-             "`commands/unit/delegate.md`, `commands/unit/checkpoint.md`, "
-             "`docs/delegate/run_phase_review.md`, `docs/production_format.md`, "
+             "`commands/unit/direct.md`, `commands/unit/checkpoint.md`, "
+             "`docs/direct/run_phase_review.md`, `docs/production_format.md`, "
              "`commands/unit/add_ons.md`, `commands/plan/shrink.md`, "
-             "`commands/plan/phase_review.md`, `docs/delegate/phase_end.md`, "
-             "`docs/delegate_plan_format.md`, `commands/unit/eta_breakdown.md`, "
-             "`docs/delegate/final_gate_commit.md`")
+             "`commands/plan/phase_review.md`, `docs/direct/phase_end.md`, "
+             "`docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, "
+             "`docs/direct/final_gate_commit.md`")
 SIMPLE_MERGE_TESTS = "- **Merge tests:** `checkpoint-test`"
 REAL_MERGE_TESTS = ("- **Merge tests:** `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py'` "
                     "and `basedpyright scripts/buildlog` (pass is its `0 errors, 0 warnings` line: it exits 3 "
@@ -88,14 +91,20 @@ if name == "verify.sh":
 if (state / ("fail-" + name)).exists():
     raise SystemExit(1)
 if name == "basedpyright":
-    print("0 errors, 0 warnings, 0 notes")
+    print("0 errors, 0 warnings, 0 notes", flush=True)
+    print("venv .venv subdirectory not found in venv path " + os.getcwd() + ".", file=sys.stderr)
     raise SystemExit(3)
 '''
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    """The times these tests expect are Pacific; the user's zone setting must not change them. The
+    scratch folders a merge removes are in a temporary folder, never /tmp/claude/scratch or ~/rust/repro."""
+    folder = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(folder.cleanup)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
+        "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
 
 
 class MergeResult(NamedTuple):
@@ -319,6 +328,16 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
         self.assertIn("scope: ok", accepted.process.stdout)
 
+    def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
+        with mock.patch.dict(os.environ, self.env):
+            done = [scratch.new("phase:alpha-unit/2", word) for word in ("gate", "copy")]
+            later = scratch.new("phase:alpha-unit/3")
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha-unit/2: ", result.process.stdout)
+        self.assertFalse(any(path.exists() for path in done))
+        self.assertTrue(later.is_dir())
+
     def assert_real_owns_path_allowed(self, relative: str) -> None:
         self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
         sha = self.checkpoint(relative, relative + "\n", subject="own " + relative)
@@ -341,8 +360,8 @@ class MergeCheckpointTests(unittest.TestCase):
     def test_real_owns_cell_still_reads_a_bare_name_as_a_root_file(self) -> None:
         self.assert_real_owns_path_allowed("merge_checkpoint.py")
 
-    def test_real_owns_cell_allows_delegate_path_in_last_group(self) -> None:
-        self.assert_real_owns_path_allowed("commands/unit/delegate.md")
+    def test_real_owns_cell_allows_a_path_in_the_last_group(self) -> None:
+        self.assert_real_owns_path_allowed("commands/unit/direct.md")
 
     def test_real_owns_cell_holds_an_outside_path(self) -> None:
         self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
@@ -565,7 +584,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
         merged = self.git("rev-parse", "--short=8", "HEAD")
         self.assertRegex(review.read_text(encoding="utf-8").splitlines()[-1],
-                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \|$")
+                         rf"^\| C8 \| The grid fades gently \| \d{{4}}-\d\d-\d\d · {merged} \| not yet \| Run `hana` in a natedev terminal\. You see: The grid lines fade out farther away \| example \|$")
         self.assertIn("change review: ok — 1 row(s) added", result.process.stdout)
         self.assertNotIn("change review: drift", result.process.stdout)
         self.assertEqual(self.git("status", "--porcelain"), "")
@@ -958,6 +977,22 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertEqual(len(self.events("review_regime.py")), 1)
         self.assertNotIn("unblocks: G1", result.process.stdout)
         self.assertIn("docs/plans/alpha-next.md", self.git("ls-tree", "-r", "--name-only", "HEAD"))
+
+    def test_shrink_after_criss_cross_merge_scopes_only_its_doc(self) -> None:
+        code = self.checkpoint()
+        self.write(self.checkout, "src/beta.txt", "beta on the merge branch\n")
+        _ = self.git("commit", "-am", "beta lands first")
+        _ = self.git("push", "origin", "production")
+        _ = self.git("merge", "--no-ff", "-m", "merge production", "production", cwd=self.unit)
+        _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
+        first = self.run_checkpoint(code)
+        self.assertEqual(first.process.returncode, 0, first.process.stderr + first.process.stdout)
+        shrink = self.checkpoint("docs/plans/alpha.md", "short as built\n", subject="shrink")
+        bases = self.git("merge-base", "--all", "production", shrink).splitlines()
+        self.assertEqual(len(bases), 2, bases)
+        result = self.run_checkpoint(shrink, "--shrink", review=False)
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scope: ok — 1 changed paths are allowed", result.process.stdout)
 
     def test_promote_none_merges_and_records_without_promotion(self) -> None:
         self.promotions = "none"
@@ -1615,6 +1650,50 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertFalse(history.has_code_merge("old-unit", "style hand-off"))
         self.assertEqual(history.last_handoff_for_child("old-unit"), history.entries[0])
         self.assertEqual(history.last_handoff_for_child("new-unit"), NoMerge())
+
+
+@final
+class TestPassedTests(unittest.TestCase):
+    VENV = "venv .venv subdirectory not found in venv path /checkout.\n"
+
+    def judge(self, status: int, stdout: str, stderr: str = "") -> bool:
+        result = subprocess.CompletedProcess(["basedpyright"], status, stdout, stderr)
+        return merge_checkpoint.test_passed(["/nix/bin/basedpyright", "scripts/buildlog"], result)
+
+    def test_clean_basedpyright_passes_with_trailing_venv_line_on_stderr(self) -> None:
+        self.assertTrue(self.judge(3, "0 errors, 0 warnings, 0 notes\n", self.VENV))
+
+    def test_basedpyright_with_errors_fails(self) -> None:
+        self.assertFalse(self.judge(1, "/checkout/a.py:1:1 - error: x\n2 errors, 0 warnings, 0 notes\n", self.VENV))
+        self.assertFalse(self.judge(3, "2 errors, 0 warnings, 0 notes\n", self.VENV))
+
+    def test_other_commands_pass_only_on_status_zero(self) -> None:
+        result = subprocess.CompletedProcess(["python3"], 3, "0 errors, 0 warnings, 0 notes\n", "")
+        self.assertFalse(merge_checkpoint.test_passed(["python3", "-m", "unittest"], result))
+        self.assertTrue(merge_checkpoint.test_passed(["python3"], subprocess.CompletedProcess(["python3"], 0, "", "")))
+
+
+@final
+class MacPromotionPathTests(unittest.TestCase):
+    def remote_command(self, promote_line: str) -> str:
+        promotion = merge_checkpoint.promotion_from_doc([f"- **Promote:** {promote_line}"])
+        assert isinstance(promotion, merge_checkpoint.PromoteTo)
+        assert isinstance(promotion.mac, merge_checkpoint.MacCheckout)
+        done = subprocess.CompletedProcess(["ssh"], 0, "rc=0\n", "")
+        with mock.patch("merge_checkpoint.subprocess.run", return_value=done) as run:
+            merge_checkpoint.pull_mac_checkout(promotion.mac.path, Path("/home/natepiano/.claude"))
+        argv = cast(list[str], run.call_args.args[0])
+        self.assertEqual(argv[:2], ["ssh", "mac"])
+        return argv[2]
+
+    def test_tilde_mac_path_is_expanded_by_the_mac_shell(self) -> None:
+        remote = self.remote_command("mac `~/.claude`")
+        self.assertTrue(remote.startswith('cd "$HOME"/.claude && git pull'), remote)
+        self.assertNotIn(str(Path.home()) + "/.claude &&", remote)
+
+    def test_absolute_mac_path_is_kept(self) -> None:
+        remote = self.remote_command("/home/natepiano/.claude, mac /Users/someone/my repo")
+        self.assertTrue(remote.startswith("cd '/Users/someone/my repo' && git pull"), remote)
 
 
 if __name__ == "__main__":

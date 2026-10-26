@@ -17,7 +17,8 @@ port_lint.py writes its own call records through write_call() here.
       nothing.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
       From verify.sh, once per call. OUTCOME is ran, failed, interrupted,
-      reused or replayed; CACHED is 1 when the call was eligible for a pass
+      reused, replayed or superseded (a newer call of the same verb from the
+      same worker replaced it in the token queue, status 76); CACHED is 1 when the call was eligible for a pass
       record; WAIT, WALL, BUILD and SAVED are whole seconds, ELAPSED the
       script's $SECONDS at the end. STATUS and BUILD may be empty (unknown).
       BUILDLOG_TOKEN_WAIT_S is the time spent acquiring the cargo token.
@@ -167,10 +168,11 @@ def caller(tty: bool) -> str:
 
 def who() -> dict[str, str | None]:
     env = os.environ
-    board = env.get("PLAN_DELEGATE_BOARD_DIR") or env.get("PLAN_DELEGATE_SESSION_DIR")
+    board = (env.get("UNIT_RUN_DIR") or env.get("PLAN_DELEGATE_BOARD_DIR")
+             or env.get("UNIT_SESSION_DIR") or env.get("PLAN_DELEGATE_SESSION_DIR"))
     return {
-        "worker": env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
-        "delegate_session": Path(board.rstrip("/")).name if board else None,
+        "worker": env.get("UNIT_TEAM_ROLE") or env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
+        "unit_session": Path(board.rstrip("/")).name if board else None,
         "session": env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None,
     }
 
@@ -485,7 +487,7 @@ def backfill(args: list[str]) -> None:
             "branch": event["branch"] or None,
             "sha": event["commit"] or None,
             "worker": None,
-            "delegate_session": event["session"] or None,
+            "unit_session": event["session"] or None,
             "session": None,
             "backfilled": True,
         }

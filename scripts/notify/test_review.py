@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import pushover
 import review
@@ -412,6 +413,24 @@ class LocalReviewTests(unittest.TestCase):
         _ = path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
         return path
 
+    def test_every_review_prompt_names_the_user_zone_and_its_date(self) -> None:
+        reply = review.ReplyContext(self.root / "session.jsonl", datetime(2026, 10, 25, 12, tzinfo=timezone.utc), "")
+        question = review.QuestionReview(review.QuestionKey("demo", "Retry"))
+        contexts: tuple[review.PushReview | review.ReplyContext | review.QuestionReview, ...] = (
+            review.PUSH_REVIEW, reply, question)
+        for zone in ("America/Curacao", "America/New_York"):
+            now = datetime.now(ZoneInfo(zone))
+            line = f"User zone: {now.tzname()} ({zone}). Today: {now:%Y-%m-%d}."
+            for context in contexts:
+                with self.subTest(zone=zone, context=type(context).__name__), mock.patch.dict(os.environ, {"USER_ZONE": zone}):
+                    runner = FakeReviewer(verdict(self.draft))
+                    _ = review._review(self.draft, False, runner, context, timeout_seconds=60)  # pyright: ignore[reportPrivateUsage]
+                    command = runner.calls[-1].argv
+                    self.assertEqual(command[-1].splitlines()[0], line)
+                    self.assertIn("Times are in the user zone the draft gives.",
+                                  command[command.index("--system-prompt") + 1])
+        self.assertEqual(datetime.now(ZoneInfo("America/Curacao")).tzname(), "AST")
+
     def test_sample_uses_reply_rules_date_and_previous_reply_without_phone_limits(self) -> None:
         old = "The prior decision is still open."
         body = "The build completed. " * 80
@@ -774,6 +793,43 @@ class LocalReviewTests(unittest.TestCase):
                 self.assertIsInstance(result, expected)
                 configured.assert_called_once()
 
+    def test_a_review_limit_caps_the_whole_review_and_a_review_out_of_time_is_unreviewed(self) -> None:
+        revised = replace(self.draft, body="Choose whether to retry the nightly build.")
+        elapsed = [0.0]
+        timeouts: list[float] = []
+
+        def reads(replies: list[VerdictJSON], seconds: float, failure: Literal["none", "timeout"] = "none") -> review.ProcessRunner:
+            """A reviewer whose each read takes `seconds` and gives the next reply."""
+            left = iter(replies)
+
+            def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+                if Path(argv[0]).name != "claude":
+                    return FakeReviewer(verdict(self.draft))(argv, timeout=timeout, env=env)
+                timeouts.append(timeout)
+                elapsed[0] += seconds
+                return FakeReviewer(next(left), failure=failure)(argv, timeout=timeout, env=env)
+            return runner
+
+        rewrite = verdict(self.draft, "rewrite", body=revised.body)
+        cases: tuple[tuple[review.ProcessRunner, type, list[float]], ...] = (
+            # The limit is the reviewer's timeout when it is shorter than the configured 60 s.
+            (reads([verdict(self.draft)], 5), review.Approved, [30]),
+            (reads([verdict(self.draft)], 30, "timeout"), review.Unreviewed, [30]),
+            # Time left after the first read is the timeout of the second.
+            (reads([rewrite, verdict(revised)], 12), review.Rewritten, [30, 18]),
+            # A rewrite whose first read used up the limit gets no second read.
+            (reads([rewrite, verdict(revised)], 31), review.Unreviewed, [30]))
+        for runner, expected, read_timeouts in cases:
+            elapsed[0], timeouts[:] = 0.0, []
+            with (self.subTest(expected=expected, read_timeouts=read_timeouts),
+                  mock.patch.object(review, "review_timeout_seconds", return_value=60),
+                  mock.patch.object(time, "monotonic", side_effect=lambda: elapsed[0])):
+                outcome = review.review(self.draft, False, runner=runner, limit=30)
+                self.assertIsInstance(outcome, expected)
+                if isinstance(outcome, review.Unreviewed):
+                    self.assertEqual(outcome.why, "timeout")
+                self.assertEqual(timeouts, read_timeouts)
+
     def test_two_slow_reviews_fit_the_sender_wait_and_keep_a_live_claim_owned(self) -> None:
         held = self.held()
         review.hold(held)
@@ -819,7 +875,8 @@ class LocalReviewTests(unittest.TestCase):
 
     def test_texts_reviews_every_example_and_approves_only_unchanged_send_results(self) -> None:
         entry = push_texts.PushText("test", "script", "decision", "Choose version", push_texts.ActionTemplate("Choose retry."),
-                                   "The check passed on {version}.", (push_texts.PushExample("typical", {"version": "1"}), push_texts.PushExample("long", {"version": "2000"})))
+                                   "The check passed on {version}.", (push_texts.PushExample("typical", {"version": "1"}), push_texts.PushExample("long", {"version": "2000"})),
+                                   purpose="Test.")
         approvals = self.root / "reviewed.json"
         reviewed: list[str] = []
         def runner(argv: list[str], *, timeout: float, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -841,7 +898,7 @@ class LocalReviewTests(unittest.TestCase):
     def test_user_spec_approves_original_text_and_keeps_ask_objections_and_existing_approvals(self) -> None:
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner remote-control is off",
             push_texts.ActionTemplate("run /remote-control"), "Reason: Remote control is off.",
-            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+            (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
         draft = review.Draft("shutdown", "1", entry.title, ActionRequired("run /remote-control"),
                              entry.body, False, SessionLine("Owner"))
         objections = [review.RuleFailureRecord(rule="reader-starts-cold", quote="Remote control is off.")]
@@ -876,7 +933,7 @@ class LocalReviewTests(unittest.TestCase):
     def test_approving_prunes_retired_examples_only_for_selected_texts_and_keeps_current_failed_approvals(self) -> None:
         entry = push_texts.PushText("selected", "shutdown", "decision", self.draft.title,
             push_texts.ActionTemplate(cast(ActionRequired, self.draft.action).text), self.draft.body,
-            (push_texts.PushExample("typical", {}), push_texts.PushExample("new", {})))
+            (push_texts.PushExample("typical", {}), push_texts.PushExample("new", {})), purpose="Test.")
         other = replace(entry, id="other")
         old: review.TextApproval = {"sha256": "old-digest", "time": "yesterday", "reviewer": "opus"}
         existing = {"selected": {"typical": old, "retired": old}, "other": {"retired": old}}
@@ -916,6 +973,21 @@ class LocalReviewTests(unittest.TestCase):
             self.assertEqual(review.main(["texts", "--id", "shutdown.holdout", "--approve",
                                           "--user-spec", "User words"]), 0)
         texts.assert_called_once_with(["shutdown.holdout"], True, authority=review.UserSpecifiedText("User words"))
+
+    def test_list_and_show_cli_print_the_catalog(self) -> None:
+        listing = push_texts.listing(push_texts.catalog())
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["list"]), 0)
+        self.assertEqual(output.getvalue(), listing + "\n")
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["show", "session.needs_go"]), 0)
+        shown = output.getvalue()
+        self.assertIn("Title: {sender}: {session} waits for your go\nSession: {session}\n", shown)
+        self.assertIn("Example (typical):\nTitle: natedev: trunk waits for your go\nSession: trunk\n", shown)
+        self.assertNotIn("{", shown.split("Example (typical):")[1])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(review.main(["show", "no.such"]), 1)
+        self.assertEqual(output.getvalue(), f"No template named no.such.\n\n{listing}\n")
 
     def test_retiring_a_rejected_claim_preserves_a_newer_hold_from_the_same_source(self) -> None:
         original = self.held()
@@ -1048,6 +1120,26 @@ class LocalReviewTests(unittest.TestCase):
         self.assertIn('failure: {"rule": "short-plain-sentences", "quote": "The build stopped."}', output.getvalue())
         self.assertIsInstance(self.reviewed(verdict(self.draft, "rewrite", failed_rules=[
             {"rule": "reader-starts-cold", "quote": "Not in the original"}])), review.Approved)
+
+    def test_a_body_that_gives_a_second_action_fails_push_one_action(self) -> None:
+        action = ActionRequired("On natedev, in the tile pane, approve the prompt or add an allow rule")
+        draft = review.Draft("writer one", "1", "tile waits for you", action,
+                             "Auto mode refused 1 command in tile. Type ! kill -TERM -3137969 in the cargo-liner session.", True)
+        result = review.validate(verdict(draft), draft, False)
+        self.assertIsInstance(result, review.Failed)
+        assert isinstance(result, review.Failed)
+        self.assertEqual(result.failed_rules, ["push-one-action"])
+        self.assertEqual(result.failures, (review.RuleFailure("push-one-action",
+            'the body says to type "kill -TERM -3137969", which the Action line does not hold; '
+            + "the body names the cargo-liner pane or session, which the Action line does not name"),))
+        clean = replace(draft, body="Auto mode refused 1 command in tile. The tile build waits for it.")
+        # Code decides the rule: a model report on a clean draft is dropped, and a rewrite that adds a second action fails.
+        self.assertIsInstance(review.validate(verdict(clean, failed_rules=[
+            {"rule": "push-one-action", "quote": clean.body}]), clean, False), review.Approved)
+        rewrite = review.validate(verdict(clean, "rewrite", body=draft.body), clean, False)
+        self.assertIsInstance(rewrite, review.Failed)
+        assert isinstance(rewrite, review.Failed)
+        self.assertIn("push-one-action", rewrite.failed_rules)
 
     def test_oversized_rewrite_remains_a_review_failure_instead_of_a_reviewer_fault(self) -> None:
         result = self.reviewed(verdict(self.draft, "rewrite", body="B" * 500, failed_rules=[

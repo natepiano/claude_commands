@@ -838,6 +838,78 @@ class SessionRecordTests(ShutdownTestCase):
         record.clear_finished_account_hold(held["login"])
         self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountOpen)
 
+    def registered_stop_hold(self) -> record.AccountHold:
+        held = account_hold()
+        held["requested_by"] = record.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
+        held["request_id"] = "e520bca5-6b79-4c16-874e-512142adfed2"
+        record.register_account_hold_request(held, account_wide=True)
+        record.complete_account_hold_registration(held["login"], held["request_id"])
+        stored = record.account_hold(held["login"])
+        assert stored is not None
+        return stored
+
+    def hold_record(self, held: record.AccountHold, number: int, progress: record.SessionProgress) -> record.SessionShutdown:
+        saved = session_shutdown(number, progress=progress, hold="account")
+        saved["request_id"] = held["request_id"]
+        self.assertTrue(record.create_session(saved))
+        return saved
+
+    def test_a_finished_stop_hold_whose_records_another_path_archived_is_released(self) -> None:
+        """The 10-18 claude2 case: a stop request's sessions ended restarted or restart failed, a later
+        path archived their records, and no conductor saw them finish, so its hold outlived it."""
+        held = self.registered_stop_hold()
+        for number, progress in ((1, record.SessionRestarted(kind="restarted", at=LATER)),
+                                 (2, record.SessionRestartFailed(kind="restart failed", at=LATER, reason="restart prompt not submitted")),
+                                 (3, record.SessionStopped(kind="stopped", at=LATER))):
+            saved = self.hold_record(held, number, progress)
+            record.archive_session(saved["login"], saved["session"]["session_id"])
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldReleased(held))
+        self.assertFalse((self.directory / "hold.json").exists())
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountOpen)
+        self.assertIsInstance(record.release_finished_account_hold(held["login"]), record.AccountOpen)
+
+    def test_a_finished_hold_is_released_while_its_stopped_records_stay_for_restore(self) -> None:
+        held = self.registered_stop_hold()
+        saved = self.hold_record(held, 1, record.SessionStopped(kind="stopped", at=LATER))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldReleased(held))
+        self.assertEqual(record.session_records(held["login"]), [saved])
+
+    def test_a_hold_stays_while_a_session_of_its_request_is_live_or_stopping_or_its_conductor_runs(self) -> None:
+        held = self.registered_stop_hold()
+        saved = self.hold_record(held, 1, record.SessionWaiting(kind="waiting"))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        stopping: record.SessionProgress = record.SessionStopping(kind="stopping", at=LATER)
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(progress=stopping))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        stopped: record.SessionProgress = record.SessionStopped(kind="stopped", at=LATER)
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(progress=stopped))
+        with record.conductor_lock(held["login"]) as conductor:
+            self.assertIsInstance(conductor, record.ConductorAcquired)
+            self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldReleased(held))
+
+    def test_a_conductor_keeps_a_restart_hold_until_it_restarts_its_stopped_sessions(self) -> None:
+        held = self.registered_stop_hold()
+        held["then"] = "restart"
+        record.set_account_hold(held)
+        saved = self.hold_record(held, 1, record.SessionStopped(kind="stopped", at=LATER))
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(then="restart"))
+        self.assertEqual(record.release_finished_account_hold(held["login"], conducting=True), record.HoldInUse(held))
+        restarted: record.SessionProgress = record.SessionRestarted(kind="restarted", at=LATER)
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(progress=restarted))
+        self.assertEqual(record.release_finished_account_hold(held["login"], conducting=True), record.HoldReleased(held))
+
+    def test_a_registering_or_old_record_hold_is_never_released(self) -> None:
+        held = account_hold()
+        held["registration"] = "in progress"
+        record.set_account_hold(held)
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        record.clear_account_hold(held["login"])
+        write_old(shutdown_record(state="down"))
+        outcome = record.release_finished_account_hold(held["login"])
+        self.assertIsInstance(outcome, record.HoldInUse)
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountHeld)
+
     def test_all_account_holds_include_explicit_and_empty_old_accounts_in_request_order(self) -> None:
         explicit = account_hold()
         explicit["label"] = "Alpha"

@@ -229,21 +229,21 @@ class AddStyleTests(unittest.TestCase):
         self.assertEqual(launched["production"], self.doc.read_text())
         self.assertEqual([line.split("|")[1].strip() for line in launched["production"].splitlines()
                           if line.startswith("| ") and "-unit |" in line],
-                         ["names-unit", "types-unit", "modules-unit"])
-        self.assertEqual(set(launched["plans"]), {f"{family}-unit.md" for family in add_style.FAMILIES})
+                         ["sample-style-names-unit", "sample-style-types-unit", "sample-style-modules-unit"])
+        self.assertEqual(set(launched["plans"]), {f"sample-style-{family}-unit.md" for family in add_style.FAMILIES})
         for unit, scope in (("names", "cargo-handler, cargo-port"), ("types", "cargo-port")):
-            lines = launched["plans"][f"{unit}-unit.md"].splitlines()
+            lines = launched["plans"][f"sample-style-{unit}-unit.md"].splitlines()
             scope_index = lines.index(f"- **Pilot scope:** {scope}")
             self.assertLess(lines.index("## Delegation Context"), scope_index)
             self.assertTrue(lines[scope_index - 1].startswith("  - `"))
             self.assertLess(scope_index, lines.index("## Phases"))
         for unit in ("values", "modules"):
-            self.assertNotIn("**Pilot scope:**", launched["plans"][f"{unit}-unit.md"])
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["names-unit.md"], self.repo),
+            self.assertNotIn("**Pilot scope:**", launched["plans"][f"sample-style-{unit}-unit.md"])
+        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-names-unit.md"], self.repo),
                          style_plan.PilotCrates(frozenset({"crates/handler", "crates/port"})))
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["types-unit.md"], self.repo),
+        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-types-unit.md"], self.repo),
                          style_plan.PilotCrates(frozenset({"crates/port"})))
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["modules-unit.md"], self.repo),
+        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-modules-unit.md"], self.repo),
                          style_plan.AllCrates())
 
     def test_pilot_is_refused_for_an_existing_production_without_changing_it(self) -> None:
@@ -281,12 +281,12 @@ class AddStyleTests(unittest.TestCase):
                                            "--pilot", "values-unit=sample", success=False).returncode, 2)
         launched = self.root / "sample-style-names"
         launched.mkdir()
-        names_plan = self.checkout / add_style.PLAN_DIRECTORY / "names-unit.md"
+        names_plan = self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md"
         _ = names_plan.write_text(names_plan.read_text() + "\n### Phase 1 — launched record\n")
         _ = self.doc.write_text(self.doc.read_text().replace("| sample-style-names | — |", "| sample-style-names | 7777 |"))
-        names_row = next(line for line in self.doc.read_bytes().splitlines(keepends=True) if line.startswith(b"| names-unit |"))
+        names_row = next(line for line in self.doc.read_bytes().splitlines(keepends=True) if line.startswith(b"| sample-style-names-unit |"))
         names_before = names_plan.read_bytes(), names_plan.stat().st_mtime_ns
-        types_plan = self.checkout / add_style.PLAN_DIRECTORY / "types-unit.md"
+        types_plan = self.checkout / add_style.PLAN_DIRECTORY / "sample-style-types-unit.md"
         _ = types_plan.write_text(types_plan.read_text() + "\nUnlaunched notes retained.\n")
         log = self.checkout / "docs/sample-style-log.md"
         _ = log.write_text("Interrupted bootstrap notes.\n")
@@ -297,12 +297,12 @@ class AddStyleTests(unittest.TestCase):
 
         self.assertIn(names_row, self.doc.read_bytes().splitlines(keepends=True))
         self.assertEqual((names_plan.read_bytes(), names_plan.stat().st_mtime_ns), names_before)
-        self.assertIn("| modules-unit |", self.doc.read_text())
-        self.assertNotIn("| values-unit |", self.doc.read_text())
+        self.assertIn("| sample-style-modules-unit |", self.doc.read_text())
+        self.assertNotIn("| sample-style-values-unit |", self.doc.read_text())
         self.assertIn("- **Pilot scope:** cargo-port\n", types_plan.read_text())
         self.assertNotIn("**Pilot scope:** cargo-handler", types_plan.read_text())
         self.assertIn("Unlaunched notes retained.", types_plan.read_text())
-        self.assertNotIn("**Pilot scope:**", (self.checkout / add_style.PLAN_DIRECTORY / "values-unit.md").read_text())
+        self.assertNotIn("**Pilot scope:**", (self.checkout / add_style.PLAN_DIRECTORY / "sample-style-values-unit.md").read_text())
         self.assertEqual(log.read_text(), "Interrupted bootstrap notes.\n")
         self.assertEqual((self.sync(), (self.repo / ".git/info/exclude").read_bytes()), (sync, excluded))
 
@@ -312,14 +312,29 @@ class AddStyleTests(unittest.TestCase):
                                     "--pilot", "types-unit=cargo-port")
         lines = result.stdout.splitlines()
         self.assertEqual(len(lines), 7)
-        for unit in ("modules-unit", "names-unit", "types-unit"):
+        for unit in ("sample-style-modules-unit", "sample-style-names-unit", "sample-style-types-unit"):
             self.assertIn(unit, lines[3])
-        self.assertIn("modules-unit: all crates", lines[4])
-        self.assertIn("names-unit: cargo-handler", lines[4])
-        self.assertIn("types-unit: cargo-port", lines[4])
+        self.assertIn("sample-style-modules-unit: all crates", lines[4])
+        self.assertIn("sample-style-names-unit: cargo-handler", lines[4])
+        self.assertIn("sample-style-types-unit: cargo-port", lines[4])
         self.assertNotIn("values-unit", lines[3] + lines[4])
         self.assertFalse(self.checkout.exists())
         self.assertFalse((self.root / "ledger").exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_pilot_family_old_id_and_full_id_produce_the_same_check(self) -> None:
+        checks = [self.run_bootstrap("--check", "--pilot", f"{name}=sample").stdout
+                  for name in ("names", "names-unit", "sample-style-names-unit")]
+        self.assertEqual(checks[1:], [checks[0], checks[0]])
+        self.assertIn("sample-style-names-unit: sample", checks[0])
+        self.assertFalse(self.checkout.exists())
+        self.assertFalse((self.root / "ledger").exists())
+
+    def test_pilot_aliases_cannot_select_the_same_family_twice(self) -> None:
+        result = self.run_bootstrap("--check", "--pilot", "names=sample",
+                                    "--pilot", "sample-style-names-unit=sample", success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.checkout.exists())
         self.assertEqual(self.calls(), [])
 
     def test_lookup_from_main_and_linked_worktree_finds_the_same_standing_production(self) -> None:
@@ -356,10 +371,10 @@ class AddStyleTests(unittest.TestCase):
             self.assertEqual(production_field(lines, field), value)
         self.assertIn("- **Merge tests:** `sample`, `support` — packages tested on every merge", lines)
         for family in add_style.FAMILIES:
-            plan = self.checkout / f"docs/style-production/units/{family}-unit.md"
+            plan = self.checkout / f"docs/style-production/units/sample-style-{family}-unit.md"
             text = plan.read_text()
-            self.assertIn(f"| {family}-unit | docs/style-production/units/{family}-unit.md |", self.doc.read_text())
-            self.assertIn(f"> **Production: sample-style** — unit `{family}-unit`", text)
+            self.assertIn(f"| sample-style-{family}-unit | docs/style-production/units/sample-style-{family}-unit.md | {self.root / ('sample-style-' + family)} | sample-style-{family} |", self.doc.read_text())
+            self.assertIn(f"> **Production: sample-style** — unit `sample-style-{family}-unit`", text)
             self.assertIn("> **Standing:** style_plan.py", text)
             self.assertNotIn("**Pilot scope:**", text)
             self.assertIn(f"global:rust/{family}.md", text)
@@ -429,7 +444,7 @@ class AddStyleTests(unittest.TestCase):
 
     def test_rerun_keeps_plans_ledger_and_excludes_and_does_not_launch_twice(self) -> None:
         _ = self.run_bootstrap()
-        plan = self.checkout / "docs/style-production/units/names-unit.md"
+        plan = self.checkout / "docs/style-production/units/sample-style-names-unit.md"
         _ = plan.write_text(plan.read_text() + "\n### Phase 1 — already assigned\n")
         paths = (plan, self.doc, self.repo / ".git/info/exclude")
         before = {path: (path.read_text(), path.stat().st_mtime_ns) for path in paths}
@@ -560,9 +575,9 @@ class AddStyleTests(unittest.TestCase):
 
     def test_bootstrapped_standing_plan_passes_real_unit_preflight(self) -> None:
         _ = self.run_bootstrap()
-        plan = add_style.PLAN_DIRECTORY / "names-unit.md"
+        plan = add_style.PLAN_DIRECTORY / "sample-style-names-unit.md"
         request = add_unit.RequestedUnitLaunch(
-            production=read_production(self.doc), requested_name="names", unit="names-unit",
+            production=read_production(self.doc), requested_name="sample-style-names", unit="sample-style-names-unit",
             branch="sample-style-names", worktree=self.root / "sample-style-names",
             plan=add_unit.PlanGiven(plan), port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
             session=add_unit.NewSession(), launch_kind=add_unit.NewWorkLaunch(), timeout=1.0,
@@ -588,7 +603,7 @@ class AddStyleTests(unittest.TestCase):
             ready = add_unit.preflight(request, NamedAccount("test", self.root / "account"))
 
         self.assertEqual(ready.launch.plan_path, plan)
-        self.assertEqual(ready.launch.identity.unit, "names-unit")
+        self.assertEqual(ready.launch.identity.unit, "sample-style-names-unit")
         self.assertIsInstance(ready.row, add_unit.ExistingUnitRow)
         self.assertEqual((self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()), before)
         self.assertFalse(request.worktree.exists())
@@ -624,7 +639,7 @@ class AddStyleTests(unittest.TestCase):
         refused = self.run_bootstrap(success=False)
         self.assertEqual(refused.returncode, 2)
         self.assertIn("launch.py exited 2", refused.stderr)
-        plan = self.checkout / "docs/style-production/units/values-unit.md"
+        plan = self.checkout / "docs/style-production/units/sample-style-values-unit.md"
         _ = plan.write_text(plan.read_text() + "\n### Phase 1 — resumed work\n")
         original_plan = plan.read_text()
         _ = (self.repo / "src/new.rs").write_text("pub fn added_after_launch() {}\n")

@@ -24,9 +24,43 @@ from feature_log import locked, state_dir, vault_dir
 
 TODAY = "2026-10-10"
 EVENT_TIME = "2026-10-10T12:34:56-07:00"
-SHA_ONE = "0000000000000000000000000000000000000001"
-SHA_TWO = "0000000000000000000000000000000000000002"
-SHA_THREE = "0000000000000000000000000000000000000003"
+sha_one: str
+sha_two: str
+sha_three: str
+sha_four: str
+default_checkout: Path
+
+
+def temporary_checkout(
+    path: Path, *, dates: tuple[str, ...] = ("2026-10-10T12:00:00+00:00",) * 4,
+) -> tuple[str, ...]:
+    """Create real commits without consulting the user's git config or checkout."""
+    path.mkdir(parents=True)
+    environment = os.environ.copy()
+    environment.update(
+        GIT_CONFIG_GLOBAL="/dev/null",
+        GIT_CONFIG_SYSTEM="/dev/null",
+        GIT_AUTHOR_NAME="Feature Log Test",
+        GIT_AUTHOR_EMAIL="feature-log-test@example.invalid",
+        GIT_COMMITTER_NAME="Feature Log Test",
+        GIT_COMMITTER_EMAIL="feature-log-test@example.invalid",
+        GIT_AUTHOR_DATE="2000-01-01T12:00:00+00:00",
+        GIT_COMMITTER_DATE="2026-10-10T12:00:00+00:00",
+    )
+
+    def git(*arguments: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *arguments],
+            capture_output=True, text=True, check=True, env=environment,
+        ).stdout.strip()
+
+    _ = git("init", "--template=", "--object-format=sha1", "-b", "main")
+    commits: list[str] = []
+    for index, date in enumerate(dates):
+        environment["GIT_COMMITTER_DATE"] = date
+        _ = git("-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", f"Result {index}")
+        commits.append(git("rev-parse", "HEAD"))
+    return tuple(commits)
 
 HANA_EXAMPLE = """---
 area: "[[widgets]]"
@@ -99,7 +133,15 @@ Start builds in two sessions. Both draw from the same natedev build capacity.
 
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    global sha_one, sha_two, sha_three, sha_four, default_checkout
+    unittest.enterModuleContext(patch.dict(os.environ, {
+        "USER_ZONE": "America/Los_Angeles",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+    }))
+    root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
+    default_checkout = root / "checkout"
+    sha_one, sha_two, sha_three, sha_four = temporary_checkout(default_checkout)
 
 
 class CliResult(NamedTuple):
@@ -343,6 +385,12 @@ class FeatureLogTests(unittest.TestCase):
         _ = self.enterContext(
             patch.object(feature_log, "_event_time", return_value=EVENT_TIME)
         )
+        _projects = cast(dict[str, feature_log.ProjectSpec], self.enterContext(
+            patch.dict(feature_log.PROJECTS, {
+                name: spec._replace(checkouts=(default_checkout,))
+                for name, spec in feature_log.PROJECTS.items()
+            }),
+        ))
 
     def cli(self, arguments: list[str]) -> CliResult:
         return self.capture_cli(lambda: feature_log.main(arguments))
@@ -377,7 +425,7 @@ class FeatureLogTests(unittest.TestCase):
         summary: str = "People can use the useful result.",
         behavior: str = "The useful behavior is available now.",
         see: str = "Exercise the useful behavior.",
-        link: str = SHA_ONE,
+        link: str | None = None,
         crates: tuple[str, ...] = ("hana",),
         evidence: tuple[str, ...] = ("Accepted by the user.",),
     ) -> list[str]:
@@ -396,7 +444,7 @@ class FeatureLogTests(unittest.TestCase):
             "--see",
             see,
             "--link",
-            link,
+            sha_one if link is None else link,
         ]
         for crate in crates:
             arguments.extend(("--crate", crate))
@@ -648,6 +696,169 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(result, CliResult(0, f"added: {path.relative_to(self.vault)}\n", ""))
         self.assertEqual(path.read_text(encoding="utf-8"), NATEDEV_EXAMPLE)
 
+    def test_add_defaults_to_committer_date_in_the_users_zone(self) -> None:
+        checkout = self.root / "dated-checkout"
+        (sha,) = temporary_checkout(checkout, dates=("2026-10-09T01:30:00+00:00",))
+        project = feature_log.PROJECTS["hana"]._replace(checkouts=(checkout,))
+        for zone, completed in (
+            ("America/Los_Angeles", "2026-10-08"),
+            ("Asia/Tokyo", "2026-10-09"),
+        ):
+            with self.subTest(zone=zone), patch.dict(feature_log.PROJECTS, {"hana": project}):
+                with patch.dict(os.environ, {"USER_ZONE": zone}):
+                    title = "Pacific result" if zone == "America/Los_Angeles" else "Tokyo result"
+                    arguments = self.add_arguments(
+                        title=title, link=f"https://github.com/natepiano/hana/commit/{sha}",
+                    ) + ["--separate-result"]
+
+                    result = self.cli(arguments)
+
+                self.assertEqual(result.status, 0, result.stderr)
+                note = feature_log.parse_note(self.note("hana", title.lower()))
+                self.assertEqual(note["completed_date"], completed)
+                self.assertEqual(note["date_created"], TODAY)
+                self.assertEqual(note["date_modified"], TODAY)
+
+    def test_explicit_completed_date_bypasses_git_even_for_an_unknown_commit(self) -> None:
+        arguments = self.add_arguments(link="f" * 40) + ["--completed", "2026-09-15"]
+        with patch.object(
+            feature_log.subprocess, "run", side_effect=AssertionError("unexpected git lookup"),
+        ) as git:
+            result = self.cli(arguments)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        git.assert_not_called()
+        note = feature_log.parse_note(self.note("hana", "a useful result"))
+        self.assertEqual(note["completed_date"], "2026-09-15")
+        self.assertEqual(note["date_created"], TODAY)
+        self.assertEqual(note["date_modified"], TODAY)
+
+    def test_commit_date_uses_the_second_checkout_after_a_missing_commit_or_directory(self) -> None:
+        empty = self.root / "empty-checkout"
+        _ = temporary_checkout(empty, dates=())
+        dated = self.root / "dated-checkout"
+        (sha,) = temporary_checkout(dated, dates=("2026-10-03T01:30:00+00:00",))
+        for first in (empty, self.root / "missing-checkout"):
+            with self.subTest(first=first.name):
+                project = feature_log.PROJECTS["hana"]._replace(checkouts=(first, dated))
+                with patch.dict(feature_log.PROJECTS, {"hana": project}):
+                    result = self.cli(self.add_arguments(
+                        title=first.name, link=sha,
+                    ) + ["--separate-result"])
+
+                self.assertEqual(result.status, 0, result.stderr)
+                note = feature_log.parse_note(self.note("hana", first.name.replace("-", " ")))
+                self.assertEqual(note["completed_date"], "2026-10-02")
+
+    def test_commit_date_stops_after_the_first_checkout_holds_the_commit(self) -> None:
+        project = feature_log.PROJECTS["hana"]._replace(
+            checkouts=(default_checkout, self.root / "missing-checkout"),
+        )
+        with (
+            patch.dict(feature_log.PROJECTS, {"hana": project}),
+            patch.object(feature_log.subprocess, "run", wraps=subprocess.run) as git,
+        ):
+            result = self.cli(self.add_arguments())
+
+        self.assertEqual(result.status, 0, result.stderr)
+        git.assert_called_once_with(
+            ["git", "-C", str(default_checkout), "show", "-s", "--format=%cI", sha_one],
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_missing_commit_refuses_each_new_note_writer_without_writing(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Existing result")).status, 0)
+        saved = self.proposal_arguments(
+            "C901", self.add_arguments(title="Existing proposal", link=sha_two),
+        )
+        self.assertEqual(self.cli(saved).status, 0)
+        before_vault = self.vault_snapshot()
+        before_events = (self.state / "events.jsonl").read_bytes()
+        before_proposals = {
+            path.relative_to(self.state): path.read_bytes()
+            for path in (self.state / "proposals").rglob("*.json")
+        }
+        unknown_sha = "f" * 40
+        project = feature_log.PROJECTS["hana"]._replace(
+            checkouts=(default_checkout, self.root / "missing-checkout"),
+        )
+        for verb in ("add", "supersede", "propose"):
+            with self.subTest(verb=verb), patch.dict(feature_log.PROJECTS, {"hana": project}):
+                arguments = self.add_arguments(title="Undated result", link=unknown_sha)
+                arguments[0] = verb
+                if verb == "supersede":
+                    arguments.extend(("--old", "Existing result"))
+                elif verb == "propose":
+                    arguments.extend(("--review", "C902"))
+
+                result = self.cli(arguments)
+
+                self.assertEqual(result, CliResult(
+                    2, "", f"feature_log: cannot date commit {unknown_sha}: "
+                    + "no checkout of natepiano/hana holds it; pass --completed\n",
+                ))
+                self.assertEqual(self.vault_snapshot(), before_vault)
+                self.assertEqual((self.state / "events.jsonl").read_bytes(), before_events)
+                self.assertEqual({
+                    path.relative_to(self.state): path.read_bytes()
+                    for path in (self.state / "proposals").rglob("*.json")
+                }, before_proposals)
+                self.assert_no_temporary_files()
+
+    def test_supersede_defaults_to_the_replacement_commits_date(self) -> None:
+        self.assertEqual(self.cli(self.add_arguments(title="Existing result")).status, 0)
+        checkout = self.root / "replacement-checkout"
+        (sha,) = temporary_checkout(checkout, dates=("2026-10-05T01:30:00+00:00",))
+        project = feature_log.PROJECTS["hana"]._replace(checkouts=(checkout,))
+        arguments = self.add_arguments(title="Replacement result", link=sha)
+        arguments[0] = "supersede"
+        arguments.extend(("--old", "Existing result"))
+        with patch.dict(feature_log.PROJECTS, {"hana": project}):
+            result = self.cli(arguments)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        replacement = feature_log.parse_note(self.note("hana", "replacement result"))
+        self.assertEqual(replacement["completed_date"], "2026-10-04")
+        self.assertEqual(replacement["date_created"], TODAY)
+        self.assertEqual(replacement["date_modified"], TODAY)
+        old = feature_log.parse_note(self.note("hana", "existing result"))
+        self.assertEqual(old["state"], "superseded")
+        self.assertEqual(old["completed_date"], TODAY)
+
+    def test_proposal_keeps_commit_date_without_git_on_correction_and_landing(self) -> None:
+        checkout = self.root / "proposal-checkout"
+        (sha,) = temporary_checkout(checkout, dates=("2026-10-07T01:30:00+00:00",))
+        project = feature_log.PROJECTS["hana"]._replace(checkouts=(checkout,))
+        arguments = self.proposal_arguments(
+            "C900", self.add_arguments(title="Dated proposal", link=sha),
+        )
+        with patch.dict(feature_log.PROJECTS, {"hana": project}):
+            result = self.cli(arguments)
+
+        self.assertEqual(result.status, 0, result.stderr)
+        self.assertEqual(self.proposal("C900")["args"]["completed"], "2026-10-06")
+        self.assertEqual(self.vault_snapshot(), {})
+        self.assertEqual(self.events(), [])
+        corrected = self.proposal_arguments("C900", self.add_arguments(
+            title="Dated proposal", link=sha_two, summary="The corrected behavior is available.",
+        ))
+        with patch.object(
+            feature_log.subprocess, "run", side_effect=AssertionError("unexpected git lookup"),
+        ) as git:
+            correction = self.cli(corrected)
+            self.assertEqual(correction.status, 0, correction.stderr)
+            self.assertEqual(self.proposal("C900")["args"]["completed"], "2026-10-06")
+            landed = self.cli(["add", "--review", "C900"])
+
+        git.assert_not_called()
+        self.assertEqual(landed.status, 0, landed.stderr)
+        note = feature_log.parse_note(self.note("hana", "dated proposal"))
+        self.assertEqual(note["completed_date"], "2026-10-06")
+        self.assertEqual(note["date_created"], TODAY)
+        self.assertEqual(note["date_modified"], TODAY)
+        self.assertEqual(note["link"], f"https://github.com/natepiano/hana/commit/{sha_two}")
+        self.assertEqual(self.proposal("C900")["status"], "landed")
+
     def test_all_basic_rejections_leave_the_vault_unchanged(self) -> None:
         cases: list[tuple[str, list[str], str]] = [
             ("unknown project", self.add_arguments(project="other"), "project"),
@@ -683,7 +894,7 @@ class FeatureLogTests(unittest.TestCase):
             (
                 "link for another repository",
                 self.add_arguments(
-                    link=f"https://github.com/natepiano/cargo-liner/commit/{SHA_ONE}"
+                    link=f"https://github.com/natepiano/cargo-liner/commit/{sha_one}"
                 ),
                 "link",
             ),
@@ -715,12 +926,12 @@ class FeatureLogTests(unittest.TestCase):
         )
         backfill = self.add_arguments(
             title="Backfill release derivation",
-            link=SHA_TWO,
+            link=sha_two,
             crates=("hana", "hana_lagrange"),
         ) + ["--backfill"]
         explicit = self.add_arguments(
             title="Explicit release derivation",
-            link=SHA_THREE,
+            link=sha_three,
             crates=("hana_lagrange",),
         ) + ["--backfill", "--release", "hana_lagrange@1.2.3-alpha.1"]
 
@@ -806,16 +1017,16 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(result.status, 0)
         self.assertTrue(self.note("hana", "hello crate_name there").is_file())
 
-        exactly_fifty = self.add_arguments(title="b" * 50, link=SHA_TWO)
+        exactly_fifty = self.add_arguments(title="b" * 50, link=sha_two)
         self.assertEqual(self.cli(exactly_fifty).status, 0)
         self.assertTrue(self.note("hana", "b" * 50).is_file())
 
-        self.assert_rejected(self.add_arguments(title="c" * 51, link=SHA_THREE), "50")
+        self.assert_rejected(self.add_arguments(title="c" * 51, link=sha_three), "50")
 
     def test_same_normalized_title_with_a_different_link_is_rejected(self) -> None:
-        self.assertEqual(self.cli(self.add_arguments(title="Same Result", link=SHA_ONE)).status, 0)
+        self.assertEqual(self.cli(self.add_arguments(title="Same Result", link=sha_one)).status, 0)
         self.assert_rejected(
-            self.add_arguments(title="Same--Result!!", link=SHA_TWO),
+            self.add_arguments(title="Same--Result!!", link=sha_two),
             "specific",
         )
 
@@ -836,11 +1047,11 @@ class FeatureLogTests(unittest.TestCase):
         )
 
     def test_repeats_without_completed_keep_existing_date_after_midnight(self) -> None:
-        first_day = "2026-10-10"
+        first_day = "2026-10-09"
         next_day = "2026-10-11"
-        add_arguments = self.add_arguments(title="Midnight Add", link=SHA_ONE)
+        add_arguments = self.add_arguments(title="Midnight Add", link=sha_one)
         with patch.object(feature_log, "today", return_value=first_day):
-            self.assertEqual(self.cli(add_arguments).status, 0)
+            self.assertEqual(self.cli([*add_arguments, "--completed", first_day]).status, 0)
         add_contents = self.note("hana", "midnight add").read_bytes()
 
         with patch.object(feature_log, "today", return_value=next_day):
@@ -860,11 +1071,11 @@ class FeatureLogTests(unittest.TestCase):
         )
         self.assertEqual(self.note("hana", "midnight add").read_bytes(), add_contents)
 
-        old_arguments = self.add_arguments(title="Midnight Old", link=SHA_TWO)
-        replacement_arguments = self.add_arguments(title="Midnight New", link=SHA_THREE)
+        old_arguments = self.add_arguments(title="Midnight Old", link=sha_two)
+        replacement_arguments = self.add_arguments(title="Midnight New", link=sha_three)
         with patch.object(feature_log, "today", return_value=first_day):
             self.assertEqual(self.cli(old_arguments).status, 0)
-            self.assertEqual(self.cli(replacement_arguments).status, 0)
+            self.assertEqual(self.cli([*replacement_arguments, "--completed", first_day]).status, 0)
         replacement_contents = self.note("hana", "midnight new").read_bytes()
         supersede_arguments = replacement_arguments.copy()
         supersede_arguments[0] = "supersede"
@@ -898,7 +1109,7 @@ class FeatureLogTests(unittest.TestCase):
         before_vault = self.vault_snapshot()
         before_events = (self.state / "events.jsonl").read_bytes()
         arguments = self.add_arguments(
-            title="Replacement result", crates=("hana_lagrange",), link=SHA_TWO,
+            title="Replacement result", crates=("hana_lagrange",), link=sha_two,
         )
         arguments[0] = "supersede"
         arguments.extend((
@@ -922,9 +1133,9 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_supersede_writes_the_new_note_and_updates_each_old_note(self) -> None:
         with patch.object(feature_log, "today", return_value="2026-10-01"):
-            self.assertEqual(self.cli(self.add_arguments(title="Old A", link=SHA_ONE)).status, 0)
-            self.assertEqual(self.cli(self.add_arguments(title="Old B", link=SHA_TWO)).status, 0)
-        arguments = self.add_arguments(title="Replacement", link=SHA_THREE)
+            self.assertEqual(self.cli(self.add_arguments(title="Old A", link=sha_one)).status, 0)
+            self.assertEqual(self.cli(self.add_arguments(title="Old B", link=sha_two)).status, 0)
+        arguments = self.add_arguments(title="Replacement", link=sha_three)
         arguments[0] = "supersede"
         arguments.extend(("--old", "Old A", "--old", "Old B"))
 
@@ -944,8 +1155,8 @@ class FeatureLogTests(unittest.TestCase):
         self.assert_no_temporary_files()
 
     def test_supersede_finishes_an_old_note_after_an_interrupted_run(self) -> None:
-        self.assertEqual(self.cli(self.add_arguments(title="Old Result", link=SHA_ONE)).status, 0)
-        replacement = self.add_arguments(title="New Result", link=SHA_TWO)
+        self.assertEqual(self.cli(self.add_arguments(title="Old Result", link=sha_one)).status, 0)
+        replacement = self.add_arguments(title="New Result", link=sha_two)
         self.assertEqual(self.cli(replacement).status, 0)
         interrupted_contents = self.note("hana", "new result").read_bytes()
         arguments = replacement.copy()
@@ -965,22 +1176,22 @@ class FeatureLogTests(unittest.TestCase):
         self.assert_no_temporary_files()
 
     def test_supersede_rejects_non_live_old_and_new_as_its_own_old(self) -> None:
-        absent = self.add_arguments(title="Replacement", link=SHA_TWO)
+        absent = self.add_arguments(title="Replacement", link=sha_two)
         absent[0] = "supersede"
         absent.extend(("--old", "Missing Result"))
         self.assert_rejected(absent, "live")
 
-        itself = self.add_arguments(title="Same Result", link=SHA_THREE)
+        itself = self.add_arguments(title="Same Result", link=sha_three)
         itself[0] = "supersede"
         itself.extend(("--old", "Same Result"))
         self.assert_rejected(itself, "old")
 
     def test_supersede_allows_old_link_but_rejects_an_unrelated_live_holder(self) -> None:
         self.assertEqual(
-            self.cli(self.add_arguments(title="Retitled Old", link=SHA_ONE)).status,
+            self.cli(self.add_arguments(title="Retitled Old", link=sha_one)).status,
             0,
         )
-        retitle = self.add_arguments(title="Retitled New", link=SHA_ONE)
+        retitle = self.add_arguments(title="Retitled New", link=sha_one)
         retitle[0] = "supersede"
         retitle.extend(("--old", "Retitled Old"))
 
@@ -991,13 +1202,13 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("superseded: retitled old → retitled new\n", retitled.stdout)
 
         self.assertEqual(
-            self.cli(self.add_arguments(title="Shared Old", link=SHA_TWO)).status,
+            self.cli(self.add_arguments(title="Shared Old", link=sha_two)).status,
             0,
         )
-        third_holder = self.add_arguments(title="Third Holder", link=SHA_TWO)
+        third_holder = self.add_arguments(title="Third Holder", link=sha_two)
         third_holder.append("--separate-result")
         self.assertEqual(self.cli(third_holder).status, 0)
-        blocked_retitle = self.add_arguments(title="Shared New", link=SHA_TWO)
+        blocked_retitle = self.add_arguments(title="Shared New", link=sha_two)
         blocked_retitle[0] = "supersede"
         blocked_retitle.extend(("--old", "Shared Old"))
 
@@ -1005,13 +1216,13 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_split_adds_a_second_replacement_and_repeat_changes_nothing(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Broad result")).status, 0)
-        first = self.add_arguments(title="First result", link=SHA_TWO)
+        first = self.add_arguments(title="First result", link=sha_two)
         first[0] = "supersede"
         first.extend(("--old", "Broad result"))
         self.assertEqual(self.cli(first).status, 0)
         old_path = self.note("hana", "broad result")
         old = feature_log.parse_note(old_path)
-        second = self.add_arguments(title="Second result", link=SHA_THREE)
+        second = self.add_arguments(title="Second result", link=sha_three)
         second[0] = "supersede"
         second.extend(("--old", "Broad result", "--split"))
 
@@ -1050,11 +1261,11 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_superseded_old_still_requires_split_for_another_replacement(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Broad result")).status, 0)
-        first = self.add_arguments(title="First result", link=SHA_TWO)
+        first = self.add_arguments(title="First result", link=sha_two)
         first[0] = "supersede"
         first.extend(("--old", "Broad result"))
         self.assertEqual(self.cli(first).status, 0)
-        second = self.add_arguments(title="Second result", link=SHA_THREE)
+        second = self.add_arguments(title="Second result", link=sha_three)
         second[0] = "supersede"
         second.extend(("--old", "Broad result"))
 
@@ -1062,7 +1273,7 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_split_accepts_a_live_old_note(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Live broad result")).status, 0)
-        arguments = self.add_arguments(title="Narrow result", link=SHA_TWO)
+        arguments = self.add_arguments(title="Narrow result", link=sha_two)
         arguments[0] = "supersede"
         arguments.extend(("--old", "Live broad result", "--split"))
 
@@ -1083,7 +1294,7 @@ class FeatureLogTests(unittest.TestCase):
     def test_split_is_refused_with_review_and_is_not_a_propose_flag(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Reviewed broad result")).status, 0)
         proposal = self.proposal_arguments(
-            "C910", self.add_arguments(title="Reviewed replacement", link=SHA_TWO),
+            "C910", self.add_arguments(title="Reviewed replacement", link=sha_two),
             old=("Reviewed broad result",),
         )
         self.assertEqual(self.cli(proposal).status, 0)
@@ -1103,7 +1314,7 @@ class FeatureLogTests(unittest.TestCase):
         titles = ("alpha result", "beta result", "gamma result")
         for title in titles:
             arguments = self.add_arguments(
-                title=title, link=SHA_TWO, crates=("hana_lagrange",),
+                title=title, link=sha_two, crates=("hana_lagrange",),
             )
             arguments[0] = "supersede"
             arguments.extend((
@@ -1116,7 +1327,7 @@ class FeatureLogTests(unittest.TestCase):
                 self.assertIn(f"superseded: broad result → {title}\n", result.stdout)
                 note = feature_log.parse_note(self.note("hana", title))
                 self.assertEqual(note["state"], "live")
-                self.assertEqual(note["link"], f"https://github.com/natepiano/hana/commit/{SHA_TWO}")
+                self.assertEqual(note["link"], f"https://github.com/natepiano/hana/commit/{sha_two}")
                 self.assertEqual(note["release"], ["hana_lagrange@Unreleased"])
         old = feature_log.parse_note(self.note("hana", "broad result"))
         self.assertEqual(old["state"], "superseded")
@@ -1165,7 +1376,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("amended: feature-log/hana/amended result.md", result.stdout)
         amended = path.read_text(encoding="utf-8")
         self.assertIn("area: \"[[editing]]\"\n", amended)
-        self.assertIn("completed_date: \"[[2026-10-01]]\"\n", amended)
+        self.assertIn(f'completed_date: "[[{TODAY}]]"\n', amended)
         self.assertIn("crate:\n  - hana\n", amended)
         self.assertIn("kind: change\n", amended)
         self.assertIn("release: []\n", amended)
@@ -1199,7 +1410,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(added.status, 0, added.stderr)
         path = self.note("hana", title.lower())
         original = feature_log.parse_note(path)
-        corrected_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        corrected_link = f"https://github.com/natepiano/hana/commit/{sha_two}"
 
         result = self.cli(
             [
@@ -1245,7 +1456,7 @@ class FeatureLogTests(unittest.TestCase):
     def test_amend_accepting_provenance_requires_backfill_and_both_fields(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Paired provenance")).status, 0)
         prefix = ["amend", "--project", "hana", "--title", "Paired provenance"]
-        link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        link = f"https://github.com/natepiano/hana/commit/{sha_two}"
         for label, suffix, reason in (
             ("link alone", ["--backfill", "--link", link], "completed"),
             ("date alone", ["--backfill", "--completed", "2026-10-01"], "link"),
@@ -1266,11 +1477,11 @@ class FeatureLogTests(unittest.TestCase):
             "amend", "--project", "hana", "--title", "Validated provenance",
             "--backfill",
         ]
-        valid_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        valid_link = f"https://github.com/natepiano/hana/commit/{sha_two}"
         for link, completed, reason in (
             ("", "2026-10-01", "link"),
             ("https://github.com/natepiano/hana/commit/abc", "2026-10-01", "link"),
-            (f"https://github.com/natepiano/nixos/commit/{SHA_TWO}", "2026-10-01", "link"),
+            (f"https://github.com/natepiano/nixos/commit/{sha_two}", "2026-10-01", "link"),
             (valid_link, "2026-02-30", "completed"),
             (valid_link, "October 1", "completed"),
         ):
@@ -1282,12 +1493,12 @@ class FeatureLogTests(unittest.TestCase):
     def test_amend_duplicate_live_link_needs_separate_result(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Correction target")).status, 0)
         self.assertEqual(
-            self.cli(self.add_arguments(title="Other live result", link=SHA_TWO)).status,
+            self.cli(self.add_arguments(title="Other live result", link=sha_two)).status,
             0,
         )
         other_path = self.note("hana", "other live result")
         other_contents = other_path.read_bytes()
-        shared_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        shared_link = f"https://github.com/natepiano/hana/commit/{sha_two}"
         arguments = [
             "amend", "--project", "hana", "--title", "Correction target",
             "--backfill", "--link", shared_link, "--completed", "2026-10-01",
@@ -1324,15 +1535,15 @@ class FeatureLogTests(unittest.TestCase):
     def test_amend_link_held_only_by_a_superseded_note_is_allowed(self) -> None:
         self.assertEqual(self.cli(self.add_arguments(title="Correction target")).status, 0)
         self.assertEqual(
-            self.cli(self.add_arguments(title="Retired result", link=SHA_TWO)).status,
+            self.cli(self.add_arguments(title="Retired result", link=sha_two)).status,
             0,
         )
-        replacement = self.add_arguments(title="Current replacement", link=SHA_THREE)
+        replacement = self.add_arguments(title="Current replacement", link=sha_three)
         replacement[0] = "supersede"
         self.assertEqual(self.cli(replacement + ["--old", "Retired result"]).status, 0)
         old_path = self.note("hana", "retired result")
         old_contents = old_path.read_bytes()
-        link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        link = f"https://github.com/natepiano/hana/commit/{sha_two}"
 
         result = self.cli(
             [
@@ -1618,7 +1829,7 @@ class FeatureLogTests(unittest.TestCase):
         )
         self.assertEqual(added.status, 0, added.stderr)
         replacement = self.add_arguments(
-            title="Current result", crates=("hana_lagrange",), link=SHA_TWO,
+            title="Current result", crates=("hana_lagrange",), link=sha_two,
         )
         replacement[0] = "supersede"
         replacement.extend(("--old", "Retired result", "--backfill"))
@@ -1733,7 +1944,7 @@ class FeatureLogTests(unittest.TestCase):
                         arguments = ["amend", "--project", "hana", "--title", title]
                     else:
                         arguments = self.add_arguments(
-                            title=title, link=SHA_TWO, crates=("hana_lagrange",)
+                            title=title, link=sha_two, crates=("hana_lagrange",)
                         )
                         arguments[0] = verb
                         arguments.append("--separate-result")
@@ -1764,7 +1975,7 @@ class FeatureLogTests(unittest.TestCase):
                         arguments = ["amend", "--project", "hana", "--title", title]
                     else:
                         arguments = self.add_arguments(
-                            title=title, link=SHA_TWO, crates=("hana_lagrange",)
+                            title=title, link=sha_two, crates=("hana_lagrange",)
                         )
                         arguments[0] = verb
                         arguments.append("--separate-result")
@@ -1800,7 +2011,7 @@ class FeatureLogTests(unittest.TestCase):
                     self.assertEqual(added.status, 0, added.stderr)
                     path = self.note("hana", feature_log.normalize_title(title))
                     original = feature_log.parse_note(path)
-                    new_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+                    new_link = f"https://github.com/natepiano/hana/commit/{sha_two}"
                     release = "hana_lagrange@1.2.3"
                     arguments = [
                         "amend", "--project", "hana", "--title", title,
@@ -1923,8 +2134,8 @@ class FeatureLogTests(unittest.TestCase):
         )
         self.assertEqual(added.status, 0, added.stderr)
         prefix = ["amend", "--project", "hana", "--title", title, "--backfill"]
-        correction = prefix + ["--link", SHA_TWO, "--completed", "2026-09-30"]
-        reversal = prefix + ["--link", SHA_ONE, "--completed", "2026-10-01"]
+        correction = prefix + ["--link", sha_two, "--completed", "2026-09-30"]
+        reversal = prefix + ["--link", sha_one, "--completed", "2026-10-01"]
         for arguments in (correction, reversal, correction):
             result = self.cli(arguments)
             self.assertEqual(result.status, 0, result.stderr)
@@ -1933,7 +2144,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(events[0], events[2])
         self.assertEqual(
             feature_log.parse_note(self.note("hana", title.lower()))["link"],
-            f"https://github.com/natepiano/hana/commit/{SHA_TWO}",
+            f"https://github.com/natepiano/hana/commit/{sha_two}",
         )
 
     def test_amend_event_records_provenance_and_releases_in_one_correction(self) -> None:
@@ -1943,7 +2154,7 @@ class FeatureLogTests(unittest.TestCase):
             + ["--backfill", "--completed", "2026-10-01"]
         )
         self.assertEqual(added.status, 0, added.stderr)
-        new_link = f"https://github.com/natepiano/hana/commit/{SHA_TWO}"
+        new_link = f"https://github.com/natepiano/hana/commit/{sha_two}"
         result = self.cli(
             [
                 "amend", "--project", "hana", "--title", title, "--backfill",
@@ -1965,7 +2176,7 @@ class FeatureLogTests(unittest.TestCase):
                 "title": title.lower(),
                 "fields": ["completed_date", "link", "release"],
                 "backfill": True,
-                "old_link": f"https://github.com/natepiano/hana/commit/{SHA_ONE}",
+                "old_link": f"https://github.com/natepiano/hana/commit/{sha_one}",
                 "new_link": new_link,
                 "old_completed": "2026-10-01",
                 "new_completed": "2026-09-30",
@@ -1991,11 +2202,11 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_mutating_verbs_reject_embedded_body_section_headings(self) -> None:
         self.assertEqual(
-            self.cli(self.add_arguments(title="Old Heading Note", link=SHA_ONE)).status,
+            self.cli(self.add_arguments(title="Old Heading Note", link=sha_one)).status,
             0,
         )
         self.assertEqual(
-            self.cli(self.add_arguments(title="Amend Heading Note", link=SHA_TWO)).status,
+            self.cli(self.add_arguments(title="Amend Heading Note", link=sha_two)).status,
             0,
         )
         dangerous_values = (
@@ -2019,7 +2230,7 @@ class FeatureLogTests(unittest.TestCase):
                         else:
                             arguments = self.add_arguments(
                                 title="Rejected Heading Note",
-                                link=SHA_THREE,
+                                link=sha_three,
                                 behavior=(
                                     dangerous_value
                                     if field == "behavior"
@@ -2042,14 +2253,14 @@ class FeatureLogTests(unittest.TestCase):
             kind="fix",
             summary="The older widget works.",
             behavior="Old widget behavior is searchable.",
-            link=SHA_ONE,
+            link=sha_one,
             crates=("hana", "hana_catalyst"),
         ) + ["--area", "widgets", "--completed", "2026-10-01", "--backfill"]
         second = self.add_arguments(
             title="Newer Panel",
             summary="The newer panel is visible.",
             behavior="New panel behavior.",
-            link=SHA_TWO,
+            link=sha_two,
             crates=("hana",),
         ) + ["--area", "panels", "--completed", "2026-10-09", "--backfill"]
         third = self.add_arguments(
@@ -2057,7 +2268,7 @@ class FeatureLogTests(unittest.TestCase):
             kind="perf",
             summary="The newest widget is quick.",
             behavior="Fast searchable behavior.",
-            link=SHA_THREE,
+            link=sha_three,
             crates=("hana",),
         ) + ["--area", "widgets", "--completed", "2026-10-10", "--backfill"]
         for arguments in (first, second, third):
@@ -2070,11 +2281,11 @@ class FeatureLogTests(unittest.TestCase):
             CliResult(
                 0,
                 "2026-10-10 perf newest widget — The newest widget is quick. [hana] (widgets) "
-                + f"https://github.com/natepiano/hana/commit/{SHA_THREE}\n"
+                + f"https://github.com/natepiano/hana/commit/{sha_three}\n"
                 + "2026-10-09 feature newer panel — The newer panel is visible. [hana] (panels) "
-                + f"https://github.com/natepiano/hana/commit/{SHA_TWO}\n"
+                + f"https://github.com/natepiano/hana/commit/{sha_two}\n"
                 + "2026-10-01 fix older widget — The older widget works. [hana, hana_catalyst] (widgets) "
-                + f"https://github.com/natepiano/hana/commit/{SHA_ONE}\n",
+                + f"https://github.com/natepiano/hana/commit/{sha_one}\n",
                 "",
             ),
         )
@@ -2086,13 +2297,13 @@ class FeatureLogTests(unittest.TestCase):
                 kind="fix",
                 summary="A signal is visible.",
                 behavior="The rare BehaviorToken is present.",
-                link=SHA_ONE,
+                link=sha_one,
                 crates=("hana", "hana_catalyst"),
             )
             + ["--area", "widgets", "--backfill"],
             self.add_arguments(
                 title="Panel Result",
-                link=SHA_TWO,
+                link=sha_two,
                 crates=("hana",),
             )
             + ["--area", "panels", "--backfill"],
@@ -2116,8 +2327,8 @@ class FeatureLogTests(unittest.TestCase):
                 self.assertNotIn("panel result", result.stdout)
 
     def test_live_excludes_superseded_notes(self) -> None:
-        self.assertEqual(self.cli(self.add_arguments(title="Old", link=SHA_ONE)).status, 0)
-        replacement = self.add_arguments(title="New", link=SHA_TWO)
+        self.assertEqual(self.cli(self.add_arguments(title="Old", link=sha_one)).status, 0)
+        replacement = self.add_arguments(title="New", link=sha_two)
         replacement[0] = "supersede"
         replacement.extend(("--old", "Old"))
         self.assertEqual(self.cli(replacement).status, 0)
@@ -2150,9 +2361,9 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_check_rejects_bare_scalars_that_yaml_changes(self) -> None:
         fixtures = (
-            ("Valid Scalar", SHA_ONE),
-            ("Colon Scalar", SHA_TWO),
-            ("Comment Scalar", SHA_THREE),
+            ("Valid Scalar", sha_one),
+            ("Colon Scalar", sha_two),
+            ("Comment Scalar", sha_three),
         )
         for title, link in fixtures:
             self.assertEqual(self.cli(self.add_arguments(title=title, link=link)).status, 0)
@@ -2210,10 +2421,10 @@ class FeatureLogTests(unittest.TestCase):
 
     def test_check_reports_each_kind_of_broken_fixture(self) -> None:
         fixtures = (
-            ("missing key", SHA_ONE),
-            ("unknown key", SHA_TWO),
-            ("live replacement", SHA_THREE),
-            ("dangling replacement", "0000000000000000000000000000000000000004"),
+            ("missing key", sha_one),
+            ("unknown key", sha_two),
+            ("live replacement", sha_three),
+            ("dangling replacement", sha_four),
         )
         for title, link in fixtures:
             self.assertEqual(self.cli(self.add_arguments(title=title, link=link)).status, 0)
@@ -2257,7 +2468,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("absent target", result.stdout)
 
     def test_check_rejects_duplicate_keys_bad_syntax_and_wrong_file_name(self) -> None:
-        for title, link in (("duplicate", SHA_ONE), ("syntax", SHA_TWO), ("wrong name", SHA_THREE)):
+        for title, link in (("duplicate", sha_one), ("syntax", sha_two), ("wrong name", sha_three)):
             self.assertEqual(self.cli(self.add_arguments(title=title, link=link)).status, 0)
         duplicate = self.note("hana", "duplicate")
         _ = duplicate.write_text(
@@ -2353,7 +2564,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assertEqual(amend_event["fields"], ["summary"])
         self.assertTrue(amend_event["backfill"])
 
-        supersede = self.add_arguments(title="Event New", link=SHA_TWO)
+        supersede = self.add_arguments(title="Event New", link=sha_two)
         supersede[0] = "supersede"
         supersede.extend(("--old", "Event Old"))
         self.assertEqual(self.cli(supersede).status, 0)
@@ -2530,7 +2741,7 @@ class FeatureLogTests(unittest.TestCase):
             self.add_arguments(
                 title="Implicit Proposal Date",
                 summary="The initial implicit-date summary.",
-                link=SHA_ONE,
+                link=sha_one,
             ),
         )
         with patch.object(feature_log, "today", return_value="2026-10-01"):
@@ -2541,26 +2752,26 @@ class FeatureLogTests(unittest.TestCase):
             self.add_arguments(
                 title="Implicit Proposal Date",
                 summary="The corrected implicit-date summary.",
-                link=SHA_ONE,
+                link=sha_one,
             ),
         )
         with patch.object(feature_log, "today", return_value="2026-10-02"):
             self.assertEqual(self.cli(implicit_correction).status, 0)
-        self.assertEqual(self.proposal("C904")["args"]["completed"], "2026-10-01")
+        self.assertEqual(self.proposal("C904")["args"]["completed"], TODAY)
 
         with patch.object(feature_log, "today", return_value="2026-10-03"):
             self.assertEqual(self.cli(["add", "--review", "C904"]).status, 0)
         implicit_contents = self.note(
             "hana", "implicit proposal date"
         ).read_text(encoding="utf-8")
-        self.assertIn('completed_date: "[[2026-10-01]]"\n', implicit_contents)
+        self.assertIn(f'completed_date: "[[{TODAY}]]"\n', implicit_contents)
 
         explicit = self.proposal_arguments(
             "C905",
             self.add_arguments(
                 title="Explicit Proposal Date",
                 summary="The initial explicit-date summary.",
-                link=SHA_TWO,
+                link=sha_two,
             ),
         )
         with patch.object(feature_log, "today", return_value="2026-10-01"):
@@ -2571,7 +2782,7 @@ class FeatureLogTests(unittest.TestCase):
             self.add_arguments(
                 title="Explicit Proposal Date",
                 summary="The corrected explicit-date summary.",
-                link=SHA_TWO,
+                link=sha_two,
             ),
         )
         explicit_correction.extend(("--completed", "2026-09-30"))
@@ -2593,7 +2804,7 @@ class FeatureLogTests(unittest.TestCase):
         self.assert_rejected(invalid_row, "review")
         missing_old = self.proposal_arguments(
             "A12",
-            self.add_arguments(title="Replacement Proposal", link=SHA_TWO),
+            self.add_arguments(title="Replacement Proposal", link=sha_two),
             old=("Missing Result",),
         )
         self.assert_rejected(missing_old, "live")
@@ -2616,7 +2827,7 @@ class FeatureLogTests(unittest.TestCase):
         notes = list((self.vault / "feature-log/hana").glob("*.md"))
         self.assertEqual(notes, [self.note("hana", "reviewed result")])
         contents = notes[0].read_text(encoding="utf-8")
-        self.assertIn('completed_date: "[[2026-10-01]]"\n', contents)
+        self.assertIn(f'completed_date: "[[{TODAY}]]"\n', contents)
         self.assertEqual(len(self.events()), 1)
         proposal = self.proposal("C900")
         self.assertEqual(proposal["status"], "landed")
@@ -2658,12 +2869,12 @@ class FeatureLogTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            self.cli(self.add_arguments(title="Verb Old", link=SHA_ONE)).status,
+            self.cli(self.add_arguments(title="Verb Old", link=sha_one)).status,
             0,
         )
         supersede_proposal = self.proposal_arguments(
             "C902",
-            self.add_arguments(title="Verb New", link=SHA_TWO),
+            self.add_arguments(title="Verb New", link=sha_two),
             old=("Verb Old",),
         )
         self.assertEqual(self.cli(supersede_proposal).status, 0)
@@ -2680,7 +2891,7 @@ class FeatureLogTests(unittest.TestCase):
 
         add_proposal = self.proposal_arguments(
             "C903",
-            self.add_arguments(title="Add Only", link=SHA_THREE),
+            self.add_arguments(title="Add Only", link=sha_three),
         )
         self.assertEqual(self.cli(add_proposal).status, 0)
         self.assert_rejected(["supersede", "--review", "C903"], "add")
@@ -2688,12 +2899,12 @@ class FeatureLogTests(unittest.TestCase):
     def test_same_merge_results_require_separate_result_to_land_together(self) -> None:
         first = self.proposal_arguments(
             "C906",
-            self.add_arguments(title="Shared Merge First", link=SHA_ONE),
+            self.add_arguments(title="Shared Merge First", link=sha_one),
         )
         first.append("--separate-result")
         second = self.proposal_arguments(
             "C907",
-            self.add_arguments(title="Shared Merge Second", link=SHA_ONE),
+            self.add_arguments(title="Shared Merge Second", link=sha_one),
         )
         second.append("--separate-result")
         self.assertEqual(self.cli(first).status, 0)
@@ -2709,11 +2920,11 @@ class FeatureLogTests(unittest.TestCase):
 
         unmarked_first = self.proposal_arguments(
             "C908",
-            self.add_arguments(title="Unmarked Merge First", link=SHA_TWO),
+            self.add_arguments(title="Unmarked Merge First", link=sha_two),
         )
         unmarked_second = self.proposal_arguments(
             "C909",
-            self.add_arguments(title="Unmarked Merge Second", link=SHA_TWO),
+            self.add_arguments(title="Unmarked Merge Second", link=sha_two),
         )
         self.assertEqual(self.cli(unmarked_first).status, 0)
         self.assertEqual(self.cli(unmarked_second).status, 0)
@@ -2762,9 +2973,9 @@ class FeatureLogTests(unittest.TestCase):
         self.assertIn("dropped", refused.stderr)
 
     def test_claude_review_rows_name_their_list_and_land_beside_hana_rows(self) -> None:
-        claude_link = f"https://github.com/natepiano/claude_commands/commit/{SHA_TWO}"
+        claude_link = f"https://github.com/natepiano/claude_commands/commit/{sha_two}"
         claude = self.add_arguments(
-            project="claude", title="Change Review List", crates=(), link=SHA_TWO,
+            project="claude", title="Change Review List", crates=(), link=sha_two,
             summary="Every production keeps a change review list.",
         ) + ["--production", "build-followups", "--unit", "build-report"]
         self.assert_rejected(self.proposal_arguments("C1", claude), "<list>/C1")
@@ -2809,7 +3020,7 @@ class FeatureLogTests(unittest.TestCase):
 
         dropped_row = self.proposal_arguments(
             "build-followups/C2",
-            self.add_arguments(project="claude", title="Dropped Claude Row", crates=(), link=SHA_THREE),
+            self.add_arguments(project="claude", title="Dropped Claude Row", crates=(), link=sha_three),
         )
         self.assertEqual(self.cli(dropped_row).status, 0)
         self.assertEqual(
@@ -3012,7 +3223,7 @@ class FeatureLogTests(unittest.TestCase):
     ) -> None:
         arguments = self.add_arguments(
             project="cargo-liner", title=title, summary=summary, crates=crates,
-            link=SHA_TWO,
+            link=sha_two,
         )
         arguments[0] = "supersede"
         arguments.extend(("--old", old, "--separate-result"))

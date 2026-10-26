@@ -321,6 +321,39 @@ class TranscriptCursor:
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
 
+    def command_rejections(self, text: str) -> int:
+        """How many times Claude answered this prompt's slash command with `Unknown command` since launch."""
+        command = _slash_command(text)
+        if not command:
+            return 0
+        rejected = re.compile(rf"Unknown command: {re.escape(command)}(?![\w:-])")
+        return sum(1 for _, row in self.read_turns()
+                   if row.get("type") == "system" and rejected.match(_turn_text(row)))
+
+
+def _slash_command(text: str) -> str:
+    """The `/name` a prompt starts with, or "" for a plain prompt."""
+    return text.split(maxsplit=1)[0] if text.startswith("/") and len(text) > 1 else ""
+
+
+def command_fallback(text: str, transcript: SessionTranscript) -> str | None:
+    """A plain prompt that runs a slash command from its file, for a session whose command list lacks it.
+
+    None when the prompt is no slash command, or the command has no file under the account's commands.
+    """
+    command = _slash_command(text)
+    name = command.removeprefix("/")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*", name):
+        return None
+    path = (transcript.config_dir / "commands").joinpath(*name.split(":")).with_suffix(".md")
+    if not path.is_file():
+        return None
+    arguments = text[len(command):].strip()
+    given = f"with the arguments: {arguments}" if arguments else "with no arguments"
+    # Plain text: a prompt that starts with the command would be parsed as that command again.
+    return (f"This session's command list does not have {command} yet, so read {path.resolve()} in full "
+            + f"and follow it as {command} {given}")
+
 
 def _turn_text(row: dict[str, object]) -> str:
     message = row.get("message", row)
@@ -1437,12 +1470,18 @@ class Herdr:
         cursor = (TranscriptCursor(opening.transcript, launched_at)
                   if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
-        typings, enters = 0, 0
+        typings, enters, rejections = 0, 0, 0
         recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
+        # The text typed last: the opening prompt, or the plain fallback once Claude twice called its command unknown.
+        current = opening.text
+        fallback = (command_fallback(opening.text, opening.transcript)
+                    if isinstance(opening.transcript, SessionTranscript) else None)
 
         def failure(reason: str) -> PromptSubmitOutcome:
             if typings and isinstance(cursor, TranscriptCursor):
-                proof = cursor.submitted_prompt(opening.text)
+                proof = cursor.submitted_prompt(current)
+                if not isinstance(proof, PromptSubmitted) and current != opening.text:
+                    proof = cursor.submitted_prompt(opening.text)
                 if isinstance(proof, PromptSubmitted):
                     if (isinstance(recipient, PromptRecipientProcess)
                             and prompt_recipient_process(cursor.transcript.session_id) != recipient):
@@ -1502,11 +1541,11 @@ class Herdr:
             while time.monotonic() < deadline:
                 typings += 1
                 try:
-                    self.prompt(pane, opening.text)
+                    self.prompt(pane, current)
                 except HerdrFailure as error:
                     if error.code != "agent_prompt_stalled":
                         if isinstance(cursor, TranscriptCursor):
-                            proof = cursor.submitted_prompt(opening.text)
+                            proof = cursor.submitted_prompt(current)
                             if isinstance(proof, PromptSubmitted):
                                 return bound_outcome(proof)
                         return failure(str(error))
@@ -1514,9 +1553,25 @@ class Herdr:
                 if not isinstance(cursor, TranscriptCursor):
                     return failure("caller did not identify the transcript; submit is unproven")
                 while True:
-                    result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
+                    result = self._wait_for_submit(cursor, current, min(deadline, time.monotonic() + 5))
                     if isinstance(result, PromptSubmitted):
                         return bound_outcome(result)
+                    rejected = cursor.command_rejections(current) if current == opening.text else rejections
+                    if rejected > rejections:
+                        # A resumed Claude can take a prompt before its command list is complete
+                        # (cbc14765, 2026-10-20): type the command once more, then its file as a plain prompt.
+                        rejections = rejected
+                        if rejections > 1:
+                            if fallback is None:
+                                return failure(f"Claude answered Unknown command: {_slash_command(current)}")
+                            current = fallback
+                        elif (remaining := deadline - time.monotonic()) > 0:
+                            time.sleep(min(PROMPT_SETTLE_SECONDS, remaining))
+                        if time.monotonic() >= deadline:
+                            return deadline_failure()
+                        if not self.prompt_input_empty(pane):
+                            return failure("destination input contains other text")
+                        break
                     raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
                     screen = _prompt_screen(raw)
                     composer = _composer_input(raw)
@@ -1526,14 +1581,14 @@ class Herdr:
                         continue
                     if isinstance(composer, NoComposer):
                         continue
-                    if composer.contains(opening.text):
+                    if composer.contains(current):
                         if enters == 3:
                             return failure("no user turn after three Enter retries")
                         if (isinstance(recipient, PromptRecipientProcess)
                                 and prompt_recipient_process(cursor.transcript.session_id) != recipient):
                             return failure("prompt recipient changed before Enter retry")
                         # A turn can land during the screen/process reads too.
-                        proof = cursor.submitted_prompt(opening.text)
+                        proof = cursor.submitted_prompt(current)
                         if isinstance(proof, PromptSubmitted):
                             return bound_outcome(proof)
                         if isinstance(cursor.readability, TranscriptUnreadable):
@@ -1570,7 +1625,7 @@ class Herdr:
                         return failure("prompt recipient changed before re-type")
                     # The last guard immediately before another typing: a late
                     # accepted turn wins over every readiness or idle observation.
-                    proof = cursor.submitted_prompt(opening.text)
+                    proof = cursor.submitted_prompt(current)
                     if isinstance(proof, PromptSubmitted):
                         return bound_outcome(proof)
                     if isinstance(cursor.readability, TranscriptUnreadable):
@@ -1581,6 +1636,13 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str) -> None:
+        """Type a prompt, recorded first so that the prompt hook does not count it as the user's."""
+        import script_prompts
+
+        try:
+            script_prompts.record(pane, text)
+        except OSError as error:
+            print(f"herdr: script prompt not recorded: {error}", file=sys.stderr)
         _ = self.run("agent", "prompt", pane, text)
 
     def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:

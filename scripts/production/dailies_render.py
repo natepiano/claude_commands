@@ -71,11 +71,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import run_out
 import note_file
 from run_out import READINGS_LOG, Reading
 from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
+import urgency
+from urgency import Urgency, UrgencyError
 
 # The longest update line of each length. `gantt` is the default: the chart, with only what needs the user and
 # what changed above it. It takes the input `simple` takes.
@@ -275,10 +278,18 @@ OutstandingTiming = DueNow | DeferredUntil
 
 
 @dataclass(frozen=True)
+class Ranking:
+    """Where an item goes in the user's list (urgency.py); `follows` is the text of the item it comes after."""
+    urgency: Urgency = Urgency()
+    follows: str = ""
+
+
+@dataclass(frozen=True)
 class OutstandingReminder:
     since: datetime
     text: str
     timing: OutstandingTiming = DueNow()
+    rank: Ranking = Ranking()
 
 
 @dataclass(frozen=True)
@@ -287,6 +298,7 @@ class OutstandingQuestion:
     text: str
     question: str
     timing: OutstandingTiming = DueNow()
+    rank: Ranking = Ranking()
 
 
 @dataclass(frozen=True)
@@ -296,6 +308,7 @@ class ReviewedOutstandingQuestion:
     question: str
     reviewed: str
     timing: OutstandingTiming = DueNow()
+    rank: Ranking = Ranking()
 
 
 @dataclass(frozen=True)
@@ -305,6 +318,7 @@ class ReviewUnavailableOutstandingQuestion:
     question: str
     reason: str
     timing: OutstandingTiming = DueNow()
+    rank: Ranking = Ranking()
 
 
 Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
@@ -983,6 +997,17 @@ def plumbing(line: str) -> str | None:
             + "say what changes in the app, or leave it out")
 
 
+def read_ranking(fields: JsonMap, where: str) -> Ranking:
+    """An item's `urgency`, `due`, `marked` and `follows`; none of them is a normal item."""
+    follows = fields.get("follows", "")
+    if not isinstance(follows, str) or "\n" in follows:
+        raise InputError(f"{where}.follows: expected one line of text")
+    try:
+        return Ranking(urgency.from_fields(fields), follows.strip())
+    except UrgencyError as error:
+        raise InputError(f"{where}: {error}") from None
+
+
 def read_outstanding(path: Path | None) -> list[Outstanding]:
     """What waits on the user, oldest first; no file means nothing waits."""
     if path is None or not path.exists():
@@ -996,7 +1021,9 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if not isinstance(entry, dict):
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
-        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable"}, where)
+        check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable", "urgency", "due",
+                            "marked", "follows"}, where)
+        rank = read_ranking(fields, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
             raise InputError(f"{where}.since: expected YYYY-MM-DDTHH:MM")
@@ -1013,20 +1040,20 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if "question" not in fields:
             if "reviewed" in fields or "review_unavailable" in fields:
                 raise InputError(f"{where}: question required for a review result")
-            items.append(OutstandingReminder(since_at, text, timing))
+            items.append(OutstandingReminder(since_at, text, timing, rank))
             continue
         if not isinstance(question, str) or not question.strip():
             raise InputError(f"{where}.question: expected non-empty full question")
         if "reviewed" in fields:
             if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
                 raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
-            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing))
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank))
         elif "review_unavailable" in fields:
             if not isinstance(unavailable, str):
                 raise InputError(f"{where}.review_unavailable: expected reason text")
-            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing))
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank))
         else:
-            items.append(OutstandingQuestion(since_at, text, question, timing))
+            items.append(OutstandingQuestion(since_at, text, question, timing, rank))
     return sorted(items, key=lambda item: item.since)
 
 

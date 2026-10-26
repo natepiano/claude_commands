@@ -356,7 +356,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
-        unit=f"{name}-unit",
+        unit=(name if any(cell_value(row["Unit"]) == name
+                          for row in unit_table(production.doc.read_text(encoding="utf-8").splitlines()))
+              else f"{name}-unit"),
         branch=branch,
         worktree=worktree,
         plan=plan,
@@ -708,7 +710,7 @@ def host_session_name(request: UnitLaunch) -> str:
         if recorded.startswith(f"{slug}-"):
             return recorded
     name = request.identity.session
-    return herdr.generated_session_name(name if name.startswith(f"{slug}-") else f"{slug}-{name}")
+    return herdr.generated_session_name(unit_names.branch(slug, name))
 
 
 def launch_session(
@@ -823,6 +825,22 @@ def launched_unit(request: UnitLaunch | RequestedUnitLaunch) -> MarkedUnitFound 
     return NoMarkedUnit() if unit is None else MarkedUnitFound(unit)
 
 
+def registry_remote_control(claude: unit_lookup.Claude) -> bool:
+    """Remote Control is on when this session's registry record carries a bridge session.
+
+    The record does not scroll off, as the pane's "/remote-control is active" line does
+    once the opening prompt starts work.
+    """
+    import sessions
+
+    if not isinstance(claude, unit_lookup.LiveClaude):
+        return False
+    record = sessions.read_session(sessions.sessions_dir() / f"{claude.pid}.json")
+    if isinstance(record, sessions.UnreadableSessionRecord) or record["sessionId"] != claude.session_id:
+        return False
+    return sessions.remote_control(record) == "active"
+
+
 def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.MarkedUnit:
     from session_pane import HerdrFailure, read_place
 
@@ -833,6 +851,16 @@ def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.MarkedUnit:
     deadline = time.monotonic() + request.timeout
     pane = ""
     while True:
+        if not isinstance(launched.claude, unit_lookup.LiveClaude):
+            # The session record can lag the pane; look again until the mark names a live Claude.
+            try:
+                again = launched_unit(request)
+            except OSError:
+                again = found
+            if isinstance(again, MarkedUnitFound):
+                launched = again.unit
+        if registry_remote_control(launched.claude):
+            return launched
         try:
             pane = read_place(launched.place)
         except (OSError, HerdrFailure) as error:

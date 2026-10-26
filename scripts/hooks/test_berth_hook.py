@@ -5,17 +5,21 @@ import contextlib
 import io
 import json
 import os
+import runpy
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from collections.abc import Callable
 from typing import cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
+from scripts.guilds import roles  # noqa: E402
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
 DIRECTOR = "sid-director"
@@ -27,9 +31,13 @@ import json, os, sys
 with open(os.environ["FAKE_BERTH_LOG"], "a") as log:
     log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(),
                           "session": os.environ.get("CARGO_BERTH_SESSION_ID")}) + "\n")
-print(open(os.environ["FAKE_BERTH_ANSWER"]).read())
+board = os.environ["FAKE_BERTH_ANSWER"] + ".board"
+print(open(board if sys.argv[1] == "board" and os.path.exists(board) else os.environ["FAKE_BERTH_ANSWER"]).read())
 '''
 AWAITING: dict[str, object] = {"kind": "enrolled_awaiting_first_touch", "phase": "15"}
+EARLIER = "01a15ec6-0000-7000-8000-000000000001"
+ACTIVE_EARLIER: dict[str, object] = {"kind": "active", "active_phase_reservation": {
+    "reservation_id": EARLIER, "coordination_run_id": RUN, "phase": "15", "phase_start_head": "f" * 40}}
 
 
 def envelope(status: str, message: str = "", acquisition: dict[str, str] | None = None) -> dict[str, object]:
@@ -76,13 +84,16 @@ class BerthHookTests(unittest.TestCase):
             **os.environ,
             "PATH": f"{self.bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
             "CLAUDE_CODE_SESSION_ID": DIRECTOR,
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "unit" / "active"),
+            "UNIT_ACTIVE_DIR": str(self.root / "unit" / "active"),
             "FAKE_BERTH_LOG": str(self.root / "berth.log"),
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
+            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
+            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership"),
+            "GUILD_ROLES_HOST": "fixture-host",
         }
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
         # A test run from inside a seat inherits its run; each test names the run it wants.
-        _ = self.environment.pop("PLAN_DELEGATE_BOARD_DIR", None)
+        _ = self.environment.pop("UNIT_RUN_DIR", None)
         self.answer(envelope("clear", acquisition=acquired()))
         _ = self.state(AWAITING)
 
@@ -114,6 +125,68 @@ class BerthHookTests(unittest.TestCase):
         payload = {"tool_name": tool, "cwd": str(cwd or self.repo), "tool_input": {"command": patch}}
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
                               text=True, check=False, env=self.environment, timeout=60)
+
+    def bind_designer(self, directory: Path, phase: str) -> None:
+        design_id = "00000000-0000-4000-8000-000000000036"
+        binding = roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
+        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
+                                  str(self.repo), str(self.repo / "design.md"), "design",
+                                  "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), binding,
+                                  (roles.RoleInstance("designer", "lasting-designer", roles.RoleOpen("designer-thread")),
+                                   roles.RoleInstance("reviewer", "lasting-reviewer", roles.RoleNotOpened())))
+        self.environment.update({"GUILD_DESIGN_ID": design_id, "GUILD_BINDING_GENERATION": "2"})
+        with mock.patch.dict(os.environ, self.environment):
+            roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        _ = (directory / "phases" / phase / "files").write_text("src/lib.rs\n")
+        _ = (directory / "progress_history_state.json").write_text(json.dumps({
+            "run_id": directory.name, "history_file": str(self.root / (directory.name + ".jsonl")),
+            "open_phases": [{"id": phase, "instance_id": "instance-" + phase, "status": "open"}],
+            "phase": {"id": phase, "instance_id": "instance-" + phase, "status": "open"},
+        }))
+
+    def held_hook(self, patch: str) -> str:
+        decide = cast(Callable[[str], int], runpy.run_path(str(HOOK))["decide"])
+        payload = json.dumps({"tool_name": "apply_patch", "cwd": str(self.repo), "tool_input": {"command": patch}})
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(roles, "resolve_holder", return_value=roles.HolderReach(DIRECTOR)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(decide(payload), 0)
+        return output.getvalue()
+
+    def test_held_designer_uses_rebound_run_while_old_board_folder_still_exists(self) -> None:
+        current = self.side_run()
+        self.bind_designer(current, "7")
+        self.environment["UNIT_RUN_DIR"] = str(self.session_dir)
+        self.assertEqual(self.held_hook(patch_text("*** Update File: src/lib.rs")), "")
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-7"])
+        self.assertEqual(self.state(), AWAITING)
+        state = cast(dict[str, object], json.loads((current / "phases/7" / phase_reservation.STATE_FILE).read_text()))
+        self.assertEqual(state["kind"], "active")
+
+    def test_held_patch_rejects_stale_generation_and_both_unlisted_rename_paths_before_attribution(self) -> None:
+        self.bind_designer(self.session_dir, "15")
+        cases = (
+            ("1", patch_text("*** Update File: src/lib.rs")),
+            ("2", patch_text("*** Update File: src/lib.rs", "*** Move to: src/other.rs")),
+            ("2", patch_text("*** Update File: src/other.rs", "*** Move to: src/lib.rs")),
+            ("2", patch_text("*** Update File: src/lib.rs", "*** Add File: private.md")),
+        )
+        for generation, command in cases:
+            with self.subTest(generation=generation, patch=command):
+                self.environment["GUILD_BINDING_GENERATION"] = generation
+                refused = cast(dict[str, object], json.loads(self.held_hook(command)))
+                self.assertEqual(cast(dict[str, object], refused["hookSpecificOutput"])["permissionDecision"], "deny")
+                self.assertEqual(self.berth_calls(), [])
+                self.assertEqual(self.state(), AWAITING)
+
+    def test_held_designer_fails_closed_when_the_engine_cannot_read_its_ledger(self) -> None:
+        self.bind_designer(self.session_dir, "15")
+        self.answer(envelope("ledger_unreadable"))
+        refused = cast(dict[str, object], json.loads(self.held_hook(patch_text("*** Update File: src/lib.rs"))))
+        detail = cast(dict[str, object], refused["hookSpecificOutput"])
+        self.assertEqual(detail["permissionDecision"], "deny")
+        self.assertIn("ledger", str(detail["permissionDecisionReason"]))
+        self.assertEqual(self.state(), AWAITING)
 
     def test_a_path_a_sibling_phase_holds_allows_the_edit_and_records_nothing(self) -> None:
         # The engine names the sibling's reservation and leaves this phase's session unmapped.
@@ -193,7 +266,7 @@ class BerthHookTests(unittest.TestCase):
 
     def test_a_seat_of_a_side_run_checks_its_own_runs_phase_not_the_markers(self) -> None:
         run = self.side_run()
-        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(run)
+        self.environment["UNIT_RUN_DIR"] = str(run)
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-7"])
@@ -210,20 +283,30 @@ class BerthHookTests(unittest.TestCase):
 
     def test_a_board_dir_that_is_gone_falls_back_to_the_marker(self) -> None:
         _ = self.side_run()
-        self.environment["PLAN_DELEGATE_BOARD_DIR"] = str(self.root / "unit" / "ended-run")
+        self.environment["UNIT_RUN_DIR"] = str(self.root / "unit" / "ended-run")
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-15"])
         self.assertEqual(self.state()["kind"], "active")
 
-    def test_an_already_active_phase_keeps_its_reservation(self) -> None:
-        active: dict[str, object] = {"kind": "active", "active_phase_reservation": {
-            "reservation_id": "earlier", "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD}}
-        _ = self.state(active)
+    def test_an_active_phase_keeps_the_reservation_its_check_still_names(self) -> None:
+        _ = self.state(ACTIVE_EARLIER | {"active_phase_reservation": {
+            "reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15", "phase_start_head": HEAD}})
+        before = self.state()
         result = self.hook(patch_text("*** Update File: src/lib.rs"))
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
         self.assertEqual(len(self.berth_calls()), 1)
-        self.assertEqual(self.state(), active)
+        self.assertEqual(self.state(), before)
+
+    def test_an_active_phase_follows_a_new_reservation_after_berth_released_its_own(self) -> None:
+        """cargo-liner handler-unit phase 22: berth released 01a15ec6 at a shrink checkpoint, the next
+        seat edit acquired 01a15ec8, and the record still named 01a15ec6, so drift exited 5."""
+        _ = self.state(ACTIVE_EARLIER)
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"]),
+                         {"reservation_id": RESERVATION, "coordination_run_id": RUN, "phase": "15",
+                          "phase_start_head": HEAD})
 
     def test_a_blocked_check_refuses_the_edit_with_the_engine_reason(self) -> None:
         self.answer(envelope("blocked_by_overlap", "src/lib.rs is held by reservation 01a1 of run hana"))
@@ -275,6 +358,135 @@ class BerthHookTests(unittest.TestCase):
         output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
         self.assertEqual(output["permissionDecision"], "deny")
         self.assertIn("not_installed: the cargo-berth binary is not on PATH.", output["permissionDecisionReason"])
+
+    def recorder_phases(self, *phases: str) -> None:
+        records = [{"id": phase, "status": "active"} for phase in phases]
+        _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
+            "phase": records[-1] if records else {"id": "15", "status": "completed"},
+            "open_phases": records[:-1]}))
+
+    def map_phase_session(self, phase: str) -> None:
+        """Berth's session map names the phase's own session, as a check acquired under it leaves it."""
+        ledger = self.repo / ".git" / phase_reservation.LEDGER_DIRECTORY
+        ledger.mkdir(exist_ok=True)
+        _ = (ledger / phase_reservation.SESSION_MAP_FILE).write_text(json.dumps({"identities": {
+            phase_reservation.phase_session_id(DIRECTOR, phase): {"reservation_id": RESERVATION,
+                                                                   "coordination_run_id": RUN}}}))
+
+    def test_a_recorder_phase_never_enrolled_checks_under_the_bare_session(self) -> None:
+        # FinalGate's `final` phase starts with no reservation: no state file and no berth mapping.
+        self.recorder_phases("final")
+        directory = phase_reservation.phase_directory(self.session_dir, "final")
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [DIRECTOR])
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+        # Once berth maps the phase's own session, the missing state file is a lost record.
+        self.map_phase_session("final")
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn(phase_reservation.repair_command(self.session_dir, "final", self.repo),
+                      output["permissionDecisionReason"])
+
+    def test_an_unreadable_recorder_state_checks_the_held_phases_without_a_traceback(self) -> None:
+        state = self.session_dir / "progress_history_state.json"
+        for content in ("not JSON", "[1]", "\udcff"):
+            with self.subTest(content=content):
+                _ = state.write_bytes(content.encode("utf-8", "surrogateescape"))
+                result = self.hook(patch_text("*** Update File: src/lib.rs"))
+                self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(self.berth_calls()[-1]["session"], f"{DIRECTOR}.phase-15")
+                self.assertEqual(self.state()["kind"], "active")
+
+    def test_a_checkpoint_released_phase_does_not_own_edits_during_plan_review(self) -> None:
+        self.open_second_phase()
+        self.recorder_phases("15", "16")
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        _ = phase_reservation.record_active(directory, phase_reservation.Acquisition(RESERVATION, RUN, HEAD))
+        phase_reservation.committed(directory, HEAD)
+        self.assertTrue(phase_reservation.clear(directory, HEAD))
+        # Phase 16 alone owns both the released phase's old file and an unlisted new file.
+        result = self.hook(patch_text("*** Update File: src/lib.rs", "*** Add File: docs/new.md"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-16"])
+        self.assertEqual(self.state(phase="16")["kind"], "active")
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_reading_open_phases_starts_no_process(self) -> None:
+        self.recorder_phases("15")
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("process started")):
+            phases = phase_reservation.open_phases(self.session_dir)
+        self.assertEqual([phase.phase for phase in phases], ["15"])
+
+    def test_a_lone_open_phase_owns_paths_once_listed_by_finished_phases(self) -> None:
+        self.open_second_phase()
+        directory = phase_reservation.phase_directory(self.session_dir, "16")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        _ = (directory / phase_reservation.FILES_FILE).write_text("src/other.rs\n")
+        self.recorder_phases("15")
+        result = self.hook(patch_text("*** Add File: src/other.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [f"{DIRECTOR}.phase-15"])
+        self.assertEqual(self.state()["kind"], "active")
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_between_phases_a_finished_directory_is_not_a_lost_record(self) -> None:
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        self.recorder_phases()
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual([call["session"] for call in self.berth_calls()], [DIRECTOR])
+        self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_a_lone_open_phase_with_a_lost_record_owns_unlisted_paths(self) -> None:
+        self.open_second_phase()
+        directory = phase_reservation.phase_directory(self.session_dir, "15")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        finished = phase_reservation.phase_directory(self.session_dir, "16")
+        (finished / phase_reservation.STATE_FILE).unlink()
+        self.recorder_phases("15")
+        self.map_phase_session("15")
+        result = self.hook(patch_text("*** Add File: src/other.rs"))
+        self.assertTrue(result.stdout, "the lost record must refuse the edit")
+        output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
+        self.assertEqual(output["permissionDecision"], "deny")
+        self.assertIn(phase_reservation.repair_command(self.session_dir, "15", self.repo),
+                      output["permissionDecisionReason"])
+        self.assertNotIn("--phase 16", output["permissionDecisionReason"])
+        self.assertEqual(self.berth_calls(), [])
+
+    def test_a_missing_phase_record_refuses_with_the_ledger_repair_command(self) -> None:
+        for sibling_open in (False, True):
+            with self.subTest(sibling_open=sibling_open):
+                _ = self.state(AWAITING)
+                if sibling_open:
+                    self.open_second_phase()
+                self.recorder_phases(*(["15", "16"] if sibling_open else ["15"]))
+                self.map_phase_session("15")
+                directory = phase_reservation.phase_directory(self.session_dir, "15")
+                (directory / phase_reservation.STATE_FILE).unlink()
+                result = self.hook(patch_text("*** Update File: src/lib.rs"))
+                output = cast(dict[str, dict[str, str]], json.loads(result.stdout))["hookSpecificOutput"]
+                self.assertEqual(output["permissionDecision"], "deny")
+                command = shlex.join(["python3", str(Path(__file__).resolve().parents[1] / "direct" / "phase_reservation.py"), "repair",
+                                      "--session-dir", str(self.session_dir), "--phase", "15",
+                                      "--repo", str(self.repo)])
+                self.assertIn(command, output["permissionDecisionReason"])
+                self.assertEqual(self.berth_calls(), [])
+                self.assertFalse((directory / phase_reservation.STATE_FILE).exists())
+
+    def test_a_completed_phases_files_do_not_block_an_explicit_live_owner(self) -> None:
+        self.open_second_phase()
+        self.recorder_phases("15")
+        directory = phase_reservation.phase_directory(self.session_dir, "16")
+        (directory / phase_reservation.STATE_FILE).unlink()
+        _ = (directory / phase_reservation.FILES_FILE).write_text("src/lib.rs\n")
+        result = self.hook(patch_text("*** Update File: src/lib.rs"))
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(self.state()["kind"], "active")
 
     def test_patch_paths_names_every_written_deleted_and_moved_path_once(self) -> None:
         patch = patch_text("*** Update File: a.rs", "*** Move to: b.rs", "*** Delete File: c.rs",
@@ -364,6 +576,40 @@ class BerthHookTests(unittest.TestCase):
         code, output = self.backstop()
         self.assertEqual((code, self.state(), self.berth_calls()), (0, unenrolled, []))
         self.assertIn("repository_not_enrolled; nothing to record", output)
+
+    def board(self, status: str) -> None:
+        _ = (self.root / "answer.json.board").write_text(json.dumps(
+            {"verb": "board", "status": "board_ready", "payload": {"kind": "reservation", "data": {
+                "reservation_id": EARLIER, "lifecycle": {"status": status}}}}))
+
+    def test_the_backstop_keeps_an_active_record_whose_reservation_is_live(self) -> None:
+        _ = self.state(ACTIVE_EARLIER)
+        self.board("active")
+        code, output = self.backstop()
+        self.assertEqual((code, self.state()), (0, ACTIVE_EARLIER))
+        self.assertIn(f"reservation {EARLIER} is active on the board", output)
+        self.assertEqual([call["argv"] for call in self.berth_calls()],
+                         [["board", "--reservation", EARLIER, "--json"]])
+
+    def test_the_backstop_moves_a_released_reservation_to_the_phases_live_one(self) -> None:
+        _ = self.state(ACTIVE_EARLIER)
+        self.board("released")
+        _ = (self.repo / "src" / "lib.rs").write_text("fn b() {}\n")
+        code, output = self.backstop()
+        self.assertEqual(code, 0)
+        self.assertIn(f"Active, reservation {RESERVATION}; reservation {EARLIER} is released on the board", output)
+        self.assertEqual(cast(dict[str, str], self.state()["active_phase_reservation"])["reservation_id"], RESERVATION)
+        self.assertEqual(self.berth_calls()[1]["argv"], ["check", "src/lib.rs", "--json"])
+
+    def test_the_backstop_fails_when_no_live_reservation_replaces_a_released_one(self) -> None:
+        _ = self.state(ACTIVE_EARLIER)
+        self.board("released")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code, _ = self.backstop()
+        self.assertEqual((code, self.state()), (1, ACTIVE_EARLIER))
+        self.assertIn(f"reservation {EARLIER} is released on the board, and nothing of this phase changed",
+                      errors.getvalue())
 
     def test_the_backstop_fails_on_a_refused_check(self) -> None:
         self.answer(envelope("blocked_by_overlap", "held elsewhere"))

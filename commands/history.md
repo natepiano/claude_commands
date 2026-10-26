@@ -4,7 +4,7 @@ description: Query stage, phase, and run timings across skill run history
 
 # history
 
-`$ARGUMENTS` — a subcommand (`summary`, `compare`, `stages`, `phases`, `runs`,
+`$ARGUMENTS` — a subcommand (`summary`, `compare`, `stages`, `phases`, `rounds`, `runs`,
 `tests`, `versions`) and its flags.
 
 Run:
@@ -13,7 +13,7 @@ Run:
 python3 ~/.claude/scripts/history/history.py $ARGUMENTS
 ```
 
-Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the seven
+Empty `$ARGUMENTS` → run `summary`. A first word that is not one of the eight
 subcommands → show `history.py --help` and stop.
 
 **Runs sandboxed — never pass `dangerouslyDisableSandbox`.** The script reads
@@ -55,6 +55,7 @@ unconverted.
   keys are rejected
 - `phases` — review and fix rounds per phase, grouped by `(run, phase)`; columns
   `run  phase  reviews  fixes  impl  fix  total`
+- `rounds` — repair rounds and causes per phase instance; `--top N` (default 25), `--plan <substring>`, `--status`, `--until` (same forms as `--since`); marks mixed phase records
 - `runs` — one row per run
 - `tests` — verification and smoke history
 - `versions` — which spine and schema versions each store holds
@@ -96,25 +97,25 @@ table|json|csv`. Beyond those:
   Directional, not settled.
 - **`N.Nx faster|slower`** — enough samples, and past the noise factor.
 
-**`--skill plan-delegate`** — the value is the store directory name under
+**`--skill unit-history`** — the value is the store directory name under
 `~/.local/state/`, not the user-facing skill name. The command is `/unit:direct`
-and its config section is `[delegate.codex]`, but neither `--skill direct` nor
-`--skill delegate` matches a store. `plan-delegate` is the only one.
+and its config section is `[direct.codex]`, but `--skill direct` matches no
+store. `unit-history` is the only one.
 
 ## Reading
 
 - **Compare agent:effort with `stages --group stage,task,agent`.** `called_agent`
   and `called_task` are stamped on every pass event, so the grouping reads the
   assignment off the data instead of reconstructing it.
-- **`task` and `stage` say the same thing for a delegate pass**, so group on one
-  or the other, not both, unless a second skill is in the window. Delegate tasks
+- **`task` and `stage` say the same thing for a worker pass**, so group on one
+  or the other, not both, unless a second skill is in the window. Worker tasks
   are the four kinds — `impl`, `test`, `fix`, `review` — and `agents.conf` holds
   one row per kind. It used to hold five keys where three (`architect`,
   `mechanical`, `escalation`) named an agent tier rather than a job, and on
   2026-08-30 the tier axis was removed and 6141 stored events were rewritten to
   the kind each pass had actually run under. **Nothing is translated at read
   time**, so a query over any window returns the four; the pre-migration logs
-  are kept at `~/.local/state/plan-delegate/backup-runs-2026-08-30-four-kinds`
+  are kept at `~/.local/state/unit-history/backup-runs-2026-08-30-four-kinds`
   and are the only place escalated work is separable from ordinary work.
 - **Stage totals are agent time, not elapsed.** The footer prints both and their
   ratio (about 1.7x parallel); summed stage seconds exceed the elapsed union.
@@ -169,7 +170,7 @@ registration.
   the run reads as open and its `wall` gets the `+` suffix.
 - **Emit `status`** on anything that can end badly; the default `--status completed`
   is what keeps abandoned work out of every total.
-- A store outside `~/.local/state/plan-delegate` needs its own `writePaths` entry in
+- A store outside `~/.local/state/unit-history` needs its own `writePaths` entry in
   `settings.json`, which takes a restart.
 
 ## Examples
@@ -179,7 +180,7 @@ registration.
 /history stages --group stage,task,agent                  compare agent:effort per stage
 /history stages --group stage,worktree --since 30d        where the repo, not the phase, moved the time
 /history stages --status all --since 30d                  include canceled and interrupted rows
-/history phases --skill plan-delegate --sort fix_passes   phases ranked by fix rounds
+/history phases --skill unit-history --sort fix_passes   phases ranked by fix rounds
 /history runs --since 7d                                  one row per run
 /history tests --raw                                      verification results, one row per wording
 /history versions                                         what each store holds

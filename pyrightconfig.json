@@ -10,6 +10,14 @@
   ],
   "executionEnvironments": [
     {
+      "root": "scripts/guilds",
+      "extraPaths": [".", "scripts/guilds", "scripts/direct", "scripts/lib", "scripts/history", "scripts/agents", "scripts/astra", "scripts/production", "scripts/message"]
+    },
+    {
+      "root": "scripts/hierarchies",
+      "extraPaths": [".", "scripts/hierarchies", "scripts/lib", "scripts/production", "scripts/message", "scripts/direct", "scripts/nightly_review"]
+    },
+    {
       "root": "scripts/herdr",
       "extraPaths": [
         ".",
@@ -54,6 +62,7 @@
     {
       "root": "scripts/hooks",
       "extraPaths": [
+        ".",
         "scripts/hooks",
         "scripts/direct",
         "scripts/message",
@@ -98,6 +107,7 @@
     {
       "root": "scripts/message",
       "extraPaths": [
+        ".",
         "scripts/message",
         "scripts/production",
         "scripts/direct",
@@ -156,7 +166,8 @@
     {
       "root": "scripts/notify",
       "extraPaths": [
-        "scripts/notify"
+        "scripts/notify",
+        "scripts/lib"
       ]
     },
     {

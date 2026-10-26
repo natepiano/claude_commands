@@ -10,8 +10,8 @@ and print its output exactly as it comes, with nothing added. It finds the
 production from this session's update timer and prints one Markdown table,
 `| Proposed by | Proposal | Date | State |`, from three sources in this order:
 
-- **Issues**: each issue directly in the folder the production doc's
-  `Proposals` line names, while its frontmatter's `status` is `open` and its
+- **Issues**: each issue directly in the folder that the `Proposals` line
+  names, of the production doc and of each production below it, while its frontmatter's `status` is `open` and its
   `tags` hold `proposal`, and its `proposed_by` names this production, one of
   its units, a production below it, or a unit of one (`unit (production)`
   names the production). Productions share one issues folder, so the others'
@@ -21,14 +21,18 @@ production from this session's update timer and prints one Markdown table,
   Each style decision is one row for one rule and crate under one rule text.
   Rule candidates are not proposals: `style_proposals.py candidates` lists them,
   and `style_proposals.py drop-candidate --idea "<text>"` drops one.
-- **The plan backlog**: each line of `~/.local/state/plan-backlog/ledger.md`
-  ending `proposed` or `deferred`, under the proposer its file names.
+- **The plan backlog**: each line ending `proposed` or `deferred` of the
+  ledger that the `Improvement queue` line names, of the production doc and of
+  each production below it, under the proposer its file names. A production
+  with no such line has no backlog rows.
 - **Add-ons**: each entry a unit's run holds until it has an answer, under the
   unit's name. Its date is the day the unit last changed its list.
 
 State says what the user can do: `waiting for your review`, `in progress by
-<unit>` (or `in progress`) or `deferred until you ask for it`. Waiting issue rows
-come before in-progress ones. An add-on is not the user's to decide, so its State says who
+<unit>` (or `in progress`) or `deferred until you ask for it`. The waiting rows
+come first, in the order of `/next` (`commands/next.md`): the value is the
+score of the proposed stars. A waiting issue's level shows after its State,
+such as `waiting for your review · blocks`. An add-on is not the user's to decide, so its State says who
 does: `the showrunner decides: build, save for later, or drop`. The unit sends
 its add-ons to the showrunner, whose answer settles each one
 (`/showrunner:produce` → Throughout → Designs and add-ons).

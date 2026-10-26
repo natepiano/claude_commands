@@ -1,0 +1,222 @@
+# Defined names are observations. This file does not approve a name change.
+# Separate several definition sources with a semicolon. Sections follow #.
+# Kept entries remove stable paths or command names before counting prose.
+# Other-meaning files exclude known uses from definition discovery only.
+
+[[terms]]
+name = "production"
+kind = "document"
+defined_in = "docs/production_format.md#Words"
+other_names = []
+
+[[terms]]
+name = "executive producer"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["user"]
+
+[[terms]]
+name = "producer"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = []
+
+[[terms]]
+name = "showrunner"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["orchestrator"]
+
+[[terms]]
+name = "unit"
+kind = "record"
+defined_in = "docs/production_format.md#Words"
+other_names = []
+
+[[terms]]
+name = "unit director"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["orchestrator"]
+
+[[terms]]
+name = "worker"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["seat", "Codex seat", "delegate", "Codex worker"]
+
+[[terms]]
+name = "review pool"
+kind = "record"
+defined_in = "docs/production_format.md#Words"
+other_names = []
+
+[[terms]]
+name = "reviewer"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["pooled reviewer"]
+
+[[terms]]
+name = "template"
+kind = "record"
+defined_in = "docs/production_format.md#Words"
+other_names = ["review template"]
+
+[[terms]]
+name = "lease"
+kind = "record"
+defined_in = "docs/production_format.md#Words"
+other_names = ["review lease"]
+
+[[terms]]
+name = "merge branch"
+kind = "record"
+defined_in = "docs/production_format.md#Words"
+other_names = ["trunk"]
+
+[[terms]]
+name = "gate"
+kind = "step"
+defined_in = "docs/production_format.md#Words"
+other_names = []
+
+[[terms]]
+name = "parent showrunner"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["parent"]
+
+[[terms]]
+name = "child showrunner"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["lower showrunner"]
+
+[[terms]]
+name = "root showrunner"
+kind = "role"
+defined_in = "docs/production_format.md#Words"
+other_names = ["root", "top-level showrunner"]
+
+[[terms]]
+name = "production doc"
+kind = "document"
+defined_in = "docs/production_format.md#Production doc structure"
+other_names = ["production document"]
+
+[[terms]]
+name = "unit plan"
+kind = "document"
+defined_in = "docs/production_format.md#Words (Unit)"
+other_names = ["direct-ready plan"]
+
+[[terms]]
+name = "Work Order"
+kind = "document"
+defined_in = "docs/direct_plan_format.md#Document structure / Work Order"
+other_names = []
+
+[[terms]]
+name = "as-built"
+kind = "document"
+defined_in = "commands/plan/to_as_built.md#Purpose"
+other_names = ["as-built overview", "as-built doc"]
+
+[[terms]]
+name = "add-on"
+kind = "document"
+defined_in = "commands/unit/add_ons.md#<ConsiderNextItems/>"
+other_names = ["next item"]
+
+[[terms]]
+name = "proposal"
+kind = "document"
+defined_in = "commands/showrunner/proposal.md#File"
+other_names = ["candidate", "add proposal"]
+
+[[terms]]
+name = "change"
+kind = "record"
+defined_in = "commands/change_review.md#add"
+other_names = ["change-review row"]
+other_meaning_files = ["commands/changelog.md", "commands/commit_prep.md"]
+
+[[terms]]
+name = "dailies"
+kind = "document"
+defined_in = "commands/showrunner/dailies.md#Dailies"
+other_names = ["scheduled update"]
+
+[[terms]]
+name = "checkpoint"
+kind = "step"
+defined_in = "commands/unit/checkpoint.md#<CheckpointCommit/>"
+other_names = ["code commit", "code ready notice", "code checkpoint"]
+
+[[terms]]
+name = "shrink"
+kind = "step"
+defined_in = "commands/plan/shrink.md#Purpose"
+other_names = []
+
+[[terms]]
+name = "phase review"
+kind = "step"
+defined_in = "docs/direct/run_phase_review.md#<RunPhaseReview/>"
+other_names = ["plan review"]
+
+[[terms]]
+name = "landing call"
+kind = "step"
+defined_in = "commands/showrunner/produce.md#<LandingCall/>"
+other_names = []
+
+[[terms]]
+name = "/unit:direct"
+kind = "step"
+defined_in = "commands/unit/direct.md#Direct"
+other_names = ["/unit:delegate"]
+kept = ["docs/direct/", "scripts/direct/"]
+
+[[terms]]
+name = "astra-designer"
+kind = "role"
+defined_in = "docs/plans/sdlc-production.md#Guild heads (planned); /home/natepiano/worktrees/claude-build-followups-sdlc-guilds/docs/plans/sdlc-guilds.md#Decisions / Phase 2 Names (planned)"
+other_names = ["chief designer"]
+
+[[terms]]
+name = "astra-reviewer"
+kind = "role"
+defined_in = "docs/plans/sdlc-production.md#Guild heads (planned); /home/natepiano/worktrees/claude-build-followups-sdlc-guilds/docs/plans/sdlc-guilds.md#Decisions / Phase 2 Names (planned)"
+other_names = ["chief reviewer"]
+
+[[terms]]
+name = "small-fix helper"
+kind = "role"
+defined_in = "none"
+other_names = ["subagent", "helper"]
+
+[[terms]]
+name = "pending decision"
+kind = "record"
+defined_in = "docs/direct_plan_format.md#Pending decisions"
+other_names = ["Pending decision block"]
+
+[[terms]]
+name = "finding"
+kind = "record"
+defined_in = "commands/unit/direct.md#<FindingsLedger/>"
+other_names = ["issue"]
+
+[[terms]]
+name = "reservation"
+kind = "record"
+defined_in = "commands/unit/direct.md#<PhaseReservationContract/>"
+other_names = ["phase reservation", "delegated phase reservation"]
+
+[[terms]]
+name = "ETA"
+kind = "record"
+defined_in = "commands/unit/eta.md#Steps"
+other_names = ["phase ETA"]

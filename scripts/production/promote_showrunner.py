@@ -7,7 +7,8 @@ The parent showrunner runs it, once the unit has written the child's production 
 The unit gets `/exit`; once its Claude is gone its herdr tab is closed, and add_showrunner.py resumes
 the same conversation as the child's showrunner: in a tab of the shared herdr session, with no unit mark, on the configured showrunners account,
 attached to this showrunner's production. The unit's Units row is then retired and committed in this
-showrunner's checkout. --check runs every refusal and stops nothing.
+showrunner's checkout, also when the session opened but its opening prompt is not proven to have run.
+--check runs every refusal and stops nothing.
 
 Exit 0 when the promoted session runs as the child's showrunner and is attached; 1 when the unit was
 stopped and the promotion did not finish, with what to run printed; 2 on a refusal, with nothing stopped.
@@ -59,7 +60,7 @@ def _git(where: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def run_marker(session_id: str) -> Path:
-    return unit_runs.marker(session_id, os.environ.get("PLAN_DELEGATE_ACTIVE_DIR"))
+    return unit_runs.marker(session_id, unit_runs.environ("ACTIVE_DIR") or None)
 
 
 def _unit_row(lines: list[str], unit: str) -> dict[str, str]:
@@ -97,7 +98,7 @@ def _quiet(unit: str, marked: unit_lookup.MarkedUnit, claude: unit_lookup.LiveCl
 def _settled(unit: str, claude: unit_lookup.LiveClaude, worktree: Path) -> None:
     """Refuse a unit with a run open, whose workers end only with the run, or with work uncommitted."""
     if run_marker(claude.session_id).exists():
-        raise Refusal(f"{unit} has a /unit:delegate run open, and its workers with it; the run finishes first")
+        raise Refusal(f"{unit} has a /unit:direct run open, and its workers with it; the run finishes first")
     status = _git(worktree, "status", "--porcelain")
     if status.returncode != 0:
         raise Refusal(f"cannot read {unit}'s worktree {worktree}: {status.stderr.strip()}")
@@ -246,18 +247,31 @@ def main(argv: list[str]) -> int:
     started = add_showrunner.main(["--production", str(promotion.child.doc), "--model", cast(str, args.model),
                                    "--effort", cast(str, args.effort), "--resume", promotion.claude.session_id,
                                    "--cwd", str(promotion.worktree), "--config-dir", str(target_directory)])
-    if started == add_showrunner.SESSION_NOT_READY:
-        print(f"{unit}'s session is open but not ready; its showrunner prompt was not sent and its Units row "
-              + f"is unchanged. Look at it with `{herdr.attach_hint(showrunners.herdr_space(slug, str(promotion.child.doc)), slug)}`.")
-        return 1
     if started == 2:
         print(f"{unit} is stopped and did not start as a showrunner; its Units row is unchanged. "
               + f"Bring it back as the unit it was with: {restore_line(promotion)}")
         return 1
+    return finish(promotion, started, moved)
+
+
+def finish(promotion: Promotion, started: int, moved: str) -> int:
+    """Retire the Units row of a unit that now runs as the child's session, and say what is still owed.
+
+    A session open without a proven prompt is no longer the unit either, so its row is retired too.
+    """
+    unit, slug = promotion.unit, promotion.child.slug
+    retired, row = True, "its Units row is retired"
     try:
         retire(promotion)
     except (OSError, subprocess.CalledProcessError, Refusal) as error:
-        print(f"{unit} now runs as the showrunner of {slug}, but its Units row was not retired: {error}")
+        retired, row = False, f"its Units row was not retired and is owed: {error}"
+    if started == add_showrunner.SESSION_NOT_READY:
+        print(f"{unit} is open as the session {slug}, but its showrunner prompt is not proven to have run; {row}. "
+              + f"Look at it with `herdr session attach {slug}`; unless it runs the production, type: "
+              + f"/showrunner:produce {promotion.child.doc} resume")
+        return 1
+    if not retired:
+        print(f"{unit} now runs as the showrunner of {slug}, but {row}")
         return 1
     print(f"{unit} is now the showrunner of {slug}; {moved}")
     return started

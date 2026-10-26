@@ -61,6 +61,11 @@ These categories are already decided and never reach the user:
   and it gets stated as mine or dropped. Before citing any constraint as settled,
   know who set it.
 
+- **Docs match current reality.** A doc that states how things are now (as-built,
+  README, plan status, examples, samples) is corrected the moment it is found
+  wrong, in any repo and any owner's doc, and a change that makes a doc wrong
+  updates it in the same commit. Never ask, never file it as a proposal. User,
+  2026-10-21.
 - **API surface.** When the question is whether to expose API surface that has
   no current consumer — only a possible future technical use case — the answer
   is always private now: keep it internal, and open it later when a real

@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -1239,15 +1240,101 @@ def _prepared_account(label: str, *, resume: bool, repair: bool) -> PreparedAcco
     return PreparedAccount(account.named_account_environment(selected.dir), remove)
 
 
+def resolve_program(tool: Literal["claude", "codex"]) -> str:
+    """Find an executable on PATH, then in the installer directory on both machines."""
+    found = shutil.which(tool)
+    if found:
+        return str(Path(found).absolute())
+    installed = accounts_home() / ".local" / "bin" / tool
+    if installed.is_file() and os.access(installed, os.X_OK):
+        return str(installed.absolute())
+    raise FileNotFoundError(f"{tool} program not found (looked in PATH and {installed})")
+
+
 def _exec_codex_account(label: str, arguments: list[str]) -> None:
     """Launch Codex on a checked account, including the stored workers selection."""
     selected_label = role_account("workers").label if label == "workers" else label
     target = check_codex_target(selected_label, accounts_home() / ".codex")
     environment = {**os.environ, "CODEX_HOME": str(target.home)}
     try:
-        os.execvpe("codex", ["codex", *arguments], environment)
+        program = resolve_program("codex")
+        os.execvpe(program, [program, *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start codex: {error}") from error
+
+
+@dataclass(frozen=True)
+class LoginRenewed:
+    """A probe ran and usage no longer reports an expired login."""
+
+
+@dataclass(frozen=True)
+class LoginRenewalFailed:
+    detail: str
+
+
+@dataclass(frozen=True)
+class LoginRenewalAttempt:
+    at: datetime
+    result: LoginRenewed | LoginRenewalFailed
+
+
+def login_renewals_file() -> Path:
+    return accounts_home() / ".local" / "state" / "accounts" / "login_renewals.json"
+
+
+def login_renewal_attempts() -> dict[str, LoginRenewalAttempt]:
+    """Read local probe results. Discard damaged state so the next attempt replaces it."""
+    try:
+        raw = cast(object, json.loads(login_renewals_file().read_text()))
+        if not isinstance(raw, dict):
+            return {}
+        attempts: dict[str, LoginRenewalAttempt] = {}
+        for label, value in cast(dict[str, object], raw).items():
+            if not isinstance(value, dict):
+                return {}
+            item = cast(dict[str, object], value)
+            at, outcome, detail = item.get("at"), item.get("outcome"), item.get("detail")
+            if not isinstance(at, str) or outcome not in ("renewed", "failed") or not isinstance(detail, str):
+                return {}
+            stamp = datetime.fromisoformat(at)
+            if stamp.tzinfo is None:
+                return {}
+            attempts[label] = LoginRenewalAttempt(stamp,
+                LoginRenewed() if outcome == "renewed" else LoginRenewalFailed(detail))
+        return attempts
+    except (OSError, ValueError):
+        return {}
+
+
+def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
+    """Run a quiet probe, then keep its new usage reading. Never expose probe output."""
+    directory = claude_account_dir(label)
+    try:
+        probe = subprocess.run([sys.executable, str(SCRIPTS / "accounts" / "accounts.py"),
+            "exec", "--probe", label, "-p", "hello"], cwd="/tmp", stdin=subprocess.DEVNULL,
+            timeout=120, capture_output=True)
+    except subprocess.TimeoutExpired:
+        return LoginRenewalFailed("timed out after 120 s")
+    except OSError:
+        return LoginRenewalFailed("probe could not start")
+    if probe.returncode != 0:
+        # The exec wrapper uses status 2 when it cannot find the program.
+        if probe.returncode == 2:
+            try:
+                _ = resolve_program("claude")
+            except FileNotFoundError as error:
+                return LoginRenewalFailed(str(error))
+        return LoginRenewalFailed(f"probe exited with status {probe.returncode}")
+    try:
+        report = agent_accounts.claude_live(directory)
+        usage_store.save([report], datetime.now(timezone.utc))
+    except (OSError, ValueError, RuntimeError):
+        return LoginRenewalFailed("usage could not be read")
+    if (report.usage_read_outcome == agent_accounts.UsageReadOutcome.STALE_TOKEN
+            or isinstance(report.weekly_read_skip, agent_accounts.StaleTokenSkip)):
+        return LoginRenewalFailed("usage still shows an expired login")
+    return LoginRenewed()
 
 
 def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> None:
@@ -1272,11 +1359,12 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         for name in UNIT_MARKS:
             _ = environment.pop(name, None)
     try:
+        program = resolve_program("claude")
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
-                                      "run", "--", "claude", *arguments], environment)
+                                      "run", "--", program, *arguments], environment)
         else:
-            os.execvpe("claude", ["claude", *arguments], environment)
+            os.execvpe(program, [program, *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error
 
@@ -1704,9 +1792,10 @@ def codex_destination_uses_credits(chosen: PickedAccount, now: datetime) -> bool
     """A destination needs paid credits when either included window cannot serve work."""
     for reason in chosen.reasons:
         if reason.label == chosen.label:
-            return not all(isinstance(window, ReadingWindow) and window.left > 0
-                           and isinstance(window.reset, KnownReset) and window.reset.at > now
-                           for window in (reason.weekly, reason.five_hour))
+            if not isinstance(reason.weekly, ReadingWindow):
+                return True
+            return not _codex_reading_can_work(
+                FreshReading(reason.weekly, reason.five_hour, "0"), now, agent_accounts.CreditsOff())
     return chosen.weekly_left <= 0
 
 
@@ -3342,7 +3431,9 @@ def _workers_swap_lines(switches: Sequence[WorkersRunSwitch], previous: Path,
 
 
 def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
-                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> WorkersSwapOutcome:
+                  cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
+                  included_only: bool = False) -> WorkersSwapOutcome:
+    """Check the live allowance before changing the workers account."""
     refuse_default(label)
     try:
         workers_home = _workers_home()
@@ -3361,9 +3452,11 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
     if (not report.email or report.email.casefold() != target.login.casefold()
             or _codex_home_login(target_home).casefold() != target.login.casefold()):
         raise AccountsError(f"accounts: cannot read {account_label} ({_codex_folder(target_home)}); check its sign-in and try again")
-    credits = agent_accounts.codex_credits_setting(account_label)
+    credits = agent_accounts.CreditsOff() if included_only else agent_accounts.codex_credits_setting(account_label)
     readiness = agent_accounts.codex_can_work(report, datetime.now(timezone.utc), credits)
     if isinstance(readiness, agent_accounts.CodexWorkExhausted):
+        if included_only:
+            raise AccountsError(f"accounts: {account_label} ({_codex_folder(target_home)}) has no included usage left; choose another account or wait for reset")
         reason = "and set not to use credits" if isinstance(credits, agent_accounts.CreditsOff) else "with no credits"
         raise AccountsError(f"accounts: {account_label} ({_codex_folder(target_home)}) is used up {reason}; choose another account or wait for reset")
     if isinstance(readiness, agent_accounts.CodexWorkUnknown):
@@ -3385,11 +3478,12 @@ def _swap_workers(label: str, *, dry_run: bool, why: str = "by hand",
 
 
 def swap(role: str, label: str, *, dry_run: bool = False, why: str = "by hand",
-         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand") -> SwapOutcome | WorkersSwapOutcome:
-    """Select the new unit account only after every old-account session can move."""
+         cause: Literal["by hand", "refusal", "auto", "credits off"] = "by hand",
+         included_only: bool = False) -> SwapOutcome | WorkersSwapOutcome:
+    """Move workers; included_only requires room without paid credits at the live check."""
     _validate_role(role)
     if role == "workers":
-        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause)
+        return _swap_workers(label, dry_run=dry_run, why=why, cause=cause, included_only=included_only)
     raise AccountsError(UNIT_ROLE_GONE)
 
 
@@ -3861,7 +3955,10 @@ def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:
                 if isinstance(row.read_at, datetime) else " and no reading is stored yet")
     match row.read_outcome:
         case agent_accounts.UsageReadOutcome.STALE_TOKEN:
-            reason = "login token expired; start a session on it to refresh"
+            attempt = login_renewal_attempts().get(row.label)
+            reason = (f"login token expired; a probe session at {attempt.at.astimezone(zone):%H:%M} failed; log in on it by hand"
+                      if attempt is not None and isinstance(attempt.result, LoginRenewalFailed)
+                      else "login token expired; the next notes pass renews it")
         case agent_accounts.UsageReadOutcome.REFUSED_401:
             reason = "the usage service did not accept this login; start a session on it to check it"
         case agent_accounts.UsageReadOutcome.RATE_LIMITED_429:
