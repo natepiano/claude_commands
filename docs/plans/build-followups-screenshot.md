@@ -476,3 +476,39 @@ Unpriced (below every priced one):
 - In `-z` output a rename or copy record is followed by a separate original-path record; the parser consumes it so it is not read as a status entry.
 - The mtime test is a heuristic, not proof of what the binary holds. Only `crates/` and the root `Cargo.toml` and `Cargo.lock` are checked (the root files added at e031f5e9).
 - Tests never start Hana: the natedev Hana ban holds, so live launch is untested.
+
+### Phase 13 — The last three `/hana_shot` failures name their next step, and failures can be priced by mode · status: todo
+
+**Source:** the 2026-10-26 re-rank (Phase 6) found 15 failures a week with no next step. The showrunner ruled it a repair of Phase 10's promise, built with no user step, and made the two measurement fixes below current (2026-10-26).
+
+#### Work Order
+
+**Goal:** every `/hana_shot` failure text names a concrete next step, failure records carry `view`, `target` and `mode`, and the report stops counting Hana source paths as BRP calls.
+
+**Spec:**
+- **Settle timeout** (`hana_shot.py:841`, `Settle.settle`): keep the text "the camera did not settle within N s" and add one next step: rerun the same command once; if it fails again, read the pose with `hana_shot.py pose` and shoot with `--mode pose --focus … --radius …`, which needs no fit move. The text names real flags of the parser at `:2601-2611`.
+- **Setup target missing** (`:1078`, the setup loop): keep "setup S ran but T did not appear within N s" and add the closest names or kinds from the same lookup the target-not-found text uses (`:1057-1066`, `difflib`, up to five), plus "run `hana_shot.py targets` to list the selectors that resolve now".
+- **No mesh bounds for the crop** (`:1242`): keep "the target has no visible mesh bounds to crop to" and add the nearest cached ancestor with an AABB through `TargetEvidence.parent_fit_hint` (`:621`) when one is known, and the `--crop` value that shoots without a crop.
+- One shared helper builds the next-step clause, so the three texts read alike. Each text is one string in the `Failure`, so it reaches the record's `error` field unchanged (Phase 10).
+- **Failure records** (`append_invocation`, `:1686`): a failed invocation record carries top-level `view`, `target` and `mode` from the request's shot, as a success record does (`:1613-1615`). Omit a key only when the request did not parse to a shot. Old records without these keys still read.
+- **BRP count** (`scripts/shot_report/transcripts.py:45`): `hana/` counts as `other_brp` only as a BRP method name, never as a path segment. `rg … crates/hana/src` and `cat crates/hana/src/x.rs` are not BRP calls; a curl body with `"method":"hana/…"` and `mcp__brp__*` tools still are.
+- No other text, flag or record field changes.
+
+**Files:**
+- `scripts/hana_shot/hana_shot.py` — the three next-step texts, the shared helper, `view`/`target`/`mode` on failure records
+- `scripts/hana_shot/test_hana_shot.py` — one fake-server test per new text (settle, setup, crop) and a failure-record field test
+- `commands/hana_shot.md` — one line: failure records carry `view`, `target` and `mode`
+- `scripts/shot_report/transcripts.py` — the `hana/` match in `parsed_tool_event_category`
+- `scripts/shot_report/test_transcripts.py` — path forms are not BRP; method forms are
+
+**Workers:** 1 writer + 1 tester; the hana_shot and shot_report changes are small and one writer holds both.
+- `impl` — `hana_shot.py`, `transcripts.py`, `commands/hana_shot.md`
+- `test` — `test_hana_shot.py` and `test_transcripts.py`, from the Spec alone, against the fake BRP server
+
+**Constraints from prior phases:**
+- Phase 10 built the hint pattern: `TargetEvidence`, closest-name lookup, `CaptureFailure(reason, error)`, and `error` on every failure record. Reuse them; do not add a second evidence store.
+- The fake BRP server projects only the requested components; a test that needs parents must ask for `ChildOf` (Phase 10 gotcha).
+- Tests never start Hana (the natedev Hana ban).
+- After the checkpoint the director adds two `changes.json` entries in the state directory on natedev and the Mac: a product change (the three texts) and a measurement change (the BRP count and the record fields). The re-rank compares recovery per failure text before and after it.
+
+**Acceptance gate:** `HERDR_BIN=/nonexistent/herdr python3 scripts/production/merge_gate.py --repo . --tests-only` green; basedpyright reports zero errors and zero warnings on the five files; the four new hana_shot tests and the transcripts tests pass.
