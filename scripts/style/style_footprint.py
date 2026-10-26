@@ -35,7 +35,8 @@ PRELUDE_NAMES = frozenset({
     "drop", "bool", "char", "str", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize",
     "u8", "u16", "u32", "u64", "u128", "usize", "self", "super", "crate",
 })
-# The Rust keywords, strict and reserved in any edition: a name with one of these needs `r#`.
+# The Rust keywords, strict and reserved, of edition 2024: a name with one of these needs `r#`. `edition_keywords`
+# gives those of an older edition.
 RUST_KEYWORDS = frozenset({
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
     "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
@@ -2318,8 +2319,9 @@ ITEM_ATTRIBUTES = INERT_ATTRIBUTES | {"cfg", "test"}
 INNER_ATTRIBUTES = frozenset({"doc", "allow", "warn", "deny", "expect", "forbid"})
 # The standard derives, which expand the same in every module.
 STANDARD_DERIVES = frozenset({"Debug", "Clone", "Copy", "PartialEq", "Eq", "PartialOrd", "Ord", "Hash", "Default"})
-# The paths a standard derive can be written behind: bare, or straight from the root of `std` or `core`.
-STANDARD_DERIVE_PREFIXES = frozenset({(), ("std", "::"), ("core", "::"), ("::", "std", "::"), ("::", "core", "::")})
+# The paths a standard derive or a std macro can be written behind: bare, or straight from the root of `std` or
+# `core`.
+STANDARD_PATH_PREFIXES = frozenset({(), ("std", "::"), ("core", "::"), ("::", "std", "::"), ("::", "core", "::")})
 # The crates every glob of the standard library starts at.
 STANDARD_CRATES = frozenset({"std", "core", "alloc"})
 # The crates of the sysroot, which a path can name without a dependency.
@@ -2581,50 +2583,140 @@ def bound_standard_names(sources: RevisionTree, crate: str, names: frozenset[str
     return frozenset(found)
 
 
-# A word that can start a macro definition or an `include!`. A file without one is not read as tokens.
-MACRO_WORD = re.compile(r"\b(?:macro(?:_rules)?|include)\b")
-# The words with which a macro expansion can make a binding, or define a macro that makes one.
-BINDING_WORDS = frozenset({"use", "extern", "mod", "as", "macro", "macro_rules"})
-# The macro fragments that can carry a keyword or a whole item into an expansion. A `use` that an `expr`, a `block`
-# or another fragment carries binds only inside its block.
-KEYWORD_FRAGMENTS = frozenset({"tt", "ident", "item", "stmt", "meta", "vis"})
+# The std macros that expand to an expression or a statement and emit no item. A macro call is accepted only when
+# it calls one of these, bare or from the root of `std` or `core`.
+STD_EXPRESSION_MACROS = frozenset({
+    "println", "eprintln", "print", "eprint", "format", "format_args", "write", "writeln", "vec", "assert",
+    "assert_eq", "assert_ne", "debug_assert", "debug_assert_eq", "debug_assert_ne", "panic", "unreachable", "todo",
+    "unimplemented", "matches", "concat", "stringify", "env", "option_env",
+})
+
+
+@lru_cache(maxsize=128)
+def raw_words(text: str) -> tuple[str, ...]:
+    """The words of text as written, each with its `r#`."""
+    return tuple(token.value for token in tokens(text))
+
+
+@lru_cache(maxsize=128)
+def plain_words(text: str) -> tuple[str, ...]:
+    """The words of text, each without its `r#`."""
+    return tuple(word.removeprefix("r#") for word in raw_words(text))
+
+
+def macro_call_names(words: tuple[str, ...], keywords: frozenset[str]) -> frozenset[str]:
+    """The name of each macro call, without its `r#`: a word before `!` and an opening delimiter that is not one of
+    keywords, the keywords of the crate's edition. words keep their `r#`, and a word with `r#`, such as `r#async`, is
+    never a keyword."""
+    return frozenset(word.removeprefix("r#") for index, word in enumerate(words[:-2])
+                     if IDENTIFIER.fullmatch(word) and (word.startswith("r#") or word not in keywords)
+                     and words[index + 1] == "!" and words[index + 2] in {"(", "[", "{"})
+
+
+def use_words(words: tuple[str, ...], ends: dict[int, int]) -> frozenset[int]:
+    """The index of each word of a `use` item and of each word in the list of a `macro_use` attribute."""
+    inside: set[int] = set()
+    for index, word in enumerate(words):
+        if word == "use":
+            end = next((cursor for cursor in range(index, len(words)) if words[cursor] == ";"), len(words))
+            inside.update(range(index, end))
+        elif word == "macro_use" and index + 1 in ends:
+            inside.update(range(index + 2, ends[index + 1]))
+    return frozenset(inside)
+
+
+def opens_macro_names(words: tuple[str, ...], standard: frozenset[str]) -> bool:
+    """Whether the words of one file can bring a macro of another crate under a bare name: a `macro_use` word in any
+    attribute, inner or outer, also inside a `cfg_attr` at any depth, or a glob use whose path can start at another
+    crate. Only a glob from `crate`, `self` or `super`, or from `std`, `core` or `alloc` while standard is empty, is
+    closed, and a `*` in a use the use trees cannot read counts as open."""
+    if any("macro_use" in words[begin:end] for begin, end in attribute_spans(words)):
+        return True
+    trees = use_trees(words, item_starts(words))
+    for index, word in enumerate(words):
+        if word != "use":
+            continue
+        end = next((cursor for cursor in range(index, len(words)) if words[cursor] == ";"), len(words))
+        for star in (cursor for cursor in range(index, end) if words[cursor] == "*"):
+            head = trees.prefixes[star][:1] if star in trees.prefixes else ("",)
+            if not (head and (head[0] in PATH_ANCHORS or (head[0] in STANDARD_CRATES and not standard))):
+                return True
+    return False
+
+
+def macro_refusal(words: tuple[str, ...], names: frozenset[str],
+                  prefixes: frozenset[tuple[str, ...]]) -> str | None:
+    """Why the words of one file can bring a binding no scan reads, or None. names holds `include` and each name
+    the crate calls as a macro, and prefixes holds the paths an allowed macro call can be written behind."""
+    uses = use_words(words, delimiter_ends(words))
+    for index, word in enumerate(words):
+        following = words[index + 1:index + 2]
+        if word == "include":
+            if following == ("!",):
+                return "an include! brings code the proof cannot read"
+            return "a use or path of include! brings code the proof cannot read"
+        if word in {"macro", "macro_rules"}:
+            return "a crate macro the proof cannot read"
+        if word not in names or following == ("::",):
+            continue
+        if following != ("!",):
+            if index in uses or (index and words[index - 1] == "::"):
+                return f"a use or path of {word}! the proof cannot resolve"
+            continue
+        start = index
+        while start >= 2 and words[start - 1] == "::" and IDENTIFIER.fullmatch(words[start - 2]):
+            start -= 2
+        if start and words[start - 1] == "::":
+            start -= 1
+        if words[index + 2:index + 3] in {("(",), ("[",), ("{",)} and (
+                word not in STD_EXPRESSION_MACROS or words[start:index] not in prefixes):
+            return f"a macro call the proof cannot resolve: {word}!"
+    return None
 
 
 def refuse_binding_macros(sources: RevisionTree, crate: str, befores: Mapping[str, MoveText],
-                          afters: Mapping[str, MoveText]) -> None:
-    """Raise MoveRefused for a file of the crate, before or after the change, that defines a macro whose expansion
-    can make a binding: any `macro` item, and a `macro_rules!` whose rules hold a `use`, `extern`, `mod`, `as`,
-    `macro` or `macro_rules` token or a fragment in KEYWORD_FRAGMENTS. Such a macro can bind a name from its
-    arguments, as `use crate::$source as $alias;` does, take the keyword itself as an argument, as `$u:tt` can, or
-    emit a glob, and no other scan reads the expansion. It also refuses any `include!`, in a macro or not: the
-    proof reads only .rs files, and the included file can bind a name. `include_str!` and `include_bytes!` give only
-    data. A raw word such as `r#use` counts as its plain spelling, so the scan reads each word without its `r#`."""
-    for path in sorted(crate_files(sources, crate, ()).keys() | afters.keys()):
-        texts = (befores[path].text, afters[path].text) if path in afters else (sources.text(path),)
-        for text in texts:
-            if not MACRO_WORD.search(text):
-                continue
-            words = tuple(token.value.removeprefix("r#") for token in tokens(text))
-            for index, word in enumerate(words):
-                body = index + 3
-                if word == "include" and words[index + 1:index + 2] == ("!",):
-                    raise MoveRefused(f"{path}: an include! brings code the proof cannot read")
-                if word == "macro_rules" and words[index + 1:index + 2] == ("!",) and words[body:body + 1] in {
-                        ("{",), ("(",), ("[",)}:
-                    rules = words[body + 1:closing(words, body)]
-                    if BINDING_WORDS & set(rules) or any(
-                            rules[cursor] == "$" and rules[cursor + 2:cursor + 3] == (":",)
-                            and rules[cursor + 3:cursor + 4] in {(fragment,) for fragment in KEYWORD_FRAGMENTS}
-                            for cursor in range(len(rules))):
-                        raise MoveRefused(f"{path}: a macro that can emit a use or a module")
-                elif word == "macro":
-                    raise MoveRefused(f"{path}: a macro that can emit a use or a module")
+                          afters: Mapping[str, MoveText], standard: frozenset[str], keywords: frozenset[str]) -> None:
+    """Raise MoveRefused for a file of the crate, before or after the change, whose macros can make a binding that
+    no other scan reads. The rules form an allow list:
+
+    - Any `macro_rules!` or `macro` item refuses, and so does any `include` word: a call, a use leaf, an alias
+      source or a path segment such as `std::include`. The proof reads only .rs files, the included file can bind a
+      name, and `use std::include as splice;` lets a macro call it under another name. `include_str!` and
+      `include_bytes!` are other words.
+    - A word that the crate calls as a macro refuses in a `use` item, in a `macro_use` list or as a path leaf, as
+      `use tracing::info as log;` hides which macro `log!` calls.
+    - A macro call anywhere in the crate, a fn body too, is accepted only from STD_EXPRESSION_MACROS. In a fn
+      body `provider::imports!()` can expand to `use crate::writer::*;`, and a `match` arm such as `LIMIT => true`
+      then binds a new name after `LIMIT` moves.
+    - The call is accepted from the root of `std` or `core` only while standard is empty. standard holds each of
+      `std`, `core` and `alloc` that is a dependency key or that a file of the crate binds: with
+      `std = { package = "provider", version = "1" }`, `std::concat!()` calls a macro of `provider`.
+    - The call is accepted bare only while no file of the crate opens a bare name to another crate's macros
+      (`opens_macro_names`): with `use provider::*;`, `concat!()` can call a `concat` macro of `provider`.
+
+    A raw word such as `r#use` counts as its plain spelling, so the scan reads each word without its `r#`, but a
+    word with `r#` is never a keyword: `provider::r#async!()` is a macro call. Any other word before `!` that is not
+    one of keywords, the keywords of the crate's edition, is a macro call, so `provider::gen!()` is one before 2024.
+    A comment or a string does not count."""
+    texts = tuple((path, text) for path in sorted(crate_files(sources, crate, ()).keys() | afters.keys())
+                  for text in ((befores[path].text, afters[path].text) if path in afters else (sources.text(path),)))
+    names = frozenset({"include"}).union(*(macro_call_names(raw_words(text), keywords)
+                                           for _, text in texts if "!" in text))
+    pattern = re.compile(r"\b(?:macro(?:_rules)?|" + "|".join(sorted(map(re.escape, names))) + r")\b")
+    opened = any(opens_macro_names(plain_words(text), standard) for _, text in texts
+                 if "macro_use" in text or GLOB_USE.search(text))
+    # A bare call is accepted while no file opens a bare name, and one from `std` or `core` while standard is empty.
+    prefixes = frozenset(prefix for prefix in STANDARD_PATH_PREFIXES if not (standard if prefix else opened))
+    for path, text in texts:
+        refusal = macro_refusal(plain_words(text), names, prefixes) if pattern.search(text) else None
+        if refusal is not None:
+            raise MoveRefused(f"{path}: {refusal}")
 
 
-def refuse_old_edition(sources: RevisionTree, crate: str, manifest: dict[str, object]) -> None:
-    """Raise MoveRefused for a crate older than Rust 2018, where a path such as `use writer::*;` starts at the crate
-    root, not at an extern crate. A missing `edition` means 2015, and `edition.workspace = true` reads the edition of
-    the nearest workspace root manifest."""
+def crate_edition(sources: RevisionTree, crate: str, manifest: dict[str, object]) -> int:
+    """The crate's edition. Raise MoveRefused for a crate older than Rust 2018, where a path such as `use writer::*;`
+    starts at the crate root, not at an extern crate. A missing `edition` means 2015, and `edition.workspace = true`
+    reads the edition of the nearest workspace root manifest."""
     package = manifest.get("package")
     edition = cast(dict[str, object], package).get("edition", "2015") if isinstance(package, dict) else "2015"
     if isinstance(edition, dict) and cast(dict[str, object], edition).get("workspace") is True:
@@ -2644,6 +2736,13 @@ def refuse_old_edition(sources: RevisionTree, crate: str, manifest: dict[str, ob
                 break
     if not isinstance(edition, str) or not edition.isdigit() or int(edition) < 2018:
         raise MoveRefused(f"the crate's edition is {edition or 'unknown'}, older than 2018 or unreadable")
+    return int(edition)
+
+
+def edition_keywords(edition: int) -> frozenset[str]:
+    """The strict and reserved keywords of an edition from 2018 on: RUST_KEYWORDS, without `gen` before 2024. The weak
+    keywords, such as `union`, `macro_rules`, `raw` and `safe`, are names."""
+    return RUST_KEYWORDS if edition >= 2024 else RUST_KEYWORDS - {"gen"}
 
 
 def library_name(manifest: dict[str, object]) -> str | None:
@@ -2826,7 +2925,7 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
         raise MoveRefused("the change crosses crates")
     crate = crates.pop()
     manifest = crate_manifest(sources, crate)
-    refuse_old_edition(sources, crate, manifest)
+    edition = crate_edition(sources, crate, manifest)
     library = library_name(manifest)
     for change in changes:
         if change.status not in {FileStatus.MODIFIED, FileStatus.ADDED} or not change.path.endswith(".rs"):
@@ -2836,7 +2935,11 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
                for change in changes}
     afters = {change.path: move_text(change.path, True, change.after, modules[change.path], library)
               for change in changes}
-    refuse_binding_macros(sources, crate, befores, afters)
+    # A path from std, core or alloc, such as `std::Clone` in a derive, names the standard library only while no
+    # dependency and no file of the crate gives the name to another crate or module.
+    standard = (STANDARD_CRATES & dependency_names(manifest)
+                | bound_standard_names(sources, crate, STANDARD_CRATES, befores, afters))
+    refuse_binding_macros(sources, crate, befores, afters, standard, edition_keywords(edition))
 
     # Pair each item that leaves one file with its one copy in another.
     def keys(text: MoveText) -> Counter[tuple[str, str, tuple[str, ...]]]:
@@ -2882,12 +2985,8 @@ def proven_item_moves(changes: tuple[FileChange, ...], sources: RevisionTree) ->
     groups: dict[tuple[str, str], list[tuple[str, str, tuple[str, ...]]]] = {}
     for source, destination, key in pairs:
         groups.setdefault((source, destination), []).append(key)
-    # A path from std, core or alloc, such as `std::Clone` in a derive, names the standard library only while no
-    # dependency and no file of the crate gives the name to another crate or module.
     sides = (*(befores[path] for path in sorted(sources_of | destinations)),
              *(afters[path] for path in sorted(sources_of | destinations)))
-    standard = (STANDARD_CRATES & dependency_names(manifest)
-                | bound_standard_names(sources, crate, STANDARD_CRATES, befores, afters))
     rebound = STANDARD_CRATES & {word for text in sides for word in text.words} & standard
     # A glob's first name names another crate only while it is a dependency or a sysroot crate that no file binds.
     candidates = dependency_names(manifest) | SYSROOT_CRATES
@@ -3417,7 +3516,7 @@ def macro_attribute(words: tuple[str, ...], allowed: frozenset[str] = INERT_ATTR
         return "derive"
     for derive in " ".join(words[end + 1:-2]).split(","):
         entry = tuple(derive.split())
-        if entry and (entry[-1] not in STANDARD_DERIVES or entry[:-1] not in STANDARD_DERIVE_PREFIXES):
+        if entry and (entry[-1] not in STANDARD_DERIVES or entry[:-1] not in STANDARD_PATH_PREFIXES):
             return "".join(entry)
     return None
 
