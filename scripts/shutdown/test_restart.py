@@ -911,8 +911,8 @@ class RestartTests(ShutdownTestCase):
             settle.report_stop([self.stored_record()])
         self.assertEqual(alert.call_count, 2)
         push = cast(RenderedPush, alert.call_args.args[0])
-        self.assertEqual(push.id, "shutdown.restart_failed")
-        self.assertEqual(push.values["stopped"], "One session (moved-owner)")
+        self.assertEqual(push.id, "shutdown.move_failed")
+        self.assertEqual((push.values["session"], push.values["target"]), ("moved-owner", "claude3"))
 
     def home_cutover_evidence(self) -> None:
         configuration = accounts.accounts_config_file()
@@ -2442,10 +2442,9 @@ class RestartTests(ShutdownTestCase):
         stale: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "idle"}]
         exited: list[herdr.AgentOccupant] = [{"pane_id": "w1:p1", "agent": "claude", "agent_status": "exited"}]
         with (patch.object(herdr.Herdr, "agents", side_effect=[stale, stale, exited]) as agents,
-              patch("time.sleep") as sleep):
+              patch.object(restart, "SESSION_POLL_SECONDS", 0.0)):
             _ = restart._herdr_launch(restart._resume_parts(owner, "restart"), restart.RecordedHerdrPane("writing", "w1:p1"), owner, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(agents.call_count, 3)
-        self.assertEqual(sleep.call_count, 2)
         calls = self.herdr_calls(log)
         self.assertIn(["--session", "writing", "pane", "close", "w1:p1"], calls)
         self.assertTrue(any(row[2:4] == ["workspace", "create"] for row in calls))
