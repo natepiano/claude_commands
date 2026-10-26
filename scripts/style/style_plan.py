@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS / "production"))
 
 import berth_board
 import coverage_report
+import mechanical_classes
 from approved_renames import (AppliedCheck, ApprovedRename, Declarations, FileRename, Folder, InlineModule,
                               MissingFile, RenameNotApplied, UncertainScan, applied_check,
                               approved_rename, declaration_sites, enclosing, file_rename, inline_modules)
@@ -820,6 +821,54 @@ def worktree_check(repo: Path, finding: style_ledger.HeldFinding) -> AppliedChec
     return applied_check(finding.kind, finding.before, finding.after, finding.path, lambda path: worktree_file(repo, path))
 
 
+@dataclass(frozen=True)
+class ApprovedTicket:
+    """The findings of a proposal ticket whose decision is approved, their approved file renames, and the paths that
+    the findings and renames allow."""
+
+    findings: tuple[style_ledger.HeldFinding, ...]
+    moves: tuple[FileRename, ...]
+    allowed: frozenset[str]
+
+
+def approved_ticket(
+    ledger: style_ledger.Ledger, ticket_id: str, origin: style_ledger.ApprovedProposal,
+) -> ApprovedTicket:
+    """Read the ticket's decision; raise unless it is open, approved for the ticket's unit, and still holds the ticket's
+    filed findings. The gate and `widen` both read approval here."""
+    fields = frontmatter(origin.issue)
+    decision = Issue(origin.issue, fields)
+    answer = decision_answer(decision)
+    if not origin.finding_ids:
+        raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
+    by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
+    if any(identity not in by_id for identity in origin.finding_ids):
+        raise style_ledger.LedgerError("proposal ticket findings changed")
+    findings = tuple(by_id[identity] for identity in origin.finding_ids)
+    if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
+            or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
+            or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
+                   or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
+        raise style_ledger.LedgerError("proposal approval or filed findings changed")
+    moves = approved_file_renames(findings)
+    allowed = frozenset({finding.path for finding in findings} | {moved.new for moved in moves})
+    return ApprovedTicket(findings, moves, allowed)
+
+
+def widen(repo: Path, ticket_id: str, paths: tuple[str, ...], reason: str, by: str) -> None:
+    """Allow paths outside the findings of an approved proposal ticket, and print the ticket's widened paths."""
+    with style_ledger.open_ledger(repo) as ledger:
+
+        def allowed() -> frozenset[str]:
+            origin = ledger.ticket_origin(ticket_id)
+            if isinstance(origin, style_ledger.SelectedByCoverage):
+                raise style_ledger.LedgerError(f"{ticket_id}: only a proposal ticket widens")
+            return approved_ticket(ledger, ticket_id, origin).allowed
+
+        for widened in ledger.ticket_widen(ticket_id, paths, reason, by, allowed):
+            print(style_ledger.widened_line(widened))
+
+
 def gate(repo: Path, ticket_id: str) -> int:
     """Exit 0 when the change may commit, 1 for a review result, 2 when the gate could not run."""
     try:
@@ -834,25 +883,17 @@ def gate(repo: Path, ticket_id: str) -> int:
                 base = coverage_footprint_base(repo, ledger, origin.base)
                 result = subprocess.run([sys.executable, str(SCRIPTS / "style/style_footprint.py"), "check",
                                          "--repo", str(repo), "--base", base, "--worktree"], check=False)
-                return result.returncode if result.returncode in (0, 2) else 1
-            fields = frontmatter(origin.issue)
-            decision = Issue(origin.issue, fields)
-            answer = decision_answer(decision)
-            if not origin.finding_ids:
-                raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
-            by_id = {finding.finding_id: finding for finding in ledger.proposal_findings(origin.issue)}
-            if any(identity not in by_id for identity in origin.finding_ids):
-                raise style_ledger.LedgerError("proposal ticket findings changed")
-            findings = tuple(by_id[identity] for identity in origin.finding_ids)
-            if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
-                    or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit
-                    or any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal != origin.issue
-                           or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings)):
-                raise style_ledger.LedgerError("proposal approval or filed findings changed")
-            moves = approved_file_renames(findings)
-            allowed = {finding.path for finding in findings} | {moved.new for moved in moves}
-            outside = changed_files(repo) - allowed
+                if result.returncode != 0:
+                    return 2 if result.returncode == 2 else 1
+                return format_check(repo)
+            approved = approved_ticket(ledger, ticket_id, origin)
+            findings, moves, allowed = approved.findings, approved.moves, set(approved.allowed)
+            # A widened path is allowed as it is; the rename and move checks below do not read it.
+            outside = changed_files(repo) - allowed - set(origin.widened)
             pairs = approved_rename_pairs(findings)
+            if outside:
+                outside -= mechanical_files(repo, frozenset(PurePosixPath(finding.rule.partition(":")[2]).stem
+                                                            for finding in findings))
             if outside:
                 unique = unique_rename_mentions(repo, pairs, allowed) if pairs else frozenset[ApprovedRename]()
                 modified = modified_reference_files(repo)
@@ -877,14 +918,157 @@ def gate(repo: Path, ticket_id: str) -> int:
                 for finding in unapplied:
                     print(f"review: {finding.finding_id}: {finding.before} -> {finding.after} not applied in {finding.path}")
                 return 1
+            if format_check(repo):
+                return 1
             print("approved proposal")
             return 0
-    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun) as error:
+    except (OSError, sqlite3.Error, style_ledger.CheckCouldNotRun, style_footprint.CheckCouldNotRun,
+            mechanical_classes.ClassListError) as error:
         print(f"error: {error}")
         return 2
     except ValueError as error:
         print(f"review: {error}")
         return 1
+
+
+CARGO_FMT_CHECK = ("cargo", "+nightly", "fmt", "--all", "--check", "--verbose", "--message-format", "short",
+                   "--", "--verbose")
+RUSTFMT_CHECK = ("rustfmt", "+nightly", "--check", "--files-with-diff")
+FMT_ERROR = re.compile(r"(?im)^error\b")
+
+
+@dataclass(frozen=True)
+class CargoFormat:
+    """What one `cargo +nightly fmt --all --check` run read: every file its module walk visited, and the visited files
+    it would change. All paths are resolved."""
+
+    visited: frozenset[Path]
+    listed: frozenset[Path]
+
+
+def format_check(repo: Path) -> int:
+    """Print each changed .rs file of the worktree that is not formatted, and return 1 if there is one, else 0.
+
+    `cargo +nightly fmt --all --check` judges each changed file that its module walk visits. Each other changed file
+    (an orphan, a file in no workspace package, a file under a `mod` that rustfmt skips) goes to
+    `rustfmt +nightly --check` by name with its package's edition. Both sides compare resolved paths, and a refusal
+    names each changed path and the command that judged it. The check never writes a file, and a change with no .rs
+    file runs neither command."""
+    root = repo.resolve()
+    changed: defaultdict[Path, list[str]] = defaultdict(list)
+    for path in sorted(changed_files(repo)):
+        if path.endswith(".rs") and (repo / path).is_file():
+            target = (root / path).resolve()
+            if not target.is_relative_to(root):
+                raise style_ledger.CheckCouldNotRun(f"{path} resolves to {target}, outside the repo")
+            changed[target].append(path)
+    if not changed:
+        return 0
+    cargo = cargo_format(root)
+    by_edition: defaultdict[str, list[Path]] = defaultdict(list)
+    for target in changed:
+        if target not in cargo.visited:
+            by_edition[package_edition(root, target.relative_to(root).as_posix())].append(target)
+    named = set[Path]().union(*(files_with_diff(root, edition, targets)
+                                for edition, targets in sorted(by_edition.items())))
+    judges = (("cargo +nightly fmt", cargo.listed), ("rustfmt +nightly", named))
+    refusals = sorted((path, judge) for judge, listed in judges for target in listed & changed.keys()
+                      for path in changed[target])
+    for path, judge in refusals:
+        print(f"review: not formatted ({judge}): {path}")
+    return 1 if refusals else 0
+
+
+def format_output(command: list[str], root: Path, label: str) -> tuple[int, list[str]]:
+    """The exit code and the stdout lines of a format check run in root.
+
+    Exit 0 passes whatever stderr holds (rustup info lines, config warnings). Exit 1 lists the files with a diff; an
+    error line on stderr with it, such as a parse error, is a failure to run, and so is any other exit code."""
+    try:
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+    except OSError as error:
+        raise style_ledger.CheckCouldNotRun(f"{label} could not run: {error}") from error
+    error = FMT_ERROR.search(result.stderr) if result.returncode == 1 else None
+    if result.returncode not in (0, 1) or error:
+        detail = result.stderr[error.start():] if error else result.stderr
+        raise style_ledger.CheckCouldNotRun(f"{label} failed: "
+                                            + (detail.strip() or result.stdout.strip() or f"exit {result.returncode}"))
+    return result.returncode, [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def listed_files(code: int, lines: list[str], label: str) -> frozenset[Path]:
+    """The resolved files that a check run lists with a diff: each line that is an absolute .rs path. Every other line
+    (verbose notes, config file lines, timings) is not read. Exit 0 lists no file whatever stdout holds; exit 1 must
+    list one."""
+    if code == 0:
+        return frozenset()
+    listed = frozenset(Path(line).resolve() for line in lines if line.endswith(".rs") and Path(line).is_absolute())
+    if not listed:
+        raise style_ledger.CheckCouldNotRun(f"{label} failed: " + ("\n".join(lines) or f"exit {code}"))
+    return listed
+
+
+def cargo_format(root: Path) -> CargoFormat:
+    """The files that `cargo +nightly fmt --all --check` visits, from rustfmt's `Formatting <path>` lines, and the
+    files it lists with a diff."""
+    label = "cargo +nightly fmt --check"
+    code, lines = format_output(list(CARGO_FMT_CHECK), root, label)
+    visited = frozenset((root / line.removeprefix("Formatting ")).resolve()
+                        for line in lines if line.startswith("Formatting "))
+    return CargoFormat(visited, listed_files(code, lines, label))
+
+
+def files_with_diff(root: Path, edition: str, targets: list[Path]) -> frozenset[Path]:
+    """The resolved files that `rustfmt +nightly --check` lists for targets, read with edition."""
+    label = "rustfmt +nightly --check"
+    code, lines = format_output([*RUSTFMT_CHECK, "--edition", edition, *map(str, targets)], root, label)
+    return listed_files(code, lines, label)
+
+
+def package_edition(root: Path, path: str) -> str:
+    """The edition cargo gives the package that holds path: the nearest Cargo.toml with a `[package]` table, its
+    `edition`, the workspace's `[workspace.package]` edition under `edition.workspace = true`, else 2015."""
+    manifests: list[dict[str, object]] = []
+    for folder in (root / path).parents:
+        if not folder.is_relative_to(root):
+            break
+        if (folder / "Cargo.toml").is_file():
+            try:
+                manifests.append(tomllib.loads((folder / "Cargo.toml").read_text()))
+            except (UnicodeError, tomllib.TOMLDecodeError) as error:
+                raise style_ledger.CheckCouldNotRun(f"{folder / 'Cargo.toml'}: {error}") from error
+    for index, manifest in enumerate(manifests):
+        package = manifest.get("package")
+        if not isinstance(package, dict):
+            continue
+        edition = cast(dict[str, object], package).get("edition", "2015")
+        if isinstance(edition, dict) and cast(dict[str, object], edition).get("workspace") is True:
+            edition = workspace_edition(manifests[index:])
+        if isinstance(edition, str):
+            return edition
+        raise style_ledger.CheckCouldNotRun(f"{path}: its package has no edition that rustfmt can take")
+    raise style_ledger.CheckCouldNotRun(f"{path} is in no package, so rustfmt has no edition for it")
+
+
+def workspace_edition(manifests: list[dict[str, object]]) -> object:
+    """The `[workspace.package]` edition of the first manifest with a `[workspace]` table, or None."""
+    for manifest in manifests:
+        workspace = manifest.get("workspace")
+        if isinstance(workspace, dict):
+            shared = cast(dict[str, object], workspace).get("package")
+            return cast(dict[str, object], shared).get("edition") if isinstance(shared, dict) else None
+    return None
+
+
+def mechanical_files(repo: Path, ticket_rules: frozenset[str]) -> frozenset[str]:
+    """The changed files of the worktree that the proof of a class in `mechanical_classes.toml` explains, for a class
+    with a rule in ticket_rules (the rule names of the ticket's findings). Such a change needs no approval. A proven
+    item move gives the file each item leaves, the file it moves to, the parent file that gains the new `mod` line,
+    and each file with a re-pointed path or a use line of the move. A proven lint removal gives each file whose whole
+    edit removes stale lint names. `style_footprint.judge` must find the whole change mechanical, so the gate and judge
+    read the change the same way, and a changed file that no proof explains stays outside."""
+    changes = style_footprint.changes_between(repo, "HEAD", style_footprint.worktree_commit(repo))
+    return mechanical_classes.explained_files(changes, style_footprint.RevisionTree(repo, "HEAD"), ticket_rules)
 
 
 def synced_tip(ledger: style_ledger.Ledger) -> str:
@@ -1211,6 +1395,15 @@ def _is_two_judge_ticket(ticket: style_ledger.TicketRecord,
             and not any(_is_name_bindings_rule(pinned.rule_id) for pinned in texts))
 
 
+def mechanical_class_lines() -> list[str]:
+    """The unit's lines for the classes of `mechanical_classes.toml`: the apply rule, then one line per class."""
+    return ["Apply a finding of a mechanical class without asking only when `style_footprint.py check` finds the "
+            + "whole change mechanical. Hold it when the change adds an allow or changes code that the proof does not "
+            + "explain:",
+            *(f"- `{entry.name}` ({', '.join(f'`{rule}`' for rule in entry.rules)}): {entry.summary}"
+              for entry in mechanical_classes.classes())]
+
+
 def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.PinnedRuleText, ...], plan: Path,
                context: str, held_findings: tuple[style_ledger.HeldFinding, ...] = (),
                file_windows: Mapping[str, tuple[ReadWindow, ...]] = _NO_READ_WINDOWS,
@@ -1261,10 +1454,13 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             line += " — " + ("lines " + ", ".join(f"{window.start}-{window.end}" for window in windows)
                               if windows else "empty file")
         files.append(line)
+    # A path that `widen` added is the ticket's work too; the line names who added it and why.
+    files.extend(f"- {style_ledger.widened_line(widened)}" for widened in ticket["widened"])
     authorization = (
         f"This ticket builds the approved proposal `{ticket['proposal']}`: its approved findings are this ticket's work. "
         + "Read the issue for its sites and before/after changes. Hold every other non-mechanical finding. Package verification remains required."
-        if approved else "Every structure finding is held as a proposal. Apply only mechanical findings from other tickets."
+        if approved else "Every structure finding is held as a proposal, except a finding of a mechanical class below. "
+        + "Apply only mechanical findings from other tickets."
     )
     if approved:
         goal = (f"Apply the approved findings of `{ticket['proposal']}` in {len(ticket['files'])} "
@@ -1373,6 +1569,7 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
           + "Hold other findings: ") if approved else "Apply only mechanical fixes under ~/.claude/docs/style_production.md. Hold every other finding: ")
         + f"`style_ledger.py held add --ticket {ticket_id}` with the pinned rule blob, rule, site path, line and text, kind, before and after; "
         + "record that cell with `record --verdict held`.",
+        *mechanical_class_lines(),
         "Hold a finding only when the cited rule's text requires the change.",
         f'Record other ideas with `style_ledger.py candidate --ticket {ticket_id} --site <path>:<line> --idea "<one line>"`.',
         *record_lines,
@@ -1758,10 +1955,19 @@ def main(argv: list[str]) -> int:
     queue = sub.add_parser("queue")
     _ = queue.add_argument("--repo", type=Path, required=True)
     _ = queue.add_argument("--unit")
+    ticket_widen = sub.add_parser("widen")
+    _ = ticket_widen.add_argument("--repo", type=Path, required=True)
+    _ = ticket_widen.add_argument("--ticket", required=True)
+    _ = ticket_widen.add_argument("--files", nargs="+", required=True)
+    _ = ticket_widen.add_argument("--reason", required=True)
+    _ = ticket_widen.add_argument("--by", required=True)
     args = cast(PlanArguments, parser.parse_args(argv))
     try:
         if args.command == "gate":
             return gate(args.repo, args.ticket)
+        if args.command == "widen":
+            widen(args.repo, args.ticket, tuple(args.files), args.reason, args.by)
+            return 0
         if args.command == "queue":
             board = berth_board.read_board(args.repo)
             if isinstance(board, berth_board.BoardUnavailable):
@@ -1826,6 +2032,9 @@ class PlanArguments(argparse.Namespace):
     repo: Path = Path()
     unit: str = ""
     plan: Path = Path()
+    files: list[str] = []
+    reason: str = ""
+    by: str = ""
 
 
 if __name__ == "__main__":
