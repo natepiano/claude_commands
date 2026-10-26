@@ -1450,6 +1450,11 @@ def _inputs_hash(inputs: dict[str, TreeEntry]) -> str:
     return hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode()).hexdigest()
 
 
+def _finding_id(fields: tuple[str | int, ...]) -> str:
+    """The first 16 hex digits of SHA-256 over the fields of a held finding."""
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
 def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
     if scope == CellInputScope.CRATE and tip.crate(path) != ".":
         return _git(repo, "rev-parse", f"{tip.commit}:{tip.crate(path)}")
@@ -2430,8 +2435,20 @@ class Ledger:
             raise LedgerError(f"{rule}: {path} is outside rule reach")
         if kind not in ("rename", "type", "restructure") or line < 1:
             raise LedgerError("held finding requires a valid kind and positive line")
-        finding_id = hashlib.sha256(json.dumps((rule, path, line, text, rule_blob), separators=(",", ":")).encode()).hexdigest()[:16]
-        if not self._connection.execute("SELECT 1 FROM held_findings WHERE finding_id=?", (finding_id,)).fetchone():
+        change = (kind, before, after)
+        site = (rule, path, line, text, rule_blob)
+        # The first id names the site. When a different change holds it, the change gets the second id, which also names
+        # the change, so a call never returns a row that holds a different change.
+        finding_ids = (_finding_id(site), _finding_id((*site, *change)))
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            rows = cast(list[tuple[str, str, str, str]], self._connection.execute(
+                "SELECT finding_id,kind,before,after FROM held_findings WHERE finding_id IN (?,?)", finding_ids,
+            ).fetchall())
+            changes = {row[0]: row[1:] for row in rows}
+            same = [finding_id for finding_id in finding_ids if changes.get(finding_id) == change]
+            if same:
+                return self._held(same[0])
             # A followed finding keeps the id of its first site. A ticket that reads its new file holds the same change
             # again, so that change returns the followed finding, the one with the nearest line.
             followed = cast(list[tuple[str, int]], self._connection.execute(
@@ -2440,13 +2457,17 @@ class Ledger:
             ).fetchall())
             if followed:
                 return self._held(min(followed, key=lambda row: (abs(row[1] - line), row[0]))[0])
-        now = _now()
-        with self._connection:
+            free = [finding_id for finding_id in finding_ids if finding_id not in changes]
+            if not free:
+                raise LedgerError(f"{rule}: other changes hold both finding ids of {path}:{line}")
+            now = _now()
             _ = self._connection.execute(
-                "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'unfiled','',?,?) ON CONFLICT(finding_id) DO NOTHING",
-                (finding_id, rule, path, line, text, kind, before, after, rule_blob, ticket, now, now),
+                "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,"
+                + "proposal,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'unfiled','',?,?)",
+                (free[0], rule, path, line, text, kind, before, after, rule_blob, ticket, now, now),
             )
-        return self._held(finding_id)
+            # Every return reads its row before the commit, so a write after the commit cannot change what it returns.
+            return self._held(free[0])
 
     def _held(self, finding_id: str) -> HeldFinding:
         rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str, str, int, str, str, str, str]], self._connection.execute(
