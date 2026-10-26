@@ -18,6 +18,36 @@
 
 set -euo pipefail
 
+count_matches() {
+    local matches status
+    if matches=$(rg --count-matches --no-filename --type "$file_type" \
+        --glob '!vendor/**' --glob '!**/vendor/**' \
+        --glob '!target/**' --glob '!**/target/**' -- "$1" "$codebase"); then
+        awk '{s+=$1} END {print s+0}' <<< "$matches"
+    else
+        status=$?
+        if [[ $status -eq 1 ]]; then
+            printf '0\n'
+        else
+            return "$status"
+        fi
+    fi
+}
+
+count_patterns() {
+    counts=()
+    total=0
+    for pattern in "${patterns[@]}"; do
+        count=$(count_matches "$pattern") || return $?
+        counts+=("$count")
+        total=$((total + count))
+    done
+}
+
+json_key() {
+    python3 -c 'import json, sys; print(json.dumps(sys.argv[1]), end="")' "$1"
+}
+
 if [[ "$1" == "--verify" ]]; then
     # Verify mode - validate Pass 2 counts against Pass 1 total
     shift
@@ -47,17 +77,17 @@ if [[ "$1" == "--verify" ]]; then
     file_type="${2:-rust}"
 
     # Count all patterns
+    count_patterns
     echo "{"
     echo "  \"pass1_total\": $pass1_total,"
     echo "  \"breakdown\": {"
-    total=0
+    separator=""
     for i in "${!patterns[@]}"; do
         pattern="${patterns[$i]}"
-        count=$(rg "$pattern" --type "$file_type" "$codebase" -c 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
-        total=$((total + count))
-        echo "    \"$pattern\": $count"
-        [[ $i -lt $((${#patterns[@]} - 1)) ]] && echo "," || echo ""
+        printf '%s    %s: %s' "$separator" "$(json_key "$pattern")" "${counts[$i]}"
+        separator=$',\n'
     done
+    echo ""
     echo "  },"
     echo "  \"pass2_total\": $total,"
 
@@ -91,14 +121,11 @@ elif [[ "$1" == "--multiple" ]]; then
     codebase="$1"
     file_type="${2:-rust}"
 
+    count_patterns
     echo "{"
-    total=0
     for i in "${!patterns[@]}"; do
         pattern="${patterns[$i]}"
-        count=$(rg "$pattern" --type "$file_type" "$codebase" -c 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
-        total=$((total + count))
-        echo "  \"$pattern\": $count"
-        [[ $i -lt $((${#patterns[@]} - 1)) ]] && echo ","
+        printf '  %s: %s,\n' "$(json_key "$pattern")" "${counts[$i]}"
     done
     echo "  \"_total\": $total"
     echo "}"
@@ -108,5 +135,5 @@ else
     codebase="$2"
     file_type="${3:-rust}"
 
-    rg "$pattern" --type "$file_type" "$codebase" -c 2>/dev/null | awk -F: '{s+=$2} END {print s+0}'
+    count_matches "$pattern"
 fi
