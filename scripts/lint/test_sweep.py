@@ -450,9 +450,13 @@ class FloorTests(SweepCase):
         with self.assertRaisesRegex(AssertionError, "unexpected floor alert send"):
             _ = sweep.send_floor_alert("test", sweep.FloorAlertChannels.NATEDEV)
 
-    def hold(self, base: Path, floor: int, free: list[int], dry_run: bool = False) -> tuple[int, str]:
+    def hold(self, base: Path, floor: int, free: list[int], dry_run: bool = False,
+             scanned: int | None = None) -> tuple[int, str]:
+        """free is the free space before the sweep and after it; scanned, the free space read once
+        the caches are measured, is the first value unless given."""
+        reads = [free[0], free[0] if scanned is None else scanned, *free[1:]]
         output = io.StringIO()
-        with mock.patch.object(sweep, "free_bytes", side_effect=free), redirect_stdout(output):
+        with mock.patch.object(sweep, "free_bytes", side_effect=reads), redirect_stdout(output):
             status = sweep.hold_floor(
                 floor,
                 dry_run,
@@ -513,6 +517,49 @@ class FloorTests(SweepCase):
         self.assertEqual(send.call_args.args[1], sweep.FloorAlertChannels.NATEDEV)
         self.assertIn("stale", message)
         self.assertFalse((base / "repo" / "target" / "debug" / "deps" / f"repo-{APP}").exists())
+
+    def test_target_deleted_during_the_scan_is_no_unexplained_fall(self) -> None:
+        """natedev 2026-10-25 23:06 AST: 298.1 GiB free at the previous sweep, 293.5 GiB before the
+        scan; during the scan another process deleted 117.9 GiB of targets, and free read after it
+        was 416.1 GiB. The read from before the scan gave a 122.6 GiB fall beyond cache growth."""
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        caches = sweep.directory_blocks(str(base / "repo" / "target"))
+        deleted = int(117.9 * GIB)
+        self.prior(int(298.1 * GIB), caches + deleted, age=3 * 60)
+        with mock.patch.object(sweep, "send_floor_alert") as send:
+            status, _ = self.hold(base, 300 * GIB, [int(293.5 * GIB), int(422.6 * GIB)],
+                                  scanned=int(416.1 * GIB))
+        self.assertEqual(status, 0)
+        send.assert_not_called()
+
+    def test_fall_beyond_a_deletion_during_the_scan_still_alerts(self) -> None:
+        """The same deletion, but free read after the scan gained only 95.3 GiB of the 117.9 GiB:
+        22.6 GiB fell outside the build caches. The floor is 400 GiB, so free after the scan is still
+        under it and the sweep takes cache."""
+        base = self.base()
+        _, _ = cargo_target(base, "repo", APP, time.time() - DAY)
+        caches = sweep.directory_blocks(str(base / "repo" / "target"))
+        self.prior(int(298.1 * GIB), caches + int(117.9 * GIB), age=3 * 60)
+        with mock.patch.object(sweep, "send_floor_alert", return_value=True) as send:
+            status, _ = self.hold(base, 400 * GIB, [int(293.5 * GIB), int(400.0 * GIB)],
+                                  scanned=int(393.4 * GIB))
+        self.assertEqual(status, 0)
+        message = cast(str, send.call_args.args[0])
+        self.assertIn("free space fell more than 10 GiB beyond build-cache growth", message)
+        self.assertIn("rose 95.3 GiB while build caches shrank 117.9 GiB", message)
+
+    def test_deletion_during_the_scan_that_lifts_free_above_the_floor_takes_nothing(self) -> None:
+        """natedev 2026-10-25 23:06 AST: 293.5 GiB free before the scan, about 416 GiB after it;
+        the shortfall from the first read took 6.5 GiB of cache."""
+        base = self.base()
+        _, output_file = cargo_target(base, "repo", APP, time.time() - DAY)
+        status, output = self.hold(base, 300 * GIB, [int(293.5 * GIB), int(416.1 * GIB)],
+                                   scanned=int(416.1 * GIB))
+        self.assertEqual(status, 0)
+        self.assertTrue(output_file.exists())
+        self.assertIn("416.1 GiB free after the scan, not under the 300.0 GiB floor; nothing taken", output)
+        self.assertNotIn("the floor took", output)
 
     def test_busy_and_ci_growth_count_as_build_caches(self) -> None:
         base = self.base()
