@@ -1502,19 +1502,27 @@ def hold_floor(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
             + f" target dirs ({gib(total)}), {len(busy)} left alone while a build or test run uses them"
         )
-        budget = total - (floor - free)
-        ordered_at = time.time()
-        left, failures, chosen = shrink(
-            scan,
-            total,
-            budget,
-            dry_run,
-            lambda group: (
-                0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
-                target_uses[tree_targets[group.build_tree]],
-                *unit_age(group, ordered_at),
-            ),
-        )
+        # The shortfall comes from the read after the scan too: on 2026-10-25 the read from before it
+        # took 6.5 GiB of cache while another process had lifted free from 293.5 to 416 GiB.
+        budget = total - max(0, floor - scanned_free)
+        left, failures = total, 0
+        chosen: list[tuple[Group, int]] = []
+        if scanned_free < floor:
+            ordered_at = time.time()
+            left, failures, chosen = shrink(
+                scan,
+                total,
+                budget,
+                dry_run,
+                lambda group: (
+                    0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
+                    target_uses[tree_targets[group.build_tree]],
+                    *unit_age(group, ordered_at),
+                ),
+            )
+        else:
+            print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
+                  + " nothing taken")
         taken: dict[str, int] = {}
         for group, freed in chosen:
             root = tree_targets[group.build_tree]
