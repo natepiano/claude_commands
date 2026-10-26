@@ -440,6 +440,7 @@ class AddUnitTests(ShutdownTestCase):
         _ = parser.add_argument("--permanent", action="store_true")
         _ = parser.add_argument("--check", action="store_true")
         _ = parser.add_argument("--probe", action="store_true")
+        _ = parser.add_argument("--source-fallback", action="store_true")
         _ = parser.add_argument("--timeout", type=float, default=90)
         parsed = parser.parse_args(args)
         parsed.production = str(self.doc)
@@ -1951,6 +1952,59 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.servers_started(), [])
         self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
+
+    def test_recorded_source_fallback_uses_add_unit_in_the_shared_host(self) -> None:
+        from test_restart import entry, unit
+        import record
+
+        self.commit_prepared_row(self.unit_row())
+        directory = self.prepare_unit_account("claude1")
+        _ = self.prepare_unit_account("claude2")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume on the source after the target refused.", encoding="utf-8")
+        saved = entry(unit("session-123"))
+        saved.update(target="claude1", source_label="claude1")
+        flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
+                 "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
+                 "--account", "claude1")
+        with (patch.object(record, "all_session_records", return_value=[saved]),
+              patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
+              patch.object(herdr, "shared_session", return_value="shared-herdr"),
+              patch.object(herdr, "start_server") as start,
+              patch.object(herdr, "start_new_server", side_effect=AssertionError("exclusive shared server start")),
+              patch.object(herdr, "open_tab", return_value="w1:p1") as tab,
+              patch.object(herdr, "start_agent", return_value=SUBMITTED_PROMPT) as agent):
+            refused = self.cli(*flags)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("units account is claude2", refused.stderr)
+            _ = self.successful(*flags, "--source-fallback")
+        start.assert_called_once_with("shared-herdr", 90_000)
+        environment = cast(dict[str, str], tab.call_args.args[4])
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(directory))
+        self.assertEqual(environment["SHOWRUNNER_UNIT_ID"], "alpha-unit")
+        self.assertEqual(environment["SHOWRUNNER_UNIT"], "build-followups")
+        agent.assert_called_once()
+        self.assertEqual(agent.call_args.args[:2], ("shared-herdr", "w1:p1"))
+
+    def test_source_fallback_requires_a_restore_of_its_recorded_source(self) -> None:
+        import record
+
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume.", encoding="utf-8")
+        with (patch.object(record, "all_session_records", return_value=[]),
+              patch.object(herdr, "start_agent", side_effect=AssertionError("invalid fallback launched"))):
+            new = self.cli("alpha", "--plan", "docs/plans/given.md", "--source-fallback", "--account", "claude2")
+            self.assertEqual(new.returncode, 2)
+            self.assertIn("requires a recorded unit restore", new.stderr)
+            restore = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
+                "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
+                "--account", "claude2", "--source-fallback")
+            self.assertEqual(restore.returncode, 2)
+            self.assertIn("must name the shutdown record's source account", restore.stderr)
 
     def test_unit_resume_uses_configured_account_instead_of_recorded_account(self) -> None:
         """F004: the configured units account decides resumes too."""

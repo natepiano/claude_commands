@@ -880,12 +880,25 @@ def record(request: UnitLaunch) -> None:
         _ = log.write(f"- {stamp}: {log_line}\n")
 
 
-def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
-    """New, standby and resumed work all use the configured units account."""
+def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "",
+                       *, source_fallback: bool = False) -> ClaudeLaunchAccount:
+    """Use the units account, or the recorded source for a failed move."""
     from scripts.accounts import accounts
     try:
+        if source_fallback:
+            from record import all_session_records
+
+            if not isinstance(request.launch_kind, UnitRestoreLaunch):
+                raise Refusal("--source-fallback requires a recorded unit restore")
+            identity = request.launch_kind.session_id
+            matches = [saved for saved in all_session_records()
+                       if saved["session"]["session_id"] == identity
+                       and saved["session"]["kind"] == "unit" and saved.get("target") == target
+                       and saved.get("source_label", saved["label"]) == target]
+            if len(matches) != 1:
+                raise Refusal("--source-fallback must name the shutdown record's source account")
         return accounts.account_for_group_launch("unit", resume=isinstance(request.session, ResumedSession),
-                                                 target=target, config_dir=config_dir)
+                                                 target=target, config_dir=config_dir, source_fallback=source_fallback)
     except accounts.AccountsError as error:
         raise Refusal(str(error)) from error
 
@@ -1007,6 +1020,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--timeout", type=float, default=90.0)
     _ = parser.add_argument("--resume")
     _ = parser.add_argument("--account", default="")
+    _ = parser.add_argument("--source-fallback", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--model", default="")
     _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
@@ -1029,7 +1043,8 @@ def main(argv: list[str]) -> int:
         # Table readers import this module from copied trees without accounts.
         from scripts.accounts import accounts
 
-        unit_account = account_for_launch(request, cast(str, args.account), cast(str, args.config_dir))
+        unit_account = account_for_launch(request, cast(str, args.account), cast(str, args.config_dir),
+                                          source_fallback=cast(bool, args.source_fallback))
         problems = accounts.check(unit_account.label)
         if problems:
             raise Refusal(
