@@ -47,7 +47,7 @@ The stages pass data through files in the state directory, so each command can r
 
 ### Phase table
 
-- `phases(state_dir, runs_dir, roster, registry_dir) -> PhaseReport` writes `phases.json` (`{phases, comparisons, drops}`). It reads `~/.local/state/plan-delegate/runs/*.jsonl`; `run_started.main_agent.session_id` picks the director (ids from `session_states`, then roster, then registry). Each completed phase (`phase_started` paired with a `phase_finished` of status `completed`) takes every request of that director with `started <= at < ended`, unfiltered; `phase_arm` names it `opus`, `sonnet` or `mixed` from the requests' models.
+- `phases(state_dir, runs_dir, roster, registry_dir) -> PhaseReport` writes `phases.json` (`{phases, comparisons, drops}`). It reads `<history root>/runs/*.jsonl` (`unit_runs.history_root()`); `run_started.main_agent.session_id` picks the director (ids from `session_states`, then roster, then registry). Each completed phase (`phase_started` paired with a `phase_finished` of status `completed`) takes every request of that director with `started <= at < ended`, unfiltered; `phase_arm` names it `opus`, `sonnet` or `mixed` from the requests' models.
 - `PhaseRow` carries `requests`, `director_seconds`, `cost_usd`, `output_tokens`, `repair_rounds` (the highest `round` of the phase's `finding_batch_dispatched` events), `phase_elapsed_seconds`, the recorded size `work_order_words`, and per-1,000-word rates `requests_per_1000_words`, `seconds_per_1000_words`, `cost_per_1000_words`. A size is null when unrecorded or invalid; a recorded 0 stays 0; rates are null for a null or 0 size.
 - `comparisons` has one entry per roster director with `switched_by_pdt` set, then `Pooled switched`. Four metrics (the three rates and `repair_rounds`) each map to Sonnet minus Opus medians. With 8 or more phases per arm the interval comes from `bootstrap_diff` and the label is `fewer`, `more` or `no measurable difference`; otherwise `too few phases (n=<a> against <b>)` with null value and bounds. Rate metrics skip rows with null rates, so their n is smaller than the `repair_rounds` n.
 - `drops` is `{stopped, errored, empty}`: finish status `stopped`; any status other than `completed` or `stopped`; completed phases with no request of the director.
@@ -64,7 +64,7 @@ The stages pass data through files in the state directory, so each command can r
 
 ### Commands
 
-`python3 scripts/model_study/model_study.py <subcommand>`. Path flags default as follows: `--state-dir` is `MODEL_STUDY_STATE`, else `~/.local/state/model-study`; `--projects-dir` `~/.claude/projects`; `--registry-dir` `~/.claude/sessions`; `--runs-dir` `~/.local/state/plan-delegate/runs`; `--roster` `scripts/model_study/roster.json`. `--now <ISO time>` (a naive time reads as PDT) replaces the wall clock everywhere: `extracted`, the history `at`, the report title, the deadline test.
+`python3 scripts/model_study/model_study.py <subcommand>`. Path flags default as follows: `--state-dir` is `MODEL_STUDY_STATE`, else `~/.local/state/model-study`; `--projects-dir` `~/.claude/projects`; `--registry-dir` `~/.claude/sessions`; `--runs-dir` `<history root>/runs`; `--roster` `scripts/model_study/roster.json`. `--now <ISO time>` (a naive time reads as PDT) replaces the wall clock everywhere: `extracted`, the history `at`, the report title, the deadline test.
 
 | Subcommand | Flags | Does |
 | --- | --- | --- |

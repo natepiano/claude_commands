@@ -23,6 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import send
+import rca
 import review
 import push_texts
 import postmaster
@@ -124,6 +125,10 @@ class SendTests(ShutdownTestCase):
         self.root: Path = Path()
         self.relayed: list[send.Message] = []
         self.outcome: send.Result = send.Result("sent", "ok")
+        self.cases: list[rca.Report] = []
+        # What the fake push review gives; None approves the draft. Each review's draft and time limit.
+        self.verdict: review.ReviewOutcome | None = None
+        self.reviews: list[tuple[review.Draft, float]] = []
 
     @override
     def setUp(self) -> None:
@@ -131,6 +136,10 @@ class SendTests(ShutdownTestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        # No test opens a real rca.py case: it would write the machine's cases and message its owner.
+        _ = self.enterContext(mock.patch.object(rca, "open_case", self.open_case))
+        # No test runs the real push review (claude -p): an auto_mode.refused send reviews its waits sentence.
+        _ = self.enterContext(mock.patch.object(review, "review", side_effect=self.review))
         for name, value in (("STATE", self.root), ("SESSIONS", self.root / "sessions"), ("relay", self.relay)):
             patcher = mock.patch.object(send, name, value)
             _ = patcher.start()
@@ -170,10 +179,20 @@ class SendTests(ShutdownTestCase):
             "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
             "messagingSocketPath": str(path), "updatedAt": 1}))
 
+    def open_case(self, report: rca.Report, at: object = None) -> str:
+        del at
+        self.cases.append(report)
+        return "rca: opened 261023-1"
+
     def relay(self, message: send.Message, timeout: float) -> send.Result:
         del timeout
         self.relayed.append(message)
         return self.outcome
+
+    def review(self, draft: review.Draft, revision: bool, *, limit: float = 0) -> review.ReviewOutcome:
+        del revision
+        self.reviews.append((draft, limit))
+        return self.verdict or review.Approved(draft)
 
     def send(self, *args: str) -> send.Result:
         return send.send(local_options(["--to", "bogus", "--from", "test", *args]))
@@ -606,6 +625,32 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("keep same address", same_address)
         self.assertIn("keep other address", send.pending("two"))
 
+    def test_retire_to_user_cancels_the_emergency_push_for_the_key(self) -> None:
+        cases = (((0, "pushover: cancelled 1\n", ""), 0, "cancelled: the emergency push for prompt-1 stopped"),
+                 ((0, "pushover: nothing to cancel\n", ""), 0,
+                  "nothing to cancel: no emergency push for prompt-1 is repeating"),
+                 ((1, "", "pushover: could not reach Pushover: timed out\n"), 3,
+                  "FAILED: the emergency push for prompt-1 may still repeat: pushover: could not reach Pushover: timed out"))
+        # A push kept during silence with the key goes too, so it never goes out when silence ends.
+        kept = {"source": "stall_watch", "priority": "2", "title": "t", "message": "m", "detail": "", "key": "prompt-1"}
+        (self.root / "notify").mkdir()
+        _ = (self.root / "notify/silence-kept.jsonl").write_text(json.dumps(kept) + "\n"
+                                                                 + json.dumps(kept | {"key": "prompt-2"}) + "\n")
+        for (response, expected, line), dropped in zip(cases, ("1 kept push", "0 kept pushes", "0 kept pushes")):
+            with (self.subTest(line=line), mock.patch.object(send, "run", return_value=response) as run,
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["retire", "--to", "user", "--from", "stall_watch", "--key", "prompt-1"])
+            self.assertEqual(code, expected)
+            self.assertEqual(output.getvalue(), f"retired 0 queued messages\ndropped {dropped}\n{line}\n")
+            self.assertEqual(cast(list[str], run.call_args.args[0])[1:],
+                             [str(send.USER_CHANNEL), "cancel", "--source", "stall_watch", "prompt-1"])
+        self.assertIn('"key": "prompt-2"', (self.root / "notify/silence-kept.jsonl").read_text())
+
+    def test_registry_argv_key_reaches_the_user_send(self) -> None:
+        rendered = push_texts.render("nixos.ups_shutdown")
+        options = send.parse(push_texts.user_send_argv(rendered, key="ups-shutdown")[2:])
+        self.assertEqual((options.key, options.need), ("ups-shutdown", "blocked"))
+
     def test_keyed_shutdown_result_survives_restart_retire_and_replaces_older_result(
         self,
     ) -> None:
@@ -966,7 +1011,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_unreadable_roster_keeps_bare_claude_fallback_but_worker_address_fails(
         self,
     ) -> None:
-        unavailable = roster.Roster([], ["cannot read the delegate root"])
+        unavailable = roster.Roster([], ["cannot read the worker root"])
         bare_errors = io.StringIO()
         with (
             mock.patch.object(roster, "roster", return_value=unavailable),
@@ -980,7 +1025,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(len(self.relayed), 1)
         self.assertEqual(
             bare_errors.getvalue(),
-            "send.py: roster: cannot read the delegate root\n",
+            "send.py: roster: cannot read the worker root\n",
         )
 
         worker_errors = io.StringIO()
@@ -995,7 +1040,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ])
 
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn("send.py: roster: cannot read the delegate root", worker_errors.getvalue())
+        self.assertIn("send.py: roster: cannot read the worker root", worker_errors.getvalue())
         self.assertIn("worker:missing/worker", worker_errors.getvalue())
         codex_send.assert_not_called()
 
@@ -1115,7 +1160,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertGreaterEqual(help_text.count(recipient_form), 2)
 
     def test_codex_failure_is_failed_not_queued(self) -> None:
-        with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no delegate named 'bogus'")):
+        with mock.patch.object(send, "run", return_value=(1, "", "codex_mesh: no worker named 'bogus'")):
             result = self.send("--codex", "--session-dir", str(self.root), "--text", "hi")
         self.assertEqual(result.outcome, "failed")
         self.assertEqual(send.pending("bogus"), "")
@@ -1205,6 +1250,13 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             send.template_fix_notice(record)
             launch.assert_called_once()
 
+    def test_a_user_specified_template_gets_no_fix_notice(self) -> None:
+        record: dict[str, object] = {"text_id": "nate.adhoc", "title": "natedev it is ready", "body": "It is ready.\n\nadhoc",
+                                     "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
+        with mock.patch.object(subprocess, "Popen") as launch:
+            send.template_fix_notice(record)
+            launch.assert_not_called()
+
     def test_template_fix_launch_failure_does_not_change_a_successful_registry_delivery(self) -> None:
         record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "action": "Choose retry.", "body": "The work stopped.", "failed_rules": ["reader-starts-cold"], "sent_despite_failed_review": True}
         message = send.Message("user", "script", "Choose an account", "The work stopped.", None)
@@ -1213,6 +1265,18 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             result = send.user(message, "decision", ActionRequired("Choose retry."), 145, text_id="quota")
         self.assertEqual(result.outcome, "sent")
         self.assertIn("session unavailable", (self.root / "notify/template-fix-errors.jsonl").read_text())
+
+    def test_user_passes_the_key_to_the_channel_in_both_forms(self) -> None:
+        for key, text_id in ((None, ""), ("subject", ""), ("subject", "quota")):
+            message = send.Message("user", "hana", "Build done", "The build passed.", key)
+            with mock.patch.object(send, "run", return_value=(0, "", "")) as run:
+                _ = send.user(message, "note", NoActionRequired(), 145, text_id=text_id)
+            command = cast(list[str], run.call_args.args[0])
+            if key is None:
+                self.assertNotIn("--key", command)
+            else:
+                self.assertEqual(command[command.index("--key") + 1], key)
+                self.assertLess(command.index("--key"), command.index("--text-id" if text_id else "--no-action"))
 
     def test_busy_notice_claim_does_not_wait_or_change_successful_push_delivery(self) -> None:
         record: dict[str, object] = {"text_id": "quota", "sent_despite_failed_review": True}
@@ -1359,6 +1423,330 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def failure_marker(self) -> Path:
         return self.root / "notify/failed/writer-id.json"
 
+    def auto_mode_arguments(self, *extra: str, commands: tuple[str, ...] = ("implement.sh --to modules-impl",
+                            "review.sh --to modules-test"), **changed: str) -> list[str]:
+        values = {"session": "modules", "machine": "natedev", "waits": "The P542 build waits for them"} | changed
+        return ["--to", "user", "--text-id", "auto_mode.refused",
+                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")),
+                *(item for command in commands for item in ("--value", f"command={command}")), *extra]
+
+    def test_auto_mode_template_takes_its_sender_from_this_session_and_shows_each_refused_command(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-style"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options(self.auto_mode_arguments())
+        self.assertEqual(options.summary, "cargo-liner-style: auto mode stopped modules")
+        self.assertEqual(options.sender, "cargo-liner-style")
+        self.assertEqual(options.need, "decision")
+        self.assertIn("sender=cargo-liner-style", options.values)
+        self.assertIn("rule_line=", options.values)
+        self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n"
+                      + "implement.sh --to modules-impl\nreview.sh --to modules-test\n\n"
+                      + "Approve: the work goes on now, and auto mode can stop it on these commands again.", options.text or "")
+        self.assertTrue((options.text or "").endswith("Allow rule: the work goes on now, and auto mode lets these commands run from then on."))
+        one = local_options(self.auto_mode_arguments(commands=("git push origin build-followups-messaging",),
+                                                     waits="The merge waits for it.", rule="Bash(git push:*)"))
+        self.assertIn("Auto mode refused a shell command in the modules session. The merge waits for it.\n"
+                      + "git push origin build-followups-messaging\n\n"
+                      + "Approve: the work goes on now, and auto mode can stop it on this command again.", one.text or "")
+        self.assertTrue((one.text or "").endswith("lets this command run from then on. The rule: Bash(git push:*)"))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "auto_mode.refused")
+        self.assertIn("sender=cargo-liner-style", command)
+        for arguments in (self.auto_mode_arguments("--value", "sender=someone"), self.auto_mode_arguments("--from", "someone"),
+                          self.auto_mode_arguments("--machine", "mac"), self.auto_mode_arguments(commands=()),
+                          self.auto_mode_arguments(commands=("implement.sh", " ")), self.auto_mode_arguments(count="2"),
+                          self.auto_mode_arguments(does="dispatch the writer"), self.auto_mode_arguments(colour="red"),
+                          self.auto_mode_arguments("--value", "waits=twice")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.parse(arguments)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = send.parse(["--here", *self.auto_mode_arguments()])
+        self.assertIn("no session record", errors.getvalue())
+
+    def test_an_auto_mode_push_that_is_sent_or_kept_opens_a_case_for_the_stopped_session(self) -> None:
+        self.writer_session()
+        long = "cargo test --workspace --all-features " + "b" * 60
+        options = local_options(self.auto_mode_arguments(commands=("implement.sh --to modules-impl", long)))
+        replies = {"sent": (0, "pushover: sent\n", ""), "kept": (0, "pushover: kept: silence is on\n", ""),
+                   "held": (4, "", "pushover: held\n"), "failed": (1, "", "pushover: unreachable\n")}
+        for outcome, reply in replies.items():
+            self.cases.clear()
+            with self.subTest(outcome=outcome), mock.patch.object(send, "run", return_value=reply):
+                self.assertEqual(send.send(options).outcome, outcome)
+                # The case names the stopped session, not the sender, and each command in full.
+                expected = [rca.Report("modules", "natedev", "auto_mode", ("implement.sh --to modules-impl", long),
+                                       waits="The P542 build waits for them", source="Build writer",
+                                       key=send.auto_mode_key("modules", ("implement.sh --to modules-impl", long)))]
+                self.assertEqual(self.cases, expected if outcome in ("sent", "kept") else [])
+        self.cases.clear()
+        with mock.patch.object(send, "run", return_value=replies["sent"]):
+            self.assertEqual(send.send(local_options(self.needs_go_arguments())).outcome, "sent")
+        self.assertEqual(self.cases, [])
+
+    def test_the_rca_pushes_are_not_held_as_a_free_text_auto_mode_refusal(self) -> None:
+        values = {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
+                  "stop": "auto mode refused a shell command", "cause": "a helper ran a build command that needs your permission",
+                  "fix": "helpers use the build command that is always allowed"}
+        rendered = push_texts.render(rca.FIXED_TEXT, **values)
+        self.assertTrue(send.reports_auto_mode_refusal(rendered.title + "\n" + rendered.body))
+        for text_id in (rca.STARTED_TEXT, rca.FIXED_TEXT, rca.REWRITTEN_TEXT):
+            with self.subTest(text_id=text_id):
+                options = local_options(["--to", "user", "--summary", rendered.title, "--no-action", "--text", rendered.body])
+                self.assertEqual(send.wrong_template(options._replace(text_id=text_id), rendered.body), None)
+                self.assertEqual(send.wrong_template(options, rendered.body), send.AUTO_MODE_HELD)
+
+    def test_auto_mode_cuts_a_long_refused_command_to_90_characters(self) -> None:
+        self.writer_session()
+        exact, long = "a" * 90, "cargo test --workspace --all-features " + "b" * 60
+        options = local_options(self.auto_mode_arguments(commands=(exact, long)))
+        self.assertIn(f"The P542 build waits for them.\n{exact}\n{long[:89]}…\n\nApprove", options.text or "")
+
+    def test_auto_mode_waits_says_what_waits_and_gives_no_instruction(self) -> None:
+        self.writer_session()
+        # The tile push that reached the phone: its waits gave a second action in a second session.
+        tile = "Type ! kill -TERM -3137969 -3138422 in the cargo-liner session."
+        for waits in (tile, "The build waits; type: /resume", "The merge waits in the cargo-liner pane"):
+            with self.subTest(waits=waits), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = send.parse(self.auto_mode_arguments(session="tile", commands=("cargo test -p tile",), waits=waits))
+            self.assertIn("waits says only what waits", errors.getvalue())
+        options = local_options(self.auto_mode_arguments(waits="The merge waits for them.."))
+        self.assertIn(" in the modules session. The merge waits for them.\nimplement.sh", options.text or "")
+
+    def test_auto_mode_keeps_its_waits_sentence_only_when_the_review_approves_it_within_30_seconds(self) -> None:
+        self.writer_session()
+        options = local_options(self.auto_mode_arguments())
+        withheld = review.Withheld(review.Draft("s", "1", "t", NoActionRequired(), "b", False), "asks for nothing")
+        for verdict, kept in ((None, True), (review.Unreviewed("timeout"), False), (review.Unreviewed("review unavailable"), False),
+                              (review.Failed(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
+                              (review.Rewritten(review.Draft("s", "1", "t", NoActionRequired(), "b", False), ["plain-words"]), False),
+                              (withheld, False)):
+            self.verdict, self.reviews, self.cases = verdict, [], []
+            with (self.subTest(verdict=verdict), mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run,
+                  redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.send(options).outcome, "sent")
+            # The review reads the whole alert with its waits sentence, and holds it back at most 30 s.
+            [(draft, limit)] = self.reviews
+            self.assertEqual(limit, send.WAITS_REVIEW_SECONDS)
+            self.assertEqual(send.WAITS_REVIEW_SECONDS, 30)
+            self.assertIn("Auto mode refused 2 shell commands in the modules session. The P542 build waits for them.\n", draft.body)
+            pushed = cast(list[str], run.call_args.args[0])
+            self.assertIn("waits_line= The P542 build waits for them." if kept else "waits_line=", pushed)
+            text = cast(str, self.log()[-1]["text"])
+            self.assertIn("in the modules session. The P542 build waits for them.\nimplement.sh" if kept else
+                          "Auto mode refused 2 shell commands in the modules session.\nimplement.sh", text)
+            self.assertEqual(self.cases[0].waits, "The P542 build waits for them" if kept else "")
+            self.assertEqual("goes without its waits sentence" in errors.getvalue(), not kept)
+        # With the review off, or no waits sentence, nothing is reviewed.
+        self.verdict, self.reviews = None, []
+        (self.root / "notify").mkdir(exist_ok=True)
+        _ = (self.root / "notify/review_off").write_text("")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(options).outcome, "sent")
+        self.assertEqual(self.reviews, [])
+
+    def test_auto_mode_goes_with_one_key_per_session_and_set_of_commands_unless_the_session_gives_one(self) -> None:
+        self.writer_session()
+        key = local_options(self.auto_mode_arguments()).key
+        self.assertEqual(key, send.auto_mode_key("modules", ("implement.sh --to modules-impl", "review.sh --to modules-test")))
+        assert key is not None
+        self.assertRegex(key, r"^auto-mode:modules:[0-9a-f]{12}$")
+        swapped = local_options(self.auto_mode_arguments(commands=("review.sh  --to modules-test", "implement.sh --to modules-impl")))
+        self.assertEqual(swapped.key, key)
+        self.assertNotEqual(local_options(self.auto_mode_arguments(session="tile")).key, key)
+        self.assertEqual(local_options([*self.auto_mode_arguments(), "--key", "auto"]).key, "auto")
+
+    def test_a_registered_value_that_gives_a_second_action_is_refused(self) -> None:
+        self.writer_session()
+        arguments = self.needs_go_arguments(does="removes it; then type /resume in the cargo-liner session")
+        with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = send.parse(arguments)
+        self.assertIn('session.needs_go gives a second action: the body says to type "/resume"', errors.getvalue())
+        self.assertIn("the body names the cargo-liner pane or session", errors.getvalue())
+
+    def test_only_auto_mode_takes_a_repeated_command_value(self) -> None:
+        for arguments in (["--to", "user", "--text-id", "nate.adhoc", "--value", "command=a", "--value", "command=b"],
+                          self.needs_go_arguments("--value", "command=a", "--value", "command=b")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = send.parse(arguments)
+            self.assertIn("--value needs distinct key=value pairs", errors.getvalue())
+
+    def test_sender_and_session_values_lose_the_unit_suffix_but_free_text_keeps_per_unit(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "cargo-liner-unit"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options(self.auto_mode_arguments(session="types-unit", commands=("save_counts.py --per-unit",),
+                                                         waits="The trunk-unit plan waits for it"))
+        self.assertEqual(options.summary, "cargo-liner: auto mode stopped types")
+        self.assertEqual(options.sender, "cargo-liner")
+        self.assertEqual(options.action, ActionRequired("On natedev, in the types pane, approve the prompt or add an allow rule"))
+        self.assertIn("Auto mode refused a shell command in the types session. The trunk-unit plan waits for it.\n"
+                      + "save_counts.py --per-unit", options.text or "")
+
+    def test_a_free_text_auto_mode_refusal_is_held_with_the_template_call(self) -> None:
+        self.writer_session()
+        for title, text in (("types: auto mode stopped", "It waits."), ("Build stopped", "Auto-mode DENIED two commands in types.")):
+            with (self.subTest(title=title), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                                  "--action", "Approve in the types pane", "--key", "auto", "--repeat-minutes", "30",
+                                  "--text", text])
+            self.assertEqual(code, 4)
+            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push reports an auto-mode refusal."))
+            self.assertIn("--text-id auto_mode.refused --value session=<session>", output.getvalue())
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "held")
+        # The hold claims no repeat window: the resend with the template goes out.
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "types"}))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options([*self.auto_mode_arguments(), "--key", "auto", "--repeat-minutes", "30"])).outcome, "sent")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options(self.user_arguments("--key", "plain"))).outcome, "sent")
+
+    def test_help_lists_the_auto_mode_template_and_when_to_use_it(self) -> None:
+        with redirect_stdout(io.StringIO()) as output, self.assertRaises(SystemExit):
+            _ = send.parse(["--help"])
+        self.assertIn("auto_mode.refused: auto mode refused a command and the session waits for the user.", output.getvalue())
+        self.assertIn("quota.paid_credits: an account now spends paid credits; a script with no Claude session names itself with --from.", output.getvalue())
+        self.assertIn("quota.paid_credits_queued: an account now spends paid credits and the user queued a workers move;", output.getvalue())
+        self.assertIn("session.needs_go: a session is stopped until the user types a go in its pane.", output.getvalue())
+        self.assertIn("permission.rca_started: a unit starts to fix why a session stopped for a permission. Sent by"
+                      + f" rca.py start; sessions run rca.py, not this: {rca.CALL} start <id> --owner <unit>", output.getvalue())
+        self.assertIn("permission.rca_fixed: the fix merged and the session does not stop for that permission again."
+                      + f" Sent by rca.py fixed; sessions run rca.py, not this: {rca.CALL} fixed <id>", output.getvalue())
+
+    def needs_go_arguments(self, *extra: str, **changed: str) -> list[str]:
+        values = {"session": "trunk", "machine": "natedev", "go": "Go: remove arrange_jacks/ from phases/130/files; 140 owns it",
+                  "why": "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.",
+                  "does": "removes it from step 130, and trunk goes on"} | changed
+        return ["--to", "user", "--text-id", "session.needs_go",
+                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")), *extra]
+
+    def test_needs_go_template_takes_its_sender_from_this_session(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options(self.needs_go_arguments())
+        self.assertEqual(options.summary, "natedev: trunk waits for your go")
+        self.assertEqual(options.sender, "natedev")
+        self.assertEqual(options.need, "decision")
+        self.assertEqual(options.action, ActionRequired(
+            "On natedev, in the trunk pane, type: Go: remove arrange_jacks/ from phases/130/files; 140 owns it"))
+        # The template gives why its period: a period in the value is not doubled.
+        self.assertEqual(options.text, "Session: trunk\n"
+                         + "Steps 130 and 140 both claim the arrange_jacks folder, and your permission check refused the fix.\n"
+                         + "Your go removes it from step 130, and trunk goes on.")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "session.needs_go")
+        self.assertIn("sender=natedev", command)
+        for arguments in (self.needs_go_arguments("--value", "sender=someone"), self.needs_go_arguments("--from", "someone"),
+                          self.needs_go_arguments("--machine", "mac"), self.needs_go_arguments(colour="red")):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.parse(arguments)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}), redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+            _ = send.parse(["--here", *self.needs_go_arguments()])
+        self.assertIn("no session record", errors.getvalue())
+
+    def test_a_free_text_push_that_asks_for_a_go_is_held_with_the_template_call(self) -> None:
+        self.writer_session()
+        for title, text, action in (("trunk waits", "Steps 130 and 140 clash.", "In the trunk pane, type: Go: remove arrange_jacks/"),
+                                    ("trunk stopped", "It does no work until you type the go.", "Answer in the trunk pane"),
+                                    ("trunk waits for your go", "Steps 130 and 140 clash.", "Answer in the trunk pane")):
+            with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                                  "--action", action, "--key", "go", "--repeat-minutes", "30", "--text", text])
+            self.assertEqual(code, 4)
+            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push asks the user to type a go."))
+            self.assertIn("--text-id session.needs_go --value session=<session> --value machine=<machine>", output.getvalue())
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "held")
+        # The hold claims no repeat window: the resend with the template goes out.
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options([*self.needs_go_arguments(), "--key", "go", "--repeat-minutes", "30"])).outcome,
+                             "sent")
+
+    def paid_credits_arguments(self, *extra: str) -> list[str]:
+        values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 EDT",
+                  "next_reset": "Sat 10-24 16:40 EDT"}
+        return ["--to", "user", "--text-id", "quota.paid_credits",
+                *(item for key, value in values.items() for item in ("--value", f"{key}={value}")), *extra]
+
+    def test_paid_credits_template_takes_its_sender_from_this_session_else_the_script_name(self) -> None:
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        # The session record wins over a name the caller gives.
+        options = local_options(self.paid_credits_arguments("--value", "sender=quota_alert"))
+        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.need, "decision")
+        self.assertIn("sender=natedev", options.values)
+        self.assertEqual(options.action, ActionRequired(
+            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+        self.assertTrue((options.text or "").startswith("codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT."))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "quota.paid_credits")
+        self.assertIn("sender=natedev", command)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
+            script = local_options(self.paid_credits_arguments("--from", "quota_alert"))
+            self.assertEqual(script.summary, "quota_alert: codex2 now uses paid credits")
+            self.assertEqual(local_options(self.paid_credits_arguments("--value", "sender=quota_alert")).summary,
+                             "quota_alert: codex2 now uses paid credits")
+            with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = local_options(self.paid_credits_arguments())
+            self.assertIn("needs a sender", errors.getvalue())
+
+    def test_paid_credits_queued_template_fills_its_sender_as_the_paid_credits_one_does(self) -> None:
+        values = {"account": "codex2", "machine": "natedev", "credits": "25,345", "refill": "Tue 10-27 02:33 AST"}
+        arguments = ["--to", "user", "--text-id", "quota.paid_credits_queued",
+                     *(item for key, value in values.items() for item in ("--value", f"{key}={value}"))]
+        _ = (self.root / "sessions/123.json").write_text(json.dumps({"sessionId": "writer-id", "name": "natedev"}))
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_PID": "123"})))
+        options = local_options([*arguments, "--value", "sender=quota_alert"])
+        self.assertEqual(options.summary, "natedev: codex2 now uses paid credits")
+        self.assertEqual(options.need, "decision")
+        self.assertEqual(options.action, ActionRequired(
+            "To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev"))
+        self.assertTrue((options.text or "").endswith("Turn off: workers stop and wait for your queued move."))
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as run:
+            self.assertEqual(send.send(options).outcome, "sent")
+        command = cast(list[str], run.call_args.args[0])
+        self.assertEqual(command[command.index("--text-id") + 1], "quota.paid_credits_queued")
+        self.assertIn("sender=natedev", command)
+        with mock.patch.dict(os.environ, {"CLAUDE_PID": ""}):
+            self.assertEqual(local_options([*arguments, "--from", "quota_alert"]).summary,
+                             "quota_alert: codex2 now uses paid credits")
+            with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
+                _ = local_options(arguments)
+            self.assertIn("quota.paid_credits_queued needs a sender", errors.getvalue())
+
+    def test_a_free_text_paid_credit_push_is_held_with_the_template_call(self) -> None:
+        self.writer_session()
+        for title, text, action in (("codex2 now spends paid credits", "It refills Tue.", "Choose in natedev terminal."),
+                                    ("Codex workers", "They spend credits now.", "Set use_credits: off in codex2.md"),
+                                    ("Codex workers", "They now use Paid-Credit time.", "Choose in natedev terminal.")):
+            with (self.subTest(title=title, text=text), mock.patch.object(send, "run", side_effect=AssertionError("pushed")),
+                  redirect_stdout(io.StringIO()) as output):
+                code = send.main(["--here", "--to", "user", "--summary", title, "--need", "decision",
+                                  "--action", action, "--key", "credits", "--repeat-minutes", "30", "--text", text])
+            self.assertEqual(code, 4)
+            self.assertTrue(output.getvalue().startswith("HELD: not sent: this push reports paid credit use."))
+            self.assertIn("--text-id quota.paid_credits --value account=<account>", output.getvalue())
+            self.assertIn("When a workers move is queued, send quota.paid_credits_queued:", output.getvalue())
+            self.assertIn("--text-id quota.paid_credits_queued --value account=<account>", output.getvalue())
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "held")
+        # The hold claims no repeat window, and registered pushes about credits are not held.
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(send.send(local_options(
+                [*self.paid_credits_arguments(), "--key", "credits", "--repeat-minutes", "30"])).outcome, "sent")
+            self.assertEqual(send.send(local_options(
+                ["--to", "user", "--text-id", "quota.codex_credits_forecast", "--value", "account=codex1",
+                 "--value", "forecast=Workers used 120 paid credits.", "--value", "destination=", "--value", "horizon=x"])).outcome,
+                "sent")
+
     def test_cancelled_user_revision_reports_replaced_locally_and_remotely_without_a_fallback(self) -> None:
         self.writer_session()
         reason = "a newer version replaced this push; nothing was sent"
@@ -1373,6 +1761,19 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertFalse(self.failure_marker().exists())
             self.assertEqual(self.log()[-1]["outcome"], "replaced")
         self.assertEqual(send.pending("user"), "")
+
+    def test_a_push_kept_during_silence_reports_kept_locally_and_remotely_without_a_fallback(self) -> None:
+        self.writer_session()
+        detail = "for the user: silence until 07:00 EDT; it goes out when silence ends"
+        for extra, reply, printed in (([], 'pushover: reviewed JSON: {}\npushover: kept: silence until 07:00 EDT\n', "KEPT: " + detail),
+                                      (["--machine", "natedev"], "KEPT: " + detail + "\n", "KEPT: on natedev: " + detail)):
+            with (self.subTest(extra=extra), mock.patch.object(send, "run", return_value=(0, reply, "")),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors):
+                self.assertEqual(send.main([*([] if extra else ["--here"]), *self.user_arguments(*extra)]), 0)
+            self.assertEqual(output.getvalue(), printed + "\n")
+            self.assertEqual(errors.getvalue(), "")
+            self.assertFalse(self.failure_marker().exists())
+            self.assertEqual(self.log()[-1]["outcome"], "kept")
 
     def test_only_a_named_session_without_from_is_answerable(self) -> None:
         self.writer_session()
@@ -1415,7 +1816,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         import push_texts
         entry = push_texts.PushText("test", "shutdown", "decision", "Owner is blocked",
             push_texts.ActionTemplate("stop Owner"), "Reason: waiting.",
-            (push_texts.PushExample("typical", {}),), session=push_texts.SessionTemplate("Owner"))
+            (push_texts.PushExample("typical", {}),), purpose="Test.", session=push_texts.SessionTemplate("Owner"))
         with mock.patch.object(push_texts, "catalog", return_value=(entry,)), mock.patch.object(send, "run", return_value=(1, "", "offline")):
             result = send.send(local_options(["--to", "user", "--text-id", "test"]))
         self.assertIsInstance(result.failure, send.FailedPush)
@@ -1875,22 +2276,22 @@ class PeerSendTests(ShutdownTestCase):
         self.assertEqual(self.forwarded(), [])
 
     def test_local_problems_prevent_unproven_bare_name_fallback_to_the_peer(self) -> None:
-        self.local = roster.Roster([], ["delegate source unreadable"])
+        self.local = roster.Roster([], ["worker source unreadable"])
         self.peer([self.row("absent here", "codex:peer")])
         status, output, errors = self.run_main("absent here")
         self.assertEqual(status, 2, output + errors)
-        self.assertIn("delegate source unreadable", errors)
+        self.assertIn("worker source unreadable", errors)
         self.assertIn("--machine", errors)
         self.assertIn("address", errors)
         self.assertEqual(self.ssh_calls(), [])
         self.assertEqual(self.relayed + self.mesh_calls + self.daemon_calls, [])
 
     def test_an_address_can_resolve_on_peer_even_when_a_local_source_failed(self) -> None:
-        self.local = roster.Roster([], ["delegate source unreadable"])
+        self.local = roster.Roster([], ["worker source unreadable"])
         self.peer([self.row("peer", "codex:peer")])
         status, output, errors = self.run_main("codex:peer")
         self.assertEqual(status, 0, output + errors)
-        self.assertIn("delegate source unreadable", errors)
+        self.assertIn("worker source unreadable", errors)
         self.assertEqual(len(self.forwarded()), 1)
 
     def test_remote_between_turns_worker_address_keeps_no_roster_address_error(self) -> None:

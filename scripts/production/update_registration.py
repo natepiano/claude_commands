@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Register a showrunner's update jobs and write its production time and log."""
+"""Register a showrunner's update jobs and write its production time and log.
+
+`open` lists what waits on the user and `next` prints the one item /next question shows, both in
+urgency.py's order. `mark-important --item <words>` marks an item the user called important.
+"""
 from __future__ import annotations
 
 import argparse
@@ -23,8 +27,9 @@ else:
     from showrunner_footer import ReportItem, reports_path
 import showrunners
 from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstanding,
-    DeferredUntil, Outstanding, OutstandingReminder, ReviewedOutstandingQuestion,
+    DeferredUntil, Outstanding, OutstandingReminder, Ranking, ReviewedOutstandingQuestion,
     ReviewUnavailableOutstandingQuestion)
+import urgency
 
 if TYPE_CHECKING:
     from ..usage import agents_log
@@ -48,6 +53,10 @@ class OutstandingItem(TypedDict):
     question: NotRequired[str]
     reviewed: NotRequired[str]
     review_unavailable: NotRequired[str]
+    urgency: NotRequired[str]
+    due: NotRequired[str]
+    marked: NotRequired[str]
+    follows: NotRequired[str]
 
 
 class QuestionRegistration(TypedDict):
@@ -66,17 +75,20 @@ class UnitJudgment(NamedTuple):
 class OpenReminder(NamedTuple):
     text: str
     after: str
+    rank: Ranking = Ranking()
 
 
 class QuestionForReview(NamedTuple):
     text: str
     after: str
     question: str
+    rank: Ranking = Ranking()
 
 
 class OpenQuestionWithoutText(NamedTuple):
     text: str
     after: str
+    rank: Ranking = Ranking()
 
 
 OpenForUserItem = OpenReminder | QuestionForReview | OpenQuestionWithoutText
@@ -314,8 +326,9 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
                 raise state_error(step, path, key, "text or an object")
             item = cast(dict[str, object], raw)
             for field in item:
-                if field not in {"text", "after", "question"}:
+                if field not in {"text", "after", "question", "urgency", "due", "follows"}:
                     raise state_error(step, path, f"{key}.{field}", "a known key")
+            rank = item_ranking(item, path, step, key)
             if not isinstance(item.get("text"), str) or not cast(str, item["text"]).strip() or "\n" in cast(str, item["text"]):
                 raise state_error(step, path, f"{key}.text", "one nonempty line of text")
             after = item.get("after", "")
@@ -330,12 +343,27 @@ def judgment_state(path: Path | None, step: str) -> ShowrunnerState:
                 question = item["question"]
                 if not isinstance(question, str) or not question.strip():
                     raise state_error(step, path, f"{key}.question", "nonempty text")
-                items.append(QuestionForReview(cast(str, item["text"]), after, question))
+                items.append(QuestionForReview(cast(str, item["text"]), after, question, rank))
             else:
-                items.append(OpenQuestionWithoutText(cast(str, item["text"]), after))
+                items.append(OpenQuestionWithoutText(cast(str, item["text"]), after, rank))
         outstanding = ReplaceOutstanding(tuple(items))
     return ShowrunnerState(tuple(units), tuple(cast(list[str], raw_held)), outstanding,
                            report_items(fields, path, step), tuple(cast(list[str], raw_next)))
+
+
+def item_ranking(item: dict[str, object], path: Path, step: str, key: str) -> Ranking:
+    """An item's `urgency` (user, blocks, soon, normal or later), `due` (with soon) and `follows`
+    (the text of the item it comes after); none of them is a normal item."""
+    follows = item.get("follows", "")
+    if not isinstance(follows, str) or "\n" in follows:
+        raise state_error(step, path, f"{key}.follows", "one line of text")
+    level, due = item.get("urgency", ""), item.get("due", "")
+    if not isinstance(level, str) or not isinstance(due, str):
+        raise state_error(step, path, f"{key}.urgency", "text")
+    try:
+        return Ranking(urgency.read(level, due), follows.strip())
+    except urgency.UrgencyError:
+        raise state_error(step, path, f"{key}.urgency", "user, blocks, soon with `due`, normal or later") from None
 
 
 def report_items(fields: dict[str, object], path: Path, step: str) -> KeepReports | ReplaceReports:
@@ -380,15 +408,37 @@ def outstanding_path(production: Production) -> Path:
 WHEN = "%a %b %d %H:%M"
 
 
-def open_items(production: Production) -> None:
-    """Print in full what waits on the user: this production's items and, for a root, every lower one's.
+class OpenItem(NamedTuple):
+    slug: str
+    item: Outstanding
 
-    Replies show only the count, so this list is what the showrunner gives when the user asks what
-    the open questions are. Each line is led by the production that owns the item.
-    """
+    def line(self) -> str:
+        """The item in full, led by its production and any level it has."""
+        text = self.item.text if isinstance(self.item, OutstandingReminder) else self.item.question
+        level = urgency.cell(self.item.rank.urgency)
+        return f"{self.slug}{f' [{level}]' if level else ''}, since {self.item.since:{WHEN}}: {text}"
+
+
+class OpenLists(NamedTuple):
+    due: list[urgency.Entry[OpenItem]]
+    deferred: list[OpenItem]
+    unreadable: list[str]
+
+
+def question_queue(production: Production) -> str:
+    """The name urgency.py pins the question /next showed under."""
+    return f"question-{production.slug}"
+
+
+def item_key(slug: str, text: str) -> str:
+    return f"{slug}: {text}"
+
+
+def open_lists(production: Production) -> OpenLists:
+    """What waits on the user now, in urgency.py's order, then what the user deferred and the lists not read."""
     now = datetime.now(production.zone).replace(tzinfo=None)
-    due: list[tuple[datetime, str, str]] = []
-    deferred: list[tuple[datetime, str, str]] = []
+    due: list[urgency.Entry[OpenItem]] = []
+    deferred: list[OpenItem] = []
     unreadable: list[str] = []
     for slug in showrunners.user_facing(production.slug):
         try:
@@ -397,19 +447,64 @@ def open_items(production: Production) -> None:
             unreadable.append(slug)
             continue
         for item in items:
-            text = item.text if isinstance(item, OutstandingReminder) else item.question
             if isinstance(item.timing, DeferredUntil) and item.timing.at > now:
-                deferred.append((item.timing.at, slug, text))
+                deferred.append(OpenItem(slug, item))
             else:
-                due.append((item.since, slug, text))
-    for number, (since, slug, text) in enumerate(sorted(due), 1):
-        print(f"{number}. {slug}, since {since:{WHEN}}: {text}")
-    for after, slug, text in sorted(deferred):
-        print(f"deferred until {after:{WHEN}}: {slug}: {text}")
-    for slug in unreadable:
+                due.append(urgency.Entry(item_key(slug, item.text), OpenItem(slug, item), item.rank.urgency,
+                                         item.since, after=item_key(slug, item.rank.follows) if item.rank.follows else ""))
+    deferred.sort(key=lambda found: (cast(DeferredUntil, found.item.timing).at, found.slug))
+    return OpenLists(urgency.queue_order(due, question_queue(production)), deferred, unreadable)
+
+
+def open_items(production: Production) -> None:
+    """Print in full what waits on the user: this production's items and those of every production below it.
+
+    Replies show only the count, so this list is what the showrunner gives when the user asks what
+    the open questions are. Each line is led by the production that owns the item.
+    """
+    lists = open_lists(production)
+    for number, entry in enumerate(lists.due, 1):
+        print(f"{number}. {entry.item.line()}")
+    for found in lists.deferred:
+        print(f"deferred until {cast(DeferredUntil, found.item.timing).at:{WHEN}}: {found.slug}: "
+              + (found.item.text if isinstance(found.item, OutstandingReminder) else found.item.question))
+    for slug in lists.unreadable:
         print(f"{slug}: {UNREADABLE_LIST}")
-    report("open", "ok", f"{len(due)} due, {len(deferred)} deferred"
-           + (f", {len(unreadable)} unreadable" if unreadable else ""))
+    report("open", "ok", f"{len(lists.due)} due, {len(lists.deferred)} deferred"
+           + (f", {len(lists.unreadable)} unreadable" if lists.unreadable else ""))
+
+
+def next_item(production: Production) -> None:
+    """Print the one question /next shows: the one shown last until it is answered, else the first due."""
+    lists = open_lists(production)
+    shown = urgency.top(lists.due, question_queue(production))
+    print(shown.item.line() if shown is not None else "no question is open")
+    report("next", "ok", f"{max(len(lists.due) - 1, 0)} more due")
+
+
+def mark_important(production: Production, words: str) -> None:
+    """Mark the one item whose text is `words`, or holds them, as the user's: it goes first after the shown one."""
+    wanted = words.strip()
+    exact: list[tuple[Path, str]] = []
+    partial: list[tuple[Path, str]] = []
+    for slug in showrunners.user_facing(production.slug):
+        for item in read_outstanding(outstanding_file(slug)):
+            full = item.text if isinstance(item, OutstandingReminder) else item.question
+            if item.text == wanted:
+                exact.append((outstanding_file(slug), item.text))
+            elif wanted and (wanted in item.text or wanted in full):
+                partial.append((outstanding_file(slug), item.text))
+    found = exact or partial
+    if len(found) != 1:
+        raise RegistrationFailure("mark-important", f"{len(found)} open items match {wanted!r}; name one by its text")
+    path, text = found[0]
+    entries = cast(list[dict[str, object]], json.loads(path.read_text(encoding="utf-8")))
+    entry = next(entry for entry in entries if entry.get("text") == text)
+    for key in ("urgency", "due", "marked"):
+        _ = entry.pop(key, None)
+    entry.update(urgency.fields(urgency.mark(datetime.now(production.zone).replace(tzinfo=None))))
+    _ = path.write_text(json.dumps(entries) + "\n", encoding="utf-8")
+    report("mark-important", "ok", text)
 
 
 def state_block(production: Production, state: ShowrunnerState, timestamp: str) -> str:
@@ -482,6 +577,19 @@ def record_question_history(outstanding: Path, items: list[OutstandingItem], now
             entry["reviewed"] = item["reviewed"]
         retained.append(entry)
     _ = history.write_text("".join(json.dumps(item) + "\n" for item in retained), encoding="utf-8")
+
+
+def store_ranking(entry: OutstandingItem, rank: Ranking) -> None:
+    """Store only what is not normal: the level, its time, and the item this one comes after."""
+    for key, value in urgency.fields(rank.urgency).items():
+        if key == "urgency":
+            entry["urgency"] = value
+        elif key == "due":
+            entry["due"] = value
+        else:
+            entry["marked"] = value
+    if rank.follows:
+        entry["follows"] = rank.follows
 
 
 def keep_question_fields(entry: OutstandingItem, previous: Outstanding) -> None:
@@ -561,6 +669,9 @@ def questions(production: Production, path: Path | None) -> None:
                                     if item.text in previous else since, text=item.text)
             if item.after:
                 entry["after"] = item.after
+            old = previous[item.text].rank.urgency if item.text in previous else urgency.Urgency()
+            store_ranking(entry, Ranking(urgency.keep_mark(item.rank.urgency, old, now.replace(tzinfo=None)),
+                                         item.rank.follows))
             if item.text in previous:
                 keep_question_fields(entry, previous[item.text])
             elif isinstance(item, QuestionForReview):
@@ -592,7 +703,7 @@ def questions(production: Production, path: Path | None) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("register", "time", "log", "questions", "open"):
+    for action in ("register", "time", "log", "questions", "open", "next", "mark-important"):
         subcommand = commands.add_parser(action)
         _ = subcommand.add_argument("--production", type=Path, required=True)
         if action == "register":
@@ -606,6 +717,8 @@ def main() -> int:
             _ = subcommand.add_argument("--before-compaction", action="store_true")
         elif action == "questions":
             _ = subcommand.add_argument("--state", type=Path)
+        elif action == "mark-important":
+            _ = subcommand.add_argument("--item", required=True)
     args = parser.parse_args()
     action = cast(str, args.action)
     try:
@@ -620,6 +733,10 @@ def main() -> int:
             append_log(production, cast(str, args.event), cast(Path | None, args.state), cast(bool, args.before_compaction))
         elif action == "open":
             open_items(production)
+        elif action == "next":
+            next_item(production)
+        elif action == "mark-important":
+            mark_important(production, cast(str, args.item))
         else:
             questions(production, cast(Path | None, args.state))
         return 0

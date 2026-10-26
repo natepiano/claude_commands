@@ -76,6 +76,8 @@ WAIT_MINUTES = 20.0
 POLL_SECONDS = 10.0
 # How long a process has to exit after SIGTERM before it is reported as still running.
 TERM_WAIT_SECONDS = 10.0
+# A run's folder of detached-run records (codex_mesh.DETACHED_RUNS_DIR).
+DETACHED_RUNS = "mesh_runs"
 RETIRED_NOTE = "(retired {date}, worktree removed{session})"
 # The note names the unit director's last session, which /showrunner:resume_unit resumes.
 SESSION_NOTE = ", session {id}"
@@ -277,7 +279,51 @@ def mesh_runs(runs: list[Path]) -> tuple[MeshRun, ...]:
     return tuple(found)
 
 
-def _same_unit(lease: str, unit: str) -> bool:
+def command_line(pid: int) -> list[str]:
+    """The process's arguments; empty once it has gone. The Mac has no /proc: ps splits them at spaces."""
+    if sys.platform == "darwin":
+        return run(["ps", "-o", "args=", "-p", str(pid)]).stdout.split()
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+    except OSError:
+        return []
+
+
+def _session_of(pid: int) -> int:
+    try:
+        return os.getsid(pid)
+    except OSError:
+        return 0
+
+
+def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
+    """The processes inside the worktree that its runs leave behind once their sessions stop, each named.
+
+    A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
+    supervisor's pid and is in the supervisor's arguments; an app-server by its run's
+    mesh_server.json; an app-server's idle-stop watcher by the run folder in its arguments. Each
+    leads its own session, so its children go with it.
+    """
+    runs = runs_of(worktree)
+    leaders = {item.pid: f"app-server {item.pid} of run {item.run.name}" for item in mesh_runs(runs)}
+    for folder in runs:
+        for path in sorted((folder / DETACHED_RUNS).glob("*.json")):
+            record = _json(path)
+            pid = record.get("pid")
+            if (record.get("status") == "running" and isinstance(pid, int) and not isinstance(pid, bool)
+                    and pid > 0 and str(path) in command_line(pid)):
+                leaders[pid] = f"run supervisor {pid} of {record.get('label', path.stem)} in run {folder.name}"
+    folders = {str(folder.resolve()): folder.name for folder in runs}
+    for pid in inside:
+        words = command_line(pid)
+        named = [folders[word] for word in words if word in folders]
+        if words[:2] == ["sh", "-c"] and named and any("idle-stop" in word for word in words):
+            leaders[pid] = f"app-server watcher {pid} of run {named[0]}"
+    return {pid: f"process {pid} ({_command_name(pid)}) of the {leaders[leader]}"
+            for pid in inside if (leader := _session_of(pid)) in leaders}
+
+
+def same_unit(lease: str, unit: str) -> bool:
     # review_pool's own rule: some leases name `trunk`, others `trunk-unit`.
     return lease.removesuffix("-unit") == unit.removesuffix("-unit")
 
@@ -289,7 +335,7 @@ def reviewers(unit: Unit) -> tuple[Reviewer, ...]:
     found: list[Reviewer] = []
     for line in listed.stdout.splitlines():
         fields = line.split("\t")
-        if len(fields) >= 4 and fields[2] != "unleased" and _same_unit(fields[2].rsplit(":", 1)[0], unit.name):
+        if len(fields) >= 4 and fields[2] != "unleased" and same_unit(fields[2].rsplit(":", 1)[0], unit.name):
             found.append(Reviewer(fields[0], fields[3] == "busy"))
     return tuple(found)
 
@@ -439,8 +485,8 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float) -> list[str]:
     return [f"{describe_session(item)}: still stopping after {wait_minutes:g} minutes" for item in still]
 
 
-def terminate(pids: list[int], what: dict[int, str]) -> list[str]:
-    """SIGTERM each pid; one alive after TERM_WAIT_SECONDS comes back as still running."""
+def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
+    """SIGTERM each pid; one alive after `wait` seconds (TERM_WAIT_SECONDS) comes back as still running."""
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -448,7 +494,7 @@ def terminate(pids: list[int], what: dict[int, str]) -> list[str]:
             continue
         except PermissionError as error:
             what[pid] += f": {error}"
-    deadline = time.monotonic() + TERM_WAIT_SECONDS
+    deadline = time.monotonic() + (TERM_WAIT_SECONDS if wait is None else wait)
     while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(0.2)
     left: list[str] = []
@@ -555,6 +601,12 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     if left:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
+        return 1
+    from scripts.guilds import roles
+    try:
+        roles.end_holder(unit.production.slug, unit.name)
+    except (OSError, ValueError, SystemExit) as error:
+        print(f"{unit.name} is not retired: held role cleanup: {error}")
         return 1
     if not unit.retired:
         mark_retired(unit, session_id)

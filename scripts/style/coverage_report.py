@@ -66,7 +66,7 @@ def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
     main = Path(git(ledger.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
     slug = main.name + "-style"
     doc = main.parent / slug / "docs" / f"{slug}-production.md"
-    units = tuple(f"{family}-unit" for family in ("modules", "names", "values", "types"))
+    units = tuple(f"{slug}-{family}-unit" for family in ("modules", "names", "values", "types"))
     if doc.is_file():
         text = doc.read_text(encoding="utf-8")
         branch = re.search(r"^\s*-?\s*\*\*Branch point:\*\*\s*(.+)$", text, re.MULTILINE)
@@ -74,7 +74,7 @@ def production(ledger: style_ledger.Ledger, tip: str) -> StyleProduction:
             raise style_ledger.LedgerError(f"{doc}: missing Branch point")
         rows = text.split("## Units", 1)[-1].split("\n## ", 1)[0]
         declared = tuple(match[1].strip(" `") for match in re.finditer(r"^\|\s*([^|]+)\|", rows, re.MULTILINE)
-                         if match[1].strip(" `") not in ("Unit", "---") and not match[1].strip().startswith("---"))
+                         if not isinstance(rules.style_family(match[1].strip(" `")), rules.NotStyleUnit))
         return StyleProduction(slug, branch[1].strip().removeprefix("refs/heads/"), declared or units)
     branches = git(ledger.repo, "for-each-ref", "--format=%(refname:short)", "--points-at", tip, "refs/heads").splitlines()
     branch_point = next((branch for branch in branches if not branch.startswith("style/")), tip[:7])
@@ -166,7 +166,8 @@ def workspace(ledger: style_ledger.Ledger, tip: str) -> tuple[rules.WorkspaceMem
 
 def ticket_line(ticket: style_ledger.TicketRecord) -> str:
     at = datetime.fromisoformat(ticket["created_at"]).astimezone(user_zone())
-    return f"{ticket['id']} · {ticket['state']} · {ticket['unit']} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
+    line = f"{ticket['id']} · {ticket['state']} · {ticket['unit']} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
+    return "\n".join([line, *(style_ledger.widened_line(widened) for widened in ticket["widened"])])
 
 
 def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") -> str:

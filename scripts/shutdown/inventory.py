@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
+import detection_rules
 import herdr
 import sessions
 from sessions import process_start as _process_start
@@ -297,7 +298,7 @@ def _notifier_state_dir() -> Path:
 
 
 def _run_roots() -> tuple[Path, ...]:
-    return unit_runs.run_roots(os.environ.get("SHUTDOWN_DELEGATE_ROOT"))
+    return unit_runs.run_roots(os.environ.get("SHUTDOWN_RUN_ROOT"))
 
 
 def _session_file(record: sessions.SessionRecord) -> SessionFile:
@@ -883,18 +884,37 @@ def _launcher_command(pid: int) -> list[str]:
     return []
 
 
+def _left_since_offered(directory: Path, roster: dict[str, dict[str, object]]) -> bool:
+    """An earlier stop paused every seat, and the director has written no board line since.
+
+    Each stop writes `<seat>.resume-prompt.md`, so the oldest one is the earliest offer
+    the restart made. A board older than that offer means the director took none back.
+    """
+    if not roster or any(entry.get("status") != "paused" for entry in roster.values()):
+        return False
+    try:
+        board = (directory / "board.log").stat().st_mtime
+        offered = min((directory / f"{name}.resume-prompt.md").stat().st_mtime for name in roster)
+    except OSError:
+        return False
+    return board < offered
+
+
 def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
     from record import PausedSeat
 
     seats: list[PausedSeat] = []
     for directory in run_directories:
         run_dir = str(directory)
-        for name, raw in sorted(_json_object(Path(run_dir) / "mesh_roster.json").items()):
-            if not isinstance(raw, dict):
-                continue
-            entry = cast(dict[str, object], raw)
-            if entry.get("status") == "ended":
-                continue
+        roster = {
+            name: cast(dict[str, object], raw)
+            for name, raw in sorted(_json_object(Path(run_dir) / "mesh_roster.json").items())
+            if isinstance(raw, dict) and cast(dict[str, object], raw).get("status") != "ended"
+        }
+        # A run whose director left it is not one to resume: its marker outlived the work.
+        if _left_since_offered(directory, roster):
+            continue
+        for name, entry in roster.items():
             thread_id, role = entry.get("thread_id", ""), entry.get("role", "impl")
             launcher = entry.get("launcher_pid", 0)
             turn_live = entry.get("status") in {"running", "starting"} or entry.get("paused_turn") is True
@@ -1640,6 +1660,8 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
         timers = _snapshot_timers()
         units = _snapshot_units(timers)
         native, presentation = _snapshot_native_hosts()
+        herdr.save_shared_layout(set(presentation))
+        _ = detection_rules.refresh(set(presentation), herdr.reload_agent_rules)
         desktops = _snapshot_desktops(refresh=False)
         processes = reader.paths()
         # Socket ownership also distinguishes a replacement with the same session name.

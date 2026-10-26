@@ -1,4 +1,4 @@
-"""Regression tests for the delegate run's terminal cleanup."""
+"""Regression tests for the unit run's terminal cleanup."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from scripts.direct import remove_workers
 
 END_SESSION = Path(__file__).with_name("end_session.sh")
 UNIT_RUNS = Path(__file__).resolve().parents[1] / "lib" / "unit_runs.py"
+REMOVE_RUN_SCRATCH = Path(__file__).with_name("remove_run_scratch.py")
 
 
 class EndSessionTests(unittest.TestCase):
@@ -50,22 +51,24 @@ class EndSessionTests(unittest.TestCase):
         self.runs.mkdir()
 
         scripts = self.root / "scripts"
-        delegate = scripts / "direct"
+        direct_dir = scripts / "direct"
         agents = scripts / "agents"
-        delegate.mkdir(parents=True)
+        direct_dir.mkdir(parents=True)
         agents.mkdir()
         (scripts / "lib").mkdir()
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
-        self.script = delegate / "end_session.sh"
+        self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
-        _ = (delegate / "remove_workers.py").write_text("", encoding="utf-8")
+        _ = shutil.copy2(REMOVE_RUN_SCRATCH, direct_dir / "remove_run_scratch.py")
+        _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
         _ = (agents / "codex_mesh.py").write_text("", encoding="utf-8")
 
         python_shim = self.root / ".claude" / "scripts" / "lib" / "py"
         python_shim.parent.mkdir(parents=True)
         _ = python_shim.write_text(
-            # The run scan is real; every other script only records its call.
-            f"#!/usr/bin/env bash\ncase \"$1\" in */unit_runs.py) exec {sys.executable} \"$@\";; esac\n"
+            # The run scan and the scratch removal are real; every other script only records its call.
+            "#!/usr/bin/env bash\ncase \"$1\" in */unit_runs.py|*/remove_run_scratch.py)"
+            + f" exec {sys.executable} \"$@\";; esac\n"
             + "printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\"\n",
             encoding="utf-8",
         )
@@ -83,8 +86,8 @@ class EndSessionTests(unittest.TestCase):
             "HOME": str(self.root),
             "CLAUDE_CODE_SESSION_ID": self.session_id,
             "END_SESSION_CALLS": str(self.calls),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.marker.parent),
-            "PLAN_DELEGATE_RUN_ROOT": str(self.runs),
+            "UNIT_ACTIVE_DIR": str(self.marker.parent),
+            "UNIT_RUN_ROOT": str(self.runs),
         })
         return environment
 
@@ -102,17 +105,22 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(len(calls), 3)
-        self.assertIn("remove_workers.py --session-dir", calls[0])
-        self.assertIn("codex_mesh.py stop --session-dir", calls[1])
-        self.assertIn(str(self.session_dir), calls[1])
-        self.assertIn("codex_mesh.py sweep --root", calls[2])
-        self.assertIn(f"{self.root} --stop", calls[2])
+        self.assertEqual(len(calls), 4)
+        self.assertTrue(calls[0].endswith(f"guilds/roles.py unbind-run {self.session_dir}"))
+        self.assertIn("remove_workers.py --session-dir", calls[1])
+        self.assertIn("codex_mesh.py stop --session-dir", calls[2])
+        self.assertIn(str(self.session_dir), calls[2])
+        self.assertIn("codex_mesh.py sweep --root", calls[3])
+        self.assertIn(f"{self.root} --stop", calls[3])
         self.assertFalse(self.marker.exists())
 
     def make_run(self, name: str, director: str) -> Path:
         run = self.runs / name
         (run / "verify_cache").mkdir(parents=True)
+        (run / "phases" / "p3" / "gate" / ".git").mkdir(parents=True)
+        _ = (run / "phases" / "p3" / "review.diff").write_text("diff\n", encoding="utf-8")
+        (run / "p62_bin").mkdir()
+        _ = (run / "p62_bin" / "CACHEDIR.TAG").write_text("tag\n", encoding="utf-8")
         _ = (run / "mesh_server.json").write_text("{}", encoding="utf-8")
         _ = (run / "director").write_text(f"{director}\n", encoding="utf-8")
         return run
@@ -128,16 +136,27 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(calls[0].split()[1:], ["--session-dir", str(marked), "--session-dir", str(side)])
+        unbinds = [line for line in calls if "guilds/roles.py unbind-run" in line]
+        self.assertEqual([line.split()[-1] for line in unbinds], [str(marked), str(side)])
+        self.assertTrue(all(calls.index(line) < next(index for index, call in enumerate(calls)
+                                                    if "remove_workers.py" in call) for line in unbinds))
+        removal = next(line for line in calls if "remove_workers.py" in line)
+        self.assertEqual(removal.split()[1:], ["--session-dir", str(marked), "--session-dir", str(side)])
         stops = [line.split()[-1] for line in calls if "codex_mesh.py stop" in line]
         self.assertEqual(stops, [str(marked), str(side)])
         sweeps = [line for line in calls if "codex_mesh.py sweep" in line]
         self.assertEqual(len(sweeps), 1)
         self.assertTrue(sweeps[0].endswith(f"codex_mesh.py sweep --root {self.runs} --stop"), sweeps)
         self.assertNotIn(str(other), "\n".join(calls))
-        self.assertFalse((marked / "verify_cache").exists())
-        self.assertFalse((side / "verify_cache").exists())
+        for run in (marked, side):
+            self.assertFalse((run / "verify_cache").exists())
+            self.assertFalse((run / "phases" / "p3" / "gate").exists())
+            self.assertFalse((run / "p62_bin").exists())
+            self.assertTrue((run / "phases" / "p3" / "review.diff").is_file())
+            self.assertTrue((run / "mesh_server.json").is_file())
         self.assertTrue((other / "verify_cache").is_dir())
+        self.assertTrue((other / "phases" / "p3" / "gate" / ".git").is_dir())
+        self.assertTrue((other / "p62_bin").is_dir())
         self.assertFalse(self.marker.exists())
 
     def test_held_runs_are_cleaned_after_the_marker_is_gone(self) -> None:
@@ -151,7 +170,11 @@ class EndSessionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("No active unit run marker", result.stdout)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(calls[0].split()[1:], ["--session-dir", str(side)])
+        unbind = next(line for line in calls if "roles.py unbind-run" in line)
+        removal = next(line for line in calls if "remove_workers.py" in line)
+        self.assertLess(calls.index(unbind), calls.index(removal))
+        self.assertEqual(unbind.split()[-1], str(side))
+        self.assertEqual(removal.split()[1:], ["--session-dir", str(side)])
         self.assertNotIn(str(other), "\n".join(calls))
         self.assertFalse((side / "verify_cache").exists())
         self.assertTrue((other / "verify_cache").is_dir())

@@ -98,6 +98,11 @@ def _execute_request(path: Path) -> None:
 
 def run(argv: list[str]) -> int:
     """Run a child on this terminal, then consume a restart or wait under a hold."""
+    if argv and argv[0] in ("claude", "codex"):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from scripts.accounts.accounts import resolve_program
+
+        argv = [resolve_program("claude" if argv[0] == "claude" else "codex"), *argv[1:]]
     child: subprocess.Popen[bytes] | None = None
 
     def ignore(_number: int, _frame: FrameType | None) -> None:

@@ -598,7 +598,7 @@ class AddUnitTests(ShutdownTestCase):
             "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
             "| --- | --- | --- | --- | --- | --- | --- |",
             "| stalls-unit | (retired by the user 2026-10-07; run done, worktree removed) follow-up: `/unit:report` shows the same sections every time, the last recorded tables when no window is open (the user, 2026-10-06 22:5x); earlier follow-up: showrunner replies end with the agent usage lines, checked by a hook (the user, 2026-10-06 08:1x), then `docs/as-built/build-followups-fn-length-hook.md (run done; as-built 4ab5e4c)` (follow-up `commands/unit/eta_breakdown.md` merged as a9f35af) (earlier runs' as-builts `docs/as-built/screen-record.md`, merged as b3c069f, `docs/as-built/build-memory-admission.md`, merged as 35151e5, and `docs/as-built/buildlog-memory-stalls.md`) | `/home/natepiano/worktrees/claude-build-followups-stalls` | `build-followups-stalls` | `hook` (resumed in `/etc/nixos`; renamed from `nightly-config` 2026-10-04, then `stalls` → `footer` → `hook` by the user 2026-10-06, herdr session too; its own herdr session `stalls` since 22:13 PDT, after the nightly review's launcher closed the `nightly-config` session it ran in) | — | memory stall recording and its report section; then memory admission, which edited `scripts/buildlog/`, `scripts/lint/` (`invoke.sh`, `memory_gate.sh`, `sweep.py`), `scripts/direct/verify.sh` and `board.sh`, `scripts/build_hold/build_hold.py`, `scripts/hooks/pre-tool-use-brp-launch-gate.sh`, `scripts/agents/codex_mesh.py`, `scripts/message/` (`send.py`, `top_level.py`), `scripts/notify/pushover.py`, `scripts/whoami/agent_notes.py`, `scripts/production/dailies_render.py`, `settings.json`, `config/lint.conf`, `pyrightconfig.json`, and `commands/` (`build_hold.md`, `lint_config.md`, `notify_top_level.md`, `showrunner/dailies.md`, `showrunner/produce.md`); promoted by the user 2026-10-04; then the screen recording skill: `commands/screen_record.md`, `scripts/screen_record/`; and the `/unit:report` timer fixes: `scripts/production/unit_status.sh`, `scripts/direct/progress_history.py`; then the Codex `systemError` fix: `scripts/agents/codex_mesh.py`, `scripts/agents/test_codex_mesh.py`; then the kill order: `scripts/lint/invoke.sh`, `scripts/lint/test_invoke_scope.py`, `docs/as-built/build-memory-admission.md`; then `/unit:eta_breakdown`: `commands/unit/eta_breakdown.md`; then the function-length hook: `scripts/hooks/fn_length_lib.py`, `scripts/hooks/post-tool-use-fn-length.py`, `scripts/hooks/test_fn_length.py`, `scripts/hooks/codex_hooks.py`, `scripts/hooks/test_codex_hooks.py`, `settings.json`; then the footer: `scripts/production/dailies_render.py`, a showrunner-only Stop hook under `scripts/hooks/`, `settings.json`, `commands/showrunner/produce.md`; `commands/unit/report.md` (the report follow-up) |",
-            "| enh-showrunner-unit | `docs/plans/build-followups-enh-showrunner-dailies.md` (follow-up: retired units drop out of the status and a simple dailies groups idle units; the user, 2026-10-07; the earlier run's as-built is `docs/as-built/showrunner-automation.md`) (Phases 7 and 8 of stalls-unit's plan, moved by the user 2026-10-06 14:2x PDT) | `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` | `build-followups-enh-showrunner` | `enh-showrunner` | — | `docs/as-built/showrunner-automation.md`; `scripts/production/add_unit.py`, `test_add_unit.py`, `merge_checkpoint.py`, `test_merge_checkpoint.py`; `commands/showrunner/add_unit.md`; after stalls-unit Phase 6 merges: `commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, `scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests (hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): `commands/unit/delegate.md`, `commands/unit/checkpoint.md`, `docs/delegate/run_phase_review.md`, `docs/production_format.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/delegate/phase_end.md`, `docs/delegate_plan_format.md`, `commands/unit/eta_breakdown.md`, `docs/delegate/final_gate_commit.md` |",
+            "| enh-showrunner-unit | `docs/plans/build-followups-enh-showrunner-dailies.md` (follow-up: retired units drop out of the status and a simple dailies groups idle units; the user, 2026-10-07; the earlier run's as-built is `docs/as-built/showrunner-automation.md`) (Phases 7 and 8 of stalls-unit's plan, moved by the user 2026-10-06 14:2x PDT) | `/home/natepiano/worktrees/claude-build-followups-enh-showrunner` | `build-followups-enh-showrunner` | `enh-showrunner` | — | `docs/as-built/showrunner-automation.md`; `scripts/production/add_unit.py`, `test_add_unit.py`, `merge_checkpoint.py`, `test_merge_checkpoint.py`; `commands/showrunner/add_unit.md`; after stalls-unit Phase 6 merges: `commands/showrunner/produce.md`, `commands/showrunner/promote_unit.md`, `scripts/production/showrunners.py`, `scripts/production/stall_watch.py` and their tests (hub rows); from its Phase 5 (the user, 2026-10-06 15:25 PDT, the phase-end split): `commands/unit/direct.md`, `commands/unit/checkpoint.md`, `docs/direct/run_phase_review.md`, `docs/production_format.md`, `commands/unit/add_ons.md`, `commands/plan/shrink.md`, `commands/plan/phase_review.md`, `docs/direct/phase_end.md`, `docs/direct_plan_format.md`, `commands/unit/eta_breakdown.md`, `docs/direct/final_gate_commit.md` |",
             "| model-study-unit | `docs/as-built/director-model-study.md` (run done; as-built 16e5ac6) | `/home/natepiano/worktrees/claude-build-followups-model-study` | `build-followups-model-study` | `model-study` | — | `docs/plans/build-followups-model-study.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md` |",
         ]
         self.assertEqual(retired_units(lines, "build-followups"), {"stalls-unit"})
@@ -885,6 +885,9 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(add_unit.host_session_name(hana), "hana-review")
         named = dataclasses.replace(request, identity=add_unit.UnitIdentity("review-unit", "build-followups-review"))
         self.assertEqual(add_unit.host_session_name(named), "build-followups-review")
+        style = dataclasses.replace(request, production=production._replace(slug="cargo-liner-style"),
+                                    identity=add_unit.UnitIdentity("cargo-liner-style-names-unit", "cargo-liner-style-names"))
+        self.assertEqual(add_unit.host_session_name(style), "cargo-liner-style-names")
         restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "build-followups-review")
         self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)),
                          "build-followups-review")
@@ -2513,6 +2516,87 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(request("feature_log_unit"), request("feature_log"))
         self.assertEqual(request("unit")[0], "unit-unit")
 
+    def assert_guild_head_launch_and_restart(self, guild: str) -> None:
+        self.doc = self.checkout / "docs/plans/guilds-production.md"
+        row = self.unit_row(guild, branch="guilds-" + guild, worktree=self.root / ("project-" + guild))
+        row = row.replace(f"| {guild}-unit |", f"| `{guild}` |")
+        _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"), encoding="utf-8")
+        _ = self.git("add", str(self.doc.relative_to(self.checkout)))
+        _ = self.git("commit", "-m", "Add guilds fixture production")
+        _ = self.git("push", "origin", "build-followups")
+
+        result = self.successful(guild, "--plan", "docs/plans/given.md")
+        self.assertIn(f"{guild} started", result.stdout)
+        rows = list(production_units.unit_table(self.doc.read_text().splitlines()))
+        self.assertEqual([cell_value(row["Unit"]) for row in rows], [guild])
+        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT_ID"], guild)
+        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT"], "guilds")
+        with patch.dict(os.environ, self.env):
+            marked = unit_lookup.marked_unit("guilds", guild)
+            self.assertIsNotNone(marked)
+            if marked is not None:
+                self.assertEqual(marked.unit, guild)
+                self.assertEqual(marked.place.session, f"guilds-{guild}")
+            self.assertIsNone(unit_lookup.marked_unit("guilds", guild + "-unit"))
+
+        note = self.root / "guild-restart.md"
+        _ = note.write_text("Resume the guild loop.\n", encoding="utf-8")
+        request = add_unit.launch_request(argparse.Namespace(
+            production=str(self.doc), name=guild, plan="docs/plans/given.md", brief=None,
+            standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+            resume="guild-session", cwd=str(self.root / ("project-" + guild)),
+            restart_note=str(note), session_name=guild, host_session="guilds-" + guild, probe=False,
+        ))
+        self.assertEqual(request.unit, guild)
+        self.assertIsInstance(request.launch_kind, add_unit.UnitRestoreLaunch)
+        self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines()),
+                              add_unit.ExistingUnitRow)
+        before = self.doc.read_bytes()
+        resumed = self.cli(guild, "--plan", "docs/plans/given.md")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
+
+    def test_guilds_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("designers")
+
+    def test_guilds_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("reviewers")
+
+    def test_guilds_showrunner_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("showrunners")
+
+    def test_guilds_unit_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_guild_head_launch_and_restart("units")
+
+    def test_head_names_in_other_productions_and_other_names_in_guilds_keep_suffix(self) -> None:
+        guilds_doc = self.doc.with_name("guilds-production.md")
+        _ = guilds_doc.write_text(self.production_doc(), encoding="utf-8")
+        for document, names in ((self.doc, ("designers", "reviewers", "showrunners", "units")),
+                                (guilds_doc, ("reports", "designers-helper"))):
+            for name in names:
+                with self.subTest(production=document.name, name=name):
+                    request = add_unit.launch_request(argparse.Namespace(
+                        production=str(document), name=name, plan="docs/plans/given.md", brief=None,
+                        standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+                        resume=None, cwd=None, restart_note=None, session_name=None, host_session=None,
+                        probe=False,
+                    ))
+                    self.assertEqual(request.unit, name + "-unit")
+
+    def test_exact_table_row_is_adopted_without_suffix_in_another_production(self) -> None:
+        row = self.unit_row("designers", branch="build-followups-designers",
+                            worktree=self.root / "project-designers").replace("| designers-unit |", "| `designers` |")
+        self.commit_prepared_row(row)
+        request = add_unit.launch_request(argparse.Namespace(
+            production=str(self.doc), name="designers", plan="docs/plans/given.md", brief=None,
+            standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
+            resume=None, cwd=None, restart_note=None, session_name=None, host_session=None, probe=False,
+        ))
+        self.assertEqual(request.unit, "designers")
+        self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines()),
+                              add_unit.ExistingUnitRow)
+
     def test_restore_flags_are_atomic_and_require_resume(self) -> None:
         note = self.root / "restart-note.txt"
         _ = note.write_text("resume here", encoding="utf-8")
@@ -2598,7 +2682,8 @@ class AddUnitTests(ShutdownTestCase):
     def test_new_work_records_no_scheduled_prompt(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
 
-        self.assertFalse(self.pause_state.exists())
+        # herdr records the typed opening prompt under script-prompts; no scheduled prompt is kept.
+        self.assertFalse((self.pause_state / "scheduled-prompts").exists())
 
     def test_brief_row_cannot_be_retried_as_plan_on_its_stub(self) -> None:
         _ = self.successful("alpha", "--brief", "Write a full plan")
@@ -2690,6 +2775,41 @@ class AddUnitTests(ShutdownTestCase):
                         patch.object(session_pane, "read_place", side_effect=session_pane.HerdrFailure("unreadable")):
                     with self.assertRaisesRegex(RuntimeError, "did not become active\\nunreadable"):
                         _ = add_unit.wait_for_remote_control(request)
+
+    def test_remote_control_is_read_from_the_session_record_after_the_pane_line_scrolls_off(self) -> None:
+        request = add_unit.UnitLaunch(
+            production=add_unit.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
+            branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
+            port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
+            launch_kind=add_unit.NewWorkLaunch(), timeout=0,
+        )
+        registry = self.root / "registry"
+        registry.mkdir()
+        place = HerdrPlace("native", "w1:p1")
+        live = unit_lookup.LiveClaude("alpha", "session-123", "/socket", 4242)
+        starting = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(), place)
+        marked = unit_lookup.MarkedUnit("alpha-unit", live, place)
+        busy_pane = "⏺ Reading the plan\n  ⎿  Read 400 lines"
+        cases: tuple[tuple[str, dict[str, str], bool], ...] = (
+            ("bridged", {"bridgeSessionId": "session_bridge"}, True),
+            ("no bridge", {}, False),
+            ("empty bridge", {"bridgeSessionId": ""}, False),
+            ("another session's record", {"sessionId": "session-other", "bridgeSessionId": "session_bridge"}, False))
+        for label, extra, active in cases:
+            with self.subTest(label):
+                _ = (registry / "4242.json").write_text(json.dumps({
+                    "pid": 4242, "sessionId": "session-123", "name": "alpha", "messagingSocketPath": "/socket",
+                    "updatedAt": 1, **extra}))
+                # The first lookup finds the mark before the record names the live Claude.
+                with patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}), \
+                        patch.object(add_unit, "launched_unit", side_effect=[
+                            add_unit.MarkedUnitFound(starting), add_unit.MarkedUnitFound(marked)]), \
+                        patch.object(session_pane, "read_place", return_value=busy_pane):
+                    if active:
+                        self.assertEqual(add_unit.wait_for_remote_control(request), marked)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "did not become active\\n⏺ Reading the plan"):
+                            _ = add_unit.wait_for_remote_control(request)
 
     def test_underscore_name_and_checkout_without_trunk_suffix(self) -> None:
         renamed = self.root / "project"

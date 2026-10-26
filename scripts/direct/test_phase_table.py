@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the phase table built from delegate state and durable events."""
+"""Tests for the phase table built from worker state and durable events."""
 
 from __future__ import annotations
 
@@ -127,8 +127,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": str(at),
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": str(at),
             },
         ):
             return phase_table.build(self.session_dir)
@@ -139,8 +139,8 @@ class PhaseTableTests(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(self.notifier_dir),
             "NOTIFIER_SESSIONS_DIR": str(self.sessions_dir),
             "PHASE_TABLE_VAULT": str(self.vault_root),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-            "PLAN_DELEGATE_NOW_EPOCH": str(at),
+            "UNIT_HISTORY_DIR": str(self.history_dir),
+            "UNIT_NOW_EPOCH": str(at),
             **fake_unit_host.environment(self.root),
         }
 
@@ -622,7 +622,7 @@ class PhaseTableTests(unittest.TestCase):
                 **self.environment(at),
                 "HOME": str(self.root),
                 "USER_ZONE": "UTC",
-                "PLAN_DELEGATE_SYNC_WRITES": "0",
+                "UNIT_SYNC_WRITES": "0",
             }
             _ = environment.pop("CODEX_THREAD_ID", None)
             _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
@@ -1954,8 +1954,8 @@ class PhaseTableTests(unittest.TestCase):
                                                phase_title="Current delivery"))
                 _ = self.write_run("current", 800, *events)
                 with patch.dict(os.environ, {
-                    "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                    "PLAN_DELEGATE_NOW_EPOCH": "2000",
+                    "UNIT_HISTORY_DIR": str(self.history_dir),
+                    "UNIT_NOW_EPOCH": "2000",
                 }):
                     planned = phase_table.build_plan(self.plan)
                     self.write_plan("# As built\n")
@@ -1981,8 +1981,8 @@ class PhaseTableTests(unittest.TestCase):
                              phase_percent=50, phase_elapsed_seconds=50),
         ]
         with patch.dict(os.environ, {
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-            "PLAN_DELEGATE_NOW_EPOCH": "150",
+            "UNIT_HISTORY_DIR": str(self.history_dir),
+            "UNIT_NOW_EPOCH": "150",
         }):
             _ = self.write_run("current", 50, *events)
             without_title = phase_table.build_plan(self.plan)
@@ -2063,8 +2063,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": "1200",
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": "1200",
             },
         ):
             record = phase_table.build_plan(self.plan)
@@ -2153,8 +2153,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": "1100",
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": "1100",
             },
         ):
             shown = cast(dict[str, object], json.loads(phase_table.show(self.session_dir, ZoneInfo("UTC"), True)))
@@ -2217,8 +2217,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": str(epoch(10, 0)),
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": str(epoch(10, 0)),
             },
         ):
             rendered = phase_table.render(phase_table.build(self.session_dir), zone)
@@ -2273,8 +2273,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": str(epoch(10, 0)),
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": str(epoch(10, 0)),
             },
         ):
             rendered = phase_table.show(self.session_dir, zone)
@@ -2337,8 +2337,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": str(epoch(10, 0)),
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": str(epoch(10, 0)),
             },
         ):
             rendered = phase_table.show(self.session_dir, zone)
@@ -2372,8 +2372,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": str(epoch(10, 0)),
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": str(epoch(10, 0)),
             },
         ):
             rendered = phase_table.show(self.session_dir, zone)
@@ -2413,8 +2413,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": "1300",
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": "1300",
             },
         ):
             rendered = phase_table.render(phase_table.build(self.session_dir), ZoneInfo("UTC"))
@@ -2451,8 +2451,8 @@ class PhaseTableTests(unittest.TestCase):
             }
         )
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
-        environment["PLAN_DELEGATE_NOW_EPOCH"] = str(reported_at)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_NOW_EPOCH"] = str(reported_at)
 
         result = subprocess.run(
             [
@@ -2637,8 +2637,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": "1200",
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": "1200",
             },
         ):
             parsed = cast(
@@ -2672,8 +2672,8 @@ class PhaseTableTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "PLAN_DELEGATE_HISTORY_DIR": str(self.history_dir),
-                "PLAN_DELEGATE_NOW_EPOCH": "1200",
+                "UNIT_HISTORY_DIR": str(self.history_dir),
+                "UNIT_NOW_EPOCH": "1200",
             },
         ):
             parsed = cast(
@@ -2786,7 +2786,7 @@ class PhaseTableTests(unittest.TestCase):
         empty_session = self.root / "empty-session"
         empty_session.mkdir()
         environment = os.environ.copy()
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
 
         result = subprocess.run(
             ["python3", str(SCRIPT), "show", "--session-dir", str(empty_session)],

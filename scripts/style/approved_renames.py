@@ -24,26 +24,43 @@ import style_footprint
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
 # The keywords that declare an item directly in a module, trait or impl body.
 ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})
-# The words after which an item keyword can stand, besides an attribute, a `pub(..)` and an `extern` ABI string.
-ITEM_LEADS = frozenset({"{", "}", ";", "pub", "unsafe", "async", "const", "extern", "default"})
 # The macros that make an item name from other tokens or bring in items from another file.
 NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 # A relative Rust file path: folders of name characters, then a file whose stem can be a module name.
 RUST_FILE = r"(?:[A-Za-z0-9_-]+/)*[A-Za-z_][A-Za-z0-9_]*\.rs"
 # A file rename finding's after: each path ends at a space, a mark, the end of a sentence or the end of the text.
 FILE_RENAME = re.compile(rf"Rename ({RUST_FILE}) to ({RUST_FILE})(?=$|[\s;,:)]|\.(?:\s|$))")
-# Words after a file rename that name another change: a second file pair, or a move, split or merge of code.
-OTHER_CHANGE = re.compile(
-    rf"{RUST_FILE}\s+to\s+{RUST_FILE}|\b(?:mov(?:e|es|ed|ing)|split(?:s|ting)?|merg(?:e|es|ed|ing))\b", re.IGNORECASE)
+# Words after a file rename that name a second file pair: another change.
+SECOND_FILE_PAIR = re.compile(rf"{RUST_FILE}\s+to\s+{RUST_FILE}", re.IGNORECASE)
+# A move, split or merge of code; a word joined to another with a hyphen, as in `finding-merging`, is a name.
+CODE_MOVE = re.compile(r"(?<![\w-])(?:mov(?:e|es|ed|ing)|split(?:s|ting)?|merg(?:e|es|ed|ing))(?![\w-])", re.IGNORECASE)
+# The text between the start of a clause and a move word: a mark or a joining word ends the clause before it.
+CLAUSE_START = re.compile(r"[.;:,()]|\b(?:and|but|then)\b", re.IGNORECASE)
+# The words right before a move that negate it: `does not move`, `doesn't move`, `cannot move`, `never moves` or
+# `without moving`. Only these exact forms count, so any other text names a move and a person decides.
+NEGATED_VERB = re.compile(
+    r"(?:\b(?:does|do|did|will|shall|must|should|may|can|could|would)\s+not|n't|\bcannot|\bnever|\bwithout)\s*$",
+    re.IGNORECASE)
+# A `no` that negates the words after it: `no longer`, `no more` and the like do not.
+NO_LEAD = r"no(?!\s+(?:longer|more|less|fewer|later|sooner|doubt|matter)\b)"
+# A noun that names code.
+CODE_NOUN = r"(?:definitions?|items?|types?|behaviou?r|code|functions?|methods?|impls?|tests?|helpers?|facades?|splits?)"
+# A clause that is a subject of `no` before its move: `nothing`, `none`, or `no`, at most three words and a noun that
+# names code, as in `no existing definition moves`.
+NEGATED_SUBJECT = re.compile(rf"\s*(?:nothing|none|{NO_LEAD}(?:\s+[\w-]+){{0,3}}?\s+{CODE_NOUN})\s*", re.IGNORECASE)
+# The end of a sentence: `.`, `;` or the end of the text. A comma or a colon can start an exception, so it is not an end.
+CLAUSE_END = r"\s*(?:[.;]|$)"
+# What follows the move of a negated subject: a place word or the end of the clause, as in `moves into a file`.
+SUBJECT_MOVE_END = re.compile(rf"\s+(?:into|out|from|to|between|across|within)\b|{CLAUSE_END}", re.IGNORECASE)
+# An object of `no` right after a move, then the end of the clause, as in `move no skipped definitions.`; a place word
+# after the object can start an exception, as in `move no helpers into a file except LockError`.
+NEGATED_OBJECT = re.compile(rf"\s+{NO_LEAD}(?:\s+[\w-]+){{0,3}}?\s+{CODE_NOUN}{CLAUSE_END}", re.IGNORECASE)
+# A clause of `no` and at most three words before a move word that is itself the noun, as in `no additional split`.
+NEGATED_NOUN = re.compile(rf"\s*{NO_LEAD}(?:\s+[\w-]+){{0,3}}\s*", re.IGNORECASE)
+# What follows a move word that is a noun: a form of `be`, as in `no additional split is introduced`.
+NOUN_MOVE_END = re.compile(r"\s+(?:is|are|was|were)\b", re.IGNORECASE)
 # The file stems that are their folder's module or a crate root, not a module of their own name.
 ROOT_STEMS = frozenset({"mod", "lib", "main"})
-# The Rust keywords, strict and reserved in any edition: a module with one of these names needs `r#`.
-RUST_KEYWORDS = frozenset({
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false", "fn", "for",
-    "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "self", "Self",
-    "static", "struct", "super", "trait", "true", "try", "type", "unsafe", "use", "where", "while", "abstract", "become",
-    "box", "do", "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield",
-})
 
 
 @dataclass(frozen=True)
@@ -186,14 +203,28 @@ def approved_rename(kind: str, before: str, after: str) -> ApprovedRename | NoQu
 def file_rename(kind: str, path: str, after: str) -> FileRename | NoFileRename:
     """The file rename a finding approves, when its after starts with `Rename <a> to <b>` and its path ends with <a>."""
     match = FILE_RENAME.match(after)
-    if kind != "rename" or not match or OTHER_CHANGE.search(after, match.end()):
+    if kind != "rename" or not match or names_other_change(after[match.end():]):
         return NoFileRename()
     named_old, named_new = PurePosixPath(match[1]), PurePosixPath(match[2])
     stems = {named_old.stem, named_new.stem}
     if ((path != match[1] and not path.endswith("/" + match[1])) or named_old.parent != named_new.parent
-            or len(stems) == 1 or stems & ROOT_STEMS or stems & RUST_KEYWORDS):
+            or len(stems) == 1 or stems & ROOT_STEMS or stems & style_footprint.RUST_KEYWORDS):
         return NoFileRename()
     return FileRename(path, path.removesuffix(match[1]) + match[2])
+
+
+def names_other_change(rest: str) -> bool:
+    """Whether the text after a file rename names a second file pair, or a move, split or merge it does not negate."""
+    if SECOND_FILE_PAIR.search(rest):
+        return True
+    for move in CODE_MOVE.finditer(rest):
+        clause = rest[max((start.end() for start in CLAUSE_START.finditer(rest, 0, move.start())), default=0):move.start()]
+        negated_subject = NEGATED_SUBJECT.fullmatch(clause) and SUBJECT_MOVE_END.match(rest, move.end())
+        negated_noun = NEGATED_NOUN.fullmatch(clause) and NOUN_MOVE_END.match(rest, move.end())
+        negated_object = NEGATED_OBJECT.match(rest, move.end())
+        if not (NEGATED_VERB.search(clause) or negated_subject or negated_noun or negated_object):
+            return True
+    return False
 
 
 def file_module(path: str) -> str:
@@ -239,17 +270,6 @@ def type_path(words: tuple[str, ...]) -> tuple[str, ...]:
     readable = len(path) % 2 == 1 and all(
         word == "::" if i % 2 else style_footprint.IDENTIFIER.fullmatch(word) is not None for i, word in enumerate(path))
     return path[::2] if readable else ()
-
-
-def item_starts(words: tuple[str, ...]) -> frozenset[int]:
-    """The word indexes where an item keyword can stand: the first word, and the word after a brace, a semicolon, an
-    attribute, a visibility, an item qualifier or an ABI string."""
-    leads = {index for index, word in enumerate(words) if word in ITEM_LEADS and words[index - 1:index] != ("'",)}
-    leads.update(end - 1 for _, end in style_footprint.attribute_spans(words))
-    leads.update(style_footprint.closing(words, index + 1) for index, word in enumerate(words[:-1])
-                 if word == "pub" and words[index + 1] == "(")
-    leads.update(index for index in range(1, len(words)) if words[index - 1] == "extern" and words[index].startswith('"'))
-    return frozenset({0} | {lead + 1 for lead in leads})
 
 
 def inline_modules(words: tuple[str, ...], starts: frozenset[int]) -> tuple[InlineModule, ...]:
@@ -322,7 +342,7 @@ def std_derives_only(attributes: tuple[str, ...]) -> bool:
 def declaration_sites(words: tuple[str, ...], path: str, rename: ApprovedRename, name: str) -> Declarations | UncertainScan:
     """Where the file at path declares name directly under the rename's parent."""
     parent = rename.parent
-    starts = item_starts(words)
+    starts = style_footprint.item_starts(words)
     modules = inline_modules(words, starts)
     declared = tuple(index for index, word in enumerate(words[:-1])
                      if word in PARENT_KEYWORDS and index in starts and words[index + 1] == parent

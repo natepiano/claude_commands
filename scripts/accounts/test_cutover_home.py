@@ -26,6 +26,12 @@ from scripts.whoami.test_agent_accounts import ServiceKeychain, folder_service
 import account
 
 
+def file_state(path: Path) -> tuple[int, int, int, int, int, int]:
+    """Return the file's identity and change times, without the access time a read can move."""
+    status = path.stat()
+    return (status.st_dev, status.st_ino, status.st_mode, status.st_size, status.st_mtime_ns, status.st_ctime_ns)
+
+
 class HomeCutoverTests(unittest.TestCase):
     home: Path = Path()
 
@@ -225,6 +231,10 @@ class HomeCutoverTests(unittest.TestCase):
                               accounts.HistoricalAccountUnresolved)
 
     def test_exec_showrunners_always_sets_the_groups_numbered_folder(self) -> None:
+        program = self.home / ".local/bin/claude"
+        program.parent.mkdir(parents=True)
+        _ = program.write_text("#!/bin/sh\nexit 99\n")
+        program.chmod(0o700)
         accounts.cutover_home("claude2")
         _ = accounts.set_group_account("showrunners", "claude2", why="fixture", now=datetime.now(timezone.utc))
         with (patch.object(os, "execvpe") as execute,
@@ -370,7 +380,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
                           return_value=agent_accounts.CodexHomePreparationFailed("synthetic initialize timeout")):
             self.assertNotEqual(self.run_cutover(), 0)
         before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
-                  (self.target / "auth.json").stat())
+                  file_state(self.target / "auth.json"))
         _ = self.output.seek(0)
         _ = self.output.truncate()
         _ = self.errors.seek(0)
@@ -380,7 +390,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
             self.assertEqual(self.run_cutover(), 0)
         self.assert_login_moved()
         self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
-                          (self.target / "auth.json").stat()), before)
+                          file_state(self.target / "auth.json")), before)
         self.assertEqual(self.output.getvalue(), "")
         self.assertEqual(self.errors.getvalue(), "")
 
@@ -399,11 +409,11 @@ class CodexHomeCutoverTests(unittest.TestCase):
     def test_complete_codex_cutover_rerun_changes_no_identity_journal_or_history(self) -> None:
         self.assertEqual(self.run_cutover(), 0)
         before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
-                  (self.target / "auth.json").stat())
+                  file_state(self.target / "auth.json"))
         with patch.object(accounts, "list_codex_home_processes", side_effect=AssertionError("completed move needs no process check")):
             self.assertEqual(self.run_cutover(), 0)
         self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes(),
-                          (self.target / "auth.json").stat()), before)
+                          file_state(self.target / "auth.json")), before)
 
     def test_completed_codex_cutover_can_move_a_new_legacy_login_to_its_own_numbered_home(self) -> None:
         self.assertEqual(self.run_cutover(), 0)
@@ -565,7 +575,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
                    "at": "2026-10-16T12:00:00Z", "state": "moving"}
         self.journal.parent.mkdir(parents=True)
         _ = self.journal.write_text(json.dumps(journal))
-        before = (self.journal.read_bytes(), (self.source / "auth.json").stat())
+        before = (self.journal.read_bytes(), file_state(self.source / "auth.json"))
         for login in ("replacement@example.invalid", ""):
             with self.subTest(readable=bool(login)):
                 _ = self.errors.seek(0)
@@ -574,7 +584,7 @@ class CodexHomeCutoverTests(unittest.TestCase):
                     self.assertNotEqual(self.run_cutover(), 0)
                 self.assertEqual(self.errors.getvalue(),
                     "accounts: ~/.codex now holds another login than the recorded cutover; undo it first\n")
-                self.assertEqual((self.journal.read_bytes(), (self.source / "auth.json").stat()), before)
+                self.assertEqual((self.journal.read_bytes(), file_state(self.source / "auth.json")), before)
                 self.assertFalse(self.target.exists())
                 self.assertFalse(accounts.accounts_config_file().exists())
 

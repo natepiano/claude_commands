@@ -4,7 +4,17 @@ description: Ask a gpt-6-astra Codex reviewer, on the current workers account, t
 
 # astra_review
 
-**Usage:** `/astra_review <document path> [focus text]`
+<Guild>
+
+Your guild is `reviewers`. Your head is the `reviewers` unit director in the top-level `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/reviewers/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `reviewers`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
+
+Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers
+
+Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
+
+The script loads the reviewers block and tip text into each prompt. A Codex
+holder relays a guild report in the reply unchanged.
+</Guild>
 
 One Codex turn with gpt-6-astra at reasoning xhigh reads the document read-only
 and reviews it: clarity, correctness, gaps, risks and what it would change, with
@@ -12,15 +22,21 @@ each finding tied to a section or a file and line. The user, showrunners and uni
 directors use it the same way. It runs on the current workers account and
 changes no file.
 
+**Usage:** `/astra_review [--run-directory <dir> --phase <id>] <document path> [focus text]`
+
 ## Steps
 
-1. Take the path and the focus from `$ARGUMENTS`: the first word is the path,
-   the rest is the focus. With no path, ask for one in one plain line and stop.
+1. Consume `--run-directory <dir> --phase <id>` before reading the document;
+   pass both for phase work, neither for standalone work. The next word is the
+   path and the rest is focus. With no path, ask for one in one plain line and stop.
    Resolve a relative path from the working directory; if no file is there, say
    so and stop.
 2. Run the review as one command, with `dangerouslyDisableSandbox: true` (it
    reads `~/.codex*` and reaches the network):
-   `~/.claude/scripts/lib/py ~/.claude/scripts/astra/astra_review.py "<path>" <focus>`
+   `~/.claude/scripts/lib/py ~/.claude/scripts/astra/astra_review.py [--run-directory <dir> --phase <id>] "<path>" <focus>`
+   A held document uses its sole reviewer in the same thread. Busy or unavailable
+   means report that state; do not start another reviewer. Without a held design,
+   the script keeps its one-turn read-only review.
    - **Claude:** run it with `run_in_background: true`, tell the caller in one
      line that the astra review is running, then end the turn or do other work.
      The task notification is the wait. Never poll it, sleep or read its output
@@ -36,7 +52,8 @@ changes no file.
      something you can check.
    - Exit 1: the review failed. Report what Codex said and the account it ran
      on. Do not retry with another model or account.
-   - Exit 2: the document was missing; say so.
+   - Exit 2: report the `astra_review:` error line. A phase or tips-baseline
+     error is that error, not a missing document.
 
 The run folder under `/tmp/claude/astra/` keeps the prompt, Codex's log and the
 review.

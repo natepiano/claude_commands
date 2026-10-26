@@ -11,7 +11,13 @@ an agent family; `[<function>.<family>]` maps each subtask to an
 `agent[:effort]` row; and `[<family>.agents]` catalogs each valid agent and its
 allowed efforts. Omit `:effort` to use the agent CLI's default.
 
-Use `/agent` to view or edit assignments and rows. The Codex catalog is
+`config/agents.conf` holds the committed defaults. This machine's own rows go
+in the untracked `config/agents.local.conf`, which holds only the rows that
+differ; readers see them over the defaults, and a commit or merge never
+touches them. To move a full registry's local rows into the overlay, run
+`scripts/agents/agents_overlay.sh migrate --from <copy>`.
+
+Use `/agent` to view or edit assignments and rows; edits write the overlay. The Codex catalog is
 automatically synchronized from `~/.codex/config.toml` and
 `~/.codex/models_cache.json` by `scripts/agents/sync_codex_catalog.sh`. Its
 launchd job checks every five minutes and at login; the registry reader also
@@ -65,7 +71,7 @@ the Mac. An empty `ci_repo` disables CI calls. `MAC_TEST_CONFIG` selects a
 different file for a checkout's scripts in tests. Installed scripts refuse to
 run with `MAC_TEST_CONFIG` set.
 
-## delegate.conf
+## direct.conf
 
 The `/unit:direct` tuning file: the convergence limits — how many automatic
 fix rounds one phase runs before the gate remarks on how it is going — plus
@@ -83,7 +89,7 @@ hard ceiling (5). The rest bound the other patterns worth reporting:
 agent says something, not when it halts — the decision to stop is the user's,
 made from what gets reported.
 
-`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
+`UNIT_PROGRESS_INTERVAL_SECONDS` sets the Codex poll timeout, per
 `<CodexDispatchWait/>` in `commands/unit/direct.md`; Codex requires a positive
 integer. It is 3600, one hour (user, 2026-10-10). Unit reports come only when
 someone asks (2026-10-19): no notifier instance or timer sends them.
@@ -92,7 +98,7 @@ someone asks (2026-10-19): no notifier instance or timer sends them.
 the next `findings.py gate` with nothing to restart. The file is authoritative:
 no limit has a compiled default, so a missing key, a non-numeric value, or a
 value below its minimum makes `findings.py` list every problem it found and
-exit 2 before running the command. `PLAN_DELEGATE_CONFIG` overrides the path,
+exit 2 before running the command. `UNIT_CONFIG` overrides the path,
 which is how `test_findings.py` supplies its own limits rather than this
 machine's.
 
@@ -129,6 +135,8 @@ file named.
   `TZ="$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/user_zone.py)" date '+%H:%M %Z'`.
 - `USER_ZONE` in the environment wins over the file. Tests whose expected
   output is in one zone pin it this way.
+- `/zone <place>` changes it on both machines and tells every session; a bare
+  `/zone` shows it. The status line reads the file in `statusline.sh`.
 
 A production keeps its own `User zone` line in its production doc, and the
 dailies read that. A time stored without an offset keeps the zone it was
@@ -138,13 +146,16 @@ roster.
 ## statusline.conf
 
 Colors for each role and account in the status line, plus usage-level colors
-and thresholds for context tokens used and quota percentages left. `counts.<type>`
+and thresholds for context tokens used and quota percentages left. Role keys are
+`role.showrunner` (purple), `role.unit-director` (yellow),
+`role.astra-designer` (mauve) and `role.astra-reviewer` (bright-green). Workers and
+unassigned sessions have no key and show as plain text. `counts.<type>`
 colors each part of the `For you:` row: `questions`, `changes`, `efficiency`,
 `proposals` and `projects`.
 `scripts/statusline/statusline.sh` passes it to `statusline.jq` on each refresh;
 an edit applies on the next refresh. A missing or bad entry leaves that piece
 uncolored. Colors use ANSI names (`cyan`, `bright-magenta`, and so on) or the
-named 256-color entries `orange`, `purple`, `pink`, `teal` and `brown`.
+named 256-color entries `orange`, `purple`, `pink`, `teal`, `brown` and `mauve`.
 `/new_account` adds the new Claude account's `account.` line.
 
 ## cargo-fmt-exclusions.json
