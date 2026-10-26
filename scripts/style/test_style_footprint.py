@@ -547,6 +547,49 @@ class StyleFootprintTests(unittest.TestCase):
                 _ = self.commit()
                 self.assertIn("check 6", self.assert_review(base))
 
+    SERIALIZED_REASON = "check 6: serialized, reflected, configured or documented name flagged"
+
+    def test_a_serde_or_reflect_attribute_a_comment_or_raw_word_hides_requires_review(self) -> None:
+        body = "struct Value {\n    input: usize,\n}\n"
+        for attribute in (
+            "#/* c */[serde(default)]", "# // c\n    [serde(default)]", "#[r#serde(default)]",
+            '#[cfg_attr(feature = "s", serde(skip))]', "#[reflect(ignore)]", '#[custom(rename // c\n    = "x")]',
+        ):
+            with self.subTest(attribute=attribute):
+                self.write("src/lib.rs", body)
+                base = self.commit()
+                self.write("src/lib.rs", body.replace("    input", f"    {attribute}\n    input"))
+                _ = self.commit()
+                self.assertIn(self.SERIALIZED_REASON, self.assert_review(base))
+
+    def test_an_inner_reflect_attribute_requires_review(self) -> None:
+        body = "struct Value;\n"
+        self.write("src/lib.rs", body)
+        base = self.commit()
+        self.write("src/lib.rs", "#![reflect(ignore)]\n" + body)
+        _ = self.commit()
+        self.assertIn(self.SERIALIZED_REASON, self.assert_review(base))
+
+    def test_a_serde_word_on_a_changed_line_of_a_longer_attribute_requires_review(self) -> None:
+        before = '#[cfg_attr(\n    feature = "s",\n    serde(default)\n)]\nstruct Value;\n'
+        self.write("src/lib.rs", before)
+        base = self.commit()
+        self.write("src/lib.rs", before.replace("serde(default)", "serde(skip)"))
+        _ = self.commit()
+        self.assertIn(self.SERIALIZED_REASON, self.assert_review(base))
+
+    def test_a_serde_attribute_in_a_comment_or_a_string_is_not_a_serialized_name(self) -> None:
+        for before, after in (
+            ("fn value() {}\n", "// #[serde(x)]\nfn value() {}\n"),
+            ('fn value() -> &\'static str { "a" }\n', 'fn value() -> &\'static str { "#[serde]" }\n'),
+        ):
+            with self.subTest(after=after):
+                self.write("src/lib.rs", before)
+                base = self.commit()
+                self.write("src/lib.rs", after)
+                _ = self.commit()
+                self.assertNotIn(self.SERIALIZED_REASON, self.check(base).stdout)
+
     def test_method_target_swap_without_a_definition_rename_requires_review(self) -> None:
         before = (
             "struct Cache;\nimpl Cache {\n    fn clear(&mut self) {}\n    fn flush(&mut self) {}\n}\n"
