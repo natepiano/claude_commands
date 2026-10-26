@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -528,6 +529,77 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.held_rows(ledger.database), before)
         _ = self.cli("held", "replace", "--id", finding_id, "--after", "corrected")
         self.assertEqual(ledger.named_held((finding_id,))[0].after, "corrected")
+
+    def test_hold_of_a_different_change_at_a_held_site_gets_its_own_row(self) -> None:
+        rule = self.rule("change-ids")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        blob = self.blob(rule)
+        change: tuple[style_ledger.FindingKind, str, str] = ("rename", "old", "new")
+        others: tuple[tuple[str, tuple[style_ledger.FindingKind, str, str]], ...] = (
+            ("after", ("rename", "old", "other")), ("kind", ("type", "old", "new")),
+            ("before", ("rename", "older", "new")))
+
+        def hold(line: int, held: tuple[style_ledger.FindingKind, str, str]) -> style_ledger.HeldFinding:
+            return ledger.hold(rule, self.sources[0], line, "value", *held, blob, "outside")
+
+        def finding_id(fields: tuple[str | int, ...]) -> str:
+            return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()[:16]
+
+        for line, (name, other) in enumerate(others, 1):
+            with self.subTest(differs=name):
+                site = (rule, self.sources[0], line, "value", blob)
+                # The same change twice is one row at today's id, so a row from before this change keeps its id.
+                today = finding_id(site)
+                self.assertEqual(hold(line, change).finding_id, today)
+                rows = self.held_rows(ledger.database)
+                self.assertEqual(hold(line, change).finding_id, today)
+                self.assertEqual(self.held_rows(ledger.database), rows)
+                second = hold(line, other)
+                self.assertEqual((second.finding_id, second.kind, second.before, second.after),
+                                 (finding_id((*site, *other)), *other))
+                count = len(self.held_rows(ledger.database))
+                self.assertEqual((hold(line, change).finding_id, hold(line, other).finding_id),
+                                 (today, second.finding_id))
+                self.assertEqual(len(self.held_rows(ledger.database)), count)
+                kept, = ledger.named_held((today,))
+                self.assertEqual((kept.kind, kept.before, kept.after), change)
+
+    def test_hold_returns_its_change_when_another_writer_changes_the_row_after_the_commit(self) -> None:
+        rule = self.rule("change-race")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        held = cast(Callable[[style_ledger.Ledger, str], style_ledger.HeldFinding],
+                    getattr(style_ledger.Ledger, "_held"))
+        waiting: list[str] = []
+
+        def held_with_another_writer(self_: style_ledger.Ledger, finding_id: str) -> style_ledger.HeldFinding:
+            # Another writer changes the row now if no lock stops it, else right after the commit.
+            try:
+                with closing(sqlite3.connect(ledger.database, timeout=0)) as connection, connection:
+                    _ = connection.execute("UPDATE held_findings SET after='other' WHERE finding_id=?",
+                                           (finding_id,))
+            except sqlite3.OperationalError:
+                waiting.append(finding_id)
+            return held(self_, finding_id)
+
+        def hold() -> style_ledger.HeldFinding:
+            return ledger.hold(rule, self.sources[0], 1, "value", "rename", "old", "new", self.blob(rule), "outside")
+
+        first = hold()
+        # The second call returns the existing row; the third inserts a row at the second id.
+        for path in ("existing row", "insert"):
+            with self.subTest(path=path):
+                with mock.patch.object(style_ledger.Ledger, "_held", held_with_another_writer):
+                    finding = hold()
+                self.assertEqual(finding.after, "new")
+                self.assertEqual(len(waiting), 1)
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute("UPDATE held_findings SET after='other' WHERE finding_id=?",
+                                           (waiting.pop(),))
+                self.assertEqual(ledger.named_held((finding.finding_id,))[0].after, "other")
+        self.assertEqual(len(self.held_rows(ledger.database)), 2)
+        self.assertEqual(ledger.named_held((first.finding_id,))[0].after, "other")
 
     def test_held_replace_refuses_an_unknown_id(self) -> None:
         result = self.cli("held", "replace", "--id", "missing", "--after", "new", success=False)
@@ -6512,9 +6584,13 @@ class StyleLedgerTests(unittest.TestCase):
         original = next(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings()) if finding.finding_id == first)
         duplicate = ledger.hold(rule_id, self.sources[0], 1, "pub fn old_name_1() {}", "type",
                                 "different before", "different after", self.blob(rule_id), "another-ticket")
-        self.assertEqual(duplicate, original)
+        # A different change at the same site is its own row, and the first row keeps its change.
+        self.assertNotEqual(duplicate.finding_id, first)
+        self.assertEqual((duplicate.kind, duplicate.before, duplicate.after),
+                         ("type", "different before", "different after"))
+        self.assertEqual(ledger.named_held((first,))[0], original)
         proposal = self.root / "issues/rename.md"
-        for finding in (first, second):
+        for finding in (first, second, duplicate.finding_id):
             for _ in range(2):
                 _ = self.cli("held", "file", "--id", finding, "--proposal", str(proposal))
         self.assertEqual(self.summary_report()["proposals"], 1)
