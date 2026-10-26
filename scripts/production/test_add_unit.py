@@ -1063,7 +1063,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(
             result.stderr,
             "add_unit: claude2 is held by a shutdown "
-            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            + "(since 2026-10-09 14:49 PDT), requested in a terminal; /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 
@@ -1752,7 +1752,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(
             result.stderr,
             "add_unit: claude3 is held by a shutdown "
-            + "(since 2026-10-09 14:49 PDT); /shutdown restart first\n",
+            + "(since 2026-10-09 14:49 PDT), requested in a terminal; /shutdown restart first\n",
         )
         self.assert_no_launch_change(document, head)
 
