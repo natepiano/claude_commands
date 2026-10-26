@@ -4755,6 +4755,16 @@ class RestartTests(ShutdownTestCase):
             ],
         })
 
+    def test_a_saved_manual_restart_of_a_host_the_launcher_starts_launches_again(self) -> None:
+        legacy = inventory.LegacyTmuxHost(kind="legacy tmux", session_name="dashboard")
+        recorded = inventory.HerdrHost(kind="herdr", herdr_session="dashboard", pane_id="w1:p1", presentation="detached")
+        for host in (legacy, recorded):
+            with self.subTest(host=host["kind"]), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / host["kind"])}):
+                saved = entry(top_level("dashboard", host=host),
+                              state=record.SessionNeedsManualRestart(kind="manual restart", command="resume"))
+                self.create([saved])
+                self.assertEqual(self.run_restarts(confirmed=frozenset({"dashboard"})), (0, ["dashboard"]))
+
     def test_pending_timers_only_retry_the_failed_timer_when_live(self) -> None:
         saved = entry(top_level("owner"), state=record.SessionRestoredTimersPending(
             kind="timers pending", at=STOPPED, timers=[record.PendingTimer(instance="pending", reason="failed")],
