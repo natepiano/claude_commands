@@ -1878,6 +1878,14 @@ def _tell_source_fallback(saved: SessionShutdown) -> None:
         saved["showrunner_told"] = settle.SHOWRUNNER_TOLD_BACK
 
 
+def _host_needs_manual_restart(host: Host) -> bool:
+    """True for a host `_launch_session` cannot start: an unknown host, or a terminal off the Mac.
+
+    A saved manual restart of any other host launches again, so a record saved by an older launcher comes back.
+    """
+    return host["kind"] == "unknown" or (host["kind"] == "terminal" and sys.platform != "darwin")
+
+
 def launch_entry(
     record: SessionShutdown,
     restarted_at: str,
@@ -1956,10 +1964,10 @@ def launch_entry(
             _record_timer_restore_progress(record, timer_failures)
         return EntrySettled()
 
-    if progress["kind"] == "manual restart":
+    if progress["kind"] == "manual restart" and _host_needs_manual_restart(session["host"]):
         if dry_run:
             print(f"manual restart {session['name']}: {progress['command']}")
-        elif not dry_run:
+        else:
             _ = _set_entry_progress(record, progress)
         return EntrySettled()
 
