@@ -2448,17 +2448,35 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 ### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: todo
 
-**Depends on:** Phase 87; shutdown-unit's 10-26 19:30 AST checkpoint merged
+**Depends on:** Phase 87
 
 #### Work Order
 
-**Goal:** Whatever stops a unit (a move, a crash, a stale hold), it comes back with no user step. Showrunner, user go 10-26: a watchdog on a timer restarts a unit whose session is down without a stop the user asked for, on the group account, else the source; a phone alert goes only when both fail. A gate test rebuilds today's case and passes only when every unit runs again with no manual step. User: "Anything you have to use a memory for is not viable."
+**Goal:** Whatever stops a unit (a move, a crash, a stale hold), it comes back with no user step. Showrunner, user go 10-26: a watchdog on a timer restarts a unit whose session is down without a stop the user asked for, on the group account, else the source; a phone alert goes only when both fail. A gate test rebuilds the 10-26 case and passes only when every unit runs again with no manual step. User: "Anything you have to use a memory for is not viable."
 
-**Spec (outline; details written at phase start from Phase 87's as-built):**
-1. A watchdog pass in `refusal_watch.run()` (the notes timer, every 2 min on natedev), after the move passes. Units that should run: each registered showrunner's production doc Units rows that are not retired, whose run is in progress (`production/live_units.py`, `unit_lookup.run_state`).
-2. A unit is down when no live session holds it. Skip it when a shutdown record or hold is in progress for it (stopping, waiting, restarting), when a user-asked stop holds it (`then: "stop"` record with a session or terminal origin that is live, or a stopped record of a stop the user asked for), or when it was first seen down less than one pass ago (state file under `~/.local/state/accounts/`).
-3. Restart: on the group account through the same launch path `agents restart` uses (record or recovery snapshot); if that fails, on the source account. Both failing: one `shutdown.restart_failed` user push per outage (not per pass), and the showrunner gets a line each time.
-4. Carried from Phase 87 review (F009, minor): the cleared-hold relay in `refusal_watch.py` builds its `quota_alert` jobs with an empty name, so each retry after a `QUEUED` result appends another copy. Name each job by the pending notice's stable identity and treat `QUEUED` as handed off (drop it from the pending file).
-5. Gate test: a scratch production with units on claude4 and a stale stop hold on claude2 (requesting session gone), then the auto group move claude4 → claude2: every unit runs again, on claude2, with no manual step. A second case with a hold still in use: the move stops nobody, and units whose sessions die are restarted by the watchdog on claude4.
+**Constraints:**
+- The notes timer (`agent-sessions-snapshot.timer`, every 2 min on natedev; the Mac has none) runs `whoami/agent_notes.py`, whose argument-free run calls `refusal_watch.run()` (~1176). The watchdog runs there, after the move passes, under the same lock. `production/stall_watch.py` belongs to other units: do not edit it.
+- Units that should run: each registered showrunner (`production/showrunners.py`) has a production doc; `production/live_units.py` (`production_units(doc)` → `LiveUnit(unit, session)`, states `live|stopped|unknown|gone`), `production_units.live_unit_table`, `unit_is_retired`, and `unit_lookup.run_state(worktree)` (`UnitState.RUNNING`) tell which units are in a run and whether their session is live. Read these; change them only if a defect blocks the watchdog.
+- Shutdown records (`shutdown/record.py`: `all_session_records`, `session_records(login)`, `lookup_account_hold`) and the recovery snapshot (`record.read_snapshot` / `all_snapshots`) say what stopped a unit. A user-asked stop is a record with `then: "stop"` whose `requested_by` is a session or a terminal; a stop the move system made has `then: "restart"`.
+- The restart path is `shutdown.py restart <login> --here --only <ids>` (Phase 87: skips the running, per-name errors), which covers both a record and a crash found in the recovery snapshot. A moved record already falls back to its source (Phase 87).
 
-**Files:** `scripts/accounts/refusal_watch.py`, a new `scripts/accounts/unit_watchdog.py` if the pass is over ~100 lines, tests in `scripts/accounts/`, `docs/accounts.md`.
+**Spec:**
+1. `scripts/accounts/unit_watchdog.py` with one entry, `run(now, *, dry_run) -> list[str]`, called from `refusal_watch.run()` after the move passes. Natedev only (the role-map host); the Mac does nothing.
+2. Down unit: a non-retired unit in a running run (`RUNNING`) whose session is not live. Skip it when a shutdown record for its session is in progress (`waiting`, `ready`, `stopping`, `restarting`, `held by usage limit`, `reaping`), when a user-asked stop holds it (`then: "stop"` record, or an account hold with `then: "stop"` that `launch_permission` still reports in use), or when it was first seen down less than one pass ago. Keep first-seen times and alert state in `~/.local/state/accounts/unit_watchdog.json` (scratch in tests; atomic write).
+3. Restart: through `shutdown.py restart` on the group account (`accounts.group_accounts()["units"]`) for a unit with no move record, else the record's own login (the Phase 87 fallback then covers the source). If the group-account restart fails and the unit last ran on another account (record source or snapshot login), try that account once. Each pass tells the unit's showrunner one line per restart ("watchdog: <unit> was down since <time>; restarted on <account>"), through the existing showrunner message path, not a phone push.
+4. Both failing: one `shutdown.move_failed`-style user push per outage (reuse an existing push id from `notify/push_catalog.py`; add no new push text), sent once until the unit runs again; the showrunner gets a line every pass.
+5. F009 carried from Phase 87: the cleared-hold relay in `refusal_watch.py` builds its `quota_alert` jobs with an empty name, so a retry after a `QUEUED` result appends another copy. Name each job by the pending notice's stable identity and treat `QUEUED` as handed off (drop it from the pending file). Test with the real retry, delivery and enqueue functions and in-memory storage.
+6. Gate test `scripts/accounts/test_unit_watchdog.py`, scratch HOME and state dirs, fakes for every launch and send leaf:
+   - the 10-26 case: units on claude4 in a scratch production, a stale `then: "stop"` hold on claude2 whose requesting session is gone, then the auto group move claude4 → claude2 through `refusal_watch.run()`. With a fake launch that makes each started session live, every unit runs again on claude2 with no manual step, and the showrunner notice names the cleared hold;
+   - a hold still in use on claude2: the move stops nobody; then a unit's session dies (crash, no record), and the watchdog restarts it on claude4 after one pass of grace;
+   - a user-asked stop (`then: "stop"`, terminal origin) is never restarted; a retired unit and a finished run are never restarted;
+   - group account and source both refuse: one user push across three passes, a showrunner line each pass, and the push again only after the unit ran and went down again.
+7. Docs: `docs/accounts.md` (the watchdog: what it restarts, what it skips, where it alerts).
+
+**Files:** `scripts/accounts/unit_watchdog.py` (new), `scripts/accounts/refusal_watch.py`, `scripts/accounts/test_unit_watchdog.py` (new), `scripts/accounts/test_refusal_watch.py`, `docs/accounts.md`.
+
+**Workers:** 1 writer. impl owns all files.
+
+**Verification:** `scripts.accounts.test_unit_watchdog scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.whoami.test_agent_notes scripts.whoami.test_quota_alert` with a scratch HOME; basedpyright 0/0 on changed Python files.
+
+**Acceptance gate:** the 10-26 gate test passes with no manual step; suites pass; basedpyright 0/0; merge gate passes.
