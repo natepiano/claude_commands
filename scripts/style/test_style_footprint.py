@@ -2180,7 +2180,7 @@ class StyleFootprintTests(unittest.TestCase):
         before = {**self.LIMIT_FILES, "src/lib.rs": macro + self.LIMIT_FILES["src/lib.rs"],
                   "src/writer.rs": self.LIMIT_FILES["src/writer.rs"].replace("= 4;", "= twice!(2);")}
         after = {name: text.replace("= 4;", "= twice!(2);") for name, text in self.LIMIT_MOVED.items()}
-        self.assert_move_refused("const LIMIT invokes the macro twice", before, after)
+        self.assert_move_refused("src/constants.rs: a macro call the proof cannot resolve: twice!", before, after)
 
     def test_an_item_move_is_refused_when_a_use_group_names_it(self) -> None:
         before = {**self.LIMIT_FILES, "src/reader.rs": "use crate::{constants::OTHER, writer::LIMIT};\n\n"
@@ -2217,11 +2217,11 @@ class StyleFootprintTests(unittest.TestCase):
         self.assert_move_refused("cannot read the use item", self.LIMIT_FILES, after)
 
     def test_an_item_move_is_refused_when_the_item_invokes_a_builtin_macro(self) -> None:
-        origin = "\npub(crate) const ORIGIN: &str = module_path!();\n"
+        origin = "\npub(crate) fn origin() -> &'static str {\n    module_path!()\n}\n"
         before = {**self.LIMIT_FILES, "src/writer.rs": self.LIMIT_FILES["src/writer.rs"] + origin}
         after = {"src/writer.rs": self.LIMIT_FILES["src/writer.rs"],
                  "src/constants.rs": self.LIMIT_FILES["src/constants.rs"] + origin}
-        self.assert_move_refused("const ORIGIN invokes the macro module_path", before, after)
+        self.assert_move_refused("src/constants.rs: a macro call the proof cannot resolve: module_path!", before, after)
 
     def test_an_item_move_is_refused_when_the_item_has_a_cfg(self) -> None:
         before = {**self.LIMIT_FILES, "src/writer.rs": self.LIMIT_FILES["src/writer.rs"].replace(
@@ -2419,7 +2419,7 @@ class StyleFootprintTests(unittest.TestCase):
         before = {"src/lib.rs": lib, "src/constants.rs": "make_value!(2);\n\npub(crate) const OTHER: usize = 1;\n",
                   "src/writer.rs": "make_value!(1);\n" + moved}
         after = {"src/constants.rs": before["src/constants.rs"] + moved, "src/writer.rs": "make_value!(1);\n"}
-        self.assert_move_refused("src/writer.rs has a macro outside a fn body: make_value", before, after)
+        self.assert_move_refused("src/constants.rs: a macro call the proof cannot resolve: make_value!", before, after)
 
     def test_an_item_move_is_refused_when_an_associated_path_finds_a_lowercase_trait(self) -> None:
         before = {
@@ -2581,7 +2581,7 @@ class StyleFootprintTests(unittest.TestCase):
                + "mod constants;\nmod reader;\nmod report;\nmod writer;\n")
         before = {**self.LIMIT_FILES, "src/lib.rs": lib,
                   "src/report.rs": "bind_bridge!();\nuse bridge::*;\n\npub(crate) fn report() -> usize { write() }\n"}
-        self.assert_move_refused("src/lib.rs: a macro that can emit a use or a module", before, self.LIMIT_MOVED)
+        self.assert_move_refused("src/lib.rs: a crate macro the proof cannot read", before, self.LIMIT_MOVED)
 
     def test_an_item_move_is_refused_when_a_macro_binds_its_arguments(self) -> None:
         lib = ("macro_rules! module_alias {\n    ($alias:ident :: $source:ident) => {\n"
@@ -2590,7 +2590,7 @@ class StyleFootprintTests(unittest.TestCase):
         report = ("module_alias!(alloc::writer);\nuse alloc::*;\n\n"
                   + "pub(crate) fn report(rows: usize) -> bool { matches!(rows, LIMIT) }\n")
         before = {**self.LIMIT_FILES, "src/lib.rs": lib, "src/report.rs": report}
-        self.assert_move_refused("src/lib.rs: a macro that can emit a use or a module", before, self.LIMIT_MOVED)
+        self.assert_move_refused("src/lib.rs: a crate macro the proof cannot read", before, self.LIMIT_MOVED)
 
     def test_an_item_move_is_refused_when_a_macro_takes_a_keyword_as_an_argument(self) -> None:
         lib = ("macro_rules! module_alias {\n    ($u:tt $alias:ident :: $source:ident $a:tt) => {\n"
@@ -2599,7 +2599,7 @@ class StyleFootprintTests(unittest.TestCase):
         report = ("module_alias!(use alloc::writer as);\nuse alloc::*;\n\n"
                   + "pub(crate) fn report(rows: usize) -> bool { matches!(rows, LIMIT) }\n")
         before = {**self.LIMIT_FILES, "src/lib.rs": lib, "src/report.rs": report}
-        self.assert_move_refused("src/lib.rs: a macro that can emit a use or a module", before, self.LIMIT_MOVED)
+        self.assert_move_refused("src/lib.rs: a crate macro the proof cannot read", before, self.LIMIT_MOVED)
 
     def test_an_item_move_is_refused_when_a_crate_macro_can_make_a_binding(self) -> None:
         cases = (
@@ -2616,18 +2616,19 @@ class StyleFootprintTests(unittest.TestCase):
         for name, macro in cases:
             with self.subTest(name=name):
                 before = {**self.LIMIT_FILES, "src/lib.rs": macro + self.LIMIT_FILES["src/lib.rs"]}
-                self.assert_move_refused("src/lib.rs: a macro that can emit a use or a module", before,
+                self.assert_move_refused("src/lib.rs: a crate macro the proof cannot read", before,
                                          self.LIMIT_MOVED)
         with self.subTest(name="added after the change"):
             after = {**self.LIMIT_MOVED, "src/writer.rs": cases[0][1] + self.LIMIT_MOVED["src/writer.rs"]}
-            self.assert_move_refused("src/writer.rs: a macro that can emit a use or a module", self.LIMIT_FILES,
+            self.assert_move_refused("src/writer.rs: a crate macro the proof cannot read", self.LIMIT_FILES,
                                      after)
 
     def test_an_item_move_is_refused_when_a_crate_file_includes_code(self) -> None:
         cases = (
-            ("src/lib.rs", "macro_rules! module_alias {\n    () => { include!(\"bindings.inc\"); };\n}\n\n"),
+            ("src/lib.rs", "fn bindings() {\n    include!(\"bindings.inc\");\n}\n\n"),
             ("src/lib.rs", "include!(\"bindings.inc\");\n\n"),
             ("src/lib.rs", "r#include!(\"bindings.inc\");\n\n"),
+            ("src/lib.rs", "std::include!(\"bindings.inc\");\n\n"),
         )
         for path, code in cases:
             with self.subTest(code=code):
@@ -2636,18 +2637,136 @@ class StyleFootprintTests(unittest.TestCase):
                 self.assert_move_refused(f"{path}: an include! brings code the proof cannot read", before,
                                          self.LIMIT_MOVED)
 
-    def test_an_item_move_is_proven_beside_an_include_str(self) -> None:
-        lib = "const NOTES: &str = include_str!(\"notes.txt\");\n\n" + self.LIMIT_FILES["src/lib.rs"]
-        result = self.prove_move({**self.LIMIT_FILES, "src/notes.txt": "use crate::writer as alloc;\n",
-                                  "src/lib.rs": lib}, self.LIMIT_MOVED)
-        assert isinstance(result, style_footprint.ItemMoves), result
-        self.assertEqual([(move.kind, move.name) for move in result.moves], [("const", "LIMIT")])
+    def test_an_item_move_is_refused_when_a_crate_file_names_include(self) -> None:
+        cases = (
+            "use std::include as splice;\n\n"
+            + "macro_rules! module_alias {\n    () => { crate::splice!(\"bindings.inc\"); };\n}\n\n",
+            "use core::include;\n\n",
+            "use std::{include as x};\n\n",
+        )
+        for code in cases:
+            with self.subTest(code=code):
+                before = {**self.LIMIT_FILES, "src/bindings.inc": "use crate::writer as alloc;\n",
+                          "src/lib.rs": code + self.LIMIT_FILES["src/lib.rs"]}
+                self.assert_move_refused("src/lib.rs: a use or path of include! brings code the proof cannot read",
+                                         before, self.LIMIT_MOVED)
 
-    def test_an_item_move_is_proven_beside_a_crate_macro_that_builds_an_expression(self) -> None:
-        macro = ("// A macro that would use a module.\nmacro_rules! twice {\n    ($e:expr) => { $e * 2 };\n}\n\n"
-                 + "macro_rules! zero {\n    ($kind:ty) => { <$kind>::default() };\n}\n\n"
-                 + "const NAME: &str = \"use mod as\";\n\n")
-        result = self.prove_move({**self.LIMIT_FILES, "src/lib.rs": macro + self.LIMIT_FILES["src/lib.rs"]},
+    def test_an_item_move_is_refused_beside_any_crate_macro(self) -> None:
+        macro = ("macro_rules! twice {\n    ($e:expr) => { $e * 2 };\n}\n\n"
+                 + "fn four() -> usize {\n    twice!(2)\n}\n\n")
+        before = {**self.LIMIT_FILES, "src/lib.rs": macro + self.LIMIT_FILES["src/lib.rs"]}
+        self.assert_move_refused("src/lib.rs: a crate macro the proof cannot read", before, self.LIMIT_MOVED)
+
+    def test_an_item_move_is_refused_beside_a_macro_call_it_does_not_list(self) -> None:
+        cases = (
+            ("an unknown macro", "codegen::make_items!(alloc);\n\n", "codegen::make_items"),
+            ("a const initializer", "const NOTES: &str = include_str!(\"notes.txt\");\n\n", "include_str"),
+            ("a listed name from another crate", "const NAME: &str = tracing::concat!(\"a\");\n\n", "concat"),
+            ("an impl body", "struct Probe;\n\nimpl Probe {\n    paste::item!();\n}\n\n", "paste::item"),
+            ("a fn body whose call can emit a glob use",
+             "fn wide(rows: usize) -> bool {\n    provider::writer_imports!();\n"
+             + "    match rows {\n        LIMIT => true,\n        _ => false,\n    }\n}\n\n", "writer_imports"),
+            ("include_bytes in a fn body", "fn notes() -> &'static [u8] {\n    include_bytes!(\"notes.txt\")\n}\n\n",
+             "include_bytes"),
+            ("a raw keyword name", "fn wait() {\n    provider::r#async!();\n}\n\n", "async"),
+        )
+        for name, code, call in cases:
+            with self.subTest(name=name):
+                before = {**self.LIMIT_FILES, "src/notes.txt": "use crate::writer as alloc;\n",
+                          "src/lib.rs": code + self.LIMIT_FILES["src/lib.rs"]}
+                self.assert_move_refused(f"src/lib.rs: a macro call the proof cannot resolve: {call.split('::')[-1]}!",
+                                         before, self.LIMIT_MOVED)
+
+    def test_an_item_move_is_refused_beside_a_use_of_a_macro_name(self) -> None:
+        cases = (
+            ("an alias", "use tracing::info as log;\n\n"),
+            ("a use leaf", "use tracing::info;\n\n"),
+            ("a use group", "use tracing::{info, Level};\n\n"),
+            ("a macro_use list", "#[macro_use(info)]\nextern crate tracing;\n\n"),
+        )
+        call = "fn trace() {\n    tracing::info!(\"moved\");\n}\n\n"
+        for name, code in cases:
+            with self.subTest(name=name):
+                before = {**self.LIMIT_FILES, "src/lib.rs": code + call + self.LIMIT_FILES["src/lib.rs"]}
+                self.assert_move_refused("src/lib.rs: a use or path of info! the proof cannot resolve", before,
+                                         self.LIMIT_MOVED)
+        with self.subTest(name="a raw keyword name"):
+            code = "use provider::r#async as wait;\n\nfn hold() {\n    r#async!();\n}\n\n"
+            before = {**self.LIMIT_FILES, "src/lib.rs": code + self.LIMIT_FILES["src/lib.rs"]}
+            self.assert_move_refused("src/lib.rs: a use or path of async! the proof cannot resolve", before,
+                                     self.LIMIT_MOVED)
+
+    def test_an_item_move_is_refused_beside_a_std_macro_path_the_crate_gives_away(self) -> None:
+        package = '[package]\nname = "sample"\nversion = "0.1.0"\nedition = "2021"\n\n'
+        cases = (
+            ("a dependency key std", package + '[dependencies]\nstd = { package = "provider", version = "1" }\n',
+             "", "std::concat"),
+            ("a workspace dependency key core", package + "[build-dependencies]\ncore = { workspace = true }\n",
+             "", "::core::concat"),
+            ("a target dependency key alloc",
+             package + "[target.'cfg(unix)'.dev-dependencies]\nalloc = { package = \"provider\", version = \"1\" }\n",
+             "", "std::concat"),
+            ("a file that binds core", package, "use crate::writer as core;\n\n", "core::concat"),
+        )
+        for name, manifest, alias, call in cases:
+            with self.subTest(name=name):
+                code = f"{alias}const NAME: &str = {call}!(\"a\");\n\n"
+                before = {**self.LIMIT_FILES, "Cargo.toml": manifest,
+                          "src/lib.rs": code + self.LIMIT_FILES["src/lib.rs"]}
+                self.assert_move_refused("src/lib.rs: a macro call the proof cannot resolve: concat!", before,
+                                         self.LIMIT_MOVED)
+
+    def test_an_item_move_is_refused_beside_a_macro_named_like_a_keyword_of_a_later_edition(self) -> None:
+        package = '[package]\nname = "sample"\nversion = "0.1.0"\n'
+        workspace = '[workspace]\n\n[workspace.package]\nedition = "2018"\n\n' + package + "edition.workspace = true\n"
+        cases = (
+            ("gen in edition 2021", package + 'edition = "2021"\n', "gen"),
+            ("gen in a workspace edition 2018", workspace, "gen"),
+            ("the weak keyword union", package + 'edition = "2024"\n', "union"),
+            ("the weak keyword safe", package + 'edition = "2024"\n', "safe"),
+        )
+        for name, manifest, call in cases:
+            with self.subTest(name=name):
+                code = f"fn make() {{\n    provider::{call}!();\n}}\n\n"
+                before = {**self.LIMIT_FILES, "Cargo.toml": manifest,
+                          "src/lib.rs": code + self.LIMIT_FILES["src/lib.rs"]}
+                self.assert_move_refused(f"src/lib.rs: a macro call the proof cannot resolve: {call}!", before,
+                                         self.LIMIT_MOVED)
+
+    def test_an_item_move_is_refused_beside_a_bare_std_macro_another_crate_can_give(self) -> None:
+        cases = (
+            ("a glob of another crate", "use provider::*;\n\n"),
+            ("a glob in a use group", "use provider::{fmt::*, Error};\n\n"),
+            ("a glob in a fn body", "fn wide() {\n    use ::provider::*;\n}\n\n"),
+            ("a glob of a crate name a file binds", "use crate::writer as alloc;\n\nuse alloc::*;\n\n"),
+            ("a macro_use", "#[macro_use]\nextern crate provider;\n\n"),
+            ("a macro_use in a cfg_attr", "#[cfg_attr(unix, cfg_attr(test, macro_use))]\nmod helpers {}\n\n"),
+            ("an inner macro_use", "#![macro_use]\n\n"),
+        )
+        for name, code in cases:
+            with self.subTest(name=name):
+                before = {**self.LIMIT_FILES, "src/lib.rs": code + "const NAME: &str = concat!(\"a\");\n\n"
+                          + self.LIMIT_FILES["src/lib.rs"]}
+                self.assert_move_refused("src/lib.rs: a macro call the proof cannot resolve: concat!", before,
+                                         self.LIMIT_MOVED)
+        with self.subTest(name="a glob the change adds"):
+            after = {**self.LIMIT_MOVED, "src/reader.rs": "use provider::*;\n\n" + self.LIMIT_MOVED["src/reader.rs"]}
+            before = {**self.LIMIT_FILES, "src/lib.rs": "const NAME: &str = concat!(\"a\");\n\n"
+                      + self.LIMIT_FILES["src/lib.rs"]}
+            self.assert_move_refused("src/lib.rs: a macro call the proof cannot resolve: concat!", before, after)
+        with self.subTest(name="a glob of a crate path to another crate"):
+            code = "mod bridge {\n    pub(crate) use provider as found;\n}\n\nuse crate::bridge::found::*;\n\n"
+            before = {**self.LIMIT_FILES, "src/lib.rs": code + "const NAME: &str = concat!(\"a\");\n\n"
+                      + self.LIMIT_FILES["src/lib.rs"]}
+            self.assert_move_refused("src/lib.rs: a glob use of crate::bridge::found, which has no file of its own",
+                                     before, self.LIMIT_MOVED)
+
+    def test_an_item_move_is_proven_beside_macro_calls_it_accepts(self) -> None:
+        code = ("use std::fmt::*;\n\nconst NAME: &str = concat!(\"a\", \"b\");\n\n"
+                + "const PATH: &str = ::std::stringify!(a);\n\n"
+                + "fn trace() -> String {\n    println!(\"moved\");\n    core::format!(\"{}\", NAME)\n}\n\n"
+                + "impl Probe {\n    fn check(&self) {\n        assert!(matches!(1, 1));\n    }\n}\n\n")
+        result = self.prove_move({**self.LIMIT_FILES, "src/lib.rs": code + self.LIMIT_FILES["src/lib.rs"]},
                                  self.LIMIT_MOVED)
         assert isinstance(result, style_footprint.ItemMoves), result
         self.assertEqual([(move.kind, move.name) for move in result.moves], [("const", "LIMIT")])
@@ -2800,8 +2919,8 @@ class StyleFootprintTests(unittest.TestCase):
              {"src/helpers.rs": "use std::fmt::*;\n\n" + helpers}, {}),
             ("a glob use of crate::helpers, which holds a restricted visibility",
              {"src/helpers.rs": helpers.replace("pub(crate)", "pub(super)")}, {}),
-            ("a glob use of crate::helpers, which has a macro outside a fn body: rows",
-             {"src/helpers.rs": "rows!();\n\n" + helpers}, {}),
+            ("a glob use of crate::helpers, which has a macro outside a fn body: stringify",
+             {"src/helpers.rs": "const ROWS: &str = stringify!(rows);\n\n" + helpers}, {}),
             ("a glob use of crate::helpers, which the change touches",
              {"src/helpers.rs": "pub(crate) fn help() -> usize { crate::writer::LIMIT }\n"},
              {"src/helpers.rs": "pub(crate) fn help() -> usize { crate::constants::LIMIT }\n"}),
@@ -2814,7 +2933,7 @@ class StyleFootprintTests(unittest.TestCase):
             ("src/writer.rs: a glob use of crate::writer, a module the move changes",
              {"src/writer.rs": self.LIMIT_FILES["src/writer.rs"] + tests},
              {"src/writer.rs": self.LIMIT_MOVED["src/writer.rs"] + tests}),
-            ("src/reader.rs: a macro that can emit a use or a module",
+            ("src/reader.rs: a crate macro the proof cannot read",
              {"src/reader.rs": "macro_rules! globs {\n    () => { use crate::writer::*; };\n}\n\n" + reader},
              {"src/reader.rs": "macro_rules! globs {\n    () => { use crate::writer::*; };\n}\n\n" + moved}),
             ("src/report.rs: a glob use the proof cannot resolve",
