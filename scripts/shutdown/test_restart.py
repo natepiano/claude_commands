@@ -951,6 +951,19 @@ class RestartTests(ShutdownTestCase):
                 if left:
                     self.assertEqual(leave.call_args.args[1:], ("natedev", "w1:p1"))
 
+    def test_a_failed_leave_of_the_recorded_session_never_drops_the_launch(self) -> None:
+        # Gate 234: under load the leave step failed after the launch and the restart counted as failed.
+        saved = entry(top_level("diagrams", host=inventory.HerdrHost(kind="herdr", herdr_session="diagrams", pane_id="w1:p1", presentation="detached")))
+        for failure in (herdr.HerdrFailure("herdr diagrams pane list: timed out"), OSError("herdr not found"),
+                        subprocess.TimeoutExpired(["herdr"], 5)):
+            with self.subTest(failure=type(failure).__name__), \
+                    patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT)) as launch, \
+                    patch.object(herdr.Herdr, "panes", side_effect=failure), redirect_stdout(io.StringIO()) as output:
+                result = restart._launch_session(saved, "continue", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsInstance(result, restart.SessionLaunched)
+            self.assertEqual(launch.call_args.args[1], restart.SharedHerdrTab("writing"))
+            self.assertIn("diagrams restart issue: herdr session diagrams left open", output.getvalue())
+
     def test_legacy_tmux_host_restarts_into_a_shared_tab_without_a_window_or_manual_restart(self) -> None:
         saved = entry(top_level("dashboard", host=inventory.LegacyTmuxHost(kind="legacy tmux", session_name="dashboard")))
         self.assertEqual(saved["stop_issues"], [])

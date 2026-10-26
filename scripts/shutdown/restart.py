@@ -1207,8 +1207,9 @@ def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
 
     A server whose other panes are idle shells, such as the one its attach window opened, counts as emptied.
     """
-    client = herdr.Herdr(recorded)
+    # The session already runs in the shared session: no failure here may undo that launch.
     try:
+        client = herdr.Herdr(recorded)
         rows = client.panes()
         left = [row for row in rows if row["pane_id"] == pane]
         if left and not isinstance(client.pane_activity(pane), herdr.PaneAtShell):
@@ -1218,7 +1219,7 @@ def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
             herdr.stop_session(recorded)
         elif left:
             client.close_pane(pane)
-    except herdr.HerdrFailure as error:
+    except (herdr.HerdrFailure, OSError, subprocess.SubprocessError) as error:
         print(f"{name} restart issue: herdr session {recorded} left open: {error}")
 
 
