@@ -25,6 +25,10 @@ CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
 CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
+# Readers see the committed defaults with this machine's overlay over them, and
+# writers store only the rows that differ in the overlay (agents_overlay.sh).
+# shellcheck source=/dev/null
+source "$AGENTS_CONFIG_DIR/agents_overlay.sh"
 
 # Keep the materialized registry current between periodic launchd runs.
 if [[ "${AGENTS_CONFIG_TIER_ONLY:-}" != 1 && -f "$AGENTS_CONFIG_FILE" \
@@ -45,8 +49,9 @@ agents_config_trim() {
 }
 
 _agents_config_has_section() {
-    local want_section="$1" line stripped section
+    local want_section="$1" line stripped section text
     [[ -f "$AGENTS_CONFIG_FILE" ]] || return 1
+    text="$(agents_registry_text)"
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
         stripped="$(agents_config_trim "$stripped")"
@@ -55,13 +60,14 @@ _agents_config_has_section() {
             section="${BASH_REMATCH[1]}"
             [[ "$section" == "$want_section" ]] && return 0
         fi
-    done < "$AGENTS_CONFIG_FILE"
+    done <<< "$text"
     return 1
 }
 
 _agents_config_section_values() {
-    local want_section="$1" line stripped section
+    local want_section="$1" line stripped section text
     [[ -f "$AGENTS_CONFIG_FILE" ]] || return 0
+    text="$(agents_registry_text)"
     section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
@@ -73,7 +79,7 @@ _agents_config_section_values() {
         fi
         [[ "$section" == "$want_section" ]] || continue
         printf '%s\n' "$stripped"
-    done < "$AGENTS_CONFIG_FILE"
+    done <<< "$text"
 }
 
 _agents_section_keys_inline() {
@@ -609,12 +615,12 @@ agents_set_assignment() {
         }
         { print }
         END { if (!found) exit 2 }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: no [assignments] entry for '$function'; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
 }
 
 # Switch every [assignments] entry — functions and any exact-task overrides —
@@ -700,12 +706,12 @@ agents_set_all_assignments() {
         }
         { print }
         END { if (!found) exit 2 }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: [assignments] has no entries; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
 }
 
 # Put every function -- or just <function> -- on one agent, keeping each row's
@@ -828,12 +834,12 @@ agents_set_model() {
             }
         }
         { print }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
     AGENT_SWEEP_FAMILY="$family"
 }
 
@@ -918,12 +924,12 @@ agents_set_row() {
         }
         { print }
         END { if (!found) exit 2 }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: no [$section] row '$subtask'; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
 
     AGENT_ROW_FAMILY="$family"
     AGENT_ROW_ASSIGNMENT="$active"
@@ -1074,12 +1080,12 @@ agents_set_service_tier() {
         { print }
         FNR in insert { print insert[FNR] }
         END { printf "%s", tail }
-    ' "$AGENTS_CONFIG_FILE" "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
     AGENT_TIER_FUNCTIONS="${fns# }"
 }
 

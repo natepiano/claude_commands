@@ -181,14 +181,18 @@ class PushTextTests(unittest.TestCase):
         entry = next(entry for entry in push_texts.catalog() if entry.id == "auto_mode.refused")
         self.assertEqual(entry.need, "decision")
         push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title, "cargo-liner-style: auto mode stopped types")
-        self.assertEqual(push.message.split("\n")[:3], [
-            "Session: types", "Action: On natedev, in the types pane, approve the prompt or add an allow rule",
-            "Auto mode refused 2 commands in types. They save and merge one finished ticket. Three builds you approved wait for them."])
+        self.assertEqual(push.title, "cargo-liner-style: auto mode stopped modules")
+        # The first line says what auto mode refused and where (user, 2026-10-23); each command follows on its own line.
+        self.assertEqual(push.message.split("\n")[:5], [
+            "Session: modules", "Action: On natedev, in the modules pane, approve the prompt or add an allow rule",
+            "Auto mode refused 2 shell commands in the modules session. The modules build waits for them.",
+            "implement.sh --to modules-impl", "review.sh --to modules-test"])
         self.assertEqual([line.split(":")[0] for line in push.body.split("\n\n")[1:]], ["Approve", "Allow rule"])
-        self.assertTrue(push.body.endswith("never stops on these commands again."))
+        self.assertTrue(push.body.endswith("auto mode lets these commands run from then on."))
         one = push_texts.render_entry(entry, entry.examples[1].values)
-        self.assertIn("refused 1 command in messaging. It pushes", one.body)
+        self.assertTrue(one.body.startswith("Auto mode refused a shell command in the messaging session."
+                                            + " The merge of the messaging work waits for it.\n"
+                                            + "git push origin build-followups-messaging\n"))
         self.assertTrue(one.body.endswith(" The rule: Bash(git push:*)"))
 
     def test_paid_credits_keeps_the_user_approved_lines(self) -> None:
@@ -197,9 +201,9 @@ class PushTextTests(unittest.TestCase):
         push = push_texts.render_entry(entry, entry.examples[0].values)
         self.assertEqual(push.title, "quota_alert: codex2 now uses paid credits")
         self.assertEqual(push.message, "Action: To stop it, set use_credits: off in ~/rust/hanadocs/agents/codex2.md on natedev\n"
-                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 EDT.\n\n"
+                         + "codex2 has 25,345 paid credits left. Its plan refills Tue 10-27 02:33 AST.\n\n"
                          + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
-                         + "Turn off: work moves to Claude until Sat 10-24 16:40 EDT.")
+                         + "Turn off: work moves to Claude until Sat 10-24 16:40 AST.")
 
     def test_paid_credits_queued_keeps_the_agreed_lines(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "quota.paid_credits_queued")

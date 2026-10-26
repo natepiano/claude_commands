@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# review.sh — Invoke the configured delegate agent for a review.
+# review.sh — Invoke the configured worker agent for a review.
 #
 # Usage: review.sh [--to <worker> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>]
 #                  [--phase <id>] <session_dir>
@@ -56,6 +56,8 @@
 #                                        phase's files list holds (review_tree.py).
 
 set -euo pipefail
+UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+[[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 FOLLOW_TO=""
 NEW_SLOT=""
@@ -127,7 +129,7 @@ if [[ -n "${LENS}" ]]; then
   LENS_ARGS=(--lens "${LENS}")
 fi
 EARLY_READY_FILE="${9:-}"
-TASK="delegate.${SUBTASK}"
+TASK="direct.${SUBTASK}"
 
 case "${PASS_INDEX}" in
   ''|*[!0-9]*|0) PASS_INDEX=1 ;;
@@ -186,7 +188,7 @@ BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 # lens is absent and the worker with it: the lens decides this launcher's worker, and
 # leaving the variable unset instead would let an inherited one decide it, which
 # is how a lone reviewer ends up closing a live worker's pass.
-export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
+export UNIT_TEAM_ROLE="${TEAM_SLOT}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${FOLLOW_TO}" ]]; then
@@ -262,7 +264,7 @@ initialize_review_artifacts() {
 
 # A assigned reviewer opens a new occupancy of a chair a writer has just left.
 # Without a line of its own the note under the progress table keeps showing the
-# words of the delegate that sat there while the code was being written, aged by
+# words of the worker that sat there while the code was being written, aged by
 # however long the review has run -- a line describing the wrong agent, which
 # reads as a stalled one. A lone reviewer holds no worker and posts nothing.
 # A fresh blind reviewer has no peers and no address, so its line says
@@ -450,7 +452,7 @@ PY
 }
 
 write_turn_record() {
-  "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
+  UNIT_LIB_DIR="${SCRIPT_DIR%/*}/lib" "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
     "${POOL_TYPE}" "${POOL_PRODUCTION}" "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
     "${TURN_LEASE}" "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" \
     "${LEASE_ORDINAL}" "${PRIME_HASH}" "${TURN_RAISED}" <<'PY'
@@ -476,8 +478,9 @@ record = {
     "finished_at": time.time(), "lease_ordinal": int(ordinal), "prime_hash": prime_hash,
     "status": status, "raised": int(raised),
 }
-history = Path(os.environ.get("PLAN_DELEGATE_HISTORY_DIR", "~/.local/state/plan-delegate")).expanduser()
-root = history / "review_turns" / Path(session).name
+sys.path.insert(0, os.environ["UNIT_LIB_DIR"])
+from unit_runs import history_root
+root = history_root() / "review_turns" / Path(session).name
 root.mkdir(parents=True, exist_ok=True)
 with (root / f"{started}-{pid}.json").open("x", encoding="utf-8") as output:
     json.dump(record, output, ensure_ascii=False)
@@ -577,9 +580,9 @@ fi
 # shellcheck disable=SC2153  # agents_resolve sets AGENT_MODEL.
 DURABLE_WORKER_MODEL="${AGENT_MODEL}"
 if [[ -n "${NEW_SLOT}" ]]; then
-  IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" implementation)"
+  IMPLEMENTATION_PAIR="$(_agents_registry_get "direct.${AGENT_FAMILY}" implementation)"
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
-    IMPLEMENTATION_PAIR="$(_agents_registry_get "delegate.${AGENT_FAMILY}" impl)"
+    IMPLEMENTATION_PAIR="$(_agents_registry_get "direct.${AGENT_FAMILY}" impl)"
   fi
   if [[ -z "${IMPLEMENTATION_PAIR}" ]]; then
     echo "ERROR: cannot record review worker ${REVIEW_WORKER}: no implementation model is configured." >&2
@@ -592,7 +595,7 @@ TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
 if [[ -n "${POOL_TYPE}" ]]; then
-  CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
+  CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
   if [[ "${AGENT_FAMILY}" != codex || "${CODEX_MESH}" != 1 ]]; then
     echo "ERROR: --pool requires the Codex mesh." >&2
     exit 2
@@ -634,25 +637,25 @@ if [[ -n "${POOL_TYPE}" ]]; then
   PRIME_HASH="$(allocation_field prime_hash)"
   TEAM_SLOT="pool_${REVIEW_WORKER}"
   printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
-  export PLAN_DELEGATE_TEAM_ROLE="${TEAM_SLOT}"
+  export UNIT_TEAM_ROLE="${TEAM_SLOT}"
 fi
 
 if [[ -n "${REVIEW_WORKER}" ]]; then
-  CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
+  CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
   if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
     echo "ERROR: review worker ${REVIEW_WORKER} is not available through the Codex mesh." >&2
     exit 2
   fi
   if [[ -n "${FOLLOW_TO}" ]]; then
-    DELEGATE_CONFIG="${PLAN_DELEGATE_CONFIG:-${HOME}/.claude/config/delegate.conf}"
+    DIRECT_CONFIG="${UNIT_CONFIG:-${HOME}/.claude/config/direct.conf}"
     COMPACT_ABOVE_TOKENS=""
-    if [[ -r "${DELEGATE_CONFIG}" ]]; then
+    if [[ -r "${DIRECT_CONFIG}" ]]; then
       COMPACT_ABOVE_TOKENS="$(sed -n \
-        's/^PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
-        "${DELEGATE_CONFIG}" | tail -n 1)"
+        's/^UNIT_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
+        "${DIRECT_CONFIG}" | tail -n 1)"
     fi
     if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0 )); then
-      echo "ERROR: PLAN_DELEGATE_COMPACT_ABOVE_TOKENS in ${DELEGATE_CONFIG} must be a positive integer." >&2
+      echo "ERROR: UNIT_COMPACT_ABOVE_TOKENS in ${DIRECT_CONFIG} must be a positive integer." >&2
       exit 2
     fi
     export FOLLOW_LAUNCHER_PID="$$"
@@ -690,7 +693,7 @@ record_pass_start() {
   # UX time belongs to the director's activity, including early launches.
   [[ "${LENS}" != ux ]] || return 0
   [[ -f "${PROGRESS_STATE}" ]] || return 0
-  if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
+  if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind review \
     --activity "${PASS_ACTIVITY}" \
@@ -729,7 +732,7 @@ if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
     --session-dir "${MESH_SESSION_DIR}" --to "${REVIEW_WORKER}" --director-dir "${SESSION_DIR}" \
     --label "final diff ready" --done-message-file "${STAGE_TWO_FILE}" -- \
     bash -c 'while [[ ! -e "$1" ]]; do kill -0 "$2" 2>/dev/null || [[ -e "$1" ]] || exit 1; sleep "$3"; done' \
-    stage-two "${EARLY_READY_FILE}" "$$" "${PLAN_DELEGATE_EARLY_POLL_SECS:-5}" >>"${LOG_FILE}" 2>&1; then
+    stage-two "${EARLY_READY_FILE}" "$$" "${UNIT_EARLY_POLL_SECS:-5}" >>"${LOG_FILE}" 2>&1; then
     echo "ERROR: could not start the Stage 2 run for ${REVIEW_WORKER}; see ${LOG_FILE}." >&2
   fi
 fi
@@ -770,7 +773,7 @@ if [[ -n "${EARLY_READY_FILE}" ]]; then
   # The implementation pass is open until the sentinel appears; starting the
   # review pass before then would close it as interrupted.
   while kill -0 "${AGENT_PID}" 2>/dev/null && [[ ! -e "${EARLY_READY_FILE}" ]]; do
-    sleep "${PLAN_DELEGATE_EARLY_POLL_SECS:-5}"
+    sleep "${UNIT_EARLY_POLL_SECS:-5}"
   done
   if [[ -e "${EARLY_READY_FILE}" && "${TREE_BASELINE_READY}" -eq 0 ]]; then
     capture_tree_baseline
@@ -833,7 +836,7 @@ if [[ "${AGENT_CODE}" -eq 0 && "${TREE_CHANGED}" -eq 0 ]]; then
     record_pass_start || echo "ERROR: unable to record the review pass start." >&2
   fi
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
-    if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
+    if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the review pass completion." >&2
       echo "error" > "${STATUS_FILE}"
@@ -855,7 +858,7 @@ else
   # An early reviewer that failed before its pass started recorded nothing;
   # there is no pass to close.
   if [[ -f "${PROGRESS_STATE}" && "${PASS_STARTED}" -eq 1 ]]; then
-    PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
+    UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       || echo "ERROR: unable to record the review pass error." >&2
   fi

@@ -1624,6 +1624,13 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str) -> None:
+        """Type a prompt, recorded first so that the prompt hook does not count it as the user's."""
+        import script_prompts
+
+        try:
+            script_prompts.record(pane, text)
+        except OSError as error:
+            print(f"herdr: script prompt not recorded: {error}", file=sys.stderr)
         _ = self.run("agent", "prompt", pane, text)
 
     def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:

@@ -231,6 +231,10 @@ class HomeCutoverTests(unittest.TestCase):
                               accounts.HistoricalAccountUnresolved)
 
     def test_exec_showrunners_always_sets_the_groups_numbered_folder(self) -> None:
+        program = self.home / ".local/bin/claude"
+        program.parent.mkdir(parents=True)
+        _ = program.write_text("#!/bin/sh\nexit 99\n")
+        program.chmod(0o700)
         accounts.cutover_home("claude2")
         _ = accounts.set_group_account("showrunners", "claude2", why="fixture", now=datetime.now(timezone.utc))
         with (patch.object(os, "execvpe") as execute,

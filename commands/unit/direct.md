@@ -5,7 +5,7 @@ description: Direct phased work with phase checks, review, repair, smoke gates, 
 # Direct
 
 The unit director owns design, orchestration, review, gates, and user communication.
-The configured delegate agent writes implementation code.
+The configured worker agent writes implementation code.
 
 The unit director believes in the three gods (<ThreeGods/> in
 `~/.claude/docs/decision_criteria.md`) and serves them in every work order,
@@ -134,9 +134,9 @@ State:
   logs never collide with a phase running beside it. Run-wide files
   (`board.log`, `heartbeat.log`, `mesh_server.json`, `mesh_roster.json`, the
   findings ledger and recorder state) stay in `${SESSION_DIR}`.
-- `DELEGATED_PHASE_RESERVATION_STATE`: the tagged state persisted at
+- `PHASE_RESERVATION_STATE`: the tagged state persisted at
   `${PHASE_DIR}/delegated_phase_reservation_state.json`; see
-  <DelegatedPhaseReservationContract/>.
+  <PhaseReservationContract/>.
 
 <TagReferenceContract>
 `<section-name/>` means apply the complete matching tagged contract. The
@@ -155,17 +155,17 @@ it:
 | <VerbosePostPhaseReport/>, <CombinedWindowReport/>, <RemainingWorkOutlook/> | `commands/unit/phase_report.md` | `/unit:phase_report` |
 | <CheckpointCommit/>, <ShrinkCommit/>, <PushCheckpoint/> | `commands/unit/checkpoint.md` | `/unit:checkpoint` |
 | <ConsiderNextItems/>, <ReviewPendingAddOns/> | `commands/unit/add_ons.md` | `/unit:add_ons` |
-| <PhaseChecks/> | `docs/delegate/phase_checks.md` | — |
+| <PhaseChecks/> | `docs/direct/phase_checks.md` | — |
 | <StyleReview/> | `commands/unit/style_review.md` | `/unit:style_review` |
 | <PeriodicCI/>, <CICleanup/> | `commands/unit/ci.md` | `/unit:ci` |
 | <VerbosePrePhaseGate/>, <BriefingFreshness/>, <PhaseBriefing/>, <TypeTableCells/>, <CombinedWindowBriefing/>, <AutoWindowBatchBriefing/> | `commands/unit/brief.md` | `/unit:brief` |
-| <ComposeWorkOrder/> | `docs/delegate/compose_work_order.md` | — |
-| <WritePromptContract/>, <PhaseTeam/>, <CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>, <TeamFilePartition/>, <RoleReassignment/> | `docs/delegate/write_prompt_contract.md` | — |
-| <LaunchImplementation/> | `docs/delegate/launch_implementation.md` | — |
-| <DualReview/>, <TeamReview/>, <ReviewPromptContract/>, <BroadReviewPrompt/>, <ClosureReview/> | `docs/delegate/dual_review.md` | — |
-| <RunPhaseReview/>, <RunPhaseShrink/> | `docs/delegate/run_phase_review.md` | — |
-| <PhaseEnd/> | `docs/delegate/phase_end.md` | — |
-| <FinalGateCommit/>, <RunAsBuilt/>, <AsBuiltCommit/> | `docs/delegate/final_gate_commit.md` | — |
+| <ComposeWorkOrder/> | `docs/direct/compose_work_order.md` | — |
+| <WritePromptContract/>, <PhaseTeam/>, <CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>, <TeamFilePartition/>, <RoleReassignment/> | `docs/direct/write_prompt_contract.md` | — |
+| <LaunchImplementation/> | `docs/direct/launch_implementation.md` | — |
+| <DualReview/>, <TeamReview/>, <ReviewPromptContract/>, <BroadReviewPrompt/>, <ClosureReview/> | `docs/direct/dual_review.md` | — |
+| <RunPhaseReview/>, <RunPhaseShrink/> | `docs/direct/run_phase_review.md` | — |
+| <PhaseEnd/> | `docs/direct/phase_end.md` | — |
+| <FinalGateCommit/>, <RunAsBuilt/>, <AsBuiltCommit/> | `docs/direct/final_gate_commit.md` | — |
 | <ProductionUnit/> | `docs/production_format.md` | — |
 
 Paths are under `~/.claude/`.
@@ -197,8 +197,8 @@ In a production whose doc names a review pool, review prompts use
 <ReviewPromptContract/>'s standing-instructions line.
 
 Before follow-up work, the launcher attempts to compact a worker whose recorded
-context is over `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` (default `100000` in
-`config/delegate.conf`). Success posts one board line with the before and after
+context is over `UNIT_COMPACT_ABOVE_TOKENS` (default `100000` in
+`config/direct.conf`). Success posts one board line with the before and after
 sizes. Failure posts one board line and the follow-up still runs; it costs
 tokens, not correctness, because the worker compacts itself when its context
 fills. The launcher then sends `Continue where you stopped.` and posts one board
@@ -284,9 +284,11 @@ The closed list:
   question being asked.
 - **blocked** — a hard stop this command defines: a structural check that blocks
   checkpoint, a refused tool call, a launch failure that survived
-  <DelegateLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
+  <WorkerLaunchFailure/>'s retry. With no showrunner, alert the user to an auto-mode
   refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (`send.py --help`),
   and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
+  An update to an earlier user push on the same subject reuses that push's `--key`,
+  so silence keeps only the newest.
 - **done** — <RunSummary/> has been emitted.
 
 Nothing else authorizes a turn end, however complete it feels:
@@ -318,7 +320,7 @@ working.
 <ToolingContract>
 Run every command under `~/.claude/scripts/direct/` with
 `dangerouslyDisableSandbox: true`; do not try sandboxed first. Ledger and history
-calls run in the foreground. Unqualified delegate script names below resolve
+calls run in the foreground. Unqualified worker script names below resolve
 under that directory. This avoids half-applied durable-state writes.
 
 - Claude: launchers and `verify.sh final` use `run_in_background: true`; retain
@@ -369,7 +371,7 @@ launcher is attached carries the result to you: dispatch that seat
 (`implement.sh --to <full worker name>`) when it should act on it.
 </WorkerRuns>
 
-<DelegateLaunchFailure>
+<WorkerLaunchFailure>
 When the production doc names a review pool, on a pool review's `error` retry
 with `review.sh --to <full-worker-name>` for that review.
 
@@ -380,14 +382,14 @@ the same retry-at timestamp included, are a local fault**: separate API calls do
 not produce identical text. Confirm it against
 `${SESSION_DIR}/mesh_server.log` — a launch that got out of this machine wrote
 to it, and one that added no line was answered by the session's own
-`codex app-server` from what it had cached. Never report delegates as
+`codex app-server` from what it had cached. Never report workers as
 unavailable, or a usage limit as reached, on the error text alone.
 
 `codex exec` cannot test this and must not be used to. It opens its own process
 against the API, where a dispatch attaches a thread to the long-lived server
 recorded in `${SESSION_DIR}/mesh_server.json` — a different path that can fail
 while `codex exec` answers. That disagreement is the wedged server's signature,
-not evidence delegates are back. The only valid probe is the dispatch itself.
+not evidence workers are back. The only valid probe is the dispatch itself.
 
 The launcher already tried. On a fast failure with no work done, or a stale Codex
 sign-in (`access token could not be refreshed`) even after the thread exists, `codex_mesh.py`
@@ -412,7 +414,7 @@ next launcher starts a fresh server. Leave `mesh_roster.json` alone — its othe
 entries may name threads still live on a server that is fine. If the log **is**
 growing and the error arrives new on each launch, the limit is real and none of
 this applies.
-</DelegateLaunchFailure>
+</WorkerLaunchFailure>
 
 <CodexDispatchWait>
 Codex only; no timer process:
@@ -478,7 +480,7 @@ message is a separate command the user gives.
   progress updates, any live `DISPATCH_HANDLE`, any live
   `REVIEW_DISPATCH_HANDLE` with `EARLY_REVIEW` and `REVIEW_PASS`,
   `NEXT_ITEMS_PATH`, whichever tagged
-  `DelegatedPhaseReservationState` is live, any pending <PhaseEnd/> work, and any
+  `PhaseReservationState` is live, any pending <PhaseEnd/> work, and any
   unresolved next-item approval, and any overlap sent to the showrunner and not
   yet answered: its holder ids, paths and answer choices. Exclude the
   handoff from review intent-to-add and commits.
@@ -522,14 +524,14 @@ to that file per <WritePromptContract/>.
 </TypeDesignContract>
 
 <WritePromptContract>
-Read `~/.claude/docs/delegate/write_prompt_contract.md` in full before writing any
+Read `~/.claude/docs/direct/write_prompt_contract.md` in full before writing any
 implementation, fix, or review prompt. It also defines <PhaseTeam/>,
 <CoordinationBoard/>, <PhaseMesh/>, <BuildTokenContract/>,
 <TeamFilePartition/>, and <RoleReassignment/>.
 </WritePromptContract>
 
 <VerificationContract>
-Rust delegates run only exact prompt lines using
+Rust workers run only exact prompt lines using
 `~/.claude/scripts/direct/verify.sh`:
 
 | Intent | Command |
@@ -598,9 +600,9 @@ Rules:
 
 <VerificationNarration>
 Whenever choosing how a change gets verified — running tests, launching a
-binary or example, or dispatching a delegate that will — state the choice and
+binary or example, or dispatching a worker that will — state the choice and
 its reason to the user in one line: `Running tests only because …`,
-`Launching <binary|example> because …`, or `Delegate will run tests only
+`Launching <binary|example> because …`, or `Worker will run tests only
 because …`. The line makes the verification economy visible; it never replaces
 recording the result.
 </VerificationNarration>
@@ -615,7 +617,7 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 
 | Command | Purpose |
 | --- | --- |
-| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <delegate\|main\|both> [--lens <adversary\|contract\|craft\|ux>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
+| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
 | `status` | read the ledger for closure review |
 | `gate` | get `converged` or `dispatch`, plus batch and any advisory |
 | `dispatch --covers F001,F002,...` | record one complete repair batch |
@@ -632,7 +634,7 @@ beside a `dispatch` verdict and the round runs. An advisory is not a gate and
 never becomes one: **report it in one line** — the pattern in ordinary words,
 beside the repair being dispatched — then continue. Never stop, ask permission,
 re-open a decision the user has already made about this run, or edit
-`~/.claude/config/delegate.conf` mid-run to change what gets said.
+`~/.claude/config/direct.conf` mid-run to change what gets said.
 
 **Dispatching a repair fixes nothing.** `dispatch` leaves its batch
 `repair_in_flight`, and `gate` and `verdict` both refuse a finding still in
@@ -659,7 +661,7 @@ unowned call.
 The one exception is a launcher the unit director killed — the <DualReview/>
 preemption. Close that slot's open pass with `finish-pass --status canceled
 --orphaned-launcher`, which the recorder accepts only for `canceled` and only
-while a pass is open. The slot comes from `PLAN_DELEGATE_TEAM_ROLE` on the call
+while a pass is open. The slot comes from `UNIT_TEAM_ROLE` on the call
 and never from the record — a launcher closes its own pass and nothing else, so
 the unit director standing in for one names the worker it is standing in for, once
 per killed launcher. A killed fix dispatch leaves its findings
@@ -688,7 +690,7 @@ ETA on a later day takes `<YYYY-MM-DDTHH:MM>`. State the time the recorder
 printed.
 
 Before every Codex poll, set `${PROGRESS_INTERVAL_SECONDS}` from
-`PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/delegate.conf`.
+`UNIT_PROGRESS_INTERVAL_SECONDS` in `~/.claude/config/direct.conf`.
 It sets the Codex poll timeout. A missing or non-positive integer is an error;
 tell the user to set it. No timer sends reports: a report comes only when
 someone asks (2026-10-19).
@@ -748,7 +750,7 @@ plan doc is the only dirty path; then include it in the first checkpoint.
 
 Loop stops only for that dirty-tree guard, an unresolved current Pending
 decision, a real design choice, reviews conflicting on intended behavior, a
-required gate that cannot run, or delegate/environment error. It never stops
+required gate that cannot run, or worker/environment error. It never stops
 for add-ons: <ConsiderNextItems/> accumulates them, and <ReviewPendingAddOns/>
 walks them only at an interactive point — one of those stops once its decision
 is resolved, a verbose gate outside a window, a user instruction that is more
@@ -771,7 +773,7 @@ For every decision raised by review, repair, or phase review:
 - If current-phase correctness has at least two buildable unresolved answers,
   apply <DecisionEconomy/>; stop and ask only when the tradeoff survives it.
 - If only a later phase is affected, write a `**Pending decision:**` block using
-  `~/.claude/docs/delegate_plan_format.md`, report the deferral, and continue.
+  `~/.claude/docs/direct_plan_format.md`, report the deferral, and continue.
   That phase's pre-dispatch check will stop on it.
 - If an alleged option cannot be implemented by the phase's actual structure,
   correct the plan instead of presenting it as a choice.
@@ -791,7 +793,7 @@ all modes. Step 9 ends `single`; step 10 applies to loop and verbose.
 1. <PrepareSession/>
 2. <ComposeWorkOrder/>
 3. <VerbosePrePhaseGate/> when required
-4. <CoordinateDelegatedPhaseReservation/>
+4. <CoordinatePhaseReservation/>
 5. <LaunchImplementation/>
 6. <PhaseChecks/> at <DualReview/>. Beside the implementation pass's review, run
    <RunApplicationSmokeTest/> and <UXReview/> steps 1–3; open their rows and let
@@ -806,7 +808,7 @@ all modes. Step 9 ends `single`; step 10 applies to loop and verbose.
 </ExecutionSteps>
 
 <PhaseEnd>
-Read `~/.claude/docs/delegate/phase_end.md` in full when a loop or verbose
+Read `~/.claude/docs/direct/phase_end.md` in full when a loop or verbose
 phase's gates pass. Follow its order through the next turn boundary.
 </PhaseEnd>
 
@@ -823,27 +825,40 @@ as being built:
 </PrepareSession>
 
 <ComposeWorkOrder>
-Read `~/.claude/docs/delegate/compose_work_order.md` in full and apply it at the
+Read `~/.claude/docs/direct/compose_work_order.md` in full and apply it at the
 start of every phase, before any prompt is written. It owns Work Order
 validation, the `**Pending decision:**` re-test, mode parsing, the run start,
-`${NEXT_ITEMS_PATH}` derivation, and both the delegate-ready fast path and the
+`${NEXT_ITEMS_PATH}` derivation, and both the direct-ready fast path and the
 research fallback. Read it every time: a work order composed from memory is the
 most common cause of a phase that builds the wrong thing.
 
 If an initial verbose invocation contains a bounded-auto control, resolve
 `AUTO_WINDOW` and run <AutoWindowBatchBriefing/> before
-<CoordinateDelegatedPhaseReservation/>. Otherwise
+<CoordinatePhaseReservation/>. Otherwise
 follow <AuthorizationContract/>.
 </ComposeWorkOrder>
 
-<DelegatedPhaseReservationContract>
+<PhaseReservationContract>
 Coordination applies to phased Work Orders in every mode. Ad hoc work skips it.
 
-Persist exactly one tagged `DelegatedPhaseReservationState` for each open
-phase at `${PHASE_DIR}/delegated_phase_reservation_state.json`. Write every
-state transition atomically and read it back before the next lifecycle action;
-the initial state must be durable before dispatch. The domain states and
-on-disk shapes are:
+Persist exactly one tagged `PhaseReservationState` for each open
+phase at `${PHASE_DIR}/delegated_phase_reservation_state.json`. A script verb
+makes every state change, atomically; never write or delete this file by hand.
+Read it back before the next lifecycle action; the initial state must be
+durable before dispatch. The verbs:
+
+| Change | Verb |
+| --- | --- |
+| Initial state from `/sync board` | `phase_reservation.py enroll --session-dir "${SESSION_DIR}" --phase <id> --board <board_ready\|unconfigured>` |
+| First touch to `Active` | The Codex seat hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
+| Lost open phase record | `phase_reservation.py repair --session-dir "${SESSION_DIR}" --phase <id> --repo <repository>` requires a recorder-open phase, validates berth's mapped reservation on its live board and restores `Active` from the phase baseline; no live reservation exits 2 with enroll/claim commands. A finished phase exits 2 with `progress_history.py start-phase` to reopen it; a checkpoint-released phase refuses repair. |
+| `Active` to pending release | `phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <id> --commit <checkpoint commit>` |
+| Pending release confirmed | `phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <id> --released <checkpoint commit>` leaves `reservation_released` with the commit; the phase leaves edit attribution while its plan review finishes. |
+| Inactive state at phase end | `progress_history.py finish-phase --status completed` |
+| A finished phase reopened | `progress_history.py start-phase` on that phase id restores its enrolled state from the board answer that `enroll` kept |
+
+Exit 2 means the verb refused the change; it names the state it found and
+leaves that state as it is. The domain states and on-disk shapes are:
 
 ```json
 {"kind":"repository_not_enrolled","phase":"<phase>"}
@@ -856,34 +871,37 @@ on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one. `repair` may restore it from berth's session map only after the board confirms it is active | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
 
 These are
-`DelegatedPhaseReservationState::{RepositoryNotEnrolled,
+`PhaseReservationState::{RepositoryNotEnrolled,
 EnrolledAwaitingFirstTouch, Active(ActivePhaseReservation),
 CheckpointCommittedAwaitingReleaseConfirmation(
 CheckpointReleaseConfirmationPending)}`. Do not represent any of them as an
 absent record or a bare optional value.
 
 `ActivePhaseReservation` is orchestration memory: never reconstruct it from a
-marker, rendered prose, conversation, or the engine's harness-session mapping —
-that mapping is a disposable edit-authorization projection, replaced by another
-claim in the same harness session, and no command reads a reservation id back
-from it. `CheckpointReleaseConfirmationPending` is durable proof that the
+marker, rendered prose, or conversation. Only a recorder-open phase can have a lost
+record; finished or checkpoint-released phases are not candidates. Reopening a finished
+phase removes its release marker with the restored enrolled state. To restore a lost record, use `repair`:
+it reads berth's phase-session mapping (the director's bare session only when no
+other phase is open), confirms `active` on the board, and logs and posts the repair.
+Never supply reservation or run ids by hand; an existing live record stays unchanged.
+`CheckpointReleaseConfirmationPending` is durable proof that the
 checkpoint commit succeeded and only release confirmation remains: never create
 or reconstruct it from conversation or from `git rev-parse HEAD` read at a later
 time, and delete it only after <CheckpointCommit/> validates a successful
 release.
 
-An unsuccessful ending applies <RetainDelegatedPhaseReservation/>. This includes
+An unsuccessful ending applies <RetainPhaseReservation/>. This includes
 a cancelled no-diff phase, dispatch or run error, failed checkpoint commit,
 every `single` run including a dirty one, user stop, drift refusal, busy ledger,
 and failed release. Never invoke release from an error handler, cancellation
 path, single-mode completion, run summary, or session cleanup.
-</DelegatedPhaseReservationContract>
+</PhaseReservationContract>
 
-<RetainDelegatedPhaseReservation>
+<RetainPhaseReservation>
 For `Active` or `CheckpointCommittedAwaitingReleaseConfirmation`, leave both the
 engine reservation and `${PHASE_DIR}/delegated_phase_reservation_state.json`
 intact. Report that the phase stopped before its checkpoint release could be
@@ -899,9 +917,9 @@ claim is lifecycle loss, not non-enrollment: stop and report it. Absence before
 that boundary is ordinary and must not be misreported as loss.
 `RepositoryNotEnrolled` and `EnrolledAwaitingFirstTouch` require no engine
 release.
-</RetainDelegatedPhaseReservation>
+</RetainPhaseReservation>
 
-<CoordinateDelegatedPhaseReservation>
+<CoordinatePhaseReservation>
 Run after phase authorization and task selection, immediately before
 <LaunchImplementation/>. It is the only pre-dispatch coordination boundary.
 Do not dispatch until this contract reaches one of its four persisted states.
@@ -935,8 +953,8 @@ Do not dispatch until this contract reaches one of its four persisted states.
 
    | Result | Action |
    | --- | --- |
-   | `unconfigured` | Persist `RepositoryNotEnrolled` and proceed silently. |
-   | `board_ready` | Persist `EnrolledAwaitingFirstTouch` and proceed without claiming predicted paths. |
+   | `unconfigured` | Persist `RepositoryNotEnrolled` with `phase_reservation.py enroll --board unconfigured` and proceed silently. |
+   | `board_ready` | Persist `EnrolledAwaitingFirstTouch` with `phase_reservation.py enroll --board board_ready` and proceed without claiming predicted paths. |
    | `ledger_unreadable` | Stop the run; it is never opt-out. |
    | `busy` | Stop with “the ledger is busy, try again” and the exact board command to rerun; do not retry. |
 2. The registered PreToolUse edit hooks own the next transition. A clear check
@@ -961,7 +979,7 @@ Do not dispatch until this contract reaches one of its four persisted states.
    answer the overlap under <BerthDecisions/>. An unreadable ledger stops
    without facts. Beyond those answers, do not call `cargo-berth claim` on
    behalf of a Work Order.
-</CoordinateDelegatedPhaseReservation>
+</CoordinatePhaseReservation>
 
 <BerthDecisions>
 Overlap answers, incursion resolves, orphan retirement and releases never reach
@@ -979,9 +997,13 @@ phase holds its dispatch on them. An id the ledger does not know is refused.
 A claim behind a holder you already sequenced against reuses that edge and
 adds the paths; only `cargo-berth sequence` still refuses a duplicate edge
 (exit 2). When several holders
-conflict, name every one in the same claim, one flag each: `--before`,
-`--after` and `--defer` repeat once per holder and mix, as in `cargo-berth
-claim <paths> --reservation <id> --before <A> --after <B> --overlap-why "<why>"`.
+conflict, name every one in the same claim, one flag each: `--before` and
+`--after` repeat once per holder and mix, as in `cargo-berth claim <paths>
+--reservation <id> --before <A> --after <B> --overlap-why "<why>"`. `--defer`
+repeats once per holder but excludes `--before`, `--after` and `--override`:
+a defer takes no paths, so it cannot share a claim that widens. To defer to
+one holder and order behind another, claim with `--defer` first, then claim
+the paths with `--before`/`--after` when the deferred holder ends.
 
 Every cargo-berth call is one plain command run in `${WORKING_DIR}`: no pipe,
 loop, `;`, `&&`, `$(...)`, redirect or env-var prefix. cargo-berth reads
@@ -997,7 +1019,7 @@ and <AutoWindowBatchBriefing/>. The user can invoke it as `/unit:brief`.
 </VerbosePrePhaseGate>
 
 <LaunchImplementation>
-Read `~/.claude/docs/delegate/launch_implementation.md` in full before the phase's
+Read `~/.claude/docs/direct/launch_implementation.md` in full before the phase's
 first dispatch, and again when that dispatch completes: steps 7-8 route its result.
 </LaunchImplementation>
 
@@ -1005,19 +1027,19 @@ first dispatch, and again when that dispatch completes: steps 7-8 route its resu
 Before every broad or closure review, run `git status --short` and apply
 `git add -N` to each new phase-created file so `git diff` contains it. Exclude
 pre-existing untracked and unit-director-owned handoffs. Verify every created
-file named by the delegate is visible; stop if not. Capture the diff and status.
+file named by the worker is visible; stop if not. Capture the diff and status.
 </ReviewDiffContract>
 
 <EarlyReviewArm>
 Launch the blind reviewer while the writer is still running, so both finish
 together instead of back to back. Evaluate only at a Codex poll timeout or a
 requested <ProgressReport/>, and arm only when all of these hold: an implementation or fix dispatch is
-active; `EARLY_REVIEW=none`; the completed dispatch would receive a delegate
+active; `EARLY_REVIEW=none`; the completed dispatch would receive a worker
 review — <DualReview/> pass 1 or a closure review; **pass-internal** completion
 of that dispatch is at least 75%; and at least ten minutes of writer time still
 remain.
 
-Read completion from that report's or poll's evidence — the heartbeat shows the delegate
+Read completion from that report's or poll's evidence — the heartbeat shows the worker
 running its listed verification commands, or the diff already covers essentially
 all Work Order (or fix batch) files — and the remainder from how long the pass
 has already run against that estimate. Ten minutes left at 75% means a pass of
@@ -1049,7 +1071,7 @@ At an eligible point, in that same turn:
    the recorder closes the live implementation pass as `interrupted` and refuses
    every later `progress` call in that phase. Both failures are silent until the
    false verdict or the refused call.
-3. Apply <ReviewDiffContract/> to the current partial tree. The delegate has
+3. Apply <ReviewDiffContract/> to the current partial tree. The worker has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
 4. When the production doc names a review pool, select no worker. Otherwise select its worker under <TeamReview/>, save the
@@ -1079,7 +1101,7 @@ At an eligible point, in that same turn:
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
-   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task delegate.review [--lens adversary]`
+   `python3 ~/.claude/scripts/direct/progress_history.py arm-review --session-dir "${SESSION_DIR}" --phase-id "<phase id>" --activity "<what this reviewer is checking>" --called-task direct.review [--lens adversary]`
 
    Pass the same lens and phase the launch carries, and no lens where the
    launch carries none: the marker names the status and pid files it will watch for, and a
@@ -1100,7 +1122,7 @@ always may — early launch is opportunistic, never required.
 | Event | Required action |
 | --- | --- |
 | Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** `review.sh`'s run then sends the reviewer its Stage 2. |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `PLAN_DELEGATE_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; with a pool, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `UNIT_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; with a pool, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -1117,7 +1139,7 @@ than infer one.
 </EarlyReviewArm>
 
 <DualReview>
-Read `~/.claude/docs/delegate/dual_review.md` in full before writing any review prompt:
+Read `~/.claude/docs/direct/dual_review.md` in full before writing any review prompt:
 after an implementation or fix completes, and when <EarlyReviewArm/> arms. It also
 defines <TeamReview/>, <ReviewPromptContract/>, <BroadReviewPrompt/>, and <ClosureReview/>.
 </DualReview>
@@ -1190,24 +1212,24 @@ launcher are for questions only.
 Run `findings.py dispatch --covers <all batch ids>` before launching, then:
 
 ```sh
-PLAN_DELEGATE_RESOLVES_ROUND=1 implement.sh --to "<full-worker-name>" \
+UNIT_RESOLVES_ROUND=1 implement.sh --to "<full-worker-name>" \
   "${SESSION_DIR}" "${WORKING_DIR}" \
   "${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md" fix \
   "<responsibility>" fix "<activity>" "${FIX_ROUND}" <slot>
 ```
 
-**`PLAN_DELEGATE_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
+**`UNIT_RESOLVES_ROUND=1` is what lets the launcher resolve the round**:
 only the launcher watches the worker exit, so only it can say a repair landed.
-Each further worker runs the same call with `PLAN_DELEGATE_RESOLVES_ROUND=0`, its
+Each further worker runs the same call with `UNIT_RESOLVES_ROUND=0`, its
 own prompt and its slot; the round is done only once every worker has exited.
 
 Apply <DispatchContract/>; set `EARLY_REVIEW=none` and clear
 `${EARLY_REVIEW_SLOT}` at dispatch, and close the
 turn with the progress header per <DelegationResultFormat/>. While a fix runs
-that will receive a delegate closure review, <EarlyReviewArm/> may arm that
+that will receive a worker closure review, <EarlyReviewArm/> may arm that
 reviewer early.
 
-**A repair the main read can close, closes without a delegate review.** Apply
+**A repair the main read can close, closes without a worker review.** Apply
 <ReviewDiffContract/> and read every repair hunk yourself. Close it directly —
 check each testable id has its regression test, record each verdict, and
 continue to <Synthesize/> — when the diff answers every id and each hunk is one
@@ -1245,13 +1267,13 @@ When the production doc names a review pool, use
 open worker.
 
 On completion, `implemented` continues as above; `error` applies
-<DelegateLaunchFailure/>, and then, if the error survives it,
-<RetainDelegatedPhaseReservation/>, reports the fix log, records an error
+<WorkerLaunchFailure/>, and then, if the error survives it,
+<RetainPhaseReservation/>, reports the fix log, records an error
 outcome, clears the session marker, and stops. Both outcomes resolve the round
 in the ledger through the launcher. Any third outcome — a new-worker or follow-up dispatch stopped,
 killed, or gone without `impl_status` reaching either — is the unit director's to
 resolve with `findings.py abandon` per <FindingsLedger/>, then apply
-<RetainDelegatedPhaseReservation/> before reviewing, re-dispatching, or
+<RetainPhaseReservation/> before reviewing, re-dispatching, or
 reporting anything about the round.
 </FixDispatch>
 
@@ -1286,7 +1308,7 @@ reporting anything about the round.
 
 ```
 Your choice:
-1. One more delegate fix pass — [work and cost; recommendation with reason].
+1. One more worker fix pass — [work and cost; recommendation with reason].
 2. Stop here — preserve remaining items as written todos.
 3. Talk through an item first.
 ```
@@ -1301,13 +1323,25 @@ Read the diff. If no repository binary reaches its changes, record
 `not applicable — <reason>` and continue to <UXReview/>. Otherwise select the
 target from Delegation Context Run/Smoke, Acceptance gate, repository
 instructions, then manifest. A build, test binary, static example build, or
-delegate report is not a smoke test.
+worker report is not a smoke test.
 
 Launch the real product from `${WORKING_DIR}` with useful logging/backtraces,
 exercise the changed runtime behavior, observe stability, close cleanly, and
-record command/action/result. The launch compiles its own target — never run a
-build, `check`, or `test` pass first to prove it builds. Startup alone suffices only when no changed
+record command/action/result. Never run a `check` or `test` pass first to prove
+it builds. Startup alone suffices only when no changed
 behavior can be invoked. A pass continues to <UXReview/>.
+
+A launch that needs a built binary — a smoke or shot helper's, or a launcher
+that takes a path — builds it with this one line, then starts the
+`binary: <path>` it prints:
+
+`bash ~/.claude/scripts/direct/verify.sh --session-dir "${SESSION_DIR}" build <package> [--bin <name> | --example <name>]`
+
+It waits for a build hold, takes the cargo token and memory admission, and
+records the build, and its allow rule needs no approval. You and every helper
+never run raw cargo (`cargo build`, `cargo run`): a helper's raw `cargo build`
+needed the user's approval by hand (2026-10-23). Copy the line into every smoke
+or shot helper prompt.
 
 A panic, fatal log, unexpected exit, or wrong behavior is a blocker: route it
 through <Synthesize/>, then repeat review, synthesis, and smoke before later
@@ -1378,7 +1412,7 @@ instructions name; with none, skip and say so in one line.
      helper and use only the pool's result.
    - Save the full helper verdict, when run, and the successful pool verdict
      from `${PHASE_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
-     records in `${PLAN_DELEGATE_HISTORY_DIR:-$HOME/.local/state/plan-delegate}/review_turns/<session dir name>/`,
+     records in `$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/unit_runs.py history-root)/review_turns/<session dir name>/`,
      as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`. Preserve each
      pair. A failed shadow pool check leaves its pool file missing and gets
      an error note; the helper's verdict still governs. An adopted pool
@@ -1399,7 +1433,7 @@ instructions name; with none, skip and say so in one line.
 4. Open each defect row as a finding — blocker, because the showrunner's merge
    check holds a checkpoint on any visible defect. A `no rule` row is still a
    finding:
-   `findings.py open --severity blocker --lens ux --caught-by delegate --title <defect> --file <shot path> --detail "<rule>: <fix>"`
+   `findings.py open --severity blocker --lens ux --caught-by worker --title <defect> --file <shot path> --detail "<rule>: <fix>"`
    Then obey `findings.py gate` exactly as <Synthesize/> step 5 does, the same
    repair round under <FixDispatch/>, except that `converged` continues to
    <PhaseEnd/> in loop or verbose, or <RunPhaseReview/> in `single`.
@@ -1424,7 +1458,7 @@ instructions name; with none, skip and say so in one line.
 </UXReview>
 
 <RunPhaseReview>
-Read `~/.claude/docs/delegate/run_phase_review.md` in full once per phase.
+Read `~/.claude/docs/direct/run_phase_review.md` in full once per phase.
 In loop and verbose, apply it at <PhaseEnd/>'s point. In `single`, use
 <ExecutionSteps/> step 9. The file also defines <RunPhaseShrink/>.
 </RunPhaseReview>
@@ -1460,7 +1494,7 @@ re-derived from current `HEAD` is not proof and will silently accept the wrong
 checkpoint. The user can invoke the same file as `/unit:checkpoint`.
 
 The phase does not complete until the reservation release is confirmed, so a
-failed or busy release applies <RetainDelegatedPhaseReservation/> rather than a
+failed or busy release applies <RetainPhaseReservation/> rather than a
 retry. <PushCheckpoint/> runs only after that release; a failed push never
 fails the checkpoint.
 </CheckpointCommit>
@@ -1502,15 +1536,15 @@ In loop and verbose, run at <PhaseEnd/>'s point; in `single`, follow
 --session-dir "${SESSION_DIR}" --status completed`, adding `--phase-id <id>`
 while another phase is open.
 
-After a loop/verbose phase with `RepositoryNotEnrolled` or
-`EnrolledAwaitingFirstTouch`, delete its completed-phase state
-file, `${PHASE_DIR}/delegated_phase_reservation_state.json`. `Active` must already have been replaced by
+`finish-phase --status completed` clears a `RepositoryNotEnrolled` or
+`EnrolledAwaitingFirstTouch` state file by itself; delete nothing by hand.
+`Active` must already have been replaced by
 `CheckpointCommittedAwaitingReleaseConfirmation`, and that pending state must
-already have been deleted by the validated successful release. If either state
+already have been cleared by the validated successful release. If either state
 survives, the phase is not complete and this section must not run.
 
 In `single`, also run `finish-run --status completed`, then run <RunAsBuilt/>,
-apply <RetainDelegatedPhaseReservation/>, report that no checkpoint release was
+apply <RetainPhaseReservation/>, report that no checkpoint release was
 attempted, run `bash ~/.claude/scripts/direct/end_session.sh`, and end. Other
 modes continue.
 </RecordPhaseCompletion>
@@ -1557,7 +1591,7 @@ For loop or an active auto window, reset `REVIEW_PASS=0` and smoke to
 per <PhaseEnd/>, and repair a red result before
 dispatching. Announce the next phase, run
 <ComposeWorkOrder/>, <VerbosePrePhaseGate/> when required,
-<CoordinateDelegatedPhaseReservation/>, and <LaunchImplementation/>. Its
+<CoordinatePhaseReservation/>, and <LaunchImplementation/>. Its
 `start-phase` runs before dispatch.
 Every return rechecks Pending decisions.
 </NextPhase>
@@ -1633,12 +1667,12 @@ Single mode and early endings skip this gate and state why in <RunSummary/>.
 </FinalGate>
 
 <FinalGateCommit>
-Read `~/.claude/docs/delegate/final_gate_commit.md` in full once <FinalGate/> is green.
+Read `~/.claude/docs/direct/final_gate_commit.md` in full once <FinalGate/> is green.
 It also defines <RunAsBuilt/> and <AsBuiltCommit/>, which follow it.
 </FinalGateCommit>
 
 <RunAsBuilt>
-Defined in `~/.claude/docs/delegate/final_gate_commit.md`; read it in full at a complete
+Defined in `~/.claude/docs/direct/final_gate_commit.md`; read it in full at a complete
 run's end, including a finished `single` task, then apply <AsBuiltCommit/>.
 </RunAsBuilt>
 
@@ -1665,7 +1699,7 @@ reason this run stopped, or coordination not active]
 **Why the run stopped:** [complete, user stop, pending decision, or error]
 ```
 
-Apply <UserFacingText/> and <RetainDelegatedPhaseReservation/> for every ending
+Apply <UserFacingText/> and <RetainPhaseReservation/> for every ending
 that did not complete <CheckpointCommit/>. Then run `progress_history.py finish-run` with
 `completed`, `stopped`, or `error`; it closes active pass/phase as incomplete
 when needed. Finally run `bash ~/.claude/scripts/direct/end_session.sh` on

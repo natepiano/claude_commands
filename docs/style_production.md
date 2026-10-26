@@ -229,7 +229,14 @@ use `--reads <files>` to name each other file the verdict rests on. The fingerpr
 uses the cell's own file plus those named files, so only a change to one of them
 brings the cell back. Without `--reads`, the fingerprint uses the whole crate or
 module. Each named file must exist at the checked commit. The manifest scope covers the workspace root and member
-manifests; crate `.` covers only its own files. Exceptions expire with their
+manifests; crate `.` covers only its own files. A `modules` family judgment
+also stays current when only comments changed: the same input files at the checked
+commit and at the tip, and each changed `.rs` file has the same mode, the same code
+tokens and the same inner docs (`//!` and `/*! */`, each at the same place in the code). A change to an ordinary comment or
+to an outer `///` or `/** */` doc does not bring it back. A changed non-`.rs` input
+(a `Cargo.toml` in crate scope), a changed file mode or submodule, an added or
+removed file, or a file that does not tokenize brings it back. Every other family compares bytes, because names rules
+judge comment text. Exceptions expire with their
 inputs. Verdicts are `clean` (no change needed), `fixed` (fix applied),
 `exception` (reviewed allowed case), `held` (proposal deferred) and `waived`
 (change declined). Held and waived judgments count as current while their
@@ -400,7 +407,29 @@ Apply a fix without asking only when all mechanical criteria hold:
    meaning, and no serialized, reflected or configured name changes (serde and
    reflect names, config keys, documented usage).
 
-An uncertain result goes to review. Every tier D finding and every
+A finding of a class in `scripts/style/mechanical_classes.toml` is applied when its proof passes.
+The proof must pass on the whole change: a change that adds an allow, or that
+changes code beyond what the proof explains, stays held for the user. The user
+never approves a finding of a listed class. The list names each class, its
+proof and its rules, and the unit text and the ticket gate read it. The classes:
+
+- `pure-move` (proof `item_move`; rules `module-structure`,
+  `types-live-with-their-behavior`, `split-by-type-ownership`): one item (a
+  const, static, fn, struct, enum, type alias or impl) goes to its owning module
+  or to a named shared owner (`constants.rs`, the type's module) in the same
+  crate. Its uses are re-pointed, and a re-export keeps every old path. It is
+  mechanical also where criteria 1 and 3 bar it. `prove_item_moves` finds that
+  only paths and `use` lines changed. The move is still held when the finding
+  names no destination, or when the move makes an import cycle or crosses crates.
+- `stale-allow-lint` (proof `lint_removal`; rule `test-module-allow-boilerplate`):
+  a lint name goes out of an `allow` attribute in test code (a test file or a
+  `#[cfg(test)]` item) when its pattern has no match in the attribute's scope,
+  the same check as the `test_allow_boilerplate` generator. The whole attribute
+  may go when it keeps no lint name. The reason and the other lint names stay.
+  `prove_lint_removals` finds that only lint names were removed. An `expect`
+  attribute is not in this class.
+
+An uncertain result goes to review. Every other tier D finding and every
 `mode: propose` rule is held. Remove non-mechanical findings and all dependent
 edits from the applied diff; merge the remainder after its gate passes.
 Record each held finding with `style_ledger.py held add` and its cell with
@@ -442,6 +471,8 @@ The gate shortens constant paths only when the added import and each site share 
 A glob is allowed in a module, but not in a block around a changed site.
 An added import may carry one `#[cfg]` if each site's item carries the same condition.
 An external crate name counts as a root only when the file uses it only as a path root.
+An edit may remove a module-level import whose name stays in the file as a plain word (for example a closure `|line|` after `use ratatui::symbols::line;` goes), only when the removed path is the parent of an import added in the same module, the name is snake case and not `drop`, a primitive type or a path keyword, no `use` is a glob, and each remaining word is outside attributes and macro token trees, with no `::` beside it and no `!` after it. The parent rule shows a module, which is never a pattern or a value, so the word names the same thing after the removal or the build fails. Residual: one `use` brings in every item with that name, so a module and a constant of the same name in one module make a pattern word a binding without a build error.
+A trailing comma that rustfmt adds or drops at the end of a call's arguments, a parameter list, an array or a brace list does not count as a change. A comma inside a macro or an attribute, or at the end of a tuple, still counts: `(x,)` is a tuple and `(x)` is not, and a macro can tell `[1,]` from `[1]`.
 It proves `Mode::Old` and `Self::Old` variant renames only when no other item has the enum's name.
 Attributes or unsupported derives that observe variant names prevent proof.
 It proves a local `let` rename only when its name is used after the statement, in its own block.
@@ -592,10 +623,12 @@ new answer. Each decision shows counts and up to three examples from different
 files. The ledger holds its full site list. Show decisions only when the user
 asks through `/showrunner:proposals` or `/adhoc_review`.
 
-Approve with `proposal_issue.py approve <issue> --showrunner <parent>
+Approve with `proposal_issue.py approve <issue> --by user --showrunner <parent>
 --unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
 Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.
+Change an answered decision only with `proposal_issue.py unapprove`, `proposal_issue.py decline-answer` or
+`proposal_issue.py reopen`; never edit its stage, unit or answer by hand.
 Refill builds approved findings in small tickets before coverage work.
 Each ticket permits its own approved findings and proven rename references.
 Only a rename whose `before` and `after` are one `<parent>::<name>` pair proves
@@ -674,20 +707,62 @@ nothing for any id.
 A file rename is a `rename` finding whose `after` starts with `Rename <a> to <b>`,
 where `<a>` and `<b>` are sibling `.rs` files and the finding's path ends with `<a>`.
 Neither file name may be a Rust keyword, and the rest of `after` may not name a
-second `<x>.rs to <y>.rs` pair or a move, split or merge.
+second `<x>.rs to <y>.rs` pair or a move, split or merge. Only these exact forms
+negate a move, so it is not a second change:
+- `does not`, `doesn't`, `cannot`, `never` or `without` right before it
+  (`does not move`, `without moving`);
+- a clause that is `nothing`, `none`, or `no`, at most three words and a noun that
+  names code (`definition`, `item`, `type`, `helper`, …) before it, with a place
+  word (`into`, `out`, `from`, `to`, …) or the sentence end (`.`, `;`, end of text) after it (`no existing
+  definition moves from those callers`);
+- a clause of `no` and at most three words before a move word that is a noun, with
+  a form of `be` after it (`no additional split is introduced`);
+- `no`, at most three words and a noun that names code right after it, then the
+  sentence end (`move no skipped definitions.`).
+
+`no longer`, `no more`, `no less`, `no fewer`, `no later`, `no sooner`, `no doubt`
+and `no matter` never negate.
+
+Every other form counts as a move, and a person decides: `Do not introduce a
+facade or move any definition`, `moves no item into a file`, `move no other helpers
+than LockError` and `move nothing apart from LockError` are refused. A clause starts after a mark
+(`. ; : , ( )`) or after `and`, `but` or `then`. A hyphenated word such as
+`finding-merging` is a name, not a merge.
 It is applied when only the new file is in the code, and not applied when only the
 old file is. It has no check when a folder of child modules (`lock/` or
 `mutation_lock/`) is there; the gate refuses changes in that folder, and a person
-moves it. The gate allows the old file to go and the new file to come, with any
-content. In other Rust files it allows only the `mod <old>;` line and the path
+moves it. The gate allows the old file to go and the new file to come, and it
+compares the new file with the old file at HEAD. The old file must be gone, and
+no file may be at the new path in HEAD. The new file may change only as the other
+Rust files below may: its own paths such as `crate::ledger::lock::LockError` take
+the new name, and its `use` and `mod` lines may take the order rustfmt gives them.
+A definition that comes into or goes out of the file, or any other change, is
+refused (`<new> (renamed from <old>: change is not only the rename)`). When
+another finding of the ticket has the old or the new path, the new file is free,
+as a finding's file is: it moves under that finding's approval, so an item rename
+declared there can change it. A new file that is byte-identical to the old one
+passes with no scan, also outside every crate root (`tests/helper.rs`). The text rules do not catch every move request
+(`only LockError goes into ledger/error.rs`): when the worker builds only the
+rename, the gate marks the finding built. In other
+Rust files it allows only the `mod <old>;` line and the path
 segments that name the module: `super::lock`, `self::lock`, `crate::ledger::lock`,
 `ledger::lock` from the module that holds `ledger`, `alpha::ledger::lock` in a file
 outside the crate (where `alpha` is the library's name), a `pub use lock::...`
-re-export, and `lock::` where a `mod` line, import or glob binds the module. When
-the ticket also renames an item, its qualified references there change too. The
-`use` and `mod` lines may take the order rustfmt gives them, and a call's trailing
-comma may change. The gate refuses every other change in those files. Comments stay
-in their order; only comments inside a block of `use` and `mod` lines move with them.
+re-export, and `lock::` where a `mod` line, import or glob binds the module. A
+`#[path = "../src/ledger/lock.rs"]` string changes only its file name, and only when
+its path, read from the file's own folder, is the old file; the `mod lock;` line it
+marks changes with it. A `mod lock;` line with a `path` attribute in any other form
+stays, and so does a `mod` or `use` line inside a macro (`stringify!(…)`, a
+`macro_rules!` body), where the words are tokens, not items. When the ticket also renames an item, its qualified references there change
+too. The `use` and `mod` lines may take the order rustfmt gives them, with their
+attributes, and a call's trailing comma may change, except inside a macro or an attribute,
+which can match `[1,]` and not `[1]`. The gate refuses every other
+change in those files. A comment changes only where a `crate::` path names the
+module (`` [`crate::ledger::lock`] ``); a `self::` or `super::` path in a comment
+stays. Comments stay in their order. In a block of `use` and `mod` lines, a comment
+belongs to the line below it and moves with that line, so a doc comment cannot go to
+another module (`/// Alpha API.` stays on `pub mod alpha;`). A comment above the
+block that is not a doc comment stays above it, as rustfmt keeps it there.
 The decision stays open and approved until every finding is built or waived.
 
 To repair a decision or an old issue that closed too early, run

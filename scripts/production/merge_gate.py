@@ -716,8 +716,9 @@ def record_changes(repo: Path, review_list: Path, production: Path, commits: lis
     merged = checked_git(repo, "rev-parse", f"--short={change_review.SHORT}", "HEAD")
     try:
         rows = change_review.append_rows(review_list, change_review.visible(commits), change_review.today(), merged,
-                                         production)
-        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED)
+                                         production, owners=change_review.visible_owners(commits, production))
+        drifted = change_review.drift(repo, merge_branch, change_review.read(review_list), change_review.LANDED,
+                                      change_review.foreign_units(production))
     except (change_review.ChangeReviewError, OSError) as error:
         raise GateRefused(f"pushed {merged}; change review list {review_list} not written: {error}") from error
     if rows:

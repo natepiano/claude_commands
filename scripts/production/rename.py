@@ -25,6 +25,9 @@ from unit_move import PathMove  # noqa: E402
 import rename_state  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.guilds import roles  # noqa: E402
+
 REVIEW_POOL_STATE = Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool")
 
 
@@ -291,6 +294,7 @@ def _describe(plan: RenamePlan) -> list[str]:
             *(f"4. showrunner state {moves(move)}" for move in plan.state),
             f"4. parent files {plan.state[-1].source.parent}/*/parent: {plan.old} -> {plan.new}",
             *(f"4. parent {path}: {plan.old} -> {plan.new}" for path in parents),
+            f"4. held guild roles: holder {plan.old} showrunner -> {plan.new} showrunner",
             *(stretches or ["5. stall-watch: no Units rows"]),
             f"6. review pool {moves(plan.review_pool)}",
             f"7. merge branch {plan.merge_branch} -> {plan.new}; commit {plan.message!r}; push origin {plan.new}; "
@@ -394,6 +398,15 @@ def _rename_showrunner_state(plan: RenamePlan) -> None:
     for path in sorted(directory.destination.parent.glob("*/parent")):
         if path.read_text(encoding="utf-8").strip() == plan.old:
             write_text(path, plan.new + "\n")
+    _move_held_roles(roles.ShowrunnerHolder(plan.old), roles.ShowrunnerHolder(plan.new))
+
+
+def _move_held_roles(old: roles.Holder, new: roles.Holder, old_checkout: str = "", new_checkout: str = "") -> None:
+    """Held guild roles name the renamed production as holder, so resume, rebind and end accept it."""
+    try:
+        roles.move_holder(old, new, old_checkout, new_checkout, reason="production rename")
+    except (OSError, ValueError, SystemExit) as error:
+        raise RenameRefused(f"held roles: {error}") from error
 
 
 def _rename_stall_watch(plan: RenamePlan) -> None:
@@ -615,6 +628,8 @@ def unit(new: str, name: str) -> None:
             write_json(result.journal, journal)
         if completed < 3:
             _move_unit_configs(record)
+            _move_held_roles(roles.UnitHolder(result.old, name), roles.UnitHolder(result.new, name),
+                             _string(record, "old_worktree"), _string(record, "new_worktree"))
             record["step"] = 3
             write_json(result.journal, journal)
         if completed < 4:

@@ -75,8 +75,8 @@ esac
         self.environment = {
             **{
                 name: value for name, value in os.environ.items()
-                if name not in {"PLAN_DELEGATE_BOARD_DIR", "PLAN_DELEGATE_TEAM_ROLE", "CODEX_THREAD_ID",
-                                "CODEX_SESSION_ID", "PLAN_DELEGATE_DETACHED_RUN"}
+                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
+                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}
             },
             "PATH": f"{stubs}:{os.environ['PATH']}",
             "HOME": str(self.root),
@@ -100,8 +100,8 @@ esac
             "BUILDLOG_SCOPE": "0",
             "BUILD_HOLD_DIR": str(self.root / "build-hold"),
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
-            "PLAN_DELEGATE_BOARD_DIR": "",
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_RUN_DIR": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "BUILD_TARGETS_SCRIPT": str(VERIFY.parent.parent / "build_targets" / "build_targets.py"),
             "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
@@ -112,7 +112,7 @@ esac
             "VERIFY_MAC_RUNNER": str(self.root / "no-mac-runner"),
             "LINT_CONFIG_READER": str(reader),
             "LINT_CONFIG_FILE": str(reader),
-            "PLAN_DELEGATE_SESSION_DIR": str(self.root / "session"),
+            "UNIT_SESSION_DIR": str(self.root / "session"),
         }
 
     @override

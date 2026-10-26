@@ -546,7 +546,8 @@ def _validate_binding(binding: Binding, repository: str, role: Role) -> None:
                 raise RoleRefused('output path escapes repository') from error
         from scripts.direct import phase_reservation
         phases = phase_reservation.open_phases(Path(binding.run_directory))
-        phase = next((phase for phase in phases if phase.phase == binding.phase), None)
+        name = phase_reservation.phase_directory_name(binding.phase)
+        phase = next((phase for phase in phases if phase.phase == name), None)
         if phase is None:
             raise RoleRefused('phase reservation ledger is unreadable or phase is not open')
         _ = _read(phase.directory / 'delegated_phase_reservation_state.json')
@@ -1347,31 +1348,44 @@ def check_patch(design_id: str, generation: int, cwd: Path, paths: list[str]) ->
             _ = candidate.relative_to(root)
         except ValueError as error:
             raise RoleRefused('output path escapes repository: ' + path) from error
-    ledger = Path(binding.run_directory) / 'phases' / binding.phase / 'delegated_phase_reservation_state.json'
+    from scripts.direct import phase_reservation
+    ledger = phase_reservation.phase_directory(Path(binding.run_directory), binding.phase) / phase_reservation.STATE_FILE
     _ = _read(ledger)
     return binding
 
 
 def rename_holder(production: str, old_unit: str, new_unit: str, old_checkout: str, new_checkout: str) -> None:
     """Rebind live routes only. Saved prompt/reply paths and aliases retain their history."""
+    move_holder(UnitHolder(production, old_unit), UnitHolder(production, new_unit), old_checkout, new_checkout,
+                reason='unit rename')
+
+
+def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', new_checkout: str = '', *,
+                reason: str) -> None:
+    """Give each design `old_holder` holds to `new_holder`, and move its live paths from `old_checkout` to
+    `new_checkout` when both are given. A unit transfer or a production rename changes the holder only;
+    a unit rename changes both. Role names, saved prompt/reply paths and aliases retain their history."""
+    moves_checkout = bool(old_checkout) and old_checkout != new_checkout
     for path in sorted(state_root().glob('*/design.json')):
         design = read_design(path.parent.name)
-        old_holder, new_holder = UnitHolder(production, old_unit), UnitHolder(production, new_unit)
         if design.holder not in (old_holder, new_holder):
             continue
         _idle(design)
-        if design.holder == new_holder and design.repository == new_checkout:
+        if design.holder == new_holder and (not moves_checkout or design.repository == new_checkout):
             continue
-        _ = authority_request('checkout', {'repository_id': design.repository_id, 'host': local_host(),
-                                          'old_checkout': old_checkout, 'new_checkout': new_checkout})
+        if moves_checkout:
+            _ = authority_request('checkout', {'repository_id': design.repository_id, 'host': local_host(),
+                                              'old_checkout': old_checkout, 'new_checkout': new_checkout})
         with _lock(path.parent):
             current = read_design(path.parent.name)
             if current != design:
-                raise RoleRefused('binding changed before unit rename')
+                raise RoleRefused(f'binding changed before {reason}')
             _idle(current)
-            _atomic(path.parent / 'transition.json', {'generation': design.placement.generation, 'reason': 'unit rename'})
+            _atomic(path.parent / 'transition.json', {'generation': design.placement.generation, 'reason': reason})
         release_servers(design)
         def moved(value: str) -> str:
+            if not moves_checkout:
+                return value
             try:
                 return str(Path(new_checkout) / Path(value).relative_to(old_checkout))
             except ValueError:
@@ -1386,8 +1400,9 @@ def rename_holder(production: str, old_unit: str, new_unit: str, old_checkout: s
         with _lock(path.parent):
             current = read_design(path.parent.name)
             if current.placement.generation != design.placement.generation:
-                raise RoleRefused('binding changed during unit rename')
-            updated = replace(current, holder=new_holder, repository=new_checkout, document=moved(current.document),
+                raise RoleRefused(f'binding changed during {reason}')
+            updated = replace(current, holder=new_holder, repository=new_checkout if moves_checkout else current.repository,
+                              document=moved(current.document),
                               binding=binding, placement=replace(current.placement, generation=current.placement.generation + 1))
             _save(updated)
             (path.parent / 'transition.json').unlink(missing_ok=True)
@@ -1396,38 +1411,51 @@ def rename_holder(production: str, old_unit: str, new_unit: str, old_checkout: s
             with _edit_roster(path.parent.name) as roster:
                 for value in roster.values():
                     entry = _object(value)
-                    entry['cwd'] = new_checkout
+                    if moves_checkout:
+                        entry['cwd'] = new_checkout
                     _ = entry.pop('authorized_prompt', None)
                     _ = entry.pop('authorized_holder', None)
                     _ = entry.pop('authorized_generation', None)
 
 
 def rename_failures(production: str, old_unit: str, old_checkout: str) -> list[str]:
+    return holder_failures(UnitHolder(production, old_unit), old_checkout)
+
+
+def holder_failures(old_holder: Holder, old_checkout: str = '') -> list[str]:
+    """Each place a design still names `old_holder`, or `old_checkout` when one is given."""
     failures: list[str] = []
     for path in state_root().glob('*/design.json'):
         try:
             design = read_design(path.parent.name)
-            if design.holder.production_slug != production:
+            if design.holder.production_slug != old_holder.production_slug:
                 continue
-            if design.holder == UnitHolder(production, old_unit):
-                failures.append(str(path) + ': holder still names ' + old_unit)
-            values = [design.repository, design.document]
-            if isinstance(design.binding, DesignBoundToPhase):
-                values.extend((design.binding.repository, design.binding.run_directory, *design.binding.output_paths))
-            if any(value == old_checkout or value.startswith(old_checkout + '/') for value in values):
-                failures.append(str(path) + ': live binding still names old checkout')
-            for value in _roster(design).values():
-                entry = _object(value)
-                if entry.get('cwd') == old_checkout:
-                    failures.append(str(path) + ': launch cwd still names old checkout')
+            if design.holder == old_holder:
+                failures.append(str(path) + ': holder still names ' + _holder_name(old_holder))
+            if old_checkout:
+                values = [design.repository, design.document]
+                if isinstance(design.binding, DesignBoundToPhase):
+                    values.extend((design.binding.repository, design.binding.run_directory,
+                                   *design.binding.output_paths))
+                if any(value == old_checkout or value.startswith(old_checkout + '/') for value in values):
+                    failures.append(str(path) + ': live binding still names old checkout')
+                for value in _roster(design).values():
+                    entry = _object(value)
+                    if entry.get('cwd') == old_checkout:
+                        failures.append(str(path) + ': launch cwd still names old checkout')
             context_path = mesh_directory(design.placement.design_id) / 'guild_context.json'
             if context_path.exists():
                 context = _read(context_path)
-                if context.get('cwd') == old_checkout or context.get('generation') != design.placement.generation:
+                if (old_checkout and context.get('cwd') == old_checkout) or (
+                        context.get('generation') != design.placement.generation):
                     failures.append(str(context_path) + ': stale launch context')
         except (OSError, ValueError) as error:
             failures.append(str(path) + ': ' + str(error))
     return failures
+
+
+def _holder_name(holder: Holder) -> str:
+    return holder.unit_name if isinstance(holder, UnitHolder) else holder.production_slug + ' showrunner'
 
 
 def main(argv: list[str]) -> int:

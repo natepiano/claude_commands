@@ -374,6 +374,7 @@ class ApprovedProposal:
     issue: Path
     unit: str
     finding_ids: tuple[str, ...]
+    widened: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -440,6 +441,35 @@ class NoBuildTicket:
 @dataclass(frozen=True)
 class BuildTicket:
     ticket: str
+
+
+# The id, state and checkpoint of a ticket that built or holds a finding.
+LinkedTicket = tuple[str, TicketState, str]
+# The checkpoint and base of the ticket that judged a finding; empty when there is no such ticket.
+JudgingTicket = tuple[tuple[str, str], ...]
+
+
+def _refuse_open_ticket(finding_id: str, ticket: str, state: TicketState) -> None:
+    if state not in FINAL_TICKET_STATES:
+        raise LedgerError(f"{finding_id}: build ticket {ticket} still holds the finding")
+
+
+@dataclass(frozen=True)
+class BuiltAtMergeRows:
+    """Every ledger row that decides whether a merge builds a finding, as read before the write lock."""
+
+    finding: HeldFinding
+    linked: tuple[LinkedTicket, ...]
+    judging: JudgingTicket
+
+    def refuse_open_build_ticket(self) -> None:
+        """Refuse the finding while its build ticket, as read, is not merged or dropped."""
+        if isinstance(self.finding.build_ticket, BuildTicket):
+            ticket = self.finding.build_ticket.ticket
+            states: dict[str, TicketState] = {id: state for id, state, _ in self.linked}
+            if ticket not in states:
+                raise LedgerError(f"unknown ticket {ticket}")
+            _refuse_open_ticket(self.finding.finding_id, ticket, states[ticket])
 
 
 @dataclass(frozen=True)
@@ -1182,6 +1212,19 @@ class StyleLedgerSummary:
         }
 
 
+class WidenedPath(TypedDict):
+    """A path that a person added to an approved proposal ticket outside its findings, with the reason."""
+
+    path: str
+    reason: str
+    widened_by: str
+    widened_at: str
+
+
+def widened_line(widened: WidenedPath) -> str:
+    return f"widened: {widened['path']} — {widened['reason']} ({widened['widened_by']}, {widened['widened_at']})"
+
+
 class TicketRecord(TypedDict):
     id: str
     unit: str
@@ -1202,6 +1245,7 @@ class TicketRecord(TypedDict):
     checkpoint: str
     created_at: str
     updated_at: str
+    widened: tuple[WidenedPath, ...]
 
 
 @dataclass(frozen=True)
@@ -1249,6 +1293,19 @@ class LintCoverage:
 
 
 @dataclass(frozen=True)
+class TreeEntry:
+    """One `git ls-tree -r` entry: a blob, or a submodule's `commit`."""
+
+    mode: str
+    kind: str
+    object: str
+
+
+# A symlink is a blob too, but its content is a path, not Rust.
+REGULAR_FILE_MODES = ("100644", "100755")
+
+
+@dataclass(frozen=True)
 class RepositoryTip:
     commit: str
     tree: str
@@ -1256,6 +1313,7 @@ class RepositoryTip:
     # Deepest first, so the first that holds a path is its innermost crate.
     crate_dirs: tuple[str, ...]
     rust_files: tuple[str, ...]
+    entries: dict[str, TreeEntry]
 
     def crate(self, path: str) -> str:
         """The innermost crate directory that holds path, as a decision's crate is."""
@@ -1319,15 +1377,15 @@ def _is_ignored(path: str, patterns: tuple[str, ...]) -> bool:
 def _tip(repo: Path, commit: str) -> RepositoryTip:
     commit = _git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
     tree = _git(repo, "rev-parse", f"{commit}^{{tree}}")
-    entries = _git(repo, "ls-tree", "-rz", "--full-tree", commit)
-    blobs: dict[str, str] = {}
-    for entry in entries.split("\0"):
+    listing = _git(repo, "ls-tree", "-rz", "--full-tree", commit)
+    entries: dict[str, TreeEntry] = {}
+    for entry in listing.split("\0"):
         if not entry:
             continue
         metadata, path = entry.split("\t", 1)
-        _, kind, blob = metadata.split()
-        if kind == "blob":
-            blobs[path] = blob
+        mode, kind, name = metadata.split()
+        entries[path] = TreeEntry(mode, kind, name)
+    blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
     manifests = {path: _git(repo, "show", f"{commit}:{path}") for path in blobs if PurePosixPath(path).name == "Cargo.toml"}
     directories = tuple(member.directory for member in rule_catalog.workspace_members(manifests))
     ignored: list[str] = []
@@ -1335,7 +1393,7 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
         if config in blobs:
             ignored.extend(_ignored_paths(_table(tomllib.loads(_git(repo, "show", f"{commit}:{config}")))))
     files = tuple(sorted(path for path in blobs if path.endswith(".rs") and not _is_ignored(path, tuple(ignored))))
-    return RepositoryTip(commit, tree, blobs, directories, files)
+    return RepositoryTip(commit, tree, blobs, directories, files, entries)
 
 
 def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
@@ -1361,29 +1419,95 @@ def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
             _ = destination.write_bytes(content)
 
 
-def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+def _inputs(tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
+    """The tree entries a cell's fingerprint covers, by path; a crate scope covers its whole directory tree."""
+    if scope in (CellInputScope.MODULE, CellInputScope.FILE) and path not in tip.blobs:
+        raise LedgerError(f"{path}: no file at {tip.commit}")
     if scope == CellInputScope.MODULE:
-        if path not in tip.blobs:
-            raise LedgerError(f"{path}: no file at {tip.commit}")
         directory = PurePosixPath(path).parent
         parent_module = directory.as_posix() + ".rs"
-        inputs = sorted((name, blob) for name, blob in tip.blobs.items()
-                        if name.endswith(".rs") and (PurePosixPath(name).parent == directory or name == parent_module))
-        return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
-    if scope == "manifest":
+        return {name: entry for name, entry in tip.entries.items()
+                if name.endswith(".rs") and (PurePosixPath(name).parent == directory or name == parent_module)}
+    if scope == CellInputScope.MANIFEST:
         paths = {"Cargo.toml", *(str(PurePosixPath(directory) / "Cargo.toml") for directory in tip.crate_dirs)}
-        manifests = sorted((name, blob) for name, blob in tip.blobs.items() if name in paths)
-        return hashlib.sha256(json.dumps(manifests, separators=(",", ":")).encode()).hexdigest()
-    if scope == "crate":
+        return {name: entry for name, entry in tip.entries.items() if name in paths}
+    if scope == CellInputScope.CRATE:
         directory = tip.crate(path)
         if directory == ".":
-            inputs = sorted((name, blob) for name, blob in tip.blobs.items() if tip.crate(name) == ".")
-            return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
-        return _git(repo, "rev-parse", f"{tip.commit}:{directory}")
-    blob = tip.blobs.get(path)
-    if blob is None:
-        raise LedgerError(f"{path}: no file at {tip.commit}")
-    return blob
+            return {name: entry for name, entry in tip.entries.items() if tip.crate(name) == "."}
+        return {name: entry for name, entry in tip.entries.items() if _under(name, directory)}
+    return {path: tip.entries[path]}
+
+
+def _input_key(tip: RepositoryTip, scope: CellInputScope, path: str) -> tuple[str, CellInputScope, str]:
+    """Cells with the same inputs share a key: a crate scope by its crate, the manifest scope once per commit."""
+    return tip.commit, scope, tip.crate(path) if scope == "crate" else "." if scope == "manifest" else path
+
+
+def _inputs_hash(inputs: dict[str, TreeEntry]) -> str:
+    """SHA-256 over the sorted (path, blob) pairs; a submodule entry is not part of it."""
+    pairs = sorted((name, entry.object) for name, entry in inputs.items() if entry.kind == "blob")
+    return hashlib.sha256(json.dumps(pairs, separators=(",", ":")).encode()).hexdigest()
+
+
+def _finding_id(fields: tuple[str | int, ...]) -> str:
+    """The first 16 hex digits of SHA-256 over the fields of a held finding."""
+    return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()[:16]
+
+
+def _fingerprint(repo: Path, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
+    if scope == CellInputScope.CRATE and tip.crate(path) != ".":
+        return _git(repo, "rev-parse", f"{tip.commit}:{tip.crate(path)}")
+    inputs = _inputs(tip, scope, path)
+    return inputs[path].object if scope == CellInputScope.FILE else _inputs_hash(inputs)
+
+
+@dataclass(frozen=True)
+class RustCode:
+    """What a modules judgment reads in a Rust file: its code tokens, and each inner doc with its code position."""
+
+    tokens: tuple[style_footprint.Token, ...]
+    # The count of code tokens before each doc, so a `//!` that moves into another `mod` block differs.
+    inner_docs: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True)
+class NotTokenized:
+    """The file is not UTF-8, or the tokenizer cannot read all of it."""
+
+
+NOT_TOKENIZED = NotTokenized()
+
+
+def _rust_code(content: bytes) -> RustCode | NotTokenized:
+    try:
+        text = content.decode()
+    except UnicodeDecodeError:
+        return NOT_TOKENIZED
+    code = style_footprint.tokens(text)
+    spans = style_footprint.token_spans(text)
+    if len(spans) != len(code):
+        return NOT_TOKENIZED
+    # Only whitespace and comments lie between two code tokens, so each gap holds the comments at one code position.
+    gaps = (text[start:end] for start, end in zip((0, *(span.end for span in spans)), (*(span.start for span in spans), len(text))))
+    # Module docs count toward a facade (when-to-split-a-module.md), so `//!` and `/*!` text is read as code.
+    return RustCode(code, tuple((position, doc) for position, gap in enumerate(gaps)
+                                for doc in style_footprint.documented_text(gap) if doc.startswith(("//!", "/*!"))))
+
+
+def _only_comments_changed(before: dict[str, TreeEntry], after: dict[str, TreeEntry],
+                           code: Callable[[str], RustCode | NotTokenized]) -> bool:
+    """Whether two input sets hold the same paths and each changed entry is a Rust file with the same code and inner docs.
+
+    code reads a blob. A changed mode, a changed submodule, a changed file that is not Rust or does not tokenize, and
+    a fingerprint change with no changed entry do not match.
+    """
+    changed = tuple(name for name, entry in before.items() if after.get(name) != entry)
+    if before.keys() != after.keys() or not changed:
+        return False
+    return all(name.endswith(".rs") and before[name].mode == after[name].mode and before[name].mode in REGULAR_FILE_MODES
+               and isinstance(old := code(before[name].object), RustCode) and old == code(after[name].object)
+               for name in changed)
 
 
 def _read_files(serialized: str) -> ReadFiles | NoReadFiles:
@@ -1392,14 +1516,17 @@ def _read_files(serialized: str) -> ReadFiles | NoReadFiles:
     return ReadFiles(tuple(cast(list[str], json.loads(serialized))))
 
 
-def _read_fingerprint(tip: RepositoryTip, path: str, reads: ReadFiles) -> str:
-    inputs: list[tuple[str, str]] = []
+def _read_inputs(tip: RepositoryTip, path: str, reads: ReadFiles) -> dict[str, TreeEntry]:
+    inputs: dict[str, TreeEntry] = {}
     for name in sorted({path, *reads.paths}):
-        blob = tip.blobs.get(name)
-        if blob is None:
+        if name not in tip.blobs:
             raise LedgerError(f"{name}: no file at {tip.commit}")
-        inputs.append((name, blob))
-    return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode()).hexdigest()
+        inputs[name] = tip.entries[name]
+    return inputs
+
+
+def _read_fingerprint(tip: RepositoryTip, path: str, reads: ReadFiles) -> str:
+    return _inputs_hash(_read_inputs(tip, path, reads))
 
 
 def _config_hash(repo: Path, tip: RepositoryTip, tool: LintTool) -> str:
@@ -1533,6 +1660,14 @@ MIGRATIONS = {
     18: "ALTER TABLE judgments ADD COLUMN read_files TEXT NOT NULL DEFAULT 'null';",
     19: "ALTER TABLE held_findings ADD COLUMN waive_provenance TEXT NOT NULL DEFAULT 'unrecorded';",
     20: "ALTER TABLE held_findings ADD COLUMN waived_by TEXT NOT NULL DEFAULT '';",
+    # A path that `style_plan.py widen` adds to an approved proposal ticket outside its findings, with the reason.
+    21: """
+        CREATE TABLE ticket_widened_paths (
+            ticket TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL,
+            widened_by TEXT NOT NULL, widened_at TEXT NOT NULL,
+            PRIMARY KEY(ticket, path)
+        );
+    """,
 }
 
 
@@ -1543,6 +1678,8 @@ class Ledger:
         self._catalog: tuple[Rule, ...] = rule_catalog.load_rules(repo)
         self._tips: dict[str, RepositoryTip] = {}
         self._fingerprints: dict[tuple[str, CellInputScope, str], str] = {}
+        self._inputs: dict[tuple[str, CellInputScope, str], dict[str, TreeEntry]] = {}
+        self._rust_codes: dict[str, RustCode | NotTokenized] = {}
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         # The declaration step's git reads, by commit: what each stored judged commit resolves to, the paths changed
@@ -1607,22 +1744,51 @@ class Ledger:
         return self._tips[commit]
 
     def _fingerprint(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> str:
-        key = (tip.commit, scope, tip.crate(path) if scope == "crate" else "." if scope == "manifest" else path)
+        key = _input_key(tip, scope, path)
         if key not in self._fingerprints:
             self._fingerprints[key] = _fingerprint(self.repo, tip, scope, path)
         return self._fingerprints[key]
 
-    def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str) -> bool:
-        if isinstance(row.reads, ReadFiles):
-            try:
-                return row.input_fingerprint == _read_fingerprint(tip, path, row.reads)
-            except LedgerError:
-                return False
-        scope = _comparison_scope(row.declared_scope, scope)
+    def _scope_inputs(self, tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
+        """What _inputs selects, selected once."""
+        key = _input_key(tip, scope, path)
+        if key not in self._inputs:
+            self._inputs[key] = _inputs(tip, scope, path)
+        return self._inputs[key]
+
+    def _rust_code(self, blob: str) -> RustCode | NotTokenized:
+        """What _rust_code reads in a blob, read once."""
+        if blob not in self._rust_codes:
+            result = subprocess.run(["git", "-C", str(self.repo), "cat-file", "blob", blob], capture_output=True, check=False)
+            if result.returncode:
+                raise CheckCouldNotRun(result.stderr.decode(errors="replace").strip() or f"git cat-file blob {blob} failed")
+            self._rust_codes[blob] = _rust_code(result.stdout)
+        return self._rust_codes[blob]
+
+    def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str, family: Family | None) -> bool:
+        """Whether the judged inputs are unchanged at tip.
+
+        Names rules judge comment text, so their inputs must be byte equal. A modules judgment also matches when only
+        comments other than inner docs changed; that check reads the inputs at the judged commit, so it runs only
+        after the fingerprints differ.
+        """
         try:
+            if isinstance(row.reads, ReadFiles):
+                if row.input_fingerprint == _read_fingerprint(tip, path, row.reads):
+                    return True
+                if family != "modules":
+                    return False
+                return _only_comments_changed(_read_inputs(self._tip(row.commit), path, row.reads),
+                                              _read_inputs(tip, path, row.reads), self._rust_code)
+            scope = _comparison_scope(row.declared_scope, scope)
             previous = (row.input_fingerprint if row.input_scope == scope
                         else self._fingerprint(self._tip(row.commit), scope, path))
-            return previous == self._fingerprint(tip, scope, path)
+            if previous == self._fingerprint(tip, scope, path):
+                return True
+            if family != "modules":
+                return False
+            return _only_comments_changed(self._scope_inputs(self._tip(row.commit), scope, path),
+                                          self._scope_inputs(tip, scope, path), self._rust_code)
         except LedgerError:
             return False
 
@@ -1672,6 +1838,10 @@ class Ledger:
         if not rows:
             raise LedgerError(f"unknown ticket {ticket_id}")
         row = rows[0]
+        widened = cast(list[tuple[str, str, str, str]], self._connection.execute(
+            "SELECT path,reason,widened_by,widened_at FROM ticket_widened_paths WHERE ticket=? ORDER BY path",
+            (ticket_id,),
+        ).fetchall())
         return {
             "id": row[0], "unit": row[1], "kind": row[2], "family": row[3], "rule": row[4], "crate": row[5],
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
@@ -1679,6 +1849,8 @@ class Ledger:
             "state": row[10], "branch": row[11], "checkpoint": row[12], "created_at": row[13], "updated_at": row[14],
             "base": row[15], "proposal": row[16], "cells": cast(list[list[str]], json.loads(row[17])),
             "finding_ids": cast(list[str], json.loads(row[18])),
+            "widened": tuple(WidenedPath(path=path, reason=reason, widened_by=by, widened_at=at)
+                             for path, reason, by, at in widened),
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -1846,6 +2018,40 @@ class Ledger:
                 "DELETE FROM held_findings WHERE ticket=? AND path=? AND state='unfiled'", (id, path),
             )
             _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, _now()))
+
+    def ticket_widen(self, id: str, paths: tuple[str, ...], reason: str, by: str,
+                     approved: Callable[[], frozenset[str]]) -> tuple[WidenedPath, ...]:
+        """Add paths outside the findings to an open proposal ticket, and return the ticket's widened paths.
+
+        approved reads the decision and returns the paths that its findings and approved renames already allow; it
+        raises when the decision is not approved. A path widened again with the same reason changes nothing.
+        """
+        reason, by = reason.strip(), by.strip()
+        if not reason:
+            raise LedgerError(f"{id}: widen requires a reason")
+        if not by:
+            raise LedgerError(f"{id}: widen requires --by")
+        normalized = tuple(dict.fromkeys(self._path(path) for path in paths))
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if ticket["kind"] != "proposal":
+                raise LedgerError(f"{id}: only a proposal ticket widens; this is a {ticket['kind']} ticket")
+            if ticket["state"] in FINAL_TICKET_STATES:
+                raise LedgerError(f"{id}: cannot widen a {ticket['state']} ticket")
+            allowed = approved()
+            previous = {widened["path"]: widened["reason"] for widened in ticket["widened"]}
+            for path in normalized:
+                if path in allowed:
+                    raise LedgerError(f"{id}: {path} is already allowed by the approved findings")
+                if path in previous and previous[path] != reason:
+                    raise LedgerError(f"{id}: {path} is already widened for another reason: {previous[path]}")
+            now = _now()
+            _ = self._connection.executemany(
+                "INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
+                [(id, path, reason, by, now) for path in normalized if path not in previous],
+            )
+            return self._ticket(id)["widened"]
 
     def applied_check(self, finding: HeldFinding, commit: str) -> AppliedCheck:
         """Whether the finding's change is in the code at commit."""
@@ -2094,7 +2300,8 @@ class Ledger:
         ticket = self._ticket(id)
         if ticket["kind"] != "proposal":
             return SelectedByCoverage(ticket["base"])
-        return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(ticket["finding_ids"]))
+        return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(ticket["finding_ids"]),
+                                tuple(widened["path"] for widened in ticket["widened"]))
 
     def proposal_tickets(self) -> tuple[TicketRecord, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
@@ -2228,8 +2435,20 @@ class Ledger:
             raise LedgerError(f"{rule}: {path} is outside rule reach")
         if kind not in ("rename", "type", "restructure") or line < 1:
             raise LedgerError("held finding requires a valid kind and positive line")
-        finding_id = hashlib.sha256(json.dumps((rule, path, line, text, rule_blob), separators=(",", ":")).encode()).hexdigest()[:16]
-        if not self._connection.execute("SELECT 1 FROM held_findings WHERE finding_id=?", (finding_id,)).fetchone():
+        change = (kind, before, after)
+        site = (rule, path, line, text, rule_blob)
+        # The first id names the site. When a different change holds it, the change gets the second id, which also names
+        # the change, so a call never returns a row that holds a different change.
+        finding_ids = (_finding_id(site), _finding_id((*site, *change)))
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            rows = cast(list[tuple[str, str, str, str]], self._connection.execute(
+                "SELECT finding_id,kind,before,after FROM held_findings WHERE finding_id IN (?,?)", finding_ids,
+            ).fetchall())
+            changes = {row[0]: row[1:] for row in rows}
+            same = [finding_id for finding_id in finding_ids if changes.get(finding_id) == change]
+            if same:
+                return self._held(same[0])
             # A followed finding keeps the id of its first site. A ticket that reads its new file holds the same change
             # again, so that change returns the followed finding, the one with the nearest line.
             followed = cast(list[tuple[str, int]], self._connection.execute(
@@ -2238,13 +2457,17 @@ class Ledger:
             ).fetchall())
             if followed:
                 return self._held(min(followed, key=lambda row: (abs(row[1] - line), row[0]))[0])
-        now = _now()
-        with self._connection:
+            free = [finding_id for finding_id in finding_ids if finding_id not in changes]
+            if not free:
+                raise LedgerError(f"{rule}: other changes hold both finding ids of {path}:{line}")
+            now = _now()
             _ = self._connection.execute(
-                "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,proposal,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'unfiled','',?,?) ON CONFLICT(finding_id) DO NOTHING",
-                (finding_id, rule, path, line, text, kind, before, after, rule_blob, ticket, now, now),
+                "INSERT INTO held_findings(finding_id,rule,path,line,text,kind,before,after,rule_blob,ticket,state,"
+                + "proposal,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'unfiled','',?,?)",
+                (free[0], rule, path, line, text, kind, before, after, rule_blob, ticket, now, now),
             )
-        return self._held(finding_id)
+            # Every return reads its row before the commit, so a write after the commit cannot change what it returns.
+            return self._held(free[0])
 
     def _held(self, finding_id: str) -> HeldFinding:
         rows = cast(list[tuple[str, str, str, int, str, FindingKind, str, str, str, str, HeldStateName, str, str, int, str, str, str, str, int, str, str, str, str]], self._connection.execute(
@@ -2282,10 +2505,16 @@ class Ledger:
                            FollowedDeclaration(row[17], row[18], row[19]) if row[19] else NotFollowed(), provenance, actor)
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
-        rows = cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT checkpoint,base FROM tickets WHERE id=?", (finding.ticket,),
-        ).fetchall())
-        for commit in (commit for commit in (rows[0] if rows else ()) if commit):
+        return self._judged_from(self._judging_ticket(finding.ticket))
+
+    def _judging_ticket(self, ticket_id: str) -> JudgingTicket:
+        return tuple(cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT checkpoint,base FROM tickets WHERE id=?", (ticket_id,),
+        ).fetchall()))
+
+    def _judged_from(self, judging: JudgingTicket) -> JudgedCommit | NoJudgedCommit:
+        """The judging ticket's checkpoint, else its start, from its row as read; reads git and not the ledger."""
+        for commit in (commit for commit in (judging[0] if judging else ()) if commit):
             if commit not in self._resolved_commits:
                 resolved = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"],
                                           capture_output=True, text=True, check=False)
@@ -2514,7 +2743,7 @@ class Ledger:
         if isinstance(held, NoHeldJudgment):
             return held
         try:
-            unchanged = (self._judgment_inputs_match(held.inputs, tip, _cell_scope(definition, path, tip), path)
+            unchanged = (self._judgment_inputs_match(held.inputs, tip, _cell_scope(definition, path, tip), path, definition.family)
                          and self._is_ancestor(held.inputs.commit, tip.commit))
         except LedgerError:
             unchanged = False
@@ -3818,35 +4047,38 @@ class Ledger:
         """Mark filed findings built after a plain merge put their change in the code, with no build ticket.
 
         Each name is a finding id or a unique prefix of one. The merge must be on the synced branch and must not be
-        older than the commit each finding was judged at, and the applied check runs at the merge. A rename that is not applied is refused. A finding that the check cannot prove needs
-        a person's reading, and the row keeps it; a proven rename clears it. Every refusal comes before the write.
-        The git work runs before the write lock; if a finding changes before the lock, it starts again.
+        older than the commit each finding was judged at. It must contain the checkpoint of each ticket that built or
+        holds a finding, except a dropped ticket. The applied check runs at the merge. A rename that is not applied is
+        refused. A finding that the check cannot prove needs a person's reading, and the row keeps it; a proven rename
+        clears it. Every refusal comes before the write.
+        The git work runs before the write lock. If the synced tip or a row that decides a finding changes before the
+        lock, it starts again.
         """
         try:
             commit = _git(self.repo, "rev-parse", "--verify", f"{merge}^{{commit}}")
         except CheckCouldNotRun as error:
             raise LedgerError(f"{merge}: no such commit") from error
-        tip = self.synced_commit()
-        if not self._is_ancestor(commit, tip):
-            raise LedgerError(f"{merge} is not on the synced branch at {tip[:7]}")
-
-        def named(name: str, identities: list[str]) -> HeldFinding:
-            """The one filed finding that name names; refuses a name that is not one."""
-            finding = self._named_finding(name, identities)
-            if not isinstance(finding.state, Filed):
-                raise LedgerError(f"{finding.finding_id}: cannot mark a {held_state_name(finding.state)} finding built")
-            self._refuse_open_build_ticket(finding)
-            return finding
 
         def attempt() -> tuple[BuiltAtMerge, ...]:
+            tip = self.synced_commit()
+            if not self._is_ancestor(commit, tip):
+                raise LedgerError(f"{merge} is not on the synced branch at {tip[:7]}")
             identities = self._held_identities()
-            findings = {finding.finding_id: finding for finding in (named(name, identities) for name in names)}
+            finding_ids = sorted({self._named_finding(name, identities).finding_id for name in names})
+            read = {finding_id: self._built_at_merge_rows(finding_id) for finding_id in finding_ids}
+            for rows in read.values():
+                if not isinstance(rows.finding.state, Filed):
+                    raise LedgerError(f"{rows.finding.finding_id}: cannot mark a "
+                                      + f"{held_state_name(rows.finding.state)} finding built")
+                rows.refuse_open_build_ticket()
             built: list[BuiltAtMerge] = []
-            for finding_id, finding in sorted(findings.items()):
+            for finding_id, rows in read.items():
+                finding = rows.finding
                 # A merge older than the finding's judgment cannot hold its change.
-                judged = self.judged_commit(finding)
+                judged = self._judged_from(rows.judging)
                 if isinstance(judged, JudgedCommit) and judged.commit != commit and self._is_ancestor(commit, judged.commit):
                     raise LedgerError(f"{finding_id}: {merge} is older than {judged.commit[:7]}, where the finding was judged")
+                self._refuse_merge_without_checkpoints(finding_id, rows.linked, commit, merge)
                 check = self.applied_check(finding, commit)
                 match check:
                     case AppliedInCode():
@@ -3860,8 +4092,10 @@ class Ledger:
                         built.append(BuiltAtMerge(finding_id, commit, reading))
             with self._connection:
                 _ = self._connection.execute("BEGIN IMMEDIATE")
-                if any(self._held(finding_id) != finding for finding_id, finding in findings.items()):
-                    raise ChangedBeforeLock(f"{', '.join(sorted(findings))}: a finding changed while it was marked built; rerun")
+                if self.synced_commit() != tip or any(self._built_at_merge_rows(finding_id) != rows
+                                                      for finding_id, rows in read.items()):
+                    raise ChangedBeforeLock(f"{', '.join(finding_ids)}: a finding or its tickets changed "
+                                            + "while it was marked built; rerun")
                 now = _now()
                 for item in built:
                     by = item.reading.by if isinstance(item.reading, ReadByPerson) else ""
@@ -3888,8 +4122,31 @@ class Ledger:
     def _refuse_open_build_ticket(self, finding: HeldFinding) -> None:
         if isinstance(finding.build_ticket, BuildTicket):
             ticket = self._ticket(finding.build_ticket.ticket)
-            if ticket["state"] not in FINAL_TICKET_STATES:
-                raise LedgerError(f"{finding.finding_id}: build ticket {ticket['id']} still holds the finding")
+            _refuse_open_ticket(finding.finding_id, ticket["id"], ticket["state"])
+
+    def _linked_tickets(self, finding: HeldFinding) -> tuple[LinkedTicket, ...]:
+        """The tickets that built or hold the finding: its build ticket and each ticket whose finding ids list it."""
+        build_ticket = finding.build_ticket.ticket if isinstance(finding.build_ticket, BuildTicket) else ""
+        return tuple(cast(list[LinkedTicket], self._connection.execute(
+            "SELECT id,state,checkpoint FROM tickets "
+            + "WHERE id=? OR EXISTS(SELECT 1 FROM json_each(finding_ids) WHERE value=?) ORDER BY id",
+            (build_ticket, finding.finding_id),
+        ).fetchall()))
+
+    def _built_at_merge_rows(self, finding_id: str) -> BuiltAtMergeRows:
+        """The finding's held row, its linked tickets and its judging ticket, as they are now."""
+        finding = self._held(finding_id)
+        return BuiltAtMergeRows(finding, self._linked_tickets(finding), self._judging_ticket(finding.ticket))
+
+    def _refuse_merge_without_checkpoints(self, finding_id: str, linked: tuple[LinkedTicket, ...], commit: str,
+                                          merge: str) -> None:
+        """Refuse a merge that does not contain the checkpoint of a linked ticket of the finding.
+
+        A dropped ticket's checkpoint is not merged work, so it does not count.
+        """
+        for ticket, state, checkpoint in linked:
+            if state != "dropped" and checkpoint and not self._is_ancestor(checkpoint, commit):
+                raise LedgerError(f"{finding_id}: {merge} does not contain {ticket}'s checkpoint {checkpoint[:7]}")
 
     def named_held(self, names: Iterable[str]) -> tuple[HeldFinding, ...]:
         """The held findings that the names name, each once and in finding-id order; refuses a name that is not one."""
@@ -4362,13 +4619,13 @@ class Ledger:
                 ancestor = self._is_ancestor(row.commit, tip.commit)
             except LedgerError:
                 continue
-            if ancestor and self._judgment_inputs_match(row, tip, scope, path):
+            if ancestor and self._judgment_inputs_match(row, tip, scope, path, rule.family):
                 return "current", row.verdict
             if not ancestor and isinstance(style_branch, StoredStyleBranch):
                 try:
                     branch_commit = self._branch_commit(style_branch.name)
                     checked_tip = self._tip(branch_commit)
-                    if self._is_ancestor(row.commit, branch_commit) and self._judgment_inputs_match(row, checked_tip, scope, path):
+                    if self._is_ancestor(row.commit, branch_commit) and self._judgment_inputs_match(row, checked_tip, scope, path, rule.family):
                         if not pending:
                             pending = row.verdict
                 except LedgerError:
@@ -4414,7 +4671,7 @@ class Ledger:
                     continue
                 try:
                     repeats = (self._is_ancestor(row.commit, tip.commit) and self._is_ancestor(row.commit, merged)
-                               and self._judgment_inputs_match(row, tip, scope, cell.path))
+                               and self._judgment_inputs_match(row, tip, scope, cell.path, rule.family))
                 except LedgerError:
                     repeats = False
                 if repeats:
@@ -4436,7 +4693,7 @@ class Ledger:
             return NoStyleMergeChange()
         tip = self._tip(pushed)
         changed = tuple(cell for cell, row, scope in self._repeated_judgments(cells, base)
-                        if not self._judgment_inputs_match(row, tip, scope, cell.path))
+                        if not self._judgment_inputs_match(row, tip, scope, cell.path, cell.family))
         return StyleMergeChanges(style_branch.name, changed) if changed else NoStyleMergeChange()
 
     def _lint_coverage(self, tool: LintTool, tip: RepositoryTip) -> LintCoverage:

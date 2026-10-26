@@ -400,11 +400,11 @@ class DurableRolesTests(unittest.TestCase):
 
         with patch.object(codex_mesh, "_release_held_server", side_effect=release_server), \
                 patch.object(codex_mesh, "_start_server", side_effect=start_server), \
-                patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.run_a),
+                patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.run_a),
                                         "PLAN_DELEGATE_PHASE": "stale-phase"}):
             self.assertEqual(codex_mesh.ensure_server(str(mesh), home), (32101, True))
         self.assertEqual(operations, ["release", "start"])
-        self.assertEqual(environments[0]["PLAN_DELEGATE_BOARD_DIR"], str(self.run_b))
+        self.assertEqual(environments[0]["UNIT_RUN_DIR"], str(self.run_b))
         self.assertEqual(environments[0]["GUILD_BINDING_GENERATION"], str(rebound.placement.generation))
         self.assertNotIn("PLAN_DELEGATE_PHASE", environments[0])
         self.holder_session = "holder-restarted"
@@ -413,9 +413,10 @@ class DurableRolesTests(unittest.TestCase):
         with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "holder-restarted"}):
             unbound = roles.rebind(design.placement.design_id, expected_generation=2, reason="run end",
                                    binding=roles.DesignUnbound())
-        with patch.dict(os.environ, {"PLAN_DELEGATE_BOARD_DIR": str(self.run_a), "PLAN_DELEGATE_PHASE": "old"}):
+        with patch.dict(os.environ, {"UNIT_RUN_DIR": str(self.run_a), "PLAN_DELEGATE_BOARD_DIR": str(self.run_a),
+                                     "UNIT_PHASE": "old"}):
             context = codex_mesh._server_environment(str(mesh), home)  # pyright: ignore[reportPrivateUsage]
-        self.assertFalse(any(key.startswith("PLAN_DELEGATE_") for key in context))
+        self.assertFalse(any(key.startswith(("UNIT_", "PLAN_DELEGATE_")) for key in context))
         self.assertEqual(context["GUILD_BINDING_GENERATION"], str(unbound.placement.generation))
 
     def test_stale_rebind_and_busy_rebind_preserve_the_current_binding(self) -> None:
@@ -479,6 +480,22 @@ class DurableRolesTests(unittest.TestCase):
         _ = (self.run_b / "phases/1/delegated_phase_reservation_state.json").write_bytes(b"\xff")
         with self.assertRaises((ValueError, OSError)):
             _ = roles.check_patch(design.placement.design_id, 2, self.repository, ["design.md"])
+
+    def test_a_binding_to_an_ad_hoc_phase_open_beside_another_accepts_its_patch(self) -> None:
+        phase = self.run_a / "phases/adhoc"
+        phase.mkdir()
+        _ = (phase / "delegated_phase_reservation_state.json").write_text(json.dumps({
+            "kind": "enrolled_awaiting_first_touch", "phase": "ad hoc"}))
+        _ = (phase / "files").write_text("design.md\n")
+        state = self.run_a / "progress_history_state.json"
+        recorded = cast(dict[str, object], json.loads(state.read_text()))
+        ad_hoc = {"id": "ad hoc", "instance_id": "instance-ad-hoc", "status": "active"}
+        recorded["open_phases"] = [*cast(list[object], recorded["open_phases"]), ad_hoc]
+        _ = state.write_text(json.dumps(recorded))
+        binding = roles.DesignBoundToPhase(str(self.run_a), "ad hoc", str(self.repository), ("design.md",))
+        design = roles.open_role("fixture-repo", "design.md", "designer", roles.UnitHolder("demo", "design-unit"),
+                                 "design", binding=binding, request_id="open-ad-hoc")
+        self.assertEqual(roles.check_patch(design.placement.design_id, 1, self.repository, ["design.md"]), binding)
 
     def test_patch_cannot_follow_a_symlink_outside_the_reserved_repository(self) -> None:
         design = self.open_designer()
@@ -544,6 +561,40 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual([(role, thread) for role, thread, _text in self.dispatches],
                          [("designer", "thread-designer"), ("reviewer", "thread-reviewer")])
         self.assertEqual(len(self.launches), 2)
+
+    def check_holder_move(self, old: roles.Holder, new: roles.Holder) -> None:
+        """The held role resumes under `new` only after the move, in the same thread, with its paths kept."""
+        design = roles.open_role("fixture-repo", "design.md", "designer", old, "design",
+                                 binding=self.binding(self.run_a))
+
+        def resolve(holder: roles.Holder) -> roles.HolderReach | roles.HolderUnavailable:
+            return roles.HolderReach("holder-one") if holder == new else roles.HolderUnavailable("not marked")
+
+        with patch.object(roles, "resolve_holder", side_effect=resolve):
+            with self.assertRaisesRegex(roles.RoleRefused, "not marked"):
+                _ = self.resume(design, "designer")
+            self.assertTrue(roles.holder_failures(old))
+            for _attempt in range(2):
+                roles.move_holder(old, new, reason="unit transfer")
+            current = roles.read_design(design.placement.design_id)
+            _ = self.resume(current, "designer")
+        self.assertEqual(current.holder, new)
+        self.assertEqual((current.repository, current.document, current.binding),
+                         (design.repository, design.document, design.binding))
+        self.assertEqual(current.placement.generation, 2)
+        self.assertEqual(current.roles[0].name, design.roles[0].name)
+        roster = cast(dict[str, dict[str, object]], json.loads(
+            (roles.mesh_directory(design.placement.design_id) / "mesh_roster.json").read_text()))
+        self.assertEqual(roster[design.roles[0].name]["cwd"], design.repository)
+        self.assertEqual(roles.holder_failures(old), [])
+        self.assertEqual(self.dispatches[-1][1], "thread-designer")
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
+    def test_a_unit_transfer_moves_the_holder_to_the_receiving_production(self) -> None:
+        self.check_holder_move(roles.UnitHolder("demo", "design-unit"), roles.UnitHolder("other", "design-unit"))
+
+    def test_a_production_rename_moves_the_showrunner_holder(self) -> None:
+        self.check_holder_move(roles.ShowrunnerHolder("demo"), roles.ShowrunnerHolder("renamed"))
 
     def test_uncertain_server_release_blocks_rename_before_holder_changes(self) -> None:
         design = self.open_designer()

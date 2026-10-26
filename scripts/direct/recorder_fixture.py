@@ -40,7 +40,7 @@ def invoke_recorder(arguments: Sequence[str], environment: Mapping[str, str],
     progress_history._config_digest.cache_clear()  # pyright: ignore[reportPrivateUsage]
     try:
         with (
-            patch.object(progress_history, "DEFAULT_CONFIG_PATH", home / ".claude/config/delegate.conf"),
+            patch.object(progress_history, "DEFAULT_CONFIG_PATH", home / ".claude/config/direct.conf"),
             patch.object(progress_history, "DEFAULT_AGENTS_CONFIG_PATH", home / ".claude/config/agents.conf"),
             patch.object(user_zone, "CONF", Path(environment.get("USER_ZONE_CONF") or
                                                str(Path(user_zone.__file__).parents[2] / "config/user_zone.conf"))),

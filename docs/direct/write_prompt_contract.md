@@ -1,4 +1,4 @@
-# Write a delegate prompt
+# Write a worker prompt
 
 Read at the point of use from `/unit:direct`. Defines `<WritePromptContract/>`,
 `<PhaseTeam/>`, `<CoordinationBoard/>`, `<PhaseMesh/>`, `<BuildTokenContract/>`,
@@ -83,7 +83,7 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    holds which files, each hub file with its one owner. Copy
    the board commands from <CoordinationBoard/>, and say a `verify.sh` run may
    pause while a peer finishes its own. Copy <BuildTokenContract/>'s
-   delegate-facing prohibition: never mention, request, or acquire the cargo
+   worker-facing prohibition: never mention, request, or acquire the cargo
    token. State the one rule plainly: **a question to a peer is a message, a
    decision is a board post**, and the board has no `ask` kind to fall back on.
    State too: **say where anything you pass to a peer came from**; only the unit
@@ -136,7 +136,7 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    ```
 
 The Verification section carries the applicable command lines and every
-delegate-facing rule from <VerificationContract/>, with nothing added around
+worker-facing rule from <VerificationContract/>, with nothing added around
 them. It must also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
 output has been read. For a Codex worker, the final report waits for the
@@ -147,7 +147,7 @@ package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
 </WritePromptContract>
 
 <PhaseTeam>
-Every phase's implementation dispatch assigns **two delegates at once**; a
+Every phase's implementation dispatch assigns **two workers at once**; a
 repair assigns one per disjoint file set under <FixDispatch/>. They share
 `${SESSION_DIR}` and `${WORKING_DIR}`, and each occupies a fixed **slot** that
 names its artifacts and board identity. Under <LongLivedWorkers/>, the first
@@ -215,7 +215,7 @@ and the token owner, where messages are addressed and transient. One post
 reaches the peer and the wrapper at once; a member resumed hours later reads
 the whole history rather than what arrived while it listened; and only the
 token, taken with `mkdir`, makes anything mutually exclusive. With
-`[delegate.options] codex_mesh=0` a codex member is unaddressable and the board
+`[direct.options] codex_mesh=0` a codex member is unaddressable and the board
 is its only channel, since the unit director is asleep between progress ticks and
 cannot relay. Each `register` line says which case holds, in its `mesh=` field.
 
@@ -268,10 +268,10 @@ mid-run, without waiting for a phase to end.
     `codex app-server`. Two calls, both with
     `--session-dir <concrete SESSION_DIR> --to <name>`:
     `python3 ~/.claude/scripts/agents/codex_mesh.py send --message "<text>"`
-    queues the message and it lands at the start of that delegate's next turn;
+    queues the message and it lands at the start of that worker's next turn;
     `… steer --message "<text>"` interrupts the turn it is running right now.
     Send by default. Steer only when the work in flight is work you need
-    stopped — it costs the delegate whatever it was mid-way through.
+    stopped — it costs the worker whatever it was mid-way through.
     `… list --session-dir <dir>` prints the roster; each entry carries `role`,
     `status` (including terminal `"ended"`), and `context_tokens`.
   - `mesh=none` — that member has no address. Do not wait on a reply from it;
@@ -284,7 +284,7 @@ mid-run, without waiting for a phase to end.
   Only the unit director starts its next turn — a later phase, repair, or
   follow-up — through `implement.sh --to <worker>`. That turn receives the held
   messages after its prompt. The launcher attempts compaction above
-  `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
+  `UNIT_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
   presses on after overflow per <LongLivedWorkers/>.
 - **A codex member has no route to the unit director.** It reaches its peer with
   the calls above and reaches the unit director only through the board, which the
@@ -319,10 +319,10 @@ to take it.** `implement.sh` exports the board directory and the slot;
 including failure and interrupt. A rule that lives only in a prompt is a rule an
 agent can drop, so it is enforced where the cargo command actually runs.
 
-**Never write `board.sh acquire cargo` into a delegate prompt.** An agent
+**Never write `board.sh acquire cargo` into a worker prompt.** An agent
 holding the token by hand will then wait out the full timeout for a token it is
 already holding — a self-inflicted deadlock that looks exactly like a slow test
-run. The token is infrastructure the delegate does not see. `--hold` is a
+run. The token is infrastructure the worker does not see. `--hold` is a
 deadline, not a reservation, so a member killed mid-hold strands nobody behind
 its lock. The unit director may inspect holders with
 `board.sh locks "${SESSION_DIR}"` when a phase looks stalled.
@@ -344,7 +344,7 @@ registration, a shared types file — has exactly one owner, named on that slot'
 Workers line; every other writer messages the owner for the line it needs.
 
 This is enforced, not merely agreed: the cargo-berth pre-edit hook claims paths
-per session, each delegate is its own session, so an edit into a peer's claimed
+per session, each worker is its own session, so an edit into a peer's claimed
 file is **blocked** rather than merged. Two consequences that must reach the
 prompts:
 

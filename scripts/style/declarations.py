@@ -14,7 +14,7 @@ from functools import lru_cache
 import re
 
 import style_footprint
-from approved_renames import ITEM_KEYWORDS, item_starts, type_path
+from approved_renames import ITEM_KEYWORDS, type_path
 
 # The items whose body is in braces; the other items end at their semicolon.
 BRACED_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "mod", "impl"})
@@ -421,7 +421,7 @@ def read_declarations(text: str) -> DeclaredFile:
     tokenized = style_footprint.tokenized_text(text)
     words = tuple(token.value for token in tokenized.tokens)
     lines = tokenized.lines
-    starts = item_starts(words)
+    starts = style_footprint.item_starts(words)
     owners = style_footprint.attribute_owners(words)
     first_attribute: dict[int, int] = {}
     for start, keyword in sorted(owners.items(), reverse=True):

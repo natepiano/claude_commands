@@ -3,14 +3,15 @@
 
   escalate.py hold KEY --summary TITLE --text TEXT (--action TEXT | --no-action)
                    [--minutes 15] [--need note|decision|blocked]
-  escalate.py close KEY    the news is over; the next hold of KEY starts a new wait
+  escalate.py close KEY    the news is over; the next hold of KEY starts a new wait, and a sent
+                           --need blocked push stops repeating (send.py retire --to user)
   escalate.py typed        the user typed in a terminal: the prompt hook's call
   escalate.py due          settle each waiting message: the notifier job's call
   escalate.py list         each held message and where it stands
 
 `hold` is for news a terminal already shows. It waits `--minutes`: if the user
 types in any terminal in that time it is never sent, and if not, `due` sends it
-with `send.py --to user`. Holding a KEY already held changes nothing, so a caller
+with `send.py --to user --key escalate-KEY`. Holding a KEY already held changes nothing, so a caller
 may hold on every check and `close` once the news stops being true.
 """
 from __future__ import annotations
@@ -381,8 +382,13 @@ def discard_script_hold(path: Path, held: RetiredScriptHold) -> Settled:
     return Settled(f"{path.stem}: closed script hold {held.text_id}: {reason}", False)
 
 
+def user_key(key: str) -> str:
+    """The send.py --key of KEY's user push."""
+    return f"{JOB}-{key}"
+
+
 def close(key: str) -> bool:
-    """Forget KEY; false when it was not held."""
+    """Forget KEY, and stop its emergency push if one was sent; false when it was not held."""
     with locked():
         path = held_path(key)
         held = read(path)
@@ -393,6 +399,15 @@ def close(key: str) -> bool:
             path.unlink()
         except FileNotFoundError:
             return False
+    if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
+        try:
+            done = subprocess.run([sys.executable, str(SEND), "retire", "--to", "user", "--from", JOB,
+                                   "--key", user_key(key)], capture_output=True, text=True, check=False, timeout=60)
+            problem = "" if done.returncode == 0 else (done.stdout.strip() or done.stderr.strip()).split("\n")[-1]
+        except (OSError, subprocess.TimeoutExpired) as error:
+            problem = str(error)
+        if problem:
+            print(f"escalate.py: {key}: {problem}", file=sys.stderr)
     return True
 
 
@@ -426,12 +441,12 @@ def reconcile_codex_holds(home: Path, login: str) -> None:
         _cancel_outgoing_codex_holds(home, login)
 
 
-def deliver(held: HeldMessage) -> str:
+def deliver(held: HeldMessage, key: str) -> str:
     """Send one held message to the user; the empty string when sent, else send.py's own line."""
     import review
 
     action_args = ["--action", held.action.text] if isinstance(held.action, ActionRequired) else ["--no-action"]
-    command = [sys.executable, str(SEND), "--to", "user", "--from", JOB, "--summary", held.summary,
+    command = [sys.executable, str(SEND), "--to", "user", "--from", JOB, "--key", user_key(key), "--summary", held.summary,
                "--need", held.need, *action_args, "--text", held.text]
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=review.user_send_seconds() + 15)
@@ -485,7 +500,7 @@ def due(now: float) -> list[Settled]:
                 line = "the user typed in a terminal; not sent"
             elif now < held.held_at + held.minutes * 60:
                 continue
-            elif problem := deliver(held):
+            elif problem := deliver(held, path.stem):
                 if not problem.startswith("HELD:"):
                     settled.append(Settled(f"{path.stem}: NOT sent: {problem}", True))
                     continue

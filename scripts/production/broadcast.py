@@ -54,7 +54,7 @@ class Agents:
 
 @dataclass(frozen=True)
 class Workers:
-    """Every delegate worker."""
+    """Every worker."""
 
 
 @dataclass(frozen=True)

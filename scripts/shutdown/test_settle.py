@@ -3759,7 +3759,7 @@ class SettleTests(ShutdownTestCase):
         restore.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "failed"), saved)
 
-    def test_now_only_failed_stop_marks_force_and_delegates_retry_to_conductor(self) -> None:
+    def test_now_only_failed_stop_marks_force_and_workers_retry_to_conductor(self) -> None:
         saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
         other = session_shutdown(top_level("other", "Other"))
         self.save(saved)

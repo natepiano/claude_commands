@@ -29,6 +29,9 @@ import note_file
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import agents_registry  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
@@ -698,7 +701,7 @@ def registry_assignments() -> dict[str, str]:
     """[assignments] in the registry: function, or exact-task override, -> family."""
     found: dict[str, str] = {}
     section = ""
-    for line in REGISTRY.read_text(encoding="utf-8").splitlines():
+    for line in agents_registry.registry_text(REGISTRY).splitlines():
         text = line.split("#", 1)[0].strip()
         if text.startswith("[") and text.endswith("]"):
             section = text[1:-1]
@@ -1058,6 +1061,11 @@ class TargetReadingUnavailable:
 
 
 @dataclass(frozen=True)
+class TargetLoginRenewalFailed:
+    detail: str
+
+
+@dataclass(frozen=True)
 class TargetAccountUnavailable:
     reason: str
 
@@ -1084,7 +1092,8 @@ class TargetIsCurrentAccount:
 
 
 BlockedHeadReason = (TargetReadingUnavailable | TargetAccountUnavailable | TargetAtOrBelowThreshold
-                     | TargetUnresolvedRefusal | TargetPreparationRefused | TargetIsCurrentAccount)
+                     | TargetUnresolvedRefusal | TargetPreparationRefused | TargetIsCurrentAccount
+                     | TargetLoginRenewalFailed)
 
 
 def blocked_next_move_reason_key(reason: BlockedHeadReason) -> str:
@@ -1095,6 +1104,9 @@ def blocked_next_move_reason_key(reason: BlockedHeadReason) -> str:
 
 
 def blocked_next_move_line(group: str, target: str, _entry_id: str, reason: BlockedHeadReason) -> str:
+    if isinstance(reason, TargetLoginRenewalFailed):
+        return (f"{group} 1 → {target} due, {target}'s login expired, and a probe session on it failed "
+                f"({reason.detail}). Log in on {target} by hand.")
     if isinstance(reason, TargetIsCurrentAccount):
         return f"{group} 1 → {target} due, {target} is already the current account"
     if isinstance(reason, TargetReadingUnavailable):
@@ -1198,7 +1210,7 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                     continue
                 stamp = now.isoformat(timespec="seconds")
                 why = f"auto: {entry.id}"
-                if isinstance(entry.to, next_moves.DelegateToClaude):
+                if isinstance(entry.to, next_moves.WorkersToClaude):
                     if isinstance(entry.to.account, next_moves.ClaudeWorkersTarget):
                         try:
                             _ = accounts.claude_workers_account(entry.to.account.label)
