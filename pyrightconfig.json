@@ -69,6 +69,7 @@
       "extraPaths": [
         ".",
         "scripts/style",
+        "scripts/herdr",
         "scripts/production",
         "scripts/lib"
       ]

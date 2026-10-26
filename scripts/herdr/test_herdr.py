@@ -88,6 +88,7 @@ class WaitingAgentCLI:
 
 REAL_SUBMIT_OPENING_PROMPT = herdr.Herdr.submit_opening_prompt
 REAL_LOAD_FACTOR = herdr.load_factor
+REQUIRE_SHARED = herdr._require_shared  # pyright: ignore[reportPrivateUsage]
 
 
 @final
@@ -914,6 +915,8 @@ class HerdrTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "linux")))
         # Test limits stay as written on a loaded machine.
         _ = self.enterContext(patch.object(herdr, "load_factor", return_value=1.0))
+        # Server start mechanics do not depend on the name. The one-session rule has its own tests.
+        _ = self.enterContext(patch.object(herdr, "_require_shared"))
         # These fixtures specify process startup and argv; PromptSubmissionTests
         # exercises the real transcript/readiness path without this substitute.
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
@@ -1911,10 +1914,45 @@ class HerdrTests(unittest.TestCase):
             _ = herdr.run_program(["true"], environment={"SHOWRUNNER_UNIT": "explicit"})
             self.assertEqual(run.call_args.kwargs["env"], {"SHOWRUNNER_UNIT": "explicit"})
 
-    def test_shared_session_is_empty_until_named(self) -> None:
-        self.assertEqual(herdr.shared_session(), "")
+    def test_shared_session_is_agents_until_named(self) -> None:
+        self.assertEqual(herdr.shared_session(), "agents")
         self.share()
         self.assertEqual(herdr.shared_session(), "fixture")
+
+    def test_every_server_start_refuses_a_session_other_than_the_shared_one(self) -> None:
+        self.share()
+        starts: tuple[Callable[[], object], ...] = (
+            lambda: herdr.start_server("writing", 10_000),
+            lambda: herdr.start_new_server("writing", 10_000),
+            lambda: herdr.restore_server("writing", 10_000, session_kind=herdr.DesktopSession(), exclusive=False),
+        )
+        with patch.object(herdr, "_require_shared", REQUIRE_SHARED):
+            for start in starts:
+                with self.subTest(start=start), self.assertRaisesRegex(
+                        herdr.HerdrFailure, "herdr session writing: every Claude session runs as a tab in "
+                        + "herdr session fixture; open a tab there instead of starting another session"):
+                    _ = start()
+        self.assertEqual(self.commands(), [])
+
+    def test_attach_hint_names_the_shared_session_workspace_and_tab(self) -> None:
+        self.assertEqual(herdr.attach_hint("build-followups", "alpha"),
+                         "herdr session attach agents, workspace build-followups, tab alpha")
+        self.share()
+        self.assertEqual(herdr.attach_hint("ad-hoc", "solo"),
+                         "herdr session attach fixture, workspace ad-hoc, tab solo")
+
+    def test_focus_tab_of_shows_the_workspace_then_the_tab_and_refuses_a_missing_pane(self) -> None:
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"},
+            {"pane_id": "w2:p3", "workspace_id": "w2", "tab_id": "w2:t2"}]}}))
+        self.herdr.focus_tab_of("w2:p3")
+        self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"],
+                                           ["--session", "fixture", "workspace", "focus", "w2"],
+                                           ["--session", "fixture", "tab", "focus", "w2:t2"]])
+        self.log.unlink()
+        with self.assertRaisesRegex(herdr.HerdrFailure, "herdr pane w9:p9 is not open in session fixture"):
+            self.herdr.focus_tab_of("w9:p9")
+        self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
 
     def test_open_tab_creates_the_production_workspace_once_then_adds_tabs(self) -> None:
         options = ["--label", "boss", "--cwd", "/repo", "--env", "SHOWRUNNER_UNIT=prod", "--env", "HERDR_AGENT_PANE=1", "--no-focus"]

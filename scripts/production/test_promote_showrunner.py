@@ -281,7 +281,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         restore.assert_not_called()
         self.assertIn("session is open but not ready", out)
         self.assertIn("showrunner prompt was not sent", out)
-        self.assertIn("herdr session attach child", out)
+        self.assertIn("herdr session attach agents, workspace child, tab child", out)
         self.assertNotIn("add_unit.py", out)
         self.assertNotIn("--resume", out)
         self.assertTrue(self.events[-1].startswith("start"))
@@ -445,12 +445,12 @@ class PromoteShowrunnerTests(unittest.TestCase):
         with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
                 mock.patch.object(showrunners, "descendants_of", return_value=[]), \
                 mock.patch.object(add_showrunner, "running", return_value=False), \
-                mock.patch.object(add_showrunner, "herdr_session_running", return_value=True) as live, \
+                mock.patch.object(add_showrunner, "herdr_tab_open", return_value=True) as live, \
                 mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
                     self.worktree, self.root / ".claude.json", self.worktree)):
             code, _out, err = self.run_main()
         self.assertEqual(code, 2, err)
-        self.assertIn("a herdr session named child is already live", err)
+        self.assertIn("a tab named child is already open in herdr session agents", err)
         live.assert_called_once_with("child")
         self.assert_nothing_stopped()
         self.assertFalse(any(event.startswith("stop herdr ") for event in self.events))
@@ -463,7 +463,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         with mock.patch.object(add_showrunner, "checked", CHILD_PREFLIGHT), \
                 mock.patch.object(showrunners, "descendants_of", return_value=[]), \
                 mock.patch.object(add_showrunner, "running", return_value=False), \
-                mock.patch.object(add_showrunner, "herdr_session_running", return_value=True) as live, \
+                mock.patch.object(add_showrunner, "herdr_tab_open", return_value=True) as live, \
                 mock.patch.object(trust_reader, "claude_trust", return_value=trust_reader.Trusted(
                     self.worktree, self.root / ".claude.json", self.worktree)), \
                 mock.patch.object(herdr, "stop_session") as stopped:
@@ -502,11 +502,11 @@ class PromoteShowrunnerTests(unittest.TestCase):
         config = self.root / "claude.json"
         _ = config.write_text(json.dumps({"projects": {str(child.checkout): {"hasTrustDialogAccepted": True}}}))
         with (mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
-              mock.patch.object(add_showrunner, "herdr_session_running", mock.Mock(return_value=True)),
+              mock.patch.object(add_showrunner, "herdr_tab_open", mock.Mock(return_value=True)),
               mock.patch.object(add_showrunner, "claude_json", return_value=config),
               mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[]))):
             self.assertIsNone(ORIGINAL_CHECKED(child, "parent", ending="child", config_dir=self.unit_account.dir))
-            with self.assertRaisesRegex(Refusal, "a herdr session named child is already live"):
+            with self.assertRaisesRegex(Refusal, "a tab named child is already open in herdr session agents"):
                 _ = ORIGINAL_CHECKED(child, "parent", config_dir=self.unit_account.dir)
 
     def test_the_childs_check_is_for_the_units_worktree_which_must_be_trusted(self) -> None:
@@ -518,7 +518,7 @@ class PromoteShowrunnerTests(unittest.TestCase):
         child = read_production(self.child_doc)
         with (mock.patch.dict(os.environ, {"ADD_SHOWRUNNER_CLAUDE_JSON": str(config)}),
               mock.patch.object(add_showrunner, "running", mock.Mock(return_value=False)),
-              mock.patch.object(add_showrunner, "herdr_session_running", mock.Mock(return_value=False)),
+              mock.patch.object(add_showrunner, "herdr_tab_open", mock.Mock(return_value=False)),
               mock.patch.object(showrunners, "descendants_of", mock.Mock(return_value=[]))):
             with self.assertRaisesRegex(Refusal, f"child: Claude is not trusted in {self.worktree.resolve()} on "
                                         + "claude2. Run:"):

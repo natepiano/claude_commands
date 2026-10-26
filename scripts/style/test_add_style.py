@@ -86,7 +86,7 @@ def run_script(script, *arguments):
     return real_run_script(script, *arguments)
 
 with mock.patch.object(add_style, "_run_script", side_effect=run_script), mock.patch.object(
-    add_style, "herdr_session_running", side_effect=lambda name:
+    add_style, "herdr_tab_open", side_effect=lambda name:
     (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).exists()
 ):
     raise SystemExit(add_style.main(sys.argv[2:]))
@@ -531,8 +531,9 @@ class AddStyleTests(unittest.TestCase):
         result = self.run_bootstrap(success=False)
 
         guidance = (
-            "look at it with herdr session attach sample-style; once it has its update timer, "
-            "rerun add_style, which attaches it; if it never gets one, end that session and rerun"
+            "look at it with herdr session attach agents, workspace sample-style, tab sample-style; "
+            "once it has its update timer, rerun add_style, which attaches it; "
+            "if it never gets one, end that session and rerun"
         )
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("add_style: sample-style was left open by add_showrunner.py (exit 3); " + guidance, result.stderr)

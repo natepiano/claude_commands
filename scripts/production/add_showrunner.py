@@ -89,15 +89,18 @@ def checked(child: Production, caller: str, ending: str = "", start_in: Path | N
         raise Refusal(f"{child.slug}: Claude is not trusted in {folder} on {label}. "
                       + f"Run: {trust_command(folder, selected)}")
     try:
-        if child.slug != ending and herdr_session_running(child.slug):
-            raise Refusal(f"a herdr session named {child.slug} is already live")
+        if child.slug != ending and herdr_tab_open(child.slug):
+            raise Refusal(f"a tab named {child.slug} is already open in herdr session {herdr.shared_session()}")
     except herdr.HerdrFailure as error:
         raise Refusal(str(error)) from error
 
 
-def herdr_session_running(name: str) -> bool:
-    """Whether a running herdr session already owns this name."""
-    return any(session["name"] == name for session in herdr.live_sessions())
+def herdr_tab_open(name: str) -> bool:
+    """Whether the shared herdr session already holds a tab named `name`."""
+    shared = herdr.shared_session()
+    if not any(session["name"] == shared for session in herdr.live_sessions()):
+        return False
+    return any(pane.get("label") == name for pane in herdr.Herdr(shared).panes())
 
 
 def account_directory(selected: ClaudeLaunchAccount) -> Path:
@@ -127,14 +130,9 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     environment = {"ENABLE_TOOL_SEARCH": "true"}
     environment.update(named_account_environment(selected.dir))
     host = herdr.shared_session()
-    if host:
-        _ = herdr.start_server(host, 90_000)
-        pane = herdr.open_tab(host, showrunners.herdr_space(child.slug, str(child.doc)), child.slug, str(cwd),
-                              environment)
-    else:
-        host = child.slug
-        herdr.start_new_server(host, 90_000)
-        pane = herdr.open_pane(host, child.slug, str(cwd), environment)
+    _ = herdr.start_server(host, 90_000)
+    pane = herdr.open_tab(host, showrunners.herdr_space(child.slug, str(child.doc)), child.slug, str(cwd),
+                          environment)
     outcome = herdr.start_agent(host, pane, kind="claude", agent=child.slug, agent_arguments=arguments,
         opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)), timeout_ms=90_000)
     return (outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted))
@@ -210,8 +208,9 @@ def main(argv: list[str]) -> int:
     if isinstance(outcome, herdr.PromptNotSubmitted):
         print(f"add_showrunner: {child.slug}: opening prompt not submitted: {outcome.reason}", file=sys.stderr)
         return SESSION_NOT_READY
-    print(f"started {child.slug}: herdr session attach {child.slug}")
-    later = (f"Its session is still running: look at it with `herdr session attach {child.slug}`, then run "
+    attach = herdr.attach_hint(showrunners.herdr_space(child.slug, str(child.doc)), child.slug)
+    print(f"started {child.slug}: {attach}")
+    later = (f"Its session is still running: look at it with `{attach}`, then run "
              + f"`showrunners.py attach {child.slug} {caller}` once it has an update timer.")
     try:
         appeared = showrunner_appeared(child.slug)

@@ -16,7 +16,8 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import showrunners
-from add_showrunner import herdr_session_running
+from add_showrunner import herdr_tab_open
+import herdr
 from add_unit import Production, read_production
 from production_units import Refusal, production_field
 
@@ -313,9 +314,10 @@ def _run_script(script: Path, *arguments: str) -> None:
         raise Refusal(f"{script.name} exited {result.returncode}; rerun add_style to continue")
 
 
-def _open_session_guidance(slug: str, reason: str) -> str:
+def _open_session_guidance(style: StyleProduction, reason: str) -> str:
+    attach = herdr.attach_hint(showrunners.herdr_space(style.slug, str(style.doc)), style.slug)
     return (
-        f"{slug} was left open by add_showrunner.py ({reason}); look at it with herdr session attach {slug}; "
+        f"{style.slug} was left open by add_showrunner.py ({reason}); look at it with {attach}; "
         + "once it has its update timer, rerun add_style, which attaches it; "
         + "if it never gets one, end that session and rerun"
     )
@@ -393,8 +395,8 @@ def main(argv: list[str]) -> int:
         if existing:
             _attach(style)
             return 0
-        if style.slug not in showrunners.timer_slugs() and herdr_session_running(style.slug):
-            raise Refusal(_open_session_guidance(style.slug, "live session without an update timer"))
+        if style.slug not in showrunners.timer_slugs() and herdr_tab_open(style.slug):
+            raise Refusal(_open_session_guidance(style, "live session without an update timer"))
         if not (style.checkout / ".git").exists():
             present = subprocess.run(
                 ["git", "-C", str(style.repository), "show-ref", "--verify", "--quiet", f"refs/heads/{style.merge_branch}"],
@@ -420,7 +422,7 @@ def main(argv: list[str]) -> int:
             "--model", cast(str, args.model), "--effort", cast(str, args.effort),
         ], check=False)
         if result.returncode in (1, 3):
-            print("add_style: " + _open_session_guidance(style.slug, f"exit {result.returncode}"), file=sys.stderr)
+            print("add_style: " + _open_session_guidance(style, f"exit {result.returncode}"), file=sys.stderr)
             return result.returncode
         if result.returncode:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")
