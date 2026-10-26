@@ -276,6 +276,9 @@ SANDBOX_MODES = (WORKER_SANDBOX, READ_ONLY_SANDBOX)
 # Production gives a server five seconds to stop; disposable child processes need no long grace.
 REAP_WAIT_SECS = 5.0
 REAP_POLL_SECS = 0.2
+# stop --pause interrupts its workers within this, so the reap after it ends inside the
+# 30 s a shutdown gives the whole stop; a hung server is reaped, never left running.
+PAUSE_INTERRUPT_SECS = 15.0
 # A launcher waiting on a turn wakes this often to check that the turn has not ended unseen.
 UNSEEN_END_CHECK_SECS = 60.0
 UNSEEN_END_CALL_SECS = 10.0
@@ -664,10 +667,8 @@ def _parse_frame(text: str) -> RpcMessage | None:
 
 @final
 class WebSocket:
-    def __init__(self, port: int, host: str = "127.0.0.1") -> None:
-        self._sock: socket.socket = socket.create_connection(
-            (host, port), timeout=CONNECT_TIMEOUT_SECS
-        )
+    def __init__(self, port: int, host: str = "127.0.0.1", timeout: float = CONNECT_TIMEOUT_SECS) -> None:
+        self._sock: socket.socket = socket.create_connection((host, port), timeout=timeout)
         key = base64.b64encode(secrets.token_bytes(16)).decode()
         self._sock.sendall(
             (
@@ -747,13 +748,15 @@ class WebSocket:
 class Client:
     """A JSON-RPC conversation with the app-server over one websocket."""
 
-    def __init__(self, port: int, name: str) -> None:
+    def __init__(self, port: int, name: str, deadline: float | None = None) -> None:
         self.port: int = port
         self.name: str = name
         self.session_dir: str = ""
         self.serving: CodexServingState = NotBoundCodexServer()
         self.turn_submitted_at: float = time.time()
-        self._ws: WebSocket = WebSocket(port)
+        # Every call ends by this wall-clock time, whatever timeout it asks for.
+        self._deadline: float | None = deadline
+        self._ws: WebSocket = WebSocket(port, timeout=self._bounded(CONNECT_TIMEOUT_SECS))
         self._name: str = name
         self._counter: int = 0
         self._pending: list[RpcMessage] = []
@@ -777,7 +780,7 @@ class Client:
                 {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
             )
         )
-        deadline = time.time() + timeout
+        deadline = time.time() + self._bounded(timeout)
         while time.time() < deadline:
             for index, message in enumerate(self._pending):
                 if message.get("id") == request_id:
@@ -789,6 +792,11 @@ class Client:
                 return frame
             self._pending.append(frame)
         return {"error": {"message": f"timed out waiting for {method}"}}
+
+    def _bounded(self, timeout: float) -> float:
+        if self._deadline is None:
+            return timeout
+        return max(0.1, min(timeout, self._deadline - time.time()))
 
     def _read(self, deadline: float) -> RpcMessage | None:
         remaining = max(0.1, deadline - time.time())
@@ -4863,10 +4871,14 @@ def _pause_roster(session_dir: str) -> None:
         _ = handle.truncate()
         _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
         handle.flush()
+    interrupt_by = time.time() + PAUSE_INTERRUPT_SECS
     for name, raw in roster.items():
         record = _as_dict(raw)
         thread_id = _as_str(record.get("thread_id"))
         if record.get("status") != "paused" or not thread_id:
+            continue
+        if time.time() >= interrupt_by:
+            print(f"codex_mesh: {name}: not interrupted: the server did not answer in time", file=sys.stderr)
             continue
         port = _as_int(record.get("port"))
         servers = _recorded_run_servers(session_dir)
@@ -4877,7 +4889,7 @@ def _pause_roster(session_dir: str) -> None:
         if live_port <= 0:
             continue
         try:
-            client = Client(live_port, f"pause-{os.getpid()}")
+            client = Client(live_port, f"pause-{os.getpid()}", deadline=interrupt_by)
         except OSError as error:
             print(f"codex_mesh: {name}: could not connect to paused worker: {error}", file=sys.stderr)
             continue

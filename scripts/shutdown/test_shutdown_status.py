@@ -561,7 +561,7 @@ else:
                     conductor.assert_not_called()
             self.assertEqual(record_store.find_session(LOGIN, saved["session"]["session_id"]), saved)
 
-    def test_legacy_unit_status_and_now_print_the_selected_group_resume_command(self) -> None:
+    def test_legacy_unit_without_leftovers_status_and_now_print_no_manual_command(self) -> None:
         self.write_note("claude3", LOGIN)
         _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": LOGIN}}))
         self.assertEqual(accounts.setup("claude3"), [])
@@ -580,12 +580,13 @@ else:
                  patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(shutdown.main([verb, LOGIN, "--here", "--only", saved["session"]["session_id"]]),
                     1 if verb == "now" else 0)
-                self.assertIn("exec claude3 --session-id 'old unit-id'", output.getvalue())
+                # A legacy host alone restarts as a shared-session tab; only tmux leftovers need the user.
+                self.assertNotIn("manual restart", output.getvalue())
                 self.assertNotIn("--session old-destination", output.getvalue())
                 conductor.assert_not_called()
         self.assertEqual(record_store.find_session(LOGIN, saved["session"]["session_id"]), saved)
 
-    def test_unresolved_legacy_claude_and_codex_snapshots_print_manual_commands(self) -> None:
+    def test_unresolved_legacy_claude_and_codex_snapshots_list_without_manual_commands(self) -> None:
         owner = cast(inventory.TopLevelSession, cast(object, {
             **session_shutdown(name="snapshot claude")["session"], "kind": "top-level",
             "host": inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old-claude")}))
@@ -602,8 +603,9 @@ else:
         record_store.write_snapshot(snapshot)
         with patch.object(shutdown, "inventory", return_value=empty_inventory()), redirect_stdout(io.StringIO()) as output:
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
-        self.assertIn("--session-id 'snapshot claude-id'", output.getvalue())
-        self.assertIn(f"CODEX_HOME={self.root}/recorded-codex codex resume recorded-id", output.getvalue())
+        self.assertIn("snapshot claude: unresolved", output.getvalue())
+        self.assertIn("snapshot codex: unresolved", output.getvalue())
+        self.assertNotIn("manual restart", output.getvalue())
         self.assertEqual(record_store.read_snapshot(LOGIN), snapshot)
         self.assertEqual(record_store.session_records(LOGIN), [])
 
