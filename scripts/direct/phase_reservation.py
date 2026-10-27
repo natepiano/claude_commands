@@ -73,7 +73,7 @@ PENDING_FIELD = "checkpoint_release_confirmation_pending"
 # The style ticket whose merge releases a pending reservation, and the worktree that release runs in.
 HELD_FOR_TICKET = "held_for_ticket"
 WORKTREE = "worktree"
-# Lifecycles of a reservation released at a checkpoint; `protected_tip` names that checkpoint.
+# Lifecycles of a released reservation; `protected_tip` names the commit it was released at.
 CHECKPOINT_RELEASED = frozenset({"outstanding", "released_after_checkpoint"})
 HOLDS_RESERVATION = frozenset({ACTIVE, PENDING})
 # A checkpoint's display form.
@@ -505,19 +505,40 @@ def lifecycle(root: Path, reservation_id: str) -> str:
     return _string(_lifecycle(root, reservation_id).get("status"))
 
 
-def _released_at(found: dict[str, object], commit: str) -> bool:
-    """Whether a lifecycle from berth's board shows the reservation released at this checkpoint commit."""
-    return _string(found.get("status")) in CHECKPOINT_RELEASED and _string(found.get("protected_tip")) == commit
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    """Whether `ancestor` is `descendant` or a commit it contains; False for a name `repo` does not know."""
+    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", "--end-of-options", ancestor, descendant],
+                          capture_output=True, check=False).returncode == 0
 
 
-def release_held(phase_dir: Path, ticket: str) -> str:
+def _released_at(repo: Path, found: dict[str, object], checkpoint: str, merged: str) -> bool:
+    """Whether a lifecycle from berth's board shows the reservation released at this checkpoint commit, or at a
+    later commit of the unit's branch that the merged commit contains.
+
+    A unit that merges style/main after its checkpoint releases at that later merge, so berth's
+    `protected_tip` is the merge, not the checkpoint (cargo-liner ticket 90)."""
+    tip = _string(found.get("protected_tip"))
+    return _string(found.get("status")) in CHECKPOINT_RELEASED and (
+        tip == checkpoint or bool(tip) and _is_ancestor(repo, checkpoint, tip) and _is_ancestor(repo, tip, merged))
+
+
+def _held_commit(worktree: Path, role: str, name: str, reservation: str) -> str:
+    """The full id of a commit `release_held` compares; a name that is no commit keeps the reservation held."""
+    try:
+        return commit_id(worktree, name)
+    except StateRefused as refused:
+        raise StateRefused(f"{role} {refused}; reservation {reservation} stays held") from None
+
+
+def release_held(phase_dir: Path, ticket: str, merged: str) -> str:
     """Release the reservation the phase's checkpoint kept for this ticket's merge, and clear the record.
 
-    Returns the released reservation id, or '' when the phase holds none for the ticket, so a repeated
-    merge changes nothing. A release an earlier run made is confirmed on the board, not made again;
-    only an `active` reservation is released. berth's release snapshots its worktree's HEAD, so a
-    worktree that moved off the checkpoint keeps the reservation held, as does a board that shows
-    another lifecycle or does not confirm the release."""
+    `merged` names the commit the ticket's merge brings in. Returns the released reservation id, or ''
+    when the phase holds none for the ticket, so a repeated merge changes nothing. A release an earlier
+    run made is confirmed on the board, not made again: berth's `protected_tip` is the checkpoint, or a
+    later commit that `merged` contains. Only an `active` reservation is released. berth's
+    release snapshots its worktree's HEAD, so a worktree that moved off the checkpoint keeps the
+    reservation held, as does a board that shows another lifecycle or does not confirm the release."""
     state = read_state(phase_dir)
     pending = _object(state.get(PENDING_FIELD))
     if _string(state.get("kind")) != PENDING or _string(pending.get(HELD_FOR_TICKET)) != ticket:
@@ -526,22 +547,21 @@ def release_held(phase_dir: Path, ticket: str) -> str:
     commit = _string(pending.get("checkpoint_commit"))
     worktree = Path(_string(pending.get(WORKTREE)))
     # A record may name its checkpoint in short form (cargo-liner ticket 59); berth and git answer in full.
-    try:
-        checkpoint = commit_id(worktree, commit)
-    except StateRefused as refused:
-        raise StateRefused(f"checkpoint {refused}; reservation {reservation} stays held") from None
+    checkpoint = _held_commit(worktree, "checkpoint", commit, reservation)
+    merged_commit = _held_commit(worktree, "merged commit", merged, reservation)
     found = _lifecycle(worktree, reservation)
-    if not _released_at(found, checkpoint):
+    if not _released_at(worktree, found, checkpoint, merged_commit):
         if _string(found.get("status")) != ACTIVE:
             raise StateRefused(f"berth shows reservation {reservation} {_string(found.get('status')) or 'unreadable'}, "
-                               + f"not active or released at checkpoint {checkpoint[:SHORT_COMMIT]}; it stays held")
+                               + f"not active or released at checkpoint {checkpoint[:SHORT_COMMIT]} or at a later commit "
+                               + f"that {merged_commit[:SHORT_COMMIT]} contains; it stays held")
         head = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"], capture_output=True, text=True,
                               check=False).stdout.strip()
         if head != checkpoint:
             raise StateRefused(f"{worktree} is at {head[:SHORT_COMMIT] or 'no commit'}, not checkpoint "
                                + f"{checkpoint[:SHORT_COMMIT]}; reservation {reservation} stays held")
         answer = _berth(worktree, "release", reservation)
-        if not _released_at(_lifecycle(worktree, reservation), checkpoint):
+        if not _released_at(worktree, _lifecycle(worktree, reservation), checkpoint, merged_commit):
             raise StateRefused(f"berth did not release reservation {reservation} at checkpoint {checkpoint[:SHORT_COMMIT]}: "
                                + (_string(answer.get("message")) or "no answer") + "; it stays held")
     _ = clear(phase_dir, commit, worktree)
@@ -760,6 +780,7 @@ def main(argv: list[str]) -> int:
     _ = cleared.add_argument("--repo", default=".")
     held = commands.add_parser("release-held", help="release the reservation a style ticket's checkpoint kept, at its merge")
     _ = held.add_argument("--ticket", required=True)
+    _ = held.add_argument("--merged", required=True, help="any name of the commit the ticket's merge brings in")
     for each in (enrolled, done, cleared, held):
         _ = each.add_argument("--session-dir", required=True)
         _ = each.add_argument("--phase", required=True)
@@ -785,7 +806,7 @@ def _state_command(command: str, args: argparse.Namespace) -> int:
             print(f"phase {phase}: {PENDING}" + (f", held for ticket {ticket}" if ticket else ""))
         elif command == "release-held":
             ticket = cast(str, args.ticket)
-            reservation = release_held(phase_dir, ticket)
+            reservation = release_held(phase_dir, ticket, cast(str, args.merged))
             print(f"phase {phase}: released reservation {reservation}" if reservation
                   else f"phase {phase}: no reservation held for ticket {ticket}")
         else:
