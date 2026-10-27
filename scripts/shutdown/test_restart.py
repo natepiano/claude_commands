@@ -4005,7 +4005,7 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(pushes, [])
         self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
 
-    def test_failed_move_into_an_untrusted_folder_pushes_the_trust_step_not_a_move_retry(self) -> None:
+    def test_failed_move_into_an_untrusted_folder_pushes_the_move_trust_step_not_a_move_retry(self) -> None:
         command = "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 claude"
         reason = f"/home/natepiano/worktrees/organon: Claude has not trusted this folder. Run: {command}"
         saved = entry(top_level("mover"), state=record.SessionRestartFailed(
@@ -4022,7 +4022,10 @@ class RestartTests(ShutdownTestCase):
             _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
                                 alerts=restart.AlertWhenNotBack(), only=["mover"], here=True)
         push, = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
-        self.assertEqual(push.id, "shutdown.restart_untrusted")
+        self.assertEqual(push.id, "shutdown.move_untrusted")
+        self.assertEqual(push.values["target"], "claude3")
+        self.assertIn("/shutdown restart \"claude2\" in the natedev session. That finishes the move to claude3.",
+                      cast(ActionRequired, push.action).text)
         # The record lives under the source account; restarting it resumes the move on its target.
         self.assertEqual((push.values["account"], push.values["command"]), ('"claude2"', command))
         self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
