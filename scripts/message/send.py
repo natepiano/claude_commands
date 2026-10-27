@@ -44,10 +44,20 @@ the key until `reopen`. The window counts from the last attempt, delivered or
 not, as the queue keeps what did not arrive. While the user's silence is on, a
 kept push with the same key from the same sender replaces the older kept one.
 
+One event sends one emergency push. An emergency push (`--to user --need blocked`)
+with no `--key` gets the key `user-emergency:<sender>:<first 12 hex of the title's
+sha256>`. With no `--repeat-minutes`, its window is the push's lifetime on the
+phone, pushover.EXPIRE_S, counted from the last push that went out: a repeat is
+skipped and its reason names the `send.py retire` that ends the first push.
+`retire --to user` forgets the key's last send to the user, so the next send with
+it goes out at once. Lower needs (note, decision) have a window only with
+`--repeat-minutes`.
+
 (user, 2026-10-05) Outcomes have a header followed by any payload lines and are logged with the full
 message text as one JSON line in STATE/log.jsonl:
   SENT: how                                                       exit 0
-  SKIPPED: why   acknowledged, or inside the repeat window        exit 0
+  SKIPPED: why   acknowledged, inside the repeat window, or       exit 0
+                 an emergency push with the key is still live
   QUEUED: why    a Claude recipient not reached; kept in          exit 1
                  STATE/queue/, the latest per key, under the
                  recipient's Claude session id, so a rename loses
@@ -63,7 +73,7 @@ message text as one JSON line in STATE/log.jsonl:
         the user to type a go: the detail gives the auto_mode.refused, quota.paid_credits
         (quota.paid_credits_queued when a workers move is queued) or session.needs_go call
         to send instead
-`retire --to user` first prints "retired N queued messages", then "dropped N kept pushes": the
+`retire --to user` forgets the key's last send to the user, prints "retired N queued messages", then "dropped N kept pushes": the
 pushes kept during silence with KEY from SENDER (silence.drop), so an obsolete alert never goes out
 when silence ends. Then one line from pushover.py cancel, which stops the emergency (--need blocked)
 push sent with KEY:
@@ -224,7 +234,7 @@ QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
 class KeyState(TypedDict):
-    # Recipient -> UTC ISO time of the last attempt, delivered or not.
+    # Recipient -> UTC ISO time of the last attempt, delivered or not; for a user emergency push, the last one sent.
     last: dict[str, str]
     acknowledged: NotRequired[str]
 
@@ -682,11 +692,11 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 
 
-def claim(message: Message, repeat: timedelta | None, at: datetime) -> str | None:
+def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False) -> str | None:
     """Why this send is skipped, or None after recording it as the key's latest attempt.
 
     Recording before delivery, under the lock, keeps two overlapping runs with
-    one key from both sending.
+    one key from both sending. `live`: the window is an emergency push's lifetime.
     """
     if message.key is None:
         return None
@@ -696,10 +706,46 @@ def claim(message: Message, repeat: timedelta | None, at: datetime) -> str | Non
             return f"key {message.key!r} acknowledged at {state['acknowledged']}; `send.py reopen` to resume"
         last = state["last"].get(message.to)
         if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
+            if live:
+                return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
             minutes = repeat.total_seconds() / 60
             return f"key {message.key!r} last sent to {message.to} at {last}, inside its {minutes:g}-minute window"
         state["last"][message.to] = at.isoformat()
     return None
+
+
+def user_emergency_key(sender: str, title: str) -> str:
+    """The key an emergency push to the user goes with when the sender gives none: one per sender and
+    title, so a repeat of one event is skipped and `send.py retire` can stop the push."""
+    return f"user-emergency:{sender}:{hashlib.sha256(title.encode()).hexdigest()[:12]}"
+
+
+def emergency_lifetime() -> timedelta:
+    """How long Pushover repeats an emergency push that the user does not acknowledge."""
+    # Imported here: only an emergency send reads it, and pushover's imports cost about 20 ms.
+    from pushover import EXPIRE_S
+    return timedelta(seconds=EXPIRE_S)
+
+
+def still_live(key: str, sender: str, sent: datetime, lifetime: timedelta) -> str:
+    """Why an emergency push to the user with this key is skipped: the first one still repeats."""
+    zone = user_zone()
+    retire_command = shlex.join(["send.py", "retire", "--to", USER, "--from", sender, "--key", key])
+    return (f"an emergency push with key {key} went to the user at {sent.astimezone(zone):%H:%M:%S %Z} and is still"
+            + f" live until {(sent + lifetime).astimezone(zone):%H:%M:%S %Z}; to send a new one, retire it first:"
+            + f" {retire_command}")
+
+
+def forget_sent(key: str, to: str, at: datetime | None = None) -> None:
+    """Forget the key's last send to `to`, so the next send goes out at once. With `at`, only when that
+    send is the one at `at`: a later run's record stays."""
+    with key_states() as states:
+        state = states.get(key)
+        if state is None or to not in state["last"] or (at is not None and state["last"][to] != at.isoformat()):
+            return
+        del state["last"][to]
+        if not state["last"] and "acknowledged" not in state:
+            del states[key]
 
 
 def acknowledge(key: str) -> str:
@@ -1202,6 +1248,9 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--codex", "--session-dir", options.selection.session_dir]
     if options.repeat_minutes is not None:
         forwarded += ["--repeat-minutes", f"{options.repeat_minutes:g}"]
+    elif message.to == USER and options.need == "blocked" and message.key is not None:
+        # This host's claim holds the emergency's lifetime window; the run on host must not apply it again.
+        forwarded += ["--repeat-minutes", "0"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
     failure: FailureText = NO_FAILED_PUSH
@@ -1589,13 +1638,19 @@ def send(options: Options) -> Result:
     sender = options.sender or default_sender()
     if options.to == USER and options.sender is None and sender != "send.py":
         options = options._replace(answerable=True)
-    message = Message(destination, sender, summary, text, options.key)
+    emergency = options.to == USER and options.need == "blocked"
+    key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
+    message = Message(destination, sender, summary, text, key)
     started = now()
-    window = None if options.repeat_minutes is None else timedelta(minutes=options.repeat_minutes)
+    # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
+    # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
+    live = emergency and options.repeat_minutes is None
+    window = (timedelta(minutes=options.repeat_minutes) if options.repeat_minutes is not None
+              else emergency_lifetime() if live else None)
     # Held before the claim, so the resend with the template is not skipped by --repeat-minutes.
     action_text = options.action.text if isinstance(options.action, ActionRequired) else ""
     held = wrong_template(options, "\n".join((summary, text, action_text)))
-    skip = None if held is not None else claim(message, window, started)
+    skip = None if held is not None else claim(message, window, started, live=live)
     log_route: Route = NO_CLAUDE_ROUTE
     if held is not None:
         result = Result("held", held)
@@ -1665,6 +1720,9 @@ def send(options: Options) -> Result:
     if result.outcome == "sent" and message.key is not None:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
+    # An emergency push that did not go out is not live: its resend goes out.
+    if live and key is not None and held is None and skip is None and result.outcome != "sent":
+        forget_sent(key, message.to, started)
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need)
     log(message, result, started, log_route)
@@ -1682,6 +1740,8 @@ def main(argv: list[str]) -> int:
             removed = retire(request.to, request.sender, request.key)
             print(f"retired {removed} queued message{'s' if removed != 1 else ''}")
             if request.to == USER:
+                # The event is over: a new send with the key pushes at once.
+                forget_sent(request.key, USER)
                 dropped = silence.drop(request.sender, request.key)
                 print(f"dropped {dropped} kept push{'es' if dropped != 1 else ''}")
                 code, line = cancel_user_push(request.sender, request.key)
