@@ -1478,11 +1478,19 @@ def report_stop(records: list[SessionShutdown]) -> None:
         for machine in dict.fromkeys(saved["machine"] for saved in due):
             items = [saved for saved in due if saved["machine"] == machine]
             # A failed move names both accounts; a restart onto its source could never start it.
-            restarted = [saved["session"]["name"] for saved in items if not saved.get("target")]
+            restarted = [(saved, restart_work.FailedSessionRestart(saved["session"]["name"], progress["reason"],
+                                                                   progress.get("trust_command", "")))
+                         for saved in items if (progress := saved["progress"])["kind"] == "restart failed"]
+            # A folder no account trusts fails every retry the same way, a move retry included, so it gets the
+            # trust push. Its account is the record's own: a restart of that record resumes a move on its target.
+            retried = [item for saved, item in restarted if not saved.get("target") and not item.trust_command]
             pushes = ((render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
                            stopped=stopped_sessions_text(len(items))),) if stop_due else
-                    (*(restart_work.restart_push(first["label"], restarted, machine=machine) if restarted else ()),
-                     *(restart_work.move_failed_push(saved) for saved in items if saved.get("target"))))
+                    (*(restart_work.restart_push(first["label"], retried, machine=machine) if retried else ()),
+                     *(restart_work.untrusted_push(saved["label"], item, machine=machine)
+                       for saved, item in restarted if item.trust_command),
+                     *(restart_work.move_failed_push(saved) for saved, item in restarted
+                       if saved.get("target") and not item.trust_command)))
             for push in pushes:
                 alert_user(push, machine=route)
             if not stop_due:
@@ -1914,6 +1922,8 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                     archive(result)
 
             def start_launch(saved: SessionShutdown) -> None:
+                if restart_work.drop_restore_without_folder(saved, dry_run=False):
+                    return
                 if restart_work.launches_window(saved["session"]["host"]):
                     try:
                         result = restart_work.relaunch_session(saved, dry_run=False, desktop_state=desktop)

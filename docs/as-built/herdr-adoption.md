@@ -174,7 +174,7 @@ Marks are `SHOWRUNNER_UNIT` (production slug) and `SHOWRUNNER_UNIT_ID` (unit). T
   - Ghostty and Zed hosts, and a Mac `terminal` host, restart into `SharedHerdrTab`. For a Ghostty or Mac `terminal` host, a live supervisor then runs `herdr session attach <shared>` in the same window; a Zed host, or one whose supervisor is gone, gets a new window unless a client is already attached.
 - **`_herdr_launch` steps.**
   1. Build the environment: a `MoveResumeAccount` takes `prepared_account(target, resume=True)` and refuses `AccountRefused`; a retained account takes `named_account_environment(config_dir)`.
-  2. Check trust.
+  2. Check trust (`_heal_folder_trust`, also before the dry-run preview). `herdr.heal_claude_trust(folder, target, sources, dry_run=)` returns `Trusted`, `TrustCopied(folder, account_file, source)`, `Untrusted` or `UnreadableTrustFile`. `accounts.trust_sources(target_dir, source_dir)` lists the session's own source account first, then every numbered account. A copy (`copy_claude_trust`, one key) prints `<name>: copied folder trust for <folder> from <label> to <target>`, and a dry run prints `would copy` and writes nothing. With no trusting account, `FolderNotTrusted` (an `OSError` carrying `command`) refuses the launch; the dry run prints the same `restart failed` line, and the record saves `trust_command` for the `shutdown.restart_untrusted` push.
   3. Call `restore_server(name, 90_000, session_kind=...)`.
   4. Refuse when `server_environment` holds `CLAUDE_CODE_OAUTH_TOKEN` or a `prepared.remove` name.
   5. Refuse a live agent in the recorded pane. A recorded pane left at its shell is closed; one running a command is left open, with a printed line, because the session resumes in a new tab.
