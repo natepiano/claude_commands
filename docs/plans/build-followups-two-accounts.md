@@ -2468,3 +2468,20 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Run the full merge gate after every origin merge: shutdown 61459ed7 (restore dropped when its folder is gone) turned five watchdog tests red only after the merge; give restored sessions a real scratch folder.
 - `test_launch_accounts` requires every Claude launcher to pick its account through `account_for_group_launch`, and `scripts/lib/test_user_zone` requires `astimezone(user_zone())`; neither is in the accounts suites, so run them.
 - Known residual: a worker can deliver `move_failed` and a later missing-folder retry archives the record, so a second, different `restart_failed` push follows for that outage.
+
+### Phase 89 — One outage sends at most one phone push  · status: todo
+
+**Depends on:** Phase 88
+
+#### Work Order
+
+The showrunner's go (10-26, after C330): one outage of a unit sends at most one phone push. Today a restart worker can deliver `shutdown.move_failed` (its claim lives in the shutdown record), and a later watchdog retry whose folder is gone archives that record; the watchdog's recordless path then sends a second, different `shutdown.restart_failed` push for the same outage.
+
+- Make the outage the owner of "a phone push was delivered": every path that delivers an alert for the outage (restart's both-failed fallback through `record.claim_restore_alert`, the watchdog's crash and missing-folder alerts) leaves a mark the watchdog still reads after the record is archived. Simplest: while the record exists, each watchdog pass copies a delivered `restore_alerted` into its outage state; the recordless and missing-folder paths send only when the outage holds no delivered alert. A failed push still leaves the outage unalerted so a later path sends once.
+- A live unit still clears both marks, so a later outage alerts again.
+- Tests (real restart and record paths, fake send leaves): worker delivers `move_failed`, later retry finds the folder gone and archives the record → no second push; worker's push fails → the folder-gone path sends exactly one; unit live, then a new outage → one new push.
+- Update `docs/accounts.md` and the shrink's as-built line.
+
+**Files:** `scripts/accounts/unit_watchdog.py`, `scripts/accounts/test_unit_watchdog.py`; `scripts/shutdown/record.py` and `test_record.py` only if the mark must live there; `docs/accounts.md`.
+
+**Verification:** `scripts.accounts.test_unit_watchdog scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.accounts.test_launch_accounts scripts.shutdown.test_restart scripts.shutdown.test_record scripts.shutdown.test_shutdown_cli scripts.lib.test_user_zone`, basedpyright on changed files, then the full merge gate.
