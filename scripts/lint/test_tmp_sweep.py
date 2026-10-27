@@ -227,20 +227,25 @@ class TempFolderTests(TmpSweepCase):
     def test_only_an_idle_unused_tempfile_folder_in_a_temp_folder_goes(self) -> None:
         temp = self.tmp.parent / "temp"
         idle = write(temp / ".tmpAb12Cd" / "Cargo.toml").parent
+        idle_mktemp = write(temp / "tmp.johjtSnxbj" / "a").parent
+        idle_python = write(temp / "tmp8m5h288i" / "a").parent
         recent = write(temp / ".tmpQq11Rr" / "a").parent
         self.recent(recent / "a")
         used = write(temp / ".tmpUu22Vv" / "a").parent
         fake_process(self.proc, 10, cwd=str(used))
         others = [write(temp / ".tmpAb12Cde" / "a").parent, write(temp / ".tmpXy34Zw"),
-                  write(temp / "notes" / "a").parent, write(temp / ".tmp-b12Cd" / "a").parent]
+                  write(temp / "notes" / "a").parent, write(temp / ".tmp-b12Cd" / "a").parent,
+                  write(temp / "tmp.short" / "a").parent, write(temp / "tmpUPPERCASE" / "a").parent]
         roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(temp),), ())
         result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
-        self.assertFalse(idle.exists())
+        for gone in (idle, idle_mktemp, idle_python):
+            self.assertFalse(gone.exists(), gone)
         self.assertTrue(recent.is_dir())
         self.assertTrue(used.is_dir())
         for other in others:
             self.assertTrue(other.exists(), other)
-        self.assertEqual([entry["path"] for entry in result.deleted], [str(idle)])
+        self.assertEqual(sorted(entry["path"] for entry in result.deleted),
+                         sorted(str(gone) for gone in (idle, idle_mktemp, idle_python)))
         self.assertEqual(result.kept[tmp_sweep.IN_USE], [f"{used}: pid 10 works in it"])
         kept = [path for paths in result.kept.values() for path in paths]
         self.assertFalse([path for path in kept if any(str(other) in path for other in others)])
