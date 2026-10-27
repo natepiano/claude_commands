@@ -678,6 +678,18 @@ Approve with `proposal_issue.py approve <issue> --by user --showrunner <parent>
 --unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
 Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.
+A rule whose frontmatter says `approval: always` never asks the user: `file`
+creates each new decision under it approved, with the fields a user approval
+writes. The unit and plan are the live family unit's Units row of the standing
+production, `showrunner` and `approved_in` are the style slug, and `approved_by`
+is `rule <rule id>`. It prints `approved <decision>: rule <rule id> is always
+approved`. With no live unit of the rule's family, `file` prints `skipped
+<decision>: rule <rule id> is always approved, but no <family> unit builds it`.
+Each `file` also approves, the same way, every open decision under such a rule
+that still waits for the user, whatever rule text it was filed under.
+A decision that inherits an approval keeps it, a declined decision stays
+declined, and reopen keeps the rule's approval. `unapprove` reads a rule
+approval as the user's. Any other `approval` value stops the catalog loading.
 Change an answered decision only with `proposal_issue.py unapprove`, `proposal_issue.py decline-answer` or
 `proposal_issue.py reopen`; never edit its stage, unit or answer by hand.
 Refill builds approved findings in small tickets before coverage work.

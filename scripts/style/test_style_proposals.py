@@ -32,6 +32,7 @@ import footer_counts
 import proposal_issue
 import proposals_table
 from issues import Issue, frontmatter, open_issues
+from style_proposals import FilingResult
 
 # Each crate declares the new name of the fixture rename, so a merge finds it applied, and still declares
 # Size and Rate, so the renames of those variants are not applied.
@@ -777,6 +778,161 @@ class StyleProposalsTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 style_proposals.complete(ledger)
             self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["stage"]), (["closed"], ["active"]))
+
+    always: str = "global:rust/always.md"
+
+    def standing_units(self, *families: str) -> None:
+        """A standing style production whose Units table lists a live unit of each family, and the always approved rule."""
+        _ = (self.catalog / "always.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\napproval: always\n---\n# Rule\n")
+        doc = self.root / "sample-style/docs/sample-style-production.md"
+        doc.parent.mkdir(parents=True)
+        rows = [f"| sample-style-{family}-unit | docs/style-production/units/{family}-unit.md | {self.root / family} | {family} |"
+                for family in families]
+        _ = doc.write_text("\n".join(["# Style", "", "## Units", "", "| Unit | Plan | Worktree | Branch |",
+                                       "| --- | --- | --- | --- |", *rows, ""]))
+        standing = add_style.StandingStyleProduction(self.repo, "sample-style", doc.parent.parent, doc, "main")
+        _ = self.enterContext(mock.patch.object(style_proposals, "standing_style_production", return_value=standing))
+        _ = self.enterContext(mock.patch.object(style_proposals, "unit_file_holders", return_value={}))
+
+    def file_lines(self, ledger: style_ledger.Ledger) -> tuple[FilingResult, list[str]]:
+        with redirect_stdout(io.StringIO()) as output:
+            result = style_proposals.file_proposals(ledger, self.proposals, "parent")
+        return result, output.getvalue().splitlines()
+
+    def waiting(self) -> list[str]:
+        """The proposals /next shows: the ones waiting for the user's review."""
+        return [entry.key for entry in proposals_table.issue_entries(open_issues(self.proposals, "proposal"))[0]]
+
+    def test_a_decision_under_an_always_approved_rule_files_approved_by_the_rule_and_never_waits_for_the_user(self) -> None:
+        self.standing_units("names")
+        with self.ledger() as ledger:
+            _ = self.hold(ledger, rule=self.always)
+            result, lines = self.file_lines(ledger)
+            issue, = result.filed
+            fields = frontmatter(issue)
+            self.assertEqual({name: fields[name] for name in ("showrunner", "unit", "plan", "approved_by", "approved_in", "stage")},
+                             {"showrunner": ["sample-style"], "unit": ["sample-style-names-unit"],
+                              "plan": ["docs/style-production/units/names-unit.md"],
+                              "approved_by": [f"rule {self.always}"], "approved_in": ["sample-style"], "stage": ["active"]})
+            self.assertIn(f"approved {issue}: rule {self.always} is always approved", lines)
+            self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
+            self.assertEqual(self.waiting(), [])
+
+    def test_a_rule_without_approval_files_a_decision_that_waits_for_the_user(self) -> None:
+        self.standing_units("names")
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            result, lines = self.file_lines(ledger)
+            issue, = result.filed
+            self.assertEqual(frontmatter(issue)["unit"], [])
+            self.assertNotIn("approved_by", frontmatter(issue))
+            self.assertFalse(any(line.startswith("approved ") for line in lines))
+            self.assertEqual(self.waiting(), [str(issue)])
+
+    def test_an_always_approved_rule_with_no_unit_of_its_family_skips_its_decision(self) -> None:
+        self.standing_units("types")
+        with self.ledger() as ledger:
+            finding = self.hold(ledger, rule=self.always)
+            result, lines = self.file_lines(ledger)
+            issue = self.proposals / style_proposals.batch_name(style_proposals.decision_key(finding, ("alpha", "beta")))
+            self.assertEqual((result.filed, result.skipped), ((), (issue,)))
+            self.assertIn(f"skipped {issue}: rule {self.always} is always approved, but no names unit builds it", lines)
+            self.assertFalse(issue.exists())
+
+    def test_planning_takes_a_rule_approved_decision_as_it_takes_a_user_approved_one(self) -> None:
+        self.standing_units("names")
+        with self.ledger() as ledger:
+            _ = self.hold(ledger, rule=self.always)
+            _ = self.hold(ledger, crate="beta")
+            result, _ = self.file_lines(ledger)
+            by_rule, by_user = sorted(result.filed, key=lambda path: frontmatter(path)["style_rule"] != [self.always])
+            self.issue_command("approve", str(by_user), "--by", "user", "--showrunner", "sample-style",
+                               "--unit", "sample-style-names-unit", "--plan", "docs/style-production/units/names-unit.md")
+            self.assertEqual({item.path for item in style_proposals.approved_decisions(self.proposals, "sample-style-names-unit")},
+                             {by_rule, by_user})
+
+    def filed_before_always(self, ledger: style_ledger.Ledger, *answer: str) -> Path:
+        """A decision filed under the rule before it said `approval: always`, given the answer, then the field added."""
+        self.standing_units("names")
+        text = (self.catalog / "always.md").read_text()
+        _ = (self.catalog / "always.md").write_text(text.replace("approval: always\n", ""))
+        _ = self.hold(ledger, rule=self.always)
+        issue, = self.file_lines(ledger)[0].filed
+        if answer:
+            self.issue_command(answer[0], str(issue), *answer[1:])
+        _ = (self.catalog / "always.md").write_text(text)
+        return issue
+
+    def test_an_open_decision_filed_before_its_rule_was_always_approved_is_approved_at_the_next_file(self) -> None:
+        with self.ledger() as ledger:
+            issue = self.filed_before_always(ledger)
+            self.assertEqual(self.waiting(), [str(issue)])
+            _, lines = self.file_lines(ledger)
+            self.assertIn(f"approved {issue}: rule {self.always} is always approved", lines)
+            self.assertEqual((frontmatter(issue)["unit"], frontmatter(issue)["approved_by"], frontmatter(issue)["approved_in"]),
+                             (["sample-style-names-unit"], [f"rule {self.always}"], ["sample-style"]))
+            self.assertEqual(self.waiting(), [])
+
+    def test_a_declined_decision_stays_declined_when_its_rule_becomes_always_approved(self) -> None:
+        with self.ledger() as ledger:
+            issue = self.filed_before_always(ledger, "decline-answer", "--words", "no")
+            _, lines = self.file_lines(ledger)
+            self.assertFalse(any(line.startswith("approved ") for line in lines))
+            self.assertNotIn("approved_by", frontmatter(issue))
+            self.assertEqual(frontmatter(issue)["style_answer"], ["declined"])
+
+    def test_a_user_approved_decision_keeps_its_bytes_when_its_rule_becomes_always_approved(self) -> None:
+        with self.ledger() as ledger:
+            issue = self.filed_before_always(ledger, "approve", "--by", "user", "--showrunner", "parent",
+                                             "--unit", "names-unit", "--plan", "unit.md")
+            before = issue.read_bytes()
+            _, lines = self.file_lines(ledger)
+            self.assertFalse(any(line.startswith("approved ") for line in lines))
+            self.assertEqual(issue.read_bytes(), before)
+
+    def test_a_decision_of_another_production_in_the_shared_folder_stays_unanswered(self) -> None:
+        with self.ledger() as ledger:
+            issue = self.filed_before_always(ledger)
+            foreign = self.proposals / "style always other 00000000.md"
+            _ = foreign.write_bytes(issue.read_bytes().replace(b"style_crate: \"alpha\"", b"style_crate: \"other\""))
+            before = foreign.read_bytes()
+            _ = self.file_lines(ledger)
+            self.assertEqual(foreign.read_bytes(), before)
+            self.assertEqual(frontmatter(issue)["approved_by"], [f"rule {self.always}"])
+
+    def test_an_approval_written_after_the_first_read_is_kept_byte_for_byte(self) -> None:
+        with self.ledger() as ledger:
+            issue = self.filed_before_always(ledger, "approve", "--by", "user", "--showrunner", "parent",
+                                             "--unit", "names-unit", "--plan", "unit.md")
+            before = issue.read_bytes()
+            # The first read sees no answer, as it would before the user's approval reached the file.
+            with mock.patch.object(style_proposals, "decision_answer", return_value=proposal_issue.UnansweredDecision()):
+                _, lines = self.file_lines(ledger)
+            self.assertEqual(issue.read_bytes(), before)
+            self.assertFalse(any(line.startswith("approved ") for line in lines))
+
+    def test_an_open_decision_under_a_rule_without_approval_still_waits_at_the_next_file(self) -> None:
+        self.standing_units("names")
+        with self.ledger() as ledger:
+            _ = self.hold(ledger)
+            issue, = self.file_lines(ledger)[0].filed
+            _, lines = self.file_lines(ledger)
+            self.assertFalse(any(line.startswith("approved ") for line in lines))
+            self.assertEqual(self.waiting(), [str(issue)])
+
+    def test_reopen_files_a_rule_approved_decision_again_still_approved_by_the_rule(self) -> None:
+        self.standing_units("names")
+        with self.ledger() as ledger:
+            finding = self.hold(ledger, rule=self.always, before="Kind::Size", after="Kind::Length")
+            result, _ = self.file_lines(ledger)
+            issue, = result.filed
+            self.built_before_the_check(ledger, finding)
+            self.issue_command("close", str(issue), "--reason", "built in test")
+            self.assertEqual(self.reopen_output(ledger, issue),
+                             f"filed again {finding.finding_id} in {issue}: Kind::Size -> Kind::Length not applied in {finding.path}\n")
+            self.assertEqual((frontmatter(issue)["status"], frontmatter(issue)["approved_by"]), (["open"], [f"rule {self.always}"]))
+            self.assertEqual(self.progress(issue), (["active"], proposal_issue.InProgress()))
+            self.assertEqual(self.waiting(), [])
 
     def approved_decision(self, ledger: style_ledger.Ledger, *findings: style_ledger.HeldFinding) -> Path:
         issue, = self.file(ledger)

@@ -305,14 +305,27 @@ def approver(issue: Issue) -> str:
 def approve(path: Path, fields: dict[str, str], by: str, approved_in: str, today: date) -> list[str]:
     """Record the approval and stage active. A showrunner approval keeps the approver of a user one."""
     with _issue_lock(path):
-        issue = Issue(path, frontmatter(path))
-        kept = by == SHOWRUNNER and isinstance(decision_answer(issue), ApprovedDecision) and approver(issue) == USER
-        actor = {} if kept else {"approved_by": by, "approved_in": approved_in}
-        text, changed = set_fields(_read(path), {**fields, **actor, "stage": IN_PROGRESS_STAGE,
-                                                 "date_modified": _vault_date(today)}, path)
-        if changed:
-            _write(path, text)
-        return changed
+        return _approve(path, fields, by, approved_in, today)
+
+
+def approve_unanswered(path: Path, fields: dict[str, str], by: str, approved_in: str, today: date) -> list[str]:
+    """Approve as approve does, only while no answer is recorded, read under the same lock as the write."""
+    with _issue_lock(path):
+        if not isinstance(decision_answer(Issue(path, frontmatter(path))), UnansweredDecision):
+            return []
+        return _approve(path, fields, by, approved_in, today)
+
+
+def _approve(path: Path, fields: dict[str, str], by: str, approved_in: str, today: date) -> list[str]:
+    """The approval write; the caller holds the issue lock."""
+    issue = Issue(path, frontmatter(path))
+    kept = by == SHOWRUNNER and isinstance(decision_answer(issue), ApprovedDecision) and approver(issue) == USER
+    actor = {} if kept else {"approved_by": by, "approved_in": approved_in}
+    text, changed = set_fields(_read(path), {**fields, **actor, "stage": IN_PROGRESS_STAGE,
+                                             "date_modified": _vault_date(today)}, path)
+    if changed:
+        _write(path, text)
+    return changed
 
 
 def unapprove(path: Path, approved_in: str, today: date, *, dry_run: bool) -> list[str]:
