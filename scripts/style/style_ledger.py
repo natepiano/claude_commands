@@ -2690,12 +2690,16 @@ class Ledger:
             return tuple(FindingNotBuilt(finding.finding_id, NoAppliedCheck(finding.kind)) for finding in self.filed_build_findings(id))
         if ticket["state"] != "checkpointed":
             raise LedgerError(f"{id}: cannot become merged from {ticket['state']}")
-        rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
-        branch = rows[0][0] if rows else ""
-        branch_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") if branch else ""
+        branch, branch_tip = self._style_branch_tip()
         if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
             raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         return self._ticket_transition(id, "merged")
+
+    def _style_branch_tip(self) -> tuple[str, str]:
+        """The style branch the ledger syncs with and the full id of its tip; both empty when it names none."""
+        rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
+        branch = rows[0][0] if rows else ""
+        return branch, _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}") if branch else ""
 
     def _ticket_reservation(self, id: str) -> tuple[str, str]:
         """The run folder and phase of the reservation record the ticket's checkpoint kept."""
@@ -2705,8 +2709,9 @@ class Ledger:
     def release_held_reservation(self, id: str) -> HeldReservationRelease | None:
         """Release the berth reservation the merged ticket's checkpoint kept; None when it keeps no record to release.
 
-        A confirmed release, or a record that holds no reservation, clears the run folder and phase, so a later
-        merge makes no berth call; a release that fails keeps them for the next merge or reconcile.
+        The style branch tip is the merged commit: a release berth made at a later commit of the unit's branch counts
+        when that tip contains it. A confirmed release, or a record that holds no reservation, clears the run folder
+        and phase, so a later merge makes no berth call; a release that fails keeps them for the next merge or reconcile.
         """
         rows = cast(list[tuple[str, str, str]], self._connection.execute(
             "SELECT state,reservation_session_dir,reservation_phase FROM tickets WHERE id=?", (id,)).fetchall())
@@ -2719,7 +2724,8 @@ class Ledger:
             raise LedgerError(f"{id}: its reservation is released at ticket merge, not in state {state}")
         scripts = Path(__file__).resolve().parents[1]
         result = subprocess.run([str(scripts / "lib/py"), str(scripts / "direct/phase_reservation.py"), "release-held",
-                                 "--session-dir", session_dir, "--phase", phase, "--ticket", id],
+                                 "--session-dir", session_dir, "--phase", phase, "--ticket", id,
+                                 "--merged", self._style_branch_tip()[1]],
                                 capture_output=True, text=True, check=False)
         answer = " ".join((result.stdout if result.returncode == 0 else result.stderr).split())
         if result.returncode == 0:
