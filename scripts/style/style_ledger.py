@@ -9,6 +9,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import posixpath
 import re
 import sqlite3
 import subprocess
@@ -30,7 +31,8 @@ import rules as rule_catalog
 import style_footprint
 import declarations
 import style_rules
-from approved_renames import AppliedCheck, AppliedInCode, Folder, MissingFile, NoAppliedCheck, RenameNotApplied, applied_check
+from approved_renames import (AppliedCheck, AppliedInCode, FileRename, Folder, MissingFile, NoAppliedCheck, RenameNotApplied,
+                              applied_check, file_rename)
 from candidate_generators import enumerate_candidates
 from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredItem, FileLevelImpl, ImplementedTrait, ImplOrTraitItem,
                           ImplPosition, UnprovedImplPosition,
@@ -1241,6 +1243,17 @@ def widened_line(widened: WidenedPath) -> str:
     return f"widened: {widened['path']} — {widened['reason']} ({widened['widened_by']}, {widened['widened_at']})"
 
 
+class YieldedPath(TypedDict):
+    """A file that a ticket gave up to product work, and when."""
+
+    path: str
+    yielded_at: str
+
+
+def yielded_line(yielded: YieldedPath) -> str:
+    return f"yielded: {yielded['path']} ({yielded['yielded_at']})"
+
+
 class TicketRecord(TypedDict):
     id: str
     unit: str
@@ -1262,6 +1275,7 @@ class TicketRecord(TypedDict):
     created_at: str
     updated_at: str
     widened: tuple[WidenedPath, ...]
+    yielded: tuple[YieldedPath, ...]
 
 
 @dataclass(frozen=True)
@@ -1276,6 +1290,156 @@ class ProposalCell:
 
     rule: str
     path: str
+
+
+@dataclass(frozen=True)
+class UnreadableCode:
+    """The file is not UTF-8 or does not tokenize, so the paths it writes are not known."""
+
+
+@dataclass(frozen=True)
+class FileYield:
+    """A yield that frees no finding: the ticket is not a proposal ticket, so it gives up only its file."""
+
+
+@dataclass(frozen=True)
+class FindingYield:
+    """The findings that a proposal ticket's yield frees, and the commit whose code showed that no kept finding
+    needs them."""
+
+    freed: tuple[str, ...]
+    read_commit: str
+
+
+def _code_words(content: bytes | Folder | MissingFile) -> tuple[str, ...] | UnreadableCode:
+    """The code words of a Rust file, each without its `r#`, with no comment. A missing file has none."""
+    if not isinstance(content, bytes):
+        return ()
+    try:
+        text = content.decode()
+    except UnicodeDecodeError:
+        return UnreadableCode()
+    code = style_footprint.tokens(text)
+    if any(token.kind == "unknown" for token in code):
+        return UnreadableCode()
+    return tuple(token.value.removeprefix("r#") for token in code)
+
+
+def _glob_sources(prefix: tuple[str, ...], home: style_footprint.CrateModule,
+                  inline: tuple[str, ...]) -> tuple[tuple[str, ...], ...] | style_footprint.UnresolvedPath:
+    """The modules of the crate, as paths under `crate`, that a glob use with prefix can import from.
+
+    In a module file of the crate, an anchored path resolves from the file's module and the inline modules around the
+    glob; any other path can start at the crate's library name or at a child of that module. A file outside the crate
+    root folder is the root of another crate, so only a path from the library name reaches the crate.
+    """
+    anchored = bool(prefix) and prefix[0] in style_footprint.PATH_ANCHORS
+    if isinstance(home, style_footprint.OutsideCrate):
+        return () if anchored else (prefix[1:],)
+    scope = (*home, *inline)
+    if not anchored:
+        return prefix[1:], (*scope, *prefix)
+    target = style_footprint.resolved_module(prefix, scope)
+    return target if isinstance(target, style_footprint.UnresolvedPath) else (target,)
+
+
+# A text that can hold a `path` attribute: the word, then `=` or a comment before it. Only such a file is tokenized.
+PATH_ATTRIBUTE_TEXT = re.compile(r"\bpath\s*(?:=|/[/*])")
+PLAIN_STRING = re.compile(r'"([^"\\]*)"')
+
+
+@dataclass(frozen=True)
+class MountedFile:
+    """A `path` attribute: the file that declares it, and each repository path its literal can name. A reading that
+    leaves the repository starts with `..`."""
+
+    declaring: str
+    readings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MountedFolder:
+    """A `path` attribute on an inline module: the file that declares it, and each repository folder its literal can
+    name. The module's code is in the declaring file; the folder holds the files that its `mod` items mount."""
+
+    declaring: str
+    readings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnreadPathAttribute:
+    """A `path` attribute whose file the scan cannot name, so it can mount any file."""
+
+    declaring: str
+    reason: str
+
+
+def _path_attributes(path: str, content: bytes) -> tuple[MountedFile | MountedFolder | UnreadPathAttribute, ...]:
+    """The `path` attributes of a Rust file, also those inside `cfg_attr`, read from its code words.
+
+    Rust reads the literal from the module's folder (`_module_folders`). On an inline module the literal names a
+    folder, not a file. Each reading is kept, also the declaring file's folder, so a caller can require that all of
+    them stay in one crate. A literal that is not a plain string, an absolute path, an attribute in a macro (an inner
+    attribute reads as one) and a file that does not read as code are unread.
+    """
+    try:
+        text = content.decode()
+    except UnicodeDecodeError:
+        return (UnreadPathAttribute(path, "is not UTF-8"),) if PATH_ATTRIBUTE_TEXT.search(content.decode(errors="replace")) else ()
+    if not PATH_ATTRIBUTE_TEXT.search(text):
+        return ()
+    words = _code_words(content)
+    if isinstance(words, UnreadableCode):
+        return (UnreadPathAttribute(path, "does not tokenize"),)
+    ends = style_footprint.delimiter_ends(words)
+    macros = style_footprint.macro_spans(words, ends)
+    blocks = style_footprint.import_context(words).module_blocks
+    owners = style_footprint.attribute_owners(words)
+    file = PurePosixPath(path)
+    read: list[tuple[int, tuple[int, ...], str | UnreadPathAttribute]] = []
+    for begin, end in style_footprint.attribute_spans(words):
+        for index in (index for index in range(begin, end) if words[index] == "path"):
+            literal = PLAIN_STRING.fullmatch(words[index + 2]) if words[index + 1:index + 2] == ("=",) else None
+            chain = tuple(sorted(block for block in blocks if block < index < ends.get(block, len(words))))
+            if any(start < index < stop for start, stop in macros):
+                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute in a macro")))
+            elif literal is None or literal.group(1).startswith("/"):
+                read.append((begin, chain, UnreadPathAttribute(path, "holds a path attribute that is not a relative string")))
+            else:
+                read.append((begin, chain, literal.group(1)))
+    # The `{` of each inline module whose outer path attribute names its folder.
+    inline_owner = {begin: owners[begin] + 2 for begin, _, _ in read
+                    if owners.get(begin) is not None and words[owners[begin]] == "mod" and owners[begin] + 2 in blocks}
+    folders: dict[int, tuple[str, ...]] = {}
+    for begin, _, relative in read:
+        if begin in inline_owner and isinstance(relative, str):
+            folders[inline_owner[begin]] = (*folders.get(inline_owner[begin], ()), relative)
+    result: list[MountedFile | MountedFolder | UnreadPathAttribute] = []
+    for begin, chain, relative in read:
+        if isinstance(relative, UnreadPathAttribute):
+            result.append(relative)
+            continue
+        readings = tuple(sorted({posixpath.normpath(str(folder / relative))
+                                 for folder in {file.parent, *_module_folders(file, chain, words, folders)}}))
+        result.append(MountedFolder(path, readings) if begin in inline_owner else MountedFile(path, readings))
+    return tuple(result)
+
+
+def _module_folders(file: PurePosixPath, chain: tuple[int, ...], words: tuple[str, ...],
+                    folders: dict[int, tuple[str, ...]]) -> set[PurePosixPath]:
+    """The folders that Rust reads a `path` literal from, inside the inline modules that open at chain.
+
+    It starts at the file's folder. An inline module moves to its name, under the file's stem first in a file that is
+    not `mod.rs`, `lib.rs` or `main.rs`, and also to the folder that each of its `path` attributes names: a `cfg_attr`
+    attribute can be inactive, so a reading is only added, never replaced. A file that another `path` attribute
+    mounts reads as `mod.rs`, so both forms are kept.
+    """
+    stems = ("",) if file.name in {"mod.rs", "lib.rs", "main.rs"} else ("", file.stem)
+    states = {(file.parent, stem) for stem in stems}
+    for block in chain:
+        states = ({(folder.joinpath(*filter(None, (stem, words[block - 1]))), "") for folder, stem in states}
+                  | {(folder / literal, "") for folder, _ in states for literal in folders.get(block, ())})
+    return {folder for folder, _ in states}
 
 
 @dataclass(frozen=True)
@@ -1412,17 +1576,18 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
     return RepositoryTip(commit, tree, blobs, directories, files, entries)
 
 
-def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
+def _blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, bytes]]:
+    """Each path of blobs with the bytes of its blob, read by one `git cat-file --batch`."""
     with tempfile.TemporaryFile() as contents:
         result = subprocess.run(
             ["git", "-C", str(repo), "cat-file", "--batch"],
-            input="".join(f"{blob}\n" for blob in tip.blobs.values()).encode(),
+            input="".join(f"{blob}\n" for blob in blobs.values()).encode(),
             stdout=contents, stderr=subprocess.PIPE, check=False,
         )
         if result.returncode:
-            raise LedgerError(result.stderr.decode(errors="replace").strip() or "could not export synced blobs")
+            raise LedgerError(result.stderr.decode(errors="replace").strip() or "could not read Git blobs")
         _ = contents.seek(0)
-        for path, blob in tip.blobs.items():
+        for path, blob in blobs.items():
             header = contents.readline().split()
             if len(header) != 3 or header[:2] != [blob.encode(), b"blob"]:
                 raise LedgerError(f"{path}: invalid Git blob response")
@@ -1430,9 +1595,14 @@ def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
             content = contents.read(size)
             if len(content) != size or contents.read(1) != b"\n":
                 raise LedgerError(f"{path}: incomplete Git blob response")
-            destination = export / path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = destination.write_bytes(content)
+            yield path, content
+
+
+def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
+    for path, content in _blob_contents(repo, tip.blobs):
+        destination = export / path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _ = destination.write_bytes(content)
 
 
 def _inputs(tip: RepositoryTip, scope: CellInputScope, path: str) -> dict[str, TreeEntry]:
@@ -1858,6 +2028,9 @@ class Ledger:
             "SELECT path,reason,widened_by,widened_at FROM ticket_widened_paths WHERE ticket=? ORDER BY path",
             (ticket_id,),
         ).fetchall())
+        yielded = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT path,recorded_at FROM ticket_yields WHERE ticket=? ORDER BY path", (ticket_id,),
+        ).fetchall())
         return {
             "id": row[0], "unit": row[1], "kind": row[2], "family": row[3], "rule": row[4], "crate": row[5],
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
@@ -1867,6 +2040,7 @@ class Ledger:
             "finding_ids": cast(list[str], json.loads(row[18])),
             "widened": tuple(WidenedPath(path=path, reason=reason, widened_by=by, widened_at=at)
                              for path, reason, by, at in widened),
+            "yielded": tuple(YieldedPath(path=path, yielded_at=at) for path, at in yielded),
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -2009,31 +2183,200 @@ class Ledger:
         judged = set(cast(list[tuple[str, str]], self._connection.execute(
             "SELECT rule,path FROM judgments WHERE ticket=?", (id,),
         ).fetchall()))
-        yielded = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
-            "SELECT path FROM ticket_yields WHERE ticket=?", (id,),
-        ).fetchall())}
+        yielded = {yielded["path"] for yielded in ticket["yielded"]}
         owned = ({(rule, path) for rule, path in ticket["cells"] if path not in yielded}
                  if ticket["cells"] else {(rule, path) for rule in rules for path in paths if path not in yielded})
         return tuple(UnjudgedTicketCell(rule, path) for rule, path in sorted(owned - judged))
 
-    def ticket_yield(self, id: str, path: str) -> None:
+    def ticket_yield(self, id: str, path: str) -> tuple[str, ...]:
+        """Give up the assigned ticket's work on path, and return the proposal findings that the yield frees.
+
+        The ticket's verdicts and unfiled held findings on path go. A proposal ticket also yields its findings at path:
+        each stays filed under its decision with no build ticket, so a later proposal ticket takes it, and this ticket
+        no longer lists it. It refuses a path with no finding of the ticket, a path that holds every finding the ticket
+        has left, and a yield that a kept finding can need (_yield_couplings). A structure ticket refuses. A recorded
+        yield changes nothing. The git reads run before the write lock; if the ticket, its findings or the commit they
+        read change before the lock, the yield starts again.
+        """
         path = self._path(path)
-        with self._connection:
-            _ = self._connection.execute("BEGIN IMMEDIATE")
-            ticket = self._ticket(id)
+
+        def recorded(ticket: TicketRecord) -> bool:
+            """Whether the ticket already yielded path; refuses a ticket that cannot yield."""
             if ticket["state"] != "assigned":
                 raise LedgerError(f"{id}: cannot yield from {ticket['state']}")
-            if ticket["kind"] in ("structure", "proposal"):
-                raise LedgerError(f"{id}: cannot yield a {ticket['kind']} ticket")
+            if ticket["kind"] == "structure":
+                raise LedgerError(f"{id}: cannot yield a structure ticket")
+            return any(yielded["path"] == path for yielded in ticket["yielded"])
+
+        def attempt() -> tuple[str, ...]:
+            ticket = self._ticket(id)
+            if recorded(ticket):
+                return ()
+            findings = tuple(self._held(finding_id) for finding_id in ticket["finding_ids"])
+            read = self._yielded_findings(ticket, findings, path)
+            freed = read.freed if isinstance(read, FindingYield) else ()
+            with self._connection:
+                _ = self._connection.execute("BEGIN IMMEDIATE")
+                current = self._ticket(id)
+                if recorded(current):
+                    return ()
+                if current != ticket or tuple(self._held(finding_id) for finding_id in current["finding_ids"]) != findings:
+                    raise ChangedBeforeLock(f"{id}: the ticket changed while it yielded {path}; rerun")
+                if isinstance(read, FindingYield) and (current["base"] or self.synced_commit()) != read.read_commit:
+                    raise ChangedBeforeLock(f"{id}: the synced tip moved while it yielded {path}; rerun")
+                now = _now()
+                _ = self._connection.execute("DELETE FROM judgments WHERE ticket=? AND path=?", (id, path))
+                _ = self._connection.execute(
+                    "DELETE FROM held_findings WHERE ticket=? AND path=? AND state='unfiled'", (id, path),
+                )
+                if freed:
+                    _ = self._connection.executemany(
+                        "UPDATE held_findings SET build_ticket='',updated_at=? WHERE finding_id=?",
+                        [(now, finding_id) for finding_id in freed],
+                    )
+                    _ = self._connection.execute(
+                        "UPDATE tickets SET finding_ids=?,updated_at=? WHERE id=?",
+                        (json.dumps([finding_id for finding_id in ticket["finding_ids"] if finding_id not in freed]), now, id),
+                    )
+                _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, now))
+            return freed
+
+        return retry_on_change(attempt)
+
+    def _yielded_findings(self, ticket: TicketRecord, findings: tuple[HeldFinding, ...],
+                          path: str) -> FileYield | FindingYield:
+        """What a yield of path frees; refuses a path the ticket cannot yield.
+
+        A proposal ticket frees its findings at path, read at its base, or at the synced tip while it has none. Any
+        other ticket yields a file of its own and frees no finding.
+        """
+        if ticket["kind"] != "proposal":
             if path not in ticket["files"]:
-                raise LedgerError(f"{id}: {path} is not in ticket files")
-            if self._connection.execute("SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (id, path)).fetchone():
-                return
-            _ = self._connection.execute("DELETE FROM judgments WHERE ticket=? AND path=?", (id, path))
-            _ = self._connection.execute(
-                "DELETE FROM held_findings WHERE ticket=? AND path=? AND state='unfiled'", (id, path),
-            )
-            _ = self._connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", (id, path, _now()))
+                raise LedgerError(f"{ticket['id']}: {path} is not in ticket files")
+            return FileYield()
+        freed = tuple(finding for finding in findings if finding.path == path)
+        kept = tuple(finding for finding in findings if finding.path != path)
+        if not freed:
+            raise LedgerError(f"{ticket['id']}: no finding of the ticket is at {path}")
+        if not kept:
+            raise LedgerError(f"{ticket['id']}: {path} holds every finding the ticket has left; "
+                              + "drop the ticket with style_ledger.py ticket drop")
+        commit = ticket["base"] or self.synced_commit()
+        couplings = self._yield_couplings(commit, freed, kept)
+        if couplings:
+            raise LedgerError(f"{ticket['id']}: a kept finding can need a finding at {path}, so the ticket cannot "
+                              + "yield it; drop the ticket instead: " + " | ".join(couplings))
+        return FindingYield(tuple(finding.finding_id for finding in freed), commit)
+
+    def _yield_couplings(self, commit: str, freed: tuple[HeldFinding, ...], kept: tuple[HeldFinding, ...]) -> tuple[str, ...]:
+        """Why a kept finding can need a freed one to build, read at commit; none when it cannot.
+
+        A kept finding in a crate with no freed finding cannot. In a crate that holds both, each finding of the crate
+        must be a plain file rename (`file_rename`), and: no freed file names a kept module, by its old or new name;
+        no freed rename and kept rename share a new name, and neither takes the other's old name; and no file of the
+        crate reaches a renamed module by a path that holds none of its names (_hidden_module_paths).
+        """
+        tip = self._tip(commit)
+        reasons = self._crossing_mounts(tip, frozenset(tip.crate(finding.path) for finding in (*freed, *kept)))
+        for crate in sorted({tip.crate(finding.path) for finding in freed}):
+            shared = tuple(finding for finding in kept if tip.crate(finding.path) == crate)
+            if shared:
+                yielded = tuple(finding for finding in freed if tip.crate(finding.path) == crate)
+                reasons += self._crate_couplings(commit, crate, yielded, shared)
+        return tuple(dict.fromkeys(reasons))
+
+    def _crossing_mounts(self, tip: RepositoryTip, crates: frozenset[str]) -> list[str]:
+        """Why a `path` attribute in any Rust file of the repository can join a crate of crates to another crate.
+
+        A reading outside the declaring crate's folder mounts a file of one crate into another, so a finding's crate
+        is not all the code that compiles its file. It refuses when the declaring crate or the mounted file's crate
+        is in crates; a folder that an inline module's attribute names is read the same way. An unread attribute, and one
+        that mounts a file not named `.rs`, refuse wherever they are. One `git cat-file --batch` reads every file.
+        """
+        reasons: list[str] = []
+        blobs = {path: blob for path, blob in tip.blobs.items() if path.endswith(".rs")}
+        for path, content in _blob_contents(self.repo, blobs):
+            for attribute in _path_attributes(path, content):
+                if isinstance(attribute, UnreadPathAttribute):
+                    reasons.append(f"{path} {attribute.reason}")
+                    continue
+                home = tip.crate(path)
+                # Only `.rs` files are read here, so a mounted file of another name could mount further files unseen.
+                if isinstance(attribute, MountedFile):
+                    reasons += [f"{path} mounts {reading}, which is not a .rs file" for reading in attribute.readings
+                                if not reading.endswith(".rs")]
+                kind = "file" if isinstance(attribute, MountedFile) else "folder"
+                for reading in attribute.readings:
+                    outside = reading.startswith("..") or tip.crate(reading) != home
+                    if outside and (home in crates or (not reading.startswith("..") and tip.crate(reading) in crates)):
+                        reasons.append(f"{path} mounts {reading}, a {kind} outside {home}")
+        return reasons
+
+    def _crate_couplings(self, commit: str, crate: str, freed: tuple[HeldFinding, ...],
+                         kept: tuple[HeldFinding, ...]) -> list[str]:
+        moves = {finding.finding_id: file_rename(finding.kind, finding.path, finding.after) for finding in (*freed, *kept)}
+        renames = {finding_id: moved for finding_id, moved in moves.items() if isinstance(moved, FileRename)}
+        if len(renames) < len(moves):
+            return [f"{finding_id} is not a file rename, and {crate} holds a freed and a kept finding"
+                    for finding_id in moves if finding_id not in renames]
+        reasons: list[str] = []
+        for finding in freed:
+            yielded = renames[finding.finding_id]
+            words = _code_words(self._commit_file(commit, finding.path))
+            for other in kept:
+                moved = renames[other.finding_id]
+                names = {moved.old_stem, moved.new_stem}
+                if isinstance(words, UnreadableCode):
+                    reasons.append(f"{finding.path} does not tokenize")
+                else:
+                    reasons += [f"{finding.path} names {name}, a module that {other.finding_id} renames"
+                                for name in sorted(names & set(words))]
+                shared = ({yielded.new_stem} & names) | ({moved.new_stem} & {yielded.old_stem})
+                reasons += [f"{finding.finding_id} and {other.finding_id} both rename to or from {name}" for name in sorted(shared)]
+        return reasons + self._hidden_module_paths(commit, crate, tuple(renames.values()))
+
+    def _hidden_module_paths(self, commit: str, crate: str, renames: tuple[FileRename, ...]) -> list[str]:
+        """Why a file of the crate can reach a renamed module by a path that holds none of its names.
+
+        A public use of a module name re-exports it, a glob use of a renamed module's parent imports its name, and an
+        `include`, `macro_rules` or `macro` word can build a path that no scan reads. Modules come from the folder
+        layout under `src` (style_footprint.crate_module), and each file of the crate must tokenize.
+        """
+        root = PurePosixPath(crate) / "src"
+        reasons: list[str] = []
+        parents: set[tuple[str, ...]] = set()
+        for moved in renames:
+            module = style_footprint.crate_module(moved.old, root)
+            if isinstance(module, style_footprint.OutsideCrate):
+                reasons.append(f"{moved.old} is not a module file of {crate}")
+            else:
+                parents.add(module[:-1])
+        names = {name for moved in renames for name in (moved.old_stem, moved.new_stem)}
+        tip = self._tip(commit)
+        for path in (path for path in tip.rust_files if tip.crate(path) == crate):
+            words = _code_words(self._commit_file(commit, path))
+            if isinstance(words, UnreadableCode):
+                reasons.append(f"{path} does not tokenize")
+                continue
+            reasons += [f"{path} holds {word}" for word in sorted(style_footprint.UNREAD_CODE_WORDS & set(words))]
+            uses = style_footprint.use_items(words)
+            reasons += [f"{path} re-exports {name}" for use in uses if "pub" in words[use.start:use.end]
+                        for name in sorted(names & set(words[use.start:use.end]))]
+            trees = style_footprint.use_trees(words, style_footprint.code_item_starts(words))
+            if any(words[index] == "*" and index not in trees.prefixes for use in uses for index in range(use.start, use.end)):
+                reasons.append(f"{path} holds a glob use that the scan cannot read")
+            globs = [index for index in trees.prefixes if words[index] == "*"]
+            if not globs:
+                continue
+            home = style_footprint.crate_module(path, root)
+            scopes = style_footprint.import_context(words).scopes
+            for index in globs:
+                sources = _glob_sources(trees.prefixes[index], home, tuple(name.split("@")[0] for name in scopes[index].module))
+                if isinstance(sources, style_footprint.UnresolvedPath):
+                    reasons.append(f"{path} holds a glob use that the scan cannot resolve")
+                else:
+                    reasons += [f"{path} glob-imports {'::'.join(('crate', *source))}" for source in sources if source in parents]
+        return reasons
 
     def ticket_widen(self, id: str, paths: tuple[str, ...], reason: str, by: str,
                      approved: Callable[[], frozenset[str]]) -> tuple[WidenedPath, ...]:
@@ -4450,13 +4793,14 @@ class Ledger:
             raise LedgerError(f"{ticket_id}: cells are for proposal tickets only")
         self._catalog = rule_catalog.load_rules(self.repo)
         tip = self._synced_tip()
+        yielded = {yielded["path"] for yielded in ticket["yielded"]}
         cells: list[ProposalCell] = []
         for rule in ticket["rules"]:
             try:
                 definition = self._component_rule(rule)
             except LedgerError:
                 continue
-            for path in ticket["files"]:
+            for path in (path for path in ticket["files"] if path not in yielded):
                 try:
                     self._check_cell_path(definition, path, tip)
                 except CheckCouldNotRun:
@@ -5164,7 +5508,8 @@ def main() -> None:
                 elif args.action == "drop":
                     ledger.ticket_drop(args.id)
                 elif args.action == "yield":
-                    ledger.ticket_yield(args.id, args.path)
+                    for finding_id in ledger.ticket_yield(args.id, args.path):
+                        print(f"yielded {finding_id}: it stays filed for a later ticket")
                 else:
                     for ticket in ledger.ticket_open(args.unit):
                         print(json.dumps(ticket, sort_keys=True))

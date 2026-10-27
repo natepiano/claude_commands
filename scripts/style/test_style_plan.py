@@ -2751,6 +2751,31 @@ class StylePlanTests(unittest.TestCase):
         self.write(self.sources[0], "enum Outcome { NewName }\n")
         self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
 
+    def test_decision_gate_skips_a_yielded_finding_and_refill_takes_it_again(self) -> None:
+        ticket = self.approved_reference_ticket()
+        self.sync()
+        ledger = self.ledger()
+        origin = ledger.ticket_origin(ticket)
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        kept, = origin.finding_ids
+        rule = ledger.proposal_findings(origin.issue)[0].rule
+        freed = ledger.hold(rule, self.sources[3], 1, "rename", "rename", "Shape::Round", "Shape::Square",
+                            ledger.proposal_findings(origin.issue)[0].rule_blob, "outside")
+        ledger.file_held(freed.finding_id, origin.issue)
+        ledger.ticket_drop(ticket)
+        ledger.ticket_add("names-unit-2", "names-unit", "proposal", "names", "crates/alpha", [self.sources[0], self.sources[3]],
+                          [rule], proposal=str(origin.issue), finding_ids=(kept, freed.finding_id))
+        ledger.ticket_assign("names-unit-2", "main")
+        self.write(self.sources[3], "enum Shape { Round }\n")
+        self.assertEqual(self.reference_gate("names-unit-2"), (1, f"review: {freed.finding_id}: Shape::Round -> Shape::Square "
+                                                                  + f"not applied in {self.sources[3]}\n"))
+        self.assertEqual(style_plan._unbuilt_findings(ledger, origin.issue), ())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(ledger.ticket_yield("names-unit-2", self.sources[3]), (freed.finding_id,))
+        _ = subprocess.run(["git", "-C", str(self.repo), "checkout", "--", self.sources[3]], check=True)
+        self.assertEqual(self.reference_gate("names-unit-2"), (0, "approved proposal\n"))
+        self.assertEqual([finding.finding_id for finding in style_plan._unbuilt_findings(ledger, origin.issue)],  # pyright: ignore[reportPrivateUsage]
+                         [freed.finding_id])
+
     def test_decision_refill_slices_forty_restructure_files_and_releases_dropped_slice(self) -> None:
         rule = self.rule("decision", "tier: C\nfamily: names\ninput_scope: file\nmode: propose\n")
         files = tuple(f"crates/alpha/src/piece_{index:02}.rs" for index in range(40))
@@ -4514,7 +4539,7 @@ class StylePlanTests(unittest.TestCase):
         for rule in (first, last):
             for path in self.sources[:2]:
                 self.record(rule, path, self.tip, "names-unit-1")
-        ledger.ticket_yield("names-unit-1", self.sources[0])
+        _ = ledger.ticket_yield("names-unit-1", self.sources[0])
         self.assertEqual({(cell.rule, cell.path): cell.state for cell in ledger.cells() if cell.path == self.sources[0]}, before)
         with (mock.patch.object(style_ledger, "open_ledger", return_value=ledger),
               mock.patch.object(style_plan, "synced_style_branch", return_value=""),
