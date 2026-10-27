@@ -2860,8 +2860,6 @@ class Ledger:
         existing = cast(list[tuple[str]], self._connection.execute("SELECT state FROM handoffs WHERE checkpoint=?", (checkpoint,)).fetchall())
         if not existing:
             raise LedgerError(f"unknown hand-off {checkpoint}")
-        if existing[0][0] == "pending":
-            raise LedgerError(f"{checkpoint}: cannot become merged from pending")
         branches = cast(list[tuple[str]], self._connection.execute("SELECT branch_point FROM reconciliation WHERE id=1").fetchall())
         if branches:
             branch_point = branches[0][0]
@@ -2884,7 +2882,8 @@ class Ledger:
             state = rows[0][0]
             if state == "merged":
                 return
-            if state != "sent":
+            # A pending row merges too: ancestry on the pushed branch point is the evidence, not the notice.
+            if state not in ("pending", "sent"):
                 raise LedgerError(f"{checkpoint}: cannot become merged from {state}")
             _ = self._connection.execute("UPDATE handoffs SET state='merged',merge_commit=?,updated_at=? WHERE checkpoint=?", (actual_merge, _now(), checkpoint))
 

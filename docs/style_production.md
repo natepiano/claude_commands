@@ -345,6 +345,8 @@ Then run
 It adds the hand-off, sends
 `From the showrunner of <style slug>: hand-off <hash>` to the current parent's
 `showrunners.py address <parent>`, then records `handoff send`.
+A send that send.py queued (`QUEUED:`, exit 1) is sent too: send.py delivers
+it later. The command prints `hand-off <hash7>: queued for <parent>`.
 Style work never waits for a sync to go home.
 
 The parent correctness-reviews the hand-off's diff against the branch point
@@ -358,10 +360,11 @@ hand-off as merged in the style ledger with its merge commit, then sends
 `From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.`
 The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
-ancestry on the branch point is the evidence. The receiver decides delivery
-state once. A local merge missing from origin is pushed, notified and promoted
-before acknowledgment, without merging again. A checkpoint already on origin
-merges, pushes, notifies and promotes nothing: it prints
+ancestry on the branch point is the evidence, so it also takes a pending row.
+The receiver decides delivery state once. A local merge missing from origin is
+pushed, notified and promoted before acknowledgment, without merging again. A
+checkpoint already on origin merges, pushes, notifies and promotes nothing: it
+prints
 `hand-off <hash7> already merged as <merge7>` and acknowledges again.
 A failed first push undoes the unpushed merge; no acknowledgment precedes a
 successful push. Hand-offs run the same package and Merge tests and test log
@@ -374,7 +377,8 @@ after `ticket merge`. Reconcile stores the branch
 point before any acknowledgment and marks merged hand-offs by ancestry.
 Replay proceeds oldest first: pending notices are sent then recorded; sent
 notices are sent again; a notice sent to another parent is sent to the current
-parent then rerouted. Failed sends leave the row unchanged.
+parent then rerouted. A queued send counts as sent; failed sends leave the row
+unchanged.
 `style_ledger.py handoff reroute --repo <checkout> --checkpoint <hash> --to <parent>`
 accepts only sent rows, preserving their checkpoint and creation time; the
 same parent is a no-op. `handoff send` still refuses a second parent.
