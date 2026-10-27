@@ -17,7 +17,7 @@ research how to use typesafe - i want you to become a resource for other session
 Measured 2026-10-26 on natedev's `~/rust/hanadocs`:
 
 - 543 open issues. 96 of them are style-rule proposals (`tags: style`, `style_rule:` set). The style production writes those in bulk with fixed ratings and an empty body, so the scorer skips them.
-- That leaves 447 open issues, 40 of them unrated. About 70 closed issues also carry ratings. Together these give about 480 rated issues to measure against.
+- That leaves 447 open issues, 40 of them unrated, so about 400 rated open issues to measure against. Closed issues are never scored (Review decisions 3).
 - 163 open issues have a body under 200 characters, so the title is almost all the state. The evaluation reports these as their own group.
 - The values are skewed. Goal is `1 - Ship Hana` on 81% of rated issues, and urgency is one star on 86%.
 - `area` has 118 values, and some are spelling variants of each other (`tool`/`tooling`, `ui`/`"[[ui]]"`). `category` is single-valued on all but 3 issues.
@@ -67,7 +67,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 ### Evaluation — the `compare` report
 
-- **Labels:** the ratings of about 480 rated, non-style issues. A hash of each file name splits them, the same way on every run, into a 70% tuning set and a 30% held-out set. The held-out set is scored once, after tuning ends.
+- **Labels:** the ratings of about 400 rated, open, non-style issues. A hash of each file name splits them, the same way on every run, into a 70% tuning set and a 30% held-out set. The held-out set is scored once, after tuning ends.
 - **Ordinal fields:** exact match, within one star, MAE, quadratic-weighted kappa, ranked probability score and a 5×5 confusion matrix. Each is shown for the whole set, for title-only issues and for the score ≥ 20 band.
 - **Choice fields:** accuracy, a confusion matrix, Brier score, and reliability by confidence bucket.
 - **Ordering:** apply `renumber.py`'s score formula to the Jev stars, and report the Spearman correlation with the current `backlog_score`. The formula is imported, not copied. Ordering is what the ratings are for.
@@ -98,7 +98,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 1. A go to send issue titles and bodies to TypeSafe on a standard plan. The key is in place.
 2. A budget for experiments. The proposal is $20, about four times the expected need.
-3. A human ceiling. Studies find a large share of human issue labels are wrong; Herzig et al. found 33.8% of issue reports misclassified. Will you re-rate 30 issues blind, about 20 minutes, so we know how often you agree with your earlier ratings? Recommended: yes. Without it, a Jev score of "70% exact" has nothing to compare against.
+3. A human baseline. Answered in Review decisions 4: a blind preference test.
 
 ### Review decisions (the user, 2026-10-26, /adhoc_review)
 
@@ -117,6 +117,8 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
    - A non-style issue with a `Proposed ranking:` line is unrated (12 open now): its values are the filer's judgment, not yet confirmed. Non-style proposals rated through `stars` (tool-based-ui, research-unit and others) were confirmed by the user, so they count as labels.
    - The user, after this answer: "once we get jef working - we should apply it to the defaulted and missing - and in fact i want to reassess all of our issues in case i like jev's categorization better". So the plan adds a reassessment phase (Phase 5) that scores every open issue, including style issues, issues with default ratings and unrated issues. Style issues need their own state, built from their rule fields because their body is empty.
 2. **Budget: $20.** The user: "i am happy to add $20 to jev". The scorer keeps a running total from each response's `usage.input_tokens` at $0.042 per million. It stops before a request that would pass $20, and asks the user before it spends more.
+3. **Open issues only.** The user: "we only need to score open issues - not closed". `score`, `compare` and `reassess` read open issues only, and closed issues are not labels either.
+4. **Baseline: blind preference.** The user: "blind preference for our teating". In Phase 3, about 20 held-out issues where Jev and the vault disagree are shown to the user. Each issue shows its two values as A and B, in random order, with no label saying which is Jev's. The user picks A, B or same. The share of picks for Jev decides how far the reassessment trusts Jev. This replaces the blind re-rating.
 
 ### Resource for other sessions
 
@@ -203,16 +205,17 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - Watch for prompt gymnastics: no criteria that name test issues, no clause added per failure, no thresholds fitted to a few cases.
 - For each field, take the threshold from its risk-coverage table, using the lowest value whose error meets the target. Targets: goal and category 10% error; impact and alignment within one star on 90%; urgency and effort have no target and are reported only.
 - Bump `QUESTION_SET_VERSION`, then score the held-out set once. Write the held-out report, and run the repeat check on the tuning set.
-- Send the user the report, the per-field recommendation (Jev proposes / agent proposes), and the disagreement lists. The user's verdict per field is recorded in `questions.py` as `JEV_FIELDS`.
+- Blind preference test (Review decisions 4): `score_issues.py blind <run-id> --count 20` picks held-out disagreements, spread across fields. It writes the A/B sheet with the order shuffled by a recorded seed, and keeps the key in a separate file the user does not see. `score_issues.py blind-score <sheet>` reads the user's picks and reports the share for Jev, the share for the vault and the share marked same, per field.
+- Send the user the report, the blind-preference result, the per-field recommendation (Jev proposes / agent proposes), and the disagreement lists. The user's verdict per field is recorded in `questions.py` as `JEV_FIELDS`.
 - Record the lessons in `~/.local/state/issue-score/lessons.md` for Phase 5.
 
-**Files:** `scripts/issue_score/questions.py`, and `scripts/issue_score/test_decide.py` when thresholds move.
+**Files:** `scripts/issue_score/questions.py`, `scripts/issue_score/score_issues.py` (`blind`, `blind-score`), `scripts/issue_score/test_blind.py`, and `scripts/issue_score/test_decide.py` when thresholds move.
 
-**Workers:** `1 writer` — the unit director runs the experiments; the writer applies the chosen wordings and thresholds.
+**Workers:** `1 writer + 1 tester` — the unit director runs the experiments; `impl` applies the chosen wordings and thresholds and writes `blind`/`blind-score`; `test` writes `test_blind.py` (the seed reproduces the order; the key never appears in the sheet; tallies are correct).
 
 **Constraints from prior phases:** set by phase review.
 
-**Acceptance gate:** the merge gate is green; the held-out report exists; the user's per-field verdict is recorded in `JEV_FIELDS`.
+**Acceptance gate:** the merge gate is green; the held-out report exists; the user has filled in the blind sheet and the result is reported; the user's per-field verdict is recorded in `JEV_FIELDS`.
 
 ### Phase 4 — `/issue` proposes with Jev  · status: todo
 
