@@ -194,7 +194,7 @@ def launch():
         source = '''
 def launch():
     selected = accounts.role_account("unit")
-    herdr.open_pane("unit", "unit", cwd, named_account_environment(selected.dir))
+    herdr.open_tab("unit", "ad-hoc", "unit", cwd, named_account_environment(selected.dir))
     herdr.start_agent("unit", pane, kind="claude", agent="unit", agent_arguments=[])
 '''
         problems = launch_account_violations(source, "fixture.py")

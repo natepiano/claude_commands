@@ -104,6 +104,14 @@ def setUpModule() -> None:
 
 
 class QuotaAlertTests(unittest.TestCase):
+    def test_shutdown_hold_has_its_own_blocked_head_line(self) -> None:
+        detail = "accounts: claude4 is held by a shutdown; no session was stopped"
+        reason = quota_alert.TargetHeldByShutdown(detail)
+        self.assertEqual(quota_alert.blocked_next_move_line("units", "claude4", "head", reason),
+                         "units 1 → claude4 due, " + detail)
+        self.assertNotEqual(quota_alert.blocked_next_move_reason_key(reason),
+                            quota_alert.blocked_next_move_reason_key(quota_alert.TargetPreparationRefused(detail)))
+
     def test_failed_login_renewal_has_its_own_blocked_head_line(self) -> None:
         reason = quota_alert.TargetLoginRenewalFailed("timed out after 120 s")
         self.assertEqual(quota_alert.blocked_next_move_line("units", "claude4", "head", reason),

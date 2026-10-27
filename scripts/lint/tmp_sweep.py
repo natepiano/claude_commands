@@ -6,28 +6,39 @@ Claude Code's own /tmp/claude-<uid>/<project>/ folders, and nothing removed
 them: on 2026-10-25 the two held 122 GiB and 86 GiB. sweep.py --floor-only, on
 disk-floor.nix's 2-minute timer, calls run_if_due, which runs this sweep when
 its last run started RUN_INTERVAL_SECONDS or more ago, and before the floor
-takes any build cache. `tmp_sweep.py [--dry-run]` runs it at once.
+takes any build cache. On the Mac, disk-floor does not run, and the tmp-sweep job
+in nixos modules/darwin/tmp-sweep.nix runs `tmp_sweep.py` every hour.
+`tmp_sweep.py [--dry-run]` runs it at once.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
-folder. It is deleted when both are true:
+folder of each /tmp/claude-<uid> this user owns, or the scratch root of scripts/lib/scratch.py
+(/tmp/claude/scratch), where each task's folder is an entry. In a temp folder (/tmp, $TMPDIR
+and the Mac's per-user temp folder) only a tempfile folder is an entry, the
+name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
+Python's tempfile), which test runs leave behind. Roots are real paths on both machines. An entry is deleted when
+both are true:
 
   * nothing in it changed for IDLE_SECONDS. A change is the newer of mtime and
     ctime (a `cp -a` copy keeps its mtime but sets ctime), over every file,
     folder and link inside it; the entry's own times do not count, except for a
     file, a link, or a folder with nothing in it;
   * no process has its working folder, an open file or a mapped file inside it
-    (one /proc scan per run).
+    (one /proc scan per run; where no /proc exists, one lsof scan).
 
 These stay too: the roots and their active/ run-marker folders; a unit run
-folder whose `director` file names a running session; a session folder named
+folder whose own record names a running session: that session's marker in an
+active/ folder, else the folder's `director` file, else the `run_started` event
+that opens its history (unit_runs.director), so an idle run that no worker has
+dispatched in yet stays too; a session folder named
 for a running session, though an entry of SESSION_ENTRY_MIN_BYTES or more in
 its folders (scratchpad/, tasks/) is judged like any other: a live session
 keeps small files there that it only reads, and a read does not move mtime;
-each of those when a session record cannot be read;
+each of those when a session record cannot be read; a scratch folder of a change review
+row, which its verdict removes (the user can take days to check a row);
 and an entry that cannot be read. Links are never followed, a read-only folder
-is made writable and deleted, and a project folder left empty goes. With no
-/proc (the Mac) nothing goes.
+is made writable and deleted, and a project folder left empty goes. With
+neither /proc nor lsof nothing goes.
 
 Each run appends one JSON line to LOG_NAME in the lint-sweep state folder: the
 entries deleted, the GiB freed, the count kept for each reason, and the paths
@@ -40,8 +51,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 from collections.abc import Sequence
@@ -51,10 +64,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import scratch  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
+    from ..lib import unit_runs
     from ..message import sessions
 else:
+    import unit_runs
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
     import sessions
 
@@ -67,10 +83,22 @@ RUN_INTERVAL_SECONDS = HOUR_SECONDS
 LOG_KEEP_SECONDS = 7 * 24 * HOUR_SECONDS
 TMP_ROOT = "/tmp/claude"
 RUN_ROOTS = (os.path.join(TMP_ROOT, "delegate"), os.path.join(TMP_ROOT, "unit"))
-SESSION_SCRATCH_ROOT = os.path.join("/tmp", f"claude-{os.getuid()}")
+# Claude Code keeps each session's scratch in /tmp/claude-<uid>/<project>/<session id>/.
+SESSION_SCRATCH_PREFIX = "claude-"
 RUN_MARKERS = "active"
-DIRECTOR_FILE = "director"
 PROC_DIR = "/proc"
+# Where no /proc exists (the Mac), one lsof scan lists what each process uses.
+LSOF = ("lsof", "-n", "-P", "-w", "-F", "pfn")
+LSOF_TIMEOUT_SECONDS = 120
+# lsof's fd names for a working folder and for mapped files (program text, memory maps).
+LSOF_CWD = "cwd"
+LSOF_MAPPED = ("txt", "mem")
+# The folder names tempfile makers give by default: Rust's tempfile crate ".tmp" and 6 letters or
+# digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
+# Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
+# 3,917 mktemp and Python ones on 2026-10-26).
+TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp[a-z0-9_]{8}")
+DARWIN_TEMP_NAME = "CS_DARWIN_USER_TEMP_DIR"
 DELETED_SUFFIX = " (deleted)"
 STATE_ENV = "LINT_SWEEP_STATE_DIR"
 DEFAULT_STATE_DIR = os.path.join("~", ".local", "state", "lint-sweep")
@@ -81,13 +109,14 @@ DRY_RUN_FLAG = "--dry-run"
 ROOT = "a root or a run-marker folder"
 SESSION_RUNS = "its session runs"
 DIRECTOR_RUNS = "its unit director runs"
+ROW_WAITS = "its change review row waits for a verdict"
 NO_SESSIONS = "a session record cannot be read"
 IN_USE = "a process uses it"
 RECENT = "changed in the last 4 h"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
 UNLISTED_REASONS = (RECENT, SMALL_IN_LIVE_SESSION)
 UNREADABLE = "it cannot be read"
-NO_PROC = "no /proc to show which processes use it"
+NO_PROC = "no /proc or lsof to show which processes use it"
 
 
 class DeletedEntry(TypedDict):
@@ -113,13 +142,24 @@ class RunRecord(TypedDict):
 
 @dataclass(frozen=True)
 class Roots:
-    """The folders whose top-level entries the sweep judges, by kind."""
+    """The folders whose top-level entries the sweep judges, by kind. In a temp folder only a
+    tempfile folder (TEMPFILE_NAME) is judged."""
     plain: tuple[str, ...]
     runs: tuple[str, ...]
     projects: tuple[str, ...]
+    temp: tuple[str, ...] = ()
+    scratch: tuple[str, ...] = ()
 
     def all(self) -> tuple[str, ...]:
-        return self.plain + self.runs + self.projects
+        return self.plain + self.runs + self.projects + self.temp + self.scratch
+
+    def entries(self, root: str) -> list[os.DirEntry[str]]:
+        """The entries of root the sweep judges."""
+        found = listing(root)
+        if root not in self.temp:
+            return found
+        return [entry for entry in found
+                if TEMPFILE_NAME.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False)]
 
 
 @dataclass
@@ -134,10 +174,42 @@ class Sweep:
 
 
 def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS,
-                  session_root: str = SESSION_SCRATCH_ROOT) -> Roots:
-    projects = tuple(entry.path for entry in listing(session_root)
+                  session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
+                  scratch_roots: Sequence[str] | None = None) -> Roots:
+    """The same roots on natedev and the Mac, each by its real path: the Mac's /tmp is a link to
+    /private/tmp, and lsof prints real paths."""
+    sessions_at = session_scratch_roots() if session_roots is None else session_roots
+    projects = tuple(entry.path for root in sessions_at for entry in listing(os.path.realpath(root))
                      if entry.name.startswith("-") and entry.is_dir(follow_symlinks=False))
-    return Roots((tmp_root,), tuple(run_roots), projects)
+    temp = temp_folders() if temp_roots is None else temp_roots
+    task_roots = (str(scratch.root()),) if scratch_roots is None else scratch_roots
+    return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in run_roots), projects,
+                 tuple(os.path.realpath(root) for root in temp),
+                 tuple(os.path.realpath(root) for root in task_roots if os.path.isdir(root)))
+
+
+def session_scratch_roots() -> tuple[str, ...]:
+    """Each /tmp/claude-<uid> folder this user owns."""
+    owned: list[str] = []
+    for entry in listing("/tmp"):
+        if not entry.name.startswith(SESSION_SCRATCH_PREFIX) or not entry.name[len(SESSION_SCRATCH_PREFIX):].isdigit():
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_uid == os.getuid():
+                owned.append(entry.path)
+        except OSError:
+            continue
+    return tuple(owned)
+
+
+def temp_folders() -> tuple[str, ...]:
+    """/tmp, $TMPDIR and the Mac's per-user temp folder, each by its real path, once."""
+    try:
+        darwin = os.confstr(DARWIN_TEMP_NAME) or ""
+    except (ValueError, OSError):
+        darwin = ""
+    candidates = ("/tmp", os.environ.get("TMPDIR", ""), darwin)
+    return tuple(dict.fromkeys(os.path.realpath(path) for path in candidates if path and os.path.isdir(path)))
 
 
 def listing(directory: str) -> list[os.DirEntry[str]]:
@@ -192,6 +264,34 @@ def process_paths(proc: str, prefix: str) -> list[tuple[str, int, str]] | None:
             parts = line.split(maxsplit=5)
             if len(parts) == 6 and parts[5].startswith(prefix):
                 found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, "maps a file in it"))
+    return found
+
+
+def lsof_paths(prefix: str) -> list[tuple[str, int, str]] | None:
+    """process_paths from one lsof scan; None when lsof cannot run or prints nothing."""
+    try:
+        completed = subprocess.run(LSOF, capture_output=True, text=True, errors="replace",
+                                   timeout=LSOF_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # lsof exits 1 when it cannot read some process; the lines it printed still hold.
+    return parse_lsof(completed.stdout, prefix) if completed.stdout else None
+
+
+def parse_lsof(text: str, prefix: str) -> list[tuple[str, int, str]]:
+    """Each path under prefix in `lsof -F pfn` output, with its pid and how the process uses it."""
+    found: list[tuple[str, int, str]] = []
+    pid = 0
+    how = ""
+    for line in text.splitlines():
+        field, value = line[:1], line[1:]
+        if field == "p" and value.isdigit():
+            pid = int(value)
+        elif field == "f":
+            how = ("works in it" if value == LSOF_CWD
+                   else "maps a file in it" if value in LSOF_MAPPED else "holds a file open in it")
+        elif field == "n" and pid and how and value.startswith(prefix):
+            found.append((value, pid, how))
     return found
 
 
@@ -257,32 +357,45 @@ def delete_tree(path: str) -> None:
         shutil.rmtree(path)
 
 
-def director(run: str) -> str | None:
-    try:
-        with open(os.path.join(run, DIRECTOR_FILE), encoding="utf-8") as handle:
-            return handle.readline().strip() or None
-    except (OSError, UnicodeError):
-        return None
+def marked_runs(roots: Roots) -> dict[str, str]:
+    """Each run folder a run marker names, by its real path, to the marker's session. A marker
+    holds the run folder's path on its first line."""
+    marked: dict[str, str] = {}
+    for root in roots.runs:
+        for marker in listing(os.path.join(root, RUN_MARKERS)):
+            try:
+                with open(marker.path, encoding="utf-8") as handle:
+                    run = handle.readline().strip()
+            except (OSError, UnicodeError):
+                continue
+            if run:
+                marked[os.path.realpath(run)] = marker.name
+    return marked
 
 
 def when(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, user_zone()).strftime("%Y-%m-%d %H:%M")
 
 
-def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozenset[str] | None) -> str | None:
+def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozenset[str] | None,
+                 marked: dict[str, str]) -> str | None:
     """Why an entry stays whatever its age: it is a root or run-marker folder, or a running session
-    owns it."""
+    owns it by the entry's own record."""
     if entry.path in roots.all() or (root in roots.runs and entry.name == RUN_MARKERS):
         return ROOT
+    if root in roots.scratch:
+        task = scratch.task_of(Path(entry.path))
+        return ROW_WAITS if task is not None and task.startswith("row:") else None
     if root in roots.projects:
         if live is None:
             return NO_SESSIONS
         return SESSION_RUNS if entry.name in live else None
     if root in roots.runs and entry.is_dir(follow_symlinks=False):
-        named = director(entry.path)
-        if named is not None and live is None:
+        names = (marked.get(os.path.realpath(entry.path)), unit_runs.director(Path(entry.path)))
+        owners = {name for name in names if name}
+        if owners and live is None:
             return NO_SESSIONS
-        return DIRECTOR_RUNS if named is not None and live is not None and named in live else None
+        return DIRECTOR_RUNS if live is not None and owners & live else None
     return None
 
 
@@ -302,21 +415,25 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
     if not roots.all():
         return result
     # The scan keeps only paths under the roots' common folder (/tmp), which entry_uses then sorts.
-    paths = process_paths(proc, os.path.join(os.path.commonpath(roots.all()), ""))
+    prefix = os.path.join(os.path.commonpath(roots.all()), "")
+    paths = process_paths(proc, prefix)
+    if paths is None:
+        paths = lsof_paths(prefix)
     if paths is None:
         for root in roots.all():
-            for entry in listing(root):
+            for entry in roots.entries(root):
                 result.keep(entry.path, NO_PROC)
         return result
     live = running_session_ids()
     inner = session_folders(roots, live)
+    marked = marked_runs(roots)
     judged = roots.all() + inner
     uses = entry_uses(paths, judged)
     since = now - IDLE_SECONDS
     for root in judged:
         emptied = False
-        for entry in listing(root):
-            reason = owner_reason(entry, root, roots, live)
+        for entry in roots.entries(root):
+            reason = owner_reason(entry, root, roots, live, marked)
             if reason is None and entry.path in uses:
                 result.keep(f"{entry.path}: {uses[entry.path]}", IN_USE)
                 continue

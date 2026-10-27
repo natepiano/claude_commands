@@ -2424,3 +2424,47 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:**
 - A test that mocks `execvpe` for a Claude or Codex start needs a scratch executable on its PATH or in its scratch `~/.local/bin`; the gate caught two that had none.
+
+### Phase 87 — A move never strands units: target check, source fallback, restart skips the running  · status: done
+
+**Depends on:** Phase 86; shutdown-unit's hold API (eb30ce4a)
+
+#### As-built
+
+- Cause of the 10-26 16:37 AST outage: a move keeps its stop records under the source login, and the target's `launch_blocked` found no record there, so a stale claude2 stop hold refused every restart.
+- One target hold check in `accounts.py` runs before any stop in the hand group move and the single move (through `check_move_target`), and in every `refusal_watch` move path (queued rule, refusal-driven move, completing a committed group). It calls `launch_permission(target env, NewWorkLaunchPurpose())`. Blocked or unreadable: no stop, no write; the hand move returns `MoveRefused("accounts: <reason>; no session was stopped")`, and the queued rule records a blocked head with `quota_alert.TargetHeldByShutdown(reason)`. A dry run reports the planned check and does not call it.
+- A released finished hold (`ReleasedHold`) gives one line: "cleared a finished <then> hold on <label> from <local time> (session <8> | requested in a terminal or by a recovery snapshot)". It is relayed to the showrunners through one helper (quota_alert session recipients, no phone push); undelivered notices wait in `pending_cleared_holds.json` under the accounts state dir and are retried per recipient. The recorded `why` stays exactly `auto: <id>`.
+- `restart.py`: every target-start failure of a moved session (exception, failed prompt outcome, not live at confirmation) goes to `_try_source_fallback`, which runs only when the target is confirmed absent. It pins the record to the source, starts a unit through `_unit_argv` → `add_unit --source-fallback --account <source>` (other sessions through their own launch), requires a submitted prompt and a live session, and records "<name> came back on <source>: <target> refused (<reason>)". Both failing: the record returns to the target, becomes `restart failed` with both reasons, and sends `shutdown.move_failed` once, hand or auto.
+- `add_unit.account_for_launch(..., source_fallback=True)` and `accounts.account_for_group_launch(..., source_fallback=True)` allow another account only for a recorded unit restore whose shutdown record names it as the source; every other launch keeps the group rule.
+- `shutdown.py restart --only`: names resolve one at a time against records first (peer records included); a recordless live session (any account) prints "<name>: already running; skipped"; an unknown name, or one with records on both machines, gets its own line; the others restart; selection errors exit 1. `cancel` and `now` keep "no shutdown in progress".
+
+**Files:** `scripts/accounts/accounts.py`, `refusal_watch.py`, `scripts/whoami/quota_alert.py`, `scripts/shutdown/restart.py`, `shutdown.py`, `scripts/production/add_unit.py`; tests in `scripts/accounts/test_refusal_watch.py`, `scripts/shutdown/test_account_move.py`, `test_restart.py`, `test_shutdown_cli.py`, `scripts/whoami/test_quota_alert.py`, `scripts/production/test_add_unit.py`; `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+**Gotchas:**
+- The gate script must fetch the GitHub origin, not the local `~/.claude` clone: the local `build-followups` ref can hold a showrunner merge still in its gate.
+- Since shutdown-unit's 088f0322 every restart comes back in the shared herdr session; `test_restart`'s setUp patches `herdr.shared_session` to "writing", so a test expects that, never a recorded host.
+- Restarts launch in a pool: assert launched names with `assertCountEqual`.
+- Carried to Phase 88: F009 (a retried cleared-hold notice after a `QUEUED` result queues again; jobs have no name).
+
+### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: done (4b8cbb3e)
+
+**Depends on:** Phase 87
+
+#### As-built
+
+- `scripts/accounts/unit_watchdog.py` runs from the two-minute notes timer on natedev. A unit that is down with no user or account stop and no work in progress gets one pass of grace, then a restart on its group account (`accounts.account_for_group_launch`), else its source account. Retired and finished units are skipped.
+- Restarts run detached (`systemd-run --user --no-block`, one 30 s deadline for all submissions per pass); the result is read on a later pass. A job is always consumed before a stale restart claim or a missing record can drop its outage. State: `~/.local/state/accounts/unit_watchdog.json`, results in `unit-watchdog-results`.
+- A crash in a live herdr host (registry not live, pane has no live agent: `restart.watchdog_crash_signal`) is saved as snapshot `crash: "agent exited"` (`record.mark_snapshot_agent_exited`); with an unreadable probe the watchdog keeps its own copy and restores it (`restore_snapshot_agent_exited`) once the exit is confirmed. The store entry always wins over the copy. Restart turns it into `AgentExitRecovery` with `last_seen` and names it in the prompt.
+- A queued restart checks its saved source under the restart claim (`RecoverySourceAuthorized` / `RecoverySourceChanged`); a newer stop or account hold stops the launch.
+- Alerts: the showrunner gets a line for each attempt. The phone gets one delivered alert per outage: `shutdown.move_failed` for a move record (shared `record.claim_restore_alert`; a failed push releases it, a live unit clears it), `shutdown.restart_failed` with a cause for a crash. A restore whose folder is gone (shutdown 61459ed7) ends the outage with one alert.
+- The gate test in `test_unit_watchdog.py` rebuilds 10-26: a stale stop hold on the target and the stopped units all come back.
+
+#### Files
+
+`scripts/accounts/unit_watchdog.py` (new), `refusal_watch.py`, `scripts/shutdown/restart.py`, `record.py`, `session_types.py`; tests `test_unit_watchdog.py` (new), `test_refusal_watch.py`, `test_restart.py`, `test_record.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+#### Gotchas
+
+- Run the full merge gate after every origin merge: shutdown 61459ed7 (restore dropped when its folder is gone) turned five watchdog tests red only after the merge; give restored sessions a real scratch folder.
+- `test_launch_accounts` requires every Claude launcher to pick its account through `account_for_group_launch`, and `scripts/lib/test_user_zone` requires `astimezone(user_zone())`; neither is in the accounts suites, so run them.
+- Known residual: a worker can deliver `move_failed` and a later missing-folder retry archives the record, so a second, different `restart_failed` push follows for that outage.

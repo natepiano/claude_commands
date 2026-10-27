@@ -96,6 +96,10 @@ if (( ${#RUNS[@]} > 0 )); then
   done
   "$PY" "${MESH}" sweep --root "$(dirname "${RUNS[0]}")" --stop || true
   "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" "${RUNS[@]}" || true
+  # Each run's scratch folders (scripts/lib/scratch.py) end with the run.
+  for run in "${RUNS[@]}"; do
+    "$PY" "${SCRIPT_DIR}/../lib/scratch.py" end --task "run:$(basename "${run}")" || true
+  done
 fi
 
 if [[ -f "${MARKER}" ]]; then

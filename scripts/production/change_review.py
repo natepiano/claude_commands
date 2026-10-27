@@ -27,7 +27,8 @@ the next C number, the push date and the merged hash, the How to check cell `<ho
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
 its id, Merged cell and position; `show` prints the current row and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
-date; `mark-important` marks a row the user called important.
+date, and removes the row's scratch folders (task `row:<showrunner>-C<n>`, scripts/lib/scratch.py)
+whichever way the verdict goes; `mark-important` marks a row the user called important.
 
 Each row's Production cell names the production whose change it is: the production whose Units
 table names the branch of the checkpoint that carries the row's line (`visible_owners`), else the
@@ -67,6 +68,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import scratch  # noqa: E402
 import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
@@ -96,7 +98,8 @@ _LINE = re.compile(rf"^{TRAILER}:\s*(?P<value>.*)$", re.MULTILINE)
 _COVERS = re.compile(rf"^{TRAILER}-Covers:\s*(?P<sha>[0-9a-f]{{7,40}})\s*$", re.MULTILINE)
 _NUMBER = re.compile(r"^\| C(\d+) \|", re.MULTILINE)
 _ROW = re.compile(r"^[A-Z]\d+$")
-_LANDS = re.compile(r"^(works|fine)\b", re.IGNORECASE)
+_LANDS = re.compile(r"\b(works|fine)\b", re.IGNORECASE)
+_FAILS = re.compile(r"\b(not|no|never|still|fails?|failed|broken|wrong|doesn't|don't|isn't)\b", re.IGNORECASE)
 # A cell boundary is a `|` that _cell did not escape.
 _BOUNDARY = re.compile(r"(?<!\\)\|")
 _CHECKPOINT = re.compile(r"^checkpoint\((?P<branch>[^)]+)\):")
@@ -741,8 +744,9 @@ def describe(row: dict[str, str]) -> str:
 
 
 def lands(verdict: str) -> bool:
-    """A verdict beginning `works` or `fine` lands the row; any other returns it to its unit."""
-    return _LANDS.match(verdict.strip()) is not None
+    """A verdict that says `works` or `fine` and no word of failure (`not`, `still`, `broken` ...) lands
+    the row ("okay c17 works"); any other returns it to its unit."""
+    return _LANDS.search(verdict) is not None and _FAILS.search(verdict) is None
 
 
 def _to_review(path: Path, lines: list[str], row: str) -> tuple[list[str], int]:
@@ -797,6 +801,17 @@ def record_verdict(path: Path, row: str, verdict: str, day: date, production: Pa
         return _plain(cells.get("Merged", ""))
 
     return _edit(path, production, day, write, lambda _: f"verdict {row}")
+
+
+def end_row_scratch(path: Path, row: str) -> list[str]:
+    """Remove the scratch folders of `row` on the list at `path`; return one line per folder.
+
+    A verdict ends the row either way: a row returned to its unit comes back as a new row.
+    """
+    try:
+        return [f"removed {folder}" for folder in scratch.end(f"row:{_owner(path)}-{row}")]
+    except (scratch.ScratchError, OSError) as error:
+        return [f"scratch not removed: {error}"]
 
 
 def production_doc(production: str) -> Path:
@@ -984,8 +999,11 @@ def _run(options: CommandLine) -> int:
         case "verdict":
             row = _row_option(options)
             verdict = _words("verdict", options.verdict)
-            merged = record_verdict(_list(options), row, verdict, today(), production_doc(options.production))
+            path = _list(options)
+            merged = record_verdict(path, row, verdict, today(), production_doc(options.production))
             print(f"{row} landed" if lands(verdict) else f"{row} returns to its unit (merged {merged})")
+            for line in end_row_scratch(path, row):
+                print(line)
         case "list-path":
             print(production_list(options.production))
         case "showrunner":

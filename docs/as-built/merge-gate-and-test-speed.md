@@ -2,7 +2,7 @@
 
 ## What it is
 
-`scripts/production/merge_gate.py` is the committed command that merges a checkpoint into a `~/.claude` production's merge branch and tests the result. It refuses unsafe starting states, merges the checkpoint `--no-ff`, then runs every test module of the 22 `~/.claude` Python suites plus basedpyright in parallel under a sampled-memory cap. On green it pushes, and with `--promote` it fast-forwards `~/.claude` main and the Mac. On red it undoes the merge and prints each red suite's failures. Run sequentially, the suites took about 30 minutes; in parallel they take 75–195 s depending on machine load. A set of test rules keeps them at that speed and keeps load from turning them red: no live state, no wall-clock thresholds, no fixed waits in the code under test, few process launches, no trivial tests.
+`scripts/production/merge_gate.py` is the committed command that merges a checkpoint into a `~/.claude` production's merge branch and tests the result. It refuses unsafe starting states, merges the checkpoint `--no-ff`, then runs every test module of the `~/.claude` Python suites in `TEST_SUITES` plus basedpyright in parallel under a sampled-memory cap. On green it pushes, and with `--promote` it fast-forwards `~/.claude` main and the Mac. On red it undoes the merge and prints each red suite's failures. Run sequentially, the suites took about 30 minutes; in parallel they take 75–195 s depending on machine load. A set of test rules keeps them at that speed and keeps load from turning them red: no live state, no wall-clock thresholds, no fixed waits in the code under test, few process launches, no trivial tests.
 
 ## How it works
 
@@ -24,7 +24,7 @@
 **Red, errors and signals.** Any exception after the merge, including red suites and `KeyboardInterrupt`, goes to `rollback_merge(repo, baseline)`. It aborts an in-progress merge and runs `git reset --keep <merge HEAD before the merge>`. If tracked files changed during the gate block that reset, it restores them to the merge tree and retries once; if the retry also fails, it reports `merge NOT undone; merge commit <hash>; blocking files: ...`. `rollback_signals()` turns SIGTERM and SIGHUP into `GateRefused`, so they roll back the same way; SIGINT arrives as `KeyboardInterrupt`.
 
 **Suite runner** (`run_suites(repo, memory_cap_mib, type_dirs) -> GateRun`):
-- `TEST_SUITES` (a tuple in the script) is the single list of suites: `lib hooks message accounts whoami agents build_hold mac_test usage bevy_upgrade production direct buildlog lint nightly_review build_targets shutdown feature_log model_study herdr notify statusline astra style history guilds`. Modules are `scripts/<suite>/test_*.py`, found non-recursively: 232 modules on 2026-10-21.
+- `TEST_SUITES` (a tuple in the script) is the single list of suites: `lib hooks message accounts whoami agents build_hold mac_test usage bevy_upgrade bevy_migration_plan production direct buildlog lint nightly_review build_targets shutdown feature_log model_study herdr notify statusline astra style history guilds`. Modules are `scripts/<suite>/test_*.py`, found non-recursively: 246 modules in 27 suites on 2026-10-26.
 - Before any job starts it refuses (and the merge rolls back) if a `--type-dirs` path is absent from the checkout, a listed suite has no modules, or `/dev/shm` is not writable.
 - Each module is one job: `python -c SUITE_BOOTSTRAP -m unittest discover -s <dir> -p <module>`, started in its own session and process group, stdin `/dev/null`. `SUITE_BOOTSTRAP` resets every signal disposition except KILL and STOP to `SIG_DFL`, then `execv`s, so a suite started from a background shell does not inherit SIGINT ignored.
 - All jobs share one `TMPDIR` under `/dev/shm/merge-gate-*`. Each job's output goes to a log file there, read and deleted when the job ends.
@@ -112,7 +112,7 @@ Every `UNIT_*` name above was `PLAN_DELEGATE_*` before the rename, and `UNIT_RUN
 
 - **Nothing is skipped to save time.** No skipped tests, no weakened assertions, no tier left out of the gate. A red under load is fixed at its source: an event-driven wait, a drained pipe, an injected `TimeoutExpired`, a hang guard.
 
-- **The gate covers only `TEST_SUITES`.** Every new suite joins it, and `run_suites` refuses a listed suite with no modules. Discovery is non-recursive, so `scripts/<suite>/tests/` is not gated. Directories with tests outside the list (berth, fix, prioritize, hana_shot, shot_report, screen_record, exclude, bevy_migration_plan) are not gated today.
+- **The gate covers only `TEST_SUITES`.** Every new suite joins it, and `run_suites` refuses a listed suite with no modules. Discovery is non-recursive, so `scripts/<suite>/tests/` is not gated. Tests outside the list are not gated: `scripts/berth/tests/` and `scripts/prioritize/tests/`, and the top-level tests of exclude, hana_shot, hierarchies, screen_record, settings and shot_report.
 
 - **Override defaults stay as they are.** Each default is pinned by a test that runs the real script or module with the override unset and observes the default through behavior: the sleep argument, the attempt count, the clock source, the fsync/PRAGMA call, the computed module value. No test reads a literal from source. A new override needs the same pin.
 

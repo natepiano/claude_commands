@@ -22,6 +22,9 @@ import merge_checkpoint
 from merge_checkpoint import (ChildHandoffEntry, CodeCheckpoint, LastMerged, MergeEntry, NoMerge, ShrinkCommit,
                               check_parallel, merge_branch_history, merge_history, promote, request_from)
 
+# Importable once merge_checkpoint has put scripts/lib on the path.
+import scratch
+
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
@@ -95,8 +98,13 @@ if name == "basedpyright":
 
 
 def setUpModule() -> None:
-    """The times these tests expect are Pacific; the user's zone setting must not change them."""
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
+    """The times these tests expect are Pacific; the user's zone setting must not change them. The
+    scratch folders a merge removes are in a temporary folder, never /tmp/claude/scratch or ~/rust/repro."""
+    folder = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(folder.cleanup)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        "USER_ZONE": "America/Los_Angeles", "SCRATCH_ROOT": f"{folder.name}/scratch",
+        "SCRATCH_VISIBLE_ROOT": f"{folder.name}/repro"}))
 
 
 class MergeResult(NamedTuple):
@@ -319,6 +327,16 @@ class MergeCheckpointTests(unittest.TestCase):
         accepted = self.run_checkpoint(sha, "--also", "outside.txt")
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
         self.assertIn("scope: ok", accepted.process.stdout)
+
+    def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
+        with mock.patch.dict(os.environ, self.env):
+            done = [scratch.new("phase:alpha-unit/2", word) for word in ("gate", "copy")]
+            later = scratch.new("phase:alpha-unit/3")
+        result = self.run_checkpoint(self.checkpoint())
+        self.assertEqual(result.process.returncode, 0, result.process.stderr + result.process.stdout)
+        self.assertIn("scratch: ok — removed 2 folder(s) of phase:alpha-unit/2: ", result.process.stdout)
+        self.assertFalse(any(path.exists() for path in done))
+        self.assertTrue(later.is_dir())
 
     def assert_real_owns_path_allowed(self, relative: str) -> None:
         self.production_doc(owns_cell=REAL_OWNS, hub_files=False)
