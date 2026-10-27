@@ -7012,6 +7012,27 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(backward.returncode, 2)
         self.assertIn("merged", backward.stderr)
 
+    def test_handoff_merged_takes_a_pending_row_once_the_branch_point_contains_it(self) -> None:
+        """A queued notice left the row pending and its merge was refused (cargo-liner, 2026-10-27)."""
+        self.set_tip(self.initial_tip)
+        _ = self.git("checkout", "-q", "-b", "style/main")
+        self.write(self.sources[0], "pub fn corrected() {}\n")
+        checkpoint = self.commit("Style checkpoint")
+        _ = self.cli("reconcile", "--branch-point", "main", "--style-branch", "style/main")
+        _ = self.cli("handoff", "add", "--checkpoint", checkpoint)
+        refused = self.cli("handoff", "merged", "--checkpoint", checkpoint, success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("hand-off is not merged into main", refused.stderr)
+        _ = self.git("checkout", "-q", "main")
+        _ = self.git("merge", "--no-ff", "-q", "style/main", "-m", "Integrate style")
+        merge_commit = self.git("rev-parse", "HEAD")
+        _ = self.cli("handoff", "merged", "--checkpoint", checkpoint)
+        with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
+            stored = cast(tuple[str, str, str], connection.execute(
+                "SELECT state,merge_commit,sent_to FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchone())
+        self.assertEqual(stored, ("merged", merge_commit, ""))
+
     def test_handoff_merged_preserves_supplied_later_merge_evidence(self) -> None:
         self.set_tip(self.initial_tip)
         _ = self.git("checkout", "-q", "-b", "style/main")
@@ -7226,10 +7247,6 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.git("branch", "style/main")
         _ = self.cli("reconcile", "--branch-point", "main", "--style-branch", "style/main")
         _ = self.cli("handoff", "add", "--checkpoint", self.initial_tip)
-        skipped = self.cli("handoff", "merged", "--checkpoint", self.initial_tip,
-                           "--merge-commit", self.initial_tip, success=False)
-        self.assertEqual(skipped.returncode, 2)
-        self.assertIn("pending", skipped.stderr)
         with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
             created = cast(list[tuple[str]], connection.execute("SELECT created_at FROM handoffs").fetchall())[0][0]
         report = self.summary_report()

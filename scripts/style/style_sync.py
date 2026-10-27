@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import cast
+from typing import Literal, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
@@ -36,6 +36,8 @@ SHOWRUNNERS = SCRIPTS / "production/showrunners.py"
 VERIFY = SCRIPTS / "direct/verify.sh"
 LEDGER = SCRIPTS / "style/style_ledger.py"
 TOOLS: tuple[style_ledger.LintTool, ...] = ("clippy", "mend", "rustfmt")
+# send.py's QUEUED (exit 1) keeps the notice for the parent's session, so it arrives later.
+HandoffDelivery = Literal["sent", "queued"]
 
 
 @dataclass(frozen=True)
@@ -158,7 +160,7 @@ def runner_value(action: str, slug: str) -> str:
     return result.stdout.strip()
 
 
-def handoff_notice(slug: str, parent: str, checkpoint: str) -> None:
+def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
     address = runner_value("address", parent)
     if not address:
         raise Refusal(f"no address for {parent}")
@@ -167,8 +169,11 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> None:
         "--text", f"From the showrunner of {slug}: hand-off {checkpoint}",
         "--timeout", str(SEND_SECONDS),
     ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
+    if result.returncode == 1 and result.stdout.startswith("QUEUED:"):
+        return "queued"
     if result.returncode:
         raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+    return "sent"
 
 
 @dataclass(frozen=True)
@@ -256,11 +261,13 @@ def replay_handoffs(ledger: style_ledger.Ledger, slug: str, parent: str) -> int:
             print(f"root: merge {checkpoint[:7]} with --root-self")
             continue
         try:
-            handoff_notice(slug, parent, checkpoint)
+            delivery = handoff_notice(slug, parent, checkpoint)
         except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("style_sync: hand-off: " + " ".join(str(error).splitlines()))
             failed = True
             continue
+        if delivery == "queued":
+            print(f"hand-off {checkpoint[:7]}: queued for {parent}")
         if row["state"] == "pending":
             ledger.handoff_send(checkpoint, parent)
         elif row["sent_to"] != parent:
@@ -284,10 +291,12 @@ def send_handoff(repo: Path, slug: str, checkpoint: str) -> int:
             print(f"root: merge {checkpoint[:7]} with --root-self")
             return 0
         try:
-            handoff_notice(slug, parent, checkpoint)
+            delivery = handoff_notice(slug, parent, checkpoint)
         except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("style_sync: hand-off: " + " ".join(str(error).splitlines()))
             return 1
+        if delivery == "queued":
+            print(f"hand-off {checkpoint[:7]}: queued for {parent}")
         row = next((row for row in ledger.pending_handoffs() if row["checkpoint"] == checkpoint), None)
         if row is not None:
             if row["state"] == "pending":

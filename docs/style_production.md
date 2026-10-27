@@ -345,6 +345,8 @@ Then run
 It adds the hand-off, sends
 `From the showrunner of <style slug>: hand-off <hash>` to the current parent's
 `showrunners.py address <parent>`, then records `handoff send`.
+A send that send.py queued (`QUEUED:`, exit 1) is sent too: send.py delivers
+it later. The command prints `hand-off <hash7>: queued for <parent>`.
 Style work never waits for a sync to go home.
 
 The parent correctness-reviews the hand-off's diff against the branch point
@@ -358,10 +360,11 @@ hand-off as merged in the style ledger with its merge commit, then sends
 `From the showrunner of <parent slug>: hand-off <hash7> merged as <merge7>.`
 The acknowledgment is a notice; only after a `hand-off ledger:` line run
 `style_ledger.py handoff merged --repo <checkout> --checkpoint <hash> --merge-commit <merge>`;
-ancestry on the branch point is the evidence. The receiver decides delivery
-state once. A local merge missing from origin is pushed, notified and promoted
-before acknowledgment, without merging again. A checkpoint already on origin
-merges, pushes, notifies and promotes nothing: it prints
+ancestry on the branch point is the evidence, so it also takes a pending row.
+The receiver decides delivery state once. A local merge missing from origin is
+pushed, notified and promoted before acknowledgment, without merging again. A
+checkpoint already on origin merges, pushes, notifies and promotes nothing: it
+prints
 `hand-off <hash7> already merged as <merge7>` and acknowledges again.
 A failed first push undoes the unpushed merge; no acknowledgment precedes a
 successful push. Hand-offs run the same package and Merge tests and test log
@@ -374,7 +377,8 @@ after `ticket merge`. Reconcile stores the branch
 point before any acknowledgment and marks merged hand-offs by ancestry.
 Replay proceeds oldest first: pending notices are sent then recorded; sent
 notices are sent again; a notice sent to another parent is sent to the current
-parent then rerouted. Failed sends leave the row unchanged.
+parent then rerouted. A queued send counts as sent; failed sends leave the row
+unchanged.
 `style_ledger.py handoff reroute --repo <checkout> --checkpoint <hash> --to <parent>`
 accepts only sent rows, preserving their checkpoint and creation time; the
 same parent is a no-op. `handoff send` still refuses a second parent.
@@ -684,10 +688,24 @@ that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
 `waiting <decision>: <finding> declared in another crate: <file>`,
 `waiting <decision>: <finding> declaration gone` or
 `waiting <decision>: <finding> its function moved to <file>; <reason>`, and stays out of the ticket.
+Each busy file of a decision gets `waiting <decision>: <path> busy`, and its free
+files are still planned in the same run.
 A finding whose change edits a busy file other than its own (for a file rename,
 a file that names the renamed module; for a qualified rename, a `.rs` or `.md`
-file that holds the old name) gets `waiting <decision>: <finding> edits <file>, busy`
+file that holds the old name; for a restructure of a `.rs` file, a file whose
+`mod` line or `#[path]` string declares it, such as the owner of a test file, or
+whose `path` attribute the planner cannot read with certainty)
+gets `waiting <decision>: <finding> edits <file>, busy`
 and stays out of the ticket; the other findings of its file stay available.
+A file rename whose old module a file, its own file included, may declare by a
+`path` attribute the planner cannot read with certainty gets
+`waiting <decision>: <finding> <file> has a path attribute the rename gate cannot read`
+and stays out of the ticket, busy or not: the gate refuses an edit to that file,
+so a person renames the module. A queued ticket that holds such a rename is dropped
+with `dropped <id>: <file> has a path attribute the rename gate cannot read`. A
+`path` string with an escape or a raw string (`#[path = "pro\u{62}e.rs"]`) can name
+the module without its name, so the planner also reads every file that has one, and
+such a file counts as one it cannot read with certainty.
 A finding on a statement line follows its moved function only when its text is on
 exactly one body line there, and that line is a statement of the function. Refill
 builds no ticket on a file that a commit on the unit base, not in the synced tip,
@@ -800,9 +818,13 @@ outside the crate (where `alpha` is the library's name), a `pub use lock::...`
 re-export, and `lock::` where a `mod` line, import or glob binds the module. A
 `#[path = "../src/ledger/lock.rs"]` string changes only its file name, and only when
 its path, read from the file's own folder, is the old file; the `mod lock;` line it
-marks changes with it. A `mod lock;` line with a `path` attribute in any other form
-stays, and so does a `mod` or `use` line inside a macro (`stringify!(…)`, a
-`macro_rules!` body), where the words are tokens, not items. When the ticket also renames an item, its qualified references there change
+marks changes with it. A `mod lock;` line whose `path` string names another file
+stays. A file with a `path` attribute the gate cannot read with certainty (one in an
+inline module, a `cfg_attr` that holds `path`, or a `path` on an inline module, which
+mounts a folder) takes no change at all. A raw name reads as its plain word, so
+`mod r#lock;` and `#[r#path = "../src/ledger/lock.rs"]` change as their plain forms do, and
+a raw name keeps its `r#` (`mod r#mutation_lock;`). A `mod` or `use` line inside a macro (`stringify!(…)`, a
+`macro_rules!` body) stays: there the words are tokens, not items. When the ticket also renames an item, its qualified references there change
 too. The `use` and `mod` lines may take the order rustfmt gives them, with their
 attributes, and a call's trailing comma may change, except inside a macro or an attribute,
 which can match `[1,]` and not `[1]`. The gate refuses every other
