@@ -126,7 +126,8 @@ Loop/verbose only:
    record with `CheckpointCommittedAwaitingReleaseConfirmation` carrying that
    same captured full id as `checkpoint_commit`, with `phase_reservation.py
    committed --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured HEAD> --ticket <ticket>`,
-   and read it back. This is the one case where
+   and read it back. `--commit` takes any name of that commit, a short hash
+   too, and the record keeps its full id. This is the one case where
    that state carries a commit the phase did not make. A failed transition or
    read-back retains the valid durable state and runs no ticket merge. Then run
    `style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured HEAD> --session-dir "${SESSION_DIR}" --phase <phase id>`
@@ -181,7 +182,9 @@ Loop/verbose only:
    phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <phase id> --commit <captured commit>
    ```
 
-   A standing ticket adds `--ticket <ticket>`, as above. Then read the new record back. Never write the record by hand. That durable transition
+   `--commit` takes any name of the commit, and the record keeps its full id;
+   a name that is no commit is refused with exit `2`. A standing ticket adds
+   `--ticket <ticket>`, as above. Then read the new record back. Never write the record by hand. That durable transition
    must succeed before release is invoked, and its value comes only from the
    commit that just succeeded (or the ancestry-checked, captured HEAD of the
    no-change standing ticket above), never from conversation or from a later
@@ -261,6 +264,10 @@ Loop/verbose only:
    ```sh
    phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <phase id> --released <read-back checkpoint_commit>
    ```
+
+   `--released` also takes any other name that git resolves in `--repo`
+   (default `.`) to that commit; a name git refuses, an ambiguous short hash
+   among them, keeps the record with exit `2`.
 
    An ordinary failed release did not append anything because transaction
    validation precedes the journal write; it is not recovery, and the original

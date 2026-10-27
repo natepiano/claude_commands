@@ -59,13 +59,18 @@ class PhaseStateTests(unittest.TestCase):
 
     def test_committed_then_clear_needs_the_released_checkpoint(self) -> None:
         phase_reservation._write_state(self.phase_dir(), ACTIVE)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(self.run_verb("committed", "--commit", "b" * 40), (0, ""))
+        phase_reservation.committed(self.phase_dir(), "b" * 40)
         pending = cast(dict[str, object], self.state()["checkpoint_release_confirmation_pending"])
         self.assertEqual(pending["checkpoint_commit"], "b" * 40)
         self.assertEqual(pending["reservation_id"], "r1")
         self.assertEqual(self.run_verb("clear", "--released", "c" * 40)[0], 2)
         self.assertEqual(self.run_verb("clear", "--released", "b" * 40), (0, ""))
         self.assertFalse((self.phase_dir() / phase_reservation.STATE_FILE).exists())
+
+    def test_a_pending_record_that_names_no_checkpoint_never_clears_without_one(self) -> None:
+        phase_reservation._write_state(self.phase_dir(), {"kind": phase_reservation.PENDING})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.run_verb("clear")[0], 2)
+        self.assertEqual(self.state(), {"kind": phase_reservation.PENDING})
 
     def test_a_finished_phase_reopens_with_its_kept_board_answer(self) -> None:
         _ = self.run_verb("enroll", "--board", "board_ready")
@@ -387,7 +392,8 @@ class HeldForTicketTests(unittest.TestCase):
                          (0, "phase 34h: no reservation held for ticket names-2\n"))
         self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
         phase_reservation._write_state(phase_reservation.phase_directory(self.session, "34h"), ACTIVE)  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(self.run_verb("committed", "--commit", self.checkpoint), (0, f"phase 34h: {phase_reservation.PENDING}\n", ""))
+        self.assertEqual(self.run_verb("committed", "--commit", self.checkpoint, "--repo", str(self.repo)),
+                         (0, f"phase 34h: {phase_reservation.PENDING}\n", ""))
         # Every other unit's checkpoint writes the pending state as before, and ticket merge never releases it.
         self.assertEqual(self.state(), {"kind": phase_reservation.PENDING, phase_reservation.PENDING_FIELD: {
             **cast(dict[str, object], ACTIVE["active_phase_reservation"]), "checkpoint_commit": self.checkpoint}})
@@ -428,6 +434,80 @@ class HeldForTicketTests(unittest.TestCase):
                 self.assertEqual(self.run_verb("release-held", "--ticket", "names-1")[0], 0)
                 self.assertEqual(self.state(), {})
         self.assertEqual({call[1] for call in self.berth_calls()}, {"board"})
+
+    def record_checkpoint(self, commit: str) -> None:
+        """Rewrite the pending record's checkpoint, as cargo-liner ticket 59's record held it in short form."""
+        phase_dir = phase_reservation.phase_directory(self.session, "34h")
+        state = phase_reservation.read_state(phase_dir)
+        pending = cast(dict[str, object], state[phase_reservation.PENDING_FIELD])
+        phase_reservation._write_state(phase_dir, {**state, phase_reservation.PENDING_FIELD: {  # pyright: ignore[reportPrivateUsage]
+            **pending, "checkpoint_commit": commit}})
+
+    def test_committed_records_the_full_id_of_any_commit_name(self) -> None:
+        for ticket in ("names-1", ""):
+            with self.subTest(ticket=ticket):
+                phase_reservation._write_state(phase_reservation.phase_directory(self.session, "34h"), ACTIVE)  # pyright: ignore[reportPrivateUsage]
+                held = ("--ticket", ticket) if ticket else ()
+                self.assertEqual(self.run_verb("committed", "--commit", self.checkpoint[:7], *held, "--repo", str(self.repo))[0], 0)
+                pending = cast(dict[str, object], self.state()[phase_reservation.PENDING_FIELD])
+                self.assertEqual(pending["checkpoint_commit"], self.checkpoint)
+
+    def test_committed_refuses_a_name_that_is_no_commit(self) -> None:
+        tree = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD^{tree}"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+        for name in ("no-such-commit", tree):
+            with self.subTest(name=name):
+                code, _, errors = self.run_verb("committed", "--commit", name, "--ticket", "names-1", "--repo", str(self.repo))
+                self.assertEqual(code, 2)
+                self.assertIn(f"{name!r} names no single commit in {self.repo}", errors)
+                self.assertEqual(self.state(), ACTIVE)
+
+    def test_clear_resolves_the_released_name_in_its_repo(self) -> None:
+        self.hold()
+        other = self.root / "other repo"
+        other.mkdir()
+        _ = subprocess.run(["git", "-C", str(other), "init", "-q"], check=True, capture_output=True)
+        # A prefix of the checkpoint that the named repo does not resolve, as an ambiguous one, is refused.
+        code, _, errors = self.run_verb("clear", "--released", self.checkpoint[:7], "--repo", str(other))
+        self.assertEqual(code, 2)
+        self.assertIn(f"{self.checkpoint[:7]!r} names no single commit in {other}", errors)
+        self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
+        # A name that is no prefix of the checkpoint, and resolves to it, is taken; the marker keeps the full id.
+        self.assertEqual(self.run_verb("clear", "--released", "HEAD", "--repo", str(self.repo)), (0, "phase 34h: cleared\n", ""))
+        self.assertEqual(self.state(), {})
+        phase_dir = phase_reservation.phase_directory(self.session, "34h")
+        self.assertEqual((phase_dir / phase_reservation.RELEASED_FILE).read_text(), self.checkpoint + "\n")
+
+    def test_a_record_stored_short_clears_with_that_string_alone(self) -> None:
+        self.hold()
+        self.record_checkpoint(self.checkpoint[:8])
+        self.assertEqual(self.run_verb("clear", "--released", self.checkpoint[:8], "--repo", str(self.root / "no repo"))[0], 0)
+        self.assertEqual(self.state(), {})
+
+    def test_a_short_record_released_by_berth_at_its_checkpoint_clears(self) -> None:
+        self.hold()
+        self.record_checkpoint(self.checkpoint[:8])
+        self.board({"r1": {"status": "released_after_checkpoint", "protected_tip": self.checkpoint,
+                           "disposition": "integrated"}})
+        self.assertEqual(phase_reservation.release_held(phase_reservation.phase_directory(self.session, "34h"), "names-1"), "r1")
+        self.assertEqual(self.state(), {})
+        self.assertEqual({call[1] for call in self.berth_calls()}, {"board"})
+
+    def test_a_short_record_with_an_active_reservation_releases_at_its_checkpoint(self) -> None:
+        self.hold()
+        self.record_checkpoint(self.checkpoint[:8])
+        self.assertEqual(self.run_verb("release-held", "--ticket", "names-1"), (0, "phase 34h: released reservation r1\n", ""))
+        self.assertIn([str(self.repo), "release", "r1", "--json"], self.berth_calls())
+        self.assertEqual(self.state(), {})
+
+    def test_a_recorded_checkpoint_that_names_no_commit_keeps_the_reservation_held(self) -> None:
+        self.hold()
+        self.record_checkpoint("c" * 40)
+        code, _, errors = self.run_verb("release-held", "--ticket", "names-1")
+        self.assertEqual(code, 2)
+        self.assertIn(f"checkpoint {'c' * 40!r} names no single commit in {self.repo}; reservation r1 stays held", errors)
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
 
 
 if __name__ == "__main__":
