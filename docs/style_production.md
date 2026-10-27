@@ -292,7 +292,16 @@ On a sync message, run `style_ledger.py tip seen --repo <checkout> --tip <tip>`;
    grant no successful coverage. Exit 0 means clean, every tool recorded passing;
    continue the sync. Exit 1 means diagnostics recorded or a tool did not pass;
    continue to `set-tip` and `tip done`. Exit 2 means an error (refusal, failed
-   `lint-record` or unreadable checkout); stop the sync.
+   `lint-record` or unreadable checkout); stop the sync. Exit 143 or 129 means
+   SIGTERM or SIGHUP stopped the run; stop the sync.
+   Every exit the run can catch stops verify.sh and its processes, then deletes the
+   checkout and removes its worktree registration, also a locked one. Each
+   `style-sync-lint-*` dir holds `owner.json` (the run's pid and repo) and
+   `verifier.pgid` (written by verify.sh's own process, which then starts verify.sh
+   only while the owner runs). The owner
+   record goes last; if the registration step fails, the dir keeps it and the next
+   run retries. A run first removes the dir and registration of a run whose owner and
+   verify.sh group are both gone; the dir stays while a killed run's verify.sh runs.
 3. Run `style_ledger.py set-tip --repo <checkout> --tip <branch-point tip> --style-branch <style merge branch>`,
    then `style_ledger.py status --repo <checkout>`: changed inputs become stale,
    new files open. Report a nonzero unclassified count to the parent with
