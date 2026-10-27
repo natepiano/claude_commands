@@ -21,11 +21,13 @@ weeks, so nothing waits on a session end. In a temp folder a folder's ctime is n
 systemd-tmpfiles-clean moves it each day when it sets the folder's times back. In a temp folder (/tmp, $TMPDIR
 and the Mac's per-user temp folder) only a tempfile folder is an entry, the
 name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
-Python's tempfile), which test runs leave behind. In /tmp alone (the wide root)
-every other folder this user owns is an entry too, whatever its name, and goes
-after WIDE_IDLE_SECONDS instead: test leftovers have names of their own. A
-folder a system tool owns (SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES), another
-root, a folder that holds one, and a folder that holds a socket stay. Roots are real paths on both machines. An entry is deleted when
+Python's tempfile), which test runs leave behind, and a lint/invoke.sh log
+file (INVOKE_TEMP_NAME). In /tmp alone (the wide root) every other empty folder
+this user owns is an entry too, whatever its name, and goes after
+WIDE_IDLE_SECONDS instead. A folder a system tool owns (SYSTEM_TEMP_NAMES,
+SYSTEM_TEMP_PREFIXES; an empty EMPTY_PREFIXES one aside), another root and a
+folder that holds one stay. A folder in /tmp that holds something is
+folder_audit.py's, which checks it for unsaved git work first. Roots are real paths on both machines. An entry is deleted when
 both are true:
 
   * nothing in it changed for IDLE_SECONDS. A change is the newer of mtime and
@@ -86,8 +88,9 @@ else:
 GIB = 1 << 30
 HOUR_SECONDS = 3600
 IDLE_SECONDS = 4 * HOUR_SECONDS
-# Any other folder this user owns in /tmp goes after this long: test leftovers have names of their
-# own (1,103 month-old ones went by hand on 2026-10-26, and the user had to approve the rm).
+# An empty folder this user owns in /tmp goes after this long, whatever its name: test leftovers
+# have names of their own (1,103 month-old ones went by hand on 2026-10-26, and the user had to
+# approve the rm). A folder there that holds something is folder_audit.py's, which checks git first.
 WIDE_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
 # A scratch folder whose task is open goes after this long anyway: an ender can fail.
 TASK_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
@@ -115,10 +118,14 @@ LSOF_MAPPED = ("txt", "mem")
 # digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
 # Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
 # 3,917 mktemp and Python ones on 2026-10-26).
-# Folders in /tmp that system tools own; the 7-day rule never judges them. A live server's socket
-# does not show as an open path, so a folder that holds a socket stays too (HOLDS_SOCKET).
+# Folders in /tmp that system tools own; the 7-day rule never judges them, except an empty one with
+# an EMPTY_PREFIXES name: nix-shell and nix develop leave theirs (1,321 on natedev, 2026-10-27).
 SYSTEM_TEMP_NAMES = frozenset({"claude", ".X11-unix", ".ICE-unix", ".XIM-unix", ".font-unix", ".Test-unix"})
 SYSTEM_TEMP_PREFIXES = ("systemd-private-", "tmux-", "nix-", "ssh-", "claude-", "com.apple.", "powerlog")
+EMPTY_PREFIXES = ("nix-",)
+# lint/invoke.sh's own logs in $TMPDIR or /tmp; a killed run leaves them (1,308 lint_invoke and
+# 1,438 buildlog files in natedev /tmp on 2026-10-27).
+INVOKE_TEMP_NAME = re.compile(r"lint_invoke\.\d+\.\d+\.log|buildlog\.\d+\.\d+\.(?:log|peak|peak\.cgroup)")
 TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp[a-z0-9_]{8}")
 DARWIN_TEMP_NAME = "CS_DARWIN_USER_TEMP_DIR"
 DELETED_SUFFIX = " (deleted)"
@@ -137,7 +144,6 @@ IN_USE = "a process uses it"
 RECENT = "changed in the last 4 h"
 RECENT_WIDE = "changed in the last 7 days"
 TASK_OPEN = "its task is open and it changed in the last 7 days"
-HOLDS_SOCKET = "it holds a socket"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
 UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION, TASK_OPEN)
 UNREADABLE = "it cannot be read"
@@ -168,18 +174,17 @@ class RunRecord(TypedDict):
 @dataclass(frozen=True)
 class Limit:
     """An entry goes when nothing in it changed at or after `since`; `recent` is why it stays when
-    something did. With `sockets`, a socket inside keeps it; without `folder_ctime`, a folder's
-    ctime is no change."""
+    something did. Without `folder_ctime`, a folder's ctime is no change."""
     since: float
     recent: str
-    sockets: bool = False
     folder_ctime: bool = True
 
 
 @dataclass(frozen=True)
 class Roots:
     """The folders whose top-level entries the sweep judges, by kind. In a temp folder only a
-    tempfile folder (TEMPFILE_NAME) is judged."""
+    tempfile folder (TEMPFILE_NAME) and an invoke.sh log (INVOKE_TEMP_NAME) are judged, and in a
+    wide one an empty folder too."""
     plain: tuple[str, ...]
     runs: tuple[str, ...]
     projects: tuple[str, ...]
@@ -196,13 +201,22 @@ class Roots:
         found = listing(root)
         if root not in self.temp:
             return found
-        return [entry for entry in found if entry.is_dir(follow_symlinks=False)
-                and (TEMPFILE_NAME.fullmatch(entry.name) or self.judged_wide(root, entry))]
+        return [entry for entry in found if self.judged_temp(root, entry)]
+
+    def judged_temp(self, root: str, entry: os.DirEntry[str]) -> bool:
+        try:
+            if entry.is_symlink():
+                return False
+            if entry.is_file():
+                return INVOKE_TEMP_NAME.fullmatch(entry.name) is not None
+            return entry.is_dir() and (TEMPFILE_NAME.fullmatch(entry.name) is not None or self.judged_empty(root, entry))
+        except OSError:
+            return False
 
     def is_wide(self, root: str, entry: os.DirEntry[str]) -> bool:
-        """Whether entry goes only after WIDE_IDLE_SECONDS: a folder in a wide root that is no
-        tempfile folder."""
-        return root in self.wide and not TEMPFILE_NAME.fullmatch(entry.name)
+        """Whether entry goes only after WIDE_IDLE_SECONDS: an empty folder in a wide root that is
+        no tempfile folder."""
+        return root in self.wide and not TEMPFILE_NAME.fullmatch(entry.name) and not INVOKE_TEMP_NAME.fullmatch(entry.name)
 
     def limit(self, root: str, entry: os.DirEntry[str], now: float) -> Limit:
         """How long entry must be idle to go, and how a change in it counts."""
@@ -215,13 +229,17 @@ class Roots:
         # systemd-tmpfiles-clean sets each folder's times back after it reads it, which moves the
         # folder's ctime, so in a temp folder only a folder's mtime counts.
         if self.is_wide(root, entry):
-            return Limit(now - WIDE_IDLE_SECONDS, RECENT_WIDE, sockets=True, folder_ctime=False)
+            return Limit(now - WIDE_IDLE_SECONDS, RECENT_WIDE, folder_ctime=False)
         return Limit(now - IDLE_SECONDS, RECENT, folder_ctime=root not in self.temp)
 
-    def judged_wide(self, root: str, entry: os.DirEntry[str]) -> bool:
-        """A folder of a wide root that this user owns, that no system tool owns, and that is no
-        other root and holds none."""
-        if root not in self.wide or entry.name in SYSTEM_TEMP_NAMES or entry.name.startswith(SYSTEM_TEMP_PREFIXES):
+    def judged_empty(self, root: str, entry: os.DirEntry[str]) -> bool:
+        """An empty folder of a wide root that this user owns, that no system tool owns (an
+        EMPTY_PREFIXES name aside), and that is no other root."""
+        name = entry.name
+        if root not in self.wide or name in SYSTEM_TEMP_NAMES or (
+                name.startswith(SYSTEM_TEMP_PREFIXES) and not name.startswith(EMPTY_PREFIXES)):
+            return False
+        if listing(entry.path):
             return False
         inside = os.path.join(entry.path, "")
         if any(other == entry.path or other.startswith(inside) for other in self.all()):
@@ -306,7 +324,7 @@ def running_session_ids() -> frozenset[str] | None:
                      if sessions.running_session(entry.record))
 
 
-def process_paths(proc: str, prefix: str) -> list[tuple[str, int, str]] | None:
+def process_paths(proc: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]] | None:
     """Each path under prefix that a process works in, holds open or maps, with its pid and how;
     None when proc does not exist. A process that ends mid-scan, or one this user cannot read, is
     passed over: another user's process does not work in an agent's scratch."""
@@ -343,7 +361,7 @@ def process_paths(proc: str, prefix: str) -> list[tuple[str, int, str]] | None:
     return found
 
 
-def lsof_paths(prefix: str) -> list[tuple[str, int, str]] | None:
+def lsof_paths(prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]] | None:
     """process_paths from one lsof scan; None when lsof cannot run or prints nothing."""
     try:
         completed = subprocess.run(LSOF, capture_output=True, text=True, errors="replace",
@@ -354,7 +372,7 @@ def lsof_paths(prefix: str) -> list[tuple[str, int, str]] | None:
     return parse_lsof(completed.stdout, prefix) if completed.stdout else None
 
 
-def parse_lsof(text: str, prefix: str) -> list[tuple[str, int, str]]:
+def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
     """Each path under prefix in `lsof -F pfn` output, with its pid and how the process uses it."""
     found: list[tuple[str, int, str]] = []
     pid = 0
@@ -384,9 +402,8 @@ def entry_uses(paths: Sequence[tuple[str, int, str]], roots: Sequence[str]) -> d
 
 def last_change(path: str, limit: Limit) -> tuple[float, int] | str:
     """The newest change inside path and its disk blocks, or why it stays: limit.recent when
-    something changed at or after limit.since, UNREADABLE when a part of it could not be read,
-    HOLDS_SOCKET when it holds a socket and limit.sockets. A folder's own times count only when it
-    holds nothing. Symbolic links are never followed."""
+    something changed at or after limit.since, UNREADABLE when a part of it could not be read. A
+    folder's own times count only when it holds nothing. Symbolic links are never followed."""
     since, recent = limit.since, limit.recent
     try:
         top = os.lstat(path)
@@ -408,8 +425,6 @@ def last_change(path: str, limit: Limit) -> tuple[float, int] | str:
                 info = entry.stat(follow_symlinks=False)
                 folder = stat.S_ISDIR(info.st_mode)
                 newest = max(newest, info.st_mtime, info.st_ctime if limit.folder_ctime or not folder else 0.0)
-                if limit.sockets and stat.S_ISSOCK(info.st_mode):
-                    return HOLDS_SOCKET
                 if newest >= since:
                     return recent
                 if folder:

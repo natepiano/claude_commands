@@ -7,7 +7,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import socket
 import sys
 import tempfile
 import time
@@ -293,38 +292,39 @@ class TempFolderTests(TmpSweepCase):
         kept = [path for paths in result.kept.values() for path in paths]
         self.assertFalse([path for path in kept if any(str(other) in path for other in others)])
 
-    def test_any_owned_folder_in_the_wide_root_goes_after_seven_idle_days(self) -> None:
+    def test_only_empty_folders_and_invoke_logs_in_the_wide_root_go(self) -> None:
         wide = self.tmp.parent / "wide"
-        leftover = write(wide / "mend-config-root-test-179035" / "a").parent
+        empty = wide / "mend-config-root-test-179035"
+        nix_empty = wide / "nix-shell.aN6y2p"
+        for folder in (empty, nix_empty):
+            folder.mkdir(parents=True)
+        full = write(wide / "loose-clone" / "a").parent
+        nix_full = write(wide / "nix-build-x" / "a").parent
         tempfile_folder = write(wide / "tmp.johjtSnxbj" / "a").parent
-        used = write(wide / "tui_pane_theme_loader_badparse_0_1" / "a").parent
+        logs = [write(wide / "lint_invoke.1121749.27492.log"), write(wide / "buildlog.35612.67614768.log"),
+                write(wide / "buildlog.35612.676.peak.cgroup")]
+        other_file = write(wide / "notes.log")
+        used = wide / "tui_pane_theme_loader_badparse_0_1"
+        used.mkdir()
         fake_process(self.proc, 11, cwd=str(used))
-        kept = [write(wide / "tmux-1000" / "default").parent, write(wide / ".X11-unix" / "X0").parent,
-                write(wide / "systemd-private-abc" / "tmp" / "a").parent.parent]
-        holder = write(wide / "holder" / "-proj" / "s" / "a").parent.parent.parent
-        listening = wide / "server"
-        listening.mkdir()
-        server = socket.socket(socket.AF_UNIX)
-        self.addCleanup(server.close)
-        server.bind(str(listening / "s"))
-        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (str(holder),), (str(wide),), (),
-                                        (str(wide),))
-        early = tmp_sweep.sweep(False, roots, time.time() + 6 * DAY, str(self.proc))
-        def wide_deleted(result: tmp_sweep.Sweep) -> list[str]:
-            return [entry["path"] for entry in result.deleted if Path(entry["path"]).parent == wide]
+        kept = [write(wide / "tmux-1000" / "default").parent, wide / ".X11-unix", wide / "ssh-empty"]
+        for folder in kept[1:]:
+            folder.mkdir()
+        for path in (used, *kept[1:]):
+            os.utime(path, (1000, 1000))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(wide),), (), (str(wide),))
 
-        self.assertEqual(wide_deleted(early), [str(tempfile_folder)])
-        self.assertEqual(early.kept[tmp_sweep.RECENT_WIDE], [str(leftover)])
-        self.assertEqual(early.kept[tmp_sweep.HOLDS_SOCKET], [str(listening)])
+        def wide_deleted(result: tmp_sweep.Sweep) -> list[str]:
+            return sorted(entry["path"] for entry in result.deleted if Path(entry["path"]).parent == wide)
+
+        early = tmp_sweep.sweep(False, roots, time.time() + 5 * 3600, str(self.proc))
+        self.assertEqual(wide_deleted(early), sorted([str(tempfile_folder), *map(str, logs)]))
+        self.assertEqual(sorted(early.kept[tmp_sweep.RECENT_WIDE]), sorted([str(empty), str(nix_empty)]))
         late = tmp_sweep.sweep(False, roots, time.time() + 8 * DAY, str(self.proc))
-        self.assertEqual(wide_deleted(late), [str(leftover)])
-        self.assertFalse(leftover.exists())
-        self.assertEqual(late.kept[tmp_sweep.HOLDS_SOCKET], [str(listening)])
+        self.assertEqual(wide_deleted(late), sorted([str(empty), str(nix_empty)]))
         self.assertEqual(late.kept[tmp_sweep.IN_USE], [f"{used}: pid 11 works in it"])
-        for folder in [*kept, holder, used, listening]:
-            self.assertTrue(folder.exists(), folder)
-        judged = [path.split(":")[0] for paths in late.kept.values() for path in paths]
-        self.assertFalse([folder for folder in [*kept, holder] if str(folder) in judged])
+        for path in [full, nix_full, other_file, used, *kept]:
+            self.assertTrue(path.exists(), path)
 
     def test_the_wide_root_is_tmp_alone_and_only_when_it_is_a_temp_folder(self) -> None:
         temp = self.tmp.parent / "temp"
