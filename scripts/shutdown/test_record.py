@@ -642,6 +642,32 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.find_session(first["login"], "session-1"), changed)
         self.assertEqual(record.find_session(first["login"], "session-2"), second)
 
+    def test_restore_alert_claim_serializes_callers_and_resets_only_its_request(self) -> None:
+        saved = session_shutdown()
+        self.assertTrue(record.create_session(saved))
+        start = threading.Barrier(2)
+        claims: list[bool] = []
+        def contender() -> None:
+            _ = start.wait(timeout=5)
+            claims.append(record.claim_restore_alert(saved, "move failed"))
+        threads = [threading.Thread(target=contender) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(claims), [False, True])
+        record.clear_restore_alert(saved)
+        self.assertTrue(record.claim_restore_alert(saved, "another outage"))
+        def replace_request(current: record.SessionShutdown) -> None:
+            current["request_id"] = "newer-request"
+        _ = record.update_session(saved["login"], saved["session"]["session_id"], replace_request)
+        record.clear_restore_alert(saved)
+        current = record.find_session(saved["login"], saved["session"]["session_id"])
+        assert current is not None
+        self.assertEqual(current.get("restore_alerted"), "another outage")
+        self.assertFalse(record.claim_restore_alert(saved, "stale request"))
+
     def test_session_records_update_rejects_identity_changes_without_writing(self) -> None:
         saved = session_shutdown()
         self.assertTrue(record.create_session(saved))
@@ -1741,6 +1767,35 @@ class RecoverySnapshotTests(ShutdownTestCase):
         _ = record.merge_snapshots(inventory.PartialInventory(("registry unreadable",)), LATER)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, stamp))
 
+    def test_agent_exit_mark_survives_missing_inventory_and_clears_when_seen(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        record.mark_snapshot_agent_exited(saved["login"], "session-1", NOW)
+        merged = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}), LATER)
+        self.assertEqual(merged[0]["sessions"][0].get("crash"), "agent exited")
+        updated = record.merge_snapshots(inventory.CompleteInventory("natedev",
+            {saved["login"]: saved["sessions"]}, {saved["login"]: saved["label"]}), LATER)
+        self.assertNotIn("crash", updated[0]["sessions"][0])
+        record.mark_snapshot_agent_exited(saved["login"], "session-1", NOW)
+        current = record.read_snapshot(saved["login"])
+        assert not isinstance(current, record.NoRecoverySnapshot)
+        self.assertNotIn("crash", current["sessions"][0])
+
+    def test_restoring_cached_agent_exit_refuses_a_newer_observation(self) -> None:
+        saved = self.snapshot(1)
+        candidate = saved["sessions"][0]
+        assert candidate["agent"] == "claude"
+        record.write_snapshot(saved)
+        _ = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}), LATER)
+        self.assertTrue(record.restore_snapshot_agent_exited(saved, candidate))
+        restored = record.read_snapshot(saved["login"])
+        assert not isinstance(restored, record.NoRecoverySnapshot)
+        self.assertEqual(restored["sessions"][0].get("crash"), "agent exited")
+        updated = record.merge_snapshots(inventory.CompleteInventory("natedev",
+            {saved["login"]: saved["sessions"]}, {saved["login"]: saved["label"]}), LATER)
+        self.assertFalse(record.restore_snapshot_agent_exited(saved, candidate))
+        self.assertEqual(record.read_snapshot(saved["login"]), updated[0])
+
     def test_reboot_retains_absent_sessions_until_seen_again(self) -> None:
         saved = self.snapshot(1, 2)
         record.write_snapshot(saved)
@@ -1788,7 +1843,7 @@ class RecoverySnapshotTests(ShutdownTestCase):
         item = snapshot["sessions"][0]
         assert item["agent"] == "claude"
         snapshot["taken_at"] = LATER
-        for signal in ("reboot", "host gone"):
+        for signal in ("reboot", "host gone", "agent exited"):
             with self.subTest(signal=signal):
                 item["crash"] = signal
                 saved = record.snapshot_restore_record(snapshot, item)
