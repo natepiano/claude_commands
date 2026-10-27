@@ -128,6 +128,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 ## Delegation Context
 
 - **Project:** `~/.claude` — the user's Claude Code configuration; this unit adds `scripts/issue_score/`, a TypeSafe-backed scorer for hanadocs issue fields.
+- **Project started:** 2026-10-27T00:44:08.723+00:00
 - **Stack:** Python ≥ 3.10, standard library only, run through `~/.claude/scripts/lib/py`; TypeSafe HTTP API `POST https://api.typesafe.ai/v1/systemone`, model `jev-1.14.0`; schemas at `https://api.typesafe.ai/openapi.json` and `https://docs.typesafe.ai/api/system-one.md`.
 - **Layout:**
   - `scripts/issue_score/` — new: `client.py`, `vault.py`, `questions.py`, `decide.py`, `evaluate.py`, `score_issues.py` (CLI), `test_*.py`, `fixtures/`
@@ -154,7 +155,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 ## Phases
 
-### Phase 1 — client, state and questions; the `score` command  · status: todo
+### Phase 1 — client, state and questions; the `score` command  · status: done
 
 #### Work Order
 
@@ -167,7 +168,19 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - `decide.py`: median level; split detection (two non-neighbor levels each ≥ 0.25); averaging of the two-order Choice; the urgency table, which never returns 5 and sets a `possible_five` flag; and `sure`/`unsure` per field from `THRESHOLDS` in `questions.py`, every field starting at 0.6.
 - `score_issues.py score`: runs the main and area requests per issue, 8 issues at a time. The result line holds the issue path, a content hash, `QUESTION_SET_VERSION`, the model that answered, both payloads, every answer and the decided fields. It reuses a cached line when the hash, version and model all match.
 
-**Files:** `scripts/issue_score/{client,vault,questions,decide,score_issues}.py`, `scripts/issue_score/test_{client,vault,decide,score_issues}.py`, `scripts/issue_score/fixtures/*.json`, `pyrightconfig.json` (one entry).
+**Files:**
+- `scripts/issue_score/client.py` — the TypeSafe client, budget check and spend ledger
+- `scripts/issue_score/vault.py` — loads open and rated issues and builds the state
+- `scripts/issue_score/questions.py` — all question wording, thresholds and the budget
+- `scripts/issue_score/decide.py` — maps answers to field values
+- `scripts/issue_score/score_issues.py` — the command line, `score` subcommand
+- `scripts/issue_score/test_client.py` — client tests
+- `scripts/issue_score/test_vault.py` — vault tests
+- `scripts/issue_score/test_decide.py` — decision tests
+- `scripts/issue_score/test_score_issues.py` — command tests
+- `scripts/issue_score/fixtures/*.json` — recorded responses for tests
+- `pyrightconfig.json` — one entry for the new folder
+- `scripts/production/merge_gate.py` — `issue_score` added to `TEST_SUITES` so the gate runs the new tests
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — all `scripts/issue_score/*.py` except the tests, and `pyrightconfig.json`
@@ -187,7 +200,10 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - `evaluate.py`: split by `sha1(filename) % 10 < 7` → tune. Ordinal metrics: exact, within one, MAE, quadratic-weighted kappa, ranked probability score, confusion matrix. Choice metrics: accuracy, confusion, Brier, reliability in 5 confidence buckets. Groups: all, title-only (body under 200 characters after cleaning), and score ≥ 20 (the current `backlog_score`). Spearman correlation between the composite score from the Jev stars, using `renumber.py`'s formula through an import, and the current `backlog_score`. A risk-coverage table per field at thresholds 0.40–0.95 in steps of 0.05. Repeat-check rate when given two run IDs. The 20 largest disagreements per field.
 - The report goes to `~/.local/state/issue-score/reports/<run-id>-<split>.md`.
 
-**Files:** `scripts/issue_score/evaluate.py`, `scripts/issue_score/score_issues.py` (the `compare` subcommand), `scripts/issue_score/test_evaluate.py`.
+**Files:**
+- `scripts/issue_score/evaluate.py` — the metrics
+- `scripts/issue_score/score_issues.py` — the `compare` subcommand
+- `scripts/issue_score/test_evaluate.py` — metric tests
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `evaluate.py` and `score_issues.py`; `test` writes `test_evaluate.py` with hand-computed kappa, ranked probability score and Spearman cases.
 
@@ -210,7 +226,11 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - Send the user the report, the blind-preference result, the per-field recommendation (Jev proposes / agent proposes), and the disagreement lists. The user's verdict per field is recorded in `questions.py` as `JEV_FIELDS`.
 - Record the lessons in `~/.local/state/issue-score/lessons.md` for Phase 5.
 
-**Files:** `scripts/issue_score/questions.py`, `scripts/issue_score/score_issues.py` (`blind`, `blind-score`), `scripts/issue_score/test_blind.py`, and `scripts/issue_score/test_decide.py` when thresholds move.
+**Files:**
+- `scripts/issue_score/questions.py` — tuned wordings and thresholds
+- `scripts/issue_score/score_issues.py` — the `blind` and `blind-score` subcommands
+- `scripts/issue_score/test_blind.py` — blind sheet tests
+- `scripts/issue_score/test_decide.py` — updated when thresholds move
 
 **Workers:** `1 writer + 1 tester` — the unit director runs the experiments; `impl` applies the chosen wordings and thresholds and writes `blind`/`blind-score`; `test` writes `test_blind.py` (the seed reproduces the order; the key never appears in the sheet; tallies are correct).
 
@@ -228,7 +248,10 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - `score_issues.py propose --project <short> --title <t> [--body-file <f>]` prints the one-line proposal in `/issue`'s format, as the Design shows. An unsure field shows its top two values. Effort is marked `(check)`. Urgency adds `possible 5` when that flag is set. Exit 0 on success. On an API failure it exits 2 with the error on stderr.
 - `commands/issue.md` step 4: run `propose` and use its line for the fields in `JEV_FIELDS`. The agent proposes the rest as today. On exit 2, say the call failed and propose every field the old way. The `Proposed ranking:` line of a unit's proposal uses the same output.
 
-**Files:** `scripts/issue_score/score_issues.py` (`propose`), `scripts/issue_score/test_score_issues.py`, `commands/issue.md`.
+**Files:**
+- `scripts/issue_score/score_issues.py` — the `propose` subcommand
+- `scripts/issue_score/test_score_issues.py` — propose tests
+- `commands/issue.md` — step 4 uses `propose`
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `score_issues.py` and `commands/issue.md`; `test` covers the output format, the unsure display and exit 2 on a failed fixture.
 
@@ -263,7 +286,11 @@ What should change:
 Recommendation:
 Accept in bulk every value Jev is sure of for the fields the user approved in Phase 3, write those for unrated and default-rated issues first, and walk the rest by `/prioritize` band.
 
-**Files:** `scripts/issue_score/vault.py`, `scripts/issue_score/questions.py`, `scripts/issue_score/score_issues.py` (`reassess`), `scripts/issue_score/test_reassess.py`.
+**Files:**
+- `scripts/issue_score/vault.py` — style issue state from rule fields
+- `scripts/issue_score/questions.py` — any question changes the reassess needs
+- `scripts/issue_score/score_issues.py` — the `reassess` subcommand
+- `scripts/issue_score/test_reassess.py` — reassess tests
 
 **Workers:** `1 writer + 1 tester` — `impl` owns the three modules; `test` covers the style state, the grouping and the sort order.
 
@@ -286,7 +313,8 @@ Accept in bulk every value Jev is sure of for the fields the user approved in Ph
 - the cost of a pass;
 - the instruction to ask `typesafe-unit` for anything not covered.
 
-**Files:** `docs/typesafe.md`.
+**Files:**
+- `docs/typesafe.md` — the TypeSafe guide for other sessions
 
 **Workers:** `1 writer`.
 
