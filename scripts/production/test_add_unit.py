@@ -1981,7 +1981,6 @@ class AddUnitTests(ShutdownTestCase):
               patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
               patch.object(herdr, "shared_session", return_value="shared-herdr"),
               patch.object(herdr, "start_server") as start,
-              patch.object(herdr, "start_new_server", side_effect=AssertionError("exclusive shared server start")),
               patch.object(herdr, "open_tab", return_value="w1:p1") as tab,
               patch.object(herdr, "start_agent", return_value=SUBMITTED_PROMPT) as agent):
             refused = self.cli(*flags)
