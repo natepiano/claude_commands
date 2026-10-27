@@ -148,7 +148,8 @@ offer the cell again; it adds no skip based on waived findings alone.
 The ticket stores its rule text. Workers read the pinned files under the unit
 worktree's `docs/style-production/rules/`, including after an interruption;
 later rule edits cannot change an assigned ticket's Work Order. A queued ticket
-is recovered under the same id if its files remain free; otherwise it is dropped
+is recovered under the same id if its files, and for a proposal ticket each file
+its findings' changes edit, remain free; otherwise it is dropped
 before selecting fresh work. Merged and dropped ticket phases are discarded on
 refill; a checkpointed ticket waits for the style showrunner to merge it.
 Refill writes plans and pinned texts atomically. Resume checks every pin's blob
@@ -673,6 +674,10 @@ that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
 `waiting <decision>: <finding> declared in another crate: <file>`,
 `waiting <decision>: <finding> declaration gone` or
 `waiting <decision>: <finding> its function moved to <file>; <reason>`, and stays out of the ticket.
+A finding whose change edits a busy file other than its own (for a file rename,
+a file that names the renamed module; for a qualified rename, a `.rs` or `.md`
+file that holds the old name) gets `waiting <decision>: <finding> edits <file>, busy`
+and stays out of the ticket; the other findings of its file stay available.
 A finding on a statement line follows its moved function only when its text is on
 exactly one body line there, and that line is a statement of the function. Refill
 builds no ticket on a file that a commit on the unit base, not in the synced tip,
