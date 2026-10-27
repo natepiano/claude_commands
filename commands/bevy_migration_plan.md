@@ -8,11 +8,10 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 
 **Usage:** `/bevy_migration_plan <version> [path]`
 **Examples:**
-- `/bevy_migration_plan 0.17.1` (analyze current directory)
-- `/bevy_migration_plan 0.17.1 ~/rust/my_game` (analyze specific project)
+- `/bevy_migration_plan 0.20.0` (analyze current directory)
+- `/bevy_migration_plan 0.20.0 ~/rust/my_game` (analyze specific project)
 
 **Output:**
-- `{path}/.claude/bevy_migration/bevy-{version}-guides.md` (combined guides)
 - `{path}/.claude/bevy_migration/bevy-{version}-migration-plan.md` (migration plan)
 
 <ExecutionSteps>
@@ -27,6 +26,7 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 **STEP 6:** Execute <MergeMigrationPlan/>
 **STEP 7:** Execute <ExcludeMigrationPlan/>
 **STEP 8:** Execute <PresentResults/>
+**STEP 9:** Execute <ProductionHandoff/>
 
 </ExecutionSteps>
 
@@ -37,7 +37,7 @@ Analyzes your codebase against official Bevy migration guides using a two-pass p
 **Extract version and optional path from arguments:**
 
 The command receives `$ARGUMENTS` containing:
-- First argument: Bevy version (e.g., "0.17.1") - REQUIRED
+- First argument: Bevy version (e.g., "0.20.0") - REQUIRED
 - Second argument: Path to codebase to analyze (e.g., "~/rust/my_game") - OPTIONAL
 
 **Validation:**
@@ -53,12 +53,15 @@ The command receives `$ARGUMENTS` containing:
 **Define execution values:**
 
 ```
-VERSION = [first argument] (e.g., "0.17.1")
+VERSION = [first argument] (e.g., "0.20.0")
 CODEBASE = [second argument or $PWD] (e.g., "~/rust/my_game" or current directory)
 BEVY_REPO_DIR = ${HOME}/rust/bevy-${VERSION} (global, reusable across projects)
 GUIDES_DIR = [resolved at clone time — captured from the final stdout line of bevy_migration_ensure_repo.sh in CloneRepository. The migration-guides directory moved from release-content/ (<= 0.18) to _release-content/ (0.19+), so do NOT hardcode it.]
 MIGRATION_PLAN = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-migration-plan.md
+PRODUCTION_DOC = [the one `*-production.md` under ${CODEBASE}/docs (`find "${CODEBASE}/docs" -name '*-production.md'`); none means the project is not in a production, and more than one means ask the user which]
 ```
+
+**Production and watch:** "a project in a production" below means PRODUCTION_DOC exists. The `/showrunner:bevy_upgrade` watch is open for it when `python3 ~/.claude/scripts/bevy_upgrade/bevy_upgrade.py --production "${PRODUCTION_DOC}" status` prints its record; `no Bevy upgrade is tracked` means no watch is open. The printed record holds the watch's current dependency table.
 
 **Path Expansion Note:**
 - When constructing bash commands, ensure tildes are expanded to actual paths
@@ -69,12 +72,6 @@ MIGRATION_PLAN = ${CODEBASE}/.claude/bevy_migration/bevy-${VERSION}-migration-pl
 **Note:** The Bevy repository is cloned to a global location (`${HOME}/rust/bevy-${VERSION}`) to avoid duplicate clones. The migration plan is saved in the target project's `.claude/bevy_migration/` directory.
 
 </ParseArguments>
-
----
-
-<UpdateTodoProgress old_task="..." new_task="...">
-Use TodoWrite tool to update the todo list - mark "${old_task}" as completed and "${new_task}" as in_progress.
-</UpdateTodoProgress>
 
 ---
 
@@ -113,7 +110,7 @@ Generate markdown section with this EXACT structure:
 
 To find all occurrences:
 ```bash
-rg "pattern" --type rust
+rg "pattern" --type rust --glob '!vendor/**' --glob '!**/vendor/**' --glob '!target/**' --glob '!**/target/**'
 ```
 
 ---
@@ -165,6 +162,8 @@ Launching Pass 2 deep analysis for [N] guides...
 
 **Standard pattern counting - use this for all occurrence counts:**
 
+Counts are regex matches, including multiple matches on a line, excluding `vendor/` and `target/`. A zero count means no match; a non-zero exit means an error and must be resolved before using the count.
+
 Single pattern (returns just the number, e.g., `42`):
 ```bash
 ~/.claude/scripts/bevy_migration_plan/bevy_migration_count_pattern.sh "pattern" "${CODEBASE}" rust
@@ -195,19 +194,6 @@ The script outputs:
 
 <CloneRepository>
 
-**Create TODO list:**
-
-```
-[
-  {"content": "Validate Bevy version exists on GitHub", "status": "in_progress", "activeForm": "Validating Bevy version exists on GitHub"},
-  {"content": "Clone Bevy repository (if needed)", "status": "pending", "activeForm": "Cloning Bevy repository"},
-  {"content": "Check dependency compatibility", "status": "pending", "activeForm": "Checking dependency compatibility"},
-  {"content": "Pass 1: Filter applicable guides (10 parallel subagents)", "status": "pending", "activeForm": "Pass 1: Filtering applicable guides"},
-  {"content": "Pass 2: Deep analysis (N parallel subagents)", "status": "pending", "activeForm": "Pass 2: Deep analysis of applicable guides"},
-  {"content": "Merge and present migration plan", "status": "pending", "activeForm": "Merging and presenting migration plan"}
-]
-```
-
 **Validate version exists on GitHub:**
 
 ```bash
@@ -222,8 +208,6 @@ gh api repos/bevyengine/bevy/releases/tags/v${VERSION}
   ```
 - Show message: "Available recent versions: ..."
 - Stop execution
-
-<UpdateTodoProgress old_task="Validate Bevy version exists on GitHub" new_task="Clone Bevy repository (if needed)"/>
 
 **Clone repository if needed (and resolve GUIDES_DIR):**
 
@@ -240,6 +224,7 @@ echo "Resolved GUIDES_DIR: ${GUIDES_DIR}"
 
 ```bash
 ~/.claude/scripts/bevy_migration_plan/bevy_migration_verify_guides.sh "${GUIDES_DIR}"
+GUIDE_COUNT=$(python3 -c 'from pathlib import Path; import sys; print(len(list(Path(sys.argv[1]).glob("*.md"))))' "${GUIDES_DIR}")
 ```
 
 **Create output directory:**
@@ -247,8 +232,6 @@ echo "Resolved GUIDES_DIR: ${GUIDES_DIR}"
 ```bash
 mkdir -p "${CODEBASE}/.claude/bevy_migration"
 ```
-
-<UpdateTodoProgress old_task="Clone Bevy repository (if needed)" new_task="Check dependency compatibility"/>
 
 </CloneRepository>
 
@@ -259,7 +242,8 @@ mkdir -p "${CODEBASE}/.claude/bevy_migration"
 **Run dependency compatibility check and save output:**
 
 ```bash
-~/.claude/scripts/bevy_migration_plan/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md"
+mkdir -p /tmp/claude
+~/.claude/scripts/bevy_migration_plan/bevy_migration_dependency_check.py --bevy-version "${VERSION}" --codebase "${CODEBASE}" --output "/tmp/claude/bevy_migration_deps_$(basename "${CODEBASE}").md"
 ```
 
 **Run it in the background and wait for it to finish.** The script sends crates.io at most one request a second, one for each direct dependency, then up to 21 more for each one that depends on Bevy. A workspace with 45 dependencies to look up took a little over two minutes.
@@ -276,9 +260,7 @@ mkdir -p "${CODEBASE}/.claude/bevy_migration"
 - Includes clear explanations of each classification category
 - Lists specific actions needed for each dependency
 
-The output file will be `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md` and will be read during MergeMigrationPlan step and inserted after the Summary section.
-
-<UpdateTodoProgress old_task="Check dependency compatibility" new_task="Pass 1: Filter applicable guides (10 parallel subagents)"/>
+The output file will be `/tmp/claude/bevy_migration_deps_$(basename "${CODEBASE}").md` and will be read during MergeMigrationPlan step and inserted after the Summary section.
 
 </DependencyCompatibilityCheck>
 
@@ -288,13 +270,13 @@ The output file will be `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md` an
 
 **Launch 10 parallel subagents for quick applicability filtering:**
 
-Use the Task tool to launch 10 general-purpose subagents **in a single message** (parallel execution).
+Use the Agent tool to launch 10 general-purpose subagents **in a single message** (parallel execution).
 
 **For each subagent (1-10):**
 
-Create a Task tool call with description: `"Pass 1: Subagent ${N}"`
+Create an Agent tool call with description: `"Pass 1: Subagent ${N}"`
 
-**Task prompt:**
+**Agent prompt:**
 
 ```
 Pass 1 Analysis - Subagent ${N} of 10:
@@ -331,7 +313,7 @@ For EACH guide file in your assigned_guides:
 {
   "applicable_guides": [
     {
-      "guide_path": "release-content/migration-guides/some_guide.md",
+      "guide_path": "_release-content/migration-guides/some_guide.md",
       "matched_patterns": [
         {"pattern": "SomeType", "occurrences": 15},
         {"pattern": "some_function", "occurrences": 8}
@@ -341,7 +323,7 @@ For EACH guide file in your assigned_guides:
   ],
   "not_applicable_guides": [
     {
-      "guide_path": "release-content/migration-guides/irrelevant_guide.md",
+      "guide_path": "_release-content/migration-guides/irrelevant_guide.md",
       "reason": "No matches for any searched patterns"
     }
   ]
@@ -377,12 +359,9 @@ For EACH guide file in your assigned_guides:
 **Handle zero applicable guides edge case:**
 
 If APPLICABLE_GUIDES_DATA is empty (no applicable guides found):
-1. Skip Pass 2 entirely
-2. Create minimal migration plan at ${MIGRATION_PLAN} stating no guides apply
-3. Update TODO: mark "Pass 1" completed, mark "Pass 2" completed (skipped)
-4. Jump to PresentResults with appropriate messaging
-
-<UpdateTodoProgress old_task="Pass 1: Filter applicable guides (10 parallel subagents)" new_task="Pass 2: Deep analysis (N parallel subagents)"/>
+1. Skip Pass 2 entirely; set PASS2_AGENT_COUNT to 0
+2. Continue with MergeMigrationPlan, stating no guides apply and retaining the dependency review
+3. Complete the remaining execution steps
 
 </Pass1_ApplicabilityFilter>
 
@@ -390,44 +369,19 @@ If APPLICABLE_GUIDES_DATA is empty (no applicable guides found):
 
 <Pass2_DetailedAnalysis>
 
-**Launch N parallel subagents (one per applicable guide):**
+**Batch applicable guides across at most 10 agents:**
 
-From Pass 1, you now have APPLICABLE_GUIDES_DATA - a list of objects containing:
-- `guide_path`: Path to the guide file
-- `matched_patterns`: Array of {pattern, occurrences} objects showing what matched in Pass 1
-- `total_occurrences`: Total occurrence count from Pass 1
+APPLICABLE_GUIDES_DATA holds each guide's `guide_path`, `matched_patterns` and `total_occurrences` from Pass 1. Set PASS2_AGENT_COUNT to min(10, the number of applicable guides). Distribute every guide exactly once across balanced batches; each agent handles several guides when there are more than 10.
 
-**IMPORTANT:** Launch all subagents in a **single message** with multiple Task tool calls for maximum parallelism.
+Launch PASS2_AGENT_COUNT Agent tool calls in one message, with description `"Deep Analysis: Batch ${N} of ${PASS2_AGENT_COUNT}"`.
 
-**For each guide in APPLICABLE_GUIDES_DATA:**
-
-Iterate through APPLICABLE_GUIDES_DATA. For each guide object, create a Task tool call with:
-
-**Task description parameter:**
-```
-"Deep Analysis: ${GUIDE_FILENAME} (${CURRENT_INDEX} of ${TOTAL_COUNT})"
-```
-
-Where:
-- `${GUIDE_FILENAME}` is the basename of the guide file (e.g., "some_guide.md")
-- `${CURRENT_INDEX}` is the 1-based position in APPLICABLE_GUIDES_DATA
-- `${TOTAL_COUNT}` is the total number of applicable guides
-
-**Task prompt parameter (substitute values from current guide object):**
+**Agent prompt (include the batch's complete guide objects):**
 
 ```
-Deep Analysis Task for ${GUIDE_FILE_PATH}:
+Analyze this batch of Bevy ${VERSION} migration guides:
+${ASSIGNED_GUIDES_JSON}
 
-You are performing detailed migration analysis for a single Bevy ${VERSION} migration guide.
-
-**Your guide:**
-${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
-
-**Pass 1 Results (use these patterns):**
-Matched patterns from Pass 1:
-${MATCHED_PATTERNS_JSON}
-
-Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
+For EACH assigned guide, set GUIDE_FILE_PATH to its guide_path, MATCHED_PATTERNS_JSON to its matched_patterns, and PASS1_TOTAL_OCCURRENCES to its total_occurrences. Repeat the following procedure independently for every guide.
 
 **Your task:**
 
@@ -454,7 +408,7 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
    - Use the EXACT patterns provided in the matched_patterns list above
    - Use rg with context to inspect actual code (needed for writing before/after diffs):
    ```bash
-   rg "pattern_from_pass1" --type rust -C 3 "${CODEBASE}"
+   rg "pattern_from_pass1" --type rust -C 3 --glob '!vendor/**' --glob '!**/vendor/**' --glob '!target/**' --glob '!**/target/**' "${CODEBASE}"
    ```
    - **DO NOT count manually** - counting happens in step 4
    - This step is ONLY for inspecting code context to write accurate diffs
@@ -509,7 +463,7 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
    - LOW: Minor changes or optimizations
    - **If 0 occurrences found:** Classify as LOW (informational only)
 
-6. Generate output using <Pass2OutputTemplate/> format
+6. Generate one <Pass2OutputTemplate/> section for this guide
    - In the output, include a link to the guide file: ${BEVY_REPO_DIR}/${GUIDE_FILE_PATH}
    - Use the guide filename (without .md extension) as the title if no title is in the guide
    - **CRITICAL**: Report occurrence counts:
@@ -519,18 +473,16 @@ Expected total occurrences from Pass 1: ${PASS1_TOTAL_OCCURRENCES}
 
 **Working directory:** ${CODEBASE}
 **Bevy repository:** ${BEVY_REPO_DIR}
-**Guide file:** ${GUIDE_FILE_PATH}
+Return one complete <Pass2OutputTemplate/> section per assigned guide, concatenated in assignment order with no surrounding prose.
 ```
 
-**Wait for all N subagents to complete:**
+**Wait for all PASS2_AGENT_COUNT agents to complete:**
 
-Collect markdown sections from each subagent.
+Collect every guide section from each agent's response.
 
 **Validate subagent outputs:**
 
 For each section, verify it contains a parseable "**Requirement Level:**" field (REQUIRED/HIGH/MEDIUM/LOW). If a section is missing this field or has unparseable content, report an error message indicating which guide failed validation and skip that guide with a note in the final plan's "Issues During Analysis" section.
-
-<UpdateTodoProgress old_task="Pass 2: Deep analysis (N parallel subagents)" new_task="Merge and present migration plan"/>
 
 </Pass2_DetailedAnalysis>
 
@@ -547,12 +499,12 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
 
 2. **Read dependency compatibility output:**
 
-   Use Read tool to read `/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md`.
-   Store this content as DEPENDENCY_OUTPUT to insert after the Summary section.
+   Use Read tool to read `/tmp/claude/bevy_migration_deps_$(basename "${CODEBASE}").md`.
+   Store this content as DEPENDENCY_OUTPUT to insert after the Summary section. If the `/showrunner:bevy_upgrade` watch is open for PRODUCTION_DOC (see ParseArguments), read its current dependency table from that `status` command and state in the plan that the watch's table is the current source for dependency state; the generated dependency review is a snapshot.
 
    **Important:** After reading, delete the temp file to prevent stale data in future runs:
    ```bash
-   rm -f "/tmp/bevy_migration_deps_$(basename ${CODEBASE}).md"
+   rm -f "/tmp/claude/bevy_migration_deps_$(basename "${CODEBASE}").md"
    ```
 
 3. **Sort sections by requirement level and identify anomalies:**
@@ -574,7 +526,7 @@ For each section, verify it contains a parseable "**Requirement Level:**" field 
    - If a guide has 50 occurrences, ALL 50 must be listed with their specific diffs
 
    **Collection process:**
-   - For each Pass 2 subagent response, extract the complete markdown section starting with "##" and ending with "---"
+   - For each Pass 2 agent response, extract ALL complete guide sections, each starting with "##" and ending with "---"
    - Verify each section contains the full <Pass2OutputTemplate/> structure
    - Group sections by their **Requirement Level:** field (REQUIRED, HIGH, MEDIUM, LOW)
    - Within each group, maintain the sections in their original order
@@ -686,8 +638,8 @@ The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
 1. Start with REQUIRED changes (must fix to compile with Bevy ${VERSION})
 2. Address HIGH priority changes (deprecated features)
 3. Consider MEDIUM and LOW priority improvements
-4. Test thoroughly after each category of changes
-5. Run `cargo check` and `cargo nextest run` frequently
+4. Run the project's own validation gate after each category (`verify.sh` where available)
+5. For a project in a production, run `/plan:to_phased_plan` on this plan
 
 ---
 
@@ -717,8 +669,6 @@ The following [X] guides from Bevy ${VERSION} do not apply to this codebase.
    - If ANOMALY_DETAILS has entries, generate the section with one subsection per anomaly
 
    Concatenate all sections in this order and write to ${MIGRATION_PLAN} using Write tool.
-
-**Note:** The final TODO update happens in PresentResults after displaying the summary.
 
 </MergeMigrationPlan>
 
@@ -757,9 +707,9 @@ Migration Plan:
   ${MIGRATION_PLAN}
 
 Analysis Summary:
-- Analyzed: 114 migration guides
+- Analyzed: ${GUIDE_COUNT} migration guides
 - Applicable: [N] guides affect this codebase
-- Not applicable: [114-N] guides
+- Not applicable: [GUIDE_COUNT-N] guides
 
 Breakdown by Priority:
 - REQUIRED: [X] guides ([Y] occurrences) - MUST FIX
@@ -769,19 +719,25 @@ Breakdown by Priority:
 
 Parallel Analysis:
 ✓ Pass 1: 10 subagents filtered applicable guides
-✓ Pass 2: [N] subagents analyzed each guide in depth
+✓ Pass 2: ${PASS2_AGENT_COUNT} agents analyzed [N] guides in batches
 
 Next Steps:
 1. Review the migration plan: ${MIGRATION_PLAN}
 2. Start with REQUIRED changes
-3. Run cargo check frequently during migration
-4. Test thoroughly after each category
+3. Run the project's own validation gate after each category (`verify.sh` where available)
+4. For a project in a production, hand the plan to `/plan:to_phased_plan`
 
 The migration plan is specific to YOUR codebase with actual
 code locations, snippets, and targeted instructions.
 ═══════════════════════════════════════════════════════════
 ```
 
-Use TodoWrite tool to mark "Merge and present migration plan" as completed.
-
 </PresentResults>
+
+---
+
+<ProductionHandoff>
+
+For a project in a production, run `/plan:to_phased_plan` on `${MIGRATION_PLAN}` and hand the resulting phased plan to the production's showrunner. If a `/showrunner:bevy_upgrade` watch is open, carry the plan's dependency-source note into the phased plan: the watch's current dependency table is the source for dependency state.
+
+</ProductionHandoff>

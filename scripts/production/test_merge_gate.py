@@ -25,9 +25,9 @@ from scripts.production import change_review, merge_gate
 SCRIPT = Path(__file__).with_name("merge_gate.py")
 EXPECTED_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold",
-    "mac_test", "usage", "bevy_upgrade", "production", "direct", "buildlog",
+    "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds",
+    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
 )
 # Each suite's fixture holds test_first.py, and lib also test_second.py.
 MODULES = len(EXPECTED_SUITES) + 1

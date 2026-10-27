@@ -1342,7 +1342,8 @@ def follow_totals(run: FollowRun) -> str:
 # The outcomes that print a line: each one changes the finding, or names why the step leaves it.
 DeclarationChange = (style_ledger.DeclarationMoved | style_ledger.DeclarationRemoved | style_ledger.DeclaredInSeveralFiles
                      | style_ledger.DeclaredInAnotherCrate | style_ledger.DeclarationRenamed | style_ledger.DeclarationGoneFromFile
-                     | style_ledger.KeptForOpenBuild | style_ledger.TraitIdentityUncertain | style_ledger.OutsideRenameUnresolved)
+                     | style_ledger.KeptForOpenBuild | style_ledger.TraitIdentityUncertain | style_ledger.OutsideRenameUnresolved
+                     | style_ledger.StatementNotFollowed)
 
 
 def follow_line(outcome: DeclarationChange, tip: str) -> str:
@@ -1365,6 +1366,8 @@ def follow_line(outcome: DeclarationChange, tip: str) -> str:
             return f"left {site}: {declaration_line(outcome.declaration)} declared in {', '.join(outcome.paths)}" + suffix
         case style_ledger.TraitIdentityUncertain():
             return f"left {site}: {declaration_line(outcome.declaration)} trait identity uncertain"
+        case style_ledger.StatementNotFollowed():
+            return f"left {site}: {declaration_line(outcome.declaration)} moved to {outcome.path}; {outcome.reason}"
         case style_ledger.DeclaredInAnotherCrate():
             return f"left {site}: {declaration_line(outcome.declaration)} declared in another crate: {outcome.path}" + suffix
         case style_ledger.DeclarationRenamed():

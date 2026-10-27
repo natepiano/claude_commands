@@ -232,6 +232,40 @@ def unit_base(repo: Path, branch: str) -> UnitBase:
 
 
 @dataclass(frozen=True)
+class UnsyncedChange:
+    """The newest commit on the unit base, not in the synced tip, that changed path."""
+
+    path: str
+    commit: str
+
+    def line(self, tip: str) -> str:
+        return f"{self.path} changed in {self.commit[:7]}, not in the synced tip {tip[:7]}"
+
+
+def unsynced_changes(repo: Path, base: UnitBase, tip: str) -> Mapping[str, UnsyncedChange]:
+    """The files that commits on the unit base, not in the synced tip, changed, by path.
+
+    The ledger reads a file's sites and cells at the synced tip, so a ticket on such a file would start from other
+    lines. A merge counts for a file only where it differs from each of its parents.
+    """
+    if isinstance(base, NoUnitBranch):
+        return {}
+    changes: dict[str, UnsyncedChange] = {}
+    commit, first = "", False
+    # Newest first. `-z` ends the `\x01<commit>` field and each path with NUL, and puts one newline before only the
+    # first path of a commit, so only that path loses one leading newline.
+    for field in git(repo, "log", "-z", "--format=%x01%H", "--name-only", "--no-renames", "--diff-merges=dense-combined",
+                     f"{tip}..{base.commit}").split("\0"):
+        if field.startswith("\x01"):
+            commit, first = field[1:], True
+        elif field:
+            path = field.removeprefix("\n") if first else field
+            first = False
+            _ = changes.setdefault(path, UnsyncedChange(path, commit))
+    return changes
+
+
+@dataclass(frozen=True)
 class TicketSelection:
     kind: style_ledger.TicketKind
     family: rules.Family
@@ -1735,6 +1769,8 @@ def _select_phase(
         decisions = style_proposals.approved_decisions(folder, unit)
     directories = style_proposals.workspace_directories(ledger) if decisions else ()
     tip = synced_tip(ledger)
+    base = unit_base(repo, branch)
+    unsynced = unsynced_changes(repo, base, tip)
     decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
     closed = False
     sites = style_proposals.MovedSites(ledger, tip)
@@ -1777,6 +1813,8 @@ def _select_phase(
                     where = "declaration gone"
                 case style_ledger.TraitIdentityUncertain():
                     where = "trait identity uncertain"
+                case style_ledger.StatementNotFollowed():
+                    where = f"its function moved to {outcome.path}; {outcome.reason}"
                 case style_ledger.OutsideRenameUnresolved():
                     where = style_ledger.outside_evidence_line(outcome.evidence)
                 case _:
@@ -1817,7 +1855,11 @@ def _select_phase(
         held = {path for path in by_file if path not in outside and busy.contains(path)}
         if held:
             print(f"waiting {issue.path}: files busy")
-        available = tuple(sorted(set(by_file) - outside - held))
+        # A file that a commit on the unit base changed waits for the sync that reads it.
+        changed = sorted(path for path in set(by_file) - outside - held if path in unsynced)
+        for path in changed:
+            print(f"waiting {issue.path}: {unsynced[path].line(tip)}")
+        available = tuple(sorted(set(by_file) - outside - held - set(changed)))
         if not available:
             continue
         limits = (_STRUCTURE_LIMITS if any(style_proposals.proposal_kind(finding, definition) == "restructure"
@@ -1838,7 +1880,6 @@ def _select_phase(
         style_proposals.renumber()
     if isinstance(decision_phase, PhaseWritten):
         return decision_phase
-    base = unit_base(repo, branch)
     refill = _refill_cells(ledger, base, family, scope)
     candidates = _tickets_from(repo, ledger, busy, family, scope, family_pilot_scopes(doc, repo), refill, first_files)
     if not candidates:
@@ -1857,14 +1898,21 @@ def _select_phase(
             if blocked:
                 return WaitingForStructure(blocked, len(ledger.unclassified_rules()))
         return NoAvailableWork()
-    selected = candidates[0]
-    ticket_id = ledger.next_ticket_id(unit)
-    ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
-                      list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
-                      cells=selected.cells)
-    ledger.ticket_assign(ticket_id, branch)
-    write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
-    return PhaseWritten(ticket_id)
+    for selected in candidates:
+        # The ticket's sites and cells were read at the synced tip, so a file a commit on the unit base changed waits.
+        changed = [unsynced[path] for path in selected.files if path in unsynced]
+        if changed:
+            print(f"waiting for sync: {' '.join(filter(None, (selected.kind, selected.crate, selected.rule)))}: "
+                  + changed[0].line(tip))
+            continue
+        ticket_id = ledger.next_ticket_id(unit)
+        ledger.ticket_add(ticket_id, unit, selected.kind, selected.family, selected.crate, list(selected.files),
+                          list(selected.rules), selected.rule, [dict(rule=site.rule, path=site.path, line=site.line, text=site.text) for site in selected.sites],
+                          cells=selected.cells)
+        ledger.ticket_assign(ticket_id, branch)
+        write_phase(ledger, ledger.ticket_open(unit)[0], plan, text)
+        return PhaseWritten(ticket_id)
+    return NoAvailableWork()
 
 
 def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:

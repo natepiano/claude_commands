@@ -44,6 +44,7 @@ from test_support import ShutdownTestCase
 SCRIPT = Path(__file__).with_name("add_unit.py")
 REAL_WORKTREE_IS_LINKED = production_units.worktree_is_linked
 MARKED_HERDR_PLACE = HerdrPlace("marked-herdr", "w7:p1")
+SHARED = herdr.SHARED_SESSION
 NO_LAUNCH_FIXTURE = add_unit.NoMarkedUnit()
 SUBMITTED_PROMPT = herdr.PromptSubmitted(datetime(2026, 10, 17, tzinfo=timezone.utc))
 OLD_HEADER = ["## Units", "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
@@ -371,9 +372,13 @@ class AddUnitTests(ShutdownTestCase):
 
 
     def configure_herdr(self, request: add_unit.UnitLaunch | add_unit.NoMarkedUnit = NO_LAUNCH_FIXTURE) -> None:
+        """Fake herdr answers a launch as a tab of the shared session, whose server has a boot unit."""
         responses: dict[str, CommandResponse | list[CommandResponse]] = {
             "--session default session list --json": CommandResponse(code=0, stdout='{"sessions": []}'),
-            "default": CommandResponse(code=0, stdout='{"result": {"root_pane": {"pane_id": "w1:p1"}}}'),
+            f"--user show -p FragmentPath --value herdr-{SHARED}.service": CommandResponse(
+                code=0, stdout=f"{self.env['HOME']}/.config/systemd/user/herdr-{SHARED}.service\n"),
+            "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
         responses["agent get"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
         # An already launched fixture advertises its session on subsequent CLI calls.
@@ -383,7 +388,9 @@ class AddUnitTests(ShutdownTestCase):
         responses["--session default session list --json"] = CommandResponse(
             code=0, stdout=json.dumps(herdr.SessionListResult(sessions=sessions)))
         if isinstance(request, add_unit.UnitLaunch):
-            name = add_unit.host_session_name(request)
+            name = SHARED
+            title = (request.launch_kind.session_name if isinstance(request.launch_kind, add_unit.UnitRestoreLaunch)
+                     else request.identity.session)
             responses[f"--session {name} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({"result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
             responses[f"--session {name} status server"] = [
                 CommandResponse(code=0, stdout="status: stopped\n"),
@@ -391,7 +398,7 @@ class AddUnitTests(ShutdownTestCase):
             responses[f"--session {name} workspace list"] = CommandResponse(
                 code=0, stdout=json.dumps({"result": {"workspaces": []}}))
             responses[f"--session {name} pane list"] = CommandResponse(code=0, stdout=json.dumps({
-                "result": {"panes": [{"pane_id": "w1:p1", "label": name}]}}))
+                "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": title}]}}))
             screen = "/remote-control is active" if (self.state / "ready").exists() else "Waiting for remote control"
             responses[f"--session {name} pane read w1:p1 --source recent --lines 60"] = CommandResponse(
                 code=0, stdout=screen)
@@ -440,6 +447,7 @@ class AddUnitTests(ShutdownTestCase):
         _ = parser.add_argument("--permanent", action="store_true")
         _ = parser.add_argument("--check", action="store_true")
         _ = parser.add_argument("--probe", action="store_true")
+        _ = parser.add_argument("--source-fallback", action="store_true")
         _ = parser.add_argument("--timeout", type=float, default=90)
         parsed = parser.parse_args(args)
         parsed.production = str(self.doc)
@@ -488,17 +496,17 @@ class AddUnitTests(ShutdownTestCase):
     def opening_prompt(self) -> str:
         return next(row[-1] for row in self.herdr_calls() if row[2:4] == ["agent", "prompt"])
 
-    def opened(self, session: str | None = None) -> list[str]:
-        """The first workspace opened, in `session` when named."""
-        return next(row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"]
-                    and (session is None or row[:2] == ["--session", session]))
+    def opened(self) -> list[str]:
+        """The last workspace opened: the latest launch's."""
+        return [row for row in self.herdr_calls() if row[2:4] == ["workspace", "create"]][-1]
 
-    def pane_environment(self, session: str | None = None) -> dict[str, str]:
-        row = self.opened(session)
+    def pane_environment(self) -> dict[str, str]:
+        row = self.opened()
         return dict(row[index + 1].split("=", 1) for index, value in enumerate(row) if value == "--env")
 
     def servers_started(self) -> list[list[str]]:
-        return [row for row in self.herdr_calls() if row[:1] == ["--user"] and "--collect" in row]
+        """Each start of the shared session's server through its boot unit."""
+        return [row for row in self.herdr_calls() if row[:2] == ["--user", "start"]]
 
     def launch_command(self) -> str:
         # Used by prompt-content assertions; argv and environment are checked separately.
@@ -685,7 +693,7 @@ class AddUnitTests(ShutdownTestCase):
             timeout=1.0,
         )
         marked = unit_lookup.MarkedUnit("alpha-unit", claude, place)
-        launched = (marked if already_marked else unit_lookup.MarkedUnit("alpha-unit", claude, HerdrPlace(add_unit.host_session_name(request), "w1:p1")))
+        launched = (marked if already_marked else unit_lookup.MarkedUnit("alpha-unit", claude, HerdrPlace(SHARED, "w1:p1")))
         ready = add_unit.ReadyToLaunch(
             request,
             add_unit.NoUnitRow(),
@@ -803,7 +811,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 1)
-        self.assertEqual(output.getvalue(), "restart-prompt-outcome: " + herdr.encode_prompt_outcome(SUBMITTED_PROMPT) + "\nalpha-unit restore launched: herdr session attach build-followups-recorded-herdr\n")
+        self.assertEqual(output.getvalue(), "restart-prompt-outcome: " + herdr.encode_prompt_outcome(SUBMITTED_PROMPT) + "\nalpha-unit restore launched: herdr session attach agents, workspace director, tab recorded-name\n")
 
     def test_restore_already_running_reports_missing_submit_proof_without_waiting_for_remote_control(self) -> None:
         launch_kind = add_unit.UnitRestoreLaunch(
@@ -830,7 +838,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
         self.assertEqual(launches, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach build-followups-alpha\n")
+        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach agents, workspace director, tab alpha\n")
 
 
     def test_restore_replaces_stopped_herdr_unit_by_name_by_herdr_name(self) -> None:
@@ -864,7 +872,7 @@ class AddUnitTests(ShutdownTestCase):
         screen = "Do you trust this folder?"
         self.herdr_overrides["agent start"] = CommandResponse(
             code=1, stdout=json.dumps({"error": {"code": "agent_not_ready", "message": "dialog"}}))
-        self.herdr_overrides["--session build-followups-alpha pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
+        self.herdr_overrides[f"--session {SHARED} pane read w1:p1 --source visible"] = CommandResponse(code=0, stdout=screen)
         result = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("add_unit: the session is not ready:\n" + screen, result.stderr)
@@ -895,14 +903,14 @@ class AddUnitTests(ShutdownTestCase):
         before = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "review")
         self.assertEqual(add_unit.host_session_name(dataclasses.replace(hana, launch_kind=before)), "hana-review")
 
-    def test_failed_unit_restore_stops_its_created_server_after_agent_exit(self) -> None:
+    def test_failed_unit_restore_closes_its_tab_after_agent_exit(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
         note = self.root / "restart-note"
         _ = note.write_text("Resume this unit.")
         with (patch.dict(os.environ, self.env),
               patch.object(herdr, "start_agent", side_effect=herdr.AgentExited("restored-unit", "w1:p1")),
-              patch.object(herdr, "stop_session") as stopped):
+              patch.object(herdr, "close_agent") as closed):
             request = add_unit.UnitLaunch(
                 production=add_unit.read_production(self.doc),
                 identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
@@ -917,15 +925,15 @@ class AddUnitTests(ShutdownTestCase):
             with self.assertRaises(herdr.AgentExited):
                 _ = add_unit.launch_session(request, add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
                                         "Resume this unit.", accounts.role_account("unit"))
-        stopped.assert_called_once_with("build-followups-alpha")
-        self.assertTrue(any(row[:2] == ["--user", "--unit=herdr-build-followups-alpha.service"] for row in self.herdr_calls()))
+        closed.assert_called_once_with(SHARED, "w1:p1")
+        self.assertEqual(self.servers_started(), [["--user", "start", "herdr-agents.service"]])
         self.assertFalse(any(row[2:4] == ["agent", "prompt"] for row in self.herdr_calls()))
 
     def test_a_prompt_never_typed_closes_the_new_session_so_a_rerun_starts_it(self) -> None:
         for unit, typed, ending in (("alpha", False, "its session is closed: run the same command again"),
                                     ("beta", True, "prompt typed 1 times")):
             with self.subTest(typed=typed):
-                place = herdr.HerdrPlace(f"build-followups-{unit}", "w1:p1")
+                place = herdr.HerdrPlace(SHARED, "w1:p1")
                 found = add_unit.MarkedUnitFound(unit_lookup.MarkedUnit(f"{unit}-unit", unit_lookup.ClaudeNotRunning(), place))
                 outcome = herdr.PromptNotSubmitted("destination never became ready for input"
                                                    + ("; prompt typed 1 times" if typed else ""), never_typed=not typed)
@@ -935,7 +943,7 @@ class AddUnitTests(ShutdownTestCase):
                     result = self.cli(unit, "--plan", "docs/plans/given.md")
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertTrue(result.stderr.rstrip().endswith(ending), result.stderr)
-                self.assertEqual(closed.call_args_list, [] if typed else [call(f"build-followups-{unit}", "w1:p1")])
+                self.assertEqual(closed.call_args_list, [] if typed else [call(SHARED, "w1:p1")])
 
     def test_unit_launch_passes_a_typed_opening_prompt_once(self) -> None:
         with patch.object(herdr, "start_agent", wraps=herdr.start_agent) as start:
@@ -951,22 +959,21 @@ class AddUnitTests(ShutdownTestCase):
         timeout = subprocess.TimeoutExpired("fixture server start", 10)
         errors = io.StringIO()
         with (patch.dict(os.environ, self.env), redirect_stderr(errors),
-              patch.object(herdr, "start_new_server", side_effect=timeout) as start,
-              patch.object(herdr, "open_pane") as opened,
+              patch.object(herdr, "start_server", side_effect=timeout) as start,
+              patch.object(herdr, "open_tab") as opened,
               patch.object(herdr, "start_agent") as agent):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md"])
         self.assertEqual(code, 1)
         self.assertEqual(errors.getvalue(), f"add_unit: {timeout}\n")
-        start.assert_called_once_with("build-followups-alpha", 90_000)
+        start.assert_called_once_with(SHARED, 90_000)
         opened.assert_not_called()
         agent.assert_not_called()
 
-    def test_destination_taken_during_start_refuses_without_opening_a_pane(self) -> None:
-        self.herdr_overrides["--session build-followups-alpha status server"] = CommandResponse(code=0, stdout="status: running\n")
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertFalse(any(row[2:4] in (["workspace", "create"], ["agent", "start"], ["agent", "prompt"])
-                             for row in self.herdr_calls()))
+    def test_a_running_shared_server_is_adopted_and_gets_the_units_tab(self) -> None:
+        self.herdr_overrides[f"--session {SHARED} status server"] = CommandResponse(code=0, stdout="status: running\n")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.servers_started(), [])
+        self.assertEqual(self.opened()[:6], ["--session", SHARED, "workspace", "create", "--label", "director"])
 
     def test_explicit_account_environment_omits_every_prepared_removal(self) -> None:
         prior = self.root / "prior-session"
@@ -1024,7 +1031,7 @@ class AddUnitTests(ShutdownTestCase):
             json.dumps({"type": "user", "message": {"model": "ignored"}}),
             json.dumps({"type": "assistant", "message": {"model": "<synthetic>"}}), "{partial"]))
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
-        self.assertIn("herdr session attach build-followups-alpha", result.stdout)
+        self.assertIn("herdr session attach agents, workspace director, tab alpha", result.stdout)
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertEqual(self.agent_arguments()[:4], ["--model", "opus", "--effort", "high"])
         self.assertIn(["--session", "alpha", "server", "stop"], self.herdr_calls())
@@ -1114,7 +1121,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertIn("review-unit restore launched", result.stdout)
         self.assertEqual(len(self.servers_started()), 1)
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
-        self.assertEqual([row[1] for row in starts], ["build-followups-review"])
+        self.assertEqual([row[4] for row in starts], ["build-followups-review"])
 
     def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
         self.env["CLAUDE_PROBE_SESSION"] = "1"
@@ -1123,7 +1130,7 @@ class AddUnitTests(ShutdownTestCase):
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         cases = ((False, ""), (True, ""), (False, "claude2"), (True, "claude2"))
-        for count, (probe, target) in enumerate(cases, 1):
+        for probe, target in cases:
             with self.subTest(probe=probe, target=target):
                 name = ("probe" if probe else "ordinary") + ("-move" if target else "-restore")
                 self.commit_prepared_row(self.unit_row(name))
@@ -1135,15 +1142,16 @@ class AddUnitTests(ShutdownTestCase):
                     *(["--account", target] if target else []),
                 )
                 self.assertIn(f"{name}-unit restore launched", result.stdout)
-                self.assertEqual(len(self.servers_started()), count)
-                opened = self.opened(f"build-followups-{name}")
+                # The first restore starts the shared server; each later one opens its tab there.
+                self.assertEqual(len(self.servers_started()), 1)
+                opened = self.opened()
                 self.assertEqual(opened[opened.index("--cwd") + 1], str(prior))
                 starts = [row for row in self.herdr_calls()
-                          if row[:4] == ["--session", f"build-followups-{name}", "agent", "start"]]
+                          if row[:5] == ["--session", SHARED, "agent", "start", f"build-followups-{name}"]]
                 self.assertEqual(len(starts), 1)
                 arguments = starts[0][starts[0].index("--") + 1:]
                 self.assertEqual(arguments[arguments.index("--resume") + 1], f"session-{name}")
-                environment = self.pane_environment(f"build-followups-{name}")
+                environment = self.pane_environment()
                 self.assertEqual(environment.get("CLAUDE_PROBE_SESSION", ""), "1" if probe else "")
                 self.assertNotIn("CLAUDE_TEST_SECRET", environment)
 
@@ -1571,7 +1579,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(commands, [])
         self.assertEqual(launches, 0)
         self.assertEqual(writes, 1)
-        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach marked-herdr\n")
+        self.assertEqual(output.getvalue(), "alpha-unit started: herdr session attach agents, workspace director, tab alpha\n")
 
     def test_restart_restore_of_a_standby_unit_moved_to_another_account(self) -> None:
         directory = self.prepare_unit_account("claude3")
@@ -1641,7 +1649,7 @@ class AddUnitTests(ShutdownTestCase):
             "oauthAccount": {"emailAddress": "owner@example.com"},
             "projects": {**self.trusted_projects(), str(folder): {"hasTrustDialogAccepted": True}}}))
         result = self.successful("nightly-review", "--permanent")
-        self.assertIn("nightly-review-unit started: herdr session attach build-followups-nightly-review", result.stdout)
+        self.assertIn("nightly-review-unit started: herdr session attach agents, workspace director, tab nightly-review", result.stdout)
         self.assertEqual(self.opened()[7], str(folder))
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(config.parent))
         arguments = self.agent_arguments()
@@ -1696,9 +1704,10 @@ class AddUnitTests(ShutdownTestCase):
                          "build-followups-alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),
                          self.git("rev-parse", "build-followups"))
-        self.assertEqual(self.servers_started(), [["--user", "--unit=herdr-build-followups-alpha.service", "--collect",
-            self.env["HERDR_BIN"], "--session", "build-followups-alpha", "server"]])
-        self.assertEqual(self.opened()[4:8], ["--label", "build-followups-alpha", "--cwd", str(worktree)])
+        self.assertEqual(self.servers_started(), [["--user", "start", "herdr-agents.service"]])
+        self.assertEqual(self.opened()[:8], ["--session", SHARED, "workspace", "create", "--label", "director",
+                                             "--cwd", str(worktree)])
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", "alpha"], self.herdr_calls())
         self.assertEqual(self.pane_environment(), {"SHOWRUNNER_UNIT": "build-followups",
             "SHOWRUNNER_UNIT_ID": "alpha-unit", "ENABLE_TOOL_SEARCH": "true", "HERDR_AGENT_PANE": "1",
             "CLAUDE_CONFIG_DIR": str(Path(self.env["HOME"]) / ".claude2"),
@@ -1715,7 +1724,7 @@ class AddUnitTests(ShutdownTestCase):
         self.assertRegex(self.log.read_text(),
                          r"^- \d\d:\d\d PDT: added alpha-unit \(plan\), worktree ")
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
-        self.assertIn("alpha-unit started: herdr session attach build-followups-alpha", result.stdout)
+        self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
 
     def test_a_review_named_unit_opens_unit_direct_beside_a_review_pool(self) -> None:
         _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
@@ -1877,7 +1886,7 @@ class AddUnitTests(ShutdownTestCase):
                                     "--cwd", str(prior), "--restart-note", str(note), "--session-name", name,
                                     "--host-session", f"build-followups-{name}", *flags)
                 start = next(row for row in self.herdr_calls()
-                             if row[:4] == ["--session", f"build-followups-{name}", "agent", "start"])
+                             if row[:5] == ["--session", SHARED, "agent", "start", f"build-followups-{name}"])
                 arguments = start[start.index("--") + 1:]
                 if expected is None:
                     self.assertNotIn("--autocompact", arguments)
@@ -1951,6 +1960,58 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.servers_started(), [])
         self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
+
+    def test_recorded_source_fallback_uses_add_unit_in_the_shared_host(self) -> None:
+        from test_restart import entry, unit
+        import record
+
+        self.commit_prepared_row(self.unit_row())
+        directory = self.prepare_unit_account("claude1")
+        _ = self.prepare_unit_account("claude2")
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume on the source after the target refused.", encoding="utf-8")
+        saved = entry(unit("session-123"))
+        saved.update(target="claude1", source_label="claude1")
+        flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
+                 "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
+                 "--account", "claude1")
+        with (patch.object(record, "all_session_records", return_value=[saved]),
+              patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
+              patch.object(herdr, "shared_session", return_value="shared-herdr"),
+              patch.object(herdr, "start_server") as start,
+              patch.object(herdr, "open_tab", return_value="w1:p1") as tab,
+              patch.object(herdr, "start_agent", return_value=SUBMITTED_PROMPT) as agent):
+            refused = self.cli(*flags)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("units account is claude2", refused.stderr)
+            _ = self.successful(*flags, "--source-fallback")
+        start.assert_called_once_with("shared-herdr", 90_000)
+        environment = cast(dict[str, str], tab.call_args.args[4])
+        self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(directory))
+        self.assertEqual(environment["SHOWRUNNER_UNIT_ID"], "alpha-unit")
+        self.assertEqual(environment["SHOWRUNNER_UNIT"], "build-followups")
+        agent.assert_called_once()
+        self.assertEqual(agent.call_args.args[:2], ("shared-herdr", "w1:p1"))
+
+    def test_source_fallback_requires_a_restore_of_its_recorded_source(self) -> None:
+        import record
+
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        note = self.root / "restart-note.txt"
+        _ = note.write_text("Resume.", encoding="utf-8")
+        with (patch.object(record, "all_session_records", return_value=[]),
+              patch.object(herdr, "start_agent", side_effect=AssertionError("invalid fallback launched"))):
+            new = self.cli("alpha", "--plan", "docs/plans/given.md", "--source-fallback", "--account", "claude2")
+            self.assertEqual(new.returncode, 2)
+            self.assertIn("requires a recorded unit restore", new.stderr)
+            restore = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
+                "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
+                "--account", "claude2", "--source-fallback")
+            self.assertEqual(restore.returncode, 2)
+            self.assertIn("must name the shutdown record's source account", restore.stderr)
 
     def test_unit_resume_uses_configured_account_instead_of_recorded_account(self) -> None:
         """F004: the configured units account decides resumes too."""
@@ -2091,7 +2152,7 @@ class AddUnitTests(ShutdownTestCase):
         for name, mode in (("alpha", ("--plan", "docs/plans/given.md")), ("beta", ("--standby",))):
             with self.subTest(mode=mode):
                 _ = self.successful(name, *mode)
-                self.assertEqual(self.pane_environment(f"build-followups-{name}")["CLAUDE_CONFIG_DIR"], str(directory))
+                self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
     def test_unit_accepts_explicit_account_matching_configured_units(self) -> None:
         """F004: matching --account selects no alternative account."""
@@ -2124,17 +2185,14 @@ class AddUnitTests(ShutdownTestCase):
         self.assertIn(f"| alpha-unit | docs/plans/given.md | {self.root / 'project-alpha'} | build-followups-alpha "
                       + "| — | 8123 | — |", self.doc.read_text())
 
-    def test_a_rerun_finds_the_unit_by_its_mark_after_its_session_was_renamed(self) -> None:
+    def test_a_rerun_finds_the_unit_by_its_mark_after_its_tab_was_renamed(self) -> None:
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        _ = (self.state / "herdr-live-build-followups-alpha").rename(self.state / "herdr-live-renamed")
-        _ = (self.root / "proc/101/cmdline").write_bytes(b"herdr\0--session\0renamed\0server\0")
-        sockets = self.root / "proc/net/unix"
-        _ = sockets.write_text(sockets.read_text().replace("/sessions/build-followups-alpha/herdr.sock", "/sessions/renamed/herdr.sock"))
-        self.herdr_overrides["--session renamed pane read w1:p1 --source recent --lines 60"] = CommandResponse(
-            code=0, stdout="/remote-control is active")
+        self.herdr_overrides[f"--session {SHARED} pane list"] = CommandResponse(code=0, stdout=json.dumps({
+            "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": "renamed"}]}}))
         result = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.servers_started()), 1)
-        self.assertIn("alpha-unit started: herdr session attach renamed", result.stdout)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)
+        self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
 
     def test_sonnet_director_row_changes_launch_model_and_effort(self) -> None:
@@ -2294,7 +2352,7 @@ class AddUnitTests(ShutdownTestCase):
         prompt = self.opening_prompt()
         self.assertIn("Write the full phased plan there", prompt)
         self.assertIn("wait for its approval before you run /unit:direct docs/plans/build-followups-alpha.md", prompt)
-        self.assertIn("alpha-unit started: herdr session attach build-followups-alpha", result.stdout)
+        self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
 
     def test_branch_takes_the_slug_and_the_stub_sits_beside_the_production_doc(self) -> None:
@@ -2318,7 +2376,8 @@ class AddUnitTests(ShutdownTestCase):
         _ = (self.state / "ready").unlink()
         first = self.cli("alpha", "--plan", "docs/plans/given.md", "--timeout", "10")
         self.assertEqual(first.returncode, 1, (first.stdout, first.stderr))
-        self.assertIn("alpha", first.stdout + first.stderr)
+        self.assertIn("/remote-control did not become active", first.stderr)
+        self.assertIn("(herdr agents:", first.stderr)
         self.assertIn("Waiting for remote control", first.stdout + first.stderr)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.log.exists())
@@ -2420,18 +2479,14 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertNotIn("| alpha-unit |", self.doc.read_text())
 
-    def test_refuses_taken_row_and_unowned_live_herdr_session(self) -> None:
+    def test_refuses_taken_row(self) -> None:
         original = self.doc.read_text()
-        _ = self.doc.write_text(original.replace("## Gates", self.unit_row(branch="different") + "\n\n## Gates"))
+        changed = original.replace("## Gates", self.unit_row(branch="different") + "\n\n## Gates")
+        _ = self.doc.write_text(changed)
         taken = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(taken.returncode, 2, (taken.stdout, taken.stderr))
-        _ = self.doc.write_text(original)
-        _ = (self.state / "herdr-live-build-followups-alpha").touch()
-        live = self.cli("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(live.returncode, 2, (live.stdout, live.stderr))
-        self.assertIn("herdr session build-followups-alpha is already live and is not marked as alpha-unit", live.stderr)
-        self.assertEqual(self.doc.read_text(), original)
-        self.assertEqual(len(self.servers_started()), 0)
+        self.assertEqual(self.doc.read_text(), changed)
+        self.assertEqual(self.servers_started(), [])
 
     def test_resume_uses_session_id_cwd_and_promote_prompt(self) -> None:
         prior = self.root / "prior-session"
@@ -2536,7 +2591,7 @@ class AddUnitTests(ShutdownTestCase):
             self.assertIsNotNone(marked)
             if marked is not None:
                 self.assertEqual(marked.unit, guild)
-                self.assertEqual(marked.place.session, f"guilds-{guild}")
+                self.assertEqual(marked.place.session, "agents")
             self.assertIsNone(unit_lookup.marked_unit("guilds", guild + "-unit"))
 
         note = self.root / "guild-restart.md"
@@ -2615,7 +2670,7 @@ class AddUnitTests(ShutdownTestCase):
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
                 self.assertEqual(self.servers_started(), [])
 
-    def test_restore_keeps_claude_name_and_sanitizes_herdr_host_name(self) -> None:
+    def test_restore_keeps_claude_name_and_sanitizes_herdr_agent_name(self) -> None:
         self.commit_prepared_row(self.unit_row())
         prior = self.root / "prior session"
         prior.mkdir()
@@ -2640,8 +2695,9 @@ class AddUnitTests(ShutdownTestCase):
             "--host-session", recorded_host,
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
-        self.assertEqual(self.opened()[1], "build-followups-restore----")
+        self.assertEqual(self.opened()[1], SHARED)
         self.assertEqual(self.opened()[7], str(prior))
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", recorded_session], self.herdr_calls())
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
         self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)
@@ -2654,7 +2710,8 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(recorded, (existing_prompt, prompt))
         self.assertIs(conversation_pause.prompt_source(prompt, frozenset, lambda: recorded),
                       conversation_pause.PromptSource.SCHEDULED)
-        self.assertEqual(self.servers_started()[0][1], "--unit=herdr-build-followups-restore----.service")
+        start, = (row for row in self.herdr_calls() if row[2:4] == ["agent", "start"])
+        self.assertEqual(start[4], "build-followups-restore----")
 
     def test_restore_refuses_launch_when_prompt_cannot_be_recorded(self) -> None:
         self.commit_prepared_row(self.unit_row())
@@ -2749,13 +2806,13 @@ class AddUnitTests(ShutdownTestCase):
         self.assertEqual(self.doc.read_text(), original)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
 
-    def test_the_herdr_name_check_is_exact_and_the_pane_is_read_by_its_id(self) -> None:
+    def test_another_live_session_leaves_the_launch_alone_and_the_pane_is_read_by_its_id(self) -> None:
         self.herdr_overrides["--session default session list --json"] = CommandResponse(code=0, stdout=json.dumps(
             herdr.SessionListResult(sessions=[herdr.SessionEntry(name="alpha2", running=True, default=False,
                 session_dir="/fixture", socket_path="/fixture/socket")])))
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(len(self.servers_started()), 1)
-        self.assertIn(["--session", "build-followups-alpha", "pane", "read", "w1:p1", "--source", "recent", "--lines", "60"], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "pane", "read", "w1:p1", "--source", "recent", "--lines", "60"], self.herdr_calls())
 
     def test_remote_control_polling_reads_each_host_through_its_place(self) -> None:
         request = add_unit.UnitLaunch(

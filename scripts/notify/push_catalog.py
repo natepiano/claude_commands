@@ -56,12 +56,43 @@ ENTRIES = (
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work is still stopped",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
         "After your restart request, Claude coding work for account {account} is still stopped on {machine}. "
-        + "{stopped} did not restart, so that work stays paused. "
+        + "{stopped} did not restart, so that work stays paused.\n\n"
+        + "The restart gave this error: {cause}\n\n"
         + "The command above retries the restart on natedev and the Mac.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session (organon-unit)"}),
+        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session (organon-unit)",
+             "cause": "window failed to open"}),
          PushExample("one_long_name", {"account": '"claude-team-build-followups-12"', "machine": "Mac",
-             "stopped": "One session (build-followups-two-accounts-unit-director)"})),
+             "stopped": "One session (build-followups-two-accounts-unit-director)",
+             "cause": "restart prompt not submitted"})),
         purpose="A restart did not start all stopped sessions again."),
+    # A retry of an untrusted folder fails the same way, so this push never asks for one first.
+    # The command is accounts.trust_command for the folder and the session's account.
+    PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs your folder trust",
+        ActionTemplate("In a terminal on {machine}, run the command below, trust the folder and type /exit. "
+                       + "Then run /shutdown restart {account} in the natedev session."),
+        "The Claude session {session} did not restart. No Claude account on {machine} trusts its folder. "
+        + "The command opens Claude there. Until you trust it, each restart fails.\n\n{command}",
+        (PushExample("typical", {"session": "organon-unit", "machine": "natedev", "account": "claude2",
+             "command": "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude2 "
+                        + "CLAUDE_CODE_REMOTE_MEMORY_DIR=/home/natepiano/.claude claude"}),
+         PushExample("long_folder", {"session": "build-followups-shutdown", "machine": "Mac", "account": "claude4",
+             "command": "cd /Users/natepiano/worktrees/claude-build-followups-shutdown && "
+                        + "CLAUDE_CONFIG_DIR=/Users/natepiano/.claude4 CLAUDE_CODE_REMOTE_MEMORY_DIR=/Users/natepiano/.claude claude"})),
+        purpose="A restart failed because no account trusts the session's folder."),
+    # The move form of shutdown.restart_untrusted: the record lives under the source account, and its
+    # restart resumes the move on the target, whose trust the command accepts.
+    PushText("shutdown.move_untrusted", "shutdown", "decision", "Stopped Claude work needs your folder trust",
+        ActionTemplate("In a terminal on {machine}, run the command below, trust the folder and type /exit. "
+                       + "Then run /shutdown restart {account} in the natedev session. That finishes the move to {target}."),
+        "The Claude session {session} did not start on {target} after its move from {account}. "
+        + "No Claude account on {machine} trusts its folder, so each restart fails until you do.\n\n{command}",
+        (PushExample("typical", {"session": "organon-unit", "machine": "natedev", "account": "claude2", "target": "claude3",
+             "command": "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 "
+                        + "CLAUDE_CODE_REMOTE_MEMORY_DIR=/home/natepiano/.claude claude"}),
+         PushExample("mac", {"session": "ups", "machine": "Mac", "account": "claude1", "target": "claude4",
+             "command": "cd /Users/natepiano/worktrees/claude-ups && "
+                        + "CLAUDE_CONFIG_DIR=/Users/natepiano/.claude4 CLAUDE_CODE_REMOTE_MEMORY_DIR=/Users/natepiano/.claude claude"})),
+        purpose="A move failed because no account trusts the session's folder."),
     PushText("shutdown.move_failed", "shutdown", "decision", "A Claude session did not finish its move",
         ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Finish moving the Claude session named {session} to {target} from its shutdown record."'),
         "The Claude session {session} on {machine} stopped on account {source} to move to account {target}. "
