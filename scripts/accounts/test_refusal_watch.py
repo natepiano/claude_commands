@@ -11,7 +11,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -1371,8 +1371,15 @@ class RefusalWatchTests(unittest.TestCase):
         self.reading(SOURCE_LOGIN, 1)
         released = launch_permission.ReleasedHold(label="claude2", then="stop",
             requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
+        deliveries = 0
+        def attempt(jobs: list[quota_alert.Job], stamp: str) -> list[str]:
+            nonlocal deliveries
+            deliveries += 1
+            if deliveries == 2:
+                return [f"quota {job.kind} {job.name} -> {job.recipient}: not delivered: fixture failed" for job in jobs]
+            return self.deliver_head_notice(jobs, stamp)
         with (patch.object(quota_alert, "recipients", return_value=["first-showrunner", "second-showrunner"]),
-              patch.object(quota_alert, "deliver_notice", side_effect=[True, False, True]) as deliver):
+              patch.object(quota_alert, "deliver_and_record", side_effect=attempt) as deliver):
             with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState(released)):
                 code, _, error = self.cli()
             self.assertEqual((code, error), (0, ""))
@@ -1387,7 +1394,50 @@ class RefusalWatchTests(unittest.TestCase):
         jobs = [cast(list[quota_alert.Job], call.args[0])[0] for call in deliver.call_args_list]
         self.assertEqual([job.recipient for job in jobs], ["first-showrunner", "second-showrunner", "second-showrunner"])
         self.assertEqual(jobs[1].text, jobs[2].text)
+        self.assertTrue(jobs[1].name)
+        self.assertEqual(jobs[1].name, jobs[2].name)
         self.assertEqual(json.loads(path.read_text()), {})
+
+    def test_cleared_hold_queue_handoff_uses_real_delivery_and_enqueue_once(self) -> None:
+        from scripts.message import send
+
+        queued: list[send.QueuedMessage] = []
+        commands: list[list[str]] = []
+        deliveries: list[str] = []
+        def deliver(jobs: list[quota_alert.Job], stamp: str) -> list[str]:
+            result = deliver_notice_jobs(jobs, stamp)
+            deliveries.extend(result)
+            return result
+        def store(_path: Path, contents: str) -> None:
+            queued[:] = cast(list[send.QueuedMessage], [json.loads(line) for line in contents.splitlines()])
+        def read_queue(_path: Path) -> list[send.QueuedMessage]:
+            return list(queued)
+        def relay(command: list[str], *, input: str, **_options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            if len(commands) == 1:
+                return subprocess.CompletedProcess(command, 3, "FAILED: fixture offline", "")
+            recipient = command[command.index("--to") + 1]
+            key = command[command.index("--key") + 1]
+            send.enqueue(send.Message(recipient, "quota_alert", "", input, key), "fixture queued", NOW)
+            return subprocess.CompletedProcess(command, 1, "QUEUED: fixture offline", "")
+
+        notify = refusal_watch._notify_cleared_hold  # pyright: ignore[reportPrivateUsage]
+        retry = refusal_watch._retry_cleared_hold_notices  # pyright: ignore[reportPrivateUsage]
+        with (patch.object(quota_alert, "deliver_and_record", side_effect=deliver),
+              patch.object(subprocess, "run", side_effect=relay),
+              patch.object(send, "queue_for", return_value=self.home / "memory/queue"),
+              patch.object(send, "locked", side_effect=nullcontext),
+              patch.object(send, "read_queue", side_effect=read_queue),
+              patch.object(send, "write_atomic", side_effect=store)):
+            notify("units", "claude2", ("cleared a finished stop hold",), NOW)
+            retry(NOW + timedelta(minutes=2))
+            retry(NOW + timedelta(minutes=4))
+        self.assertEqual(len(commands), 2, deliveries)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["text"], "units move to claude2: cleared a finished stop hold")
+        self.assertTrue(queued[0]["key"])
+        self.assertEqual(commands[0][commands[0].index("--key") + 1], queued[0]["key"])
+        self.assertEqual(json.loads((self.home / ".local/state/accounts/pending_cleared_holds.json").read_text()), {})
 
     def test_released_hold_does_not_change_the_auto_id_used_after_interrupted_consumption(self) -> None:
         path = self.groups()

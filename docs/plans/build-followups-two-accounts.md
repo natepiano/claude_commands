@@ -2446,7 +2446,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Restarts launch in a pool: assert launched names with `assertCountEqual`.
 - Carried to Phase 88: F009 (a retried cleared-hold notice after a `QUEUED` result queues again; jobs have no name).
 
-### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: todo
+### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: done
 
 **Depends on:** Phase 87
 
