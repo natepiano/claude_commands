@@ -3329,8 +3329,23 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_proposals, "proposal_command")):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
-        self.assertEqual(output.count(f"waiting {issue}: files busy\n"), 1)
+        self.assertEqual(output.count(f"waiting {issue}: {files[0]} busy\nwaiting {issue}: {files[1]} busy\n"), 1)
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [files[2]])
+
+    def test_decision_refill_names_its_busy_file_and_builds_its_free_file(self) -> None:
+        rule = self.rule("read")
+        files = ("crates/alpha/src/piece_00.rs", "crates/alpha/src/piece_01.rs")
+        for path in files:
+            self.write(path, "fn work() {}\n")
+        self.commit_to_every_checkout()
+        issue = self.approved_decision(rule, files, "rename")
+        with (mock.patch.object(berth_board, "read_board", return_value=self.board(files[1])),
+              mock.patch.object(style_proposals, "proposal_command")):
+            code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        self.assertEqual(output.count(f"waiting {issue}: {files[1]} busy\n"), 1)
+        self.assertNotIn(files[0], output)
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [files[0]])
 
     def file_rename_decision(self, rule: str, renames: tuple[tuple[str, str], ...]) -> Path:
         """An approved decision of file rename findings, each a path and its `Rename <a> to <b>` after."""
@@ -3359,7 +3374,7 @@ class StylePlanTests(unittest.TestCase):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
         self.assertEqual(output.count(f"waiting {issue}: {probe.finding_id} edits crates/alpha/src/render.rs, busy\n"), 1)
-        self.assertNotIn(f"waiting {issue}: files busy", output)
+        self.assertNotIn(f"waiting {issue}: crates/alpha/src/probe.rs busy", output)
         ticket = self.ledger().ticket_open("names-unit")[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/gauge.rs"], [gauge.finding_id]))
 
@@ -3426,6 +3441,116 @@ class StylePlanTests(unittest.TestCase):
             _, output, _ = self.run_next()
         self.assertIn(f"waiting {issue}: {finding.finding_id} edits crates/alpha/src/gauge.rs, busy\n", output)
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+
+    def owned_module_decision(self, path: str, owner: str, declaration: str,
+                              kind: style_ledger.FindingKind = "restructure") -> tuple[Path, str]:
+        """An approved decision of one finding on the module file at path, whose owner file starts with declaration at
+        the synced tip, and the finding's id."""
+        self.write("crates/alpha/src/lib.rs", "mod census;\nmod terminal;\npub fn value() {}\n")
+        self.write(owner, declaration + "pub fn open() {}\n")
+        self.write(path, "#[test]\nfn opens() { super::open(); }\n")
+        self.commit_to_every_checkout()
+        issue = self.approved_decision(self.rule("read"), (path,), kind)
+        return issue, self.ledger().proposal_findings(issue)[0].finding_id
+
+    def refill_with_busy(self, *paths: str) -> str:
+        with (mock.patch.object(berth_board, "read_board", return_value=self.board(*paths)),
+              mock.patch.object(style_proposals, "proposal_command")):
+            code, output, errors = self.run_next()
+        self.assertEqual(code, 0, errors)
+        return output
+
+    def test_decision_refill_holds_a_restructure_whose_owner_declares_it_and_is_busy(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
+                                                    "#[cfg(test)]\nmod startup_tests;\n")
+        output = self.refill_with_busy("crates/alpha/src/terminal.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/terminal.rs, busy\n", output)
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_declares_it_by_a_path_attribute(self) -> None:
+        issue, finding = self.owned_module_decision(
+            "crates/alpha/src/census/hierarchy_snapshot_tests.rs", "crates/alpha/src/census/hierarchy.rs",
+            '#[cfg(test)]\n#[path = "hierarchy_snapshot_tests.rs"]\nmod snapshot_tests;\n')
+        output = self.refill_with_busy("crates/alpha/src/census/hierarchy.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/census/hierarchy.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_declares_it_only_at_the_unit_base(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs", "")
+        # The unit's branch adds the declaration after the synced tip.
+        _ = self.unit_commit("crates/alpha/src/terminal.rs", "#[cfg(test)]\nmod startup_tests;\npub fn open() {}\n")
+        output = self.refill_with_busy("crates/alpha/src/terminal.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/terminal.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_has_a_path_attribute_in_an_inline_module(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/lib.rs",
+                                                    'mod terminal {\n    #[path = "startup_tests.rs"]\n    mod startup_tests;\n}\n')
+        output = self.refill_with_busy("crates/alpha/src/lib.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/lib.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_has_a_cfg_attr_path(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
+                                                    '#[cfg_attr(test, path = "terminal/startup_tests.rs")]\nmod startup_tests;\n')
+        output = self.refill_with_busy("crates/alpha/src/terminal.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/terminal.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_mounts_its_folder_on_an_inline_module(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/lib.rs",
+                                                    '#[path = "terminal"]\nmod shell {\n    mod startup_tests;\n}\n')
+        output = self.refill_with_busy("crates/alpha/src/lib.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/lib.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_mounts_its_folder_by_a_raw_path_attribute(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/lib.rs",
+                                                    '#[r#path = "terminal"]\nmod shell {\n    mod startup_tests;\n}\n')
+        output = self.refill_with_busy("crates/alpha/src/lib.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/lib.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_declares_it_by_a_raw_path_attribute(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/lib.rs",
+                                                    '#[r#path = "terminal/startup_tests.rs"]\nmod probe;\n')
+        output = self.refill_with_busy("crates/alpha/src/lib.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/lib.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_declares_it_by_a_raw_module_name(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
+                                                    "#[cfg(test)]\nmod r#startup_tests;\n")
+        output = self.refill_with_busy("crates/alpha/src/terminal.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/terminal.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_of_a_mod_rs_file_whose_declaring_root_is_busy(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/census/mod.rs", "crates/alpha/src/terminal.rs", "")
+        output = self.refill_with_busy("crates/alpha/src/lib.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/lib.rs, busy\n", output)
+
+    def test_decision_refill_builds_a_restructure_whose_busy_file_names_its_module_without_declaring_it(self) -> None:
+        _, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
+                                                "#[cfg(test)]\nmod startup_tests;\n")
+        # The busy file holds the word startup_tests as a function name, and the owner is free.
+        self.write(self.sources[1], "pub fn startup_tests() {}\n")
+        self.commit_to_every_checkout()
+        output = self.refill_with_busy(self.sources[1])
+        self.assertNotIn("waiting", output)
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
+
+    def test_decision_refill_builds_a_restructure_whose_busy_file_mounts_another_file_by_path(self) -> None:
+        _, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
+                                                "#[cfg(test)]\nmod startup_tests;\n")
+        # The busy file's `path` attribute is read with certainty, and names another file.
+        self.write(self.sources[1], '#[path = "probe/startup_tests.rs"]\nmod startup_tests;\n')
+        self.commit_to_every_checkout()
+        output = self.refill_with_busy(self.sources[1])
+        self.assertNotIn("waiting", output)
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
+
+    def test_decision_refill_builds_a_type_finding_whose_declaring_owner_is_busy(self) -> None:
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
+                                                    "#[cfg(test)]\nmod startup_tests;\n", "type")
+        output = self.refill_with_busy("crates/alpha/src/terminal.rs")
+        self.assertNotIn(f"waiting {issue}", output)
+        ticket = self.ledger().ticket_open("names-unit")[0]
+        self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/terminal/startup_tests.rs"], [finding]))
 
     def test_decision_gate_names_the_cause_for_a_ticket_made_before_decisions(self) -> None:
         ticket = self.approved_reference_ticket()
@@ -4587,7 +4712,7 @@ class StylePlanTests(unittest.TestCase):
               mock.patch.object(style_ledger.Ledger, "cells", autospec=True, side_effect=style_ledger.Ledger.cells) as coverage):
             code, output, errors = self.run_next()
             self.assertEqual(code, 3, errors)
-            self.assertIn(f"waiting {issue}: files busy", output)
+            self.assertIn(f"waiting {issue}: {self.sources[0]} busy\n", output)
             self.assertEqual(self.count_tickets(), 0)
             self.assertEqual(frontmatter(issue)["stage"], ["backlog"])
             start.assert_not_called()

@@ -503,7 +503,7 @@ def approved_file_renames(findings: tuple[style_ledger.HeldFinding, ...]) -> tup
 
 @dataclass(frozen=True)
 class NoCrateRoot:
-    """No folder above the renamed file holds a `lib.rs` or `main.rs`."""
+    """No folder above the module file holds a `lib.rs` or `main.rs`."""
 
 
 @dataclass(frozen=True)
@@ -520,9 +520,11 @@ class NoLibrary:
 
 @dataclass(frozen=True)
 class PathAttributes:
-    """The `mod` keywords whose attributes hold a `path` word, and the string of each one whose path is the renamed file."""
+    """The `mod` keywords whose attributes hold a `path` word, the ones whose file the scan reads with certainty, and the
+    string of each one whose path is the module file."""
 
     keywords: frozenset[int]
+    resolved: frozenset[int]
     literals: Mapping[int, int]
 
 
@@ -550,9 +552,9 @@ USE_LEAF_ENDS = frozenset({";", ",", "}", "as"})
 CRATE_PATH = re.compile(r"(?<![\w:$])crate(?:::[A-Za-z_][A-Za-z0-9_]*)+")
 
 
-def crate_root(repo: Path, moved: FileRename) -> PurePosixPath | NoCrateRoot:
-    """The nearest folder above the renamed file that holds a crate root file."""
-    for folder in PurePosixPath(moved.old).parents:
+def crate_root(repo: Path, file: str) -> PurePosixPath | NoCrateRoot:
+    """The nearest folder above the module file that holds a crate root file."""
+    for folder in PurePosixPath(file).parents:
         if any((repo / folder / name).is_file() for name in ("lib.rs", "main.rs")):
             return folder
     return NoCrateRoot()
@@ -573,16 +575,88 @@ def crate_library(repo: Path, root: PurePosixPath) -> Library | NoLibrary:
     return NoLibrary()
 
 
+def module_name(file: str) -> str:
+    """The name a `mod` line declares the module file by: its folder's name for a `mod.rs`, else its stem."""
+    path = PurePosixPath(file)
+    return path.parent.name if path.name == "mod.rs" else path.stem
+
+
 @dataclass(frozen=True)
-class RenamedModuleScan:
-    """One Rust file at path read at HEAD, and the module file rename whose references the scan finds in it."""
+class DeclarationScan:
+    """One Rust file at path read at a commit, and the module file whose `mod` declarations the scan finds in it."""
 
     path: str
     words: tuple[str, ...]
     module: style_footprint.CrateModule
     parent: tuple[str, ...]
-    moved: FileRename
+    file: str
+
+    def declares(self) -> bool:
+        """Whether a `mod` item of the file declares the module file, or can: a `mod <name>;` line that resolves to it,
+        a `#[path]` string that names it, or a `path` word whose file the scan cannot read with certainty (a `path`
+        attribute in an inline module, a `cfg_attr` that holds `path`, or a `path` on an inline module, which mounts a
+        folder for the modules in it)."""
+        starts = style_footprint.code_item_starts(self.words)
+        modules = inline_modules(self.words, starts)
+        paths = self.path_attributes(starts, modules)
+        name = module_name(self.file)
+        return bool(paths.literals or paths.keywords - paths.resolved) or any(
+            word == name and self.mod_line(index, starts, modules, paths) for index, word in enumerate(self.words))
+
+    def scope_module(self, scope: tuple[InlineModule, ...]) -> style_footprint.CrateModule:
+        if isinstance(self.module, style_footprint.OutsideCrate):
+            return self.module
+        return self.module + tuple(module.name for module in scope)
+
+    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...], paths: PathAttributes) -> bool:
+        """Whether the word at index is the name in the module file's `mod <name>;` line.
+
+        A line with a `path` attribute declares the module only when the attribute's string names its file.
+        """
+        if not (self.words[index - 1:index] == ("mod",) and index - 1 in starts
+                and self.words[index + 1:index + 2] == (";",)):
+            return False
+        if index - 1 in paths.keywords:
+            return index - 1 in paths.literals
+        return self.scope_module(enclosing(modules, index)) == self.parent
+
+    def path_attributes(self, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> PathAttributes:
+        """The `path` attributes of the file's `mod` items.
+
+        A `#[path = "<string>"]` names the module file when it is the only `path` word of a `mod` at an item start
+        outside every inline module, and its string, read from the file's own folder, is the module file and ends with
+        its name. A string with an escape, or a `path` word in any other form, names no file the gate can read. The
+        scan reads the file of a `mod <name>;` with a `path` attribute in that form with certainty.
+        """
+        words, name = self.words, PurePosixPath(self.file).name
+        spans = dict(style_footprint.attribute_spans(words))
+        attributes = style_footprint.decorated_items(words)
+        keywords = frozenset(owner for owner, words_of in attributes.items() if words[owner] == "mod" and "path" in words_of)
+        resolved: set[int] = set()
+        literals: dict[int, int] = {}
+        for start, owner in style_footprint.attribute_owners(words).items():
+            named = words[start + 4][1:-1] if spans[start] == start + 6 else ""
+            readable = (owner in keywords and owner in starts and attributes[owner].count("path") == 1
+                        and not enclosing(modules, owner)
+                        and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named)
+            if readable and words[owner + 2:owner + 3] == (";",):
+                resolved.add(owner)
+            if (readable and named.rsplit("/", 1)[-1] == name
+                    and posixpath.normpath(str(PurePosixPath(self.path).parent / named)) == self.file):
+                literals[owner] = start + 4
+        return PathAttributes(keywords, frozenset(resolved), MappingProxyType(literals))
+
+
+@dataclass(frozen=True)
+class RenamedModuleScan(DeclarationScan):
+    """A declaration scan of a module file rename's old file that also finds the module's references in it."""
+
+    new: str
     library: Library | NoLibrary
+
+    @property
+    def moved(self) -> FileRename:
+        return FileRename(self.file, self.new)
 
     def renames(self) -> Mapping[int, str]:
         """The words that name the renamed module, each with its new word: its `mod` line, the path segments that name
@@ -641,45 +715,6 @@ class RenamedModuleScan:
         old_name, new_name = PurePosixPath(self.moved.old).name, PurePosixPath(self.moved.new).name
         return ({index: self.moved.new_stem for index in found}
                 | {index: words[index].removesuffix(old_name + '"') + new_name + '"' for index in paths.literals.values()})
-
-    def scope_module(self, scope: tuple[InlineModule, ...]) -> style_footprint.CrateModule:
-        if isinstance(self.module, style_footprint.OutsideCrate):
-            return self.module
-        return self.module + tuple(module.name for module in scope)
-
-    def mod_line(self, index: int, starts: frozenset[int], modules: tuple[InlineModule, ...], paths: PathAttributes) -> bool:
-        """Whether the word at index is the name in the renamed module's `mod <name>;` line.
-
-        A line with a `path` attribute declares the renamed module only when the attribute's string names its file.
-        """
-        if not (self.words[index - 1:index] == ("mod",) and index - 1 in starts
-                and self.words[index + 1:index + 2] == (";",)):
-            return False
-        if index - 1 in paths.keywords:
-            return index - 1 in paths.literals
-        return self.scope_module(enclosing(modules, index)) == self.parent
-
-    def path_attributes(self, starts: frozenset[int], modules: tuple[InlineModule, ...]) -> PathAttributes:
-        """The `path` attributes of the file's `mod` items.
-
-        A `#[path = "<string>"]` names the renamed file when it is the only `path` word of a `mod` at an item start
-        outside every inline module, and its string, read from the file's own folder, is the old file and ends with the
-        old file's name. A string with an escape, or a `path` word in any other form, names no file the gate can read.
-        """
-        words, old_name = self.words, PurePosixPath(self.moved.old).name
-        spans = dict(style_footprint.attribute_spans(words))
-        attributes = style_footprint.decorated_items(words)
-        keywords = frozenset(owner for owner, words_of in attributes.items() if words[owner] == "mod" and "path" in words_of)
-        literals: dict[int, int] = {}
-        for start, owner in style_footprint.attribute_owners(words).items():
-            named = words[start + 4][1:-1] if spans[start] == start + 6 else ""
-            if (owner in keywords and owner in starts and attributes[owner].count("path") == 1
-                    and not enclosing(modules, owner)
-                    and words[start + 1:start + 5] == ("[", "path", "=", f'"{named}"') and "\\" not in named
-                    and named.rsplit("/", 1)[-1] == old_name
-                    and posixpath.normpath(str(PurePosixPath(self.path).parent / named)) == self.moved.old):
-                literals[owner] = start + 4
-        return PathAttributes(keywords, MappingProxyType(literals))
 
     def names_parent(self, prefix: tuple[str, ...], module: style_footprint.CrateModule) -> bool:
         """Whether a path prefix read in module names the renamed module's parent.
@@ -774,14 +809,14 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
     renamed = list(words)
     scans: list[RenamedModuleScan] = []
     for moved in moves:
-        root = crate_root(repo, moved)
+        root = crate_root(repo, moved.old)
         if isinstance(root, NoCrateRoot):
             return NoRenamedText()
         module = style_footprint.crate_module(moved.old, root)
         if isinstance(module, style_footprint.OutsideCrate):
             return NoRenamedText()
-        scans.append(RenamedModuleScan(path, words, style_footprint.crate_module(path, root), module[:-1], moved,
-                                       crate_library(repo, root)))
+        scans.append(RenamedModuleScan(path, words, style_footprint.crate_module(path, root), module[:-1], moved.old,
+                                       moved.new, crate_library(repo, root)))
         for index, word in scans[-1].renames().items():
             renamed[index] = word
     comments = style_footprint.comment_gaps(before, old, lambda line: renamed_comment(line, tuple(scans)))
@@ -792,6 +827,22 @@ def renamed_text(repo: Path, path: str, before: str, moves: tuple[FileRename, ..
             if word == pair.old and approved_reference_qualifier(words, index, use_parents, pair):
                 renamed[index] = pair.new
     return RenamedText(style_footprint.canonical_code(tuple(renamed), comments), module_sites)
+
+
+def declares_module(repo: Path, path: str, text: str, file: str) -> bool:
+    """Whether the Rust file at path, read as text, declares the module file, or has a token the scan cannot read, or
+    the module file is not in a crate whose modules it can name. The rename gate's scan reads raw identifiers as written."""
+    spans = style_footprint.token_spans(text)
+    root = crate_root(repo, file)
+    if len(spans) != len(style_footprint.tokens(text)) or isinstance(root, NoCrateRoot):
+        return True
+    module = style_footprint.crate_module(file, root)
+    if isinstance(module, style_footprint.OutsideCrate):
+        return True
+    # A raw identifier reads as its plain word, so `#[r#path = ...]` and `mod r#name;` compare as `path` and `name`.
+    words = tuple(span.token.value.removeprefix("r#") if span.token.kind == "identifier" else span.token.value
+                  for span in spans)
+    return DeclarationScan(path, words, style_footprint.crate_module(path, root), module[:-1], file).declares()
 
 
 def approved_module_file(repo: Path, path: str, moves: tuple[FileRename, ...], pairs: tuple[ApprovedRename, ...]) -> bool:
@@ -1738,7 +1789,10 @@ class EditedFiles:
     A file rename edits its own file, its new file and each Rust file whose module sites `renamed_text` renames at
     either commit; a file that names the old module but that `renamed_text` cannot read counts as edited. A qualified
     rename edits its own file and each `.rs` and `.md` file that holds its old name as a word at either commit, the
-    files `approved_reference_file` can take. Any other finding edits its own file only.
+    files `approved_reference_file` can take. A restructure of a `.rs` file edits its own file and each Rust file whose
+    `mod` line or `#[path]` string declares it at either commit, as a move of a test file into its owner removes the
+    owner's declaration; a file that names the module but that the scan cannot read, or whose `path` attribute it cannot
+    read with certainty, counts as edited. Any other finding edits its own file only.
     """
 
     def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase) -> None:
@@ -1754,18 +1808,18 @@ class EditedFiles:
         """The finding's own file first, then each other file its change edits."""
         moved = file_rename(finding.kind, finding.path, finding.after)
         if isinstance(moved, FileRename):
-            named = {commit: tuple(path for path in self.ledger.files_naming(commit, moved.old_stem) if path != finding.path)
-                     for commit in self.commits()}
-            self.read(named)
-            # A path with the same blob at both commits is scanned once.
-            versions = dict.fromkeys((path, self.blobs[commit, path]) for commit, paths in named.items() for path in paths)
-            edited = (path for path, blob in versions if self.names_module(path, self.texts[blob], moved))
+            edited = (path for path, text in self.naming(finding.path, moved.old_stem)
+                      if self.names_module(path, text, moved))
             return (finding.path, moved.new, *dict.fromkeys(edited))
         pair = approved_rename(finding.kind, finding.before, finding.after)
         if isinstance(pair, ApprovedRename):
             named_files = (path for commit in self.commits()
                            for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
             return (finding.path, *dict.fromkeys(named_files))
+        if finding.kind == "restructure" and finding.path.endswith(".rs"):
+            owners = (path for path, text in self.naming(finding.path, module_name(finding.path))
+                      if declares_module(self.repo, path, text, finding.path))
+            return (finding.path, *dict.fromkeys(owners))
         return (finding.path,)
 
     def of_ticket(self, ticket: style_ledger.TicketRecord) -> tuple[str, ...]:
@@ -1784,6 +1838,15 @@ class EditedFiles:
         if isinstance(self.base, UnitBranchTip) and self.base.commit != self.tip:
             return (self.tip, self.base.commit)
         return (self.tip,)
+
+    def naming(self, own: str, name: str) -> tuple[tuple[str, str], ...]:
+        """Each Rust file other than own that holds name as a word at either commit, with its text there, read by one
+        batch. A path with the same blob at both commits is listed once."""
+        named = {commit: tuple(path for path in self.ledger.files_naming(commit, name) if path != own)
+                 for commit in self.commits()}
+        self.read(named)
+        versions = dict.fromkeys((path, self.blobs[commit, path]) for commit, paths in named.items() for path in paths)
+        return tuple((path, self.texts[blob]) for path, blob in versions)
 
     def read(self, named: Mapping[str, tuple[str, ...]]) -> None:
         """Find the blob of each path at its commit by one `git ls-tree` for each commit, then read each blob not read
@@ -1813,7 +1876,7 @@ class EditedFiles:
         A file outside the crate's root folder names the module only through the library's name or a `path` attribute
         that names the old file, so a text that holds neither name is not scanned.
         """
-        root = crate_root(self.repo, moved)
+        root = crate_root(self.repo, moved.old)
         if (isinstance(root, PurePosixPath)
                 and isinstance(style_footprint.crate_module(path, root), style_footprint.OutsideCrate)
                 and PurePosixPath(moved.old).name not in text
@@ -1953,8 +2016,8 @@ def _select_phase(
         if outside:
             print(f"waiting {issue.path}: outside pilot scope")
         held = {path for path in by_file if path not in outside and busy.contains(path)}
-        if held:
-            print(f"waiting {issue.path}: files busy")
+        for path in sorted(held):
+            print(f"waiting {issue.path}: {path} busy")
         # A file that a commit on the unit base changed waits for the sync that reads it.
         changed = sorted(path for path in set(by_file) - outside - held if path in unsynced)
         for path in changed:

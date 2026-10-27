@@ -688,9 +688,14 @@ that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
 `waiting <decision>: <finding> declared in another crate: <file>`,
 `waiting <decision>: <finding> declaration gone` or
 `waiting <decision>: <finding> its function moved to <file>; <reason>`, and stays out of the ticket.
+Each busy file of a decision gets `waiting <decision>: <path> busy`, and its free
+files are still planned in the same run.
 A finding whose change edits a busy file other than its own (for a file rename,
 a file that names the renamed module; for a qualified rename, a `.rs` or `.md`
-file that holds the old name) gets `waiting <decision>: <finding> edits <file>, busy`
+file that holds the old name; for a restructure of a `.rs` file, a file whose
+`mod` line or `#[path]` string declares it, such as the owner of a test file, or
+whose `path` attribute the planner cannot read with certainty)
+gets `waiting <decision>: <finding> edits <file>, busy`
 and stays out of the ticket; the other findings of its file stay available.
 A finding on a statement line follows its moved function only when its text is on
 exactly one body line there, and that line is a statement of the function. Refill
