@@ -78,7 +78,7 @@ class TmpSweepCase(unittest.TestCase):
 
     def roots(self) -> tmp_sweep.Roots:
         return tmp_sweep.default_roots(str(self.tmp), (str(self.delegate), str(self.unit)), (str(self.session_root),), (),
-                                       (str(self.tmp / "scratch"),))
+                                       (str(self.tmp / "scratch"),), (), (str(self.tmp / "session"),))
 
     def unreadable_sessions(self) -> None:
         self.live = None
@@ -208,20 +208,62 @@ class ProcessUseTests(TmpSweepCase):
 
 
 class ScratchRootTests(TmpSweepCase):
-    def test_each_task_folder_is_judged_and_a_rows_folder_waits_for_its_verdict(self) -> None:
-        run = write(self.tmp / "scratch" / "run-x-gate-abc123" / "a").parent
-        row = write(self.tmp / "scratch" / "row-natedev-C5-copy-abc123" / "a").parent
-        recent = write(self.tmp / "scratch" / "phase-builds-unit-7-def456" / "a").parent
-        for folder, task in ((run, "run:x"), (row, "row:natedev-C5"), (recent, "phase:builds-unit/7")):
+    def test_a_task_folder_stays_while_its_task_is_open_and_goes_when_its_time_passes(self) -> None:
+        scratch_root = self.tmp / "scratch"
+        run = write(scratch_root / "run-x-gate-abc123" / "a").parent
+        row = write(scratch_root / "row-natedev-C5-copy-abc123" / "a").parent
+        due = write(scratch_root / "until-due-abc123" / "a").parent
+        later = write(scratch_root / "until-later-abc123" / "a").parent
+        loose = write(scratch_root / "loose-abc123" / "a").parent
+        tasks = ((run, "run:x"), (row, "row:natedev-C5"), (due, scratch.until_task(self.now - 60)),
+                 (later, scratch.until_task(self.now + 3 * DAY)))
+        for folder, task in tasks:
             scratch.write_record(folder, task, 0.0)
-            os.utime(folder / scratch.RECORD, (0, 0))
-        self.recent(recent / "a")
+        self.recent(due / "a")
         result = self.sweep()
+        self.assertFalse(due.exists())
+        self.assertFalse(loose.exists())
+        for folder in (run, row, later):
+            self.assertTrue(folder.is_dir(), folder)
+        self.assertEqual(sorted(result.kept[tmp_sweep.TASK_OPEN]), [str(run), str(later)])
+        self.assertEqual(result.kept[tmp_sweep.ROW_WAITS], [str(row)])
+        self.assertIn(str(scratch_root), result.kept[tmp_sweep.ROOT])
+        _ = tmp_sweep.sweep(False, self.roots(), time.time() + 8 * DAY, str(self.proc))
         self.assertFalse(run.exists())
         self.assertTrue(row.is_dir())
-        self.assertTrue(recent.is_dir())
-        self.assertEqual(result.kept[tmp_sweep.ROW_WAITS], [str(row)])
-        self.assertIn(str(self.tmp / "scratch"), result.kept[tmp_sweep.ROOT])
+
+
+class TempParentTests(TmpSweepCase):
+    def test_entries_in_a_live_sessions_temp_root_and_a_run_temp_go_after_4_h(self) -> None:
+        live_root = self.tmp / "session" / LIVE_SESSION
+        idle = write(live_root / ".tmpAb12Cd" / "a").parent
+        fresh = write(live_root / "pymp-x" / "a").parent
+        self.recent(fresh / "a")
+        gone = write(self.tmp / "session" / "ended-session" / "a").parent
+        run_idle = write(self.unit / "run-1" / "tmp" / "tmp.abcdefgh" / "a").parent
+        result = self.sweep()
+        self.assertFalse(idle.exists())
+        self.assertTrue(fresh.is_dir())
+        self.assertTrue(live_root.is_dir())
+        self.assertFalse(gone.exists())
+        self.assertFalse(run_idle.exists())
+        self.assertIn(str(live_root), result.kept[tmp_sweep.SESSION_RUNS])
+
+    def test_a_folders_ctime_is_no_change_in_a_temp_folder(self) -> None:
+        top = self.tmp / "old"
+        deeper = top / "inner" / "deeper"
+        deeper.mkdir(parents=True)
+        for folder in (deeper, deeper.parent):
+            os.utime(folder, (1000, 1000))
+        since = time.time() - 60
+        self.assertEqual(tmp_sweep.last_change(str(top), tmp_sweep.Limit(since, tmp_sweep.RECENT, folder_ctime=False)),
+                         (1000, 0))
+        self.assertEqual(tmp_sweep.last_change(str(top), tmp_sweep.Limit(since, tmp_sweep.RECENT)), tmp_sweep.RECENT)
+        # An empty folder falls back to its own times, and its own ctime is no change either.
+        os.utime(deeper, (1000, 1000))
+        self.assertEqual(tmp_sweep.last_change(str(deeper), tmp_sweep.Limit(since, tmp_sweep.RECENT, folder_ctime=False)),
+                         (1000, 0))
+        self.assertEqual(tmp_sweep.last_change(str(deeper), tmp_sweep.Limit(since, tmp_sweep.RECENT)), tmp_sweep.RECENT)
 
 
 class TempFolderTests(TmpSweepCase):

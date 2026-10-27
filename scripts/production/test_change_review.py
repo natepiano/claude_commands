@@ -242,6 +242,16 @@ class ActionTest(unittest.TestCase):
         self.assertEqual(run("add", "--production", DOC, "--list", str(self.fresh), "--change", "A", "--check", "B", "--see", "C")[1], "C1\n")
         self.assertIn(f"| C1 | A | {day} | B. You see: C |", self.fresh.read_text(encoding="utf-8"))
 
+    def test_add_holds_each_folder_by_the_new_row(self) -> None:
+        held = self.path.parent / "shown-repo"
+        held.mkdir()
+        with mock.patch.dict(os.environ, {scratch.HOLDS_ENV: str(self.path.parent / "holds.json")}):
+            code, output, _ = run("add", "--production", DOC, "--list", str(self.path), "--change", "A", "--check", "B",
+                                  "--see", "C", "--hold", str(held))
+            self.assertEqual(code, 0)
+            row = output.splitlines()[0]
+            self.assertEqual(scratch.holds()[os.path.realpath(held)]["task"], f"row:{change_review._owner(self.path)}-{row}")  # pyright: ignore[reportPrivateUsage]
+
     def test_back_to_back_adds_in_one_shell_each_append_the_next_number(self) -> None:
         changes = [Visible("cargo-handler nests a showrunner | inside its parent", "open `cargo-handler` on natedev",
                            "the showrunner tile sits inside its parent"),

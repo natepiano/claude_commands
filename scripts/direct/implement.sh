@@ -490,6 +490,10 @@ bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
 # The worker's own verify.sh runs inherit these and take the cargo token with
 # them, so serialization does not depend on the agent remembering a prompt rule.
 export UNIT_RUN_DIR="${SESSION_DIR}"
+# Test temp folders (mktemp, tempfile, Rust .tmpXXXXXX) land in the run folder and end with it;
+# the hourly tmp sweep judges each entry there with its 4 h rule.
+mkdir -p "${SESSION_DIR}/tmp"
+export TMPDIR="${SESSION_DIR}/tmp"
 
 # A claude-family worker launches as a NAMED BACKGROUND session so it joins the
 # machine's session mesh: it can message its peers and the unit director, and both
