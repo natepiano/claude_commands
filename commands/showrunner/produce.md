@@ -975,10 +975,11 @@ it needs. Every other wait is yours to clear, and fast.
       a phone: the session, the exact words to type or the exact allow rule
       to add, and why the check refused it, in a few words. Put it in
       `needed:` and send it as a <Notify/> `blocked` alert. An auto-mode refusal
-      goes as `send.py --to user --need blocked --text-id auto_mode.refused` with its
+      goes as `send.py --to user --need blocked --clears-when "<check>" --text-id auto_mode.refused` with its
       `--value`s (`send.py --help`); free text about it is held. A session that waits
-      for the user to type a go goes as `send.py --to user --need blocked --text-id
-      session.needs_go` with its `--value`s; free text about it is held.
+      for the user to type a go goes as `send.py --to user --need blocked --clears-when "<check>" --text-id
+      session.needs_go` with its `--value`s; free text about it is held. `<check>` is a
+      command that exits 0 once the unit no longer waits; with none, drop `--need blocked`.
    4. **Rule 4's limit holds.** Each hour, run
       `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit>`
       and repeat 1–3.
@@ -1005,7 +1006,8 @@ message is the one action or fact, under 500 characters, per the message guide. 
 what the user does with `--action`, or says nothing is needed with
 `--no-action`. An update to an earlier user push on the same subject reuses that
 push's `--key`, so silence keeps only the newest. Emergency (`--need blocked`) is
-only for an action the user must take now. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
+only for an action the user must take now. A `--need blocked` push also takes `--clears-when "<command that exits 0 when fixed>"`, such as `--clears-when github-warm-status`: send.py cancels the push when that command exits 0. Without it, send.py refuses the push (`REFUSED`, exit 2). With no such command, send the push at its own need. A repeat with the key of a live emergency
+push is skipped; to send an update, first `send.py retire --to user --from <sender> --key <key>`. Exit 0 means sent. On `FAILED` (exit 3), fall back to PushNotification
 with the `fallback text:` that `send.py` printed, and say so in the log. Never
 read or print `~/.config/pushover/env`. Every attempt is logged in
 `~/.local/state/message/log.jsonl`.
