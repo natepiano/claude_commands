@@ -168,7 +168,8 @@ def ticket_line(ticket: style_ledger.TicketRecord) -> str:
     at = datetime.fromisoformat(ticket["created_at"]).astimezone(user_zone())
     line = f"{ticket['id']} · {ticket['state']} · {ticket['unit']} · {ticket['crate']} · opened {at:%a %H:%M %Z}"
     return "\n".join([line, *(style_ledger.widened_line(widened) for widened in ticket["widened"]),
-                      *(style_ledger.yielded_line(yielded) for yielded in ticket["yielded"])])
+                      *(style_ledger.yielded_line(yielded) for yielded in ticket["yielded"]),
+                      *(style_ledger.removed_line(removed) for removed in ticket["removed"])])
 
 
 def render_report(ledger: style_ledger.Ledger, rule: str = "", crate: str = "") -> str:

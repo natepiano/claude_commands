@@ -88,7 +88,14 @@ the checkpoint procedure's atomic committed-awaiting-release record using that
 ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
 report `From <unit>: ticket <id> closed with no code change; <n> held.` and
 refill at once. If ancestry fails, leave the ticket assigned and report it.
-The gate and `ticket checkpoint` refuse any ticket with owned cells unjudged and name each one.
+The gate and `ticket checkpoint` refuse any ticket with an owned cell that is neither recorded nor removed, and name each one.
+When the ticket's own commits delete a cell's file, record that cell with `style_ledger.py record --verdict removed`
+(same flags as any record). The ledger finds the deleting commit with git, and the cell then reads
+`removed by ticket <id> at <commit7>` in `ticket open` and the style report. The record refuses a file still in
+the tree, a file deleted before the ticket's start or by a commit merged in from another branch, a cell outside the
+ticket, and a crate folder. A removed cell is closed, not clean; a later file at that path is a new cell. A delete
+by any ticket counts: no verdict on a commit before it judges the new file, and the gate and `ticket checkpoint`
+name the cell as unjudged until the ticket records it again.
 
 Refill only the unit worktree's own plan copy:
 

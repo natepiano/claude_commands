@@ -40,7 +40,8 @@ from declarations import (BlockScopedImpl, Declaration, DeclaredFile, DeclaredIt
 from rules import Family, InputScope, MemberReach, Rule, Tier
 
 CellState = Literal["current", "stale", "open", "awaiting merge"]
-Verdict = Literal["clean", "fixed", "exception", "held", "waived"]
+# `removed` closes a ticket cell whose file the ticket's own commits deleted; it is not a verdict on code.
+Verdict = Literal["clean", "fixed", "exception", "held", "waived", "removed"]
 LintTool = Literal["clippy", "mend", "rustfmt"]
 # How long every ledger connection waits for another writer's lock before it fails.
 BUSY_TIMEOUT_SECONDS = 30
@@ -1119,6 +1120,7 @@ class TicketJudgment:
     rule: str
     path: str
     commit: str
+    verdict: Verdict
     declared_scope: DeclaredInputScope
     reads: ReadFiles | NoReadFiles = NO_READ_FILES
 
@@ -1254,6 +1256,19 @@ def yielded_line(yielded: YieldedPath) -> str:
     return f"yielded: {yielded['path']} ({yielded['yielded_at']})"
 
 
+class RemovedCell(TypedDict):
+    """A ticket cell whose file the ticket's own commits deleted, the commit that deleted it, and its state line."""
+
+    rule: str
+    path: str
+    commit: str
+    state: str
+
+
+def removed_line(removed: RemovedCell) -> str:
+    return f"{removed['rule']} {removed['path']}: {removed['state']}"
+
+
 class TicketRecord(TypedDict):
     id: str
     unit: str
@@ -1276,6 +1291,7 @@ class TicketRecord(TypedDict):
     updated_at: str
     widened: tuple[WidenedPath, ...]
     yielded: tuple[YieldedPath, ...]
+    removed: tuple[RemovedCell, ...]
 
 
 @dataclass(frozen=True)
@@ -1462,6 +1478,7 @@ class Judgment:
     input_scope: CellInputScope
     declared_scope: DeclaredInputScope
     reads: ReadFiles | NoReadFiles = NO_READ_FILES
+    ticket: str = ""
 
 
 @dataclass(frozen=True)
@@ -2031,6 +2048,8 @@ class Ledger:
         yielded = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT path,recorded_at FROM ticket_yields WHERE ticket=? ORDER BY path", (ticket_id,),
         ).fetchall())
+        removed = sorted((judgment.rule, judgment.path, judgment.commit) for judgment in self.latest_ticket_judgments(ticket_id)
+                         if judgment.verdict == "removed")
         return {
             "id": row[0], "unit": row[1], "kind": row[2], "family": row[3], "rule": row[4], "crate": row[5],
             "files": cast(list[str], json.loads(row[6])), "sites": cast(list[dict[str, object]], json.loads(row[7])),
@@ -2041,6 +2060,8 @@ class Ledger:
             "widened": tuple(WidenedPath(path=path, reason=reason, widened_by=by, widened_at=at)
                              for path, reason, by, at in widened),
             "yielded": tuple(YieldedPath(path=path, yielded_at=at) for path, at in yielded),
+            "removed": tuple(RemovedCell(rule=rule, path=path, commit=commit, state=f"removed by ticket {ticket_id} at {commit[:7]}")
+                             for rule, path, commit in removed),
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -2174,19 +2195,36 @@ class Ledger:
                        if re.fullmatch(re.escape(unit) + r"-\d+", row[0])), default=0)
         return f"{unit}-{highest + 1}"
 
-    def unjudged_ticket_cells(self, id: str) -> tuple[UnjudgedTicketCell, ...]:
+    def _ticket_cells(self, ticket: TicketRecord) -> frozenset[tuple[str, str]]:
+        """The rule and path cells the ticket owns, less the paths it yielded."""
+        yielded = {yielded["path"] for yielded in ticket["yielded"]}
+        if ticket["cells"]:
+            return frozenset((rule, path) for rule, path in ticket["cells"] if path not in yielded)
+        paths = [ticket["crate"]] if ticket["kind"] == "structure" else ticket["files"]
+        rules = [ticket["rule"]] if ticket["kind"] == "listed" else ticket["rules"]
+        return frozenset((rule, path) for rule in rules for path in paths if path not in yielded)
+
+    def unjudged_ticket_cells(self, id: str, tip: str, exists: Callable[[str], bool]) -> tuple[UnjudgedTicketCell, ...]:
+        """The cells the ticket owns with no verdict of the ticket at tip. A proposal ticket owns none.
+
+        A cell with a removed row of any ticket is judged by a row of this ticket while exists says nothing is at its path.
+        A file there again is a new cell: the removals of every ticket in tip set the boundary, as coverage reads them, and
+        only a row of this ticket after them judges it (_rows_after_removals).
+        """
         ticket = self._ticket(id)
         if ticket["kind"] == "proposal":
             return ()
-        paths = [ticket["crate"]] if ticket["kind"] == "structure" else ticket["files"]
-        rules = [ticket["rule"]] if ticket["kind"] == "listed" else ticket["rules"]
-        judged = set(cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT rule,path FROM judgments WHERE ticket=?", (id,),
-        ).fetchall()))
-        yielded = {yielded["path"] for yielded in ticket["yielded"]}
-        owned = ({(rule, path) for rule, path in ticket["cells"] if path not in yielded}
-                 if ticket["cells"] else {(rule, path) for rule in rules for path in paths if path not in yielded})
-        return tuple(UnjudgedTicketCell(rule, path) for rule, path in sorted(owned - judged))
+        unjudged: list[UnjudgedTicketCell] = []
+        for rule, path in sorted(self._ticket_cells(ticket)):
+            rows = self._judgments(rule, path)
+            if any(row.verdict == "removed" for row in rows) and exists(path):
+                commit = _git(self.repo, "rev-parse", "--verify", f"{tip}^{{commit}}")
+                judged = any(row.ticket == id and row.verdict != "removed" for row in self._rows_after_removals(rows, commit))
+            else:
+                judged = any(row.ticket == id for row in rows)
+            if not judged:
+                unjudged.append(UnjudgedTicketCell(rule, path))
+        return tuple(unjudged)
 
     def ticket_yield(self, id: str, path: str) -> tuple[str, ...]:
         """Give up the assigned ticket's work on path, and return the proposal findings that the yield frees.
@@ -2449,7 +2487,7 @@ class Ledger:
             if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
                 raise LedgerError(f"{id}: cannot become {target} from {state}")
             if target == "checkpointed":
-                missing = self.unjudged_ticket_cells(id)
+                missing = self.unjudged_ticket_cells(id, commit, lambda path: not isinstance(self._file_at(commit, path), MissingFile))
                 if missing:
                     raise LedgerError(f"{id}: unjudged cells: " + ", ".join(f"{cell.rule} {cell.path}" for cell in missing))
             if target == "assigned":
@@ -2542,14 +2580,14 @@ class Ledger:
         _ = self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
 
     def latest_ticket_judgments(self, ticket_id: str) -> tuple[TicketJudgment, ...]:
-        rows = cast(list[tuple[int, str, str, str, str, str]], self._connection.execute(
-            'SELECT j.id,j.rule,j.path,j."commit",j.declared_scope,j.read_files FROM judgments j WHERE j.ticket=? '
+        rows = cast(list[tuple[int, str, str, str, Verdict, str, str]], self._connection.execute(
+            'SELECT j.id,j.rule,j.path,j."commit",j.verdict,j.declared_scope,j.read_files FROM judgments j WHERE j.ticket=? '
             + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.ticket=j.ticket '
             + 'AND latest.rule=j.rule AND latest.path=j.path ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
             (ticket_id,),
         ).fetchall())
-        return tuple(TicketJudgment(judgment_id, rule, path, commit, DeclaredInputScope(declared), _read_files(reads))
-                     for judgment_id, rule, path, commit, declared, reads in rows)
+        return tuple(TicketJudgment(judgment_id, rule, path, commit, verdict, DeclaredInputScope(declared), _read_files(reads))
+                     for judgment_id, rule, path, commit, verdict, declared, reads in rows)
 
     def filed_build_findings(self, ticket_id: str) -> tuple[HeldFinding, ...]:
         """The filed findings this ticket holds for its build."""
@@ -2570,11 +2608,18 @@ class Ledger:
                                "^" + ticket["base"]).splitlines())
         carried: list[CarriedVerdict] = []
         for judgment in latest:
+            # A removed cell keeps the commit that deleted its file; it has no inputs to carry.
+            if judgment.verdict == "removed":
+                continue
             try:
                 definition = self._component_rule(judgment.rule)
                 if definition.family != ticket["family"] or judgment.commit == checkpoint:
                     continue
                 if not self._is_ancestor(judgment.commit, checkpoint):
+                    continue
+                # A removal in the checkpoint by any ticket ends the cell, so a verdict before it does not carry.
+                after = self._rows_after_removals(self._judgments(judgment.rule, judgment.path), checkpoint)
+                if judgment.commit not in {row.commit for row in after if row.verdict != "removed"}:
                     continue
                 paths = (judgment.path, *judgment.reads.paths) if isinstance(judgment.reads, ReadFiles) else (judgment.path,)
                 changed_commits = set(_git(self.repo, "rev-list", "--full-history", checkpoint,
@@ -3146,9 +3191,10 @@ class Ledger:
             # followed_at holds a commit. updated_at uses the same UTC clock and format as recorded_at.
             # After a follow, require a verdict after that row update. This can keep a finding judged before
             # its move, or before a later row edit; keeping it is safer than closing its decision too soon.
+            # A removed row closes a cell whose file is gone; it is no verdict on code.
             rows = cast(list[tuple[int, Verdict, str, str, str, str, str]], self._connection.execute(
                 "SELECT j.id,j.verdict,j.rule_blob,j.recorded_at,h.created_at,h.followed_at,h.updated_at FROM judgments j "
-                + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.rule_blob IN (?,?) "
+                + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.rule_blob IN (?,?) AND j.verdict!='removed' "
                 + "ORDER BY j.recorded_at DESC,j.id DESC LIMIT 1",
                 (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
             ).fetchall())
@@ -4890,6 +4936,11 @@ class Ledger:
         definition = self._component_rule(rule)
         rule_blob = self._check_pin(ticket, rule, rule_blob)
         path = self._path(path)
+        if verdict == "removed":
+            if not isinstance(reads, NoReadFiles):
+                raise LedgerError(f"{verdict}: --reads requires clean, exception or held")
+            self._record_removed(rule, definition, path, commit, rule_blob, detail, ticket, worker)
+            return
         if ticket and self._connection.execute("SELECT 1 FROM tickets WHERE id=?", (ticket,)).fetchone():
             owned = self._ticket(ticket)["cells"]
             if owned and [rule, path] not in owned:
@@ -4948,6 +4999,54 @@ class Ledger:
                  json.dumps(read_files.paths if isinstance(read_files, ReadFiles) else None)),
             )
 
+    def _record_removed(self, rule: str, definition: Rule, path: str, commit: str, rule_blob: str, detail: str,
+                        ticket_id: str, worker: str) -> None:
+        """Close a ticket cell whose file the ticket's own commits deleted; the row keeps the commit that deleted it.
+
+        Own commits are the first-parent commits from the ticket's start to commit, as `checkpoint_restamps` reads them.
+        The deleting commit is the newest own commit whose diff against its first parent deletes the path; a merge that
+        only brings in other work is not it. It refuses a ticket the ledger does not hold, a cell outside the ticket, a
+        ticket with no start, a commit not under the start, a path that is not a file at the start (a crate folder
+        included), a path still in the tree at commit, a path that any other commit changed, and a path that no own commit
+        deletes. The git reads run before the write lock; under it, a yield of the path refuses as in record.
+        """
+        ticket = self._ticket(ticket_id)
+        if (rule, path) not in self._ticket_cells(ticket):
+            raise LedgerError(f"{ticket_id}: {rule} {path} is outside ticket cells")
+        base = ticket["base"]
+        if not base:
+            raise LedgerError(f"{ticket_id}: no start commit, so its own commits are not known")
+        commit = _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+        if not self._is_ancestor(base, commit):
+            raise LedgerError(f"{ticket_id}: {commit[:7]} is not under the ticket's start {base[:7]}")
+        if not isinstance(self._file_at(base, path), bytes):
+            raise LedgerError(f"{path}: not a file at the ticket's start {base[:7]}")
+        if not isinstance(self._file_at(commit, path), MissingFile):
+            raise LedgerError(f"{path}: still in the tree at {commit[:7]}")
+        own_commits = set(_git(self.repo, "rev-list", "--first-parent", commit, "^" + base).splitlines())
+        changed_commits = set(_git(self.repo, "rev-list", "--full-history", commit, "^" + base, "--", path).splitlines())
+        outside = changed_commits - own_commits
+        if outside:
+            raise LedgerError(f"{path}: changed by commits that are not {ticket_id}'s own: "
+                              + ", ".join(sorted(outside_commit[:7] for outside_commit in outside)))
+        removing = _git(self.repo, "log", "--first-parent", "--diff-merges=first-parent", "--diff-filter=D", "--no-renames",
+                        "--no-patch", "--format=%H", "-n", "1", commit, "^" + base, "--", path)
+        if not removing:
+            raise LedgerError(f"{path}: no commit of {ticket_id}'s own deletes it")
+        scope = _cell_scope(definition, path, self._tip(removing))
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            if self._connection.execute("SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket_id, path)).fetchone():
+                raise LedgerError(f"{ticket_id}: {path} was yielded")
+            _ = self._connection.execute(
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
+                + "DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at",
+                # A removed row has no inputs, so its fingerprint is empty and no tip matches it.
+                (rule, rule_blob, scope, "", path, removing, "removed", detail, ticket_id, worker,
+                 datetime.now(timezone.utc).isoformat(), DeclaredInputScope.RULE, json.dumps(None)),
+            )
+
     def latest_held_judgments(self) -> dict[tuple[str, str], str]:
         """Return judgment commits for cells whose latest verdict is held."""
         rows = cast(list[tuple[str, str, str]], self._connection.execute(
@@ -4975,19 +5074,64 @@ class Ledger:
             )
 
     def _judgments(self, rule: str, path: str) -> tuple[Judgment, ...]:
-        rows = cast(list[tuple[str, str, str, Verdict, str, str, str]], self._connection.execute(
-            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope,read_files FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC', (rule, path),
+        rows = cast(list[tuple[str, str, str, Verdict, str, str, str, str]], self._connection.execute(
+            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope,read_files,ticket FROM judgments '
+            + "WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC", (rule, path),
         ).fetchall())
-        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads))
-                     for blob, fingerprint, commit, verdict, scope, declared, reads in rows)
+        return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads), ticket)
+                     for blob, fingerprint, commit, verdict, scope, declared, reads, ticket in rows)
+
+    def _rows_after_removals(self, rows: tuple[Judgment, ...], tip: str) -> tuple[Judgment, ...]:
+        """The rows, newest first, that can judge the file at the path in tip.
+
+        A removed row in tip ends the cell: a file at the path after it is a new cell. So the removed rows in tip go, and
+        so does each row whose commit is not under every one of them, whenever it was recorded. A removed row outside tip
+        stays.
+        """
+        removals: set[str] = set()
+        for row in rows:
+            if row.verdict == "removed":
+                try:
+                    if self._is_ancestor(row.commit, tip):
+                        removals.add(row.commit)
+                except LedgerError:
+                    pass
+
+        def after_removals(row: Judgment) -> bool:
+            if row.verdict == "removed" and row.commit in removals:
+                return False
+            try:
+                return all(self._is_ancestor(removal, row.commit) for removal in removals)
+            except LedgerError:
+                return False
+
+        return tuple(row for row in rows if after_removals(row))
 
     def _judgment_state(self, rule: Rule, path: str, tip: RepositoryTip) -> tuple[CellState, str]:
-        rows = self._judgments(rule.rule_id, path)
+        """The cell's state at tip, with the verdict that gives it.
+
+        A removed row in tip ends the cell: a file at the path now is a new cell, so no row at a commit before the removal
+        judges it (_rows_after_removals). A removed row only in the style branch, whose file is gone there, gives awaiting
+        merge.
+        """
+        rows = self._rows_after_removals(self._judgments(rule.rule_id, path), tip.commit)
         scope = _cell_scope(rule, path, tip)
         pending = ""
+        judged = False
+        declared = next((row.declared_scope for row in rows if row.verdict != "removed"), DeclaredInputScope.RULE)
         style_branch = self._style_branch()
         for row in rows:
-            if row.declared_scope != rows[0].declared_scope or row.rule_blob != rule.blob:
+            if row.verdict == "removed":
+                try:
+                    if not pending and isinstance(style_branch, StoredStyleBranch):
+                        branch_commit = self._branch_commit(style_branch.name)
+                        if self._is_ancestor(row.commit, branch_commit) and path not in self._tip(branch_commit).entries:
+                            pending = row.verdict
+                except LedgerError:
+                    pass
+                continue
+            judged = True
+            if row.declared_scope != declared or row.rule_blob != rule.blob:
                 continue
             try:
                 ancestor = self._is_ancestor(row.commit, tip.commit)
@@ -5006,7 +5150,7 @@ class Ledger:
                     continue
         if pending:
             return "awaiting merge", pending
-        return ("stale" if rows else "open"), ""
+        return ("stale" if judged else "open"), ""
 
     def _style_branch(self) -> StyleBranch:
         branches = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
@@ -5039,8 +5183,11 @@ class Ledger:
                 continue
             rule = _judgment_rule(self._component_rule(cell.rule), cell.path)
             scope = _cell_scope(rule, cell.path, synced)
-            rows = self._judgments(cell.rule, cell.path)
+            # Rows before a removal in base judged a file that is gone.
+            rows = self._rows_after_removals(self._judgments(cell.rule, cell.path), tip.commit)
             for row in rows:
+                if row.verdict == "removed":
+                    break
                 if row.declared_scope != rows[0].declared_scope or row.rule_blob != rule.blob:
                     continue
                 try:
@@ -5351,7 +5498,7 @@ def main() -> None:
     for field in ("rule", "path", "commit", "ticket", "worker"):
         _ = record.add_argument(f"--{field}", required=True)
     _ = record.add_argument("--rule-blob", default="")
-    _ = record.add_argument("--verdict", choices=("clean", "fixed", "exception", "held", "waived"), required=True)
+    _ = record.add_argument("--verdict", choices=("clean", "fixed", "exception", "held", "waived", "removed"), required=True)
     _ = record.add_argument("--detail", default="")
     _ = record.add_argument("--input-scope", choices=tuple(DeclaredInputScope), type=DeclaredInputScope, default=UNDECLARED_INPUT_SCOPE)
     _ = record.add_argument("--reads", nargs="+", default=NO_READ_FILES)

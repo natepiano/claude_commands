@@ -909,7 +909,8 @@ def gate(repo: Path, ticket_id: str) -> int:
         with style_ledger.open_ledger(repo) as ledger:
             origin = ledger.ticket_origin(ticket_id)
             if isinstance(origin, style_ledger.SelectedByCoverage):
-                missing = ledger.unjudged_ticket_cells(ticket_id)
+                # The worktree is what the checkpoint commits: a removed cell's path is looked for there, its removal in HEAD.
+                missing = ledger.unjudged_ticket_cells(ticket_id, "HEAD", lambda path: os.path.lexists(repo / path))
                 if missing:
                     for cell in missing:
                         print(f"unjudged: {cell.rule} {cell.path}")
@@ -1476,10 +1477,12 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
                            and approved_rename(finding.kind, finding.before, finding.after) not in pairs
                            for finding in held_findings)
     # A proposal ticket names its exact cells, because the ledger refuses a tier B cell at a file with no listed site.
+    removed_line = "Record a cell whose file this ticket deletes with `--verdict removed`; the ledger finds the commit that deleted it."
     record_lines = ([f"Record exactly these cells, each with `style_ledger.py record --ticket {ticket_id} --rule <rule> --path <file>`; "
-                     + "the ledger takes its pinned rule blob:"] + [f"- `{cell.rule}` · `{cell.path}`" for cell in proposal_cells]
+                     + "the ledger takes its pinned rule blob:"] + [f"- `{cell.rule}` · `{cell.path}`" for cell in proposal_cells] + [removed_line]
                     if proposal_cells else ["Record no cell: the ledger takes no cell of this ticket."]) if approved else [
-        f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob."]
+        f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; the ledger takes its pinned rule blob.",
+        removed_line]
     files: list[str] = []
     for path in ticket["files"]:
         line = f"- `{path}`"
