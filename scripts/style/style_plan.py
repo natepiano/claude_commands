@@ -1588,6 +1588,9 @@ def phase_text(ticket: style_ledger.TicketRecord, texts: tuple[style_ledger.Pinn
             ]),
         ] if ticket["kind"] == "read" else []),
         "Product work wins. Skip reserved, unmerged or dirty files; follow the yielding procedure in ~/.claude/docs/style_production.md.",
+        *([f"When a finding's file, or a file its change edits, is reserved, unmerged or dirty, yield the finding's file with "
+           + f"`style_ledger.py ticket yield --repo . --id {ticket_id} --path <finding file>`: its findings stay filed for a "
+           + "later ticket, and the gate skips them."] if approved else []),
         (("Apply the approved findings. "
           + ("For each of these renames, find every use through the compiler, not a text search, and update each one "
              + "in other files: " + ", ".join(rename_pair_text(pair) for pair in dict.fromkeys(pairs)) + ". "

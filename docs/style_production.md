@@ -391,6 +391,26 @@ finding touches, rerun the gate, and leave dropped cells stale for later work.
 Record each dropped file with `style_ledger.py ticket yield --repo <unit-worktree>
 --id <ticket> --path <file>`; this clears the ticket's verdicts and unfiled held
 findings on it, leaving its cells for later work.
+A proposal ticket yields the file of a finding whose file, or a file its change
+edits, is blocked. Its findings at that file stay filed under their decision with
+no build ticket, and the ticket no longer lists them. The gate and `ticket merge`
+skip them, and a later proposal ticket takes them. The command prints
+`yielded <finding id>: it stays filed for a later ticket` for each. It refuses a
+file with no finding of the ticket, a file that holds every finding the ticket has
+left (drop the ticket), and a kept finding that can need a yielded one. A `path`
+attribute that mounts a file across crates refuses when either crate holds a
+finding of the ticket, and a `path` attribute that mounts a file not named
+`.rs` refuses anywhere. A `path` attribute on an inline module names the folder
+its `mod` items read from; it refuses only when that folder is in another crate.
+The module's own name stays a reading too, because a `cfg_attr` attribute can be
+inactive.
+Otherwise a kept finding in another crate passes. In a shared crate, each finding of both sides
+must be a plain file rename; the yielded file must not name a kept module; the
+new names must differ, and neither can be the other's old name; and no file of
+the crate can re-export a renamed module, glob-import its parent, or hold an
+`include`, `macro_rules` or `macro` word. The acceptance gate's `verify.sh` run
+on the unit branch proves that the kept work builds without the yielded change.
+A structure ticket cannot yield.
 Style units obey build holds and memory admission like any unit.
 
 ## Big changes

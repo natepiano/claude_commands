@@ -5996,7 +5996,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.ticket_assign("proposal-1", "main")
         cases = (("read-1", self.sources[0], "cannot yield from queued"),
                  ("modules-1", self.sources[0], "cannot yield a structure ticket"),
-                 ("proposal-1", self.sources[0], "cannot yield a proposal ticket"))
+                 ("proposal-1", self.sources[0], f"{self.sources[0]} holds every finding the ticket has left; "
+                  + "drop the ticket with style_ledger.py ticket drop"))
         for ticket, path, reason in cases:
             with self.subTest(ticket=ticket):
                 refused = self.cli("ticket", "yield", "--id", ticket, "--path", path, success=False)
@@ -6014,6 +6015,189 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(refused.stderr.strip(), "style_ledger: read-1: cannot yield from checkpointed")
         self.assertEqual(self.states(rule)[self.sources[0]], "current")
         self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Filed(issue))
+
+    def yield_proposal(self, kept: tuple[str, str, str, str], freed: tuple[str, str, str, str],
+                       files: dict[str, str] | None = None) -> tuple[str, str, Path]:
+        """Add an assigned proposal ticket proposal-1 with one finding at each (path, kind, before, after), at a tip
+        that adds files; return the kept finding, the finding to yield and the decision."""
+        rule = self.rule("decision")
+        for path, text in (files or {}).items():
+            self.write(path, text)
+        self.set_tip(self.commit("Write the yield files") if files else self.initial_tip)
+        ledger = self.ledger()
+        issue = self.root / "issues/decision.md"
+        identities: list[str] = []
+        for line, (path, kind, before, after) in enumerate((kept, freed), 1):
+            finding = ledger.hold(rule, path, line, "change", cast(style_ledger.FindingKind, kind), before, after,
+                                  self.blob(rule), "outside")
+            ledger.file_held(finding.finding_id, issue)
+            identities.append(finding.finding_id)
+        ledger.ticket_add("proposal-1", "proposal", "proposal", "names", "crates/alpha", sorted({kept[0], freed[0]}),
+                          [rule], proposal=str(issue), finding_ids=tuple(identities))
+        ledger.ticket_assign("proposal-1", "main")
+        return identities[0], identities[1], issue
+
+    def test_a_proposal_yield_keeps_the_yielded_finding_filed_and_free_for_a_later_ticket(self) -> None:
+        kept, freed, issue = self.yield_proposal((self.sources[3], "rename", "Outcome::Old", "Outcome::New"),
+                                                 (self.sources[1], "rename", "Shape::Round", "Shape::Square"))
+        ledger = self.ledger()
+        refused = self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[0], success=False)
+        self.assertEqual(refused.stderr.strip(), f"style_ledger: proposal-1: no finding of the ticket is at {self.sources[0]}")
+        yielded = self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[1])
+        self.assertEqual(yielded.stdout, f"yielded {freed}: it stays filed for a later ticket\n")
+        findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+        self.assertEqual(findings[freed].state, style_ledger.Filed(issue))
+        self.assertEqual(findings[freed].build_ticket, style_ledger.NoBuildTicket())
+        self.assertEqual(findings[kept].build_ticket, style_ledger.BuildTicket("proposal-1"))
+        ticket = ledger.ticket_open("proposal")[0]
+        self.assertEqual(ticket["finding_ids"], [kept])
+        self.assertEqual([path["path"] for path in ticket["yielded"]], [self.sources[1]])
+        self.assertEqual(self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[1]).stdout, "")
+        self.assertEqual(ledger.ticket_open("proposal")[0], ticket)
+        refused = self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[3], success=False)
+        self.assertIn("holds every finding the ticket has left", refused.stderr)
+        # The merge builds the kept finding and leaves the yielded one filed for a later ticket.
+        self.write(self.sources[3], "enum Outcome { New }\n")
+        checkpoint = self.commit("Build the kept finding")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("proposal-1", checkpoint)
+        self.assertEqual(ledger.ticket_merge("proposal-1"), ())
+        findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+        self.assertEqual(findings[kept].state, style_ledger.Built(issue))
+        self.assertEqual((findings[freed].state, findings[freed].build_ticket), (style_ledger.Filed(issue), style_ledger.NoBuildTicket()))
+        ledger.ticket_add("proposal-2", "proposal", "proposal", "names", "crates/alpha", [self.sources[1]],
+                          [findings[freed].rule], proposal=str(issue), finding_ids=(freed,))
+        self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[1].build_ticket, style_ledger.BuildTicket("proposal-2"))
+
+    # Two module files of crates/alpha that two file renames move; lib.rs declares them.
+    yield_files: dict[str, str] = {
+        "crates/alpha/src/a.rs": "pub fn alpha() {}\n",
+        "crates/alpha/src/b.rs": "pub fn beta() {}\n",
+        "crates/alpha/src/c.rs": "pub const BAR: char = '\\u{2580}';\npub const TAB: u8 = b'\\x7f';\n",
+        "crates/alpha/src/other.rs": "#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::collections::*;\n}\n",
+    }
+    kept_rename: tuple[str, str, str, str] = ("crates/alpha/src/a.rs", "rename", "Alpha", "Rename src/a.rs to src/first.rs")
+    freed_rename: tuple[str, str, str, str] = ("crates/alpha/src/b.rs", "rename", "Beta", "Rename src/b.rs to src/second.rs")
+
+    def test_a_proposal_yield_frees_a_file_rename_beside_an_independent_one_in_its_crate(self) -> None:
+        # Mounts inside alpha, also through an inline module's folder, and one from beta to a file of no finding's
+        # crate, join no finding crate to another.
+        mounts = {"crates/alpha/src/other.rs": self.yield_files["crates/alpha/src/other.rs"] + "#[path = \"c.rs\"]\nmod again;\n"
+                  + "#[path = \".\"]\nmod folded {\n    #[path = \"c.rs\"]\n    mod again;\n}\n",
+                  "crates/beta/src/other.rs": "#[path = \"../../../vendor/third-party/src/lib.rs\"]\nmod third;\n"}
+        kept, freed, _ = self.yield_proposal(self.kept_rename, self.freed_rename, {**self.yield_files, **mounts})
+        self.assertEqual(self.ledger().ticket_yield("proposal-1", self.freed_rename[0]), (freed,))
+        self.assertEqual(self.ledger().ticket_open("proposal")[0]["finding_ids"], [kept])
+
+    def test_a_proposal_yield_refuses_a_kept_finding_that_can_need_the_yielded_one(self) -> None:
+        library = "crates/alpha/src/lib.rs"
+        reexport = {library: "mod producer; mod consumer;\npub use producer::make;\n",
+                    "crates/alpha/src/producer.rs": "pub fn make() -> u32 { 1 }\n",
+                    "crates/alpha/src/consumer.rs": "pub fn take() -> u32 { crate::make() }\n"}
+        qualified = ("crates/alpha/src/b.rs", "rename", "Shape::Round", "Shape::Square")
+        cases: tuple[tuple[str, tuple[str, str, str, str], tuple[str, str, str, str], dict[str, str], str], ...] = (
+            ("a re-export carries the yielded type", ("crates/alpha/src/consumer.rs", "type", "pub fn take() -> u32", "u64"),
+             ("crates/alpha/src/producer.rs", "type", "pub fn make() -> u32", "u64"), reexport,
+             "{kept} is not a file rename, and crates/alpha holds a freed and a kept finding"),
+            ("a qualified rename beside a file rename", self.kept_rename, qualified, {},
+             "{freed} is not a file rename, and crates/alpha holds a freed and a kept finding"),
+            ("the yielded file names the kept old module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/b.rs": "pub fn beta() { crate::a::alpha() }\n"},
+             "crates/alpha/src/b.rs names a, a module that {kept} renames"),
+            ("the yielded file names the kept new module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/b.rs": "pub fn first() {}\n"}, "crates/alpha/src/b.rs names first, a module that {kept} renames"),
+            ("one new name", self.kept_rename, (*self.freed_rename[:3], "Rename src/b.rs to src/first.rs"), {},
+             "{freed} and {kept} both rename to or from first"),
+            ("the yielded new name is the kept old name", self.kept_rename,
+             (*self.freed_rename[:3], "Rename src/b.rs to src/a.rs"), {}, "{freed} and {kept} both rename to or from a"),
+            ("the kept new name is the yielded old name", (*self.kept_rename[:3], "Rename src/a.rs to src/b.rs"),
+             self.freed_rename, {}, "{freed} and {kept} both rename to or from b"),
+            ("a public use of a renamed module", self.kept_rename, self.freed_rename,
+             {library: "mod a; mod b; mod c; mod other;\npub use a::alpha;\n"}, f"{library} re-exports a"),
+            ("a glob use of the renamed modules' parent", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "use super::*;\n"}, "crates/alpha/src/other.rs glob-imports crate"),
+            ("a macro_rules item", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "macro_rules! made { () => {} }\n"}, "crates/alpha/src/c.rs holds macro_rules"),
+            ("an include call", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "include!(\"made.rs\");\n"}, "crates/alpha/src/c.rs holds include"),
+            ("a path attribute mounts the yielded file into the kept crate",
+             ("crates/alpha/src/consumer.rs", "type", "pub fn take() -> u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "pub fn make() -> u32", "u64"),
+             {library: "#[path = \"../../beta/src/producer.rs\"]\nmod producer;\nmod consumer;\n"},
+             f"{library} mounts crates/beta/src/producer.rs, a file outside crates/alpha"),
+            ("a cfg_attr path attribute mounts the yielded file", ("crates/alpha/src/consumer.rs", "type", "u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[cfg_attr(all(), cfg_attr(test, path = \"../../beta/src/producer.rs\"))]\nmod producer;\n"},
+             f"{library} mounts crates/beta/src/producer.rs, a file outside crates/alpha"),
+            ("another crate mounts the yielded file", self.kept_rename, self.freed_rename,
+             {"crates/beta/src/lib.rs": "#[path = \"../../alpha/src/b.rs\"]\nmod b;\n"},
+             "crates/beta/src/lib.rs mounts crates/alpha/src/b.rs, a file outside crates/beta"),
+            ("a path attribute mounts a file that is not .rs", ("crates/alpha/src/consumer.rs", "type", "u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[path = \"mount.inc\"]\nmod mount;\n",
+              "crates/alpha/src/mount.inc": "#[path = \"../../beta/src/producer.rs\"]\nmod producer;\n"},
+             f"{library} mounts crates/alpha/src/mount.inc, which is not a .rs file"),
+            ("an inline module's folder is in another crate", ("crates/alpha/src/consumer.rs", "type", "u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[path = \"../../beta/src\"]\nmod mounted {\n    mod producer;\n}\n"},
+             f"{library} mounts crates/beta/src, a folder outside crates/alpha"),
+            ("a path attribute in an inline module reads from the module's folder",
+             ("crates/alpha/src/consumer.rs", "type", "u32", "u64"), ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[path = \"a/b\"]\nmod up {\n    #[path = \"../../../../beta/src/producer.rs\"]\n    mod producer;\n}\n"},
+             f"{library} mounts crates/beta/src/producer.rs, a file outside crates/alpha"),
+            ("an inactive path attribute leaves the module's own folder a reading",
+             ("crates/alpha/src/consumer.rs", "type", "u32", "u64"), ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {"Cargo.toml": '[workspace]\nmembers = ["crates/alpha", "crates/beta", "crates/gamma"]\nresolver = "2"\n',
+              "crates/gamma/Cargo.toml": '[package]\nname = "gamma"\nversion = "0.1.0"\nedition = "2021"\n',
+              "crates/gamma/src/lib.rs": "#[cfg_attr(any(), path = \".\")]\npub mod deep {\n"
+              + "    #[path = \"../../../beta/src/producer.rs\"]\n    pub mod producer;\n}\n"},
+             "crates/gamma/src/lib.rs mounts crates/beta/src/producer.rs, a file outside crates/gamma"),
+            ("a path attribute leaves the repository", self.kept_rename, self.freed_rename,
+             {library: "mod a; mod b; mod c; mod other;\n#[path = \"../../../../outside.rs\"]\nmod outside;\n"},
+             f"{library} mounts ../outside.rs, a file outside crates/alpha"),
+            ("a path attribute in a macro of another crate", self.kept_rename, self.freed_rename,
+             {"crates/beta/src/other.rs": "macro_rules! mount { () => { #[path = \"x.rs\"] mod x; } }\n"},
+             "crates/beta/src/other.rs holds a path attribute in a macro"),
+            ("a path attribute that is not a string", self.kept_rename, self.freed_rename,
+             {"crates/beta/src/other.rs": "#[path = concat!(\"x\", \".rs\")]\nmod x;\n"},
+             "crates/beta/src/other.rs holds a path attribute that is not a relative string"),
+            ("a file that does not tokenize", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "pub fn odd() { \\ }\n"}, "crates/alpha/src/c.rs does not tokenize"),
+        )
+        for name, kept, freed, files, reason in cases:
+            with self.subTest(name):
+                self.setUp()
+                kept_id, freed_id, _ = self.yield_proposal(kept, freed, {**self.yield_files, **files})
+                ledger = self.ledger()
+                with self.assertRaises(style_ledger.LedgerError) as refused:
+                    _ = ledger.ticket_yield("proposal-1", freed[0])
+                self.assertIn(f"proposal-1: a kept finding can need a finding at {freed[0]}", str(refused.exception))
+                self.assertIn(reason.format(kept=kept_id, freed=freed_id), str(refused.exception))
+                ticket = ledger.ticket_open("proposal")[0]
+                self.assertEqual((ticket["finding_ids"], ticket["yielded"]), (sorted([kept_id, freed_id]), ()))
+
+    def test_a_proposal_yield_reads_again_when_the_synced_tip_moves_before_its_lock(self) -> None:
+        _ = self.yield_proposal(self.kept_rename, self.freed_rename, self.yield_files)
+        self.write("crates/alpha/src/c.rs", "macro_rules! made { () => {} }\n")
+        moved = self.commit("Add a macro")
+        ledger = self.ledger()
+        read = style_ledger.Ledger._yielded_findings  # pyright: ignore[reportPrivateUsage]
+        calls: list[str] = []
+
+        def advancing(self: style_ledger.Ledger, ticket: style_ledger.TicketRecord, findings: tuple[style_ledger.HeldFinding, ...],
+                      path: str) -> style_ledger.FileYield | style_ledger.FindingYield:
+            calls.append(self.synced_commit())
+            result = read(self, ticket, findings, path)
+            if len(calls) == 1:
+                self.set_tip(moved)
+            return result
+
+        with mock.patch.object(style_ledger.Ledger, "_yielded_findings", advancing), \
+                self.assertRaises(style_ledger.LedgerError) as refused:
+            _ = ledger.ticket_yield("proposal-1", self.freed_rename[0])
+        self.assertIn("crates/alpha/src/c.rs holds macro_rules", str(refused.exception))
+        self.assertEqual(calls, [self.git("rev-parse", "HEAD~1"), moved])
+        self.assertEqual(ledger.ticket_open("proposal")[0]["yielded"], ())
 
     def test_repeated_listed_yield_preserves_the_recorded_yield_and_remaining_ownership(self) -> None:
         rule = self.rule("listed", "tier: B\nfamily: names\ninput_scope: file\npre_filter: value\n")
@@ -6807,7 +6991,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = ledger.hold(rule, files[0], 1, "pub fn old() {}", "rename", "old", "new",
                         self.blob(rule), "names-unit-2")
         ledger.record_candidate("names-unit-2", files[0], 1, "Check names in public APIs.")
-        ledger.ticket_yield("names-unit-2", files[1])
+        _ = ledger.ticket_yield("names-unit-2", files[1])
         ledger.wait_for_sync("names-unit")
         ledger.wait_for_sync("types-unit")
         tables = ("tickets", "sync_waits", "rule_candidates", "held_findings", "ticket_yields")
