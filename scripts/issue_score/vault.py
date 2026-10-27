@@ -14,7 +14,7 @@ from .questions import BODY_CHARACTER_LIMIT, GOAL_LABELS, IssueState, PROJECT_AB
 VAULT_ROOT = Path.home() / "rust/hanadocs"
 ISSUES_DIR = VAULT_ROOT / "issues"
 RATING_FIELDS = ("backlog_alignment", "backlog_impact", "backlog_urgency", "backlog_effort")
-LABEL_FIELDS = ("backlog_goal", *RATING_FIELDS, "category", "area")
+LABEL_FIELDS = ("backlog_goal", *RATING_FIELDS, "category", "area", "backlog_score")
 WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
 PROPOSED_RANKING = re.compile(r"^\s*Proposed ranking:.*$", re.MULTILINE)
 
@@ -26,6 +26,7 @@ class Issue:
     project: str
     body: str
     labels: dict[str, str]
+    is_style: bool = False
 
 
 @dataclass(frozen=True)
@@ -57,7 +58,7 @@ class VaultDocument:
     def issue(self) -> Issue:
         return Issue(self.path, self.value("title") or self.path.stem,
                      plain(self.value("project")), self.body,
-                     {key: plain(self.value(key)) for key in LABEL_FIELDS})
+                     {key: plain(self.value(key)) for key in LABEL_FIELDS}, self.is_style)
 
 
 def _unquote(value: str) -> str:
