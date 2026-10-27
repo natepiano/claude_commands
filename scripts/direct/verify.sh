@@ -53,7 +53,9 @@
 # that differs from HEAD, so one lint record answers for each package. A
 # `test` key holds only the part of the tree its package is built from
 # (TREE_KEY_PY), so a second phase editing another member in the same worktree
-# neither drops the pass nor misses it. A `test --filter` key holds its names
+# neither drops the pass nor misses it. No key holds the files under the
+# session folder (--session-dir, UNIT_RUN_DIR) when it is inside the worktree:
+# the call writes its own log and board there while it runs. A `test --filter` key holds its names
 # sorted, each once, so one set of names finds one record whatever order a call
 # gives them in. The same call on the
 # same tree then prints that record and its log and exits 0 without the cargo
@@ -538,10 +540,18 @@ if package:
 # session working in it. Same paths: staged, unstaged, deleted, untracked.
 top = run("git", "--no-optional-locks", "rev-parse", "--show-toplevel").strip()
 status = run("git", "--no-optional-locks", "-C", top, "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames")
-changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3})
+real_top = os.path.realpath(top)
+# The session folder of this run, when it is inside the worktree: verify.sh writes
+# its log and board there while the command runs, so they are not tree changes.
+own = tuple(
+    folder + b"/" for folder in (
+        os.path.relpath(os.path.realpath(os.fsencode(name)), real_top)
+        for name in {os.environ.get("UNIT_SESSION_DIR", ""), os.environ.get("UNIT_RUN_DIR", "")} if name
+    ) if not folder.startswith(b"..") and folder != b"."
+)
+changed = sorted({entry[3:] for entry in status.split(b"\0") if len(entry) > 3 and not entry[3:].startswith(own)})
 if package:
     built, members = package_roots(package)
-    real_top = os.path.realpath(top)
 
     def counts(path: bytes) -> bool:
         full = os.path.join(real_top, path)
