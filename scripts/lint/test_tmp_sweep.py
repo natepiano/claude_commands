@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -249,6 +250,46 @@ class TempFolderTests(TmpSweepCase):
         self.assertEqual(result.kept[tmp_sweep.IN_USE], [f"{used}: pid 10 works in it"])
         kept = [path for paths in result.kept.values() for path in paths]
         self.assertFalse([path for path in kept if any(str(other) in path for other in others)])
+
+    def test_any_owned_folder_in_the_wide_root_goes_after_seven_idle_days(self) -> None:
+        wide = self.tmp.parent / "wide"
+        leftover = write(wide / "mend-config-root-test-179035" / "a").parent
+        tempfile_folder = write(wide / "tmp.johjtSnxbj" / "a").parent
+        used = write(wide / "tui_pane_theme_loader_badparse_0_1" / "a").parent
+        fake_process(self.proc, 11, cwd=str(used))
+        kept = [write(wide / "tmux-1000" / "default").parent, write(wide / ".X11-unix" / "X0").parent,
+                write(wide / "systemd-private-abc" / "tmp" / "a").parent.parent]
+        holder = write(wide / "holder" / "-proj" / "s" / "a").parent.parent.parent
+        listening = wide / "server"
+        listening.mkdir()
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(str(listening / "s"))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (str(holder),), (str(wide),), (),
+                                        (str(wide),))
+        early = tmp_sweep.sweep(False, roots, time.time() + 6 * DAY, str(self.proc))
+        def wide_deleted(result: tmp_sweep.Sweep) -> list[str]:
+            return [entry["path"] for entry in result.deleted if Path(entry["path"]).parent == wide]
+
+        self.assertEqual(wide_deleted(early), [str(tempfile_folder)])
+        self.assertEqual(early.kept[tmp_sweep.RECENT_WIDE], [str(leftover)])
+        self.assertEqual(early.kept[tmp_sweep.HOLDS_SOCKET], [str(listening)])
+        late = tmp_sweep.sweep(False, roots, time.time() + 8 * DAY, str(self.proc))
+        self.assertEqual(wide_deleted(late), [str(leftover)])
+        self.assertFalse(leftover.exists())
+        self.assertEqual(late.kept[tmp_sweep.HOLDS_SOCKET], [str(listening)])
+        self.assertEqual(late.kept[tmp_sweep.IN_USE], [f"{used}: pid 11 works in it"])
+        for folder in [*kept, holder, used, listening]:
+            self.assertTrue(folder.exists(), folder)
+        judged = [path.split(":")[0] for paths in late.kept.values() for path in paths]
+        self.assertFalse([folder for folder in [*kept, holder] if str(folder) in judged])
+
+    def test_the_wide_root_is_tmp_alone_and_only_when_it_is_a_temp_folder(self) -> None:
+        temp = self.tmp.parent / "temp"
+        temp.mkdir()
+        self.assertEqual(tmp_sweep.default_roots(str(self.tmp), (), (), (str(temp),), ()).wide, ())
+        self.assertEqual(tmp_sweep.default_roots(str(self.tmp), (), (), ("/tmp",), ()).wide,
+                         (os.path.realpath("/tmp"),))
 
     def test_roots_are_real_paths(self) -> None:
         """The Mac's /tmp is a link to /private/tmp, and lsof prints real paths."""

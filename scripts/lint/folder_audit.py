@@ -2,7 +2,7 @@
 """Find loose folders in ~/rust, /tmp, /tmp/claude and $TMPDIR once a day, and tell their makers.
 
 The scratch guard refuses most loose folders before they exist and the hourly tmp sweep removes
-idle ones under /tmp; this audit catches the rest, ~/rust above all, where nothing is swept. A
+idle ones under /tmp (any folder there after 7 idle days); this audit catches the rest, ~/rust above all, where nothing is swept. A
 folder is loose when it is none of these:
 
   * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or the
@@ -31,13 +31,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from tmp_sweep import TEMPFILE_NAME
+from tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
 
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 MIN_AGE_SECONDS = 24 * 3600
-KEPT_NAMES = frozenset({"claude", "unit", "delegate", "scratch", ".X11-unix", ".ICE-unix", ".XIM-unix",
-                        ".font-unix", ".Test-unix", "repro"})
-KEPT_PREFIXES = ("systemd-private-", "tmux-", "nix-", "ssh-", "claude-", "com.apple.", "powerlog")
+KEPT_NAMES = SYSTEM_TEMP_NAMES | {"unit", "delegate", "scratch", "repro"}
+KEPT_PREFIXES = SYSTEM_TEMP_PREFIXES
 RG_FILES_PER_CALL = 500
 # A session counts as a maker only where one of its own commands names the folder. ripgrep returns
 # each whole JSON "command" string that names a loose folder (the path, then a boundary or the
