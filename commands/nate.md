@@ -59,8 +59,11 @@ The user receives:
 Title: <sender> <title>
 Description: <description>
 
-<template>
+Sent by: <sender>
+Template: nate.<template>
 ```
+
+Every push ends with these `Sent by` and `Template` lines; a push with no text id shows `Template: none (free text)`.
 
 ## silence
 

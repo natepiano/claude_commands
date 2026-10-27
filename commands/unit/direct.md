@@ -288,7 +288,8 @@ The closed list:
   refusal with `send.py --to user --text-id auto_mode.refused` and its `--value`s (`send.py --help`),
   and to a wait for the user to type a go with `send.py --to user --text-id session.needs_go`.
   An update to an earlier user push on the same subject reuses that push's `--key`,
-  so silence keeps only the newest.
+  so silence keeps only the newest. A `--need blocked` push with a live earlier one
+  on its key is skipped: first `send.py retire --to user --from <sender> --key <key>`.
 - **done** — <RunSummary/> has been emitted.
 
 Nothing else authorizes a turn end, however complete it feels:

@@ -16,6 +16,11 @@ The keys are in KEYS_FILE (PUSHOVER_USER, PUSHOVER_TOKEN; 0600, filled in by the
 user). Nothing here prints them. (user, 2026-10-05) Each LOG_FILE JSON line
 holds the local time, source, priority, posted title and message, and outcome.
 
+Every posted push ends with two lines, after the review: "Sent by: <sender>" and, last,
+"Template: <text id>", or "Template: none (free text)" for a push with no --text-id. The
+sender is the source; "send.py in hana" shows as "hana". A long body is cut so the two lines
+always fit. A push with no sender is refused and nothing is posted.
+
 While the user's silence is on (silence.py), a push below priority 2 is kept,
 not posted: it prints "pushover: kept: silence until ..." and exits 0, and
 `silence.py off` posts it later. A kept push with the same --key from the same
@@ -59,6 +64,10 @@ TITLE_MAX = 250
 MESSAGE_MAX = 1024
 ACTION_TEXT_MAX = MESSAGE_MAX - len("Action: ") - 1
 TIMEOUT_S = 15
+SOURCE_MAX = 80
+# send.py's default_sender: the Claude session that ran send.py follows this prefix.
+SESSION_SOURCE = "send.py in "
+FREE_TEXT = "none (free text)"
 USAGE = "usage: pushover.py [--priority 0|1|2] [--source NAME] [--key KEY] [--answerable] (--action TEXT | --no-action) TITLE MESSAGE"
 CANCEL_USAGE = "usage: pushover.py cancel [--source NAME] KEY"
 
@@ -151,7 +160,12 @@ def parent_source() -> str:
         ).stdout.strip()
     except OSError:
         found = ""
-    return (found or f"parent pid {os.getppid()}")[:80]
+    return (found or f"parent pid {os.getppid()}")[:SOURCE_MAX]
+
+
+def sender_name(source: str) -> str:
+    """The "Sent by" name: the session for a send.py source, else the source, on one line."""
+    return " ".join(source.removeprefix(SESSION_SOURCE).split())[:SOURCE_MAX]
 
 
 def log(source: str, priority: str, title: str, message: str, outcome: str) -> None:
@@ -370,14 +384,15 @@ def send(argv: list[str], keys_file: Path = KEYS_FILE, post: Post = http_post) -
         if not isinstance(found, review.LiveHold):
             completion: review.ClaimDelivery = review.ClaimCancelled()
         else:
-            completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header, key=key))
+            completion = review.post_claim(found.hold, lambda: deliver(version, keys_file, post, detail=detail, header=header,
+                                                                             key=key, text_id=arguments["text_id"]))
         if isinstance(completion, review.ClaimCancelled):
             review.log_review(draft, outcome, detail="claim cancelled before posting")
             print("pushover: replaced: a newer version replaced this push; nothing was sent")
             return 5
         code = completion.code if isinstance(completion, review.ClaimFailed) else 0
     else:
-        code = deliver(version, keys_file, post, detail=detail, header=header, key=key)
+        code = deliver(version, keys_file, post, detail=detail, header=header, key=key, text_id=arguments["text_id"])
     delivery = review.Sent(version) if code == 0 else review.NotSent()
     review.log_review(draft, outcome, delivery, detail=detail, text_id=arguments["text_id"])
     if code == 0 and send_anyway:
@@ -405,7 +420,7 @@ def request_template_fix(record: ReviewedPushRecord) -> None:
 
 
 def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
-            post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "") -> int:
+            post: Post = http_post, *, detail: str = "", header: bool = True, key: str = "", text_id: str = "") -> int:
     """Post an already reviewed version, including expiry sends; do not review again.
 
     During silence a non-empty `key` makes the kept push replace an older kept one from the same source.
@@ -414,25 +429,33 @@ def deliver(draft: review.Draft, keys_file: Path = KEYS_FILE,
     message = posted_message(draft.action, draft.body, draft.session, header=header)
     if priority != "2":
         kept = silence.keep({"source": source, "priority": priority, "title": title,
-                             "message": message, "detail": detail, "key": key},
+                             "message": message, "detail": detail, "key": key, "text_id": text_id},
                             deliver=lambda push: post_kept(push, keys_file, post))
         if isinstance(kept, silence.Kept):
             log(source, priority, title, message, f"kept: silence {kept.until}" + (f", {detail}" if detail else ""))
             print(f"pushover: kept: silence {kept.until}")
             return 0
-    return post_message(source, priority, title, message, keys_file, post, detail, key)
+    return post_message(source, priority, title, message, keys_file, post, detail, key, text_id)
 
 
 def post_kept(push: silence.KeptPush, keys_file: Path = KEYS_FILE, post: Post = http_post) -> int:
     """Post a push kept during silence, exactly as it was kept."""
     detail = ", ".join(part for part in ("kept during silence", push["detail"]) if part)
     return post_message(push["source"], push["priority"], push["title"], push["message"], keys_file, post, detail,
-                        push["key"])
+                        push["key"], push["text_id"])
 
 
 def post_message(source: str, priority: str, title: str, message: str,
-                 keys_file: Path, post: Post, detail: str, key: str = "") -> int:
+                 keys_file: Path, post: Post, detail: str, key: str = "", text_id: str = "") -> int:
+    """Every push to the phone goes out here, with its "Sent by" and "Template" lines last."""
     suffix = f", {detail}" if detail else ""
+    sender = sender_name(source)
+    if not sender:
+        log(source, priority, title, message, f"{REFUSED_BEFORE_SENDING}: no sender" + suffix)
+        print(f"pushover: {REFUSED_BEFORE_SENDING}: no sender. Name the sender with --source NAME.", file=sys.stderr)
+        return 2
+    footer = f"\n\nSent by: {sender}\nTemplate: {text_id or FREE_TEXT}"
+    message = message[:MESSAGE_MAX - len(footer)].rstrip() + footer
     keys = read_keys(keys_file)
     if keys is None:
         log(source, priority, title, message, "keys missing" + suffix)

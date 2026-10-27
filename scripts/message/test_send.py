@@ -15,7 +15,7 @@ import tempfile
 import time
 import unittest
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest import mock
@@ -27,6 +27,7 @@ import rca
 import review
 import push_texts
 import postmaster
+import silence
 from test_postmaster import FakeClock
 import codex_daemon
 import record as shutdown_record
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 else:
     from scripts.accounts import accounts
 from test_support import ShutdownTestCase, ShutdownSendLeaf
+from user_zone import user_zone
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
 
 
@@ -417,6 +419,86 @@ class SendTests(ShutdownTestCase):
         with mock.patch.object(send, "now", return_value=later):
             self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "four").outcome, "sent")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "skipped", "sent", "sent"])
+
+    @staticmethod
+    def emergency(*extra: str) -> list[str]:
+        return ["--here", "--to", "user", "--from", "hana", "--summary", "GitHub credentials are cold", "--need", "blocked",
+                "--action", "Run github-warmup on natedev", "--text", "The push waits.", *extra]
+
+    def emergency_at(self, at: datetime, *extra: str) -> send.Result:
+        with mock.patch.object(send, "now", return_value=at):
+            return send.send(send.parse(self.emergency(*extra)))
+
+    def test_a_repeat_of_an_emergency_push_is_skipped_while_the_first_is_live(self) -> None:
+        sent = datetime(2026, 10, 27, 15, 26, 37, tzinfo=timezone.utc)
+        zone = user_zone()
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(self.emergency_at(sent, "--key", "github-cold").outcome, "sent")
+            with mock.patch.object(send, "now", return_value=sent + timedelta(seconds=23)), \
+                 redirect_stdout(io.StringIO()) as output:
+                code = send.main(self.emergency("--key", "github-cold"))
+        self.assertEqual(code, 0)
+        self.assertEqual(channel.call_count, 1)
+        self.assertEqual(output.getvalue(), (
+            f"SKIPPED: an emergency push with key github-cold went to the user at {sent.astimezone(zone):%H:%M:%S %Z}"
+            + f" and is still live until {(sent + timedelta(hours=3)).astimezone(zone):%H:%M:%S %Z}; to send a new one,"
+            + " retire it first: send.py retire --to user --from hana --key github-cold\n"))
+
+    def test_an_emergency_push_with_no_key_takes_one_from_its_sender_and_title(self) -> None:
+        sent = send.now()
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual(self.emergency_at(sent).outcome, "sent")
+            self.assertEqual(self.emergency_at(sent + timedelta(seconds=23)).outcome, "skipped")
+        self.assertEqual(channel.call_count, 1)
+        key = send.user_emergency_key("hana", "GitHub credentials are cold")
+        self.assertRegex(key, r"^user-emergency:hana:[0-9a-f]{12}$")
+        self.assertEqual([entry["key"] for entry in self.log()], [key, key])
+        command = cast(list[str], channel.call_args.args[0])
+        self.assertEqual(command[command.index("--key") + 1], key)
+
+    def test_after_a_retire_or_the_push_lifetime_an_emergency_push_with_the_key_goes_out(self) -> None:
+        sent = send.now()
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel,
+              mock.patch.object(silence, "drop", return_value=0), redirect_stdout(io.StringIO())):
+            self.assertEqual(self.emergency_at(sent, "--key", "github-cold").outcome, "sent")
+            self.assertEqual(send.main(["retire", "--to", "user", "--from", "hana", "--key", "github-cold"]), 0)
+            self.assertEqual(self.emergency_at(sent + timedelta(seconds=30), "--key", "github-cold").outcome, "sent")
+            lifetime = send.emergency_lifetime()
+            self.assertEqual(self.emergency_at(sent + lifetime, "--key", "github-cold").outcome, "skipped")
+            self.assertEqual(self.emergency_at(sent + timedelta(seconds=30) + lifetime, "--key", "github-cold").outcome,
+                             "sent")
+        # Two pushes, the retire's cancel, and the push after the lifetime.
+        self.assertEqual(channel.call_count, 4)
+
+    def test_an_emergency_push_that_did_not_go_out_does_not_skip_its_resend(self) -> None:
+        sent = send.now()
+        with mock.patch.object(send, "run", return_value=(1, "", "pushover: could not reach Pushover\n")):
+            self.assertEqual(self.emergency_at(sent, "--key", "github-cold").outcome, "failed")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(self.emergency_at(sent + timedelta(seconds=23), "--key", "github-cold").outcome, "sent")
+
+    def test_an_explicit_repeat_window_wins_over_the_emergency_lifetime(self) -> None:
+        sent = send.now()
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")):
+            self.assertEqual(self.emergency_at(sent, "--key", "k", "--repeat-minutes", "1").outcome, "sent")
+            inside = self.emergency_at(sent + timedelta(seconds=30), "--key", "k", "--repeat-minutes", "1")
+            self.assertEqual(self.emergency_at(sent + timedelta(minutes=2), "--key", "k", "--repeat-minutes", "1").outcome,
+                             "sent")
+        self.assertEqual(inside, send.Result("skipped", f"key 'k' last sent to user at {sent.isoformat()}, inside its 1-minute window"))
+
+    def test_a_note_to_the_user_with_one_key_has_no_window_without_repeat_minutes(self) -> None:
+        note = ["--here", "--to", "user", "--from", "hana", "--summary", "Build done", "--key", "build", "--no-action",
+                "--text", "The build passed."]
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            self.assertEqual([send.send(send.parse(note)).outcome for _ in range(2)], ["sent", "sent"])
+        self.assertEqual(channel.call_count, 2)
+
+    def test_a_remote_emergency_push_holds_its_window_on_this_host_only(self) -> None:
+        with mock.patch.object(send, "run", return_value=(0, "SENT: to the user\n", "")) as run:
+            self.assertEqual(send.send(send.parse(self.emergency()[1:] + ["--machine", "mac"])).outcome, "sent")
+        forwarded = shlex.split(cast(list[str], run.call_args.args[0])[-1])
+        self.assertEqual(forwarded[forwarded.index("--repeat-minutes") + 1], "0")
+        self.assertEqual(forwarded[forwarded.index("--key") + 1], send.user_emergency_key("hana", "GitHub credentials are cold"))
 
     def test_log_keeps_full_text_for_every_outcome(self) -> None:
         sent = "sent heading\nsent detail"
@@ -1195,9 +1277,12 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 "--action", "free disk space", "--text", "full"]
         with mock.patch.object(send, "run", channel):
             self.assertEqual(send.send(local_options(told)), send.Result("sent", "to the user"))
+            # Another title is another event: the first emergency push does not skip it.
+            told[told.index("natedev: disk")] = "natedev: memory"
             self.assertEqual(send.send(local_options(told)).outcome, "failed")
-        self.assertEqual(commands[0][2:], ["--priority", "2", "--source", "test", "--action", "free disk space",
-                                           "natedev: disk", "full"])
+        self.assertEqual(commands[0][2:], ["--priority", "2", "--source", "test",
+                                           "--key", send.user_emergency_key("test", "natedev: disk"),
+                                           "--action", "free disk space", "natedev: disk", "full"])
         self.assertEqual(self.relayed, [])
         self.assertEqual(send.pending("user"), "")
         self.assertEqual([entry["to"] for entry in self.log()], ["user", "user"])
