@@ -403,7 +403,8 @@
     "command": "statusline=\"$HOME/.claude/scripts/statusline\"; . \"$statusline/statusline.sh\""
   },
   "enabledPlugins": {
-    "rust-analyzer-lsp@claude-plugins-official": false
+    "rust-analyzer-lsp@claude-plugins-official": false,
+    "typesafe@typesafe-ai": true
   },
   "sandbox": {
     "enabled": false,

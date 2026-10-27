@@ -1499,6 +1499,22 @@ def trust_command(folder: Path, selected: ClaudeLaunchAccount) -> str:
     return f"cd {shlex.quote(str(folder))} && {prefix} claude"
 
 
+def trust_sources(target_dir: Path, source_dir: Path | None) -> list[tuple[str, Path]]:
+    """Every other account's trust file on this machine, the session's own source account first.
+
+    `herdr.heal_claude_trust` copies a folder's trust from the first of them that has it.
+    """
+    home = (accounts_home() / ".claude").resolve()
+    candidates = [NamedAccount(source_dir.name.removeprefix("."), source_dir)] if source_dir is not None else []
+    candidates.extend(_existing_named_accounts())
+    sources: dict[Path, tuple[str, Path]] = {}
+    for named in candidates:
+        directory = named.dir.resolve()
+        if directory != target_dir.resolve() and directory not in sources:
+            sources[directory] = (named.label, accounts_home() / ".claude.json" if directory == home else named.dir / ".claude.json")
+    return list(sources.values())
+
+
 def launch_prefix(role: str) -> str:
     """Return the shell assignment needed before launching this role."""
     return account_prefix(role_account(role))

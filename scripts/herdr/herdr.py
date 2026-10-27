@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -1042,16 +1043,6 @@ class Herdr:
             raise HerdrFailure(f"several panes ({found.count}) for label {label!r}")
         return found.pane_id
 
-    def open_pane(self, label: str, cwd: str, environment: dict[str, str]) -> str:
-        arguments = ["workspace", "create", "--label", label, "--cwd", cwd]
-        for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
-            arguments.extend(["--env", f"{key}={value}"])
-        result = self.result(*arguments, "--no-focus")
-        root_pane = json_object(result.get("root_pane"), "herdr workspace root pane")
-        pane = json_text(root_pane.get("pane_id"), "herdr workspace root pane id")
-        _ = self.run("pane", "rename", pane, label)
-        return pane
-
     def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
         """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first.
 
@@ -1756,6 +1747,37 @@ def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Unt
     return Trusted(folder, target, granted.project_key)
 
 
+@dataclass(frozen=True)
+class TrustCopied:
+    """The target account lacked trust for the folder, and the account `source` had it."""
+
+    folder: Path
+    account_file: Path
+    source: str
+
+
+def heal_claude_trust(
+    folder: Path, target: Path, sources: Sequence[tuple[str, Path]], *, dry_run: bool,
+) -> Trusted | TrustCopied | Untrusted | UnreadableTrustFile:
+    """Give the target account file the trust the first trusting source already gave this folder.
+
+    `sources` pairs each account's label with its account file, in the order to try. The copy is
+    `copy_claude_trust`'s one key; a dry run copies nothing. With no trusting source, the target's
+    own `Untrusted` comes back, and the user accepts trust once.
+    """
+    present = claude_trust(folder, target)
+    if not isinstance(present, Untrusted):
+        return present
+    for label, source in sources:
+        if not isinstance(claude_trust(folder, source), Trusted):
+            continue
+        if dry_run:
+            return TrustCopied(present.folder, target, label)
+        copied = copy_claude_trust(folder, source, target)
+        return TrustCopied(present.folder, target, label) if isinstance(copied, Trusted) else copied
+    return present
+
+
 def repository_root(directory: Path) -> Path:
     return _repository_key(directory, "--show-toplevel")
 
@@ -1940,15 +1962,13 @@ def _server_start_failure(name: str) -> HerdrFailure:
     return HerdrFailure(message)
 
 
-def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
+def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
     from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
     try:
         if server_answering(run_program(client.argv("status", "server"),
                                         timeout=max(0.001, deadline - time.monotonic()))):
-            if exclusive:
-                raise SessionTaken(client.session)
             return ServerAdopted()
     except subprocess.TimeoutExpired:
         pass
@@ -1979,8 +1999,6 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
                              output=DiscardOutput(), environment=ExplicitEnvironment(unmarked_environment()))
     except DetachedChildExited as error:
         if holders and holders != {error.pid}:
-            if exclusive:
-                raise SessionTaken(client.session) from error
             return ServerAdopted()
         raise _server_start_failure(client.session) from error
     except (DetachedStartFailure, HerdrFailure) as error:
@@ -1991,8 +2009,6 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        if exclusive:
-            raise SessionTaken(client.session)
         return ServerAdopted()
     _clear_restored_workspaces(client)
     return ServerCreated()
@@ -2005,7 +2021,7 @@ def start_server(name: str, timeout_ms: int, *,
     _timeout(timeout_ms)
     herdr = Herdr(name)
     if _platform() == "darwin":
-        return _start_darwin_server(herdr, timeout_ms, exclusive=False,
+        return _start_darwin_server(herdr, timeout_ms,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
     deadline = time.monotonic() + timeout_ms / 1000
     try:
@@ -2031,59 +2047,13 @@ def start_server(name: str, timeout_ms: int, *,
             time.sleep(min(0.1, remaining))
 
 
-def start_new_server(name: str, timeout_ms: int, *,
-                     session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> None:
-    """Create an exclusive server; never adopt a server another launch started."""
-    _validate_session_name(name)
-    _require_shared(name)
-    _timeout(timeout_ms)
-    herdr = Herdr(name)
-    if _platform() == "darwin":
-        _ = _start_darwin_server(herdr, timeout_ms, exclusive=True,
-            session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
-        return
-    deadline = time.monotonic() + timeout_ms / 1000
-    try:
-        if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
-            raise SessionTaken(name)
-    except subprocess.TimeoutExpired:
-        pass
-    created = _submit_server(herdr)
-    if created.returncode:
-        detail = (created.stdout + created.stderr).lower()
-        if "already exists" in detail or "already loaded" in detail:
-            raise SessionTaken(name)
-        require_success(created, f"start {server_unit(name)}")
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise HerdrFailure(f"server {name} not answering after {timeout_ms} ms")
-        try:
-            if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, remaining))):
-                if not _server_unit_active(name):
-                    raise SessionTaken(name)
-                _clear_restored_workspaces(herdr)
-                return
-        except subprocess.TimeoutExpired:
-            pass
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(0.1, remaining))
-
-
-def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
-                   exclusive: bool) -> ServerCreated | ServerAdopted | WindowServerCreated:
+def restore_server(name: str, timeout_ms: int, *,
+                   session_kind: SecuritySession) -> ServerCreated | ServerAdopted | WindowServerCreated:
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
     _validate_session_name(name)
     _require_shared(name)
     _timeout(timeout_ms)
     if _platform() != "darwin" or isinstance(session_kind, DesktopSession):
-        if exclusive:
-            if _platform() == "darwin":
-                start_new_server(name, timeout_ms, session_kind=session_kind)
-            else:
-                start_new_server(name, timeout_ms)
-            return ServerCreated()
         if _platform() == "darwin":
             return start_server(name, timeout_ms, session_kind=session_kind)
         return start_server(name, timeout_ms)
@@ -2092,8 +2062,6 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
     try:
         if server_answering(run_program(client.argv("status", "server"),
                                         timeout=max(0.001, deadline - time.monotonic()))):
-            if exclusive:
-                raise SessionTaken(name)
             return ServerAdopted()
         # An existing listener that has not answered yet is also another launch's.
         if any(item.path == _session_socket(name) for item in _darwin_bound_sockets(
@@ -2119,13 +2087,6 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
     except (OSError, subprocess.SubprocessError, HerdrFailure) as error:
         raise MacDesktopUnavailable() from error
     raise MacDesktopUnavailable()
-
-
-def stop_created_server(name: str, ownership: ServerCreated | ServerAdopted | WindowServerCreated) -> None:
-    """Only directly created servers are ours to stop; desktop windows stay open."""
-    if isinstance(ownership, (ServerAdopted, WindowServerCreated)):
-        return
-    stop_session(name)
 
 
 def shared_session() -> str:
@@ -2203,10 +2164,6 @@ def stop_session(name: str) -> None:
             command = [os.environ.get("SYSTEMCTL", "systemctl"), "--user", "stop", server_unit(name)]
             require_success(run_program(command), f"stop {server_unit(name)}")
     require_success(result, f"stop herdr session {name}")
-
-
-def open_pane(name: str, label: str, cwd: str, environment: dict[str, str]) -> str:
-    return Herdr(name).open_pane(label, cwd, environment)
 
 
 def _proc_root() -> Path:

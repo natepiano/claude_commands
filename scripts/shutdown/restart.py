@@ -357,6 +357,7 @@ class ManualRestartRequired:
 class FailedSessionRestart:
     name: str
     reason: str
+    trust_command: str = ""  # set when no account trusts the folder; a retry fails until the user runs it
 
 
 @dataclass(frozen=True)
@@ -757,7 +758,7 @@ def herdr_space(session: Session) -> str:
 
 
 class HerdrDestinationTaken(OSError):
-    """An exclusive launch found an occupied destination, before opening a pane."""
+    """A desktop restart found another launch's server listener, before opening a pane."""
 
 
 def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "", probe: bool = False, source_fallback: bool = False) -> ResumeParts:
@@ -1111,6 +1112,30 @@ def _holds_live_agent(client: herdr.Herdr, destination: HerdrDestination) -> boo
         time.sleep(min(SESSION_POLL_SECONDS, remaining))
 
 
+class FolderNotTrusted(OSError):
+    """No account on this machine trusts the session's folder; `command` is the user's one-time fix."""
+
+    def __init__(self, reason: str, command: str) -> None:
+        super().__init__(f"{reason}. Run: {command}")
+        self.command: str = command
+
+
+def _heal_folder_trust(session: Session, folder: Path, config_dir: Path, *, dry_run: bool) -> None:
+    """Copy the folder's trust from another account on this machine, or raise `FolderNotTrusted`."""
+    from scripts.accounts import accounts
+
+    recorded = session.get("config_dir")
+    sources = accounts.trust_sources(config_dir, Path(recorded) if recorded else None)
+    trust = herdr.heal_claude_trust(folder, config_dir / ".claude.json", sources, dry_run=dry_run)
+    target = config_dir.name.removeprefix(".")
+    if isinstance(trust, herdr.TrustCopied):
+        copied = "would copy" if dry_run else "copied"
+        print(f"{session['name']}: {copied} folder trust for {folder} from {trust.source} to {target}")
+    elif isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
+        reason = str(trust) if isinstance(trust, herdr.UnreadableTrustFile) else f"{folder}: Claude has not trusted this folder"
+        raise FolderNotTrusted(reason, accounts.trust_command(folder, accounts.NamedAccount(target, config_dir)))
+
+
 def _herdr_launch(
     parts: ResumeParts, destination: HerdrDestination, session: Session, *, dry_run: bool,
     session_kind: herdr.SecuritySession | herdr.SessionKindNotRead = _SESSION_KIND_NOT_READ,
@@ -1131,25 +1156,16 @@ def _herdr_launch(
         environment = dict(parts.environment)
         environment = {**named_account_environment(parts.account.config_dir), **environment}
     name = destination.name
+    config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
+    _heal_folder_trust(session, Path(parts.cwd), config_dir, dry_run=dry_run)
     if dry_run:
         location = (destination.pane_id if isinstance(destination, RecordedHerdrPane)
                     else f"a new tab in {herdr_space(session)}")
         print(f"herdr {name}: resume {session['session_id']} in {location}")
         return HerdrLaunch(herdr.ServerAdopted(), herdr.PromptNotSubmitted("dry run"))
     try:
-        from scripts.accounts.accounts import NamedAccount, trust_command
-
-        config_dir = Path(environment["CLAUDE_CONFIG_DIR"])
-        claude_json = config_dir / ".claude.json"
-        trust = herdr.claude_trust(Path(parts.cwd), claude_json)
-        if isinstance(trust, (herdr.Untrusted, herdr.UnreadableTrustFile)):
-            account = NamedAccount(config_dir.name.removeprefix("."), config_dir)
-            reason = (str(trust) if isinstance(trust, herdr.UnreadableTrustFile)
-                      else f"{parts.cwd}: Claude has not trusted this folder")
-            raise OSError(f"{reason}. Run: {trust_command(Path(parts.cwd), account)}")
         server = herdr.restore_server(name, 90_000,
-            session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind,
-            exclusive=False)
+            session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind)
         server_environment = herdr.server_environment(name)
         for variable in sorted(unset_variables):
             if variable in server_environment:
@@ -1699,10 +1715,13 @@ def _dry_run_entry_order(record: SessionShutdown) -> tuple[int, str]:
 def mark_restart_failed(
     record: SessionShutdown,
     reason: str,
+    *,
+    trust_command: str = "",
 ) -> None:
-    _ = _set_entry_progress(record, SessionRestartFailed(
-        kind="restart failed", at=settle.record_time(), reason=reason,
-    ))
+    progress = SessionRestartFailed(kind="restart failed", at=settle.record_time(), reason=reason)
+    if trust_command:
+        progress["trust_command"] = trust_command
+    _ = _set_entry_progress(record, progress)
 
 
 def _launch_failure_left_session_live(
@@ -1789,6 +1808,30 @@ def _launch_recovery_record(
         if isinstance(permission, restore_permission.ShutdownStateUnreadable):
             raise OSError("shutdown state unreadable: " + permission.detail)
         return _launch_session(launch_record, note, desktop_state, dry_run=False)
+
+
+def _folder_exists(folder: str) -> bool:
+    return Path(folder).is_dir()
+
+
+def drop_restore_without_folder(record: SessionShutdown, *, dry_run: bool) -> bool:
+    """True when the session's folder is gone, and archive its record.
+
+    No launch, user step or retry can bring that session back, so it never holds the account's
+    restart and never sends a push. History keeps the cause as the record's last progress.
+    """
+    folder = record["session"]["cwd"]
+    if record["progress"]["kind"] == "restarted" or _folder_exists(folder):
+        return False
+    reason = f"folder {folder} no longer exists; restore dropped"
+    print(f"{record['session']['name']}: {reason}")
+    if not dry_run:
+        mark_restart_failed(record, reason)
+        try:
+            archive_session(record["login"], record["session"]["session_id"])
+        except NoLiveRecord:
+            pass
+    return True
 
 
 def _retarget_move_claim(saved: SessionShutdown, target: str) -> None:
@@ -1996,6 +2039,14 @@ def launch_entry(
         else:
             mark_restart_failed(record, str(error))
         return EntrySettled()
+    except FolderNotTrusted as error:
+        # Nothing launched, and a retry refuses the same way until the user accepts trust once.
+        # No account on this machine trusts the folder, the source included, so no source fallback is tried.
+        if dry_run:
+            print(f"{session['name']} restart failed: {_error_reason(error)}")
+        else:
+            mark_restart_failed(record, _error_reason(error), trust_command=error.command)
+        return EntrySettled()
     except (accounts.AccountsError, OSError, subprocess.SubprocessError) as error:
         if dry_run:
             print(f"cannot restart {session['name']}: {_error_reason(error)}")
@@ -2141,7 +2192,8 @@ def _machine_result(records: list[SessionShutdown], machine: str, label: str) ->
     incomplete = [item for item in records if item["progress"]["kind"] != "restarted"
                   and not restart_failed_session_running(item)]
     failed = tuple(
-        FailedSessionRestart(item["session"]["name"], item["progress"]["reason"])
+        FailedSessionRestart(item["session"]["name"], item["progress"]["reason"],
+                             item["progress"].get("trust_command", ""))
         for item in incomplete if item["progress"]["kind"] == "restart failed"
     )
     manual = tuple(
@@ -2175,7 +2227,8 @@ def _result_lines(result: MachineRestartResult) -> list[str]:
         )
     ]
     lines.extend(
-        f"{result.machine}: {item.name} restart failed: {item.reason}"
+        f"{result.machine}: {item.name} needs folder trust: {item.trust_command}" if item.trust_command
+        else f"{result.machine}: {item.name} restart failed: {item.reason}"
         for item in result.failed_sessions
     )
     lines.extend(
@@ -2458,7 +2511,7 @@ def _launch_codex_snapshot(
     if dry_run:
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in a new tab in {herdr_space(owner)}")
         return SessionLaunched()
-    server = herdr.restore_server(name, 90_000, session_kind=state.session_kind, exclusive=False)
+    server = herdr.restore_server(name, 90_000, session_kind=state.session_kind)
     pane = herdr.open_tab(name, herdr_space(owner), title, owner["cwd"], {"CODEX_HOME": launch["home"]})
     try:
         _ = herdr.start_agent(name, pane, kind="codex", agent=title, agent_arguments=arguments,
@@ -2688,6 +2741,12 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         or (record["progress"]["kind"] == "restarting" and
             (at - datetime.fromisoformat(record["progress"]["at"])).total_seconds() >= CLAIM_STALE_SECONDS)
     ]
+    dropped = {record["session"]["session_id"] for record in eligible if drop_restore_without_folder(record, dry_run=dry_run)}
+    if dropped:
+        eligible = [record for record in eligible if record["session"]["session_id"] not in dropped]
+        records = [record for record in records if record["session"]["session_id"] not in dropped]
+        if not dry_run:
+            all_records = [record for record in all_records if record["session"]["session_id"] not in dropped]
     label = eligible[0]["label"] if eligible else hold_outcome.hold["label"] if isinstance(hold_outcome, AccountHeld) else login
     machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else settle.local_machine()
     if not eligible and not codex_entries:
@@ -3006,14 +3065,32 @@ def move_failed_push(saved: SessionShutdown) -> RenderedPush:
                   source=saved.get("source_label", saved["label"]), target=saved.get("target", ""))
 
 
-def restart_push(label: str, names: list[str], *, machine: str) -> tuple[RenderedPush, ...]:
-    """Render known failed sessions, or the unconfirmed machine when names are unavailable."""
-    if not names:
-        return (render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine),)
+RESTART_CAUSE_LIMIT = 100
 
+
+def restart_cause(reason: str) -> str:
+    """The first line of a failure reason, cut to fit a push."""
+    line = reason.strip().partition("\n")[0].strip() or "no reason recorded"
+    return line if len(line) <= RESTART_CAUSE_LIMIT else line[:RESTART_CAUSE_LIMIT - 1] + "…"
+
+
+def restart_push(label: str, failures: Sequence[FailedSessionRestart], *, machine: str) -> tuple[RenderedPush, ...]:
+    """Render known failed sessions, one cause per push, or the unconfirmed machine when names are unavailable."""
+    if not failures:
+        return (render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine),)
+    by_cause: dict[str, list[str]] = {}
+    for item in failures:
+        by_cause.setdefault(restart_cause(item.reason), []).append(item.name)
+    return tuple(push for cause, names in by_cause.items()
+                 for push in _cause_pushes(label, cause, names, machine=machine))
+
+
+def _cause_pushes(label: str, cause: str, names: list[str], *, machine: str) -> list[RenderedPush]:
+    """Split one cause's sessions across pushes that each fit the phone limits."""
     def named_push(group: list[str]) -> RenderedPush:
         stopped = settle.stopped_sessions_text(len(group)) + " (" + ", ".join(group) + ")"
-        return render("shutdown.restart_failed", account=json.dumps(label), stopped=stopped, machine=machine)
+        return render("shutdown.restart_failed", account=json.dumps(label), stopped=stopped, machine=machine,
+                      cause=cause)
 
     def fits(push: RenderedPush) -> bool:
         return len(push.values["stopped"]) <= 400 and len(push.message) < 500 and len(push.title) < 45
@@ -3034,7 +3111,21 @@ def restart_push(label: str, names: list[str], *, machine: str) -> tuple[Rendere
         group.append(name)
     if group:
         pushes.append(named_push(group))
-    return tuple(pushes)
+    return pushes
+
+
+def untrusted_push(label: str, item: FailedSessionRestart, *, machine: str) -> RenderedPush:
+    """Ask the user to accept folder trust first; a retry before that fails the same way."""
+    def named_push(name: str) -> RenderedPush:
+        return render("shutdown.restart_untrusted", session=name, machine=machine, account=json.dumps(label),
+                      command=item.trust_command)
+
+    push = named_push(item.name)
+    excess = len(push.message) - 499
+    # The command must stay whole to run, so only the session name is shortened.
+    if excess > 0 and len(item.name) > 1:
+        push = named_push(item.name[:max(1, len(item.name) - excess - 1)] + "…")
+    return push
 
 
 def restart(
@@ -3131,27 +3222,37 @@ def restart(
                            and restart_failed_session_running(saved)}
                 failed = [item for item in local.failed_sessions if item.name not in pushed and item.name not in running]
                 manual = [item for item in local.manual_sessions if item.name not in pushed]
-                names = [item.name for item in failed]
-                names.extend(match.group(1) for line in peer["lines"]
-                             if (match := re.match(r"[^:]+: (.+) restart failed:", line)) is not None)
-                local_partial = local.status == "partial" and (failed or manual or not (
+                # A folder no account trusts fails every retry the same way, so it gets the trust push instead.
+                retried = [item for item in failed if not item.trust_command]
+                untrusted = [(local.machine, item) for item in failed if item.trust_command]
+                for line in peer["lines"]:
+                    if match := re.match(r"[^:]+: (.+?) restart failed: (.*)", line):
+                        retried.append(FailedSessionRestart(match.group(1), match.group(2)))
+                    elif match := re.match(r"[^:]+: (.+?) needs folder trust: (.+)", line):
+                        untrusted.append((peer["machine"], FailedSessionRestart(match.group(1), "", match.group(2))))
+                local_partial = local.status == "partial" and (retried or manual or not (
                     local.failed_sessions or local.manual_sessions))
                 machines = [local.machine] if local_partial else []
                 if peer["outcome"] == "partial" or not_reached:
                     machines.append(peer["machine"])
                 # Pending scheduled jobs are reported in the command output; they need no user step.
+                # Manual restarts and folder trust get their own pushes, never a retry.
                 peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
-                    re.match(r"[^:]+: (timer .+ not started:|manual restart |[0-9]+ restarted|restarted [0-9]+|already running; skipped$)", line)
+                    re.match(r"[^:]+: (timer .+ not started:|manual restart |.+? needs folder trust: |[0-9]+ restarted|restarted [0-9]+|already running; skipped$)", line)
                     for line in peer["lines"]))
+                # A move into a folder no account trusts gets the trust push: a move retry fails the same way.
+                # Its retry is this account's restart, which resumes the move on its target.
                 moved = {saved["session"]["name"]: saved for saved in session_records(selected.login)
                          if saved.get("target") and saved["machine"] == local.machine
-                         and saved["session"]["name"] in {item.name for item in failed}}
+                         and saved["session"]["name"] in {item.name for item in failed if not item.trust_command}}
                 for saved in moved.values():
                     settle.alert_user(move_failed_push(saved))
-                names = [name for name in names if name not in moved]
-                if names or not_reached or peer_requires_retry:
-                    for push in restart_push(selected.label, names, machine=" and ".join(machines)):
+                retried = [item for item in retried if item.name not in moved]
+                if retried or not_reached or peer_requires_retry:
+                    for push in restart_push(selected.label, retried, machine=" and ".join(machines)):
                         settle.alert_user(push)
+                for machine, item in untrusted:
+                    settle.alert_user(untrusted_push(selected.label, item, machine=machine))
                 for item in manual:
                     settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
                 _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})
