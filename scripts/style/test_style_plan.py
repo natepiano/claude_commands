@@ -3347,13 +3347,17 @@ class StylePlanTests(unittest.TestCase):
         self.assertNotIn(files[0], output)
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["files"], [files[0]])
 
-    def file_rename_decision(self, rule: str, renames: tuple[tuple[str, str], ...]) -> Path:
-        """An approved decision of file rename findings, each a path and its `Rename <a> to <b>` after."""
+    def file_rename_decision(self, rule: str, renames: tuple[tuple[str, str], ...],
+                             files: tuple[tuple[str, str], ...] = ()) -> Path:
+        """An approved decision of file rename findings, each a path and its `Rename <a> to <b>` after. Files replace or
+        add files at the synced tip."""
         self.write("crates/alpha/src/lib.rs", "mod gauge;\nmod probe;\nmod render;\n")
         self.write("crates/alpha/src/gauge.rs", "pub fn level() {}\n")
         self.write("crates/alpha/src/probe.rs", "pub fn sample() {}\n")
         self.write("crates/alpha/src/render.rs", "pub fn draw() { crate::probe::sample(); }\n")
         self.write(self.sources[1], "pub fn probe() {}\n")
+        for path, text in files:
+            self.write(path, text)
         self.commit_to_every_checkout()
         issue = self.approved_decision(rule, (), "rename")
         with style_ledger.open_ledger(self.repo) as ledger:
@@ -3442,6 +3446,64 @@ class StylePlanTests(unittest.TestCase):
         self.assertIn(f"waiting {issue}: {finding.finding_id} edits crates/alpha/src/gauge.rs, busy\n", output)
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
+    def test_decision_refill_holds_a_file_rename_whose_busy_file_declares_it_by_a_raw_name(self) -> None:
+        issue = self.file_rename_decision(self.rule("read"), (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),),
+                                          (("crates/alpha/src/lib.rs", "mod gauge;\nmod r#probe;\nmod render;\n"),))
+        finding = self.ledger().proposal_findings(issue)[0]
+        output = self.refill_with_busy("crates/alpha/src/lib.rs")
+        self.assertIn(f"waiting {issue}: {finding.finding_id} edits crates/alpha/src/lib.rs, busy\n", output)
+
+    def assert_rename_waits_for_an_uncertain_path(self, path: str, text: str) -> None:
+        """An approved rename of probe.rs, where the file at path has text with a `path` attribute the rename gate cannot
+        read, counts that file as edited and waits while no file is busy."""
+        issue = self.file_rename_decision(self.rule("read"), (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),),
+                                          ((path, text),))
+        finding = self.ledger().proposal_findings(issue)[0]
+        self.assertIn(path, style_plan.EditedFiles(self.repo, self.ledger(), style_plan.NoUnitBranch()).of(finding))
+        output = self.refill_with_busy()
+        self.assertIn(f"waiting {issue}: {finding.finding_id} {path} has a path attribute the rename gate cannot read\n",
+                      output)
+        self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+
+    def test_decision_refill_holds_a_file_rename_declared_by_a_path_attribute_in_an_inline_module(self) -> None:
+        self.assert_rename_waits_for_an_uncertain_path(
+            "crates/alpha/src/lib.rs", 'mod gauge;\nmod render;\nmod shell {\n    #[path = "probe.rs"]\n    mod probe;\n}\n')
+
+    def test_decision_refill_holds_a_file_rename_declared_by_a_cfg_attr_path(self) -> None:
+        self.assert_rename_waits_for_an_uncertain_path(
+            "crates/alpha/src/lib.rs", 'mod gauge;\n#[cfg_attr(test, path = "probe.rs")]\nmod probe;\nmod render;\n')
+
+    def test_decision_refill_holds_a_file_rename_declared_in_a_folder_an_inline_module_mounts(self) -> None:
+        self.assert_rename_waits_for_an_uncertain_path(
+            "crates/alpha/src/lib.rs", 'mod gauge;\nmod render;\n#[path = "."]\nmod shell {\n    mod probe;\n}\n')
+
+    def test_decision_refill_holds_a_file_rename_declared_by_an_escaped_path_string(self) -> None:
+        # The string names probe.rs, but the file does not hold the word probe.
+        self.assert_rename_waits_for_an_uncertain_path(
+            "crates/alpha/src/lib.rs", 'mod gauge;\n#[path = "pro\\u{62}e.rs"]\nmod alias;\nmod render;\n')
+
+    def test_decision_refill_holds_a_file_rename_declared_by_an_escaped_path_string_outside_the_crate(self) -> None:
+        self.assert_rename_waits_for_an_uncertain_path(
+            "crates/alpha/tests/probe_tests.rs", '#[path = "../src/pro\\u{62}e.rs"]\nmod alias;\n')
+
+    def test_refill_drops_a_queued_file_rename_ticket_whose_owner_has_an_uncertain_path(self) -> None:
+        lib = "crates/alpha/src/lib.rs"
+        issue = self.file_rename_decision(self.rule("read"), (("crates/alpha/src/probe.rs", "Rename probe.rs to frame_log.rs"),),
+                                          ((lib, 'mod gauge;\n#[cfg_attr(test, path = "probe.rs")]\nmod probe;\nmod render;\n'),))
+        ledger = self.ledger()
+        finding = ledger.proposal_findings(issue)[0]
+        ledger.ticket_add("names-unit-1", "names-unit", "proposal", "names", "crates/alpha", [finding.path], [self.rule("read")],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        output = self.refill_with_busy()
+        self.assertIn(f"dropped names-unit-1: {lib} has a path attribute the rename gate cannot read\n", output)
+        self.assertIn(f"waiting {issue}: {finding.finding_id} {lib} has a path attribute the rename gate cannot read\n", output)
+        self.assertIsInstance(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
+
+    def test_decision_refill_holds_a_file_rename_whose_own_file_has_an_uncertain_path(self) -> None:
+        # Moving the file moves the folder that the inline module's `path` attribute reads from.
+        self.assert_rename_waits_for_an_uncertain_path(
+            "crates/alpha/src/probe.rs", 'pub fn sample() {}\nmod inner {\n    #[path = "probe/helper.rs"]\n    mod helper;\n}\n')
+
     def owned_module_decision(self, path: str, owner: str, declaration: str,
                               kind: style_ledger.FindingKind = "restructure") -> tuple[Path, str]:
         """An approved decision of one finding on the module file at path, whose owner file starts with declaration at
@@ -3514,6 +3576,13 @@ class StylePlanTests(unittest.TestCase):
     def test_decision_refill_holds_a_restructure_whose_owner_declares_it_by_a_raw_module_name(self) -> None:
         issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
                                                     "#[cfg(test)]\nmod r#startup_tests;\n")
+        output = self.refill_with_busy("crates/alpha/src/terminal.rs")
+        self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/terminal.rs, busy\n", output)
+
+    def test_decision_refill_holds_a_restructure_whose_owner_declares_it_by_an_escaped_path_string(self) -> None:
+        # The string names startup_tests.rs, but the owner does not hold the word startup_tests.
+        issue, finding = self.owned_module_decision("crates/alpha/src/terminal/startup_tests.rs", "crates/alpha/src/terminal.rs",
+                                                    '#[cfg(test)]\n#[path = "terminal/startup\\u{5f}tests.rs"]\nmod tests;\n')
         output = self.refill_with_busy("crates/alpha/src/terminal.rs")
         self.assertIn(f"waiting {issue}: {finding} edits crates/alpha/src/terminal.rs, busy\n", output)
 
@@ -3837,6 +3906,36 @@ class StylePlanTests(unittest.TestCase):
                 result, output = self.reference_gate(ticket)
                 self.assertEqual(result, 1, output)
                 self.assertIn(f"{tests} (change is not an approved rename reference)", output)
+
+    def test_approved_file_rename_reads_a_raw_path_attribute(self) -> None:
+        tests = "crates/alpha/tests/unit_tests.rs"
+        ticket = self.file_rename_ticket(files=((tests, '#[r#path = "../src/ledger/lock.rs"]\nmod lock;\n'),))
+        self.renamed_ledger()
+        self.write(tests, '#[r#path = "../src/ledger/mutation_lock.rs"]\nmod mutation_lock;\n')
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+
+    def test_approved_file_rename_renames_a_raw_module_name_and_keeps_its_prefix(self) -> None:
+        mod_file = "crates/alpha/src/ledger/mod.rs"
+        ticket = self.file_rename_ticket(files=((mod_file, self.LEDGER_MOD.replace("mod lock;", "mod r#lock;")),))
+        self.renamed_ledger()
+        renamed = (self.repo / mod_file).read_text().replace("mod mutation_lock;", "mod r#mutation_lock;")
+        self.write(mod_file, renamed)
+        self.assertEqual(self.reference_gate(ticket), (0, "approved proposal\n"))
+        # The rename changes the name only, so a site that drops its `r#` changes something else.
+        self.write(mod_file, renamed.replace("mod r#mutation_lock;", "mod mutation_lock;"))
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(f"{mod_file} (change is not an approved rename reference)", output)
+
+    def test_approved_file_rename_refuses_a_file_with_a_path_attribute_it_cannot_read(self) -> None:
+        mod_file = "crates/alpha/src/ledger/mod.rs"
+        cfg_path = '#[cfg_attr(test, path = "map_tests.rs")]\nmod map_tests;\n'
+        ticket = self.file_rename_ticket(files=((mod_file, self.LEDGER_MOD + cfg_path),))
+        self.renamed_ledger()
+        self.write(mod_file, (self.repo / mod_file).read_text() + cfg_path)
+        result, output = self.reference_gate(ticket)
+        self.assertEqual(result, 1, output)
+        self.assertIn(f"{mod_file} (change is not an approved rename reference)", output)
 
     def test_approved_file_rename_refuses_a_path_attribute_that_names_another_file(self) -> None:
         tests = "crates/alpha/tests/unit_tests.rs"

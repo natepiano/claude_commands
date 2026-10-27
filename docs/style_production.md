@@ -697,6 +697,15 @@ file that holds the old name; for a restructure of a `.rs` file, a file whose
 whose `path` attribute the planner cannot read with certainty)
 gets `waiting <decision>: <finding> edits <file>, busy`
 and stays out of the ticket; the other findings of its file stay available.
+A file rename whose old module a file, its own file included, may declare by a
+`path` attribute the planner cannot read with certainty gets
+`waiting <decision>: <finding> <file> has a path attribute the rename gate cannot read`
+and stays out of the ticket, busy or not: the gate refuses an edit to that file,
+so a person renames the module. A queued ticket that holds such a rename is dropped
+with `dropped <id>: <file> has a path attribute the rename gate cannot read`. A
+`path` string with an escape or a raw string (`#[path = "pro\u{62}e.rs"]`) can name
+the module without its name, so the planner also reads every file that has one, and
+such a file counts as one it cannot read with certainty.
 A finding on a statement line follows its moved function only when its text is on
 exactly one body line there, and that line is a statement of the function. Refill
 builds no ticket on a file that a commit on the unit base, not in the synced tip,
@@ -809,9 +818,13 @@ outside the crate (where `alpha` is the library's name), a `pub use lock::...`
 re-export, and `lock::` where a `mod` line, import or glob binds the module. A
 `#[path = "../src/ledger/lock.rs"]` string changes only its file name, and only when
 its path, read from the file's own folder, is the old file; the `mod lock;` line it
-marks changes with it. A `mod lock;` line with a `path` attribute in any other form
-stays, and so does a `mod` or `use` line inside a macro (`stringify!(…)`, a
-`macro_rules!` body), where the words are tokens, not items. When the ticket also renames an item, its qualified references there change
+marks changes with it. A `mod lock;` line whose `path` string names another file
+stays. A file with a `path` attribute the gate cannot read with certainty (one in an
+inline module, a `cfg_attr` that holds `path`, or a `path` on an inline module, which
+mounts a folder) takes no change at all. A raw name reads as its plain word, so
+`mod r#lock;` and `#[r#path = "../src/ledger/lock.rs"]` change as their plain forms do, and
+a raw name keeps its `r#` (`mod r#mutation_lock;`). A `mod` or `use` line inside a macro (`stringify!(…)`, a
+`macro_rules!` body) stays: there the words are tokens, not items. When the ticket also renames an item, its qualified references there change
 too. The `use` and `mod` lines may take the order rustfmt gives them, with their
 attributes, and a call's trailing comma may change, except inside a macro or an attribute,
 which can match `[1,]` and not `[1]`. The gate refuses every other
