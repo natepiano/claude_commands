@@ -1643,7 +1643,8 @@ def _confirm_relaunch_pass(records: list[SessionShutdown]) -> ConfirmedRelaunchP
         claim = saved["progress"]
         if claim["kind"] == "restarting":
             try:
-                restart_work.confirm_entry(saved, claim["at"], saved["session"]["session_id"] in confirmation.live_ids)
+                restart_work.confirm_entry(saved, claim["at"], saved["session"]["session_id"] in confirmation.live_ids,
+                                           observed_at=confirmation.observed_at)
             except store.NoLiveRecord:
                 continue
             except Exception as error:
@@ -1769,9 +1770,7 @@ def _record_cut_off(saved: SessionShutdown) -> None:
 
 def _archive_finished(saved: SessionShutdown) -> bool:
     try:
-        if saved["progress"]["kind"] == "restarted":
-            outage_alerts.clear(saved["session"]["session_id"])
-            store.clear_restore_alert(saved)
+        # Live confirmation already cleared its outage; archive may follow a new crash.
         store.archive_session(saved["login"], saved["session"]["session_id"])
     except store.NoLiveRecord:
         return False

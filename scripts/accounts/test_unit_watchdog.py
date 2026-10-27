@@ -430,6 +430,149 @@ class UnitWatchdogTests(unittest.TestCase):
                 Path(command[offset + 3]), command[offset + 4])
         self.assertIsNone(record.find_session(saved["login"], saved["session"]["session_id"]))
 
+    def test_clear_removes_only_claims_before_the_live_observation(self) -> None:
+        for delivered in (False, True):
+            with self.subTest(delivered=delivered):
+                identity = "delivered" if delivered else "claimed"
+                with patch.object(time, "time", return_value=1000.0):
+                    claimed = outage_alerts.claim(identity)
+                assert isinstance(claimed, outage_alerts.AlertClaim)
+                if delivered:
+                    outage_alerts.delivered(claimed)
+                self.assertFalse(outage_alerts.clear(identity, 999.0))
+                self.assertFalse(outage_alerts.clear(identity, 1000.0))
+                with patch.object(time, "time", return_value=1001.0):
+                    self.assertIsInstance(outage_alerts.claim(identity),
+                                          outage_alerts.AlertDelivered if delivered else outage_alerts.AlertInFlight)
+                self.assertTrue(outage_alerts.clear(identity, time.time() + 1))
+                self.assertIsInstance(outage_alerts.claim(identity), outage_alerts.AlertClaim)
+
+    def test_old_live_observation_preserves_a_new_record_alert_mark(self) -> None:
+        saved = self.moved_outage()
+        with patch.object(time, "time", return_value=1000.0):
+            claimed = outage_alerts.claim("alpha")
+            assert isinstance(claimed, outage_alerts.AlertClaim)
+            self.assertTrue(record.claim_restore_alert(saved, "new outage"))
+            outage_alerts.delivered(claimed)
+        restart._clear_live_outage(saved, 999.0)  # pyright: ignore[reportPrivateUsage]
+        current = record.find_session(saved["login"], "alpha")
+        assert current is not None
+        self.assertEqual(current.get("restore_alerted"), "new outage")
+        restart._clear_live_outage(saved, 1001.0)  # pyright: ignore[reportPrivateUsage]
+        current = record.find_session(saved["login"], "alpha")
+        assert current is not None
+        self.assertNotIn("restore_alerted", current)
+
+    def test_slow_snapshot_probe_preserves_a_new_watchdog_alert(self) -> None:
+        beta = self.add_unit("beta")
+        _ = self.add_unit("alpha")
+        self.die("beta")
+        self.finish_jobs = False
+        sessions.sessions_dir().mkdir(parents=True, exist_ok=True)
+        clock = [1000.0]
+
+        delayed = [False]
+
+        def slow_probe(pid: int, _start: str) -> restart.SessionNotLive:
+            if pid == beta["pid"] and not delayed[0]:
+                delayed[0] = True
+                clock[0] += 10
+                self.die("alpha")
+                for minute in (0, 2, 8):
+                    _ = self.pass_at(minute)
+                self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
+            return restart.SessionNotLive()
+
+        with (patch.object(time, "time", side_effect=lambda: clock[0]),
+              patch.object(restart, "_process_liveness", side_effect=slow_probe) as probe,
+              patch.object(restart, "_launch_session", side_effect=OSError("fixture refused")),
+              patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
+              redirect_stdout(io.StringIO())):
+            _ = restart.up("four@example.invalid", only=("beta", "alpha"))
+            self.assertGreater(probe.call_count, 0)
+            self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
+            _ = self.pass_at(14)
+            alpha_pushes = [call for call in phone.call_args_list
+                           if cast(RenderedPush, call.args[0]).values.get("stopped") == "owner alpha"]
+            self.assertEqual(len(alpha_pushes), 1)
+
+    def test_slow_batch_archive_preserves_a_new_outage_alert(self) -> None:
+        self.slow_confirmation_outage(conductor=False)
+
+    def test_slow_conductor_archive_preserves_a_new_outage_alert(self) -> None:
+        self.slow_confirmation_outage(conductor=True)
+
+    def slow_confirmation_outage(self, *, conductor: bool) -> None:
+        alpha = self.moved_outage()
+        beta_owner = self.add_unit("beta")
+        beta = alpha.copy()
+        beta.update(session=beta_owner, request_id="beta-move",
+            timers=[record.TimerRestore(instance="slow-beta", was_enabled=True)])
+        self.assertTrue(record.create_session(beta))
+        self.die("beta")
+        clock = [time.time() + 10]
+        old = outage_alerts.claim("alpha")
+        assert isinstance(old, outage_alerts.AlertClaim)
+        outage_alerts.delivered(old)
+
+        def recipient(identity: str) -> herdr.PromptRecipientProcess:
+            owner = self.units[identity]
+            return herdr.PromptRecipientProcess(owner["pid"], owner["proc_start"])
+
+        def launch(saved: record.SessionShutdown, _note: str, _desktop: restart.DesktopLaunchState,
+                   *, dry_run: bool) -> restart.SessionLaunched:
+            self.assertFalse(dry_run)
+            identity = saved["session"]["session_id"]
+            self.revive(identity, "claude2")
+            return restart.SessionLaunched(herdr.PromptSubmitted(NOW, recipient(identity)))
+
+        def slow_timer(_verb: str, instance: str) -> None:
+            self.assertEqual(instance, "slow-beta")
+            current = record.find_session(alpha["login"], "alpha")
+            assert current is not None
+            self.assertEqual(current["progress"]["kind"], "restarted")
+            clock[0] += 10
+            self.die("alpha")
+            for minute in (0, 2, 8):
+                _ = self.pass_at(minute)
+            self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
+
+        with (patch.object(time, "time", side_effect=lambda: clock[0]),
+              patch.object(restart, "_retire"),
+              patch.object(restart, "_launch_session", side_effect=launch),
+              patch.object(herdr, "prompt_recipient_process", side_effect=recipient),
+              patch.object(sessions, "remote_control", return_value="active"),
+              patch.object(quota_alert, "tell_user", return_value=quota_alert.PushSent()) as phone,
+              patch.object(settle, "run_notifier", side_effect=slow_timer)):
+            launched = [restart.relaunch_session(saved, dry_run=False,
+                desktop_state=restart.DesktopLaunchState()) for saved in (alpha, beta)]
+            if conductor:
+                for saved in launched:
+                    progress = saved["progress"]
+                    assert progress["kind"] == "restarting"
+                    restart.confirm_entry(saved, progress["at"], True, observed_at=time.time())
+                for saved in launched:
+                    self.assertTrue(settle._archive_finished(saved))  # pyright: ignore[reportPrivateUsage]
+            else:
+                restart._confirm_entries(launched)  # pyright: ignore[reportPrivateUsage]
+            self.assertIsNone(record.find_session(alpha["login"], "alpha"))
+            self.assertIsInstance(outage_alerts.claim("alpha"), outage_alerts.AlertDelivered)
+            _ = self.pass_at(14)
+            phone.assert_called_once()
+            clock[0] += 10
+            self.revive("alpha", "claude2")
+            _ = self.pass_at(16)
+            # The live snapshot pass provides recovery for the next outage.
+            seen_at = (NOW + timedelta(minutes=16)).isoformat()
+            record.write_snapshot(record.RecoverySnapshot(machine="natedev", login="main@example.invalid",
+                label="claude2", taken_at=seen_at, sessions=[record.SnapshotClaudeSession(agent="claude",
+                    session=self.units["alpha"], workers=[], timers=[], last_seen=seen_at,
+                    state="unresolved", crash="agent exited")]))
+            self.die("alpha")
+            for minute in (18, 20, 26):
+                _ = self.pass_at(minute)
+            self.assertEqual(phone.call_count, 2)
+
     def test_dead_alert_owner_is_replaced_and_its_old_token_cannot_finish(self) -> None:
         first = outage_alerts.claim("dead-owner")
         assert isinstance(first, outage_alerts.AlertClaim)

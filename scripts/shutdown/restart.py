@@ -409,6 +409,7 @@ class PeerRestartResult(TypedDict):
 class RegistryConfirmation:
     """Live registry records retained from the final confirmation poll."""
     records: tuple[sessions.SessionRecord, ...] = ()
+    observed_at: float = field(default_factory=lambda: time.time())
 
     @property
     def live_ids(self) -> frozenset[str]:
@@ -587,8 +588,9 @@ def wait_for_confirmation(session_ids: frozenset[str], timeout: float) -> Regist
     deadline = time.monotonic() + timeout
     confirmed = RegistryConfirmation()
     while time.monotonic() < deadline:
+        observed_at = time.time()
         live = sessions.live_sessions()
-        confirmed = RegistryConfirmation(tuple(item for item in live if item["sessionId"] in session_ids))
+        confirmed = RegistryConfirmation(tuple(item for item in live if item["sessionId"] in session_ids), observed_at)
         if confirmed.live_ids == session_ids:
             return confirmed
         remaining = deadline - time.monotonic()
@@ -1659,6 +1661,7 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
                 or record["machine"].casefold() != settle.local_machine().casefold()):
             remaining.append(record)
             continue
+        observed_at = time.time()
         directory, target = _live_config_dir(record), _target_config_dir(record)
         if (isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir)
                 or directory.path.resolve() != target.path.resolve()):
@@ -1667,6 +1670,7 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
         if not _require_submitted_prompt(record):
             remaining.append(record)
             continue
+        _clear_live_outage(record, observed_at)
         if record.get("target", ""):
             _confirm_move(record)
         failures = _restore_timers(record["timers"], dry_run=False)
@@ -1677,7 +1681,6 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
             if isinstance(found, ShutdownFound):
                 remaining.append(found.record)
             continue
-        _clear_live_outage(record)
         if failures:
             remaining.append({**record, "progress": progress})
             continue
@@ -1690,7 +1693,7 @@ def _record_timer_restore_progress(
     record: SessionShutdown,
     failures: tuple[PendingTimer, ...],
 ) -> None:
-    _clear_live_outage(record)
+    # The caller clears the outage at its live observation, before timer work.
     _clear_assumed_refusal(record["session"]["session_id"])
     if failures:
         _record_pending_timers(record, failures)
@@ -1962,7 +1965,7 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
     saved.setdefault("restart_issues", []).append(line)
     _journal_move_failure(saved, line)
     print(line)
-    confirm_entry(saved, saved["progress"].get("at", settle.record_time()), True)
+    confirm_entry(saved, saved["progress"].get("at", settle.record_time()), True, observed_at=confirmation.observed_at)
     return SourceFallbackSettled()
 
 
@@ -2007,6 +2010,7 @@ def launch_entry(
     relaunching_pending_timers = False
     if progress["kind"] == "timers pending":
         relaunching_pending_timers = True
+        observed_at = time.time()
         match _session_liveness(session_id):
             case SessionLive():
                 if not dry_run:
@@ -2016,6 +2020,7 @@ def launch_entry(
                     outcome = _prompt_outcome({**record, "progress": progress})
                     if not _prove_move(record, outcome):
                         return EntrySettled()
+                    _clear_live_outage(record, observed_at)
                 timers = _pending_timer_restores(record, progress["timers"])
                 failures = _restore_timers(timers, dry_run=dry_run)
                 if not dry_run:
@@ -2028,11 +2033,12 @@ def launch_entry(
             case SessionNotLive():
                 pass
     if progress["kind"] == "restart failed" or (record["requested_by"]["kind"] == "snapshot" and progress["kind"] == "already gone"):
+        observed_at = time.time()
         observed = _owner_liveness(session)
         if isinstance(observed, SessionLive):
             print(f"{session['name']}: already running; skipped")
             if not dry_run:
-                _clear_live_outage(record)
+                _clear_live_outage(record, observed_at)
                 _restore_prior(record)
             return EntrySettled()
         if isinstance(observed, SessionLivenessUnknown):
@@ -2049,11 +2055,14 @@ def launch_entry(
                 f"queued shutdown messages not retired: {_error_reason(error)}",
             )
         return EntrySettled()
+    observed_at = time.time()
     was_live = session_id in _live_session_ids()
     note = restart_note(record, restarted_at)
     if was_live:
-        if not dry_run and not _prove_move(record):
-            return EntrySettled()
+        if not dry_run:
+            if not _prove_move(record):
+                return EntrySettled()
+            _clear_live_outage(record, observed_at)
         if progress["kind"] != "manual restart" and not _restart_note_delivered(
             record, note, dry_run=dry_run
         ):
@@ -2205,16 +2214,18 @@ def _send_worker_resume(record: SessionShutdown) -> None:
         print(f"shutdown: worker resume message: {_error_reason(error)}", file=sys.stderr)
 
 
-def _clear_live_outage(record: SessionShutdown) -> None:
-    outage_alerts.clear(record["session"]["session_id"])
-    recovery_store.clear_restore_alert(record)
-    _ = record.pop("restore_alerted", None)
+def _clear_live_outage(record: SessionShutdown, observed_at: float) -> None:
+    if outage_alerts.clear(record["session"]["session_id"], observed_at):
+        recovery_store.clear_restore_alert(record)
+        _ = record.pop("restore_alerted", None)
 
 
 def confirm_entry(
     record: SessionShutdown,
     restarted_at: str,
     live: bool,
+    *,
+    observed_at: float,
 ) -> None:
     """Finish an entry after its shared registry wait."""
     found = lookup_session(record["login"], record["session"]["session_id"])
@@ -2240,7 +2251,7 @@ def confirm_entry(
         return
     if not _prove_move(record):
         return
-    _clear_live_outage(record)
+    _clear_live_outage(record, observed_at)
     if record["session"]["kind"] == "showrunner" and record["requested_by"]["kind"] != "snapshot":
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
@@ -2416,10 +2427,11 @@ def relaunch_session(
 ) -> SessionShutdown:
     """Claim and launch one session; leave registry confirmation to the caller."""
     if record["progress"]["kind"] == "restart failed":
+        observed_at = time.time()
         observed = _owner_liveness(record["session"])
         if isinstance(observed, SessionLive):
             if not dry_run:
-                _clear_live_outage(record)
+                _clear_live_outage(record, observed_at)
             print(f"{record['session']['name']}: already running; skipped")
             return record
         if isinstance(observed, SessionLivenessUnknown):
@@ -2503,10 +2515,11 @@ def _confirm_entries(records: list[SessionShutdown]) -> None:
     for record in launched:
         progress = record["progress"]
         if progress["kind"] == "restarting":
-            confirm_entry(record, progress["at"], record["session"]["session_id"] in confirmation.live_ids)
+            confirm_entry(record, progress["at"], record["session"]["session_id"] in confirmation.live_ids,
+                          observed_at=confirmation.observed_at)
     for record in records:
         if record["progress"]["kind"] == "restarted":
-            _clear_live_outage(record)
+            # Confirmation ended the old outage. Archive must preserve a newer one.
             archive_session(record["login"], record["session"]["session_id"])
             _acknowledge_restored_snapshots(record["session"]["session_id"])
 
@@ -2748,6 +2761,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
     recovery_failures: list[FailedSessionRestart] = []
     sources: dict[str, RecoverySnapshot] = {}
     recorded = {saved["session"]["session_id"]: saved for saved in all_records}
+    live_observed_at = time.time()
     live_ids = _live_session_ids()
     codex_entries: list[tuple[RecoverySnapshot, SnapshotCodexSession]] = []
     snapshot_ids: set[str] = set()
@@ -2790,13 +2804,14 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 continue
             if identity in live_ids:
                 if not dry_run:
-                    outage_alerts.clear(identity)
+                    _ = outage_alerts.clear(identity, live_observed_at)
                 print(f"{name}: already running; skipped")
                 continue
+            observed_at = time.time()
             liveness = _owner_liveness(entry["session"])
             if isinstance(liveness, SessionLive):
                 if not dry_run:
-                    outage_alerts.clear(identity)
+                    _ = outage_alerts.clear(identity, observed_at)
                 print(f"{name}: already running; skipped")
                 continue
             if isinstance(liveness, SessionLivenessUnknown):
@@ -2846,25 +2861,27 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
             continue
         if decision.login != login.casefold() and identity in live_ids:
             if not dry_run:
-                _clear_live_outage(saved)
+                _clear_live_outage(saved, live_observed_at)
             print(f"{name}: already running on {decision.login}; skipped")
             continue
         saved = _restore_target(saved, decision, dry_run=dry_run)
         if saved["requested_by"]["kind"] == "snapshot" and saved["progress"]["kind"] in {"already gone", "restart failed"}:
+            observed_at = time.time()
             observed = _owner_liveness(saved["session"])
             if isinstance(observed, SessionLive):
                 if not dry_run:
-                    _clear_live_outage(saved)
+                    _clear_live_outage(saved, observed_at)
                 print(f"{name}: already running; skipped")
                 continue
             if isinstance(observed, SessionLivenessUnknown):
                 print(f"{name}: recovery refused: {observed.reason}")
                 recovery_failures.append(FailedSessionRestart(name, observed.reason))
                 continue
+        observed_at = time.time()
         recovered = _recover_incomplete_shutdown(saved, dry_run=dry_run)
         if isinstance(recovered, IncompleteShutdownStillLive):
             if not dry_run:
-                _clear_live_outage(saved)
+                _clear_live_outage(saved, observed_at)
             print(f"{name}: already running; skipped")
             selected_records.append(saved)
         elif isinstance(recovered, IncompleteShutdownRefused):

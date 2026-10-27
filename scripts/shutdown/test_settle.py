@@ -2187,7 +2187,8 @@ class SettleTests(ShutdownTestCase):
             current["progress"] = {"kind": "restarting", "at": NOW, "prior": prior}
         return record.update_session(LOGIN, saved["session"]["session_id"], launch)
 
-    def fake_confirm(self, saved: record.SessionShutdown, _at: str, live: bool) -> None:
+    def fake_confirm(self, saved: record.SessionShutdown, _at: str, live: bool, *, observed_at: float) -> None:
+        del observed_at
         self.assertTrue(live)
         saved["progress"] = {"kind": "restarted", "at": NOW}
         def confirm(current: record.SessionShutdown) -> None:
@@ -2245,10 +2246,10 @@ class SettleTests(ShutdownTestCase):
             owner["host"] = inventory.TerminalHost(kind="terminal")
             owners.append(owner)
             self.save(session_shutdown(owner, progress={"kind": "stopped", "at": NOW}, then="restart"))
-        def confirm(saved: record.SessionShutdown, at: str, live: bool) -> None:
+        def confirm(saved: record.SessionShutdown, at: str, live: bool, *, observed_at: float) -> None:
             if saved["session"]["session_id"] == "second":
                 raise OSError("confirm failed")
-            self.fake_confirm(saved, at, live)
+            self.fake_confirm(saved, at, live, observed_at=observed_at)
         with (
             patch.object(settle, "run_inventory", return_value=machine_inventory(owners)),
             patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch),
@@ -2304,11 +2305,11 @@ class SettleTests(ShutdownTestCase):
                 "prior": {"kind": "stopped", "at": NOW}}, then="restart")
             self.save(saved)
             batch.append(saved)
-        def confirm(saved: record.SessionShutdown, at: str, live: bool) -> None:
+        def confirm(saved: record.SessionShutdown, at: str, live: bool, *, observed_at: float) -> None:
             if saved["session"]["session_id"] == "missing":
                 record.archive_session(LOGIN, "missing")
                 raise record.NoLiveRecord("gone")
-            self.fake_confirm(saved, at, live)
+            self.fake_confirm(saved, at, live, observed_at=observed_at)
         with (
             patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
             patch.object(restart_work, "confirm_entry", side_effect=confirm),
@@ -2421,7 +2422,8 @@ class SettleTests(ShutdownTestCase):
             self.assertCountEqual(launches, [str(index) for index in range(8)])
             self.assertEqual(ids, frozenset(launches))
             return registry_confirmation(frozenset({"7"}))
-        def confirm(saved: record.SessionShutdown, _at: str, live: bool) -> None:
+        def confirm(saved: record.SessionShutdown, _at: str, live: bool, *, observed_at: float) -> None:
+            del observed_at
             saved["progress"] = ({"kind": "restarted", "at": NOW} if live
                                  else {"kind": "restart failed", "at": NOW, "reason": "not live"})
             def save(current: record.SessionShutdown) -> None:
@@ -2854,12 +2856,12 @@ class SettleTests(ShutdownTestCase):
             else:
                 self.assertEqual(ids, frozenset({"fast"}))
             return registry_confirmation(ids)
-        def confirm(saved: record.SessionShutdown, at: str, live: bool) -> None:
+        def confirm(saved: record.SessionShutdown, at: str, live: bool, *, observed_at: float) -> None:
             if saved["session"]["session_id"] == "fast":
                 self.assertFalse(release.is_set())
                 fast_confirmed.set()
                 release.set()
-            self.fake_confirm(saved, at, live)
+            self.fake_confirm(saved, at, live, observed_at=observed_at)
         def tick(futures: list[Future[object]], *, timeout: float, return_when: str) -> tuple[set[Future[object]], set[Future[object]]]:
             del timeout
             if registry_entered.is_set() and not advanced[0]:

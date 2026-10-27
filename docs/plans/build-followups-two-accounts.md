@@ -2492,7 +2492,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Reserving all of a report's pushes up front lets a late claim pass its lease behind slow sends; claim per push.
 - Known residual, moved to Phase 90: a slow batch confirm can clear a newer outage's entry and allow a second push.
 
-### Phase 90 — A slow batch restart does not clear a newer outage's alert  · status: todo
+### Phase 90 — A slow batch restart does not clear a newer outage's alert  · status: done
 
 **Depends on:** Phase 89
 

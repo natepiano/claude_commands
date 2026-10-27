@@ -336,6 +336,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
             doc = Path(runner["doc"])
             try:
                 rows = production_units.live_unit_table(doc.read_text(encoding="utf-8").splitlines(), runner["slug"])
+                observed_at = time.time()
                 observed = {unit.unit: unit for unit in live_units.production_units(doc)}
                 for row in rows:
                     unit = production_units.cell_value(row.get("Unit", ""))
@@ -348,11 +349,11 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                     claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
                     if isinstance(claude, unit_lookup.LiveClaude):
                         if not dry_run:
-                            outage_alerts.clear(claude.session_id)
-                            for saved in record.all_session_records():
-                                if (saved["session"]["session_id"] == claude.session_id
-                                        and "restore_alerted" in saved):
-                                    record.clear_restore_alert(saved)
+                            if outage_alerts.clear(claude.session_id, observed_at):
+                                for saved in record.all_session_records():
+                                    if (saved["session"]["session_id"] == claude.session_id
+                                            and "restore_alerted" in saved):
+                                        record.clear_restore_alert(saved)
                         outage = state.get(claude.session_id)
                         if outage is not None and "job" in outage and not dry_run:
                             Path(outage["job"]["result"]).unlink(missing_ok=True)

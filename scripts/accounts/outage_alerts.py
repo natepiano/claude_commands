@@ -115,7 +115,7 @@ def delivered(claimed: AlertClaim) -> None:
     with _locked_entries() as entries:
         existing = entries.get(claimed.session_id)
         if existing is not None and existing["state"] == "claimed" and existing["token"] == claimed.token:
-            entries[claimed.session_id] = AlertLedgerEntry(state="delivered", token=claimed.token)
+            entries[claimed.session_id] = {**existing, "state": "delivered"}
 
 
 def release(claimed: AlertClaim) -> None:
@@ -125,10 +125,14 @@ def release(claimed: AlertClaim) -> None:
             del entries[claimed.session_id]
 
 
-def clear(session_id: str) -> None:
-    """A live session ends the outage, including any old in-flight delivery."""
+def clear(session_id: str, observed_at: float) -> bool:
+    """End only an outage claimed before this live observation; retain newer ones."""
     with _locked_entries() as entries:
+        existing = entries.get(session_id)
+        if existing is not None and existing.get("at", 0) >= observed_at:
+            return False
         _ = entries.pop(session_id, None)
+        return True
 
 
 @contextmanager
