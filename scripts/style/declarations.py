@@ -7,14 +7,16 @@ keeps its declaration.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 import difflib
 from enum import StrEnum
 from functools import lru_cache
+from itertools import accumulate
 import re
 
 import style_footprint
-from approved_renames import ITEM_KEYWORDS, item_starts, type_path
+from approved_renames import ITEM_KEYWORDS, type_path
 
 # The items whose body is in braces; the other items end at their semicolon.
 BRACED_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "mod", "impl"})
@@ -421,7 +423,7 @@ def read_declarations(text: str) -> DeclaredFile:
     tokenized = style_footprint.tokenized_text(text)
     words = tuple(token.value for token in tokenized.tokens)
     lines = tokenized.lines
-    starts = item_starts(words)
+    starts = style_footprint.item_starts(words)
     owners = style_footprint.attribute_owners(words)
     first_attribute: dict[int, int] = {}
     for start, keyword in sorted(owners.items(), reverse=True):
@@ -499,6 +501,38 @@ def moved_site_line(old: DeclaredFile, old_line: int, old_item: DeclaredItem, ne
                if new.source_lines[number - 1].strip() == site and not any(first <= number <= last for first, last in nested)]
     offset = old_line - old_item.keyword_line
     return min(matches, key=lambda number: (abs(number - new_item.keyword_line - offset), number), default=new_item.keyword_line)
+
+
+class StatementRefusal(StrEnum):
+    TEXT_NOT_FOUND = "text not on a statement line of the moved function"
+    TEXT_REPEATED = "text on more than one line of the moved function's body"
+
+
+def statement_site(new: DeclaredFile, new_item: DeclaredItem, text: str) -> int | StatementRefusal:
+    """The one body line of the new function whose code tokens hold the code tokens of the one-line text as one
+    unbroken run, when it is a statement of the function itself, else why there is none. A line of an item nested in
+    the body counts as a match, but it is not a statement of the function.
+
+    Comments are not tokens, so a comment in the text or on the line does not count, and a string literal is one
+    token, so a copy inside a string does not match. A text or file whose tokens cannot be read holds no match.
+    """
+    site = tuple(style_footprint.tokens(text)) if "\n" not in text.strip() else ()
+    if not site or any(token.kind == "unknown" for token in site):
+        return StatementRefusal.TEXT_NOT_FOUND
+    source = "\n".join(new.source_lines)
+    offsets = tuple(accumulate((len(line) + 1 for line in new.source_lines), initial=0))
+    by_line: dict[int, list[style_footprint.Token]] = {}
+    for span in style_footprint.token_spans(source):
+        by_line.setdefault(bisect_right(offsets, span.start), []).append(span.token)
+    matches = [number for number in range(new_item.first_line, min(new_item.last_line, len(new.source_lines)) + 1)
+               if new.site_kind(new_item, number) == DeclarationSite.STATEMENT
+               and any(tuple(line[index:index + len(site)]) == site
+                       for line in (by_line.get(number, []),) for index in range(len(line) - len(site) + 1))]
+    if len(matches) > 1:
+        return StatementRefusal.TEXT_REPEATED
+    if not matches or new.declaration_at(matches[0]) != new_item:
+        return StatementRefusal.TEXT_NOT_FOUND
+    return matches[0]
 
 
 class MappingFailure(StrEnum):

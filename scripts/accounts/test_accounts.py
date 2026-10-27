@@ -57,6 +57,15 @@ def named_environment(config_dir: Path) -> dict[str, str]:
     }
 
 
+def installed_program(home: Path, tool: str) -> str:
+    """Put an executable fixture in the shared installer directory. Never run it."""
+    program = home / ".local" / "bin" / tool
+    program.parent.mkdir(parents=True, exist_ok=True)
+    _ = program.write_text("#!/bin/sh\nexit 99\n")
+    program.chmod(0o700)
+    return str(program)
+
+
 def setUpModule() -> None:
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
@@ -149,6 +158,8 @@ class AccountsTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.home = self.root / "home with spaces"
         _ = self.home.mkdir()
+        _ = installed_program(self.home, "claude")
+        _ = installed_program(self.home, "codex")
         self.main_dir = self.home / ".claude"
         _ = self.main_dir.mkdir(mode=0o700)
         notes = self.root / "notes"
@@ -513,7 +524,7 @@ class AccountsTests(unittest.TestCase):
             result = self.run_cli("exec", "claude2", "--version", "--", "quoted argument")
         self.assertEqual(result, (0, "", ""))
         environment = {**os.environ, **named_environment(accounts.account_dir("claude2"))}
-        launch.assert_called_once_with("claude", ["claude", "--version", "--", "quoted argument"], environment)
+        launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--version", "--", "quoted argument"], environment)
         self.assertEqual(set(self.home.iterdir()), before)
         self.assertFalse(accounts.accounts_config_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
@@ -529,7 +540,7 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(self.run_cli("exec", *account_options,
                                                   "-n", "throwaway", "--version"), (0, "", ""))
                 launch.assert_called_once()
-                self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", "-n", "throwaway", "--version"]))
+                self.assertEqual(launch.call_args.args[:2], (str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "-n", "throwaway", "--version"]))
                 environment = cast(dict[str, str], launch.call_args.args[2])
                 if probe:
                     self.assertEqual(environment["CLAUDE_PROBE_SESSION"], "1")
@@ -545,7 +556,7 @@ class AccountsTests(unittest.TestCase):
         with patch.object(os, "execvpe") as launch:
             self.assertEqual(self.run_cli("exec", "--probe", "claude2", *arguments), (0, "", ""))
         launch.assert_called_once()
-        self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", *arguments]))
+        self.assertEqual(launch.call_args.args[:2], (str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), *arguments]))
         self.assertEqual(launch.call_args.args[2]["CLAUDE_PROBE_SESSION"], "1")
 
     def test_exec_probe_after_the_account_passes_through_to_claude_unmarked(self) -> None:
@@ -555,7 +566,7 @@ class AccountsTests(unittest.TestCase):
             with patch.object(os, "execvpe") as launch:
                 self.assertEqual(self.run_cli("exec", "claude2", "--probe"), (0, "", ""))
         launch.assert_called_once()
-        self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", "--probe"]))
+        self.assertEqual(launch.call_args.args[:2], (str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--probe"]))
         self.assertNotIn("CLAUDE_PROBE_SESSION", cast(dict[str, str], launch.call_args.args[2]))
 
     def test_legacy_exec_alias_selects_the_numbered_configuration(self) -> None:
@@ -670,7 +681,7 @@ class AccountsTests(unittest.TestCase):
             expected.update(named_environment(accounts.account_dir("claude2")))
             del expected["CLAUDE_CODE_OAUTH_TOKEN"]
             self.assertEqual(self.run_cli("exec", "claude2", "--resume", "same-id"), (0, "", ""))
-        launch.assert_called_once_with("claude", ["claude", "--resume", "same-id"], expected)
+        launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "same-id"], expected)
 
     def test_exec_missing_directory_prints_setup_refusal_without_launching(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -821,7 +832,7 @@ class AccountsTests(unittest.TestCase):
             environment = {**os.environ, **named_environment(accounts.account_dir("claude3"))}
             result = self.run_cli("exec", "claude3", "--resume", "conversation id", "-p", "a prompt")
         self.assertEqual(result, (0, "", ""))
-        launch.assert_called_once_with("claude", ["claude", "--resume", "conversation id", "-p", "a prompt"], environment)
+        launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "conversation id", "-p", "a prompt"], environment)
         self.assertIsInstance(accounts.account_directory_readiness("claude3"), accounts.AccountDirectoryReady)
 
     def test_exec_uses_one_expected_login_through_resolution_and_readiness(self) -> None:
@@ -889,7 +900,7 @@ class AccountsTests(unittest.TestCase):
                         del expected_environment["CLAUDE_CODE_REMOTE_MEMORY_DIR"]
                     self.assertEqual(self.run_cli("exec", label, "--version"), (0, "", ""))
                     launch.assert_called_once_with(
-                        "claude", ["claude", "--version"], expected_environment,
+                        str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--version"], expected_environment,
                     )
                     self.assertEqual(os.environ["CLAUDE_CODE_OAUTH_TOKEN"], "another-account-token")
 
@@ -909,7 +920,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertIn("not logged in", "\n".join(accounts.check("claude3")))
                 with patch.object(os, "execvpe") as launch:
                     self.assertEqual(self.run_cli("exec", "claude3"), (0, "", ""))
-                launch.assert_called_once_with("claude", ["claude"], {**os.environ, **named_environment(accounts.account_dir("claude3"))})
+                launch.assert_called_once_with(str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude")], {**os.environ, **named_environment(accounts.account_dir("claude3"))})
 
     def test_exec_allows_login_before_a_new_label_has_a_note(self) -> None:
         self.login_directory("claude2", "main@example.invalid", default=True)
@@ -1095,9 +1106,9 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual(executable, sys.executable)
                     self.assertEqual(argv, [sys.executable,
                         str(accounts.SCRIPTS / "lib" / "relaunch.py"), "run", "--",
-                        "claude", "--resume", "conversation-id"])
+                        str(self.home / ".local/bin/claude"), "--resume", "conversation-id"])
                 else:
-                    self.assertEqual((executable, argv), ("claude", ["claude", "--resume", "conversation-id"]))
+                    self.assertEqual((executable, argv), (str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--resume", "conversation-id"]))
                 self.assertEqual(child_environment["CLAUDE_CONFIG_DIR"], str(accounts.account_dir("claude3")))
                 self.assertEqual(child_environment["PRESERVED_MARKER"], "keep")
                 launch.assert_called_once()
@@ -1108,6 +1119,47 @@ class AccountsTests(unittest.TestCase):
             result = self.run_cli("exec", "claude2")
         self.assertEqual(result, (2, "", "accounts: could not start claude: fixture executable missing\n"))
 
+    def test_program_resolver_uses_path_before_the_installer_directory(self) -> None:
+        for tool in ("claude", "codex"):
+            with self.subTest(tool=tool):
+                program = Path(installed_program(self.root, tool))
+                with patch.dict(os.environ, {"PATH": str(program.parent)}):
+                    self.assertEqual(accounts.resolve_program("claude" if tool == "claude" else "codex"), str(program))
+
+    def test_probe_exec_finds_the_installed_claude_with_a_service_path(self) -> None:
+        self.login_directory("claude2", "main@example.invalid")
+        program = str(self.home / ".local/bin/claude")
+        with (patch.dict(os.environ, {"PATH": str(self.root / "empty-path")}),
+              patch.object(os, "execvpe") as launch):
+            self.assertEqual(self.run_cli("exec", "--probe", "claude2", "-p", "hello"), (0, "", ""))
+        self.assertEqual(launch.call_args.args[:2], (program, [program, "-p", "hello"]))
+        self.assertEqual(launch.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(accounts.account_dir("claude2")))
+        self.assertEqual(launch.call_args.args[2]["CLAUDE_PROBE_SESSION"], "1")
+
+    def test_program_resolver_rejects_missing_and_non_executable_installs(self) -> None:
+        program = self.home / ".local/bin/claude"
+        for mode in ("missing", "not executable", "directory"):
+            with self.subTest(mode=mode), patch.dict(os.environ, {"PATH": str(self.root / "empty-path")}):
+                program.unlink(missing_ok=True)
+                if mode == "not executable":
+                    _ = program.write_text("fixture")
+                    program.chmod(0o600)
+                elif mode == "directory":
+                    program.mkdir()
+                with self.assertRaisesRegex(FileNotFoundError, "claude program not found ") as failure:
+                    _ = accounts.resolve_program("claude")
+                self.assertIn(f"looked in PATH and {program}", str(failure.exception))
+
+    def test_login_renewal_reports_a_missing_program_without_probe_output(self) -> None:
+        self.login_directory("claude2", "main@example.invalid")
+        program = self.home / ".local/bin/claude"
+        program.unlink()
+        with (patch.dict(os.environ, {"PATH": str(self.root / "empty-path")}),
+              patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2, b"private", b"private"))):
+            self.assertEqual(accounts.renew_login("claude2"), accounts.LoginRenewalFailed(
+                f"claude program not found (looked in PATH and {program})"))
+        self.live_reads.assert_not_called()
+
     def test_exec_codex_labels_use_the_home_holding_each_login_and_preserve_arguments(self) -> None:
         home, numbered = self.workers_fixture()
         arguments = ["resume", "conversation id", "--model", "model-name", "--", "quoted argument"]
@@ -1116,7 +1168,7 @@ class AccountsTests(unittest.TestCase):
                 "CODEX_HOME": str(self.root / "inherited"), "PRESERVED_MARKER": "keep",
             }), patch.object(sys.stdin, "isatty", return_value=True), patch.object(os, "execvpe") as launch:
                 self.assertEqual(self.run_cli("exec", label, *arguments), (0, "", ""))
-                launch.assert_called_once_with("codex", ["codex", *arguments],
+                launch.assert_called_once_with(str(self.home / ".local/bin/codex"), [str(self.home / ".local/bin/codex"), *arguments],
                     {**os.environ, "CODEX_HOME": str(directory)})
 
     def test_exec_workers_follows_the_stored_selection_instead_of_the_callers_home(self) -> None:
@@ -1126,7 +1178,7 @@ class AccountsTests(unittest.TestCase):
                 self.assertEqual(self.run_cli("set-role", "workers", label), (0, "", ""))
                 with patch.dict(os.environ, {"CODEX_HOME": str(self.root / "caller")}), patch.object(os, "execvpe") as launch:
                     self.assertEqual(self.run_cli("exec", "workers", "--version"), (0, "", ""))
-                    launch.assert_called_once_with("codex", ["codex", "--version"],
+                    launch.assert_called_once_with(str(self.home / ".local/bin/codex"), [str(self.home / ".local/bin/codex"), "--version"],
                         {**os.environ, "CODEX_HOME": str(directory)})
 
     def test_exec_unknown_codex_account_refuses_without_starting_a_process(self) -> None:
@@ -2261,6 +2313,7 @@ class AccountsTests(unittest.TestCase):
         self.assertIn(f"accounts: {linked} is broken", problems)
 
     def test_invalid_label_is_refused_without_creating_a_directory(self) -> None:
+        before = set(self.home.iterdir())
         for command in ("setup", "check"):
             with self.subTest(command=command):
                 result, stdout, stderr = self.run_cli(command, "claude0")
@@ -2269,7 +2322,7 @@ class AccountsTests(unittest.TestCase):
                 expected = ("accounts: claude0 is not a claudeN label\n" if command == "setup" else
                             "accounts: 'claude0' is not a numbered claude account; use claudeN\n")
                 self.assertEqual(stderr, expected)
-                self.assertEqual(set(self.home.iterdir()), {self.main_dir})
+                self.assertEqual(set(self.home.iterdir()), before)
 
     def test_check_is_silent_for_a_complete_logged_in_account(self) -> None:
         account_dir = self.home / ".claude2"
@@ -5154,6 +5207,8 @@ class PickerTests(unittest.TestCase):
             "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
         }, clear=True)))
         (self.home / "notes").mkdir()
+        _ = installed_program(self.home, "claude")
+        _ = installed_program(self.home, "codex")
         (self.home / ".claude").mkdir()
         self.claude("default", "main@example.invalid")
         self.claude("claude2", "main@example.invalid")
@@ -6071,7 +6126,7 @@ class PickerTests(unittest.TestCase):
             self.assertIn(f"CLAUDE_CONFIG_DIR={accounts.account_dir('claude3')}", environment)
             with patch.object(os, "execvpe") as launch:
                 self.assertEqual(accounts.main(["exec", "unit", "--version"]), 0)
-        self.assertEqual(launch.call_args.args[:2], ("claude", ["claude", "--version"]))
+        self.assertEqual(launch.call_args.args[:2], (str(self.home / ".local/bin/claude"), [str(self.home / ".local/bin/claude"), "--version"]))
         self.assertEqual(launch.call_args.args[2]["CLAUDE_CONFIG_DIR"], str(accounts.account_dir("claude3")))
         self.assertFalse(accounts.accounts_config_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())

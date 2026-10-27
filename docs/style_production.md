@@ -407,7 +407,29 @@ Apply a fix without asking only when all mechanical criteria hold:
    meaning, and no serialized, reflected or configured name changes (serde and
    reflect names, config keys, documented usage).
 
-An uncertain result goes to review. Every tier D finding and every
+A finding of a class in `scripts/style/mechanical_classes.toml` is applied when its proof passes.
+The proof must pass on the whole change: a change that adds an allow, or that
+changes code beyond what the proof explains, stays held for the user. The user
+never approves a finding of a listed class. The list names each class, its
+proof and its rules, and the unit text and the ticket gate read it. The classes:
+
+- `pure-move` (proof `item_move`; rules `module-structure`,
+  `types-live-with-their-behavior`, `split-by-type-ownership`): one item (a
+  const, static, fn, struct, enum, type alias or impl) goes to its owning module
+  or to a named shared owner (`constants.rs`, the type's module) in the same
+  crate. Its uses are re-pointed, and a re-export keeps every old path. It is
+  mechanical also where criteria 1 and 3 bar it. `prove_item_moves` finds that
+  only paths and `use` lines changed. The move is still held when the finding
+  names no destination, or when the move makes an import cycle or crosses crates.
+- `stale-allow-lint` (proof `lint_removal`; rule `test-module-allow-boilerplate`):
+  a lint name goes out of an `allow` attribute in test code (a test file or a
+  `#[cfg(test)]` item) when its pattern has no match in the attribute's scope,
+  the same check as the `test_allow_boilerplate` generator. The whole attribute
+  may go when it keeps no lint name. The reason and the other lint names stay.
+  `prove_lint_removals` finds that only lint names were removed. An `expect`
+  attribute is not in this class.
+
+An uncertain result goes to review. Every other tier D finding and every
 `mode: propose` rule is held. Remove non-mechanical findings and all dependent
 edits from the applied diff; merge the remainder after its gate passes.
 Record each held finding with `style_ledger.py held add` and its cell with
@@ -605,6 +627,8 @@ Approve with `proposal_issue.py approve <issue> --by user --showrunner <parent>
 --unit <unit> --plan <unit's own plan copy>`. Do not add phase numbers.
 Approval sets the decision's stage active (in progress), so it leaves the
 footer's proposal count.
+Change an answered decision only with `proposal_issue.py unapprove`, `proposal_issue.py decline-answer` or
+`proposal_issue.py reopen`; never edit its stage, unit or answer by hand.
 Refill builds approved findings in small tickets before coverage work.
 Each ticket permits its own approved findings and proven rename references.
 Only a rename whose `before` and `after` are one `<parent>::<name>` pair proves
@@ -619,8 +643,15 @@ changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
 Refill first runs the declaration step once, on the findings of all approved
 decisions, so a finding tickets at the file its declaration moved to. A finding
 that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
-`waiting <decision>: <finding> declared in another crate: <file>` or
-`waiting <decision>: <finding> declaration gone`, and stays out of the ticket. A
+`waiting <decision>: <finding> declared in another crate: <file>`,
+`waiting <decision>: <finding> declaration gone` or
+`waiting <decision>: <finding> its function moved to <file>; <reason>`, and stays out of the ticket.
+A finding on a statement line follows its moved function only when its text is on
+exactly one body line there, and that line is a statement of the function. Refill
+builds no ticket on a file that a commit on the unit base, not in the synced tip,
+changed: it prints
+`waiting <decision>: <file> changed in <commit>, not in the synced tip <tip>` or
+`waiting for sync: <kind> <crate> [<rule>]: <file> changed in ...`, and waits for the sync. A
 decision whose last finding the step built closes. A decision whose answer
 changes during the refill gets `waiting <decision>: no longer approved`. A decision
 that the step skips gets `waiting <decision>: skipped by the declaration step`,

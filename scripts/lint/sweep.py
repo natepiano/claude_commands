@@ -1493,23 +1493,36 @@ def hold_floor(
         ci_bytes = sum(directory_blocks(path) for path in CI_TARGETS)
         unchanged_caches = held_bytes + ci_bytes
         before_caches = total + unchanged_caches
+        # The growth check compares this pair with the previous record. The scan takes minutes, so
+        # free is read again after it: a target another process deletes during the scan is then out
+        # of both figures, not out of before_caches alone. On 2026-10-25 the read from before the
+        # scan reported a 122.6 GiB fall while 123 GiB was freed.
+        scanned_free = free_bytes(home)
         print(
             f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; choosing from {len(idle)}"
             + f" target dirs ({gib(total)}), {len(busy)} left alone while a build or test run uses them"
         )
-        budget = total - (floor - free)
-        ordered_at = time.time()
-        left, failures, chosen = shrink(
-            scan,
-            total,
-            budget,
-            dry_run,
-            lambda group: (
-                0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
-                target_uses[tree_targets[group.build_tree]],
-                *unit_age(group, ordered_at),
-            ),
-        )
+        # The shortfall comes from the read after the scan too: on 2026-10-25 the read from before it
+        # took 6.5 GiB of cache while another process had lifted free from 293.5 to 416 GiB.
+        budget = total - max(0, floor - scanned_free)
+        left, failures = total, 0
+        chosen: list[tuple[Group, int]] = []
+        if scanned_free < floor:
+            ordered_at = time.time()
+            left, failures, chosen = shrink(
+                scan,
+                total,
+                budget,
+                dry_run,
+                lambda group: (
+                    0.0 if scratch_targets[tree_targets[group.build_tree]] else 1.0,
+                    target_uses[tree_targets[group.build_tree]],
+                    *unit_age(group, ordered_at),
+                ),
+            )
+        else:
+            print(f"lint sweep: {gib(scanned_free)} free after the scan, not under the {gib(floor)} floor;"
+                  + " nothing taken")
         taken: dict[str, int] = {}
         for group, freed in chosen:
             root = tree_targets[group.build_tree]
@@ -1523,6 +1536,8 @@ def hold_floor(
         print(f"lint sweep: {gib(after_free)} free")
         if not dry_run:
             now = time.time()
+            # The record's free is read before its caches and the next sweep's free after its scan,
+            # so a deletion during either walk can only make the computed fall smaller.
             after_caches = sum(directory_blocks(path) for path in idle) + unchanged_caches
             removed = max(0, before_caches - after_caches)
             history = previous.alert_history if isinstance(previous, FloorRecord) else NoDeliveredAlert()
@@ -1547,7 +1562,7 @@ def hold_floor(
                 if delivered or told:
                     push_history = DeliveredAlert(time.time())
             elif removed > 0 and (isinstance(history, NoDeliveredAlert) or now - history.at >= ALERT_INTERVAL_SECONDS):
-                free_fall = previous.free_bytes - free if isinstance(previous, FloorRecord) else 0
+                free_fall = previous.free_bytes - scanned_free if isinstance(previous, FloorRecord) else 0
                 cache_growth = before_caches - previous.build_cache_bytes if isinstance(previous, FloorRecord) else 0
                 recent = isinstance(previous, FloorRecord) and 0 <= now - previous.measured_at <= GROWTH_WINDOW_SECONDS
                 growth_fired = recent and free_fall - cache_growth > UNEXPLAINED_FALL_BYTES

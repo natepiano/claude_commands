@@ -22,6 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 from change_review import Invisible, Malformed, Visible
 
+# Importable once change_review has put scripts/lib on the path.
+import scratch
+
 LIST = """# Change review list
 
 ## To review
@@ -49,10 +52,13 @@ DOC = str(PRODUCTION)
 
 
 def setUpModule() -> None:
-    """The pin on the row `show` printed goes to a temporary folder, never ~/.local/state/next."""
+    """The pin on the row `show` printed and the scratch folders a verdict removes are in a temporary
+    folder, never ~/.local/state/next, /tmp/claude/scratch or ~/rust/repro."""
     folder = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(folder.cleanup)
-    unittest.enterModuleContext(mock.patch.dict(os.environ, {"NEXT_STATE_DIR": folder.name}))
+    unittest.enterModuleContext(mock.patch.dict(os.environ, {
+        "NEXT_STATE_DIR": folder.name, scratch.ROOT_ENV: f"{folder.name}/scratch",
+        scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
 
 
 class ParseTest(unittest.TestCase):
@@ -361,6 +367,19 @@ class ActionTest(unittest.TestCase):
         self.assertIn("| C77 | Fonts redraw | still the old font \\| x |", self.path.read_text(encoding="utf-8"))
         self.assertTrue(change_review.lands("Works: it does"))
         self.assertFalse(change_review.lands("not fine"))
+
+    def test_a_verdict_removes_the_rows_scratch_folders_either_way(self) -> None:
+        demo = scratch.new("row:natedev-C1", "demo", visible=True)
+        copy = scratch.new("row:natedev-C2", "copy")
+        kept = scratch.new("row:natedev-C3")
+        _ = change_review.append_rows(self.fresh, [Visible(name, "B", "C") for name in "XYZ"], date(2026, 10, 15), "",
+                                      PRODUCTION)
+        self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C1", "--verdict", "works"),
+                         (0, f"C1 landed\nremoved {demo}\n", ""))
+        self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.fresh), "--row", "C2", "--verdict", "no"),
+                         (0, f"C2 returns to its unit (merged 2026-10-15)\nremoved {copy}\n", ""))
+        self.assertFalse(demo.exists() or copy.exists())
+        self.assertTrue(kept.is_dir())
 
     def test_a_verdict_for_a_row_not_to_review_is_refused(self) -> None:
         for row in ("C70", "C99", "76"):

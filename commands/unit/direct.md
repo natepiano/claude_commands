@@ -851,8 +851,9 @@ durable before dispatch. The verbs:
 | --- | --- |
 | Initial state from `/sync board` | `phase_reservation.py enroll --session-dir "${SESSION_DIR}" --phase <id> --board <board_ready\|unconfigured>` |
 | First touch to `Active` | The Codex seat hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
+| Lost open phase record | `phase_reservation.py repair --session-dir "${SESSION_DIR}" --phase <id> --repo <repository>` requires a recorder-open phase, validates berth's mapped reservation on its live board and restores `Active` from the phase baseline; no live reservation exits 2 with enroll/claim commands. A finished phase exits 2 with `progress_history.py start-phase` to reopen it; a checkpoint-released phase refuses repair. |
 | `Active` to pending release | `phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <id> --commit <checkpoint commit>` |
-| Pending release confirmed | `phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <id> --released <checkpoint commit>` |
+| Pending release confirmed | `phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <id> --released <checkpoint commit>` leaves `reservation_released` with the commit; the phase leaves edit attribution while its plan review finishes. |
 | Inactive state at phase end | `progress_history.py finish-phase --status completed` |
 | A finished phase reopened | `progress_history.py start-phase` on that phase id restores its enrolled state from the board answer that `enroll` kept |
 
@@ -870,7 +871,7 @@ leaves that state as it is. The domain states and on-disk shapes are:
 | --- | --- | --- |
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
-| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
+| `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one. `repair` may restore it from berth's session map only after the board confirms it is active | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
 | `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
 
 These are
@@ -881,10 +882,13 @@ CheckpointReleaseConfirmationPending)}`. Do not represent any of them as an
 absent record or a bare optional value.
 
 `ActivePhaseReservation` is orchestration memory: never reconstruct it from a
-marker, rendered prose, conversation, or the engine's harness-session mapping —
-that mapping is a disposable edit-authorization projection, replaced by another
-claim in the same harness session, and no command reads a reservation id back
-from it. `CheckpointReleaseConfirmationPending` is durable proof that the
+marker, rendered prose, or conversation. Only a recorder-open phase can have a lost
+record; finished or checkpoint-released phases are not candidates. Reopening a finished
+phase removes its release marker with the restored enrolled state. To restore a lost record, use `repair`:
+it reads berth's phase-session mapping (the director's bare session only when no
+other phase is open), confirms `active` on the board, and logs and posts the repair.
+Never supply reservation or run ids by hand; an existing live record stays unchanged.
+`CheckpointReleaseConfirmationPending` is durable proof that the
 checkpoint commit succeeded and only release confirmation remains: never create
 or reconstruct it from conversation or from `git rev-parse HEAD` read at a later
 time, and delete it only after <CheckpointCommit/> validates a successful

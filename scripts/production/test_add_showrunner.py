@@ -27,6 +27,7 @@ from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
+SHARED = herdr.SHARED_SESSION
 PARENT_SESSION = "11111111-2222-3333-4444-555555555555"
 STUB = '''#!__PYTHON__
 import json
@@ -230,27 +231,32 @@ class AddShowrunnerTests(unittest.TestCase):
                               env=self.env, capture_output=True, text=True, check=False, cwd=cwd)
 
     def prepare_herdr(self, slug: str, *extra: str) -> None:
-        """Fake herdr answers a launch of `slug`'s showrunner; the agent prompt brings it up."""
+        """Fake herdr answers a launch of `slug`'s showrunner as a tab of the shared session, which has
+        a boot unit; the agent prompt brings the session up. While the shared session is live, it holds
+        a tab named `slug`."""
         sessions = [herdr.SessionEntry(name=path.name.removeprefix("live-"), running=True, default=False,
                     session_dir="/fixture", socket_path="/fixture/socket") for path in self.state.glob("live-*")]
         responses: dict[str, CommandResponse | list[CommandResponse]] = {
             "--session default session list --json": CommandResponse(code=0, stdout=json.dumps(
                 herdr.SessionListResult(sessions=sessions))),
-            f"--session {slug} status server": [CommandResponse(code=0, stdout="status: stopped\n"),
-                                               CommandResponse(code=0, stdout="status: running\n")],
-            f"--session {slug} workspace list": CommandResponse(
+            f"--session {SHARED} status server": [CommandResponse(code=0, stdout="status: stopped\n"),
+                                                 CommandResponse(code=0, stdout="status: running\n")],
+            f"--user show -p FragmentPath --value herdr-{SHARED}.service": CommandResponse(
+                code=0, stdout=f"{self.env['HOME']}/.config/systemd/user/herdr-{SHARED}.service\n"),
+            f"--session {SHARED} workspace list": CommandResponse(
                 code=0, stdout=json.dumps({"result": {"workspaces": []}})),
-            f"--session {slug} pane list": CommandResponse(code=0, stdout=json.dumps({
-                "result": {"panes": [{"pane_id": "w1:p1", "label": slug}]}})),
-            "default": CommandResponse(code=0, stdout=json.dumps({"result": {"root_pane": {"pane_id": "w1:p1"}}})),
+            f"--session {SHARED} pane list": CommandResponse(code=0, stdout=json.dumps({
+                "result": {"panes": [{"pane_id": "w1:p1", "tab_id": "w1:t1", "label": slug}]}})),
+            "default": CommandResponse(code=0, stdout=json.dumps({"result": {
+                "root_pane": {"pane_id": "w1:p1"}, "tab": {"tab_id": "w1:t1"}, "tabs": []}})),
         }
-        responses[f"--session {slug} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
+        responses[f"--session {SHARED} agent get w1:p1"] = CommandResponse(code=0, stdout=json.dumps({
             "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
-        responses[f"--session {slug} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
+        responses[f"--session {SHARED} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
         prompt = f"/showrunner:produce {self.doc(slug)}" + (" resume" if "--resume" in extra else "")
-        responses[f"--session {slug} agent prompt w1:p1 {prompt}"] = CommandResponse(
-            code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{slug}"): ""})
+        responses[f"--session {SHARED} agent prompt w1:p1 {prompt}"] = CommandResponse(
+            code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{SHARED}"): ""})
         responses.update(self.herdr_overrides)
         _ = Path(self.env["FAKE_HERDR_RESPONSES"]).write_text(json.dumps(responses))
 
@@ -287,15 +293,14 @@ class AddShowrunnerTests(unittest.TestCase):
         result = self.run_command("kid")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines()[:2],
-                         ["started kid: herdr session attach kid", "kid now reports to top"])
+                         ["started kid: herdr session attach agents, workspace kid, tab kid", "kid now reports to top"])
         self.assertEqual(self.parent_of("kid"), "top")
         # The parent ran the command and reads its output; only the child is told.
         self.assertEqual(self.sent_to(), [f"uds:{self.root / 'kid-session.sock'}"])
         calls = self.herdr_calls()
-        self.assertIn(["--user", "--unit=herdr-kid.service", "--collect", self.env["HERDR_BIN"],
-                       "--session", "kid", "server"], calls)
+        self.assertIn(["--user", "start", "herdr-agents.service"], calls)
         opened = self.opened()
-        self.assertEqual(opened[:8], ["--session", "kid", "workspace", "create", "--label", "kid",
+        self.assertEqual(opened[:8], ["--session", "agents", "workspace", "create", "--label", "kid",
                                      "--cwd", str(self.root / "kid-checkout")])
         self.assertEqual(opened[8:], ["--env", "ENABLE_TOOL_SEARCH=true",
             "--env", f"CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}",
@@ -305,7 +310,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(started[started.index("--") + 1:], ["--model", "opus", "--effort", "high",
             "--session-id", started[started.index("--session-id") + 1], "--remote-control", "kid", "-n", "kid", "--settings", '{"disableAgentView": true}'])
         self.assertEqual([row for row in calls if row[2:4] == ["agent", "prompt"]], [[
-            "--session", "kid", "agent", "prompt", "w1:p1", f"/showrunner:produce {self.doc('kid')}"]])
+            "--session", "agents", "agent", "prompt", "w1:p1", f"/showrunner:produce {self.doc('kid')}"]])
 
     def test_resume_starts_in_the_given_directory_with_the_resume_prompt(self) -> None:
         self.starts("abc-123", registers="kid")
@@ -316,7 +321,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(self.opened()[7], str(elsewhere))
         args = self.started()
         self.assertEqual(args[args.index("--resume") + 1], "abc-123")
-        self.assertIn(["--session", "kid", "agent", "prompt", "w1:p1",
+        self.assertIn(["--session", "agents", "agent", "prompt", "w1:p1",
                        f"/showrunner:produce {self.doc('kid')} resume"], self.herdr_calls())
         alone = self.run_command("other", "--resume", "abc-123")
         self.assertEqual(alone.returncode, 2)
@@ -520,15 +525,15 @@ class AddShowrunnerTests(unittest.TestCase):
         self.refused(result, "claude2")
         self.assertNotIn("SECRET", result.stderr)
 
-    def test_resume_refuses_an_unrelated_herdr_name_collision_without_stopping_it(self) -> None:
-        (self.state / "live-kid").touch()
+    def test_resume_refuses_an_unrelated_tab_of_the_same_name_without_closing_it(self) -> None:
+        (self.state / "live-agents").touch()
         self.live("unrelated-conversation")
         result = self.run_command("kid", "--resume", "ended-conversation", "--cwd", str(self.root),
                                   "--account", "claude2")
-        self.refused(result, "a herdr session named kid is already live")
+        self.refused(result, "a tab named kid is already open in herdr session agents")
         self.assertEqual(len(result.stderr.splitlines()), 1)
-        self.assertFalse(any(row[2:4] == ["server", "stop"] for row in self.herdr_calls()))
-        self.assertTrue((self.state / "live-kid").exists())
+        self.assertFalse(any(row[2:4] in (["server", "stop"], ["tab", "close"]) for row in self.herdr_calls()))
+        self.assertTrue((self.state / "live-agents").exists())
 
     def test_showrunner_resume_refuses_directory_outside_configured_account(self) -> None:
         """F004: a valid retained directory is still not the configured account."""
@@ -598,7 +603,7 @@ class AddShowrunnerTests(unittest.TestCase):
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(add_showrunner, "running", return_value=False), \
                 patch.object(showrunners, "descendants_of", return_value=[]), \
-                patch.object(add_showrunner, "herdr_session_running", return_value=False) as destination:
+                patch.object(add_showrunner, "herdr_tab_open", return_value=False) as destination:
             result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
         self.assertIsNone(result)
         destination.assert_called_once_with("kid")
@@ -656,7 +661,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.herdr_overrides["agent start"] = CommandResponse(code=1, stdout=json.dumps({
             "error": {"code": "agent_not_ready", "message": "permission dialog"}}))
         screen = "Do you trust this folder?\n1. Yes\n2. No"
-        self.herdr_overrides["--session kid pane read w1:p1 --source visible"] = CommandResponse(
+        self.herdr_overrides["--session agents pane read w1:p1 --source visible"] = CommandResponse(
             code=0, stdout=screen)
         result = self.run_command("kid")
         self.assertEqual(result.returncode, add_showrunner.SESSION_NOT_READY, result.stdout + result.stderr)
@@ -667,7 +672,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(self.parent_of("kid"), "")
 
     def test_showrunner_start_failure_is_reported_without_attaching(self) -> None:
-        self.herdr_overrides["--session kid workspace create --label kid --cwd "
+        self.herdr_overrides["--session agents workspace create --label kid --cwd "
             + str(self.root / "kid-checkout") + " --env ENABLE_TOOL_SEARCH=true"
             + f" --env CLAUDE_CONFIG_DIR={Path(self.env['HOME']) / '.claude2'}"
             + f" --env CLAUDE_CODE_REMOTE_MEMORY_DIR={Path(self.env['HOME']) / '.claude'}"
@@ -687,18 +692,16 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
 
-    def test_child_refuses_a_server_that_appears_after_preflight(self) -> None:
-        self.herdr_overrides["--session kid status server"] = CommandResponse(
+    def test_child_opens_its_tab_in_a_shared_server_that_already_runs(self) -> None:
+        self.herdr_overrides["--session agents status server"] = CommandResponse(
             code=0, stdout="status: running\n")
+        self.starts("kid-session", registers="kid")
         result = self.run_command("kid")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("add_showrunner: herdr session kid is already taken", result.stderr)
-        self.assertEqual(self.herdr_calls(), [
-            ["--session", "default", "session", "list", "--json"],
-            ["--session", "kid", "status", "server"],
-        ])
-        self.assertEqual(self.parent_of("kid"), "")
-        self.assertEqual(self.sent_to(), [])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.herdr_calls()
+        self.assertFalse(any(row[:1] == ["--user"] for row in calls))
+        self.assertEqual(self.opened()[:6], ["--session", "agents", "workspace", "create", "--label", "kid"])
+        self.assertEqual(self.parent_of("kid"), "top")
 
     def test_new_showrunner_zero_reading_without_refusal_can_launch(self) -> None:
         file = Path(self.env["HOME"]) / ".local/state/agent-notes/usage.json"
@@ -721,7 +724,7 @@ class AddShowrunnerTests(unittest.TestCase):
         self.starts("abc-123")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["started kid: herdr session attach kid", "kid already reports to top"])
+        self.assertEqual(result.stdout.splitlines(), ["started kid: herdr session attach agents, workspace kid, tab kid", "kid already reports to top"])
         self.assertEqual(self.sent_to(), [])
 
     def test_a_stored_timer_alone_is_not_a_showrunner_that_appeared(self) -> None:
@@ -736,8 +739,8 @@ class AddShowrunnerTests(unittest.TestCase):
         self.assertIn("kid has no running showrunner after 0 s, so it is not attached. Its session is still running",
                       result.stdout)
         self.assertIn("showrunners.py attach kid top", result.stdout)
-        self.assertIn("herdr session attach kid", result.stdout)
-        self.assertTrue((self.state / "live-kid").exists())
+        self.assertIn("herdr session attach agents, workspace kid, tab kid", result.stdout)
+        self.assertTrue((self.state / "live-agents").exists())
         self.assertEqual(self.parent_of("kid"), "")
         self.assertEqual(self.sent_to(), [])
 
@@ -752,7 +755,7 @@ class AddShowrunnerTests(unittest.TestCase):
         count = self.root / "registry-failures"
         _ = (self.root / "flaky_sessions.py").write_text(
             "import os, pathlib, runpy, sys\n"
-            + f"count, started = pathlib.Path({str(count)!r}), pathlib.Path({str(self.state / 'live-kid')!r})\n"
+            + f"count, started = pathlib.Path({str(count)!r}), pathlib.Path({str(self.state / 'live-agents')!r})\n"
             + "seen = int(count.read_text()) if count.exists() else 0\n"
             + f"if started.exists() and seen < {failures}:\n"
             + "    count.write_text(str(seen + 1))\n"
@@ -818,8 +821,8 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         self.assertEqual(result.stdout.strip(),
                          f"check: ok — would start kid in {self.root / 'kid-checkout'} and attach it to top")
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
-        (self.state / "live-kid").touch()
-        self.refused(self.run_command("kid", "--check"), "a herdr session named kid is already live")
+        (self.state / "live-agents").touch()
+        self.refused(self.run_command("kid", "--check"), "a tab named kid is already open in herdr session agents")
 
     def test_each_refusal_names_its_cause_and_starts_nothing(self) -> None:
         notes = self.root / "notes.md"
@@ -832,8 +835,8 @@ raise SystemExit(add_showrunner.main(sys.argv[2:]))
         self.timer("running", "running-session")
         self.live("running-session")
         self.refused(self.run_command("running"), "running already has a running showrunner")
-        (self.state / "live-kid").touch()
-        self.refused(self.run_command("kid"), "a herdr session named kid is already live")
+        (self.state / "live-agents").touch()
+        self.refused(self.run_command("kid"), "a tab named kid is already open in herdr session agents")
 
     def test_a_production_above_the_caller_is_refused(self) -> None:
         self.timer("middle", "middle-session")

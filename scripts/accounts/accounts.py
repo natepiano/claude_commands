@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import socket
 import stat
 import subprocess
@@ -1239,13 +1240,25 @@ def _prepared_account(label: str, *, resume: bool, repair: bool) -> PreparedAcco
     return PreparedAccount(account.named_account_environment(selected.dir), remove)
 
 
+def resolve_program(tool: Literal["claude", "codex"]) -> str:
+    """Find an executable on PATH, then in the installer directory on both machines."""
+    found = shutil.which(tool)
+    if found:
+        return str(Path(found).absolute())
+    installed = accounts_home() / ".local" / "bin" / tool
+    if installed.is_file() and os.access(installed, os.X_OK):
+        return str(installed.absolute())
+    raise FileNotFoundError(f"{tool} program not found (looked in PATH and {installed})")
+
+
 def _exec_codex_account(label: str, arguments: list[str]) -> None:
     """Launch Codex on a checked account, including the stored workers selection."""
     selected_label = role_account("workers").label if label == "workers" else label
     target = check_codex_target(selected_label, accounts_home() / ".codex")
     environment = {**os.environ, "CODEX_HOME": str(target.home)}
     try:
-        os.execvpe("codex", ["codex", *arguments], environment)
+        program = resolve_program("codex")
+        os.execvpe(program, [program, *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start codex: {error}") from error
 
@@ -1306,6 +1319,12 @@ def renew_login(label: str) -> LoginRenewed | LoginRenewalFailed:
     except OSError:
         return LoginRenewalFailed("probe could not start")
     if probe.returncode != 0:
+        # The exec wrapper uses status 2 when it cannot find the program.
+        if probe.returncode == 2:
+            try:
+                _ = resolve_program("claude")
+            except FileNotFoundError as error:
+                return LoginRenewalFailed(str(error))
         return LoginRenewalFailed(f"probe exited with status {probe.returncode}")
     try:
         report = agent_accounts.claude_live(directory)
@@ -1340,11 +1359,12 @@ def exec_account(label: str, arguments: list[str], *, probe: bool = False) -> No
         for name in UNIT_MARKS:
             _ = environment.pop(name, None)
     try:
+        program = resolve_program("claude")
         if sys.stdin.isatty() and "RELAUNCH_SUPERVISED" not in environment:
             os.execvpe(sys.executable, [sys.executable, str(SCRIPTS / "lib" / "relaunch.py"),
-                                      "run", "--", "claude", *arguments], environment)
+                                      "run", "--", program, *arguments], environment)
         else:
-            os.execvpe("claude", ["claude", *arguments], environment)
+            os.execvpe(program, [program, *arguments], environment)
     except OSError as error:
         raise AccountsError(f"accounts: could not start claude: {error}") from error
 
@@ -1413,9 +1433,14 @@ def _claude_role_selection(group: ClaudeGroup, label: str) -> NamedAccount:
 
 
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
-                             target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
-    """Keep every launcher and explicit override on its configured group account."""
-    selected = role_account(role)
+                             target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
+    """Use the group account, except for a moved unit restored on its source."""
+    if source_fallback:
+        if role != "unit" or not resume or not target or config_dir:
+            raise AccountsError("a source fallback needs a unit restore and its source account")
+        selected = NamedAccount(target, claude_account_dir(target))
+    else:
+        selected = role_account(role)
     label = selected.label
     directory = selected.dir
     group = "units" if role == "unit" else "showrunners"
@@ -1472,6 +1497,22 @@ def trust_command(folder: Path, selected: ClaudeLaunchAccount) -> str:
     """The command the user runs to accept trust, then type /exit in Claude."""
     prefix = account_prefix(selected).strip()
     return f"cd {shlex.quote(str(folder))} && {prefix} claude"
+
+
+def trust_sources(target_dir: Path, source_dir: Path | None) -> list[tuple[str, Path]]:
+    """Every other account's trust file on this machine, the session's own source account first.
+
+    `herdr.heal_claude_trust` copies a folder's trust from the first of them that has it.
+    """
+    home = (accounts_home() / ".claude").resolve()
+    candidates = [NamedAccount(source_dir.name.removeprefix("."), source_dir)] if source_dir is not None else []
+    candidates.extend(_existing_named_accounts())
+    sources: dict[Path, tuple[str, Path]] = {}
+    for named in candidates:
+        directory = named.dir.resolve()
+        if directory != target_dir.resolve() and directory not in sources:
+            sources[directory] = (named.label, accounts_home() / ".claude.json" if directory == home else named.dir / ".claude.json")
+    return list(sources.values())
 
 
 def launch_prefix(role: str) -> str:
@@ -3082,8 +3123,41 @@ class MoveDryRun:
     lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MoveTargetHoldClear:
+    notices: tuple[str, ...] = ()
+
+
+def check_move_target_hold(target: str, *, dry_run: bool = False) -> MoveTargetHoldClear | MoveRefused:
+    """Check the target before changing a group or stopping a session."""
+    if dry_run:
+        return MoveTargetHoldClear((f"{target}: would check the shutdown hold",))
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import launch_permission
+    else:
+        launch_permission = import_module("launch_permission")
+    environment = {**os.environ, "CLAUDE_CONFIG_DIR": str(claude_account_dir(target))}
+    permission = launch_permission.launch_permission(environment, launch_permission.NewWorkLaunchPurpose())
+    if isinstance(permission, launch_permission.BlockedByShutdown):
+        return MoveRefused(f"accounts: {permission.reason}; no session was stopped")
+    if isinstance(permission, launch_permission.ShutdownStateUnreadable):
+        return MoveRefused(f"accounts: shutdown state unreadable: {permission.detail}; no session was stopped")
+    released = permission.released
+    if released is None:
+        return MoveTargetHoldClear()
+    requester = (f"session {released.session_id[:8]}" if released.session_id is not None
+                 else "requested in a terminal or by a recovery snapshot")
+    at = datetime.fromisoformat(released.requested_at).astimezone(agent_accounts.user_zone())
+    return MoveTargetHoldClear((f"cleared a finished {released.then} hold on {released.label} "
+                               + f"from {at:%Y-%m-%d %H:%M %Z} ({requester})",))
+
+
 def check_move_target(target: str, now: datetime, *, repair: bool = True) -> MoveTargetReady | MoveRefused:
     """Check the destination without changing a group or starting a shutdown."""
+    hold = check_move_target_hold(target, dry_run=not repair)
+    if isinstance(hold, MoveRefused):
+        return hold
     destination = _move_target(target, repair=repair)
     if isinstance(destination, MoveRefused):
         return destination
@@ -3101,11 +3175,11 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True) -> Mov
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
                     return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); {room}")
-        return MoveTargetReady(destination)
+        return MoveTargetReady(destination, hold.notices)
     windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
     times = [window.at for window in windows if isinstance(window, ReadingWindow)]
     age = f"last {max(0, int((now - max(times)).total_seconds() // 60))} minutes ago" if times else "last reading unknown"
-    return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
+    return MoveTargetReady(destination, (*hold.notices, f"no fresh usage reading for {destination.label} ({age})"))
 
 
 def move_preview_line(member: ListedSession, now: datetime) -> str:

@@ -113,13 +113,17 @@ class RelaunchTests(ShutdownTestCase):
         self.assertFalse(request.exists(), "a consumed request could launch twice")
 
     def test_child_environment_marks_supervision_without_changing_the_parent(self) -> None:
+        program = self.root / ".local/bin/claude"
+        program.parent.mkdir(parents=True)
+        _ = program.write_text("#!/bin/sh\nexit 99\n")
+        program.chmod(0o700)
         with (patch.dict(os.environ, {"HOME": str(self.root),
                   "SHUTDOWN_STATE_DIR": str(self.state), "PRESERVED_MARKER": "keep"}, clear=True),
               patch.object(subprocess, "Popen", return_value=FinishedChild()) as launch):
             self.assertEqual(relaunch.run(["claude", "--resume", "conversation-id"]), 23)
             self.assertNotIn("RELAUNCH_SUPERVISED", os.environ)
         launch.assert_called_once()
-        self.assertEqual(launch.call_args.args[0], ["claude", "--resume", "conversation-id"])
+        self.assertEqual(launch.call_args.args[0], [str(program), "--resume", "conversation-id"])
         environment = cast(dict[str, str], launch.call_args.kwargs["env"])
         self.assertEqual(environment["RELAUNCH_SUPERVISED"], "1")
         self.assertEqual(environment["PRESERVED_MARKER"], "keep")

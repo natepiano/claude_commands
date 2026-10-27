@@ -562,6 +562,10 @@ class RoleMapTests(unittest.TestCase):
                          "accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
 
     def test_mac_launch_reads_the_map_once_per_command_and_the_next_command_observes_a_change(self) -> None:
+        program = self.home / ".local/bin/claude"
+        program.parent.mkdir(parents=True)
+        _ = program.write_text("#!/bin/sh\nexit 99\n")
+        program.chmod(0o700)
         self.seed(self.server_home, groups={"units": "claude2"})
         self.assertEqual(accounts.setup("claude2"), [])
         self.assertEqual(accounts.setup("claude3"), [])

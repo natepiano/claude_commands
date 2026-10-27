@@ -32,9 +32,10 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory, record, restart, settle
+    from scripts.shutdown import inventory, launch_permission, record, restart, settle
     from scripts.message import sessions
 else:
+    launch_permission = import_module("launch_permission")
     inventory = import_module("inventory")
     record = import_module("record")
     restart = import_module("restart")
@@ -77,6 +78,7 @@ class RefusalWatchTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.home), "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
@@ -1306,6 +1308,110 @@ class RefusalWatchTests(unittest.TestCase):
                    for line in accounts.roles_history_file().read_text().splitlines()]
         self.assertEqual([saved["why"] for saved in history], ["auto: units-low", "operator return"])
 
+    def test_auto_move_relays_a_cleared_hold_once_to_showrunners(self) -> None:
+        for released in (None, launch_permission.ReleasedHold(label="claude2", then="stop",
+                requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")):
+            with self.subTest(released=released):
+                _ = self.groups()
+                self.next_entries(self.low_rule("cleared-hold" if released else "no-hold"))
+                self.reading(SOURCE_LOGIN, 1)
+                self.head_deliveries.clear()
+                with patch.object(launch_permission, "launch_permission",
+                        return_value=launch_permission.AllowedByShutdownState(released)):
+                    code, _, error = self.cli()
+                    _ = self.cli()
+                self.assertEqual((code, error), (0, ""))
+                notices = [job for jobs in self.head_deliveries for job in jobs
+                           if "cleared a finished" in job.text]
+                self.assertEqual(len(notices), int(released is not None))
+                if notices:
+                    self.assertEqual(notices[0].recipient, "fixture-showrunner")
+                    self.assertIn("units move to claude2: cleared a finished stop hold on claude2", notices[0].text)
+                    self.assertIn("session b1f5ca98", notices[0].text)
+
+    def test_committed_auto_group_move_relays_its_cleared_hold(self) -> None:
+        _ = self.groups()
+        _ = self.owner("committed-unit", host="unit")
+        self.reading(TARGET_LOGIN, 80)
+        _ = accounts.set_group_account("units", "claude3", why="auto: committed", now=NOW, origin=accounts.AutoOrigin())
+        released = launch_permission.ReleasedHold(label="claude3", then="stop",
+            requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
+        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState(released)):
+            code, _, error = self.cli()
+            _ = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn("--no-alert", self.commands[0])
+        notices = [job for jobs in self.head_deliveries for job in jobs if "cleared a finished" in job.text]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].recipient, "fixture-showrunner")
+        self.assertIn("units move to claude3: cleared a finished stop hold on claude3", notices[0].text)
+        self.assertIn("session b1f5ca98", notices[0].text)
+        self.assertEqual(self.commands[0][self.commands[0].index("--why") + 1], "auto: committed")
+
+    def test_refusal_group_move_relays_its_cleared_hold(self) -> None:
+        _ = self.groups()
+        owner = self.owner("refused-unit", host="unit")
+        _ = self.transcript(owner["session_id"])
+        self.reading(TARGET_LOGIN, 0)
+        released = launch_permission.ReleasedHold(label="claude2", then="stop",
+            requested_at=NOW.isoformat(), session_id=None)
+        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState(released)):
+            code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(len(self.commands), 1)
+        notices = [job for jobs in self.head_deliveries for job in jobs if "cleared a finished" in job.text]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0].recipient, "fixture-showrunner")
+        self.assertIn("units move to claude2: cleared a finished stop hold on claude2", notices[0].text)
+
+    def test_cleared_hold_retries_only_failed_recipients_after_the_move_is_consumed(self) -> None:
+        _ = self.groups()
+        self.next_entries(self.low_rule())
+        self.reading(SOURCE_LOGIN, 1)
+        released = launch_permission.ReleasedHold(label="claude2", then="stop",
+            requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
+        with (patch.object(quota_alert, "recipients", return_value=["first-showrunner", "second-showrunner"]),
+              patch.object(quota_alert, "deliver_notice", side_effect=[True, False, True]) as deliver):
+            with patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState(released)):
+                code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(next_moves.read_next_moves(), ())
+            path = self.home / ".local/state/accounts/pending_cleared_holds.json"
+            pending = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
+            self.assertEqual([notice["recipients"] for notice in pending.values()], [["second-showrunner"]])
+            _ = self.cli("--dry-run")
+            self.assertEqual(deliver.call_count, 2)
+            _ = self.cli()
+            _ = self.cli()
+        jobs = [cast(list[quota_alert.Job], call.args[0])[0] for call in deliver.call_args_list]
+        self.assertEqual([job.recipient for job in jobs], ["first-showrunner", "second-showrunner", "second-showrunner"])
+        self.assertEqual(jobs[1].text, jobs[2].text)
+        self.assertEqual(json.loads(path.read_text()), {})
+
+    def test_released_hold_does_not_change_the_auto_id_used_after_interrupted_consumption(self) -> None:
+        path = self.groups()
+        head = self.low_rule()
+        self.next_entries(head)
+        self.reading(SOURCE_LOGIN, 1)
+        released = launch_permission.ReleasedHold(label="claude2", then="stop",
+            requested_at=NOW.isoformat(), session_id="b1f5ca98-rest")
+        with (patch.object(launch_permission, "launch_permission",
+                           return_value=launch_permission.AllowedByShutdownState(released)),
+              patch.object(next_moves, "write_next_moves", side_effect=OSError("interrupted consumption"))):
+            with self.assertRaises(OSError):
+                _ = self.cli()
+        self.assertEqual(stored_group_labels(path)["units"], "claude2")
+        self.assertEqual(next_moves.read_next_moves(), (head,))
+        _ = accounts.set_group_account("units", "claude1", why="operator return", now=NOW)
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(next_moves.read_next_moves(), ())
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        history = [cast(dict[str, object], json.loads(line))
+                   for line in accounts.roles_history_file().read_text().splitlines()]
+        self.assertEqual([item["why"] for item in history], ["auto: units-low", "operator return"])
+
     def test_failed_consumption_cannot_replay_a_recorded_move_when_role_history_becomes_malformed(self) -> None:
         path = self.groups()
         entry = self.low_rule()
@@ -1688,6 +1794,40 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(stored_group_labels(path)["units"], "claude1")
         _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
+
+    def test_auto_move_held_target_keeps_group_and_head_and_names_the_hold(self) -> None:
+        path = self.groups()
+        _ = self.owner("unit", host="unit")
+        head = self.low_rule()
+        self.next_entries(head)
+        reason = "claude2 is held by a shutdown, requested by session b1f5ca98"
+        for permission in (launch_permission.BlockedByShutdown(reason),
+                           launch_permission.ShutdownStateUnreadable("broken state")):
+            with (self.subTest(permission=permission),
+                  patch.object(launch_permission, "launch_permission", return_value=permission)):
+                lines = refusal_watch.run_auto_moves(NOW)
+            self.assertEqual(stored_group_labels(path)["units"], "claude1")
+            self.assertEqual(next_moves.read_next_moves(), (head,))
+            self.assertEqual(self.commands, [])
+            self.assertTrue(any("no session was stopped" in line for line in lines), lines)
+        self.assertTrue(self.head_deliveries)
+        self.assertIn(reason, self.head_deliveries[0][0].text)
+
+    def test_refusal_and_committed_group_paths_check_the_shutdown_hold(self) -> None:
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.owners.clear()
+                self.live.clear()
+                _ = self.groups(units="claude3" if committed else "claude1")
+                owner = self.owner("held-unit", host="unit")
+                self.reading(TARGET_LOGIN, 80)
+                if not committed:
+                    _ = self.transcript(owner["session_id"])
+                with patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("target held")):
+                    lines = refusal_watch.run(NOW)
+                self.assertEqual(self.commands, [])
+                self.assertTrue(any("target held" in line for line in lines), lines)
+                self.assertTrue(any("target held" in text for text in self.notifications))
 
     def test_automatic_low_rule_holds_at_two_percent_and_moves_at_one_with_one_transition(self) -> None:
         path = self.groups()
@@ -2236,7 +2376,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIsInstance(result, accounts.GroupMoveDryRun)
         assert isinstance(result, accounts.GroupMoveDryRun)
         self.assertEqual(result.session_ids, ())
-        self.assertEqual(result.lines, ("units: would select claude1", "units: no live session moves"))
+        self.assertEqual(result.lines, ("claude1: would check the shutdown hold",
+            "units: would select claude1", "units: no live session moves"))
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.commands, [])
 
@@ -2986,7 +3127,8 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIn("owner second: refused; move from claude3 to claude2", preview)
         self.assertEqual(self.snapshot(), before)
         _, actual, _ = self.cli()
-        self.assertEqual("\n".join(preview.splitlines()[1:]) + "\n", actual)
+        self.assertEqual("\n".join(line for line in preview.splitlines()[1:]
+            if ": would check the shutdown hold" not in line) + "\n", actual)
         self.assertEqual(len(self.commands), 2)
         self.assertTrue(all(command[command.index("--to") + 1] == "claude2" for command in self.commands))
 

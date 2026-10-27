@@ -33,7 +33,7 @@ Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-lengt
 
 ### Codex registration and trust
 
-`scripts/hooks/codex_hooks.py install|check` manages two `apply_patch` handlers. Fn-length uses `PostToolUse` with a 10-second timeout. Berth uses `PreToolUse` with a 30-second timeout and runs `pre-tool-use-berth.py`. Both `install` and `check` return 0 only when both handlers are trusted and enabled. A trusted, enabled duplicate takes precedence over another matching entry.
+`scripts/hooks/codex_hooks.py install|check` manages three handlers, each with its own tool matcher. Fn-length uses `PostToolUse` on `apply_patch` with a 10-second timeout. Berth uses `PreToolUse` on `apply_patch` with a 30-second timeout and runs `pre-tool-use-berth.py`. The scratch guard uses `PreToolUse` on `Bash` (Codex's name for a shell command, as in Claude Code) with a 10-second timeout and runs `pre-tool-use-scratch-guard.py`. Both `install` and `check` return 0 only when every handler is trusted and enabled. A trusted, enabled duplicate takes precedence over another matching entry.
 
 `CodexHook(name, script, event, timeout)` defines a required handler. `LocatedHook` holds its definition, key, current hash, trust state and enabled state. `MissingHook` means no matching handler was listed from the managed configuration.
 

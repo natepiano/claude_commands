@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, final, override
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import pushover
 import review
@@ -411,6 +412,24 @@ class LocalReviewTests(unittest.TestCase):
                    for index, (stamp, text, stop) in enumerate(replies)]
         _ = path.write_text("\n".join(json.dumps(record) for record in records) + "\n")
         return path
+
+    def test_every_review_prompt_names_the_user_zone_and_its_date(self) -> None:
+        reply = review.ReplyContext(self.root / "session.jsonl", datetime(2026, 10, 25, 12, tzinfo=timezone.utc), "")
+        question = review.QuestionReview(review.QuestionKey("demo", "Retry"))
+        contexts: tuple[review.PushReview | review.ReplyContext | review.QuestionReview, ...] = (
+            review.PUSH_REVIEW, reply, question)
+        for zone in ("America/Curacao", "America/New_York"):
+            now = datetime.now(ZoneInfo(zone))
+            line = f"User zone: {now.tzname()} ({zone}). Today: {now:%Y-%m-%d}."
+            for context in contexts:
+                with self.subTest(zone=zone, context=type(context).__name__), mock.patch.dict(os.environ, {"USER_ZONE": zone}):
+                    runner = FakeReviewer(verdict(self.draft))
+                    _ = review._review(self.draft, False, runner, context, timeout_seconds=60)  # pyright: ignore[reportPrivateUsage]
+                    command = runner.calls[-1].argv
+                    self.assertEqual(command[-1].splitlines()[0], line)
+                    self.assertIn("Times are in the user zone the draft gives.",
+                                  command[command.index("--system-prompt") + 1])
+        self.assertEqual(datetime.now(ZoneInfo("America/Curacao")).tzname(), "AST")
 
     def test_sample_uses_reply_rules_date_and_previous_reply_without_phone_limits(self) -> None:
         old = "The prior decision is still open."

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-from scripts.direct import phase_reservation, phase_table, plan_history, progress_history
+from scripts.direct import phase_reservation, phase_table, plan_history, progress_history, recorder_state
 from scripts.direct.recorder_fixture import invoke_recorder
 
 
@@ -5482,6 +5482,50 @@ print('two homes isolated; recorder lock retained; caller restored')
         current = cast(dict[str, object], state["phase"])
         parked = cast(list[dict[str, object]], state.get("open_phases", []))
         return cast(str, current["id"]), [cast(str, phase["id"]) for phase in parked]
+
+    def test_start_phase_restores_ownership_after_a_checkpoint_release(self) -> None:
+        started_at = 40_000
+        session_dir = self.start_run("reopen-released-phase", started_at)
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        directory = phase_reservation.phase_directory(session_dir, "6")
+        _ = phase_reservation.enroll(directory, "6", "board_ready")
+        _ = phase_reservation.record_active(directory, phase_reservation.Acquisition("r1", "c1", "a" * 40))
+        phase_reservation.committed(directory, "b" * 40)
+        self.assertTrue(phase_reservation.clear(directory, "b" * 40))
+        marker = directory / "reservation_released"
+        self.assertEqual(marker.read_text().strip(), "b" * 40)
+        self.assertEqual(phase_reservation.open_phases(session_dir), [])
+        self.finish_numbered_phase(session_dir, started_at + 20)
+        self.start_numbered_phase(session_dir, "6", started_at + 30)
+        self.assertFalse(marker.exists())
+        self.assertEqual(phase_reservation.read_state(directory)["kind"], "enrolled_awaiting_first_touch")
+        owners = phase_reservation.attribute(phase_reservation.open_phases(session_dir), ["unlisted.rs"])
+        self.assertEqual([phase.phase for phase in owners.by_phase], ["6"])
+        self.assertEqual(owners.refused, [])
+
+    def test_open_phase_reader_tracks_start_finish_and_reopen_without_writing(self) -> None:
+        started_at = 40_000
+        session_dir = self.start_run("open-phase-reader", started_at)
+        state_path = session_dir / plan_history.STATE_FILENAME
+        self.assertEqual(recorder_state.read_open_phase_ids(session_dir), [])
+        self.start_numbered_phase(session_dir, "6", started_at + 10)
+        self.start_numbered_phase(session_dir, "18", started_at + 20)
+        before = state_path.read_bytes()
+        self.assertEqual(recorder_state.read_open_phase_ids(session_dir), ["6", "18"])
+        self.assertEqual(state_path.read_bytes(), before)
+        self.finish_numbered_phase(session_dir, started_at + 30, "--phase-id", "6")
+        self.assertEqual(recorder_state.read_open_phase_ids(session_dir), ["18"])
+        self.finish_numbered_phase(session_dir, started_at + 40)
+        self.assertEqual(recorder_state.read_open_phase_ids(session_dir), [])
+        directory = phase_reservation.phase_directory(session_dir, "6")
+        _ = phase_reservation.enroll(directory, "6", "board_ready")
+        _ = phase_reservation.clear(directory)
+        self.start_numbered_phase(session_dir, "6", started_at + 50)
+        self.assertEqual(recorder_state.read_open_phase_ids(session_dir), ["6"])
+        self.assertEqual(phase_reservation.read_state(directory)["kind"], "enrolled_awaiting_first_touch")
+        missing = session_dir / "not-a-run"
+        self.assertEqual(recorder_state.read_open_phase_ids(missing), [])
+        self.assertFalse(missing.exists())
 
     def test_a_phase_started_while_another_is_open_leaves_the_older_one_open(self) -> None:
         started_at = 40_000

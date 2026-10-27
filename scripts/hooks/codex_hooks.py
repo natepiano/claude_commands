@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Install and trust the Codex `apply_patch` hooks: the Rust PostToolUse checks and the berth PreToolUse check."""
+"""Install and trust the Codex hooks: the Rust PostToolUse checks and the berth PreToolUse check on
+`apply_patch`, and the scratch guard PreToolUse check on `Bash`."""
 
 from __future__ import annotations
 
@@ -20,15 +21,17 @@ RETIRED_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/p
 
 
 class CodexHook:
-    """A named `apply_patch` handler for one hook event that must be installed and trusted."""
+    """A named handler for one hook event and tool matcher that must be installed and trusted."""
 
-    __slots__: tuple[str, ...] = ("name", "command", "event", "timeout")
+    __slots__: tuple[str, ...] = ("name", "command", "event", "timeout", "matcher")
 
-    def __init__(self, name: str, script: str, event: str = "PostToolUse", timeout: int = 10) -> None:
+    def __init__(self, name: str, script: str, event: str = "PostToolUse", timeout: int = 10,
+                 matcher: str = "apply_patch") -> None:
         self.name: str = name
         self.command: str = f'"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/{script}"'
         self.event: str = event
         self.timeout: int = timeout
+        self.matcher: str = matcher
 
     def handler(self) -> dict[str, object]:
         return {"type": "command", "command": self.command, "timeout": self.timeout}
@@ -42,6 +45,8 @@ HOOKS: tuple[CodexHook, ...] = (
     CodexHook("fn-length", "post-tool-use-fn-length.py"),
     # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
     CodexHook("berth", "pre-tool-use-berth.py", "PreToolUse", 30),
+    # Codex sends a shell command as tool `Bash`, as Claude Code does.
+    CodexHook("scratch-guard", "pre-tool-use-scratch-guard.py", "PreToolUse", 10, "Bash"),
 )
 
 
@@ -119,7 +124,7 @@ def _matching_group(group: object, hook: CodexHook) -> bool:
     if not isinstance(group, dict):
         return False
     fields = cast(dict[str, object], group)
-    if fields.get("matcher") != "apply_patch" or not isinstance(fields.get("hooks"), list):
+    if fields.get("matcher") != hook.matcher or not isinstance(fields.get("hooks"), list):
         return False
     handlers = cast(list[object], fields["hooks"])
     return any(
@@ -187,7 +192,7 @@ def _install_file(path: str, binary: str, codex_home: str) -> list[HandlerTrustI
             raise HookError(f"{path}: invalid {hook.event} groups")
         groups = cast(list[object], groups_value)
         if not any(_matching_group(group, hook) for group in groups):
-            groups.append({"matcher": "apply_patch", "hooks": [hook.handler()]})
+            groups.append({"matcher": hook.matcher, "hooks": [hook.handler()]})
             changed = True
     if not changed:
         return []
@@ -376,7 +381,7 @@ def _select_hooks(entries: list[dict[str, object]]) -> dict[CodexHook, LocatedHo
         if (
             hook is None
             or entry.get("eventName") != hook.listed_event()
-            or entry.get("matcher") != "apply_patch"
+            or entry.get("matcher") != hook.matcher
             or entry.get("handlerType") != "command"
             or entry.get("timeoutSec") != hook.timeout
         ):

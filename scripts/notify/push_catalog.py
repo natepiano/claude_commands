@@ -56,12 +56,52 @@ ENTRIES = (
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work is still stopped",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
         "After your restart request, Claude coding work for account {account} is still stopped on {machine}. "
-        + "{stopped} did not restart, so that work stays paused. "
+        + "{stopped} did not restart, so that work stays paused.\n\n"
+        + "The restart gave this error: {cause}\n\n"
         + "The command above retries the restart on natedev and the Mac.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session (organon-unit)"}),
+        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session (organon-unit)",
+             "cause": "window failed to open"}),
          PushExample("one_long_name", {"account": '"claude-team-build-followups-12"', "machine": "Mac",
-             "stopped": "One session (build-followups-two-accounts-unit-director)"})),
+             "stopped": "One session (build-followups-two-accounts-unit-director)",
+             "cause": "restart prompt not submitted"})),
         purpose="A restart did not start all stopped sessions again."),
+    # A retry of an untrusted folder fails the same way, so this push never asks for one first.
+    # The command is accounts.trust_command for the folder and the session's account.
+    PushText("shutdown.restart_untrusted", "shutdown", "decision", "Stopped Claude work needs your folder trust",
+        ActionTemplate("In a terminal on {machine}, run the command below, trust the folder and type /exit. "
+                       + "Then run /shutdown restart {account} in the natedev session."),
+        "The Claude session {session} did not restart. No Claude account on {machine} trusts its folder. "
+        + "The command opens Claude there. Until you trust it, each restart fails.\n\n{command}",
+        (PushExample("typical", {"session": "organon-unit", "machine": "natedev", "account": "claude2",
+             "command": "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude2 "
+                        + "CLAUDE_CODE_REMOTE_MEMORY_DIR=/home/natepiano/.claude claude"}),
+         PushExample("long_folder", {"session": "build-followups-shutdown", "machine": "Mac", "account": "claude4",
+             "command": "cd /Users/natepiano/worktrees/claude-build-followups-shutdown && "
+                        + "CLAUDE_CONFIG_DIR=/Users/natepiano/.claude4 CLAUDE_CODE_REMOTE_MEMORY_DIR=/Users/natepiano/.claude claude"})),
+        purpose="A restart failed because no account trusts the session's folder."),
+    # The move form of shutdown.restart_untrusted: the record lives under the source account, and its
+    # restart resumes the move on the target, whose trust the command accepts.
+    PushText("shutdown.move_untrusted", "shutdown", "decision", "Stopped Claude work needs your folder trust",
+        ActionTemplate("In a terminal on {machine}, run the command below, trust the folder and type /exit. "
+                       + "Then run /shutdown restart {account} in the natedev session. That finishes the move to {target}."),
+        "The Claude session {session} did not start on {target} after its move from {account}. "
+        + "No Claude account on {machine} trusts its folder, so each restart fails until you do.\n\n{command}",
+        (PushExample("typical", {"session": "organon-unit", "machine": "natedev", "account": "claude2", "target": "claude3",
+             "command": "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 "
+                        + "CLAUDE_CODE_REMOTE_MEMORY_DIR=/home/natepiano/.claude claude"}),
+         PushExample("mac", {"session": "ups", "machine": "Mac", "account": "claude1", "target": "claude4",
+             "command": "cd /Users/natepiano/worktrees/claude-ups && "
+                        + "CLAUDE_CONFIG_DIR=/Users/natepiano/.claude4 CLAUDE_CODE_REMOTE_MEMORY_DIR=/Users/natepiano/.claude claude"})),
+        purpose="A move failed because no account trusts the session's folder."),
+    PushText("shutdown.move_failed", "shutdown", "decision", "A Claude session did not finish its move",
+        ActionTemplate('In the Claude session named natedev on the natedev computer, send: "Finish moving the Claude session named {session} to {target} from its shutdown record."'),
+        "The Claude session {session} on {machine} stopped on account {source} to move to account {target}. "
+        + "It did not start on {target}, so its work stays paused. "
+        + "Its shutdown record starts it on {target}, not on {source}.",
+        (PushExample("typical", {"session": "ups", "machine": "natedev", "source": "claude1", "target": "claude3"}),
+         PushExample("long_session", {"session": "build-followups-message-clarity-unit-director-session-12",
+             "machine": "Mac", "source": "claude2", "target": "claude4"})),
+        purpose="A session stopped for an account move did not start on its new account."),
     PushText("shutdown.restart_incomplete", "shutdown", "decision", "Claude restart could not be confirmed",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
         "The restart of Claude account {account} could not be confirmed on {machine}. "
@@ -98,25 +138,25 @@ ENTRIES = (
     PushText('quota.codex_workers_moved', "quota_alert", "note", '{transition}',
         NoActionNeeded(),
         'Codex account {account} has exhausted its included weekly usage until {reset}. Credits are off, so new work moves to the other Codex account, {target}, using {funding}. Jobs already running finish their current turn first.',
-        (PushExample('codex_one', {'account': 'codex1', 'reset': 'Tue 2026-10-20 00:58 EDT', 'target': 'codex2', 'funding': '97% weekly usage left', 'transition': 'Codex work now uses codex2'}),
-         PushExample('codex_two', {'account': 'codex2', 'reset': 'Thu 2026-10-22 07:00 EDT', 'target': 'codex1', 'funding': 'its own paid credits', 'transition': 'Codex work now spends paid credits'})),
+        (PushExample('codex_one', {'account': 'codex1', 'reset': 'Tue 2026-10-20 00:58 AST', 'target': 'codex2', 'funding': '97% weekly usage left', 'transition': 'Codex work now uses codex2'}),
+         PushExample('codex_two', {'account': 'codex2', 'reset': 'Thu 2026-10-22 07:00 AST', 'target': 'codex1', 'funding': 'its own paid credits', 'transition': 'Codex work now spends paid credits'})),
         purpose="A Codex account ran out, and its work moved to another account."),
     PushText('quota.codex_workers_stay', "quota_alert", "note", '{account} {outcome}',
         NoActionNeeded(),
         'Codex account {account} has exhausted its included weekly usage until {reset}. Credits are off. {reason} {fallback}',
-        (PushExample('no_room', {'account': 'codex1', 'reset': 'Tue 2026-10-20 00:58 EDT', 'reason': 'No other Codex account has room.', 'outcome': 'work moves to Claude', 'fallback': 'New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Sat 2026-10-17 07:00 EDT. Current turns finish first.'}),
-         PushExample('failed_move', {'account': 'codex2', 'reset': 'Thu 2026-10-22 07:00 EDT', 'reason': 'Workers could not move to codex1 because its usage reading is unavailable.', 'outcome': 'work moves to Claude', 'fallback': 'New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Tue 2026-10-20 00:58 EDT. Current turns finish first.'})),
+        (PushExample('no_room', {'account': 'codex1', 'reset': 'Tue 2026-10-20 00:58 AST', 'reason': 'No other Codex account has room.', 'outcome': 'work moves to Claude', 'fallback': 'New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Sat 2026-10-17 07:00 AST. Current turns finish first.'}),
+         PushExample('failed_move', {'account': 'codex2', 'reset': 'Thu 2026-10-22 07:00 AST', 'reason': 'Workers could not move to codex1 because its usage reading is unavailable.', 'outcome': 'work moves to Claude', 'fallback': 'New coding work uses Claude, the other coding assistant, until the earliest Codex refill at Tue 2026-10-20 00:58 AST. Current turns finish first.'})),
         purpose="A Codex account ran out, and its workers wait or move to Claude."),
     PushText('quota.codex_credits_forecast', "quota_alert", "note", '{account}: paid credits {horizon}',
         NoActionNeeded(),
         '{forecast} {destination}',
-        (PushExample('codex_one', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'destination': 'When credits run out, workers move to codex2 (97% weekly usage left).', 'horizon': 'until Fri 13:05 EDT'}),
-         PushExample('codex_two', {'account': 'codex2', 'forecast': 'Workers on Codex account codex2 used 40 paid credits in the last hour; its 2,114 credits last until about Fri 2026-10-16 12:51 EDT.', 'destination': 'When credits run out, workers move to codex1 and spend its own paid credits.', 'horizon': 'until Fri 12:51 EDT'}),
+        (PushExample('codex_one', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 AST.', 'destination': 'When credits run out, workers move to codex2 (97% weekly usage left).', 'horizon': 'until Fri 13:05 AST'}),
+         PushExample('codex_two', {'account': 'codex2', 'forecast': 'Workers on Codex account codex2 used 40 paid credits in the last hour; its 2,114 credits last until about Fri 2026-10-16 12:51 AST.', 'destination': 'When credits run out, workers move to codex1 and spend its own paid credits.', 'horizon': 'until Fri 12:51 AST'}),
          PushExample('zero_use', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used no credits in the last hour; 6,370 paid credits left.', 'destination': 'When credits run out, workers move to codex2 (97% weekly usage left).', 'horizon': 'use is zero'}),
          PushExample('unlimited', {'account': 'codex1', 'forecast': 'Codex account codex1 has unlimited paid credits; its coding workers remain on paid usage with no credit limit.', 'destination': '', 'horizon': 'have no limit'}),
          PushExample('unknown_balance', {'account': 'codex1', 'forecast': 'Codex account codex1 reports no credit balance; its coding workers remain on paid usage, but the run-out time is unknown.', 'destination': 'When credits run out, workers move to codex2 (97% weekly usage left).', 'horizon': 'run-out unknown'}),
-         PushExample('unknown_use', {'account': 'codex2', 'forecast': 'Coding workers on Codex account codex2 remain on paid usage. Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.', 'destination': 'When they run out, Codex work moves to Claude, the other coding assistant, until Tue 2026-10-20 00:58 EDT.', 'horizon': 'run-out unknown'}),
-         PushExample('queued', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 EDT.', 'destination': 'When credits run out, workers wait for the account move you queued.', 'horizon': 'until Fri 13:05 EDT'})),
+         PushExample('unknown_use', {'account': 'codex2', 'forecast': 'Coding workers on Codex account codex2 remain on paid usage. Their hourly use is unknown because credit observations cover less than 30 minutes of the hour; 2,114 credits left.', 'destination': 'When they run out, Codex work moves to Claude, the other coding assistant, until Tue 2026-10-20 00:58 AST.', 'horizon': 'run-out unknown'}),
+         PushExample('queued', {'account': 'codex1', 'forecast': 'Workers on Codex account codex1 used 120 paid credits in the last hour; its 6,370 credits last until about Fri 2026-10-16 13:05 AST.', 'destination': 'When credits run out, workers wait for the account move you queued.', 'horizon': 'until Fri 13:05 AST'})),
         purpose="Tells when the paid credits of a Codex account run out."),
     PushText("quota.codex_refused", "quota_alert", "decision", "Codex work stopped for lack of usage",
         ActionTemplate("At chatgpt.com/codex/settings/usage, add credits for account {account}."),
@@ -280,9 +320,9 @@ ENTRIES = (
         + "Leave on (recommended): work spends these credits, then moves to Claude.\n\n"
         + "Turn off: work moves to Claude until {next_reset}.",
         (PushExample("typical", {"sender": "quota_alert", "account": "codex2", "machine": "natedev",
-            "credits": "25,345", "refill": "Tue 10-27 02:33 EDT", "next_reset": "Sat 10-24 16:40 EDT"}),
+            "credits": "25,345", "refill": "Tue 10-27 02:33 AST", "next_reset": "Sat 10-24 16:40 AST"}),
          PushExample("from_session", {"sender": "natedev", "account": "codex1", "machine": "natedev",
-            "credits": "6,370", "refill": "Thu 10-29 07:00 EDT", "next_reset": "Sat 10-24 16:40 EDT"})),
+            "credits": "6,370", "refill": "Thu 10-29 07:00 AST", "next_reset": "Sat 10-24 16:40 AST"})),
         purpose="An account now spends paid credits. You can turn this off."),
     # Paid credits with a queued workers move (agreed with accounts-unit 2026-10-21): workers never go to
     # Claude; they wait for the queued move. Same title, action, need and sender rule as quota.paid_credits.

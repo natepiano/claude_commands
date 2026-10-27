@@ -24,8 +24,6 @@ import style_footprint
 PARENT_KEYWORDS = frozenset({"enum", "struct", "union", "trait", "mod"})
 # The keywords that declare an item directly in a module, trait or impl body.
 ITEM_KEYWORDS = frozenset({"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"})
-# The words after which an item keyword can stand, besides an attribute, a `pub(..)` and an `extern` ABI string.
-ITEM_LEADS = frozenset({"{", "}", ";", "pub", "unsafe", "async", "const", "extern", "default"})
 # The macros that make an item name from other tokens or bring in items from another file.
 NAME_MACROS = frozenset({"include", "concat_idents", "paste"})
 # A relative Rust file path: folders of name characters, then a file whose stem can be a module name.
@@ -274,17 +272,6 @@ def type_path(words: tuple[str, ...]) -> tuple[str, ...]:
     return path[::2] if readable else ()
 
 
-def item_starts(words: tuple[str, ...]) -> frozenset[int]:
-    """The word indexes where an item keyword can stand: the first word, and the word after a brace, a semicolon, an
-    attribute, a visibility, an item qualifier or an ABI string."""
-    leads = {index for index, word in enumerate(words) if word in ITEM_LEADS and words[index - 1:index] != ("'",)}
-    leads.update(end - 1 for _, end in style_footprint.attribute_spans(words))
-    leads.update(style_footprint.closing(words, index + 1) for index, word in enumerate(words[:-1])
-                 if word == "pub" and words[index + 1] == "(")
-    leads.update(index for index in range(1, len(words)) if words[index - 1] == "extern" and words[index].startswith('"'))
-    return frozenset({0} | {lead + 1 for lead in leads})
-
-
 def inline_modules(words: tuple[str, ...], starts: frozenset[int]) -> tuple[InlineModule, ...]:
     """The `mod` items of the file that have a braced body, outer ones before the ones they hold."""
     modules: list[InlineModule] = []
@@ -355,7 +342,7 @@ def std_derives_only(attributes: tuple[str, ...]) -> bool:
 def declaration_sites(words: tuple[str, ...], path: str, rename: ApprovedRename, name: str) -> Declarations | UncertainScan:
     """Where the file at path declares name directly under the rename's parent."""
     parent = rename.parent
-    starts = item_starts(words)
+    starts = style_footprint.item_starts(words)
     modules = inline_modules(words, starts)
     declared = tuple(index for index, word in enumerate(words[:-1])
                      if word in PARENT_KEYWORDS and index in starts and words[index + 1] == parent

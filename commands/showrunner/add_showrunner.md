@@ -28,7 +28,8 @@ Pass your own model id and effort level, so the lower showrunner runs as you
 do. Your system prompt names your model's exact id. When you cannot tell your
 effort level, ask the user which to use. Show the script's output. If it exits
 nonzero, show its message and stop.
-On launch it prints `started <slug>: herdr session attach <slug>`.
+On launch it prints `started <slug>: herdr session attach agents, workspace <slug>, tab <slug>`: every
+Claude session is a tab of the one herdr session, `agents`.
 
 What it does:
 
@@ -67,16 +68,14 @@ It refuses, and starts nothing, when:
   answers a trust prompt (live check, 2026-10-13: a child sat on it for the whole wait).
 
 If the session starts and no showrunner appears in time, the command says so,
-exits 1 and leaves the session running. Look at it with `herdr session attach
-<slug>`; once it has its update timer, run `/showrunner:attach <slug>`.
+exits 1 and leaves the session running. Look at it in its tab (the line above names it); once it has its update timer, run `/showrunner:attach <slug>`.
 
 If Claude opens but is not ready, such as at a dialog, the command prints its
-screen, sends no prompt, exits 3 and leaves the session open. Look at it with
-`herdr session attach <slug>`.
+screen, sends no prompt, exits 3 and leaves the session open. Look at it in its tab.
 
-The user reaches the lower showrunner with `herdr session attach <slug>` or by
+The user reaches the lower showrunner in its tab of `agents` or by
 Remote Control under the same name. `/showrunner:rename` does not rename a
-running session: its herdr session and Remote Control name keep the slug it
+running session: its herdr tab and Remote Control name keep the slug it
 started with until it is started or resumed again, which uses the new slug. What each side does once attached is in
 `/showrunner:produce` → Nested showrunners. To take it out of the tree, use
 `/showrunner:attach detach <slug>`; wrapping its production does the same.
