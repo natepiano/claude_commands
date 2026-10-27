@@ -55,10 +55,34 @@ class ScratchGuardTests(unittest.TestCase):
         decision = cast(HookResponse, json.loads(output))["hookSpecificOutput"]
         self.assertEqual((decision["hookEventName"], decision["permissionDecision"]), ("PreToolUse", "deny"))
         self.assertIn(f"makes a new loose folder ({folder})", decision["permissionDecisionReason"])
-        self.assertIn("scratch.py new --task", decision["permissionDecisionReason"])
+        self.assertIn("scratch.py new [--task", decision["permissionDecisionReason"])
 
     def assert_allowed(self, command: str | list[str], cwd: Path | None = None, tool: str = "Bash") -> None:
         self.assertEqual(self.run_hook(command, cwd, tool), "", command)
+
+    def write_hook(self, tool: str, key: str, path: Path) -> str:
+        payload = json.dumps({"tool_name": tool, "tool_input": {key: str(path)}, "cwd": str(self.home)})
+        environment = {**os.environ, "HOME": str(self.home), "TMPDIR": str(self.temp)}
+        return subprocess.run([str(HOOK)], input=payload, capture_output=True, text=True, check=True, timeout=10,
+                              env=environment).stdout
+
+    def test_a_write_into_a_new_folder_of_a_root_is_refused_and_rust_scratch_is_a_root(self) -> None:
+        rust = self.home / "rust"
+        (rust / "scratch" / "old").mkdir(parents=True)
+        for tool, key, path, folder in [("Write", "file_path", rust / "loose" / "a.rs", rust / "loose"),
+                                        ("NotebookEdit", "notebook_path", rust / "scratch" / "new" / "n.ipynb",
+                                         rust / "scratch" / "new")]:
+            decision = cast(HookResponse, json.loads(self.write_hook(tool, key, path)))["hookSpecificOutput"]
+            self.assertIn(f"makes a new loose folder ({folder})", decision["permissionDecisionReason"])
+        for path in (rust / "hana" / "new" / "a.rs", rust / "scratch" / "old" / "a", rust / "notes.md"):
+            self.assertEqual(self.write_hook("Write", "file_path", path), "", path)
+        self.assert_refused(f"mkdir {rust}/scratch/{self.name}", f"{rust}/scratch/{self.name}")
+
+    def test_a_session_temp_root_is_no_root_and_is_made_again(self) -> None:
+        own = Path("/tmp/claude/session") / f"guard-test-{self.name}"
+        self.addCleanup(lambda: own.rmdir() if own.is_dir() else None)
+        self.assertEqual(self.run_hook("mktemp -d", temp=own), "")
+        self.assertTrue(own.is_dir())
 
     def test_each_judged_command_making_a_loose_folder_is_refused(self) -> None:
         tmp, rust = os.path.realpath("/tmp"), self.home / "rust"

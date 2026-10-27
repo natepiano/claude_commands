@@ -4,7 +4,7 @@
     change_review.py check --repo R --checkpoint C --previous P --merge-branch B
     change_review.py append --repo R [--production DOC] [--list L] --merged M --checkpoint C --previous P --merge-branch B
     change_review.py drift --repo R --merge-branch B [--production DOC] [--list L] --since YYYY-MM-DD
-    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>]
+    change_review.py add [--production DOC] [--list L] --change "<what changed for you>" --check "<how to try it>" --see "<what you see>" [--merged M] [--urgency user|blocks|soon|normal|later] [--due ISO] [--after C<n>] [--hold <folder> ...]
     change_review.py edit [--production DOC] [--list L] --row C<n> --change "<what changed for you>" --check "<how to try it>" --see "<what you see>"
     change_review.py show [--production DOC] [--list L]
     change_review.py verdict [--production DOC] [--list L] --row C<n> --verdict "<the user's words>"
@@ -27,8 +27,9 @@ the next C number, the push date and the merged hash, the How to check cell `<ho
 see: <what you see>`, and "not yet" when the table has an "On the Mac build" column. `add` writes one
 row for a change no checkpoint line carries; `edit` rewrites one row still to review in place and keeps
 its id, Merged cell and position; `show` prints the current row and how many wait after it; `verdict` moves a row to "## Reviewed" with the user's verdict and today's
-date, and removes the row's scratch folders (task `row:<showrunner>-C<n>`, scripts/lib/scratch.py)
-whichever way the verdict goes; `mark-important` marks a row the user called important.
+date, and removes the row's scratch folders and held folders (task `row:<showrunner>-C<n>`,
+scripts/lib/scratch.py) whichever way the verdict goes; `add --hold <folder>` holds a folder the user
+checks the row in, where it is, until that verdict; `mark-important` marks a row the user called important.
 
 Each row's Production cell names the production whose change it is: the production whose Units
 table names the branch of the checkpoint that carries the row's line (`visible_owners`), else the
@@ -814,6 +815,19 @@ def end_row_scratch(path: Path, row: str) -> list[str]:
         return [f"scratch not removed: {error}"]
 
 
+def hold_for_row(path: Path, row: str, folders: list[str]) -> list[str]:
+    """Hold each folder the user checks `row` in until the row's verdict; return one line per folder."""
+    lines: list[str] = []
+    for folder in folders:
+        try:
+            task = scratch.hold(Path(folder).expanduser(), f"row:{_owner(path)}-{row}", f"change review {row}")
+        except (scratch.ScratchError, OSError) as error:
+            lines.append(f"not held: {error}")
+            continue
+        lines.append(f"held {folder} for {task}")
+    return lines
+
+
 def production_doc(production: str) -> Path:
     """The production doc given; without one, the calling showrunner's."""
     if production:
@@ -940,6 +954,7 @@ class CommandLine(argparse.Namespace):
     due: str = ""
     after: str = ""
     write: bool = False
+    hold: list[str] | None = None
 
 
 def _list(options: CommandLine) -> Path:
@@ -979,9 +994,12 @@ def _run(options: CommandLine) -> int:
     match options.action:
         case "add":
             item, rank = _visible(options), _rank_option(options)
-            rows = append_rows(_list(options), [item], today(), options.merged.strip(),
-                               production_doc(options.production), rank)
-            print(row_id(rows[0]))
+            path = _list(options)
+            rows = append_rows(path, [item], today(), options.merged.strip(), production_doc(options.production), rank)
+            row = row_id(rows[0])
+            print(row)
+            for line in hold_for_row(path, row, options.hold or []):
+                print(line)
         case "edit":
             row, item = _row_option(options), _visible(options)
             print(edit_row(_list(options), row, item, today(), production_doc(options.production)))
@@ -1053,6 +1071,7 @@ def main(argv: list[str]) -> int:
                  "row", "verdict", "production", "urgency", "due", "after"):
         _ = parser.add_argument(f"--{name}", default="")
     _ = parser.add_argument("--write", action="store_true")
+    _ = parser.add_argument("--hold", action="append")
     try:
         return _run(cast(CommandLine, parser.parse_args(argv)))
     except (ChangeReviewError, OSError) as error:

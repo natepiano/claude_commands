@@ -13,7 +13,12 @@ in nixos modules/darwin/tmp-sweep.nix runs `tmp_sweep.py` every hour.
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
 folder of each /tmp/claude-<uid> this user owns, or the scratch root of scripts/lib/scratch.py
-(/tmp/claude/scratch), where each task's folder is an entry. In a temp folder (/tmp, $TMPDIR
+(/tmp/claude/scratch), where each task's folder is an entry: it stays while its task is open, goes
+when its until: time passes, and goes after TASK_IDLE_SECONDS whatever its task. Each running
+session's temp root (SESSION_TEMP_ROOT/<session id>, its TMPDIR) and each run folder's tmp/ (the
+run's TMPDIR) stays, and every entry in it is one too, judged by the 4 h rule: sessions run for
+weeks, so nothing waits on a session end. In a temp folder a folder's ctime is no change, since
+systemd-tmpfiles-clean moves it each day when it sets the folder's times back. In a temp folder (/tmp, $TMPDIR
 and the Mac's per-user temp folder) only a tempfile folder is an entry, the
 name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
 Python's tempfile), which test runs leave behind. In /tmp alone (the wide root)
@@ -84,12 +89,18 @@ IDLE_SECONDS = 4 * HOUR_SECONDS
 # Any other folder this user owns in /tmp goes after this long: test leftovers have names of their
 # own (1,103 month-old ones went by hand on 2026-10-26, and the user had to approve the rm).
 WIDE_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
+# A scratch folder whose task is open goes after this long anyway: an ender can fail.
+TASK_IDLE_SECONDS = 7 * 24 * HOUR_SECONDS
 # Inside a running session's folders only an entry this large can go (showrunner, 2026-10-25).
 SESSION_ENTRY_MIN_BYTES = GIB
 RUN_INTERVAL_SECONDS = HOUR_SECONDS
 LOG_KEEP_SECONDS = 7 * 24 * HOUR_SECONDS
 TMP_ROOT = "/tmp/claude"
 RUN_ROOTS = (os.path.join(TMP_ROOT, "delegate"), os.path.join(TMP_ROOT, "unit"))
+# Each Claude session's TMPDIR is SESSION_TEMP_ROOT/<session id> (hooks/session-start-temp-root.py),
+# and each run's is <run folder>/RUN_TEMP_NAME; the entries in both are judged with the 4 h rule.
+SESSION_TEMP_ROOT = os.path.join(TMP_ROOT, "session")
+RUN_TEMP_NAME = "tmp"
 # Claude Code keeps each session's scratch in /tmp/claude-<uid>/<project>/<session id>/.
 SESSION_SCRATCH_PREFIX = "claude-"
 RUN_MARKERS = "active"
@@ -125,9 +136,10 @@ NO_SESSIONS = "a session record cannot be read"
 IN_USE = "a process uses it"
 RECENT = "changed in the last 4 h"
 RECENT_WIDE = "changed in the last 7 days"
+TASK_OPEN = "its task is open and it changed in the last 7 days"
 HOLDS_SOCKET = "it holds a socket"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
-UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION)
+UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION, TASK_OPEN)
 UNREADABLE = "it cannot be read"
 NO_PROC = "no /proc or lsof to show which processes use it"
 
@@ -154,6 +166,17 @@ class RunRecord(TypedDict):
 
 
 @dataclass(frozen=True)
+class Limit:
+    """An entry goes when nothing in it changed at or after `since`; `recent` is why it stays when
+    something did. With `sockets`, a socket inside keeps it; without `folder_ctime`, a folder's
+    ctime is no change."""
+    since: float
+    recent: str
+    sockets: bool = False
+    folder_ctime: bool = True
+
+
+@dataclass(frozen=True)
 class Roots:
     """The folders whose top-level entries the sweep judges, by kind. In a temp folder only a
     tempfile folder (TEMPFILE_NAME) is judged."""
@@ -163,9 +186,10 @@ class Roots:
     temp: tuple[str, ...] = ()
     scratch: tuple[str, ...] = ()
     wide: tuple[str, ...] = ()
+    sessions: tuple[str, ...] = ()
 
     def all(self) -> tuple[str, ...]:
-        return self.plain + self.runs + self.projects + self.temp + self.scratch
+        return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions
 
     def entries(self, root: str) -> list[os.DirEntry[str]]:
         """The entries of root the sweep judges."""
@@ -179,6 +203,20 @@ class Roots:
         """Whether entry goes only after WIDE_IDLE_SECONDS: a folder in a wide root that is no
         tempfile folder."""
         return root in self.wide and not TEMPFILE_NAME.fullmatch(entry.name)
+
+    def limit(self, root: str, entry: os.DirEntry[str], now: float) -> Limit:
+        """How long entry must be idle to go, and how a change in it counts."""
+        if root in self.scratch:
+            task = scratch.task_of(Path(entry.path))
+            if task is not None and scratch.ended(task, now):
+                return Limit(float("inf"), RECENT)
+            if task is not None:
+                return Limit(now - TASK_IDLE_SECONDS, TASK_OPEN)
+        # systemd-tmpfiles-clean sets each folder's times back after it reads it, which moves the
+        # folder's ctime, so in a temp folder only a folder's mtime counts.
+        if self.is_wide(root, entry):
+            return Limit(now - WIDE_IDLE_SECONDS, RECENT_WIDE, sockets=True, folder_ctime=False)
+        return Limit(now - IDLE_SECONDS, RECENT, folder_ctime=root not in self.temp)
 
     def judged_wide(self, root: str, entry: os.DirEntry[str]) -> bool:
         """A folder of a wide root that this user owns, that no system tool owns, and that is no
@@ -207,7 +245,8 @@ class Sweep:
 
 def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS,
                   session_roots: Sequence[str] | None = None, temp_roots: Sequence[str] | None = None,
-                  scratch_roots: Sequence[str] | None = None, wide_roots: Sequence[str] | None = None) -> Roots:
+                  scratch_roots: Sequence[str] | None = None, wide_roots: Sequence[str] | None = None,
+                  session_temp_roots: Sequence[str] | None = None) -> Roots:
     """The same roots on natedev and the Mac, each by its real path: the Mac's /tmp is a link to
     /private/tmp, and lsof prints real paths. The wide root is /tmp alone: $TMPDIR and the Mac's
     temp folder hold app state, and macOS clears its own."""
@@ -218,9 +257,11 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS
     task_roots = (str(scratch.root()),) if scratch_roots is None else scratch_roots
     temp_real = tuple(os.path.realpath(root) for root in temp)
     wide = ("/tmp",) if wide_roots is None else wide_roots
+    session_temp = (SESSION_TEMP_ROOT,) if session_temp_roots is None else session_temp_roots
     return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in run_roots), projects,
                  temp_real, tuple(os.path.realpath(root) for root in task_roots if os.path.isdir(root)),
-                 tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real))
+                 tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real),
+                 tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)))
 
 
 def session_scratch_roots() -> tuple[str, ...]:
@@ -341,18 +382,19 @@ def entry_uses(paths: Sequence[tuple[str, int, str]], roots: Sequence[str]) -> d
     return uses
 
 
-def last_change(path: str, since: float, wide: bool = False) -> tuple[float, int] | str:
-    """The newest change inside path and its disk blocks, or why it stays: RECENT (RECENT_WIDE for a
-    wide entry) when something changed at or after since, UNREADABLE when a part of it could not be
-    read, HOLDS_SOCKET when a wide entry holds a socket. A folder's own times count only when it
+def last_change(path: str, limit: Limit) -> tuple[float, int] | str:
+    """The newest change inside path and its disk blocks, or why it stays: limit.recent when
+    something changed at or after limit.since, UNREADABLE when a part of it could not be read,
+    HOLDS_SOCKET when it holds a socket and limit.sockets. A folder's own times count only when it
     holds nothing. Symbolic links are never followed."""
-    recent = RECENT_WIDE if wide else RECENT
+    since, recent = limit.since, limit.recent
     try:
         top = os.lstat(path)
     except OSError:
         return UNREADABLE
-    own = max(top.st_mtime, top.st_ctime)
-    if not stat.S_ISDIR(top.st_mode):
+    folder = stat.S_ISDIR(top.st_mode)
+    own = max(top.st_mtime, top.st_ctime if limit.folder_ctime or not folder else 0.0)
+    if not folder:
         return recent if own >= since else (own, top.st_blocks * 512)
     newest = 0.0
     total = 0
@@ -364,12 +406,13 @@ def last_change(path: str, since: float, wide: bool = False) -> tuple[float, int
                 listed = list(entries)
             for entry in listed:
                 info = entry.stat(follow_symlinks=False)
-                newest = max(newest, info.st_mtime, info.st_ctime)
-                if wide and stat.S_ISSOCK(info.st_mode):
+                folder = stat.S_ISDIR(info.st_mode)
+                newest = max(newest, info.st_mtime, info.st_ctime if limit.folder_ctime or not folder else 0.0)
+                if limit.sockets and stat.S_ISSOCK(info.st_mode):
                     return HOLDS_SOCKET
                 if newest >= since:
                     return recent
-                if entry.is_dir(follow_symlinks=False):
+                if folder:
                     frontier.append(entry.path)
                 elif (info.st_dev, info.st_ino) not in seen:
                     seen.add((info.st_dev, info.st_ino))
@@ -425,7 +468,7 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
     if root in roots.scratch:
         task = scratch.task_of(Path(entry.path))
         return ROW_WAITS if task is not None and task.startswith("row:") else None
-    if root in roots.projects:
+    if root in roots.projects or root in roots.sessions:
         if live is None:
             return NO_SESSIONS
         return SESSION_RUNS if entry.name in live else None
@@ -448,6 +491,19 @@ def session_folders(roots: Roots, live: frozenset[str] | None) -> tuple[str, ...
                  for inner in listing(session.path) if inner.is_dir(follow_symlinks=False))
 
 
+def temp_parents(roots: Roots, live: frozenset[str] | None) -> tuple[str, ...]:
+    """Each running session's temp root and each run folder's temp folder: the parent stays, and
+    every entry in it is judged with the 4 h rule. Sessions run for weeks, so these entries are what
+    goes; the parent goes only once its session or director stops."""
+    sessions = () if live is None else tuple(
+        entry.path for root in roots.sessions for entry in listing(root)
+        if entry.name in live and entry.is_dir(follow_symlinks=False))
+    runs = tuple(temp for root in roots.runs for entry in listing(root)
+                 if entry.is_dir(follow_symlinks=False) and os.path.isdir(temp := os.path.join(entry.path, RUN_TEMP_NAME))
+                 and not os.path.islink(temp))
+    return sessions + runs
+
+
 def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Sweep:
     """Delete every idle entry no process uses, and record why each other entry stays."""
     result = Sweep()
@@ -466,18 +522,16 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
     live = running_session_ids()
     inner = session_folders(roots, live)
     marked = marked_runs(roots)
-    judged = roots.all() + inner
+    judged = roots.all() + inner + temp_parents(roots, live)
     uses = entry_uses(paths, judged)
     for root in judged:
         emptied = False
         for entry in roots.entries(root):
-            wide = roots.is_wide(root, entry)
-            since = now - (WIDE_IDLE_SECONDS if wide else IDLE_SECONDS)
             reason = owner_reason(entry, root, roots, live, marked)
             if reason is None and entry.path in uses:
                 result.keep(f"{entry.path}: {uses[entry.path]}", IN_USE)
                 continue
-            change = last_change(entry.path, since, wide) if reason is None else reason
+            change = last_change(entry.path, roots.limit(root, entry, now)) if reason is None else reason
             if isinstance(change, str):
                 result.keep(entry.path, change)
                 continue

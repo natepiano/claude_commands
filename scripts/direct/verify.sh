@@ -800,6 +800,10 @@ VERIFY_ORIGINAL_ARGS=("$@")
 if [[ "${1:-}" == "--session-dir" ]]; then
     export UNIT_SESSION_DIR="${2:?verify.sh --session-dir <dir> <command> ...}"
     shift 2
+    # Test temp folders land in the run folder and end with it (tmp_sweep.py judges each entry).
+    if mkdir -p "${UNIT_SESSION_DIR}/tmp" 2>/dev/null; then
+        export TMPDIR="${UNIT_SESSION_DIR}/tmp"
+    fi
 fi
 
 # A Codex mesh worker's command dies with its turn, and a worker that waits on

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Refuse a Bash command that makes a new loose folder in /tmp, $TMPDIR, /tmp/claude or ~/rust.
+"""Refuse a Bash command or file write that makes a new loose folder in /tmp, $TMPDIR, /tmp/claude,
+~/rust or ~/rust/scratch.
 
 Agents made repo copies, repros and test trees in those folders, and nothing removed them
 (user, 2026-10-26: "i need a more robust solution"). A scratch folder now belongs to a task and
 goes when the task ends: `scripts/lib/scratch.py`, or the session's own scratchpad.
 
 The commands judged are mkdir, mktemp -d, git clone, git worktree add, cp -r/-R/-a, rsync,
-cargo new/init, and tar extraction (-C or the working folder). A command is refused when it makes
-a folder directly in one of the roots that does not exist yet. Folders in the roots that stay
-allowed: the session scratchpads (/tmp/claude-<uid>), /tmp/claude/unit, /tmp/claude/delegate and
-the two scratch roots (/tmp/claude/scratch, ~/rust/repro). ~/worktrees is no root, and a
+cargo new/init, and tar extraction (-C or the working folder); a Write or NotebookEdit judges its
+file's path. A command is refused when it makes a folder directly in one of the roots that does not
+exist yet. Folders in the roots that stay allowed: the session scratchpads (/tmp/claude-<uid>),
+/tmp/claude/unit, /tmp/claude/delegate, the session temp roots (/tmp/claude/session) and the two
+scratch roots (/tmp/claude/scratch, ~/rust/repro). A TMPDIR inside a session temp root or a run
+folder is the session's or run's own, so it is no root, and mktemp -d there is allowed; this hook
+also makes that TMPDIR again when the sweep removed it. ~/worktrees is no root, and a
 make_a_worktree command is never judged. A path this scanner cannot follow (a variable other
 than HOME or TMPDIR, a command substitution, a command inside `bash -c` or ssh) is allowed: the
 hourly tmp sweep is the backstop.
@@ -33,6 +37,8 @@ PUNCTUATION = ";&|(){}\n"
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 ENVIRONMENT_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 SESSION_SCRATCHPAD = re.compile(r"claude-[0-9]+")
+OWN_TEMP_PARENTS = ("/tmp/claude/session", "/tmp/claude/unit", "/tmp/claude/delegate")
+WRITE_TOOLS = {"Write": "file_path", "NotebookEdit": "notebook_path"}
 KNOWN_VARIABLES = re.compile(r"\$(?:\{(HOME|TMPDIR)\}|(HOME|TMPDIR)\b)")
 # Options of the judged commands that take a value as the next word.
 GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
@@ -46,6 +52,8 @@ CARGO_VALUE_OPTIONS = frozenset({"--name", "--vcs", "--edition", "--registry", "
 
 class BashInput(TypedDict, total=False):
     command: str | list[str]
+    file_path: str
+    notebook_path: str
 
 
 class HookInput(TypedDict, total=False):
@@ -60,12 +68,19 @@ def real(path: str) -> Path:
     return Path(os.path.realpath(os.path.expanduser(path)))
 
 
+def own_temp(temp: str) -> bool:
+    """Whether TMPDIR is this session's or run's own: in a session temp root, a run folder or a
+    scratchpad (a sandbox can point it there)."""
+    path = real(temp)
+    return (any(real(parent) in path.parents for parent in OWN_TEMP_PARENTS)
+            or any(SESSION_SCRATCHPAD.fullmatch(part) for part in path.parts))
+
+
 def roots() -> list[Path]:
     """The folders in which a new loose folder is refused, as real paths, nested ones included."""
-    found = [real("/tmp"), real("/tmp/claude"), real("~/rust")]
+    found = [real("/tmp"), real("/tmp/claude"), real("~/rust"), real("~/rust/scratch")]
     temp = os.environ.get("TMPDIR")
-    # A sandbox can point TMPDIR into the session's own scratchpad, which is no root.
-    if temp and not any(SESSION_SCRATCHPAD.fullmatch(part) for part in real(temp).parts):
+    if temp and not own_temp(temp):
         found.append(real(temp))
     return list(dict.fromkeys(found))
 
@@ -74,7 +89,7 @@ def allowed(top: Path) -> bool:
     """A folder directly in a root that may be made: a scratchpad, the run folders, a scratch root."""
     if top.parent == real("/tmp") and (top.name == "claude" or SESSION_SCRATCHPAD.fullmatch(top.name)):
         return True
-    if top.parent == real("/tmp/claude") and top.name in ("unit", "delegate", "scratch"):
+    if top.parent == real("/tmp/claude") and top.name in ("unit", "delegate", "scratch", "session"):
         return True
     return top == real("~/rust/repro")
 
@@ -279,13 +294,31 @@ def loose_folders(text: str, cwd: Path) -> list[Path]:
 def refusal(folders: list[Path]) -> str:
     shown = ", ".join(str(folder) for folder in folders)
     return (
-        f"Refused: this command makes a new loose folder ({shown}). Nothing removes a loose folder in "
-        + "/tmp, /tmp/claude or ~/rust, so they piled up.\n"
+        f"Refused: this makes a new loose folder ({shown}). Nothing removes a loose folder in "
+        + "/tmp, /tmp/claude, ~/rust or ~/rust/scratch, so they piled up.\n"
         + "Make scratch that belongs to a task, and it goes when the task ends:\n"
-        + "  ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new --task <run:<id> | "
-        + "phase:<unit>/<phase> | row:<showrunner>-C<n>> [--name <word>] [--visible]\n"
-        + "It prints the folder to use. For your own short work, use this session's scratchpad instead."
+        + "  ~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new [--task <run:<id> | "
+        + "phase:<unit>/<phase> | gate:<id> | row:<showrunner>-C<n>> | --until <YYYY-MM-DD [HH:MM]>] "
+        + "[--name <word>] [--visible]\n"
+        + "With no task it lasts 24 h. It prints the folder to use. For temp files, use $TMPDIR (mktemp -d "
+        + "with no path); a new project goes through its own command (add_unit, ~/worktrees)."
     )
+
+
+def written_folders(raw: str) -> list[Path]:
+    """The new loose folder a Write or NotebookEdit makes for its file, if any."""
+    try:
+        hook_input = cast(HookInput, json.loads(raw))
+        key = WRITE_TOOLS.get(hook_input.get("tool_name", ""))
+        file_path = hook_input.get("tool_input", {}).get(key) if key else None
+    except (ValueError, AttributeError):
+        return []
+    if not isinstance(file_path, str) or not file_path:
+        return []
+    path = real(file_path)
+    top = loose_folder(path)
+    # A file directly in a root makes no folder.
+    return [top] if top is not None and top != path else []
 
 
 def bash_input(raw: str) -> tuple[str, Path] | None:
@@ -307,14 +340,24 @@ def bash_input(raw: str) -> tuple[str, Path] | None:
     return command, real(cwd)
 
 
+def remake_own_temp() -> None:
+    """Make this session's TMPDIR again when the sweep removed it, so mktemp works."""
+    temp = os.environ.get("TMPDIR")
+    if temp and own_temp(temp) and not os.path.lexists(temp):
+        try:
+            os.makedirs(temp, mode=0o700, exist_ok=True)
+        except OSError:
+            pass
+
+
 def main() -> None:
+    remake_own_temp()
     try:
-        found = bash_input(sys.stdin.read())
+        raw = sys.stdin.read()
     except UnicodeDecodeError:
         return
-    if found is None:
-        return
-    folders = loose_folders(*found)
+    found = bash_input(raw)
+    folders = loose_folders(*found) if found is not None else written_folders(raw)
     if not folders:
         return
     print(json.dumps({
