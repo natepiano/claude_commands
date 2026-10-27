@@ -758,7 +758,10 @@ class DeclarationInPlace:
 @dataclass(frozen=True)
 class DeclarationMoved:
     """One other file declares the finding's subject at the synced tip, or a built rename of an approved decision renamed
-    the subject or its impl or trait and one file gained the new declaration. A proved outside rename also follows to path and line."""
+    the subject or its impl or trait and one file gained the new declaration. A proved outside rename also follows to path and line.
+
+    For a finding on a statement line of a function, the subject is the function, and line is the one statement line of
+    the function there that holds the finding's text."""
 
     finding: HeldFinding
     declaration: Declaration
@@ -783,6 +786,17 @@ class DeclaredInSeveralFiles:
     declaration: Declaration
     paths: tuple[str, ...]
     evidence: NoOutsideEvidence | OutsideRenameNotProven = NoOutsideEvidence()
+
+
+@dataclass(frozen=True)
+class StatementNotFollowed:
+    """The function that holds the finding's statement line moved to path, but the finding's text is not on exactly one
+    statement line of the function there. The finding stays as it is."""
+
+    finding: HeldFinding
+    declaration: Declaration
+    path: str
+    reason: declarations.StatementRefusal
 
 
 @dataclass(frozen=True)
@@ -1058,9 +1072,11 @@ class KeptForOpenBuild:
 
 DeclarationOutcome = (DeclarationNotRead | DeclarationInPlace | DeclarationMoved | DeclarationRemoved
                       | DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationRenamed | RenameAwaitingApproval
-                      | DeclarationGoneFromFile | KeptForOpenBuild | TraitIdentityUncertain | OutsideRenameUnresolved)
+                      | DeclarationGoneFromFile | KeptForOpenBuild | TraitIdentityUncertain | OutsideRenameUnresolved
+                      | StatementNotFollowed)
 # The outcomes that leave a finding as it is for a person to waive or fix in the code.
-DeclarationLeft = DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain | OutsideRenameUnresolved
+DeclarationLeft = (DeclaredInSeveralFiles | DeclaredInAnotherCrate | DeclarationGoneFromFile | TraitIdentityUncertain
+                   | OutsideRenameUnresolved | StatementNotFollowed)
 
 
 @dataclass(frozen=True)
@@ -3621,8 +3637,7 @@ class Ledger:
         if found:
             path, items = next(iter(found.items()))
             item, = items
-            return DeclarationMoved(finding, declaration, path,
-                                    moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
+            return self._moved_site(finding, old_file, old, declaration, tip, path, item)
         after_builds = self._built_renaming(finding, read, old, tip, approved, renames)
         if isinstance(after_builds, TraitIdentityUncertain):
             return after_builds
@@ -3874,7 +3889,8 @@ class Ledger:
 
     def _followed_rename(self, finding: HeldFinding, read: str, old_file: DeclaredFile, old: DeclaredItem,
                          after_builds: RenamedByBuilds, tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],
-                         ) -> DeclarationMoved | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite | TraitIdentityUncertain:
+                         ) -> (DeclarationMoved | StatementNotFollowed | DeclaredInSeveralFiles | DeclaredInAnotherCrate | NoRenamedSite
+                               | TraitIdentityUncertain):
         """Where the finding's item is declared at the tip under the new names that the built renames gave it.
 
         Several gaining files or a filed finding's file in another crate leave the finding, as a move does.
@@ -3891,8 +3907,22 @@ class Ledger:
         item, = items
         if isinstance(finding.state, Filed) and tip.crate(path) != tip.crate(finding.path):
             return DeclaredInAnotherCrate(finding, renamed, path)
-        return DeclarationMoved(finding, renamed, path,
-                                moved_site_line(old_file, finding.line, old, self._declared_file(tip.commit, path), item))
+        return self._moved_site(finding, old_file, old, renamed, tip, path, item)
+
+    def _moved_site(self, finding: HeldFinding, old_file: DeclaredFile, old: DeclaredItem, declaration: Declaration,
+                    tip: RepositoryTip, path: str, item: DeclaredItem) -> DeclarationMoved | StatementNotFollowed:
+        """The finding's site in item, the one declaration of path at the tip that its old item moved to.
+
+        A statement line of a function follows only to the one statement line of the function there that holds the
+        finding's text; another site follows as moved_site_line reads it.
+        """
+        destination = self._declared_file(tip.commit, path)
+        if old_file.site_kind(old, finding.line) != declarations.DeclarationSite.STATEMENT:
+            return DeclarationMoved(finding, declaration, path, moved_site_line(old_file, finding.line, old, destination, item))
+        site = declarations.statement_site(destination, item, finding.text)
+        if isinstance(site, declarations.StatementRefusal):
+            return StatementNotFollowed(finding, declaration, path, site)
+        return DeclarationMoved(finding, declaration, path, site)
 
     def _gaining_files(self, finding: HeldFinding, read: str, renamed: Declaration, requirement: TraitRequirement,
                        tip: RepositoryTip, rust_files: frozenset[str], changed: frozenset[str],

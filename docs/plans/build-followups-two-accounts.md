@@ -2424,3 +2424,41 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Gotchas:**
 - A test that mocks `execvpe` for a Claude or Codex start needs a scratch executable on its PATH or in its scratch `~/.local/bin`; the gate caught two that had none.
+
+### Phase 87 — A move never strands units: target check, source fallback, restart skips the running  · status: done
+
+**Depends on:** Phase 86; shutdown-unit's hold API (eb30ce4a)
+
+#### As-built
+
+- Cause of the 10-26 16:37 AST outage: a move keeps its stop records under the source login, and the target's `launch_blocked` found no record there, so a stale claude2 stop hold refused every restart.
+- One target hold check in `accounts.py` runs before any stop in the hand group move and the single move (through `check_move_target`), and in every `refusal_watch` move path (queued rule, refusal-driven move, completing a committed group). It calls `launch_permission(target env, NewWorkLaunchPurpose())`. Blocked or unreadable: no stop, no write; the hand move returns `MoveRefused("accounts: <reason>; no session was stopped")`, and the queued rule records a blocked head with `quota_alert.TargetHeldByShutdown(reason)`. A dry run reports the planned check and does not call it.
+- A released finished hold (`ReleasedHold`) gives one line: "cleared a finished <then> hold on <label> from <local time> (session <8> | requested in a terminal or by a recovery snapshot)". It is relayed to the showrunners through one helper (quota_alert session recipients, no phone push); undelivered notices wait in `pending_cleared_holds.json` under the accounts state dir and are retried per recipient. The recorded `why` stays exactly `auto: <id>`.
+- `restart.py`: every target-start failure of a moved session (exception, failed prompt outcome, not live at confirmation) goes to `_try_source_fallback`, which runs only when the target is confirmed absent. It pins the record to the source, starts a unit through `_unit_argv` → `add_unit --source-fallback --account <source>` (other sessions through their own launch), requires a submitted prompt and a live session, and records "<name> came back on <source>: <target> refused (<reason>)". Both failing: the record returns to the target, becomes `restart failed` with both reasons, and sends `shutdown.move_failed` once, hand or auto.
+- `add_unit.account_for_launch(..., source_fallback=True)` and `accounts.account_for_group_launch(..., source_fallback=True)` allow another account only for a recorded unit restore whose shutdown record names it as the source; every other launch keeps the group rule.
+- `shutdown.py restart --only`: names resolve one at a time against records first (peer records included); a recordless live session (any account) prints "<name>: already running; skipped"; an unknown name, or one with records on both machines, gets its own line; the others restart; selection errors exit 1. `cancel` and `now` keep "no shutdown in progress".
+
+**Files:** `scripts/accounts/accounts.py`, `refusal_watch.py`, `scripts/whoami/quota_alert.py`, `scripts/shutdown/restart.py`, `shutdown.py`, `scripts/production/add_unit.py`; tests in `scripts/accounts/test_refusal_watch.py`, `scripts/shutdown/test_account_move.py`, `test_restart.py`, `test_shutdown_cli.py`, `scripts/whoami/test_quota_alert.py`, `scripts/production/test_add_unit.py`; `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+**Gotchas:**
+- The gate script must fetch the GitHub origin, not the local `~/.claude` clone: the local `build-followups` ref can hold a showrunner merge still in its gate.
+- Since shutdown-unit's 088f0322 every restart comes back in the shared herdr session; `test_restart`'s setUp patches `herdr.shared_session` to "writing", so a test expects that, never a recorded host.
+- Restarts launch in a pool: assert launched names with `assertCountEqual`.
+- Carried to Phase 88: F009 (a retried cleared-hold notice after a `QUEUED` result queues again; jobs have no name).
+
+### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: todo
+
+**Depends on:** Phase 87; shutdown-unit's 10-26 19:30 AST checkpoint merged
+
+#### Work Order
+
+**Goal:** Whatever stops a unit (a move, a crash, a stale hold), it comes back with no user step. Showrunner, user go 10-26: a watchdog on a timer restarts a unit whose session is down without a stop the user asked for, on the group account, else the source; a phone alert goes only when both fail. A gate test rebuilds today's case and passes only when every unit runs again with no manual step. User: "Anything you have to use a memory for is not viable."
+
+**Spec (outline; details written at phase start from Phase 87's as-built):**
+1. A watchdog pass in `refusal_watch.run()` (the notes timer, every 2 min on natedev), after the move passes. Units that should run: each registered showrunner's production doc Units rows that are not retired, whose run is in progress (`production/live_units.py`, `unit_lookup.run_state`).
+2. A unit is down when no live session holds it. Skip it when a shutdown record or hold is in progress for it (stopping, waiting, restarting), when a user-asked stop holds it (`then: "stop"` record with a session or terminal origin that is live, or a stopped record of a stop the user asked for), or when it was first seen down less than one pass ago (state file under `~/.local/state/accounts/`).
+3. Restart: on the group account through the same launch path `agents restart` uses (record or recovery snapshot); if that fails, on the source account. Both failing: one `shutdown.restart_failed` user push per outage (not per pass), and the showrunner gets a line each time.
+4. Carried from Phase 87 review (F009, minor): the cleared-hold relay in `refusal_watch.py` builds its `quota_alert` jobs with an empty name, so each retry after a `QUEUED` result appends another copy. Name each job by the pending notice's stable identity and treat `QUEUED` as handed off (drop it from the pending file).
+5. Gate test: a scratch production with units on claude4 and a stale stop hold on claude2 (requesting session gone), then the auto group move claude4 → claude2: every unit runs again, on claude2, with no manual step. A second case with a hold still in use: the move stops nobody, and units whose sessions die are restarted by the watchdog on claude4.
+
+**Files:** `scripts/accounts/refusal_watch.py`, a new `scripts/accounts/unit_watchdog.py` if the pass is over ~100 lines, tests in `scripts/accounts/`, `docs/accounts.md`.

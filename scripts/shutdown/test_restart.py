@@ -399,6 +399,92 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         return saved
 
+    def test_moved_unit_uses_source_after_exception_failed_outcome_or_confirmation_timeout(self) -> None:
+        for failure in ("exception", "outcome", "confirmation"):
+            with self.subTest(failure=failure):
+                owner = unit("source-fallback-" + failure)
+                owner["config_dir"] = str(self.root / ".claude2")
+                saved = entry(owner)
+                saved.update(target="claude3", source_label=LABEL, alerts="none", showrunner_told="stopping")
+                self.create([saved])
+                live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                target_result = (OSError("target held") if failure == "exception" else
+                    restart.SessionLaunched(herdr.PromptNotSubmitted("add_unit failed")) if failure == "outcome" else
+                    restart.SessionLaunched(SUBMITTED_PROMPT))
+                with (patch.object(restart, "_retire"),
+                      patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                      patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+                      patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
+                      patch.object(restart, "_launch_session", side_effect=[target_result, restart.SessionLaunched(SUBMITTED_PROMPT)]) as launch,
+                      patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
+                      patch.object(settle, "_unit_showrunner", return_value="fixture-showrunner"),
+                      patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as notice,
+                      patch.object(settle, "alert_user") as phone,
+                      redirect_stdout(io.StringIO()) as output):
+                    current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+                    if failure == "confirmation":
+                        restart.confirm_entry(current, RESTARTED, False)
+                self.assertEqual(launch.call_count, 2)
+                self.assertEqual(launch.call_args_list[0].kwargs, {"dry_run": False})
+                self.assertEqual(launch.call_args_list[1].kwargs, {"dry_run": False, "source_fallback": True})
+                found = record.find_session(LOGIN, owner["session_id"])
+                assert found is not None
+                self.assertEqual(found.get("target"), LABEL)
+                self.assertEqual(found["progress"]["kind"], "restarted")
+                line = f"{owner['name']} came back on claude2: claude3 refused"
+                self.assertIn(line, output.getvalue())
+                self.assertTrue(any(line in issue for issue in found.get("restart_issues", [])))
+                self.assertIn(line, str(notice.call_args))
+                self.assertTrue(any(move["kind"] == "failed" and line in move["reason"] for move in moves.read_moves()))
+                phone.assert_not_called()
+
+    def test_moved_unit_both_launches_fail_and_each_move_kind_pushes_move_failed_once(self) -> None:
+        for alerts in ("user", "none"):
+            with self.subTest(alerts=alerts):
+                saved = entry(unit("both-failed-" + alerts))
+                saved.update(target="claude3", source_label=LABEL, alerts=alerts)
+                self.create([saved])
+                with (patch.object(restart, "_retire"),
+                      patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                      patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+                      patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
+                      patch.object(restart, "_launch_session", side_effect=[OSError("target held"), OSError("source failed")]) as launch,
+                      patch.object(settle, "alert_user") as phone):
+                    _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+                self.assertEqual(launch.call_count, 2)
+                current = record.find_session(LOGIN, saved["session"]["session_id"])
+                assert current is not None
+                self.assertEqual(current.get("target"), "claude3")
+                progress = current["progress"]
+                assert progress["kind"] == "restart failed"
+                self.assertIn("target held", progress["reason"])
+                self.assertIn("source failed", progress["reason"])
+                phone.assert_called_once()
+                push = cast(RenderedPush, phone.call_args.args[0])
+                self.assertEqual(push.id, "shutdown.move_failed")
+                self.assertEqual(push.values["target"], "claude3")
+                self.assertIn("restore_alerted", current)
+
+    def test_source_unit_launch_uses_add_unit_in_the_shared_session(self) -> None:
+        saved = entry(unit("source-only", session_name="shared-herdr"))
+        saved.update(target=LABEL, source_label=LABEL)
+        self.configure_groups(units="claude3")
+        child = subprocess.CompletedProcess(["fake add_unit"], 0,
+            "restart-prompt-outcome: " + herdr.encode_prompt_outcome(SUBMITTED_PROMPT) + "\n", "")
+        with (patch.object(restart, "_run", return_value=child) as launch,
+              patch.object(restart, "_herdr_launch", side_effect=AssertionError("unit bypassed add_unit")),
+              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState())):
+            _ = restart._launch_session(saved, "fallback note", self.desktop_state, dry_run=False, source_fallback=True)  # pyright: ignore[reportPrivateUsage]
+        argv = cast(list[str], launch.call_args.args[0])
+        self.assertTrue(any(part.endswith("/add_unit.py") for part in argv))
+        self.assertEqual(argv[argv.index("--account") + 1], LABEL)
+        self.assertEqual(argv[argv.index("--host-session") + 1], herdr.shared_session())
+        self.assertIn("--source-fallback", argv)
+        self.assertEqual(accounts.group_accounts().get("units"), "claude3")
+
     def test_confirmed_unit_restart_sends_one_resume_message_for_all_recorded_seats(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
         for moved in (False, True):
@@ -645,7 +731,11 @@ class RestartTests(ShutdownTestCase):
 
     def test_unconfirmed_target_restart_records_failure_with_request_id(self) -> None:
         saved = self.moved_record()
-        restart.confirm_entry(saved, RESTARTED, False)
+        with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
+              patch.object(restart, "_launch_session", side_effect=OSError("source failed")),
+              patch.object(settle, "alert_user")):
+            restart.confirm_entry(saved, RESTARTED, False)
         entries = moves.read_moves()
         self.assertEqual([item["kind"] for item in entries], ["failed"])
         item = entries[0]
@@ -819,32 +909,40 @@ class RestartTests(ShutdownTestCase):
                 timers.assert_not_called()
                 launch.assert_not_called()
 
-    @patch.object(restart, "_prompt_outcome", READ_PROMPT_OUTCOME)
-    def test_unit_child_not_submitted_outcome_fails_the_restart_without_waiting_for_liveness(self) -> None:
+    def test_unit_child_failed_prompt_outcome_starts_the_source(self) -> None:
         self.configure_groups(units="claude3")
         saved = entry(unit("unsent-unit"))
-        saved.update(target="claude3", source_label=LABEL)
+        saved.update(target="claude3", source_label=LABEL, alerts="none")
         self.create([saved])
+        owner = saved["session"]
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+            messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
         outcome = herdr.PromptNotSubmitted("fixture Enter was lost")
         child = subprocess.CompletedProcess(["fake add_unit"], 1,
-            "restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome) + "\n",
-            "unsent-unit: restart prompt not submitted\n")
-        with (patch.object(restart, "_run", return_value=child) as command,
+            "restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome) + "\n", "")
+        source_child = subprocess.CompletedProcess(["fake add_unit"], 0,
+            "restart-prompt-outcome: " + herdr.encode_prompt_outcome(SUBMITTED_PROMPT) + "\n", "")
+        with (patch.object(restart, "_run", side_effect=[child, source_child]) as command,
               patch.object(restart, "_retire"),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
-              patch.object(restart, "wait_for_confirmation") as confirmation,
-              patch.object(settle, "alert_user"), redirect_stdout(io.StringIO()) as output):
-            code = restart.up(LOGIN)
-        self.assertEqual(code, 1)
+              patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
+              patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((live,))),
+              patch.object(sessions, "live_sessions", return_value=[live]),
+              patch.object(account_reader, "process_config_dir", return_value=account_reader.ConfiguredClaudeFolder(self.root / ".claude2")),
+              patch.object(settle, "alert_user") as phone, redirect_stdout(io.StringIO()) as output):
+            current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
         launches = [call for call in command.call_args_list
                     if any(part.endswith("/add_unit.py") for part in cast(list[str], call.args[0]))]
-        self.assertEqual(len(launches), 1, output.getvalue())
-        confirmation.assert_not_called()
-        current = self.stored_record()
-        self.assertEqual(current["progress"], {"kind": "restart failed", "at": RESTARTED,
-                                               "reason": "restart prompt not submitted"})
-        self.assertEqual(READ_PROMPT_OUTCOME(current), outcome)
-        self.assertEqual([row["kind"] for row in moves.read_moves()], ["failed"])
+        self.assertEqual(len(launches), 2, output.getvalue())
+        target_argv = cast(list[str], launches[0].args[0])
+        source_argv = cast(list[str], launches[1].args[0])
+        self.assertNotIn("--source-fallback", target_argv)
+        self.assertIn("--source-fallback", source_argv)
+        self.assertEqual(source_argv[source_argv.index("--account") + 1], LABEL)
+        self.assertEqual(current["progress"]["kind"], "restarted")
+        self.assertIn("fixture Enter was lost", output.getvalue())
+        phone.assert_not_called()
 
     def hand_restart_record(self, identity: str = "moved-owner") -> SessionShutdown:
         saved = self.moved_record(identity)
@@ -1193,7 +1291,7 @@ class RestartTests(ShutdownTestCase):
         self.configure_groups(units="claude2")
         with patch.object(accounts, "account_for_group_launch", wraps=accounts.account_for_group_launch) as check:
             argv = restart._unit_argv(entry(unit("alias-unit")))  # pyright: ignore[reportPrivateUsage]
-        check.assert_called_once_with("unit", resume=True, target="")
+        check.assert_called_once_with("unit", resume=True, target="", source_fallback=False)
         self.assertEqual(argv[argv.index("--account") + 1], "claude2")
 
     def test_unit_restart_migrates_legacy_default_group_to_its_number(self) -> None:
@@ -4108,13 +4206,16 @@ class RestartTests(ShutdownTestCase):
                 progress=record.SessionAlreadyGone(kind="already gone", at=RESTARTED)))
         launched: list[SessionShutdown] = []
         def launch(current: SessionShutdown, _note: str, _desktop: restart.DesktopLaunchState, *,
-                   dry_run: bool) -> restart.SessionLaunched:
+                   dry_run: bool, source_fallback: bool = False) -> restart.SessionLaunched:
             self.assertFalse(dry_run)
-            launched.append(current)
+            self.assertEqual(source_fallback, bool(launched))
+            launched.append(copy.deepcopy(current))
             return restart.SessionLaunched(SUBMITTED_PROMPT)
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_process_liveness", return_value=restart.SessionNotLive()),
               patch.object(stop_work, "stop_session", side_effect=cleanup) as stop,
+              patch.object(restore_permission, "launch_permission", return_value=restore_permission.AllowedByShutdownState()),
+              patch.object(settle, "alert_user") as phone,
               patch.object(restart, "_retire"),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
               patch.object(restart, "_launch_session", side_effect=launch),
@@ -4122,7 +4223,13 @@ class RestartTests(ShutdownTestCase):
               redirect_stdout(io.StringIO())):
             _ = restart.up(LOGIN)
         stop.assert_called_once()
-        self.assertEqual(len(launched), 1)
+        self.assertEqual(len(launched), 2)
+        self.assertEqual(launched[1].get("target"), LABEL)
+        self.assertEqual((launched[1]["timers"], launched[1]["where"], launched[1]["request_id"]),
+                         (saved["timers"], saved["where"], saved["request_id"]))
+        self.assertEqual(self.stored_record().get("target"), "claude3")
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restart failed")
+        phone.assert_called_once()
         self.assertEqual((launched[0].get("target"), launched[0]["timers"], launched[0]["where"],
                           launched[0]["request_id"]),
                          ("claude3", saved["timers"], saved["where"], saved["request_id"]))

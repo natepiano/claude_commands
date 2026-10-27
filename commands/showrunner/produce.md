@@ -398,7 +398,7 @@ For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
 `<name>` is the Units row's Unit value without `-unit`; the existing row is adopted.
 Use `--standby` for a unit waiting for an assignment. Tell the user one line
-per unit director: its session name and `herdr session attach <session>`.
+per unit director: its session name and the place add_unit printed (its tab in `agents`).
 
 When a unit director is blocked on a full context, first read its pane with
 `~/.claude/scripts/lib/py ~/.claude/scripts/production/session_pane.py read unit <slug> <unit> --ansi`

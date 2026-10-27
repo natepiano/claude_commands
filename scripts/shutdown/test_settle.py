@@ -281,6 +281,8 @@ class SettleTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(settle, "now_utc", return_value=NOW_UTC))
         _ = self.enterContext(patch.object(settle, "merge_in_progress", return_value=False))
         _ = self.enterContext(patch.object(settle, "_showing_form", return_value=False))
+        # Fixture folders do not exist; a restore whose folder is gone is dropped before launch.
+        _ = self.enterContext(patch.object(restart_work, "_folder_exists", return_value=True))
 
     def save(self, saved: record.SessionShutdown) -> None:
         self.assertTrue(record.create_session(saved))

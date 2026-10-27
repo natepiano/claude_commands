@@ -17,8 +17,9 @@ Run:
 ```
 
 Show the script's output. If it exits nonzero, show its message and stop.
-New launches print `<unit> started: herdr session attach <name>`; restores print
-`<unit> restore launched: herdr session attach <name>`.
+New launches print `<unit> started: herdr session attach agents, workspace <space>, tab <name>`;
+restores print `<unit> restore launched: ` and the same place. Every unit is a tab of the one
+herdr session, `agents`.
 A name may be given with or without its `-unit` ending; `feature-log` and
 `feature-log-unit` both make unit `feature-log-unit`.
 An existing Units row is adopted; its Port and Owns values stand when omitted.

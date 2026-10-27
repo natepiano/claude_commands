@@ -1433,9 +1433,14 @@ def _claude_role_selection(group: ClaudeGroup, label: str) -> NamedAccount:
 
 
 def account_for_group_launch(role: Literal["unit", "showrunner"], *, resume: bool,
-                             target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
-    """Keep every launcher and explicit override on its configured group account."""
-    selected = role_account(role)
+                             target: str = "", config_dir: str = "", source_fallback: bool = False) -> ClaudeLaunchAccount:
+    """Use the group account, except for a moved unit restored on its source."""
+    if source_fallback:
+        if role != "unit" or not resume or not target or config_dir:
+            raise AccountsError("a source fallback needs a unit restore and its source account")
+        selected = NamedAccount(target, claude_account_dir(target))
+    else:
+        selected = role_account(role)
     label = selected.label
     directory = selected.dir
     group = "units" if role == "unit" else "showrunners"
@@ -3118,8 +3123,41 @@ class MoveDryRun:
     lines: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class MoveTargetHoldClear:
+    notices: tuple[str, ...] = ()
+
+
+def check_move_target_hold(target: str, *, dry_run: bool = False) -> MoveTargetHoldClear | MoveRefused:
+    """Check the target before changing a group or stopping a session."""
+    if dry_run:
+        return MoveTargetHoldClear((f"{target}: would check the shutdown hold",))
+    sys.path.insert(0, str(SCRIPTS / "shutdown"))
+    if TYPE_CHECKING:
+        from scripts.shutdown import launch_permission
+    else:
+        launch_permission = import_module("launch_permission")
+    environment = {**os.environ, "CLAUDE_CONFIG_DIR": str(claude_account_dir(target))}
+    permission = launch_permission.launch_permission(environment, launch_permission.NewWorkLaunchPurpose())
+    if isinstance(permission, launch_permission.BlockedByShutdown):
+        return MoveRefused(f"accounts: {permission.reason}; no session was stopped")
+    if isinstance(permission, launch_permission.ShutdownStateUnreadable):
+        return MoveRefused(f"accounts: shutdown state unreadable: {permission.detail}; no session was stopped")
+    released = permission.released
+    if released is None:
+        return MoveTargetHoldClear()
+    requester = (f"session {released.session_id[:8]}" if released.session_id is not None
+                 else "requested in a terminal or by a recovery snapshot")
+    at = datetime.fromisoformat(released.requested_at).astimezone(agent_accounts.user_zone())
+    return MoveTargetHoldClear((f"cleared a finished {released.then} hold on {released.label} "
+                               + f"from {at:%Y-%m-%d %H:%M %Z} ({requester})",))
+
+
 def check_move_target(target: str, now: datetime, *, repair: bool = True) -> MoveTargetReady | MoveRefused:
     """Check the destination without changing a group or starting a shutdown."""
+    hold = check_move_target_hold(target, dry_run=not repair)
+    if isinstance(hold, MoveRefused):
+        return hold
     destination = _move_target(target, repair=repair)
     if isinstance(destination, MoveRefused):
         return destination
@@ -3137,11 +3175,11 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True) -> Mov
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
                     return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); {room}")
-        return MoveTargetReady(destination)
+        return MoveTargetReady(destination, hold.notices)
     windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
     times = [window.at for window in windows if isinstance(window, ReadingWindow)]
     age = f"last {max(0, int((now - max(times)).total_seconds() // 60))} minutes ago" if times else "last reading unknown"
-    return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
+    return MoveTargetReady(destination, (*hold.notices, f"no fresh usage reading for {destination.label} ({age})"))
 
 
 def move_preview_line(member: ListedSession, now: datetime) -> str:

@@ -44,6 +44,7 @@ _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+SHARED_SESSION = "agents"
 
 
 def _platform() -> str:
@@ -1225,6 +1226,17 @@ class Herdr:
                 _ = self.run("tab", "close", json_text(row.get("tab_id"), "herdr pane tab id"))
                 return
 
+    def focus_tab_of(self, pane: str) -> None:
+        """Show the tab holding `pane`, and its workspace, in the session's attached clients."""
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        for row in rows:
+            if row.get("pane_id") == pane:
+                self.focus_workspace(json_text(row.get("workspace_id"), "herdr pane workspace id"))
+                _ = self.run("tab", "focus", json_text(row.get("tab_id"), "herdr pane tab id"))
+                return
+        raise HerdrFailure(f"herdr pane {pane} is not open in session {self.session}")
+
     def focus_workspace(self, workspace_id: str) -> None:
         """Show a workspace in the session's attached clients."""
         _ = self.run("workspace", "focus", workspace_id)
@@ -2021,6 +2033,7 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
 def start_server(name: str, timeout_ms: int, *,
                  session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> ServerCreated | ServerAdopted:
     _validate_session_name(name)
+    _require_shared(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
     if _platform() == "darwin":
@@ -2054,6 +2067,7 @@ def start_new_server(name: str, timeout_ms: int, *,
                      session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> None:
     """Create an exclusive server; never adopt a server another launch started."""
     _validate_session_name(name)
+    _require_shared(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
     if _platform() == "darwin":
@@ -2093,6 +2107,7 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
                    exclusive: bool) -> ServerCreated | ServerAdopted | WindowServerCreated:
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
     _validate_session_name(name)
+    _require_shared(name)
     _timeout(timeout_ms)
     if _platform() != "darwin" or isinstance(session_kind, DesktopSession):
         if exclusive:
@@ -2146,16 +2161,31 @@ def stop_created_server(name: str, ownership: ServerCreated | ServerAdopted | Wi
 
 
 def shared_session() -> str:
-    """The one herdr session every production lives in, one workspace per production and one tab
-    per Claude session, named in `herdr/shared-session` under the config directory. Empty when the
-    file is absent: each Claude session then gets a herdr session of its own."""
+    """The one herdr session every Claude session lives in, one workspace per production and one tab
+    per Claude session: `agents`, or the name in `herdr/shared-session` under the config directory.
+
+    There is no other herdr session. A launcher opens a tab here and never starts a server of its own
+    (user, 2026-10-26); `_require_shared` refuses any other name.
+    """
     path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "shared-session"
     try:
         name = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        return ""
+        return SHARED_SESSION
     _validate_session_name(name)
     return name
+
+
+def attach_hint(space: str, tab: str) -> str:
+    """Where the user finds one Claude session: its tab in a workspace of the shared session."""
+    return f"herdr session attach {shared_session()}, workspace {space}, tab {tab}"
+
+
+def _require_shared(name: str) -> None:
+    shared = shared_session()
+    if name != shared:
+        raise HerdrFailure(f"herdr session {name}: every Claude session runs as a tab in herdr session "
+                           + f"{shared}; open a tab there instead of starting another session")
 
 
 def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:

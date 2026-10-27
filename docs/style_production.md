@@ -643,8 +643,15 @@ changes to a live unit's files through `produce.md`'s `<CrossUnitChange>`.
 Refill first runs the declaration step once, on the findings of all approved
 decisions, so a finding tickets at the file its declaration moved to. A finding
 that the step leaves gets `waiting <decision>: <finding> declared in <n> files`,
-`waiting <decision>: <finding> declared in another crate: <file>` or
-`waiting <decision>: <finding> declaration gone`, and stays out of the ticket. A
+`waiting <decision>: <finding> declared in another crate: <file>`,
+`waiting <decision>: <finding> declaration gone` or
+`waiting <decision>: <finding> its function moved to <file>; <reason>`, and stays out of the ticket.
+A finding on a statement line follows its moved function only when its text is on
+exactly one body line there, and that line is a statement of the function. Refill
+builds no ticket on a file that a commit on the unit base, not in the synced tip,
+changed: it prints
+`waiting <decision>: <file> changed in <commit>, not in the synced tip <tip>` or
+`waiting for sync: <kind> <crate> [<rule>]: <file> changed in ...`, and waits for the sync. A
 decision whose last finding the step built closes. A decision whose answer
 changes during the refill gets `waiting <decision>: no longer approved`. A decision
 that the step skips gets `waiting <decision>: skipped by the declaration step`,
