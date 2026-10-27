@@ -492,6 +492,21 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         )
         return checkpoint
 
+    def handoff_sender(self, outcome: str, code: int) -> None:
+        _ = (self.root / "send.py").write_text(
+            "import json,sys\nfrom pathlib import Path\n"
+            + f"with Path({str(self.root / 'notices.jsonl')!r}).open('a') as out:\n"
+            + " out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            + f"print({outcome!r})\nraise SystemExit({code})\n",
+        )
+
+    def send_handoff(self, checkpoint: str) -> tuple[int, str]:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = style_sync.main(["send-handoff", "--repo", str(self.repo), "--slug", "sample-style",
+                                    "--checkpoint", checkpoint])
+        return code, output.getvalue()
+
     def handoff_rows(self) -> list[tuple[str, str, str, str, str]]:
         with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
             return cast(list[tuple[str, str, str, str, str]], connection.execute(
@@ -633,6 +648,32 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertEqual(output.getvalue().strip(), f"root: merge {checkpoint[:7]} with --root-self")
         self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
         self.assertEqual(self.handoff_notices(), [])
+
+    def test_queued_send_handoff_is_sent_to_the_parent(self) -> None:
+        """send.py queued a hand-off and the row stayed pending, so its merge was refused (cargo-liner, 2026-10-27)."""
+        checkpoint = self.handoff_checkpoint()
+        self.handoff_sender("QUEUED: relay timed out", 1)
+        self.assertEqual(self.send_handoff(checkpoint), (0, f"hand-off {checkpoint[:7]}: queued for parent\n"))
+        self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
+        self.assertEqual(len(self.handoff_notices()), 1)
+
+    def test_undelivered_send_handoff_stays_pending(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        for outcome, code in (("FAILED: unavailable", 3), ("relay error", 1)):
+            with self.subTest(outcome=outcome):
+                self.handoff_sender(outcome, code)
+                self.assertEqual(self.send_handoff(checkpoint), (1, f"style_sync: hand-off: {outcome}\n"))
+                self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
+
+    def test_resume_records_a_queued_notice_as_sent(self) -> None:
+        checkpoint = self.handoff_checkpoint()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.handoff_add(checkpoint)
+        self.handoff_sender("QUEUED: relay timed out", 1)
+        code, output = self.resume_handoffs()
+        self.assertEqual(code, 0, output)
+        self.assertIn(f"hand-off {checkpoint[:7]}: queued for parent\n", output)
+        self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "sent", "parent"))
 
     def test_send_handoff_interrupted_after_notice_is_replayed_on_resume(self) -> None:
         checkpoint = self.handoff_checkpoint()
