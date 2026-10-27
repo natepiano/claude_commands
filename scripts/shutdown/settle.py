@@ -40,6 +40,7 @@ import sessions
 import stop as stop_work
 from user_zone import user_zone
 from scripts.accounts.accounts import HAND_ORIGIN
+from scripts.accounts import outage_alerts
 if TYPE_CHECKING:
     from ..accounts import refusals, accounts
     from . import restart as restart_work
@@ -363,13 +364,14 @@ def stopped_sessions_text(count: int) -> str:
     return "One session" if count == 1 else f"{count} sessions"
 
 
-def alert_user(push: RenderedPush, *, machine: str = "") -> None:
+def alert_user(push: RenderedPush, *, machine: str = "") -> bool:
     """Send a registry action through the shutdown alert path."""
     command = [*_send_command(), *user_send_argv(push, machine=machine)[2:]]
     try:
-        _ = _deliver_message(command, "user", "")
-    except RuntimeError as error:
+        return _deliver_message(command, "user", "")["kind"] == "sent"
+    except (OSError, RuntimeError) as error:
         print(f"shutdown: user alert failed: {error}", file=sys.stderr)
+        return False
 
 
 def _notifier_enabled(instance: str) -> bool:
@@ -1477,31 +1479,28 @@ def report_stop(records: list[SessionShutdown]) -> None:
         due = stop_due or [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
         for machine in dict.fromkeys(saved["machine"] for saved in due):
             items = [saved for saved in due if saved["machine"] == machine]
-            # A failed move names both accounts; a restart onto its source could never start it.
-            restarted = [(saved, restart_work.FailedSessionRestart(saved["session"]["name"], progress["reason"],
-                                                                   progress.get("trust_command", "")))
+            if stop_due:
+                _ = alert_user(render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
+                                      stopped=stopped_sessions_text(len(items))), machine=route)
+                continue
+            restarted = [restart_work.FailedSessionRestart(saved["session"]["name"], progress["reason"],
+                                                          progress.get("trust_command", ""))
                          for saved in items if (progress := saved["progress"])["kind"] == "restart failed"]
-            # A folder no account trusts fails every retry the same way, a move retry included, so it gets the
-            # trust push. Its account is the record's own: a restart of that record resumes a move on its target.
-            retried = [item for saved, item in restarted if not saved.get("target") and not item.trust_command]
-            pushes = ((render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
-                           stopped=stopped_sessions_text(len(items))),) if stop_due else
-                    (*(restart_work.restart_push(first["label"], retried, machine=machine) if retried else ()),
-                     *(restart_work.move_untrusted_push(saved, item, machine=machine) if saved.get("target")
-                       else restart_work.untrusted_push(saved["label"], item, machine=machine)
-                       for saved, item in restarted if item.trust_command),
-                     *(restart_work.move_failed_push(saved) for saved, item in restarted
-                       if saved.get("target") and not item.trust_command)))
-            for push in pushes:
-                alert_user(push, machine=route)
-            if not stop_due:
-                for saved in items:
+            sent = restart_work.send_failure_pushes(first["label"], restarted, machine=machine,
+                identities={saved["session"]["name"]: saved["session"]["session_id"] for saved in items},
+                moved={saved["session"]["name"]: saved for saved in items if saved.get("target")},
+                send=lambda push: alert_user(push, machine=route))
+            for saved in items:
+                if saved["session"]["name"] in sent:
                     mark_not_back_pushed(saved)
         if not stop_due:
             for saved in unpushed:
                 if saved["progress"]["kind"] == "manual restart":
-                    alert_user(render("shutdown.manual_restart", session=saved["session"]["name"], machine=saved["machine"]), machine=route)
-                    mark_not_back_pushed(saved)
+                    with outage_alerts.reserve((saved["session"]["session_id"],)) as claims:
+                        if claims and alert_user(render("shutdown.manual_restart", session=saved["session"]["name"],
+                                                       machine=saved["machine"]), machine=route):
+                            outage_alerts.delivered(claims[saved["session"]["session_id"]])
+                            mark_not_back_pushed(saved)
     finally:
         if not origins:
             print(text)
@@ -1729,7 +1728,7 @@ def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
         for saved, reason in held:
             hold = HoldoutKind.from_reason(reason)
             command = shutdown_command("now", note_file.canonical_label(saved["label"]), "--here", "--only", saved["session"]["session_id"])
-            alert_user(render(hold.value, session=saved["session"]["name"], machine=saved["machine"], command=command,
+            _ = alert_user(render(hold.value, session=saved["session"]["name"], machine=saved["machine"], command=command,
                               operation="restart" if saved["then"] == "restart" else "shutdown"),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
@@ -1770,6 +1769,9 @@ def _record_cut_off(saved: SessionShutdown) -> None:
 
 def _archive_finished(saved: SessionShutdown) -> bool:
     try:
+        if saved["progress"]["kind"] == "restarted":
+            outage_alerts.clear(saved["session"]["session_id"])
+            store.clear_restore_alert(saved)
         store.archive_session(saved["login"], saved["session"]["session_id"])
     except store.NoLiveRecord:
         return False

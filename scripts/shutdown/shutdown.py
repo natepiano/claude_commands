@@ -1028,7 +1028,7 @@ def main(arguments: list[str] | None = None) -> int:
     _ = up.add_argument("--only")
     _ = up.add_argument("--here", action="store_true")
     _ = up.add_argument("--json", action="store_true", dest="as_json")
-    # Read by nothing; an older peer still sends `up --no-alert`.
+    # The peer owns alert delivery for its local sessions.
     _ = up.add_argument("--no-alert", action="store_true", help=argparse.SUPPRESS)
     ownership = commands.add_parser("conductor-status")
     _ = ownership.add_argument("account")
@@ -1278,7 +1278,8 @@ def _dispatch(options: CommandLine) -> int:
 
     if options.command == "up":
         if options.as_json:
-            result = restart_work.up_result(options.account or "", options.dry_run, _only_ids(options.only))
+            result = restart_work.up_result(options.account or "", options.dry_run, _only_ids(options.only),
+                alerts=restart_work.NeverAlert() if options.no_alert else restart_work.AlertWhenNotBack())
             print(json.dumps(result, sort_keys=True))
             return 1 if result["outcome"] == "partial" or result["refused"] else 0
         return restart_work.up(options.account or "", options.dry_run, _only_ids(options.only))

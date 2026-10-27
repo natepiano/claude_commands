@@ -47,7 +47,7 @@ else:
 import stop as stop_work
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
-from scripts.accounts import accounts, moves
+from scripts.accounts import accounts, moves, outage_alerts
 import usage_store
 from scripts.production import showrunners
 from account import Account
@@ -365,7 +365,7 @@ class SettleTests(ShutdownTestCase):
             patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(self.fake_stop)),
             patch.object(settle, "report_stop"),
             patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-            patch.object(settle, "alert_user") as alert,
+            patch.object(settle, "alert_user", return_value=True) as alert,
             patch.object(time, "sleep", side_effect=end),
         ):
             for _ in range(2):
@@ -1034,7 +1034,7 @@ class SettleTests(ShutdownTestCase):
             patch.object(stop_work, "update_session", side_effect=observe_update),
             patch.object(stop_work, "stop_session", new=perform_stop),
             patch.object(settle, "send_message") as sender,
-            patch.object(settle, "alert_user") as alert,
+            patch.object(settle, "alert_user", return_value=True) as alert,
             patch.object(settle, "report_stop"),
         ):
             self.assertEqual(settle.conduct(LOGIN), 0)
@@ -1220,7 +1220,7 @@ class SettleTests(ShutdownTestCase):
                     patch.object(settle, "now_utc", return_value=NOW_UTC + settle.NOT_ANSWERING_AFTER),
                     patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])),
                     patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-                    patch.object(settle, "alert_user") as alert,
+                    patch.object(settle, "alert_user", return_value=True) as alert,
                     patch.object(stop_work, "stop_session") as stop,
                     patch.object(time, "sleep", side_effect=end_pass),
                     self.assertRaises(PassObserved),
@@ -1459,7 +1459,7 @@ class SettleTests(ShutdownTestCase):
         self.assertFalse(settle._reserve_holdout_alert(saved, at))  # pyright: ignore[reportPrivateUsage]
         def end_pass(_seconds: float) -> None:
             raise PassObserved()
-        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "_screen", return_value=settle.ScreenText("wait for limit to reset")), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], *saved["workers"]])), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message") as sender, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
+        with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "_screen", return_value=settle.ScreenText("wait for limit to reset")), patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"], *saved["workers"]])), patch.object(settle, "alert_user", return_value=True) as alert, patch.object(settle, "send_message") as sender, patch.object(time, "sleep", side_effect=end_pass), self.assertRaises(PassObserved):
             _ = settle.conduct(LOGIN)
         alert.assert_not_called()
         sender.assert_not_called()
@@ -1705,7 +1705,7 @@ class SettleTests(ShutdownTestCase):
               patch.object(settle_showrunners, "current_name", return_value="runner"),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
               patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send,
-              patch.object(settle, "alert_user") as alert):
+              patch.object(settle, "alert_user", return_value=True) as alert):
             settle.report_stop([saved])
         liveness.assert_called_once_with(saved)
         back = [call for call in send.call_args_list if call.args[0] == "runner"]
@@ -2000,7 +2000,7 @@ class SettleTests(ShutdownTestCase):
         with (patch.object(settle, "now_utc", return_value=NOW_UTC + timedelta(hours=3)),
               patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
               patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-              patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "alert_user", return_value=True) as alert,
               patch.object(stop_work, "stop_session") as stop,
               patch.object(time, "sleep", side_effect=PassObserved),
               self.assertRaises(PassObserved)):
@@ -2641,7 +2641,7 @@ class SettleTests(ShutdownTestCase):
                     patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live),
                     patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm),
                     patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")),
-                    patch.object(settle, "alert_user") as alert,
+                    patch.object(settle, "alert_user", return_value=True) as alert,
                     patch.object(settle, "report_stop"),
                     patch.object(os, "execv", side_effect=reexec) as execute,
                     self.assertRaises(PassObserved),
@@ -3127,7 +3127,7 @@ class SettleTests(ShutdownTestCase):
               patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001),
               patch.object(settle, "run_remote", return_value=(0, json.dumps([peer, older_peer]))),
               patch.object(settle, "send_message", return_value={"kind": "sent"}),
-              patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(settle.conduct(LOGIN), 0)
         self.assertIn("natedev Current local: stopped", output.getvalue())
@@ -3145,13 +3145,13 @@ class SettleTests(ShutdownTestCase):
         saved["hold"] = "account"
         peer = session_shutdown(top_level("peer", "Peer"))
         peer["machine"] = "Mac"
-        with patch.object(settle, "run_remote", return_value=(0, json.dumps([peer]))), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "run_remote", return_value=(0, json.dumps([peer]))), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user", return_value=True) as alert:
             settle.report_stop([saved])
         self.assertIn("Mac Peer: waiting", cast(str, send.call_args.args[2]))
         self.assertEqual(send.call_args.kwargs["key"], f"shutdown-result-{LOGIN}")
         alert.assert_called_once()
         saved["alerts"] = "none"
-        with patch.object(settle, "run_remote", return_value=(255, "")), patch.object(settle, "send_message", return_value={"kind": "sent"}), patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "run_remote", return_value=(255, "")), patch.object(settle, "send_message", return_value={"kind": "sent"}), patch.object(settle, "alert_user", return_value=True) as alert:
             settle.report_stop([saved])
         alert.assert_not_called()
 
@@ -3364,7 +3364,7 @@ class SettleTests(ShutdownTestCase):
                 saved = session_shutdown(top_level("owner", "Owner"), progress=progress, requester="requester")
                 saved["hold"] = "account"
                 with (patch.object(settle, "run_remote", return_value=(0, "[]")),
-                      patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert):
+                      patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user", return_value=True) as alert):
                     settle.report_stop([saved])
                 push = cast(RenderedPush, alert.call_args.args[0])
                 self.assertEqual(push.id, "shutdown.stop_failed" if progress["kind"] == "stop failed" else "shutdown.restart_failed")
@@ -3390,7 +3390,7 @@ class SettleTests(ShutdownTestCase):
                            return_value=restart_work.RecordedConfigDir(self.root / ".claude3")),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
               patch.object(settle, "send_message"),
-              patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO())):
             settle.report_stop([saved])
         alert.assert_called_once()
@@ -3411,7 +3411,7 @@ class SettleTests(ShutdownTestCase):
                            return_value=restart_work.RecordedConfigDir(self.root / ".claude3")),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
               patch.object(settle, "send_message"),
-              patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO())):
             settle.report_stop([saved])
         alert.assert_called_once()
@@ -3434,7 +3434,7 @@ class SettleTests(ShutdownTestCase):
         with (patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
               patch.object(settle, "send_message") as sender,
-              patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO()) as output):
             settle.report_stop([saved])
         sender.assert_not_called()
@@ -3446,6 +3446,32 @@ class SettleTests(ShutdownTestCase):
         current = record.find_session(LOGIN, "unsent-owner")
         assert current is not None
         self.assertEqual(current["progress"], saved["progress"])
+
+    def test_report_claims_each_move_push_just_before_sending(self) -> None:
+        records = [session_shutdown(top_level(f"slow-{index}", f"Owner {index}"), then="restart",
+                   progress={"kind": "restart failed", "at": NOW, "reason": "both failed"}) for index in range(6)]
+        for saved in records:
+            saved["target"] = "claude3"
+            self.save(saved)
+        clock = [1000.0]
+        sent: list[str] = []
+        def send(push: RenderedPush, **_kwargs: object) -> bool:
+            for saved in records[len(sent) + 1:]:
+                claim = outage_alerts.claim(saved["session"]["session_id"])
+                self.assertIsInstance(claim, outage_alerts.AlertClaim)
+                assert isinstance(claim, outage_alerts.AlertClaim)
+                outage_alerts.release(claim)
+            sent.append(push.values["session"])
+            clock[0] += 190
+            return True
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(accounts, "claude_account_dir", return_value=self.root / ".claude3"),
+              patch.object(settle, "run_remote", return_value=(0, "[]")),
+              patch.object(settle, "send_message"),
+              patch.object(time, "time", side_effect=lambda: clock[0]),
+              patch.object(settle, "alert_user", side_effect=send), redirect_stdout(io.StringIO())):
+            settle.report_stop(records)
+        self.assertEqual(len(sent), 6)
 
     def test_untrusted_folder_restart_pushes_the_trust_step_and_never_a_retry(self) -> None:
         command = "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude2 claude"
@@ -3462,7 +3488,7 @@ class SettleTests(ShutdownTestCase):
                   patch.object(sessions, "live_sessions", return_value=[]),
                   patch.object(settle, "run_remote", return_value=(0, "[]")),
                   patch.object(settle, "send_message"),
-                  patch.object(settle, "alert_user") as alert,
+                  patch.object(settle, "alert_user", return_value=True) as alert,
                   redirect_stdout(io.StringIO())):
                 settle.report_stop([current for saved in records
                                     if (current := record.find_session(LOGIN, saved["session"]["session_id"]))])
@@ -3500,8 +3526,8 @@ class SettleTests(ShutdownTestCase):
                       patch.object(restart_work, "restart_failed_liveness", return_value=observed) as liveness,
                       patch.object(settle, "run_remote", return_value=(0, "[]")),
                       patch.object(settle, "send_message") as sender,
-                      patch.object(settle, "alert_user") as alert,
-                      patch.object(restart_work, "restart_push", wraps=restart_work.restart_push) as pushes,
+                      patch.object(settle, "alert_user", return_value=True) as alert,
+                      patch.object(restart_work, "restart_outage_pushes", wraps=restart_work.restart_outage_pushes) as pushes,
                       patch.object(settle, "mark_not_back_pushed", wraps=settle.mark_not_back_pushed) as mark):
                     settle.report_stop(records)
                 liveness.assert_called_once_with(failed)
@@ -3531,7 +3557,7 @@ class SettleTests(ShutdownTestCase):
                     if isinstance(observed, restart_work.SessionLivenessUnknown):
                         self.assertIn(f"{command}; liveness unknown: {observed.reason}", text)
                     alert.assert_called_once()
-                    pushes.assert_called_once_with(
+                    pushes.assert_called_with(
                         LABEL, [restart_work.FailedSessionRestart("Slow owner", "restart prompt not submitted")],
                         machine="natedev")
                     mark.assert_called_once_with(failed)
@@ -3550,7 +3576,7 @@ class SettleTests(ShutdownTestCase):
                     self.save(saved)
                 with (patch.object(sessions, "live_sessions", return_value=[]),
                       patch.object(settle, "run_remote", return_value=(0, "[]")),
-                      patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert,
+                      patch.object(settle, "send_message"), patch.object(settle, "alert_user", return_value=True) as alert,
                       redirect_stdout(io.StringIO())):
                     settle.report_stop(records)
                     pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
@@ -3589,7 +3615,7 @@ class SettleTests(ShutdownTestCase):
         saved["hold"] = "account"
         with (patch.object(sessions, "live_sessions", return_value=[]),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
-              patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "send_message"), patch.object(settle, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO())):
             settle.report_stop([saved])
         alert.assert_called_once()
@@ -3604,7 +3630,7 @@ class SettleTests(ShutdownTestCase):
             for index in range(100)]
         for saved in records:
             saved["hold"] = "account"
-        with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user", return_value=True) as alert:
             settle.report_stop(records)
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["stopped"], "100 sessions")
@@ -3615,7 +3641,7 @@ class SettleTests(ShutdownTestCase):
     def test_holdout_alert_names_each_terminal_and_pushes_for_busy_sessions(self) -> None:
         form = session_shutdown(top_level("form", "Owner"), requester="requester")
         busy = session_shutdown(top_level("busy", "Busy"), requester="requester")
-        with patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user", return_value=True) as alert:
             settle._send_holdout_alert([(form, "showing a form"), (busy, "busy")])  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(alert.call_count, 2)
         pushes = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
@@ -3630,7 +3656,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_holdout_with_a_form_among_other_details_asks_to_answer_the_form(self) -> None:
         saved = session_shutdown(top_level("held", "pm-move-ghostty"), requester="requester")
-        with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "send_message"), patch.object(settle, "alert_user", return_value=True) as alert:
             settle._send_holdout_alert([(saved, "busy, ahead 3 on main, showing a form, merge in progress")])  # pyright: ignore[reportPrivateUsage]
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.holdout")
@@ -3643,7 +3669,7 @@ class SettleTests(ShutdownTestCase):
         owner = top_level("form", "Display name")
         owner["host"] = inventory.HerdrHost(kind="herdr", herdr_session="Actual terminal", pane_id="w1:p1", presentation="detached")
         saved = session_shutdown(owner)
-        with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "send_message"), patch.object(settle, "alert_user", return_value=True) as alert:
             settle._send_holdout_alert([(saved, "showing a form")])  # pyright: ignore[reportPrivateUsage]
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.values["session"], "Display name")
@@ -3656,7 +3682,7 @@ class SettleTests(ShutdownTestCase):
                 saved = session_shutdown(top_level("held", "pm-move-ghostty"), then="restart")
                 saved["login"] = "held-account@example.com"
                 saved["label"] = "claude 4"
-                with patch.object(settle, "send_message"), patch.object(settle, "alert_user") as alert:
+                with patch.object(settle, "send_message"), patch.object(settle, "alert_user", return_value=True) as alert:
                     settle._send_holdout_alert([(saved, reason)])  # pyright: ignore[reportPrivateUsage]
                 push = cast(RenderedPush, alert.call_args.args[0])
                 self.assertEqual(push.id, expected_id)
@@ -3666,7 +3692,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_pending_scheduled_jobs_remain_in_session_reports_without_a_phone_alert(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "timers pending", "at": NOW, "timers": []}, requester="requester")
-        with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user", return_value=True) as alert:
             settle.report_stop([saved])
         alert.assert_not_called()
         self.assertIn("timers pending", cast(str, sender.call_args.args[2]))
@@ -3675,7 +3701,7 @@ class SettleTests(ShutdownTestCase):
         busy = session_shutdown(top_level("busy", "Busy"))
         pending = session_shutdown(top_level("pending", "Pending"), progress={"kind": "timers pending", "at": NOW, "timers": []})
         with (patch.object(settle, "run_remote", return_value=(0, "[]")),
-              patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert,
+              patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO()) as output):
             settle._send_holdout_alert([(busy, "busy")])  # pyright: ignore[reportPrivateUsage]
             settle.report_stop([pending])
@@ -3686,7 +3712,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_manual_restart_asks_for_manual_restore_instead_of_retrying_the_automatic_path(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "manual restart", "command": "private resume command"}, requester="requester")
-        with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user") as alert:
+        with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message") as sender, patch.object(settle, "alert_user", return_value=True) as alert:
             settle.report_stop([saved])
         push = cast(RenderedPush, alert.call_args.args[0])
         self.assertEqual(push.id, "shutdown.manual_restart")
@@ -3702,7 +3728,7 @@ class SettleTests(ShutdownTestCase):
             with (self.subTest(records=records),
                   patch.object(settle, "run_remote", return_value=(0, "[]")),
                   patch.object(settle, "send_message") as sender,
-                  patch.object(settle, "alert_user") as alert):
+                  patch.object(settle, "alert_user", return_value=True) as alert):
                 settle.report_stop(records)
             alert.assert_not_called()
             if records:
@@ -3728,7 +3754,7 @@ class SettleTests(ShutdownTestCase):
                 saved = session_shutdown(top_level("owner", "Owner"), progress=cast(record.SessionProgress, cast(object, {"kind": kind, "at": NOW})), requester="requester")
                 saved["hold"], saved["alerts"] = "account", alerts
                 saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="herdr", session_name="unit", cause="stop not confirmed")]
-                with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user") as alert:
+                with patch.object(settle, "run_remote", return_value=(0, "[]")), patch.object(settle, "send_message", return_value={"kind": "sent"}) as send, patch.object(settle, "alert_user", return_value=True) as alert:
                     settle.report_stop([saved])
                 self.assertEqual(send.call_args.args[1], f"{LABEL}: stop partial")
                 self.assertIn(f"now {LOGIN} --here --only owner", cast(str, send.call_args.args[2]))
@@ -3950,7 +3976,7 @@ class SettleTests(ShutdownTestCase):
                        "busy, ahead 3 on main, merge in progress"):
             with self.subTest(reason=reason):
                 saved = session_shutdown(top_level("owner", "Owner"), requester="requester")
-                with patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
+                with patch.object(settle, "alert_user", return_value=True) as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
                     settle._send_holdout_alert([(saved, reason)])  # pyright: ignore[reportPrivateUsage]
                 alert.assert_called_once()
                 push = cast(RenderedPush, alert.call_args.args[0])
@@ -3972,7 +3998,7 @@ class SettleTests(ShutdownTestCase):
             raise PassObserved()
         for showing, pushes in ((False, 1), (True, 0), (True, 0)):
             shown[0] = showing
-            with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "run_inventory", return_value=machine_inventory([owner])), patch.object(settle, "_showing_form", side_effect=form), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")), patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
+            with patch.object(settle, "now_utc", return_value=at), patch.object(settle, "run_inventory", return_value=machine_inventory([owner])), patch.object(settle, "_showing_form", side_effect=form), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user", return_value=True) as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")), patch.object(time, "sleep", side_effect=end), self.assertRaises(PassObserved):
                 _ = settle.conduct(LOGIN)
             self.assertEqual(alert.call_count, pushes)
 
@@ -4080,7 +4106,7 @@ class SettleTests(ShutdownTestCase):
                                 current["progress"] = {"kind": "ready", "at": NOW}
                         _ = record.update_session(LOGIN, other["session"]["session_id"], ready)
                     return machine_inventory([restored["session"], other["session"]])
-                with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", side_effect=check), patch.object(remote_control, "launch_fixer") as fixer, patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()) as output:
+                with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=confirmed), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", side_effect=check), patch.object(remote_control, "launch_fixer") as fixer, patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_send_settle_message"), patch.object(settle, "alert_user", return_value=True) as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(settle.conduct(LOGIN), 0)
                 self.assertNotIn("Remote Control", output.getvalue())
                 self.assertIsNone(record.find_session(LOGIN, restored["session"]["session_id"]))
@@ -4096,7 +4122,7 @@ class SettleTests(ShutdownTestCase):
             for machine, expected in (("", 220), ("natedev", 260)):
                 with (self.subTest(machine=machine),
                       patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender):
-                    settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"), machine=machine)
+                    _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"), machine=machine)
                 self.assertEqual(sender.call_args.kwargs["timeout"], expected)
             with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender:
                 self.assertEqual(settle.send_message("session:owner", "Shutdown", "Stop work"), {"kind": "sent"})
@@ -4107,7 +4133,7 @@ class SettleTests(ShutdownTestCase):
         with (patch.object(review, "user_send_seconds", return_value=115),
               patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("fake send", 130)),
               redirect_stderr(io.StringIO()) as errors):
-            settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"))
+            _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"))
         self.assertIn("shutdown: user alert failed: send to user timed out after 130 seconds", errors.getvalue())
 
     def test_ups_alert_ignores_account_hold_and_every_session_progress(self) -> None:
@@ -4119,7 +4145,7 @@ class SettleTests(ShutdownTestCase):
             saved = session_shutdown(top_level(str(index), str(index)), progress=progress)
             self.save(saved)
             with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender, patch.object(record, "session_records", side_effect=AssertionError("alert consulted shutdown state")), patch.object(review, "user_send_seconds", return_value=85):
-                settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"))
+                _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"))
             self.assertEqual(sender.call_args.kwargs["input"], "")
             self.assertIn("nixos.ups_battery", cast(list[str], sender.call_args.args[0]))
             self.assertEqual(sender.call_args.kwargs["timeout"], 100)
@@ -4150,7 +4176,7 @@ class SettleTests(ShutdownTestCase):
             result = self.fake_stop(saved)
             stopped.set()
             return result
-        with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_send_settle_message"), patch.object(remote_control, "launch_fixer", side_effect=launch_fixer) as fixer, patch.object(settle, "alert_user") as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()):
+        with patch.object(settle, "run_inventory", side_effect=observe), patch.object(settle, "SETTLE_INTERVAL_SECONDS", 0.001), patch.object(restart_work, "relaunch_session", side_effect=self.fake_launch), patch.object(restart_work, "wait_for_confirmation", side_effect=self.all_live), patch.object(restart_work, "confirm_entry", side_effect=self.fake_confirm), patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(stop)), patch.object(settle, "_send_settle_message"), patch.object(remote_control, "launch_fixer", side_effect=launch_fixer) as fixer, patch.object(settle, "alert_user", return_value=True) as alert, patch.object(settle, "report_stop"), redirect_stdout(io.StringIO()):
             self.assertEqual(settle.conduct(LOGIN), 0)
         fixer.assert_called_once()
         alert.assert_not_called()
@@ -4159,7 +4185,7 @@ class SettleTests(ShutdownTestCase):
     def test_holdout_alert_from_mac_routes_phone_to_natedev_and_same_text_to_requester(self) -> None:
         saved = session_shutdown(top_level("held", "Held"), requester="requester")
         saved["machine"] = "Mac"
-        with patch.object(settle, "local_machine", return_value="Mac"), patch.object(settle, "alert_user") as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
+        with patch.object(settle, "local_machine", return_value="Mac"), patch.object(settle, "alert_user", return_value=True) as alert, patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as sender:
             settle._send_holdout_alert([(saved, "showing a form")])  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(alert.call_args.kwargs, {"machine": "natedev"})
         push = cast(RenderedPush, alert.call_args.args[0])

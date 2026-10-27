@@ -25,6 +25,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, Never, Protocol, TypedDict, cast
 
+from scripts.accounts import outage_alerts
+
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
@@ -133,7 +135,7 @@ class ShutdownServices(Protocol):
     ) -> dict[str, str]: ...
     def alert_user(
         self, push: RenderedPush, *, machine: str = "",
-    ) -> None: ...
+    ) -> bool: ...
     def tell_showrunners_outcome(self, records: list[SessionShutdown]) -> None: ...
     def not_back_text(self, saved: SessionShutdown) -> str: ...
     def mark_not_back_pushed(self, saved: SessionShutdown) -> None: ...
@@ -193,6 +195,9 @@ class AlertWhenNotBack:
 @dataclass(frozen=True)
 class NeverAlert:
     """The restart is a silent live check."""
+
+
+DEFAULT_RESTART_ALERTS = AlertWhenNotBack()
 
 
 @dataclass(frozen=True)
@@ -1672,6 +1677,7 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
             if isinstance(found, ShutdownFound):
                 remaining.append(found.record)
             continue
+        _clear_live_outage(record)
         if failures:
             remaining.append({**record, "progress": progress})
             continue
@@ -1684,6 +1690,7 @@ def _record_timer_restore_progress(
     record: SessionShutdown,
     failures: tuple[PendingTimer, ...],
 ) -> None:
+    _clear_live_outage(record)
     _clear_assumed_refusal(record["session"]["session_id"])
     if failures:
         _record_pending_timers(record, failures)
@@ -1933,10 +1940,19 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
         both = f"{target} refused ({reason}); {source} also failed ({_error_reason(source_error)})"
         mark_restart_failed(saved, both)
         # Retries belong to this outage until the session is confirmed live.
-        if (saved["requested_by"]["kind"] != "snapshot"
-                and recovery_store.claim_restore_alert(saved, settle.not_back_text(saved))):
-            if not isinstance(quota_alert.tell_user(move_failed_push(saved)), quota_alert.PushSent):
-                recovery_store.clear_restore_alert(saved)
+        if saved["requested_by"]["kind"] != "snapshot":
+            claimed = outage_alerts.claim(saved["session"]["session_id"])
+            if isinstance(claimed, outage_alerts.AlertClaim):
+                sent = False
+                try:
+                    _ = recovery_store.claim_restore_alert(saved, settle.not_back_text(saved))
+                    sent = isinstance(quota_alert.tell_user(move_failed_push(saved)), quota_alert.PushSent)
+                    if sent:
+                        outage_alerts.delivered(claimed)
+                finally:
+                    if not sent:
+                        outage_alerts.release(claimed)
+                        recovery_store.clear_restore_alert(saved)
         return SourceFallbackSettled()
     def remember(current: SessionShutdown) -> None:
         if not _same_relaunch_claim(saved, current):
@@ -2016,6 +2032,7 @@ def launch_entry(
         if isinstance(observed, SessionLive):
             print(f"{session['name']}: already running; skipped")
             if not dry_run:
+                _clear_live_outage(record)
                 _restore_prior(record)
             return EntrySettled()
         if isinstance(observed, SessionLivenessUnknown):
@@ -2188,6 +2205,12 @@ def _send_worker_resume(record: SessionShutdown) -> None:
         print(f"shutdown: worker resume message: {_error_reason(error)}", file=sys.stderr)
 
 
+def _clear_live_outage(record: SessionShutdown) -> None:
+    outage_alerts.clear(record["session"]["session_id"])
+    recovery_store.clear_restore_alert(record)
+    _ = record.pop("restore_alerted", None)
+
+
 def confirm_entry(
     record: SessionShutdown,
     restarted_at: str,
@@ -2217,8 +2240,7 @@ def confirm_entry(
         return
     if not _prove_move(record):
         return
-    recovery_store.clear_restore_alert(record)
-    _ = record.pop("restore_alerted", None)
+    _clear_live_outage(record)
     if record["session"]["kind"] == "showrunner" and record["requested_by"]["kind"] != "snapshot":
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
@@ -2396,6 +2418,8 @@ def relaunch_session(
     if record["progress"]["kind"] == "restart failed":
         observed = _owner_liveness(record["session"])
         if isinstance(observed, SessionLive):
+            if not dry_run:
+                _clear_live_outage(record)
             print(f"{record['session']['name']}: already running; skipped")
             return record
         if isinstance(observed, SessionLivenessUnknown):
@@ -2482,6 +2506,7 @@ def _confirm_entries(records: list[SessionShutdown]) -> None:
             confirm_entry(record, progress["at"], record["session"]["session_id"] in confirmation.live_ids)
     for record in records:
         if record["progress"]["kind"] == "restarted":
+            _clear_live_outage(record)
             archive_session(record["login"], record["session"]["session_id"])
             _acknowledge_restored_snapshots(record["session"]["session_id"])
 
@@ -2764,10 +2789,14 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                         print(f"{name}: no crash signal; skipped")
                 continue
             if identity in live_ids:
+                if not dry_run:
+                    outage_alerts.clear(identity)
                 print(f"{name}: already running; skipped")
                 continue
             liveness = _owner_liveness(entry["session"])
             if isinstance(liveness, SessionLive):
+                if not dry_run:
+                    outage_alerts.clear(identity)
                 print(f"{name}: already running; skipped")
                 continue
             if isinstance(liveness, SessionLivenessUnknown):
@@ -2816,12 +2845,16 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
             print(f"{name}: skipped obsolete copy on {saved['label']}; current account {decision.login}")
             continue
         if decision.login != login.casefold() and identity in live_ids:
+            if not dry_run:
+                _clear_live_outage(saved)
             print(f"{name}: already running on {decision.login}; skipped")
             continue
         saved = _restore_target(saved, decision, dry_run=dry_run)
         if saved["requested_by"]["kind"] == "snapshot" and saved["progress"]["kind"] in {"already gone", "restart failed"}:
             observed = _owner_liveness(saved["session"])
             if isinstance(observed, SessionLive):
+                if not dry_run:
+                    _clear_live_outage(saved)
                 print(f"{name}: already running; skipped")
                 continue
             if isinstance(observed, SessionLivenessUnknown):
@@ -2830,6 +2863,8 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 continue
         recovered = _recover_incomplete_shutdown(saved, dry_run=dry_run)
         if isinstance(recovered, IncompleteShutdownStillLive):
+            if not dry_run:
+                _clear_live_outage(saved)
             print(f"{name}: already running; skipped")
             selected_records.append(saved)
         elif isinstance(recovered, IncompleteShutdownRefused):
@@ -2982,12 +3017,18 @@ def refusal_line(refusal: RestartRefusal) -> str:
     return f"{refusal['name']} is {refusal['progress']}, not stopped; nothing to restart"
 
 
-def up_result(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> PeerRestartResult:
+def up_result(login: str, dry_run: bool = False, only: Iterable[str] = (), *,
+              alerts: AlertWhenNotBack | NeverAlert = DEFAULT_RESTART_ALERTS) -> PeerRestartResult:
     """Run the local verb and retain its printed lines in a validated peer object."""
     output = io.StringIO()
+    ids = tuple(only)
+    notify = isinstance(alerts, AlertWhenNotBack) and not dry_run
+    identities = _local_alert_sources(login) if notify else {}
     with redirect_stdout(output):
         try:
-            result = _up(login, dry_run, only)
+            result = _up(login, dry_run, ids)
+            if notify and result.status == "partial":
+                _notify_local_restart(login, result, ids, identities)
         except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             print(f"{settle.local_machine()}: restart failed: {error}")
             result = MachineRestartResult(settle.local_machine(), login, "partial", failed=1)
@@ -3130,28 +3171,19 @@ class PeerRestartAvailability(Enum):
     REACHED_TO_BE_READ = "reached and to be read"
 
 
-def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerRestartAvailability) -> bool:
+def _restart_alerts_enabled(login: str, only: Iterable[str] = (), *, peer: PeerRestartAvailability,
+                            observed: list[SessionShutdown]) -> bool:
     ids = tuple(only)
     try:
         records = [saved for saved in session_records(login)
                    if not ids or saved["session"]["session_id"] in ids]
     except (InvalidRecord, OSError, ValueError):
         return True
+    observed.extend(records)
     if peer is PeerRestartAvailability.NOT_ASKED:
         return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
     if peer is PeerRestartAvailability.NOT_REACHED:
         return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
-    try:
-        peer_records = _remote_records()
-    except (InvalidRecord, OSError, ValueError):
-        return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
-    if peer_records["kind"] == "machine not reached":
-        return (not records and not ids) or any(saved["alerts"] == "user" for saved in records)
-    records.extend(
-        saved for saved in peer_records["records"]
-        if saved["login"].casefold() == login.casefold()
-        and (not ids or saved["session"]["session_id"] in ids)
-    )
     return (not records and not ids) or any(saved["alerts"] == "user" for saved in _eligible_records(records))
 
 
@@ -3204,18 +3236,29 @@ def restart_cause(reason: str) -> str:
     return line if len(line) <= RESTART_CAUSE_LIMIT else line[:RESTART_CAUSE_LIMIT - 1] + "…"
 
 
+@dataclass(frozen=True)
+class SessionOutagePush:
+    push: RenderedPush
+    sessions: tuple[str, ...]
+
+
 def restart_push(label: str, failures: Sequence[FailedSessionRestart], *, machine: str) -> tuple[RenderedPush, ...]:
-    """Render known failed sessions, one cause per push, or the unconfirmed machine when names are unavailable."""
+    """Render known failed sessions or the unconfirmed machine when names are unavailable."""
     if not failures:
         return (render("shutdown.restart_incomplete", account=json.dumps(label), machine=machine),)
+    return tuple(batch.push for batch in restart_outage_pushes(label, failures, machine=machine))
+
+
+def restart_outage_pushes(label: str, failures: Sequence[FailedSessionRestart], *, machine: str) -> list[SessionOutagePush]:
+    """Keep each split push with the exact sessions it covers, including shortened names."""
     by_cause: dict[str, list[str]] = {}
     for item in failures:
         by_cause.setdefault(restart_cause(item.reason), []).append(item.name)
-    return tuple(push for cause, names in by_cause.items()
-                 for push in _cause_pushes(label, cause, names, machine=machine))
+    return [batch for cause, names in by_cause.items()
+            for batch in _cause_pushes(label, cause, names, machine=machine)]
 
 
-def _cause_pushes(label: str, cause: str, names: list[str], *, machine: str) -> list[RenderedPush]:
+def _cause_pushes(label: str, cause: str, names: list[str], *, machine: str) -> list[SessionOutagePush]:
     """Split one cause's sessions across pushes that each fit the phone limits."""
     def named_push(group: list[str]) -> RenderedPush:
         stopped = settle.stopped_sessions_text(len(group)) + " (" + ", ".join(group) + ")"
@@ -3225,22 +3268,22 @@ def _cause_pushes(label: str, cause: str, names: list[str], *, machine: str) -> 
     def fits(push: RenderedPush) -> bool:
         return len(push.values["stopped"]) <= 400 and len(push.message) < 500 and len(push.title) < 45
 
-    pushes: list[RenderedPush] = []
+    pushes: list[SessionOutagePush] = []
     group: list[str] = []
     for name in names:
         candidate = named_push([*group, name])
         if group and not fits(candidate):
-            pushes.append(named_push(group))
+            pushes.append(SessionOutagePush(named_push(group), tuple(group)))
             group = []
             candidate = named_push([name])
         if not fits(candidate):
             excess = max(len(candidate.values["stopped"]) - 400, len(candidate.message) - 499)
             shortened = name[:max(0, len(name) - excess - 1)] + "…"
-            pushes.append(named_push([shortened]))
+            pushes.append(SessionOutagePush(named_push([shortened]), (name,)))
             continue
         group.append(name)
     if group:
-        pushes.append(named_push(group))
+        pushes.append(SessionOutagePush(named_push(group), tuple(group)))
     return pushes
 
 
@@ -3271,6 +3314,88 @@ def _session_shortened_to_fit(named_push: Callable[[str], RenderedPush], name: s
     return push
 
 
+def send_failure_pushes(
+    label: str, failures: Sequence[FailedSessionRestart], *, machine: str,
+    identities: dict[str, str], moved: dict[str, SessionShutdown],
+    send: Callable[[RenderedPush], bool],
+) -> set[str]:
+    """Claim only one push at a time, and render only the sessions it owns."""
+    sent: set[str] = set()
+    retried: list[FailedSessionRestart] = []
+    for item in failures:
+        move = moved.get(item.name)
+        if not item.trust_command and move is None:
+            retried.append(item)
+            continue
+        identity = identities.get(item.name, "")
+        with outage_alerts.reserve((identity,) if identity else ()) as claims:
+            if not claims:
+                continue
+            if item.trust_command:
+                push = (move_untrusted_push(move, item, machine=machine) if move is not None
+                        else untrusted_push(label, item, machine=machine))
+            elif move is not None:
+                push = move_failed_push(move)
+            else:
+                continue
+            if send(push):
+                outage_alerts.delivered(claims[identity])
+                sent.add(item.name)
+    for candidate in restart_outage_pushes(label, retried, machine=machine):
+        with outage_alerts.reserve(identities[name] for name in candidate.sessions if name in identities) as claims:
+            held = [item for item in retried if item.name in candidate.sessions and identities.get(item.name, "") in claims]
+            for batch in restart_outage_pushes(label, held, machine=machine):
+                if send(batch.push):
+                    for name in batch.sessions:
+                        outage_alerts.delivered(claims[identities[name]])
+                        sent.add(name)
+    return sent
+
+
+def _local_alert_sources(login: str) -> dict[str, str]:
+    identities = {saved["session"]["name"]: saved["session"]["session_id"] for saved in session_records(login)
+                  if saved["machine"].casefold() == settle.local_machine().casefold()}
+    for snapshot in all_snapshots():
+        if snapshot["login"].casefold() == login.casefold() and snapshot["machine"].casefold() == settle.local_machine().casefold():
+            identities.update({entry["session"]["name"]: entry["session"]["session_id"]
+                               for entry in snapshot["sessions"] if entry["agent"] == "claude"})
+    return identities
+
+
+def _notify_local_restart(login: str, result: MachineRestartResult, ids: tuple[str, ...],
+                          identities: dict[str, str], *, unreached: str = "") -> None:
+    """Only the machine that owns a session may send its outage alert."""
+    observed: list[SessionShutdown] = []
+    if not _restart_alerts_enabled(login, ids, peer=PeerRestartAvailability.NOT_REACHED if unreached
+                                   else PeerRestartAvailability.NOT_ASKED, observed=observed):
+        return
+    identities.update({saved["session"]["name"]: saved["session"]["session_id"] for saved in observed
+                       if saved["machine"].casefold() == result.machine.casefold()})
+    pushed = _pushed_not_back(login, ids)
+    running = {saved["session"]["name"] for saved in observed if restart_failed_session_running(saved)}
+    failed = [item for item in result.failed_sessions if item.name not in pushed and item.name not in running]
+    manual = [item.name for item in result.manual_sessions if item.name not in pushed]
+    moved = {saved["session"]["name"]: saved for saved in observed if saved.get("target")
+             and saved["requested_by"]["kind"] != "snapshot"}
+    sent = send_failure_pushes(result.label, failed, machine=result.machine, identities=identities,
+                               moved=moved, send=settle.alert_user)
+    for name in manual:
+        identity = identities.get(name, "")
+        with outage_alerts.reserve((identity,) if identity else ()) as claims:
+            if claims and settle.alert_user(render("shutdown.manual_restart", session=name, machine=result.machine)):
+                outage_alerts.delivered(claims[identity])
+                sent.add(name)
+    _mark_pushed_not_back(login, ids, sent)
+    unknown = any(item.name not in identities for item in failed) or any(name not in identities for name in manual)
+    if unreached or unknown or (result.status == "partial" and not result.failed_sessions
+                               and not result.manual_sessions and not result.timers_not_started):
+        machines = ([result.machine] if unknown or (result.status == "partial" and not failed and not manual) else [])
+        if unreached:
+            machines.append(unreached)
+        _ = settle.alert_user(render("shutdown.restart_incomplete", account=json.dumps(result.label),
+                                     machine=" and ".join(machines)))
+
+
 def restart(
     account: AccountNamed | AccountNotNamed,
     *,
@@ -3296,6 +3421,7 @@ def restart(
     notify = isinstance(alerts, AlertWhenNotBack) and not dry_run
     ids = tuple(only)
     local_ids: set[str] = set()
+    alert_identities = _local_alert_sources(selected.login) if notify else {}
     try:
         token = _COMMAND_SECURITY_SESSION.set(session_kind)
         try:
@@ -3354,58 +3480,10 @@ def restart(
         print(f"restart incomplete: {other_machine()} not reached; when it is back, "
             + f"in a terminal on {other_machine()}: {settle.shutdown_command(*retry)}")
     bring_back = local.status == "partial" or peer["outcome"] == "partial" or not_reached
-    if notify:
-        failure_alert = bring_back and _restart_alerts_enabled(selected.login, ids, peer=peer_availability)
+    if notify and bring_back:
         try:
-            if failure_alert:
-                # A retry that fails the same way as a pushed failure tells the user nothing new.
-                pushed = _pushed_not_back(selected.login, ids)
-                running = {saved["session"]["name"] for saved in session_records(selected.login)
-                           if (not ids or saved["session"]["session_id"] in ids)
-                           and restart_failed_session_running(saved)}
-                failed = [item for item in local.failed_sessions if item.name not in pushed and item.name not in running]
-                manual = [item for item in local.manual_sessions if item.name not in pushed]
-                # A folder no account trusts fails every retry the same way, so it gets the trust push instead.
-                retried = [item for item in failed if not item.trust_command]
-                untrusted = [(local.machine, item) for item in failed if item.trust_command]
-                for line in peer["lines"]:
-                    if match := re.match(r"[^:]+: (.+?) restart failed: (.*)", line):
-                        retried.append(FailedSessionRestart(match.group(1), match.group(2)))
-                    elif match := re.match(r"[^:]+: (.+?) needs folder trust: (.+)", line):
-                        untrusted.append((peer["machine"], FailedSessionRestart(match.group(1), "", match.group(2))))
-                local_partial = local.status == "partial" and (retried or manual or not (
-                    local.failed_sessions or local.manual_sessions))
-                machines = [local.machine] if local_partial else []
-                if peer["outcome"] == "partial" or not_reached:
-                    machines.append(peer["machine"])
-                # Pending scheduled jobs are reported in the command output; they need no user step.
-                # Manual restarts and folder trust get their own pushes, never a retry.
-                peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
-                    re.match(r"[^:]+: (timer .+ not started:|manual restart |.+? needs folder trust: |[0-9]+ restarted|restarted [0-9]+|already running; skipped$)", line)
-                    for line in peer["lines"]))
-                # A move into a folder no account trusts gets the trust push: a move retry fails the same way.
-                # Its retry is this account's restart, which resumes the move on its target.
-                moved = {saved["session"]["name"]: saved for saved in session_records(selected.login)
-                         if saved.get("target") and saved["machine"] == local.machine
-                         and saved["requested_by"]["kind"] != "snapshot"
-                         and saved["session"]["name"] in {item.name for item in failed}}
-                for item in failed:
-                    if item.name in moved and not item.trust_command:
-                        settle.alert_user(move_failed_push(moved[item.name]))
-                retried = [item for item in retried if item.name not in moved]
-                if retried or not_reached or peer_requires_retry:
-                    for push in restart_push(selected.label, retried, machine=" and ".join(machines)):
-                        settle.alert_user(push)
-                for machine, item in untrusted:
-                    move = moved.get(item.name) if machine == local.machine else None
-                    settle.alert_user(move_untrusted_push(move, item, machine=machine) if move is not None
-                                      else untrusted_push(selected.label, item, machine=machine))
-                for item in manual:
-                    settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
-                _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})
-                for line in peer["lines"]:
-                    if match := re.match(r"[^:]+: manual restart (.+?):", line):
-                        settle.alert_user(render("shutdown.manual_restart", session=match.group(1), machine=peer["machine"]))
+            _notify_local_restart(selected.login, local, ids, alert_identities,
+                                  unreached=other_machine() if not_reached else "")
         except (OSError, RuntimeError, ValueError):
             pass
     return 0 if local.exit_status == 0 and peer["outcome"] != "partial" and not peer["refused"] else 1

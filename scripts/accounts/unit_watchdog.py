@@ -15,7 +15,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
-from scripts.accounts import accounts, role_map
+from scripts.accounts import accounts, outage_alerts, role_map
 from scripts.production import showrunners
 import account
 
@@ -279,29 +279,42 @@ def _recovery_result(job: RecoveryJob, now: datetime) -> RecoveryStillRunning | 
     return RecoveryFinished(failure)
 
 
-def _alert_without_record(context: RecoveryAlertContext, outage: DownOutage, cause: str) -> None:
-    if outage["alerted"]:
+def _alert_without_record(session_id: str, context: RecoveryAlertContext, outage: DownOutage, cause: str) -> None:
+    claimed = outage_alerts.claim(session_id)
+    outage["alerted"] = isinstance(claimed, outage_alerts.AlertDelivered)
+    if not isinstance(claimed, outage_alerts.AlertClaim):
         return
-    push = render("shutdown.restart_failed", account=context["account"], machine="natedev",
-                  stopped=context["session_name"], cause=cause)
-    if isinstance(quota_alert.tell_user(push), quota_alert.PushSent):
-        outage["alerted"] = True
+    try:
+        push = render("shutdown.restart_failed", account=context["account"], machine="natedev",
+                      stopped=context["session_name"], cause=cause)
+        if isinstance(quota_alert.tell_user(push), quota_alert.PushSent):
+            outage_alerts.delivered(claimed)
+            outage["alerted"] = True
+    finally:
+        if not outage["alerted"]:
+            outage_alerts.release(claimed)
 
 
 def _alert_failure(source: RecoverySource, outage: DownOutage, cause: str) -> None:
-    if outage["alerted"]:
-        return
     saved = record.find_session(source.login, source.session["session_id"]) if source.move_record else None
     if saved is not None:
-        if record.claim_restore_alert(saved, restart.settle.not_back_text(saved)):
+        claimed = outage_alerts.claim(source.session["session_id"])
+        outage["alerted"] = isinstance(claimed, outage_alerts.AlertDelivered)
+        if not isinstance(claimed, outage_alerts.AlertClaim):
+            return
+        try:
+            _ = record.claim_restore_alert(saved, restart.settle.not_back_text(saved))
             if isinstance(quota_alert.tell_user(restart.move_failed_push(saved)), quota_alert.PushSent):
+                outage_alerts.delivered(claimed)
                 outage["alerted"] = True
-            else:
+        finally:
+            if not outage["alerted"]:
+                outage_alerts.release(claimed)
                 record.clear_restore_alert(saved)
     else:
         host = source.session["host"]
         assert host["kind"] == "unit"
-        _alert_without_record(RecoveryAlertContext(production=host["production"], unit=host["unit"],
+        _alert_without_record(source.session["session_id"], RecoveryAlertContext(production=host["production"], unit=host["unit"],
             account=source.label, session_name=source.session["name"]), outage, cause)
 
 
@@ -335,6 +348,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                     claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
                     if isinstance(claude, unit_lookup.LiveClaude):
                         if not dry_run:
+                            outage_alerts.clear(claude.session_id)
                             for saved in record.all_session_records():
                                 if (saved["session"]["session_id"] == claude.session_id
                                         and "restore_alerted" in saved):
@@ -369,16 +383,16 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                                 text = f"watchdog: {unit}: {outage['dropped']}"
                                 lines.append(text)
                                 lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{key}-{now.isoformat()}", text))
-                                _alert_without_record(context, outage, outage["dropped"])
+                                _alert_without_record(key, context, outage, outage["dropped"])
                         lines.append(f"watchdog: {unit}: no recovery record or snapshot")
                         continue
                     key = source.session["session_id"]
+                    outage = state.get(key)
                     if isinstance(claude, unit_lookup.ClaudeUnknown):
                         if key in state:
                             retained[key] = state[key]
                         lines.append(f"watchdog: {unit}: {claude.reason}")
                         continue
-                    outage = state.get(key)
                     if outage is None:
                         if source.blocked or _held(source, dry_run=dry_run):
                             continue
