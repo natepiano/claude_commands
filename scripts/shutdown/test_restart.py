@@ -4005,6 +4005,28 @@ class RestartTests(ShutdownTestCase):
                     self.assertEqual(pushes, [])
         self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
 
+    def test_failed_move_into_an_untrusted_folder_pushes_the_trust_step_not_a_move_retry(self) -> None:
+        command = "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 claude"
+        reason = f"/home/natepiano/worktrees/organon: Claude has not trusted this folder. Run: {command}"
+        saved = entry(top_level("mover"), state=record.SessionRestartFailed(
+            kind="restart failed", at=STOPPED, reason=reason, trust_command=command))
+        saved["target"], saved["source_label"] = "claude3", LABEL
+        self.create([saved])
+        result = restart.MachineRestartResult("natedev", LABEL, "partial", failed=1,
+            failed_sessions=(restart.FailedSessionRestart("mover", reason, command),))
+        with (patch.object(restart, "named_claude_account", return_value=self.account),
+              patch.object(restart, "_up", return_value=result),
+              patch.object(settle, "local_machine", return_value="natedev"),
+              patch.object(settle, "alert_user") as alert,
+              redirect_stdout(io.StringIO())):
+            _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
+                                alerts=restart.AlertWhenNotBack(), only=["mover"], here=True)
+        push, = [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
+        self.assertEqual(push.id, "shutdown.restart_untrusted")
+        # The record lives under the source account; restarting it resumes the move on its target.
+        self.assertEqual((push.values["account"], push.values["command"]), ('"claude2"', command))
+        self.assertEqual(self.stored_record().get("restore_alerted"), settle.not_back_text(self.stored_record()))
+
     def test_untrusted_failure_reports_its_trust_command_to_the_other_machine(self) -> None:
         command = "cd /tmp/organon && claude"
         result = restart.MachineRestartResult("Mac", LABEL, "partial", failed=2, failed_sessions=(

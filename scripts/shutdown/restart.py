@@ -3240,9 +3240,11 @@ def restart(
                 peer_requires_retry = peer["outcome"] == "partial" and not (peer["lines"] and all(
                     re.match(r"[^:]+: (timer .+ not started:|manual restart |.+? needs folder trust: |[0-9]+ restarted|restarted [0-9]+|already running; skipped$)", line)
                     for line in peer["lines"]))
+                # A move into a folder no account trusts gets the trust push: a move retry fails the same way.
+                # Its retry is this account's restart, which resumes the move on its target.
                 moved = {saved["session"]["name"]: saved for saved in session_records(selected.login)
                          if saved.get("target") and saved["machine"] == local.machine
-                         and saved["session"]["name"] in {item.name for item in failed}}
+                         and saved["session"]["name"] in {item.name for item in failed if not item.trust_command}}
                 for saved in moved.values():
                     settle.alert_user(move_failed_push(saved))
                 retried = [item for item in retried if item.name not in moved]
@@ -3250,8 +3252,7 @@ def restart(
                     for push in restart_push(selected.label, retried, machine=" and ".join(machines)):
                         settle.alert_user(push)
                 for machine, item in untrusted:
-                    if item.name not in moved:
-                        settle.alert_user(untrusted_push(selected.label, item, machine=machine))
+                    settle.alert_user(untrusted_push(selected.label, item, machine=machine))
                 for item in manual:
                     settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
                 _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})
