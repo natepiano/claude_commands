@@ -1136,9 +1136,10 @@ class CarriedVerdict:
 
 @dataclass(frozen=True)
 class CheckpointRestamps:
-    """The ticket's latest judgments as read before the write lock, and the verdicts they carry to the checkpoint."""
+    """The ticket's latest judgments and the removed rows on their cells as read before the write lock, and the verdicts they carry."""
 
     latest: tuple[TicketJudgment, ...]
+    removals: frozenset[tuple[int, str, str, str, str]]
     carried: tuple[CarriedVerdict, ...]
 
 
@@ -1263,6 +1264,10 @@ class RemovedCell(TypedDict):
     path: str
     commit: str
     state: str
+
+
+def removed_cell(ticket_id: str, rule: str, path: str, commit: str) -> RemovedCell:
+    return RemovedCell(rule=rule, path=path, commit=commit, state=f"removed by ticket {ticket_id} at {commit[:7]}")
 
 
 def removed_line(removed: RemovedCell) -> str:
@@ -2060,8 +2065,7 @@ class Ledger:
             "widened": tuple(WidenedPath(path=path, reason=reason, widened_by=by, widened_at=at)
                              for path, reason, by, at in widened),
             "yielded": tuple(YieldedPath(path=path, yielded_at=at) for path, at in yielded),
-            "removed": tuple(RemovedCell(rule=rule, path=path, commit=commit, state=f"removed by ticket {ticket_id} at {commit[:7]}")
-                             for rule, path, commit in removed),
+            "removed": tuple(removed_cell(ticket_id, rule, path, commit) for rule, path, commit in removed),
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
@@ -2511,8 +2515,11 @@ class Ledger:
                 current = self._ticket(id)
                 if arrived(current):
                     return ()
+                # A removal recorded since the read moves the boundary that decides which verdicts carry.
                 if (current != ticket or (building and self.filed_build_findings(id) != findings)
-                        or (isinstance(restamps, CheckpointRestamps) and self.latest_ticket_judgments(id) != restamps.latest)):
+                        or (isinstance(restamps, CheckpointRestamps)
+                            and (self.latest_ticket_judgments(id) != restamps.latest
+                                 or self._removals(restamps.latest) != restamps.removals))):
                     raise ChangedBeforeLock(f"{id}: the ticket changed while it became {target}; rerun")
                 if isinstance(restamps, CheckpointRestamps):
                     for verdict in restamps.carried:
@@ -2601,6 +2608,7 @@ class Ledger:
         if not ticket["base"] or not self._is_ancestor(ticket["base"], checkpoint):
             return NoRestamps()
         latest = self.latest_ticket_judgments(ticket["id"])
+        removals = self._removals(latest)
         self._catalog = rule_catalog.load_rules(self.repo)
         tip = self._tip(checkpoint)
         # Commits inherited at the start or merged from another branch are not ours.
@@ -2632,7 +2640,17 @@ class Ledger:
             except LedgerError:
                 continue
             carried.append(CarriedVerdict(judgment.judgment_id, scope, fingerprint))
-        return CheckpointRestamps(latest, tuple(carried))
+        return CheckpointRestamps(latest, removals, tuple(carried))
+
+    def _removals(self, judgments: tuple[TicketJudgment, ...]) -> frozenset[tuple[int, str, str, str, str]]:
+        """The removed rows of any ticket on the cells of these judgments, as (id, ticket, rule, path, commit).
+
+        A yield deletes rows and SQLite can give a deleted id to the next row, so the id alone does not name a removal.
+        """
+        cells = {(judgment.rule, judgment.path) for judgment in judgments}
+        rows = cast(list[tuple[int, str, str, str, str]], self._connection.execute(
+            'SELECT id,ticket,rule,path,"commit" FROM judgments WHERE verdict=\'removed\'').fetchall())
+        return frozenset(row for row in rows if (row[2], row[3]) in cells)
 
     def ticket_merge(self, id: str) -> tuple[FindingNotBuilt, ...]:
         """Mark the ticket merged. A proposal finding becomes built only when its change is in the checkpoint.
@@ -4930,17 +4948,15 @@ class Ledger:
         input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE,
         reads: Iterable[str] | NoReadFiles = NO_READ_FILES,
     ) -> None:
+        if verdict == "removed":
+            _ = self.record_removed(rule, path, commit, rule_blob, detail, ticket, worker, input_scope=input_scope, reads=reads)
+            return
         if input_scope == DeclaredInputScope.FILE and verdict not in SCOPED_VERDICTS:
             raise LedgerError(f"{verdict}: file input scope requires clean, exception or held")
         self._catalog = rule_catalog.load_rules(self.repo)
         definition = self._component_rule(rule)
         rule_blob = self._check_pin(ticket, rule, rule_blob)
         path = self._path(path)
-        if verdict == "removed":
-            if not isinstance(reads, NoReadFiles):
-                raise LedgerError(f"{verdict}: --reads requires clean, exception or held")
-            self._record_removed(rule, definition, path, commit, rule_blob, detail, ticket, worker)
-            return
         if ticket and self._connection.execute("SELECT 1 FROM tickets WHERE id=?", (ticket,)).fetchone():
             owned = self._ticket(ticket)["cells"]
             if owned and [rule, path] not in owned:
@@ -4999,17 +5015,30 @@ class Ledger:
                  json.dumps(read_files.paths if isinstance(read_files, ReadFiles) else None)),
             )
 
-    def _record_removed(self, rule: str, definition: Rule, path: str, commit: str, rule_blob: str, detail: str,
-                        ticket_id: str, worker: str) -> None:
+    def record_removed(
+        self, rule: str, path: str, commit: str, rule_blob: str, detail: str, ticket_id: str, worker: str, *,
+        input_scope: DeclaredInputScope | UndeclaredInputScope = UNDECLARED_INPUT_SCOPE,
+        reads: Iterable[str] | NoReadFiles = NO_READ_FILES,
+    ) -> RemovedCell:
         """Close a ticket cell whose file the ticket's own commits deleted; the row keeps the commit that deleted it.
 
         Own commits are the first-parent commits from the ticket's start to commit, as `checkpoint_restamps` reads them.
-        The deleting commit is the newest own commit whose diff against its first parent deletes the path; a merge that
-        only brings in other work is not it. It refuses a ticket the ledger does not hold, a cell outside the ticket, a
-        ticket with no start, a commit not under the start, a path that is not a file at the start (a crate folder
-        included), a path still in the tree at commit, a path that any other commit changed, and a path that no own commit
-        deletes. The git reads run before the write lock; under it, a yield of the path refuses as in record.
+        The deleting commit is the newest first-parent commit whose diff against its first parent deletes the path, and it
+        must be an own commit that is not a merge: a merge that only brings in other work deletes nothing in that diff,
+        and a delete that a merge brings in is not the ticket's. Commits of other work that changed the file before the
+        delete do not matter. It refuses a ticket the ledger does not hold, a cell outside the ticket, a ticket with no
+        start, a commit not under the start, a path that is not a file at the start (a crate folder included), a path
+        still in the tree at commit, and a path whose newest delete is a merge or is not there. The git reads run before
+        the write lock; under it, a yield of the path refuses as in record.
         """
+        if input_scope == DeclaredInputScope.FILE:
+            raise LedgerError("removed: file input scope requires clean, exception or held")
+        if not isinstance(reads, NoReadFiles):
+            raise LedgerError("removed: --reads requires clean, exception or held")
+        self._catalog = rule_catalog.load_rules(self.repo)
+        definition = self._component_rule(rule)
+        rule_blob = self._check_pin(ticket_id, rule, rule_blob)
+        path = self._path(path)
         ticket = self._ticket(ticket_id)
         if (rule, path) not in self._ticket_cells(ticket):
             raise LedgerError(f"{ticket_id}: {rule} {path} is outside ticket cells")
@@ -5023,17 +5052,15 @@ class Ledger:
             raise LedgerError(f"{path}: not a file at the ticket's start {base[:7]}")
         if not isinstance(self._file_at(commit, path), MissingFile):
             raise LedgerError(f"{path}: still in the tree at {commit[:7]}")
-        own_commits = set(_git(self.repo, "rev-list", "--first-parent", commit, "^" + base).splitlines())
-        changed_commits = set(_git(self.repo, "rev-list", "--full-history", commit, "^" + base, "--", path).splitlines())
-        outside = changed_commits - own_commits
-        if outside:
-            raise LedgerError(f"{path}: changed by commits that are not {ticket_id}'s own: "
-                              + ", ".join(sorted(outside_commit[:7] for outside_commit in outside)))
+        # The newest first-parent delete, then its parents: more than one parent is a merge.
         removing = _git(self.repo, "log", "--first-parent", "--diff-merges=first-parent", "--diff-filter=D", "--no-renames",
-                        "--no-patch", "--format=%H", "-n", "1", commit, "^" + base, "--", path)
+                        "--no-patch", "--format=%H %P", "-n", "1", commit, "^" + base, "--", path).split()
         if not removing:
             raise LedgerError(f"{path}: no commit of {ticket_id}'s own deletes it")
-        scope = _cell_scope(definition, path, self._tip(removing))
+        deleting = removing[0]
+        if len(removing) > 2:
+            raise LedgerError(f"{path}: merge {deleting[:7]} deletes it, not a commit of {ticket_id}'s own")
+        scope = _cell_scope(definition, path, self._tip(deleting))
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
             if self._connection.execute("SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket_id, path)).fetchone():
@@ -5043,9 +5070,10 @@ class Ledger:
                 + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
                 + "DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at",
                 # A removed row has no inputs, so its fingerprint is empty and no tip matches it.
-                (rule, rule_blob, scope, "", path, removing, "removed", detail, ticket_id, worker,
+                (rule, rule_blob, scope, "", path, deleting, "removed", detail, ticket_id, worker,
                  datetime.now(timezone.utc).isoformat(), DeclaredInputScope.RULE, json.dumps(None)),
             )
+        return removed_cell(ticket_id, rule, path, deleting)
 
     def latest_held_judgments(self) -> dict[tuple[str, str], str]:
         """Return judgment commits for cells whose latest verdict is held."""
@@ -5612,6 +5640,9 @@ def main() -> None:
                 print(f"moved {renamed.tickets} tickets and {renamed.waits} sync waits")
             elif args.command == "set-tip":
                 ledger.set_tip(args.tip, args.style_branch)
+            elif args.command == "record" and args.verdict == "removed":
+                print(removed_line(ledger.record_removed(args.rule, args.path, args.commit, args.rule_blob, args.detail, args.ticket,
+                                                         args.worker, input_scope=args.input_scope, reads=args.reads)))
             elif args.command == "record":
                 ledger.record(args.rule, args.path, args.commit, args.rule_blob, args.verdict, args.detail, args.ticket, args.worker,
                               input_scope=args.input_scope, reads=args.reads)
