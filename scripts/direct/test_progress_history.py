@@ -4417,7 +4417,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         self.assertEqual(header.splitlines()[0], "**bevy_hana_rubric**")
 
-    def report_eta_chain(self, name: str, *, untimed_gate: bool = False) -> tuple[Path, str]:
+    def report_eta_chain(self, name: str, *, untimed_gate: bool = False, ranged: bool = True) -> tuple[Path, str]:
         def at(hour: int, minute: int) -> int:
             return int(datetime(2026, 10, 16, hour, minute, tzinfo=UTC).timestamp())
 
@@ -4465,7 +4465,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         )
         _ = self.run_command(
             "eta", "--session-dir", str(session_dir), "--time", "18:30",
-            "--earliest", "18:20", "--latest", "18:50", "--basis", "stated",
+            *(("--earliest", "18:20", "--latest", "18:50") if ranged else ()), "--basis", "stated",
             at=at(17, 40),
         )
         report = self.run_command(
@@ -4744,6 +4744,18 @@ print('two homes isolated; recorder lock retained; caller restored')
             record = phase_table.build(session_dir)
         assert isinstance(record.plan_finish, phase_table.PredictedFinish)
         self.assertEqual(record.plan_finish.at, datetime(2026, 10, 16, 18, 54, tzinfo=UTC))
+
+    def test_project_eta_takes_the_phase_rows_band_when_the_stated_eta_has_no_range(self) -> None:
+        _, report = self.report_eta_chain("project-unranged", ranged=False)
+        rows = {line.split("|")[1].strip(): [cell.strip() for cell in line.strip("|").split("|")]
+                for line in report.splitlines() if line.startswith(("| Project", "| Phase"))}
+        project, phase = rows["Project"], rows["Phase 5"]
+
+        def swing(cell: str) -> str:
+            return cell.rsplit(" ", 1)[1]
+        self.assertNotIn("—", project[-2:])
+        self.assertEqual([swing(cell) for cell in project[-2:]], [swing(cell) for cell in phase[-2:]])
+        self.assertEqual(project[3], "today 18:54")
 
     def test_project_eta_names_an_untimed_gate_and_has_no_band(self) -> None:
         _, report = self.report_eta_chain("project-gated", untimed_gate=True)

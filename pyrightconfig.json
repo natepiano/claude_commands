@@ -78,6 +78,7 @@
       "extraPaths": [
         ".",
         "scripts/style",
+        "scripts/herdr",
         "scripts/production",
         "scripts/lib"
       ]
@@ -237,6 +238,10 @@
         "scripts/production",
         "scripts/lib"
       ]
+    },
+    {
+      "root": "scripts/issue_score",
+      "extraPaths": [".", "scripts/issue_score"]
     },
     {
       "root": "."

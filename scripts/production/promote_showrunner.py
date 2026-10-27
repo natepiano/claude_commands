@@ -4,8 +4,8 @@
 Usage: promote_showrunner.py <unit> --production <child production doc> --model <id> --effort <level> [--check]
 
 The parent showrunner runs it, once the unit has written the child's production doc and committed it.
-The unit gets `/exit`; once its Claude is gone its host session is ended, and add_showrunner.py resumes
-the same conversation as the child's showrunner: in its own herdr session, with no unit mark, on the configured showrunners account,
+The unit gets `/exit`; once its Claude is gone its herdr tab is closed, and add_showrunner.py resumes
+the same conversation as the child's showrunner: in a tab of the shared herdr session, with no unit mark, on the configured showrunners account,
 attached to this showrunner's production. The unit's Units row is then retired and committed in this
 showrunner's checkout, also when the session opened but its opening prompt is not proven to have run.
 --check runs every refusal and stops nothing.
@@ -267,7 +267,7 @@ def finish(promotion: Promotion, started: int, moved: str) -> int:
         retired, row = False, f"its Units row was not retired and is owed: {error}"
     if started == add_showrunner.SESSION_NOT_READY:
         print(f"{unit} is open as the session {slug}, but its showrunner prompt is not proven to have run; {row}. "
-              + f"Look at it with `herdr session attach {slug}`; unless it runs the production, type: "
+              + f"Look at it with `{herdr.attach_hint(showrunners.herdr_space(slug, str(promotion.child.doc)), slug)}`; unless it runs the production, type: "
               + f"/showrunner:produce {promotion.child.doc} resume")
         return 1
     if not retired:

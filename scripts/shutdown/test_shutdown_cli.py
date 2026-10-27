@@ -148,6 +148,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state = self.root / "shutdown"
+        # Fixture folders do not exist; a restore whose folder is gone is dropped before launch.
+        _ = self.enterContext(patch.object(restart_work, "_folder_exists", return_value=True))
         self.home = self.root / "home"
         self.home.mkdir()
         (self.home / ".claude").mkdir()
@@ -1959,6 +1961,8 @@ class OnlySessionCliTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state")})))
+        # Fixture folders do not exist; a restore whose folder is gone is dropped before launch.
+        _ = self.enterContext(patch.object(restart_work, "_folder_exists", return_value=True))
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         self.owners = []
         for identity, name in (("alpha-id", "Alpha"), ("beta-id", "Beta"), ("gamma-id", "Gamma")):

@@ -281,6 +281,8 @@ class SettleTests(ShutdownTestCase):
         _ = self.enterContext(patch.object(settle, "now_utc", return_value=NOW_UTC))
         _ = self.enterContext(patch.object(settle, "merge_in_progress", return_value=False))
         _ = self.enterContext(patch.object(settle, "_showing_form", return_value=False))
+        # Fixture folders do not exist; a restore whose folder is gone is dropped before launch.
+        _ = self.enterContext(patch.object(restart_work, "_folder_exists", return_value=True))
 
     def save(self, saved: record.SessionShutdown) -> None:
         self.assertTrue(record.create_session(saved))
@@ -3366,11 +3368,15 @@ class SettleTests(ShutdownTestCase):
                     settle.report_stop([saved])
                 push = cast(RenderedPush, alert.call_args.args[0])
                 self.assertEqual(push.id, "shutdown.stop_failed" if progress["kind"] == "stop failed" else "shutdown.restart_failed")
-                self.assertEqual(push.values, {"account": '"claude2"', "machine": "natedev",
-                    "stopped": "One session" if progress["kind"] == "stop failed" else "One session (Owner)"})
                 assert progress["kind"] == "stop failed" or progress["kind"] == "restart failed"
+                if progress["kind"] == "stop failed":
+                    self.assertEqual(push.values, {"account": '"claude2"', "machine": "natedev", "stopped": "One session"})
+                    self.assertNotIn(progress["reason"], push.body)
+                else:
+                    self.assertEqual(push.values, {"account": '"claude2"', "machine": "natedev",
+                        "stopped": "One session (Owner)", "cause": progress["reason"]})
+                    self.assertIn(f"The restart gave this error: {progress['reason']}", push.body)
                 self.assertIn(progress["reason"], cast(str, sender.call_args.args[2]))
-                self.assertNotIn(progress["reason"], push.body)
                 self.assertIsInstance(push.action, ActionRequired)
                 self.assertNotIn("status", cast(ActionRequired, push.action).text)
 
@@ -3393,6 +3399,34 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual((push.values["session"], push.values["target"]), ("ups", "claude3"))
         self.assertNotIn("restart", cast(ActionRequired, push.action).text)
 
+    def test_failed_move_into_an_untrusted_folder_pushes_the_move_trust_step_not_a_move_retry(self) -> None:
+        command = "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 claude"
+        saved = session_shutdown(top_level("ups-id", "ups"), then="restart",
+            progress={"kind": "restart failed", "at": NOW, "trust_command": command,
+                      "reason": f"/home/natepiano/worktrees/organon: Claude has not trusted this folder. Run: {command}"})
+        saved["target"], saved["source_label"] = "claude3", saved["label"]
+        self.save(saved)
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(restart_work, "_target_config_dir",
+                           return_value=restart_work.RecordedConfigDir(self.root / ".claude3")),
+              patch.object(settle, "run_remote", return_value=(0, "[]")),
+              patch.object(settle, "send_message"),
+              patch.object(settle, "alert_user") as alert,
+              redirect_stdout(io.StringIO())):
+            settle.report_stop([saved])
+        alert.assert_called_once()
+        push = cast(RenderedPush, alert.call_args.args[0])
+        self.assertEqual(push.id, "shutdown.move_untrusted")
+        self.assertEqual(push.values["target"], "claude3")
+        self.assertIn("/shutdown restart \"claude2\" in the natedev session. That finishes the move to claude3.",
+                      cast(ActionRequired, push.action).text)
+        # The record lives under the source account; restarting it resumes the move on its target.
+        self.assertEqual((push.values["session"], push.values["account"], push.values["command"]),
+                         ("ups", '"claude2"', command))
+        current = record.find_session(LOGIN, "ups-id")
+        assert current is not None
+        self.assertEqual(current.get("restore_alerted"), settle.not_back_text(current))
+
     def test_automatic_restart_with_an_unsent_prompt_pushes_the_failed_session_name(self) -> None:
         saved = session_shutdown(top_level("unsent-owner", "Unsent owner"), then="restart",
             progress={"kind": "restart failed", "at": NOW, "reason": "restart prompt not submitted"})
@@ -3412,6 +3446,38 @@ class SettleTests(ShutdownTestCase):
         current = record.find_session(LOGIN, "unsent-owner")
         assert current is not None
         self.assertEqual(current["progress"], saved["progress"])
+
+    def test_untrusted_folder_restart_pushes_the_trust_step_and_never_a_retry(self) -> None:
+        command = "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude2 claude"
+        untrusted = session_shutdown(top_level("untrusted-owner", "Untrusted owner"), then="restart",
+            progress={"kind": "restart failed", "at": NOW, "trust_command": command,
+                      "reason": f"/home/natepiano/worktrees/organon: Claude has not trusted this folder. Run: {command}"})
+        broken = session_shutdown(top_level("broken-owner", "Broken owner"), then="restart",
+            progress={"kind": "restart failed", "at": NOW, "reason": "window failed to open"})
+        records = [untrusted, broken]
+        for saved in records:
+            self.save(saved)
+        for attempt in ("first", "unchanged"):
+            with (self.subTest(attempt=attempt),
+                  patch.object(sessions, "live_sessions", return_value=[]),
+                  patch.object(settle, "run_remote", return_value=(0, "[]")),
+                  patch.object(settle, "send_message"),
+                  patch.object(settle, "alert_user") as alert,
+                  redirect_stdout(io.StringIO())):
+                settle.report_stop([current for saved in records
+                                    if (current := record.find_session(LOGIN, saved["session"]["session_id"]))])
+            pushes = {cast(RenderedPush, call.args[0]).id: cast(RenderedPush, call.args[0]) for call in alert.call_args_list}
+            if attempt == "unchanged":
+                self.assertEqual(pushes, {})
+                continue
+            self.assertEqual(set(pushes), {"shutdown.restart_untrusted", "shutdown.restart_failed"})
+            trust = pushes["shutdown.restart_untrusted"]
+            self.assertEqual(trust.values, {"session": "Untrusted owner", "machine": "natedev",
+                                            "account": '"claude2"', "command": command})
+            retry = pushes["shutdown.restart_failed"]
+            self.assertEqual((retry.values["stopped"], retry.values["cause"]),
+                             ("One session (Broken owner)", "window failed to open"))
+            self.assertNotIn("Untrusted owner", retry.message)
 
     def test_stop_report_observes_failed_restart_liveness_once_before_commands_and_pushes(self) -> None:
         cases = (
@@ -3465,7 +3531,9 @@ class SettleTests(ShutdownTestCase):
                     if isinstance(observed, restart_work.SessionLivenessUnknown):
                         self.assertIn(f"{command}; liveness unknown: {observed.reason}", text)
                     alert.assert_called_once()
-                    pushes.assert_called_once_with(LABEL, ["Slow owner"], machine="natedev")
+                    pushes.assert_called_once_with(
+                        LABEL, [restart_work.FailedSessionRestart("Slow owner", "restart prompt not submitted")],
+                        machine="natedev")
                     mark.assert_called_once_with(failed)
                     self.assertEqual(current.get("restore_alerted"), settle.not_back_text(failed))
 

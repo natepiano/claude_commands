@@ -730,18 +730,28 @@
       "time": "2026-10-22T08:41:13.031634-04:00"
     }
   },
-  "shutdown.restart_failed": {
-    "one_long_name": {
-      "objections": [],
-      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 65 Spec 4: example key renamed, text unchanged (showrunner add-on, 2026-10-17); reviewer: opus",
-      "sha256": "18e1f2b816796ea65e2488c2166f6ff89dc8e4113c30408ef7c3853b6788b3c6",
-      "time": "2026-10-17T21:43:37.983637-04:00"
+  "shutdown.move_untrusted": {
+    "mac": {
+      "reviewer": "opus",
+      "sha256": "2e17d7c3028fdd3491f34b3599cd2af20308e3ca5c7c9170fc6cee6c11086ff6",
+      "time": "2026-10-26T20:42:16.674086-04:00"
     },
     "typical": {
-      "objections": [],
-      "reviewer": "user-spec: docs/plans/build-followups-two-accounts.md Phase 65 Spec 4: example key renamed, text unchanged (showrunner add-on, 2026-10-17); reviewer: opus",
-      "sha256": "18e1f2b816796ea65e2488c2166f6ff89dc8e4113c30408ef7c3853b6788b3c6",
-      "time": "2026-10-17T21:43:29.144586-04:00"
+      "reviewer": "opus",
+      "sha256": "2e17d7c3028fdd3491f34b3599cd2af20308e3ca5c7c9170fc6cee6c11086ff6",
+      "time": "2026-10-26T20:42:04.292331-04:00"
+    }
+  },
+  "shutdown.restart_failed": {
+    "one_long_name": {
+      "reviewer": "opus",
+      "sha256": "1c5bdd7ba6330bd03c3c3abaecea9c104a6fa2effc0a6ad652bcda66b8e22ddf",
+      "time": "2026-10-26T20:03:23.034661-04:00"
+    },
+    "typical": {
+      "reviewer": "opus",
+      "sha256": "1c5bdd7ba6330bd03c3c3abaecea9c104a6fa2effc0a6ad652bcda66b8e22ddf",
+      "time": "2026-10-26T20:03:15.200466-04:00"
     }
   },
   "shutdown.restart_incomplete": {
@@ -754,6 +764,18 @@
       "reviewer": "opus",
       "sha256": "f5e0e31c30d4008c005131d88f87330e7b85b24a28214e26a81c6dc89cfdfc46",
       "time": "2026-10-14T17:15:20.109165-04:00"
+    }
+  },
+  "shutdown.restart_untrusted": {
+    "long_folder": {
+      "reviewer": "opus",
+      "sha256": "3b93542505b329db050aa3ae4e95cf4561d4ebf613678c8ddcc91cd5277be6eb",
+      "time": "2026-10-26T20:04:34.245746-04:00"
+    },
+    "typical": {
+      "reviewer": "opus",
+      "sha256": "3b93542505b329db050aa3ae4e95cf4561d4ebf613678c8ddcc91cd5277be6eb",
+      "time": "2026-10-26T20:04:20.684453-04:00"
     }
   },
   "shutdown.stop_failed": {
