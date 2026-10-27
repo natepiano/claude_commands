@@ -34,6 +34,19 @@ import declarations
 
 
 PARENT_FILE = "crates/alpha/src/a.rs"
+# A cargo-berth that logs each call and keeps lifecycles in a file; a release checkpoints the cwd's HEAD.
+RELEASE_BERTH = r'''#!__PYTHON__
+import json, os, subprocess, sys
+with open(os.environ["LEDGER_BERTH_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\n")
+path = os.environ["LEDGER_BOARD"]
+board = json.load(open(path)) if os.path.exists(path) else {}
+if sys.argv[1] == "release":
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    board[sys.argv[2]] = {"status": "outstanding", "protected_tip": head}
+    json.dump(board, open(path, "w"))
+print(json.dumps({"payload": {"data": {"lifecycle": board.get(sys.argv[-2], {"status": "active"})}}}))
+'''
 MOVED_FILE = "crates/alpha/src/b.rs"
 TWIN_FILE = "crates/alpha/src/c.rs"
 PARENT = "pub struct Parent {\n    old: u32,\n}\n"
@@ -801,6 +814,8 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waive_provenance")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waived_by")
             _ = connection.execute("DROP TABLE ticket_widened_paths")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
             _ = connection.execute("UPDATE schema_version SET version=18")
         migrated = self.ledger()
         finding, = migrated.named_held((finding_id,))
@@ -1436,7 +1451,7 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual(finding.state, style_ledger.Filed(issue))
             self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn")), ())
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT withdrawn_by FROM held_findings").fetchone(), (0,))
 
     def test_person_read_migration_fourteen_keeps_version_thirteen_findings_not_read_by_a_person(self) -> None:
@@ -1457,7 +1472,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.reading), (style_ledger.Built(issue), style_ledger.NotReadByPerson()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT person_read_by FROM held_findings").fetchone(), ("",))
 
     def test_an_unfiled_finding_withdrawn_by_a_newer_judgment_reads_and_lists_as_judged_again(self) -> None:
@@ -1492,7 +1507,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual(finding.state, style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT withdrawn_by,duplicate_of FROM held_findings").fetchone(), (7, ""))
 
     def test_unwaive_migration_sixteen_keeps_version_fifteen_waived_findings_not_unwaived(self) -> None:
@@ -1513,7 +1528,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.waive_undo), (style_ledger.Waived(), style_ledger.NoWaiveUndo()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT unwaived_by FROM held_findings").fetchone(), ("",))
 
     def test_follow_migration_seventeen_keeps_version_sixteen_findings_not_followed(self) -> None:
@@ -1535,7 +1550,7 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual((finding.state, finding.follow),
                              (style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)), style_ledger.NotFollowed()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT followed_from,followed_from_line,followed_at,declaration_gone_at "
                                                 + "FROM held_findings").fetchone(), ("", 0, "", ""))
 
@@ -4258,7 +4273,7 @@ class StyleLedgerTests(unittest.TestCase):
             connection.commit()
         with style_ledger.Ledger(self.repo, database) as ledger:
             with closing(sqlite3.connect(database)) as connection:
-                self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (21,))
+                self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             ledger.set_tip(self.initial_tip)
             self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[self.sources[0]], "current")
             self.write(self.sources[1], "pub fn changed() {}\n")
@@ -4286,7 +4301,7 @@ class StyleLedgerTests(unittest.TestCase):
                 rows = cast(list[tuple[str, str, str]], connection.execute(
                     "SELECT path,declared_scope,verdict_detail FROM judgments ORDER BY id").fetchall())
                 version = cast(tuple[int], connection.execute("SELECT version FROM schema_version").fetchone())
-            self.assertEqual(version, (21,))
+            self.assertEqual(version, (max(style_ledger.MIGRATIONS),))
             self.assertEqual(rows, [(path, "rule", "original detail") for path in self.sources[:2]])
             self.write(self.sources[1], "pub fn sibling_changed() {}\n")
             ledger.set_tip(self.commit("Change sibling after migration"))
@@ -4647,6 +4662,8 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
             _ = connection.execute("DROP TABLE ticket_widened_paths")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
@@ -5195,7 +5212,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(21,)])
+        self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -6218,6 +6235,133 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.cli("ticket", "merge", "--id", "modules-unit-1")
         self.assertEqual(ledger.ticket_open("modules-unit"), ())
 
+    def held_reservation(self, ticket: str) -> Path:
+        """A unit run folder whose phase 7 checkpoint kept reservation r1 for the ticket's merge, and a cargo-berth on PATH."""
+        binary = self.root / "bin"
+        binary.mkdir()
+        berth = binary / "cargo-berth"
+        _ = berth.write_text(RELEASE_BERTH.replace("__PYTHON__", sys.executable))
+        berth.chmod(0o755)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
+            "LEDGER_BERTH_LOG": str(self.root / "berth.log"), "LEDGER_BOARD": str(self.root / "board.json")})))
+        session = self.root / "unit run"
+        (session / "phases/7").mkdir(parents=True)
+        _ = (session / "phases/7/delegated_phase_reservation_state.json").write_text(json.dumps({
+            "kind": "checkpoint_committed_awaiting_release_confirmation",
+            "checkpoint_release_confirmation_pending": {
+                "reservation_id": "r1", "coordination_run_id": "c1", "phase": "7", "phase_start_head": self.initial_tip,
+                "checkpoint_commit": self.initial_tip, "held_for_ticket": ticket, "worktree": str(self.repo)}}))
+        return session
+
+    def berth_calls(self) -> list[list[str]]:
+        log = self.root / "berth.log"
+        return [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def assigned_structure_ticket(self, ticket: str) -> None:
+        rule = self.rule(f"structure-{ticket}", "tier: D\nfamily: modules\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add(ticket, "modules-unit", "structure", "modules", "crates/alpha", [], [rule])
+        ledger.ticket_assign(ticket, "main")
+        self.record(rule, "crates/alpha", self.initial_tip, "waived", detail="accepted", ticket=ticket)
+
+    def checkpointed_structure_ticket(self, ticket: str, *reservation: str) -> None:
+        self.assigned_structure_ticket(ticket)
+        _ = self.cli("ticket", "checkpoint", "--id", ticket, "--commit", "HEAD", *reservation)
+
+    def ticket_row(self, ticket: str) -> tuple[str, str, str]:
+        with closing(sqlite3.connect(style_ledger.ledger_location(self.repo).database)) as connection:
+            return cast(tuple[str, str, str], connection.execute(
+                "SELECT state,reservation_session_dir,reservation_phase FROM tickets WHERE id=?", (ticket,)).fetchone())
+
+    def test_a_style_checkpoint_keeps_its_reservation_until_ticket_merge_releases_it(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        half = self.cli("ticket", "checkpoint", "--id", "modules-unit-1", "--commit", "HEAD", "--session-dir", str(session),
+                        success=False)
+        self.assertEqual(half.returncode, 2)
+        self.assertIn("ticket checkpoint takes --session-dir and --phase together", half.stderr)
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout,
+                         "ticket modules-unit-1: phase 7: released reservation r1\n")
+        self.assertIn(["release", "r1", "--json"], self.berth_calls())
+        self.assertFalse((session / "phases/7/delegated_phase_reservation_state.json").exists())
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", "", ""))
+        calls = self.berth_calls()
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout, "")
+        self.assertEqual(self.berth_calls(), calls)
+
+    def test_a_checkpoint_stores_its_reservation_in_the_same_write_as_its_state(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.assigned_structure_ticket("modules-unit-1")
+        with closing(sqlite3.connect(style_ledger.ledger_location(self.repo).database)) as connection:
+            _ = connection.execute("CREATE TRIGGER lost_reservation BEFORE UPDATE OF reservation_session_dir ON tickets "
+                                   + "BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+            connection.commit()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "disk full"):
+            self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "7")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("assigned", "", ""))
+        with closing(sqlite3.connect(style_ledger.ledger_location(self.repo).database)) as connection:
+            _ = connection.execute("DROP TRIGGER lost_reservation")
+            connection.commit()
+        self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "7")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+
+    def test_a_repeat_checkpoint_stores_a_missing_reservation_and_refuses_another(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1")
+        self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "7")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"checkpointed holding the reservation of phase 7 in {re.escape(str(session))}"):
+            self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "8")
+        self.ledger().ticket_checkpoint("modules-unit-1", "HEAD")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+
+    def test_a_checkpoint_that_names_no_reservation_record_merges_as_before(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        state = (session / "phases/7/delegated_phase_reservation_state.json").read_bytes()
+        self.checkpointed_structure_ticket("modules-unit-1")
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout, "")
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual((session / "phases/7/delegated_phase_reservation_state.json").read_bytes(), state)
+
+    def test_a_reservation_ticket_merge_cannot_release_stays_held_until_a_rerun(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        self.write("README.md", "moved on\n")
+        moved = self.commit("Move the unit worktree off its checkpoint")
+        refused = self.cli("ticket", "merge", "--id", "modules-unit-1", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn(f"style_ledger: ticket modules-unit-1: phase_reservation: {self.repo} is at {moved[:7]}, not checkpoint "
+                      + f"{self.initial_tip[:7]}; reservation r1 stays held; rerun ticket merge", refused.stderr)
+        self.assertEqual(self.ledger().ticket_open("modules-unit"), ())
+        self.assertNotIn("release", [call[0] for call in self.berth_calls()])
+        # Only a merged ticket releases its reservation.
+        self.checkpointed_structure_ticket("modules-unit-2", "--session-dir", str(session), "--phase", "7")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "released at ticket merge, not in state checkpointed"):
+            _ = self.ledger().release_held_reservation("modules-unit-2")
+        _ = self.git("reset", "-q", "--hard", self.initial_tip)
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout,
+                         "ticket modules-unit-1: phase 7: released reservation r1\n")
+
+    def test_reconcile_retries_a_merged_ticket_reservation_until_its_release_is_confirmed(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        self.write("README.md", "moved on\n")
+        moved = self.commit("Move the unit worktree off its checkpoint")
+        changes = self.ledger().reconcile("main", "main")
+        self.assertIn("ticket modules-unit-1: checkpointed -> merged", changes)
+        self.assertIn(f"ticket modules-unit-1: phase_reservation: {self.repo} is at {moved[:7]}, not checkpoint "
+                      + f"{self.initial_tip[:7]}; reservation r1 stays held", changes)
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", str(session), "7"))
+        _ = self.git("reset", "-q", "--hard", self.initial_tip)
+        self.assertIn("ticket modules-unit-1: phase 7: released reservation r1", self.ledger().reconcile("main", "main"))
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", "", ""))
+        calls = self.berth_calls()
+        self.assertEqual(self.ledger().reconcile("main", "main"), ())
+        self.assertEqual(self.berth_calls(), calls)
+
     def test_read_checkpoint_names_only_the_missing_rule_and_file_pair(self) -> None:
         first, last = self.rule("read-first"), self.rule("read-last")
         self.set_tip(self.initial_tip)
@@ -7153,7 +7297,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(21,)])
+        self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -7581,7 +7725,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(21,)])
+        self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
         ledger = self.ledger()
@@ -7658,6 +7802,8 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN declaration_gone_at")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:

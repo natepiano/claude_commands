@@ -80,12 +80,13 @@ sends that wake to every unit waiting for sync. Refill records its wait before
 checking once more for work; delivery clears only that wait, preserving a later one.
 
 A ticket with no code changes makes no commit: record its cells at HEAD, verify
-`git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then run
-`style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD>`
-and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`. Act on
-its `not built` lines as after a showrunner's `ticket merge` (**Merging back**). Follow
-the checkpoint procedure's atomic committed-awaiting-release record using that
-ancestry-checked HEAD and release confirmation. Mark the unit's phase done,
+`git merge-base --is-ancestor HEAD refs/heads/<style merge branch>`, then write
+the checkpoint procedure's atomic committed-awaiting-release record for that
+ancestry-checked HEAD with `--ticket <ticket>`, run
+`style_ledger.py ticket checkpoint --repo <unit-worktree> --id <ticket> --commit <HEAD> --session-dir <run folder> --phase <phase>`
+and `style_ledger.py ticket merge --repo <unit-worktree> --id <ticket>`, which
+releases the held reservation. Act on
+its `not built` lines as after a showrunner's `ticket merge` (**Merging back**). Mark the unit's phase done,
 report `From <unit>: ticket <id> closed with no code change; <n> held.` and
 refill at once. If ancestry fails, leave the ticket assigned and report it.
 The gate and `ticket checkpoint` refuse any ticket with an owned cell that is neither recorded nor removed, and name each one.
@@ -315,14 +316,17 @@ remaining finding touches, rerun the gate and leave dropped cells stale.
 ## Merging back
 
 Merge each unit checkpoint into the style merge branch as soon as it arrives;
-that clears its berth protection. Use the ordinary
+the `ticket merge` after it releases its berth reservation. Use the ordinary
 `merge_checkpoint.py --production <style doc> <unit> <phase> <hash> --started …`
 with one `--also <path>` for each entry of the unit's open ticket's `files`
 (`style_ledger.py ticket open --repo <checkout> --unit <unit>`). Its Owns is
 `none — takes what the board leaves free`; paths outside that ticket stay refused.
 
+A style ticket's checkpoint does not release its berth reservation: the unit's
+reservation record holds it for the ticket, and `ticket checkpoint` keeps the
+record's run folder and phase on the ticket.
 After the merge, run `style_ledger.py ticket merge --repo <checkout> --id <ticket>`
-to wake every unit waiting for sync, and send the owning unit director
+to release that reservation and wake every unit waiting for sync, and send the owning unit director
 `From the showrunner of <style slug>: ticket <id> merged; refill.`
 For each `has no applied check` line that merge prints, check the change in the
 code, and run the printed `held built` command when the change is there. A rerun
@@ -330,6 +334,11 @@ of `ticket merge` on a merged ticket prints these lines again. A finding whose
 change is not there waits for a person, who makes the change and
 runs that command, or waives the finding with
 `style_ledger.py held waive --repo <checkout> --id <finding id> --person <name>`.
+A merge that cannot release the reservation (the unit worktree moved off the
+checkpoint, or berth did not confirm the release) exits 2 with
+`ticket <id>: ... stays held; rerun ticket merge` and keeps it held; fix the
+cause and run `ticket merge` again, or let the next `reconcile` retry it. A
+merge after the release is confirmed releases nothing more.
 The ledger accepts only a checkpoint contained by its stored style merge branch.
 Then run
 `style_sync.py send-handoff --repo <checkout> --slug <style slug> --checkpoint <style branch tip>`.

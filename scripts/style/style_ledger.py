@@ -1091,6 +1091,14 @@ class DeclarationReading:
 
 
 @dataclass(frozen=True)
+class HeldReservationRelease:
+    """What a ticket merge did with the reservation the ticket's checkpoint kept: the line to print, and whether it stays held."""
+
+    line: str
+    still_held: bool
+
+
+@dataclass(frozen=True)
 class FindingNotBuilt:
     """A merged ticket's finding that stays filed for a later ticket."""
 
@@ -1876,6 +1884,11 @@ MIGRATIONS = {
             PRIMARY KEY(ticket, path)
         );
     """,
+    # The unit run folder and phase whose reservation record the ticket's checkpoint kept for its merge to release.
+    22: """
+        ALTER TABLE tickets ADD COLUMN reservation_session_dir TEXT NOT NULL DEFAULT '';
+        ALTER TABLE tickets ADD COLUMN reservation_phase TEXT NOT NULL DEFAULT '';
+    """,
 }
 
 
@@ -2472,8 +2485,11 @@ class Ledger:
             raise CheckCouldNotRun(shown.stderr.decode(errors="replace").strip() or f"git show {commit}:{path} failed")
         return shown.stdout
 
-    def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "") -> tuple[FindingNotBuilt, ...]:
+    def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "",
+                           reservation: tuple[str, str] = ("", "")) -> tuple[FindingNotBuilt, ...]:
         """Move the ticket to target. A proposal merge returns each of its findings that stays filed.
+
+        A checkpoint stores the reservation's run folder and phase in the same write as its state.
 
         The git work runs before the write lock; if the rows it read change before the lock, the move starts again.
         """
@@ -2486,6 +2502,12 @@ class Ledger:
                     raise LedgerError(f"{id}: assigned to branch {ticket['branch']}")
                 if target == "checkpointed" and ticket["checkpoint"] != commit:
                     raise LedgerError(f"{id}: checkpointed at {ticket['checkpoint']}")
+                if target == "checkpointed" and reservation[0]:
+                    held = self._ticket_reservation(id)
+                    if held[0] and held != reservation:
+                        raise LedgerError(f"{id}: checkpointed holding the reservation of phase {held[1]} in {held[0]}")
+                    # A repeat stores the reservation an earlier checkpoint did not name.
+                    return held == reservation
                 return True
             predecessor = {"assigned": "queued", "checkpointed": "assigned", "merged": "checkpointed"}
             if (target == "dropped" and state in ("merged", "dropped")) or (target != "dropped" and predecessor.get(target) != state):
@@ -2555,6 +2577,9 @@ class Ledger:
                     (target, branch if target == "assigned" else ticket["branch"],
                      commit if target == "checkpointed" else ticket["checkpoint"], _now(), id),
                 )
+                if target == "checkpointed" and reservation[0]:
+                    _ = self._connection.execute("UPDATE tickets SET reservation_session_dir=?,reservation_phase=? WHERE id=?",
+                                                 (*reservation, id))
             return tuple(not_built)
 
         return retry_on_change(attempt)
@@ -2583,8 +2608,10 @@ class Ledger:
             _ = self._connection.execute("UPDATE tickets SET base=?,updated_at=? WHERE id=?", (base, _now(), id))
             return base
 
-    def ticket_checkpoint(self, id: str, commit: str) -> None:
-        _ = self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"))
+    def ticket_checkpoint(self, id: str, commit: str, session_dir: str = "", phase: str = "") -> None:
+        """Mark the ticket checkpointed; a unit run folder and phase name the reservation record its merge releases."""
+        _ = self._ticket_transition(id, "checkpointed", _git(self.repo, "rev-parse", "--verify", f"{commit}^{{commit}}"),
+                                    reservation=(session_dir, phase))
 
     def latest_ticket_judgments(self, ticket_id: str) -> tuple[TicketJudgment, ...]:
         rows = cast(list[tuple[int, str, str, str, Verdict, str, str]], self._connection.execute(
@@ -2669,6 +2696,37 @@ class Ledger:
         if not branch_tip or not self._is_ancestor(ticket["checkpoint"], branch_tip):
             raise LedgerError(f"{id}: checkpoint {ticket['checkpoint'][:7]} is not on {branch or 'the style branch'}")
         return self._ticket_transition(id, "merged")
+
+    def _ticket_reservation(self, id: str) -> tuple[str, str]:
+        """The run folder and phase of the reservation record the ticket's checkpoint kept."""
+        return cast(tuple[str, str], self._connection.execute(
+            "SELECT reservation_session_dir,reservation_phase FROM tickets WHERE id=?", (id,)).fetchone())
+
+    def release_held_reservation(self, id: str) -> HeldReservationRelease | None:
+        """Release the berth reservation the merged ticket's checkpoint kept; None when it keeps no record to release.
+
+        A confirmed release, or a record that holds no reservation, clears the run folder and phase, so a later
+        merge makes no berth call; a release that fails keeps them for the next merge or reconcile.
+        """
+        rows = cast(list[tuple[str, str, str]], self._connection.execute(
+            "SELECT state,reservation_session_dir,reservation_phase FROM tickets WHERE id=?", (id,)).fetchall())
+        if not rows:
+            raise LedgerError(f"unknown ticket {id}")
+        state, session_dir, phase = rows[0]
+        if not session_dir:
+            return None
+        if state != "merged":
+            raise LedgerError(f"{id}: its reservation is released at ticket merge, not in state {state}")
+        scripts = Path(__file__).resolve().parents[1]
+        result = subprocess.run([str(scripts / "lib/py"), str(scripts / "direct/phase_reservation.py"), "release-held",
+                                 "--session-dir", session_dir, "--phase", phase, "--ticket", id],
+                                capture_output=True, text=True, check=False)
+        answer = " ".join((result.stdout if result.returncode == 0 else result.stderr).split())
+        if result.returncode == 0:
+            with self._connection:
+                _ = self._connection.execute("UPDATE tickets SET reservation_session_dir='',reservation_phase='' WHERE id=?", (id,))
+        return HeldReservationRelease(f"ticket {id}: {answer or f'phase_reservation.py exited {result.returncode}'}",
+                                      result.returncode != 0)
 
     def rename_unit(self, old: str, new: str) -> UnitRenamed:
         family = rule_catalog.style_family(old)
@@ -4752,6 +4810,13 @@ class Ledger:
                     changes.append(f"ticket {id}: assigned -> dropped")
                 elif result.returncode:
                     raise LedgerError(result.stderr.decode(errors="replace").strip())
+        # A merged ticket keeps its reservation record until a release is confirmed, so a failed release is retried here.
+        held = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE state='merged' AND reservation_session_dir!='' ORDER BY id").fetchall())
+        for (id,) in held:
+            release = self.release_held_reservation(id)
+            if release is not None:
+                changes.append(release.line)
         return tuple(changes)
 
     def summary(self) -> StyleLedgerSummary:
@@ -5448,6 +5513,8 @@ class LedgerArguments(argparse.Namespace):
     # `held built` takes more than one --id only with --commit.
     ids: list[str] = []
     merge: str | None = None
+    session_dir: str = ""
+    phase: str = ""
     by: str | None = None
     person: str | None = None
 
@@ -5586,6 +5653,8 @@ def main() -> None:
                     _ = command.add_argument("--branch", required=True)
                 elif action == "checkpoint":
                     _ = command.add_argument("--commit", required=True)
+                    _ = command.add_argument("--session-dir", default="")
+                    _ = command.add_argument("--phase", default="")
                 elif action == "yield":
                     _ = command.add_argument("--path", required=True)
             elif name == "handoff":
@@ -5633,6 +5702,8 @@ def main() -> None:
             parser.error("held built --by requires --commit")
         if args.by is not None and not args.by.strip():
             parser.error("held built --by requires a name")
+    if args.command == "ticket" and args.action == "checkpoint" and bool(args.session_dir) != bool(args.phase):
+        parser.error("ticket checkpoint takes --session-dir and --phase together")
     try:
         with open_ledger(Path(args.repo)) as ledger:
             if args.command == "unit":
@@ -5677,12 +5748,17 @@ def main() -> None:
                 elif args.action == "assign":
                     ledger.ticket_assign(args.id, args.branch)
                 elif args.action == "checkpoint":
-                    ledger.ticket_checkpoint(args.id, args.commit)
+                    ledger.ticket_checkpoint(args.id, args.commit, args.session_dir, args.phase)
                 elif args.action == "merge":
                     for item in ledger.ticket_merge(args.id):
                         print(not_built_line(ledger.repo, item))
+                    release = ledger.release_held_reservation(args.id)
                     if ledger.sync_waits():
                         _wake_sync_waiters(ledger.repo, args.id)
+                    if release is not None and release.still_held:
+                        raise LedgerError(f"{release.line}; rerun ticket merge")
+                    if release is not None:
+                        print(release.line)
                 elif args.action == "drop":
                     ledger.ticket_drop(args.id)
                 elif args.action == "yield":
