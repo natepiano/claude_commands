@@ -18,6 +18,7 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py retire --to ADDRESS --from SENDER --key KEY
                           remove obsolete queued messages for ADDRESS; for --to user,
                           also stop the emergency push sent with KEY (see below)
+  send.py clear-check     retire each live emergency push whose --clears-when check passes
 
 Delivery. A Claude recipient is tried through the postmaster outbox first when
 its heartbeat is fresh. Every path without confirmed delivery falls back to a
@@ -52,6 +53,20 @@ skipped and its reason names the `send.py retire` that ends the first push.
 `retire --to user` forgets the key's last send to the user, so the next send with
 it goes out at once. Lower needs (note, decision) have a window only with
 `--repeat-minutes`.
+
+An emergency push stops by itself when its cause is fixed. `--clears-when CMD` gives a shell
+command, run on this machine, that exits 0 when the cause is gone (`--clears-when github-warm-status`).
+A sent push with it is recorded in STATE/emergencies.json: key, sender, check, machine (the host
+that posted the push: this one, or --machine HOST), sent and expires (sent + pushover.EXPIRE_S).
+`clear-check` runs each record's check with no stdin and a CHECK_TIMEOUT_S limit. On exit 0 it
+retires the push as `retire --to user` does (on the posting host over ssh when that is another
+host) and removes the record; it drops an expired record; it never pushes. It prints one line per
+record: `retired: KEY from SENDER: ...`, `kept: KEY from SENDER: ...`, `dropped: KEY from SENDER: ...`,
+or `FAILED: KEY from SENDER: ...` (the record stays; exit 3). With no records it prints nothing.
+The notifier tick (notifier.sh) runs it on both machines when the file exists, and github-warmup
+runs it after the keys are warm. An emergency push with neither `--clears-when` nor
+`--self-clearing` is refused: REFUSED, exit 2. `--self-clearing` is for a script that retires its
+own push (stall_watch.py, escalate.py); sessions that send by hand give `--clears-when`.
 
 (user, 2026-10-05) Outcomes have a header followed by any payload lines and are logged with the full
 message text as one JSON line in STATE/log.jsonl:
@@ -193,6 +208,14 @@ TIMEOUT = 40
 KILL_GRACE = 10
 # Above pushover.TIMEOUT_S, so Pushover's own timeout reports first.
 USER_CANCEL_TIMEOUT = 30
+# A --clears-when check that runs longer is stopped, and its push is kept.
+CHECK_TIMEOUT_S = 20
+# The far retire's cancel limit, the ssh connect timeout and its start-up.
+REMOTE_RETIRE_TIMEOUT = USER_CANCEL_TIMEOUT + 30
+EMERGENCIES = "emergencies.json"
+NO_CLEAR_STEP = ("an emergency push (--need blocked) repeats on the phone until it is cancelled, and this one has no"
+                 + ' way to clear. Add --clears-when "<command that exits 0 when fixed>", such as'
+                 + " --clears-when github-warm-status: send.py then cancels the push when that command exits 0")
 
 Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "replaced", "kept"]
 Need = Literal["note", "decision", "blocked"]
@@ -474,6 +497,10 @@ class Options(NamedTuple):
     values: tuple[str, ...] = ()
     # The auto_mode.refused commands as given: rca.py opens its case with them.
     commands: tuple[str, ...] = ()
+    # An emergency push's shell check that exits 0 when its cause is gone; "" for none.
+    clears_when: str = ""
+    # The sending script retires its own emergency push.
+    self_clearing: bool = False
 
     @property
     def to(self) -> str:
@@ -672,6 +699,155 @@ def cancel_user_push(sender: str, key: str) -> tuple[int, str]:
         return 0, f"cancelled: the emergency push for {key} stopped"
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
     return EXIT["failed"], f"FAILED: the emergency push for {key} may still repeat: {why}"
+
+
+def retire_user(sender: str, key: str) -> tuple[int, list[str]]:
+    """`retire --to user`: drop the queued and kept copies, forget the key's last send, cancel the push."""
+    removed = retire(USER, sender, key)
+    # The event is over: a new send with the key pushes at once.
+    forget_sent(key, USER)
+    dropped = silence.drop(sender, key)
+    code, line = cancel_user_push(sender, key)
+    return code, [f"retired {removed} queued message{'s' if removed != 1 else ''}",
+                  f"dropped {dropped} kept push{'es' if dropped != 1 else ''}", line]
+
+
+# ---------------------------------------------------------------------------
+# Emergency pushes that clear by themselves (--clears-when, clear-check)
+# ---------------------------------------------------------------------------
+
+
+class Emergency(TypedDict):
+    key: str
+    sender: str
+    # The --clears-when shell command; it runs on this machine.
+    check: str
+    # The host that posted the push, where its retire runs.
+    machine: str
+    # UTC ISO times.
+    sent: str
+    expires: str
+
+
+EMERGENCY_FIELDS = ("key", "sender", "check", "machine", "sent", "expires")
+
+
+def read_emergencies() -> list[Emergency]:
+    """The live emergency records; the caller holds the lock."""
+    try:
+        text = (STATE / EMERGENCIES).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    records: list[Emergency] = []
+    for item in as_list(loads(text)):
+        record = as_dict(item)
+        if all(isinstance(record.get(field), str) for field in EMERGENCY_FIELDS):
+            records.append(cast(Emergency, cast(object, record)))
+    return records
+
+
+def write_emergencies(records: list[Emergency]) -> None:
+    """Write the records under the lock; no records removes the file, so the notifier tick runs nothing."""
+    path = STATE / EMERGENCIES
+    if records:
+        write_atomic(path, json.dumps(records, indent=2) + "\n")
+    else:
+        path.unlink(missing_ok=True)
+
+
+def record_emergency(record: Emergency) -> None:
+    """Keep a sent emergency push for clear-check; it replaces an older record with its sender and key."""
+    with locked():
+        kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
+        write_emergencies([*kept, record])
+
+
+def check_exit(command: str, timeout: float) -> int | None:
+    """Run a --clears-when check with no stdin; its exit code, or None when it ran past the timeout."""
+    with subprocess.Popen(["/bin/sh", "-c", command], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, cwd=Path.home(), start_new_session=True) as process:
+        try:
+            return process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _ = process.wait()
+            return None
+
+
+def retire_record(record: Emergency) -> tuple[int, str]:
+    """Retire the push as `retire --to user` does, on the host that posted it; the exit code and the cancel line."""
+    if record["machine"] == machine():
+        code, lines = retire_user(record["sender"], record["key"])
+        return code, lines[-1]
+    # This host holds the key's window (remote() sends --repeat-minutes 0); the posting host holds the keys.
+    forget_sent(record["key"], USER)
+    forwarded = shlex.join(["retire", "--to", USER, "--from", record["sender"], "--key", record["key"]])
+    command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", record["machine"], f"{REMOTE} {forwarded}"]
+    code, out, err = run(command, "", REMOTE_RETIRE_TIMEOUT)
+    last = (out.strip().splitlines() or [""])[-1]
+    if code == 0:
+        return 0, f"on {record['machine']}: {last}"
+    why = one_line(err or last) or ("timed out" if code is None else f"exit {code}")
+    return EXIT["failed"], f"on {record['machine']}: the emergency push for {record['key']} may still repeat: {why}"
+
+
+@contextmanager
+def clear_check_turn() -> Generator[bool]:
+    """True when this run holds the clear-check turn; a run that finds another in progress skips."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / ".clear-check.lock", "w", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
+    """Retire each live emergency push whose check passes and drop the expired ones; never pushes.
+
+    The lock is not held while checks and retires run: a retire takes it, and a send must not wait on a check.
+    """
+    if not (STATE / EMERGENCIES).exists():
+        return 0, []
+    with clear_check_turn() as turn:
+        if not turn:
+            return 0, ["clear-check: another run is in progress"]
+        with locked():
+            records = read_emergencies()
+        code = 0
+        lines: list[str] = []
+        done: list[Emergency] = []
+        zone = user_zone()
+        for record in records:
+            name = f"{record['key']} from {record['sender']}"
+            expires = datetime.fromisoformat(record["expires"])
+            if now() >= expires:
+                done.append(record)
+                lines.append(f"dropped: {name}: its push expired at {expires.astimezone(zone):%H:%M:%S %Z}")
+                continue
+            exit_code = check_exit(record["check"], timeout)
+            if exit_code is None:
+                lines.append(f"kept: {name}: its check ran past {timeout:g} s and was stopped")
+            elif exit_code != 0:
+                lines.append(f"kept: {name}: its check exits {exit_code}")
+            else:
+                retired, line = retire_record(record)
+                if retired == 0:
+                    done.append(record)
+                    lines.append(f"retired: {name}: its check passed; {line}")
+                else:
+                    code = retired
+                    lines.append(f"FAILED: {name}: its check passed, but {line.removeprefix('FAILED: ')}")
+        # A file with no records goes too, so the notifier tick stops running this.
+        if done or not records:
+            with locked():
+                write_emergencies([record for record in read_emergencies() if record not in done])
+        return code, lines
 
 
 def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE_ROUTE) -> None:
@@ -1235,6 +1411,9 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--key", message.key]
     if message.to == USER:
         forwarded += ["--need", options.need]
+        if options.need == "blocked":
+            # This host refused a push with no clear step and keeps its --clears-when record.
+            forwarded += ["--self-clearing"]
         if options.text_id:
             forwarded += ["--text-id", options.text_id]
             for value in options.values:
@@ -1469,6 +1648,11 @@ def parse(argv: list[str]) -> Options:
                             help="to `user`: what they must do (default note: nothing)")
     _ = parser.add_argument("--action", help="to `user`: what the user does")
     _ = parser.add_argument("--no-action", action="store_true", help="to `user`: nothing is needed")
+    clears = parser.add_mutually_exclusive_group()
+    _ = clears.add_argument("--clears-when", metavar="CMD",
+                            help="to `user` with --need blocked: a shell command that exits 0 when the cause is fixed;"
+                            + " the push is then cancelled")
+    _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
                                            + " the user replaces an older kept one with this key from the same sender"))
     _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
@@ -1555,13 +1739,15 @@ def parse(argv: list[str]) -> Options:
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
-    get = {name: attr(args, name) for name in Options._fields if name not in {"action", "selection", "scope", "values", "commands"}}
+    get = {name: attr(args, name) for name in Options._fields
+           if name not in {"action", "selection", "scope", "values", "commands"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
                       file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values),
-                      commands=tuple(commands))
+                      commands=tuple(commands), clears_when=optional_str(get["clears_when"]) or "",
+                      self_clearing=get["self_clearing"] is True)
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -1570,6 +1756,10 @@ def parse(argv: list[str]) -> Options:
         parser.error(f"--need {options.need} requires --action. {FIX}")
     if options.repeat_minutes is not None and options.key is None:
         parser.error("--repeat-minutes needs --key")
+    if get["clears_when"] is not None and not options.clears_when.strip():
+        parser.error("--clears-when needs a command")
+    if (options.clears_when or options.self_clearing) and (options.to != USER or options.need != "blocked"):
+        parser.error("--clears-when and --self-clearing go with --to user --need blocked")
     return options
 
 
@@ -1649,10 +1839,14 @@ def send(options: Options) -> Result:
               else emergency_lifetime() if live else None)
     # Held before the claim, so the resend with the template is not skipped by --repeat-minutes.
     action_text = options.action.text if isinstance(options.action, ActionRequired) else ""
-    held = wrong_template(options, "\n".join((summary, text, action_text)))
-    skip = None if held is not None else claim(message, window, started, live=live)
+    # An emergency push with no clear step would repeat after its cause is fixed: refused, not claimed.
+    refused = emergency and not options.clears_when and not options.self_clearing
+    held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
+    skip = None if refused or held is not None else claim(message, window, started, live=live)
     log_route: Route = NO_CLAUDE_ROUTE
-    if held is not None:
+    if refused:
+        result = Result("refused", NO_CLEAR_STEP)
+    elif held is not None:
         result = Result("held", held)
     elif skip is not None:
         result = Result("skipped", skip)
@@ -1721,8 +1915,12 @@ def send(options: Options) -> Result:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
     # An emergency push that did not go out is not live: its resend goes out.
-    if live and key is not None and held is None and skip is None and result.outcome != "sent":
+    if live and key is not None and not refused and held is None and skip is None and result.outcome != "sent":
         forget_sent(key, message.to, started)
+    if emergency and options.clears_when and key is not None and result.outcome == "sent":
+        posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
+        record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
+                                   sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need)
     log(message, result, started, log_route)
@@ -1737,16 +1935,17 @@ def main(argv: list[str]) -> int:
             deliver_template_fix(text_id, recipient, text)
         case ["retire", *arguments]:
             request = parse_retire(arguments)
+            if request.to == USER:
+                code, lines = retire_user(request.sender, request.key)
+                print("\n".join(lines))
+                return code
             removed = retire(request.to, request.sender, request.key)
             print(f"retired {removed} queued message{'s' if removed != 1 else ''}")
-            if request.to == USER:
-                # The event is over: a new send with the key pushes at once.
-                forget_sent(request.key, USER)
-                dropped = silence.drop(request.sender, request.key)
-                print(f"dropped {dropped} kept push{'es' if dropped != 1 else ''}")
-                code, line = cancel_user_push(request.sender, request.key)
-                print(line)
-                return code
+        case ["clear-check"]:
+            code, lines = clear_check()
+            if lines:
+                print("\n".join(lines))
+            return code
         case ["ack", key]:
             print(acknowledge(key))
         case ["reopen", key]:
@@ -1758,8 +1957,8 @@ def main(argv: list[str]) -> int:
                 usage_error(str(error))
             if text:
                 print(text)
-        case ["ack" | "reopen" | "pending", *_]:
-            usage_error(f"usage: send.py {argv[0]} {'[NAME]' if argv[0] == 'pending' else 'KEY'}")
+        case ["ack" | "reopen" | "pending" | "clear-check", *_]:
+            usage_error(f"usage: send.py {argv[0]}" + {"pending": " [NAME]", "clear-check": ""}.get(argv[0], " KEY"))
         case _:
             options = parse(argv)
             if options.to == USER and os.environ.get(PROBE_ENV) == "1":

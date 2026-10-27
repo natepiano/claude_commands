@@ -13,6 +13,13 @@ SESSIONS=${SCRIPT:h}/sessions.py
 STATE_DIR=${NOTIFIER_STATE_DIR:-$HOME/.local/state/notifier}
 SESSIONS_DIR=${NOTIFIER_SESSIONS_DIR:-$HOME/.claude/sessions}
 NOW=${NOTIFIER_NOW_EPOCH:-$EPOCHSECONDS}
+# send.py's live emergency pushes with a --clears-when check; each tick runs `send.py clear-check`
+# while the file exists. A tick on another notifier state (a test) reads only NOTIFIER_EMERGENCIES.
+if [[ -n ${NOTIFIER_STATE_DIR:-} ]]; then
+  EMERGENCIES=${NOTIFIER_EMERGENCIES:-}
+else
+  EMERGENCIES=${XDG_STATE_HOME:-$HOME/.local/state}/message/emergencies.json
+fi
 
 die() { print -u2 -r -- "notifier.sh: $*"; exit 2 }
 usage() { die 'usage: notifier.sh new <instance> --every <min> (--run <cmd> | --to <target> (--command <text> | --prompt-file <path>)) [--from <sender>] [--check <cmd>] [--hold] [--aligned] [--timeout <s>]; start|resume|stop|pause|unpause|status|fire|restart|remove|health <instance>; interval <instance> <min>; align <instance> on|off; status|tick' }
@@ -449,6 +456,19 @@ launch_run() {
   esac
 }
 
+# Cancel each emergency push whose cause is fixed. send.py prints one line per record; only a failure is logged.
+clear_check() {
+  local output fired
+  if [[ -n ${NOTIFIER_SEND:-} ]]; then
+    output=$("$NOTIFIER_SEND" clear-check 2>&1)
+  else
+    output=$("$PY" "$SEND" clear-check 2>&1)
+  fi
+  (( $? == 0 )) && return 0
+  fired=$(fired_stamp)
+  log_error "clear-check: ${output//$'\n'/ / }"
+}
+
 cmd_tick() {
   local tick_fd dir name fired
   local -a deferred_runs
@@ -479,6 +499,8 @@ cmd_tick() {
   for name in "${deferred_runs[@]}"; do
     run_due "$name"
   done
+  # After the unlock, so a slow check never holds the scheduled messages back.
+  [[ -n $EMERGENCIES && -s $EMERGENCIES ]] && clear_check
   return 0
 }
 

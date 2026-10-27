@@ -326,6 +326,26 @@ class NotifierTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse((self.state_dir / "example").exists())
 
+    def test_tick_runs_clear_check_only_while_emergencies_are_recorded(self) -> None:
+        emergencies = self.root / "emergencies.json"
+        with mock.patch.dict(os.environ, {"NOTIFIER_EMERGENCIES": str(emergencies)}):
+            _ = self.successful("tick")
+            self.assertFalse(self.send_args.exists())
+            _ = emergencies.write_text('[{"key": "github-cold"}]\n')
+            _ = self.successful("tick")
+            self.assertEqual(self.send_args.read_text(), "clear-check\n")
+            self.assertFalse((self.state_dir / "notifier.log").exists())
+            _ = self.successful("tick", send_rc=3)
+        self.assertIn("clear-check: fake send result", (self.state_dir / "notifier.log").read_text())
+
+    def test_tick_on_another_notifier_state_never_reads_the_real_emergencies(self) -> None:
+        state = self.root / "xdg"
+        (state / "message").mkdir(parents=True)
+        _ = (state / "message" / "emergencies.json").write_text('[{"key": "github-cold"}]\n')
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+            _ = self.successful("tick")
+        self.assertFalse(self.send_args.exists())
+
     def test_tick_with_existing_state_does_not_call_mkdir(self) -> None:
         _ = self.new()
         fake_bin = self.root / "bin"

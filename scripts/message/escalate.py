@@ -446,8 +446,10 @@ def deliver(held: HeldMessage, key: str) -> str:
     import review
 
     action_args = ["--action", held.action.text] if isinstance(held.action, ActionRequired) else ["--no-action"]
+    # `close` retires a sent blocked push.
+    clearing = ["--self-clearing"] if held.need == "blocked" else []
     command = [sys.executable, str(SEND), "--to", "user", "--from", JOB, "--key", user_key(key), "--summary", held.summary,
-               "--need", held.need, *action_args, "--text", held.text]
+               "--need", held.need, *clearing, *action_args, "--text", held.text]
     done = subprocess.run(command, capture_output=True, text=True, check=False,
                           timeout=review.user_send_seconds() + 15)
     return "" if done.returncode == 0 else " ".join((done.stdout or done.stderr).split()) or f"exit {done.returncode}"
