@@ -758,7 +758,7 @@ def herdr_space(session: Session) -> str:
 
 
 class HerdrDestinationTaken(OSError):
-    """An exclusive launch found an occupied destination, before opening a pane."""
+    """A desktop restart found another launch's server listener, before opening a pane."""
 
 
 def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str = "", at: str = "", probe: bool = False, source_fallback: bool = False) -> ResumeParts:
@@ -1165,8 +1165,7 @@ def _herdr_launch(
         return HerdrLaunch(herdr.ServerAdopted(), herdr.PromptNotSubmitted("dry run"))
     try:
         server = herdr.restore_server(name, 90_000,
-            session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind,
-            exclusive=False)
+            session_kind=herdr.security_session() if isinstance(session_kind, herdr.SessionKindNotRead) else session_kind)
         server_environment = herdr.server_environment(name)
         for variable in sorted(unset_variables):
             if variable in server_environment:
@@ -2512,7 +2511,7 @@ def _launch_codex_snapshot(
     if dry_run:
         print(f"herdr {name}: CODEX_HOME={launch['home']} codex {shlex.join(arguments)} in a new tab in {herdr_space(owner)}")
         return SessionLaunched()
-    server = herdr.restore_server(name, 90_000, session_kind=state.session_kind, exclusive=False)
+    server = herdr.restore_server(name, 90_000, session_kind=state.session_kind)
     pane = herdr.open_tab(name, herdr_space(owner), title, owner["cwd"], {"CODEX_HOME": launch["home"]})
     try:
         _ = herdr.start_agent(name, pane, kind="codex", agent=title, agent_arguments=arguments,
