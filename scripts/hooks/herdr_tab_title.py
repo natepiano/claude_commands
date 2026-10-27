@@ -43,7 +43,7 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     if not pane or not session_id or environment.get("TMUX_PANE"):
         return False
     shared = herdr.shared_session()
-    if not shared or environment.get("HERDR_SESSION") != shared:
+    if environment.get("HERDR_SESSION") != shared:
         return False
     name = current_name(session_id)
     return bool(name) and herdr.Herdr(shared).retitle(pane, name)

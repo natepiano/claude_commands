@@ -1593,7 +1593,7 @@ class RestartTests(ShutdownTestCase):
                 log.unlink(missing_ok=True)
                 state = restart.DesktopLaunchState(session_kind=herdr.NonDesktopSession())
                 with (patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"),
-                      patch.object(herdr, "stop_created_server", side_effect=AssertionError("running agent stopped")),
+                      patch.object(herdr, "stop_session", side_effect=AssertionError("running agent stopped")),
                       redirect_stdout(io.StringIO()) as output):
                     result = restart._launch_session(entry(owner), "restart", state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                 self.assertIsInstance(result, restart.SessionLaunched)
@@ -1856,7 +1856,7 @@ class RestartTests(ShutdownTestCase):
               patch.object(restart, "_run") as window,
               self.assertRaisesRegex(restart.HerdrDestinationTaken, "writing")):
             _ = restart._launch_session(entry(owner), "resume", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
-        server.assert_called_once_with("writing", 90_000, session_kind=herdr.DesktopSession(), exclusive=False)
+        server.assert_called_once_with("writing", 90_000, session_kind=herdr.DesktopSession())
         pane.assert_not_called()
         agent.assert_not_called()
         window.assert_not_called()
@@ -2045,9 +2045,16 @@ class RestartTests(ShutdownTestCase):
         })))
         _ = cast(object, self.enterContext(patch.object(herdr, "server_environment", return_value={})))
         _ = cast(object, self.enterContext(patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell())))
-        # The fake server records a tab as the pane it opens; workspace layout is herdr's own test.
+        # The fake server records a tab as a workspace it creates; workspace layout is herdr's own test.
         def open_tab(name: str, _space: str, _title: str, cwd: str, environment: dict[str, str]) -> str:
-            return herdr.open_pane(name, name, cwd, environment)
+            client = herdr.Herdr(name)
+            arguments = ["workspace", "create", "--label", name, "--cwd", cwd]
+            for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
+                arguments.extend(["--env", f"{key}={value}"])
+            root_pane = herdr.json_object(client.result(*arguments, "--no-focus").get("root_pane"), "fake root pane")
+            pane = herdr.json_text(root_pane.get("pane_id"), "fake root pane id")
+            _ = client.run("pane", "rename", pane, name)
+            return pane
 
         _ = cast(object, self.enterContext(patch.object(herdr, "open_tab", open_tab)))
         return owner, responses, log
@@ -2060,7 +2067,6 @@ class RestartTests(ShutdownTestCase):
               patch.object(herdr, "server_environment", return_value={}),
               patch.object(herdr.Herdr, "agents", return_value=[]),
               patch.object(herdr, "open_tab", return_value="destination:p1") as opened,
-              patch.object(herdr, "open_pane") as pane,
               patch.object(herdr.Herdr, "start_agent", return_value=failed) as start,
               patch.object(restart, "_focus_restored_pane", return_value=True)):
             result = restart._herdr_launch(restart._resume_parts(owner, "resume checkpoint"),  # pyright: ignore[reportPrivateUsage]
@@ -2068,7 +2074,6 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(result.prompt_outcome, failed)
         opened.assert_called_once()
         self.assertEqual(opened.call_args.args[1:3], ("ad-hoc", "kept name"))
-        pane.assert_not_called()
         self.assertEqual(start.call_args.args[1], "destination:p1")
         opening = cast(herdr.OpeningPrompt, start.call_args.kwargs["opening"])
         assert "config_dir" in owner
@@ -2307,7 +2312,7 @@ class RestartTests(ShutdownTestCase):
     def test_codex_snapshot_running_now_is_skipped_without_server_or_acknowledgement(self) -> None:
         snapshot, _saved, _responses, log = self.codex_recovery_fixture()
         with (patch.object(inventory, "codex_liveness", return_value=inventory.CodexLive(99001)),
-              patch.object(herdr, "start_new_server") as start, redirect_stdout(io.StringIO()) as output):
+              patch.object(herdr, "restore_server") as start, redirect_stdout(io.StringIO()) as output):
             self.assertEqual(restart.up(snapshot["login"]), 0)
         start.assert_not_called()
         self.assertFalse(log.exists())
@@ -2371,7 +2376,7 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(herdr, "restore_server", side_effect=herdr.HerdrFailure("server refused")) as server,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(restart.up(snapshot["login"]), 1)
-        server.assert_called_once_with("writing", 90_000, session_kind=herdr.DesktopSession(), exclusive=False)
+        server.assert_called_once_with("writing", 90_000, session_kind=herdr.DesktopSession())
         self.assertIn("server refused", output.getvalue())
         self.assertFalse(log.exists() and any(row[2:4] in (["workspace", "create"], ["agent", "start"])
                                               for row in self.herdr_calls(log)))
@@ -3072,7 +3077,7 @@ class RestartTests(ShutdownTestCase):
                                 if not dry_run:
                                     seen_notes.append(Path(argv[argv.index("--restart-note") + 1]).read_text())
                                 return None if dry_run else SUBMITTED_UNIT_RESTORE
-                            with (patch.object(herdr, "open_pane") as opened,
+                            with (patch.object(herdr, "open_tab") as opened,
                                   patch.object(herdr.Herdr, "close_pane") as closed,
                                   patch.object(herdr.Herdr, "start_agent") as started,
                                   patch.object(restart, "_run", side_effect=read_note) as other_host):

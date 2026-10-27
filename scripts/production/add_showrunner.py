@@ -194,9 +194,6 @@ def main(argv: list[str]) -> int:
         return 0
     try:
         outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected)
-    except herdr.SessionTaken as error:
-        print(f"add_showrunner: {error}", file=sys.stderr)
-        return 2
     except herdr.AgentNotReady as error:
         print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
         return SESSION_NOT_READY

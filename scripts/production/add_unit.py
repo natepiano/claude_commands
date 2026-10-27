@@ -1148,7 +1148,7 @@ def main(argv: list[str]) -> int:
     except herdr.AgentNotReady as error:
         print(f"add_unit: the session is not ready:\n{error.screen}", file=sys.stderr)
         return 1
-    except (Refusal, herdr.SessionTaken) as error:
+    except Refusal as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
     except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr.HerdrFailure) as error:
