@@ -84,6 +84,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - New folder `scripts/issue_score/`, Python standard library only, like the rest of the repo. The HTTP API is one POST, so the client uses `urllib` with backoff on 429/529, not the SDK. That avoids a virtualenv, which no checkout here has.
 - The model is pinned to `jev-1.14.0`, not the `jev-latest` alias, because the thresholds are tuned against one version. Each result records the model that answered.
 - All question wording, criteria, option names, thresholds and project lines live in `questions.py`. That file is the one people audit and edit.
+- A spend ledger, `~/.local/state/issue-score/spend.jsonl`, logs each request's input tokens and cost. The client refuses a request once the total reaches the cap, `BUDGET_USD = 20.0` in `questions.py`.
 - Results go to `~/.local/state/issue-score/`: one JSONL line per issue per run, holding the exact request payload, every probability and the model ID, so any case can be rerun. A run reuses a cached result when the issue text, the question set version and the model are unchanged.
 - The tool never writes to the vault. Ratings change only through `/issue` and `/prioritize`, with the user's confirmation, as now.
 
@@ -114,7 +115,8 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
    - All 86 rated style issues match the formula exactly. Frontmatter cannot tell an accepted proposal from a copied default.
    - **Rule:** a style issue (`style_rule:` or `style_rules:` set) is a label only when its values differ from the formula. Every other style issue is left out.
    - A non-style issue with a `Proposed ranking:` line is unrated (12 open now): its values are the filer's judgment, not yet confirmed. Non-style proposals rated through `stars` (tool-based-ui, research-unit and others) were confirmed by the user, so they count as labels.
-   - Scoring style issues is not in this plan. Their state lives in frontmatter fields, not in a body.
+   - The user, after this answer: "once we get jef working - we should apply it to the defaulted and missing - and in fact i want to reassess all of our issues in case i like jev's categorization better". So the plan adds a reassessment phase (Phase 5) that scores every open issue, including style issues, issues with default ratings and unrated issues. Style issues need their own state, built from their rule fields because their body is empty.
+2. **Budget: $20.** The user: "i am happy to add $20 to jev". The scorer keeps a running total from each response's `usage.input_tokens` at $0.042 per million. It stops before a request that would pass $20, and asks the user before it spends more.
 
 ### Resource for other sessions
 
@@ -156,7 +158,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Goal:** `score_issues.py score [--only <glob>] [--limit N]` scores open non-style issues and writes one JSONL result per issue to `~/.local/state/issue-score/runs/<run-id>.jsonl`.
 
 **Spec:**
-- `client.py`: `system_one(state, questions, model) -> Response`. Uses `urllib`, gzip body, and `Authorization: Bearer <key>`. The key comes only from `TYPESAFE_API_KEY`, which `with-typesafe` sets. If it is missing, raise `TypeSafeError("TYPESAFE_API_KEY not set: run under with-typesafe")`. The client never decrypts the key itself, and it never puts the key in a log, a payload record or an error message. Retries 429/529 with exponential backoff, following `retry-after` when present, for at most 5 attempts. Any other non-2xx raises `TypeSafeError` with the status and body. Typed `TypedDict`s describe the Noul, Choice and Score answers, following the response shapes on the API page. No `Any`.
+- `client.py`: `system_one(state, questions, model) -> Response`. Uses `urllib`, gzip body, and `Authorization: Bearer <key>`. The key comes only from `TYPESAFE_API_KEY`, which `with-typesafe` sets. If it is missing, raise `TypeSafeError("TYPESAFE_API_KEY not set: run under with-typesafe")`. The client never decrypts the key itself, and it never puts the key in a log, a payload record or an error message. Before each request, it checks the spend ledger against `BUDGET_USD` and raises `BudgetExceeded` if the total has reached the cap. After each response, it appends the input tokens and cost to the ledger. It retries 429/529 with exponential backoff, following `retry-after` when present, for at most 5 attempts. Any other non-2xx raises `TypeSafeError` with the status and body. Typed `TypedDict`s describe the Noul, Choice and Score answers, following the response shapes on the API page. No `Any`.
 - `vault.py`: `Issue` dataclass (path, title, project, body, labels), with labels parsed from the frontmatter: goal, the four stars, category, area. `load_open_issues()` skips style issues and directories. `load_rated_issues()` also skips any issue with a `Proposed ranking:` body line, and it keeps a style issue only when its five values differ from the style formula (Review decisions 1). It returns each skipped path with its reason, so the report can show the count. `clean_body()` reduces `[[a|b]]` to `b` and `[[a]]` to `a`, then applies the 24,000-character cap at a heading. `normalize_area()` strips quotes, `[[ ]]` and case. `area_vocabulary()` returns the sorted, deduplicated normalized areas of non-style issues.
 - `questions.py`: `QUESTION_SET_VERSION`; `PROJECT_ABOUT` (one line per project in `/issue`'s mapping table, from each repo's README); and builders for the main request and the area request, exactly as in the Design table. Option names describe content. Levels are situations. Each Noul's `false` criterion is a concrete situation. The five rubric levels come from `commands/issue.md` step 4, rewritten as situations.
 - `decide.py`: median level; split detection (two non-neighbor levels each ≥ 0.25); averaging of the two-order Choice; the urgency table, which never returns 5 and sets a `possible_five` flag; and `sure`/`unsure` per field from `THRESHOLDS` in `questions.py`, every field starting at 0.6.
@@ -230,7 +232,42 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Acceptance gate:** the merge gate is green; basedpyright clean; one live `propose` on a held-out issue's title and body prints a line that matches its report row.
 
-### Phase 5 — the TypeSafe guide for other sessions  · status: todo
+### Phase 5 — reassess every open issue  · status: todo
+
+#### Work Order
+
+**Goal:** every open issue has a Jev proposal for each field in `JEV_FIELDS`, and the user reviews current values against Jev's and decides which to write.
+
+**Spec:**
+- `score` covers all open issues: rated, default-rated (Review decisions 1), unrated, and style issues.
+- Style issue state: title, project, the rule's name and its one-line summary from the `style_rule` file, `style_crate`, and the finding count.
+- `score_issues.py reassess <run-id>` writes a review file, `~/.local/state/issue-score/reports/<run-id>-reassess.md`. Each issue gets one row: its current value and Jev's value for each field, sure or unsure, sorted so the largest differences come first. Unrated and default-rated issues come in their own group.
+- Writing approved values goes through `proposal_issue.py stars` or a direct frontmatter edit of only the five rating fields, `category` and `area`. The watcher recomputes score and rank. The scorer itself still never writes to the vault.
+
+**Pending decision: how the user approves reassessed values**
+
+Actual problem:
+About 640 open issues will each have up to seven Jev values. Reviewing every field of every issue one at a time is too much to read.
+
+What exists now:
+- `/prioritize` reviews one band of issues in a single proposal table and writes what the user approves.
+- `/showrunner:proposal` writes proposal stars through `proposal_issue.py stars`.
+
+What should change:
+- Decide after Phase 3 shows how often Jev is sure and right for each field.
+
+Recommendation:
+Accept in bulk every value Jev is sure of for the fields the user approved in Phase 3, write those for unrated and default-rated issues first, and walk the rest by `/prioritize` band.
+
+**Files:** `scripts/issue_score/vault.py`, `scripts/issue_score/questions.py`, `scripts/issue_score/score_issues.py` (`reassess`), `scripts/issue_score/test_reassess.py`.
+
+**Workers:** `1 writer + 1 tester` — `impl` owns the three modules; `test` covers the style state, the grouping and the sort order.
+
+**Constraints from prior phases:** set by phase review.
+
+**Acceptance gate:** the merge gate is green; basedpyright clean; a full reassess run within budget; the user has the review file, and the values the user approved are written.
+
+### Phase 6 — the TypeSafe guide for other sessions  · status: todo
 
 #### Work Order
 
@@ -241,7 +278,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - how to reuse `scripts/issue_score/client.py`;
 - the `questions.py` pattern (all wording in one module, model pinned, payloads logged);
 - the skill's core rules, with links to the live docs;
-- the measured lessons from Phase 3's `lessons.md`;
+- the measured lessons from Phases 3 and 5 (`lessons.md`);
 - the cost of a pass;
 - the instruction to ask `typesafe-unit` for anything not covered.
 
