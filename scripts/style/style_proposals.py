@@ -29,11 +29,12 @@ import rules
 import style_ledger
 import style_rules
 from approved_renames import ApprovedRename, NoAppliedCheck, RenameNotApplied, approved_rename
-from add_style import StandingStyleProduction, standing_style_production
+from add_style import NoStyleProduction, StandingStyleProduction, standing_style_production
 from declarations import declaration_line
 from issues import Issue, frontmatter, open_issues, plain
+from production_units import cell_value, plan_cell_is_retired, unit_table
 from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, DeclinedDecision, Refusal,
-                            UnansweredDecision, decision_answer, fill_ranking, refresh_decision, require_generated_body)
+                            UnansweredDecision, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
 from user_zone import user_zone
 
@@ -286,6 +287,22 @@ def decision_kind(findings: tuple[style_ledger.HeldFinding, ...],
     return "restructure" if "restructure" in kinds else "type" if "type" in kinds else "rename"
 
 
+@dataclass(frozen=True)
+class FamilyUnit:
+    """The live unit of the standing style production that builds one family's decisions, with its Plan cell."""
+    unit: str
+    plan: str
+
+
+def family_units(doc: Path) -> dict[rules.Family, FamilyUnit]:
+    units: dict[rules.Family, FamilyUnit] = {}
+    for row in unit_table(doc.read_text().splitlines()):
+        family = rules.style_family(cell_value(row["Unit"]))
+        if not isinstance(family, rules.NotStyleUnit) and not plan_cell_is_retired(row.get("Plan", "")):
+            units[family] = FamilyUnit(cell_value(row["Unit"]), cell_value(row["Plan"]))
+    return units
+
+
 @dataclass
 class DecisionWriter:
     """What one command run loads once and shares for every decision it writes."""
@@ -296,6 +313,7 @@ class DecisionWriter:
     holders: Mapping[str, frozenset[str]]
     linker: RuleLinker
     repository: str
+    standing: StandingStyleProduction | NoStyleProduction
     goals: dict[str, str] = field(default_factory=dict)
 
     def goal(self, project: str) -> str:
@@ -324,9 +342,38 @@ class DecisionWriter:
         body.append("Recommended answer: approve the described changes under this rule text.")
         return "\n".join(body) + "\n"
 
+    def rule_approval(self, key: DecisionKey, inherited: Mapping[str, str]) -> dict[str, str]:
+        """The approval fields of a rule that is always approved, as a user approval writes them, for a new decision
+        that inherits no approval. Refuse when no live unit of the rule's family builds it."""
+        definition = self.definitions.get(key.rule)
+        if (definition is None or not isinstance(definition.approval, rules.AlwaysApproved)
+                or isinstance(decision_answer(Issue(Path(), {name: [value] for name, value in inherited.items()})),
+                              ApprovedDecision)):
+            return {}
+        units = family_units(self.standing.doc) if isinstance(self.standing, StandingStyleProduction) else {}
+        unit = units.get(definition.approval.family)
+        if unit is None:
+            raise style_ledger.LedgerError(f"rule {key.rule} is always approved, but no {definition.approval.family} unit builds it")
+        slug = style_slug(self.ledger.repo)
+        return {"showrunner": slug, "unit": unit.unit, "plan": unit.plan, "approved_by": f"rule {key.rule}",
+                "approved_in": slug}
+
+    def approve_by_rule(self, decision: Issue) -> None:
+        """Approve an open decision still waiting for the user when its rule, whatever the blob, is always approved."""
+        if not isinstance(decision_answer(decision), UnansweredDecision):
+            return
+        rule = decision.value("style_rule")
+        approval = self.rule_approval(DecisionKey(rule, decision.value("style_crate"), decision.value("style_rule_blob")), {})
+        if approval:
+            # The answer is read again under the issue lock, so an approval written since the read above is kept.
+            if approve_unanswered(decision.path, {name: approval[name] for name in ("showrunner", "unit", "plan")},
+                                  approval["approved_by"], approval["approved_in"], datetime.now(user_zone()).date()):
+                    print(f"approved {decision.path}: rule {rule} is always approved")
+
     def create(self, key: DecisionKey, findings: tuple[style_ledger.HeldFinding, ...],
                inherited: Mapping[str, str]) -> Path:
         issue = self.proposals / batch_name(key)
+        approval = self.rule_approval(key, inherited)
         project = issue_project(self.ledger.repo, key.crate, self.proposals.parent)
         ranking = proposed_ranking(decision_kind(findings, self.definitions), len(findings), self.goal(project.project))
         with tempfile.TemporaryDirectory(prefix="style-decision-") as scratch:
@@ -336,8 +383,10 @@ class DecisionWriter:
                              "--proposed-by", style_slug(self.ledger.repo), "--extra-tags", "style",
                              "--rule", key.rule, "--crate", key.crate, "--rule-blob", key.blob,
                              "--count", str(len(findings)), "--body-file", str(body),
-                             "--proposed-ranking", ranking, "--initial-fields", json.dumps(dict(inherited)),
+                             "--proposed-ranking", ranking, "--initial-fields", json.dumps({**inherited, **approval}),
                              "--rules", ",".join(self.linker.urls(findings)))
+        if approval:
+            print(f"approved {issue}: rule {key.rule} is always approved")
         return issue
 
     def refresh(self, decision: Issue) -> None:
@@ -354,7 +403,7 @@ def decision_writer(ledger: style_ledger.Ledger, proposals: Path, parent: str) -
     standing = standing_style_production(ledger.repo)
     holders = unit_file_holders(ledger.repo, standing.doc, ledger) if isinstance(standing, StandingStyleProduction) else {}
     return DecisionWriter(ledger, proposals, parent, {rule.rule_id: rule for rule in rules.load_rules(ledger.repo)},
-                          holders, RuleLinker(ledger.repo), repository_name(ledger.repo))
+                          holders, RuleLinker(ledger.repo), repository_name(ledger.repo), standing)
 
 
 def find_decision(proposals: Path, key: DecisionKey) -> Path:
@@ -485,10 +534,14 @@ def file_proposals(ledger: style_ledger.Ledger, proposals: Path, parent: str) ->
             print(skip_line(issue, error))
     # Also finish a refresh interrupted after all ledger moves reached disk.
     # Only an open decision can get new findings, so a closed one needs no repair.
+    # An open decision filed before its rule was always approved leaves the user's list here, whatever its blob.
     for decision in open_issues(proposals, "style"):
-        if decision.path not in skipped and is_decision(decision) and issue_findings(ledger, decision.path):
+        if decision.path not in skipped and is_decision(decision):
             try:
-                writer.refresh(decision)
+                # Only a decision whose findings this ledger holds is this production's own.
+                if issue_findings(ledger, decision.path):
+                    writer.approve_by_rule(decision)
+                    writer.refresh(Issue(decision.path, frontmatter(decision.path)))
             except (style_ledger.LedgerError, Refusal) as error:
                 skipped.append(decision.path)
                 print(skip_line(decision.path, error))

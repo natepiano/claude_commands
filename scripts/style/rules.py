@@ -54,6 +54,20 @@ class WorkspaceMember:
 
 
 @dataclass(frozen=True)
+class UserApproves:
+    """The user answers each decision under the rule."""
+
+
+@dataclass(frozen=True)
+class AlwaysApproved:
+    """The rule says `approval: always`: filing approves each new decision under it for the unit of its family."""
+    family: Family
+
+
+RuleApproval = UserApproves | AlwaysApproved
+
+
+@dataclass(frozen=True)
 class Rule:
     rule_id: str
     reach: RepoReach | MemberReach
@@ -67,6 +81,7 @@ class Rule:
     pre_filter: str | None
     blob: str
     origin: RuleOrigin
+    approval: RuleApproval
 
 
 class RuleValidationError(ValueError):
@@ -125,6 +140,15 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
         if candidates is not None and candidates.surface == "unclassified":
             raise RuleValidationError(path, "classified rule's candidates.surface must be whole or partial")
 
+    approval: RuleApproval = UserApproves()
+    declared_approval = _scalar(metadata, "approval", path)
+    if declared_approval:
+        if declared_approval != "always":
+            raise RuleValidationError(path, "approval must be always")
+        if family is None:
+            raise RuleValidationError(path, "approval always requires a family")
+        approval = AlwaysApproved(family)
+
     pre_filter = style_rules.read_pre_filter(path) or None
     if tier == "B" and candidates is None and pre_filter is None:
         raise RuleValidationError(path, "tier B requires candidates or pre_filter")
@@ -148,6 +172,7 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
         pre_filter=pre_filter,
         blob=blob,
         origin=origin,
+        approval=approval,
     )
 
 
