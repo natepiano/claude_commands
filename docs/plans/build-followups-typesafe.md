@@ -90,18 +90,18 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 ### Cost, key, data
 
 - One full pass is about 450 issues × about 4k input tokens (state plus about 25 questions) × 2 requests, or about 3.6M tokens. That costs about $0.15. Phase 3 tuning should stay under $5.
-- The key is read from `TYPESAFE_API_KEY`, or else from `~/.config/typesafe/key.gpg` through gpg-agent, the same way `gh`'s token is stored. natedev adds the file to the nixos repo.
+- The key is already on both machines, encrypted at `~/.config/typesafe/token.gpg` (nixos a289e23, `modules/common/typesafe.nix`). Every live call runs as `with-typesafe <cmd>`. That nixos command decrypts the key through gpg-agent and sets `TYPESAFE_API_KEY` for that one command only. The scorer reads only that variable. No code, log, payload or message reads, prints or stores the key. If the variable is missing, the scorer stops with an error that names `with-typesafe`. If gpg-agent is cold, `with-typesafe` fails, and the user runs `github-warmup`.
 - The data sent is the title and body of each non-style issue, including the business, investor, legal and financial notes. TypeSafe states that it does not train on requests. Zero data retention is offered only on enterprise plans.
 
 ### Questions for the user (needed before Phase 1's live call)
 
-1. A TypeSafe API key, and a go to send issue titles and bodies to TypeSafe on a standard plan.
+1. A go to send issue titles and bodies to TypeSafe on a standard plan. The key is in place.
 2. A budget for experiments. The proposal is $20, about four times the expected need.
 3. A human ceiling. Studies find a large share of human issue labels are wrong; Herzig et al. found 33.8% of issue reports misclassified. Will you re-rate 30 issues blind, about 20 minutes, so we know how often you agree with your earlier ratings? Recommended: yes. Without it, a Jev score of "70% exact" has nothing to compare against.
 
 ### Resource for other sessions
 
-`typesafe-unit` stays on to answer other sessions' TypeSafe questions. Phase 5 writes `docs/typesafe.md` so the knowledge outlasts this session: how to reach the key, how to reuse the client, the `questions.py` pattern, and the measured lessons from Phase 3. Those lessons cover which wordings won, the order-bias results, threshold values, and where Jev was wrong.
+`typesafe-unit` stays on to answer other sessions' TypeSafe questions. Phase 5 writes `docs/typesafe.md` so the knowledge outlasts this session: how to run a command under `with-typesafe`, how to reuse the client, the `questions.py` pattern, and the measured lessons from Phase 3. Those lessons cover which wordings won, the order-bias results, threshold values, and where Jev was wrong.
 
 ## Delegation Context
 
@@ -127,7 +127,8 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
   - A failed API call is an error, never an answer.
   - All question text, criteria, option names and thresholds live in `questions.py`.
   - Current field values are never sent in the state.
-  - Live API calls only after the user's key and go (Questions for the user 1–2), and only within the budget.
+  - Live API calls only after the user's go (Questions for the user 1–2), only within the budget, and always as `with-typesafe <cmd>`.
+  - The key is never read, printed, logged or stored. Code sees it only as `TYPESAFE_API_KEY` in its own environment.
 
 ## Phases
 
@@ -138,7 +139,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Goal:** `score_issues.py score [--only <glob>] [--limit N]` scores open non-style issues and writes one JSONL result per issue to `~/.local/state/issue-score/runs/<run-id>.jsonl`.
 
 **Spec:**
-- `client.py`: `system_one(state, questions, model) -> Response`. Uses `urllib`, gzip body, and `Authorization: Bearer <key>`. The key comes from `TYPESAFE_API_KEY`, or else from `gpg --quiet --decrypt ~/.config/typesafe/key.gpg`. Retries 429/529 with exponential backoff, following `retry-after` when present, for at most 5 attempts. Any other non-2xx raises `TypeSafeError` with the status and body. Typed `TypedDict`s describe the Noul, Choice and Score answers, following the response shapes on the API page. No `Any`.
+- `client.py`: `system_one(state, questions, model) -> Response`. Uses `urllib`, gzip body, and `Authorization: Bearer <key>`. The key comes only from `TYPESAFE_API_KEY`, which `with-typesafe` sets. If it is missing, raise `TypeSafeError("TYPESAFE_API_KEY not set: run under with-typesafe")`. The client never decrypts the key itself, and it never puts the key in a log, a payload record or an error message. Retries 429/529 with exponential backoff, following `retry-after` when present, for at most 5 attempts. Any other non-2xx raises `TypeSafeError` with the status and body. Typed `TypedDict`s describe the Noul, Choice and Score answers, following the response shapes on the API page. No `Any`.
 - `vault.py`: `Issue` dataclass (path, title, project, body, labels), with labels parsed from the frontmatter: goal, the four stars, category, area. `load_open_issues()` and `load_rated_issues()` skip style issues and directories. `clean_body()` reduces `[[a|b]]` to `b` and `[[a]]` to `a`, then applies the 24,000-character cap at a heading. `normalize_area()` strips quotes, `[[ ]]` and case. `area_vocabulary()` returns the sorted, deduplicated normalized areas of non-style issues.
 - `questions.py`: `QUESTION_SET_VERSION`; `PROJECT_ABOUT` (one line per project in `/issue`'s mapping table, from each repo's README); and builders for the main request and the area request, exactly as in the Design table. Option names describe content. Levels are situations. Each Noul's `false` criterion is a concrete situation. The five rubric levels come from `commands/issue.md` step 4, rewritten as situations.
 - `decide.py`: median level; split detection (two non-neighbor levels each ≥ 0.25); averaging of the two-order Choice; the urgency table, which never returns 5 and sets a `possible_five` flag; and `sure`/`unsure` per field from `THRESHOLDS` in `questions.py`, every field starting at 0.6.
@@ -152,7 +153,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Constraints from prior phases:** none.
 
-**Acceptance gate:** the merge gate is green; `basedpyright scripts/issue_score` prints `0 errors, 0 warnings`; and, once the user has given the key and the go, `score --limit 5` writes 5 result lines on the live API, and the unit director reads each one.
+**Acceptance gate:** the merge gate is green; `basedpyright scripts/issue_score` prints `0 errors, 0 warnings`; and, once the user has given the go, `with-typesafe ~/.claude/scripts/lib/py scripts/issue_score/score_issues.py score --limit 5` writes 5 result lines on the live API, and the unit director reads each one.
 
 ### Phase 2 — the `compare` report  · status: todo
 
@@ -219,7 +220,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 **Goal:** `docs/typesafe.md` lets any session use TypeSafe here without this unit.
 
 **Spec:** in STE, under 150 lines:
-- where the key lives, and the data rule (what may be sent);
+- that live calls run as `with-typesafe <cmd>`, that the key is never read or printed, and the data rule (what may be sent);
 - how to reuse `scripts/issue_score/client.py`;
 - the `questions.py` pattern (all wording in one module, model pinned, payloads logged);
 - the skill's core rules, with links to the live docs;
