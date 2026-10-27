@@ -99,6 +99,23 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 2. A budget for experiments. The proposal is $20, about four times the expected need.
 3. A human ceiling. Studies find a large share of human issue labels are wrong; Herzig et al. found 33.8% of issue reports misclassified. Will you re-rate 30 issues blind, about 20 minutes, so we know how often you agree with your earlier ratings? Recommended: yes. Without it, a Jev score of "70% exact" has nothing to compare against.
 
+### Review decisions (the user, 2026-10-26, /adhoc_review)
+
+1. **Data: send all of it.** The title, project and body of every non-style issue may go to TypeSafe on a standard plan, business, investor and legal notes included. The user added: "we did create a bunch of proposals at a deafult level (which is still happening because we don't have jev in use yet) so we can't use those to determine anything". Default-rated proposals are therefore not labels, and they are left out of tuning and evaluation.
+
+   The style unit's answer (2026-10-26) fixes the label filter in `vault.py`:
+   - No code writes defaults into frontmatter. A style proposal is filed with the five fields empty and a `Proposed ranking:` body line. That line comes from a formula in `scripts/style/style_proposals.py` (`proposed_ranking()` ~:204, `project_goal()` ~:189):
+     - goal: the project's most common goal among open non-style issues, falling back to `1 - Ship Hana`;
+     - alignment ⭐⭐;
+     - impact ⭐ for a rename, ⭐⭐ otherwise;
+     - urgency ⭐;
+     - effort ⭐ for ≤ 3 findings, ⭐⭐ for ≤ 15, ⭐⭐⭐ for more.
+   - The `stars` verb of `scripts/production/proposal_issue.py` writes the five fields when the user confirms a proposal on review, and deletes the line. Empty fields plus a `Proposed ranking:` line mean not rated.
+   - All 86 rated style issues match the formula exactly. Frontmatter cannot tell an accepted proposal from a copied default.
+   - **Rule:** a style issue (`style_rule:` or `style_rules:` set) is a label only when its values differ from the formula. Every other style issue is left out.
+   - A non-style issue with a `Proposed ranking:` line is unrated (12 open now): its values are the filer's judgment, not yet confirmed. Non-style proposals rated through `stars` (tool-based-ui, research-unit and others) were confirmed by the user, so they count as labels.
+   - Scoring style issues is not in this plan. Their state lives in frontmatter fields, not in a body.
+
 ### Resource for other sessions
 
 `typesafe-unit` stays on to answer other sessions' TypeSafe questions. Phase 5 writes `docs/typesafe.md` so the knowledge outlasts this session: how to run a command under `with-typesafe`, how to reuse the client, the `questions.py` pattern, and the measured lessons from Phase 3. Those lessons cover which wordings won, the order-bias results, threshold values, and where Jev was wrong.
@@ -140,7 +157,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Spec:**
 - `client.py`: `system_one(state, questions, model) -> Response`. Uses `urllib`, gzip body, and `Authorization: Bearer <key>`. The key comes only from `TYPESAFE_API_KEY`, which `with-typesafe` sets. If it is missing, raise `TypeSafeError("TYPESAFE_API_KEY not set: run under with-typesafe")`. The client never decrypts the key itself, and it never puts the key in a log, a payload record or an error message. Retries 429/529 with exponential backoff, following `retry-after` when present, for at most 5 attempts. Any other non-2xx raises `TypeSafeError` with the status and body. Typed `TypedDict`s describe the Noul, Choice and Score answers, following the response shapes on the API page. No `Any`.
-- `vault.py`: `Issue` dataclass (path, title, project, body, labels), with labels parsed from the frontmatter: goal, the four stars, category, area. `load_open_issues()` and `load_rated_issues()` skip style issues and directories. `clean_body()` reduces `[[a|b]]` to `b` and `[[a]]` to `a`, then applies the 24,000-character cap at a heading. `normalize_area()` strips quotes, `[[ ]]` and case. `area_vocabulary()` returns the sorted, deduplicated normalized areas of non-style issues.
+- `vault.py`: `Issue` dataclass (path, title, project, body, labels), with labels parsed from the frontmatter: goal, the four stars, category, area. `load_open_issues()` skips style issues and directories. `load_rated_issues()` also skips any issue with a `Proposed ranking:` body line, and it keeps a style issue only when its five values differ from the style formula (Review decisions 1). It returns each skipped path with its reason, so the report can show the count. `clean_body()` reduces `[[a|b]]` to `b` and `[[a]]` to `a`, then applies the 24,000-character cap at a heading. `normalize_area()` strips quotes, `[[ ]]` and case. `area_vocabulary()` returns the sorted, deduplicated normalized areas of non-style issues.
 - `questions.py`: `QUESTION_SET_VERSION`; `PROJECT_ABOUT` (one line per project in `/issue`'s mapping table, from each repo's README); and builders for the main request and the area request, exactly as in the Design table. Option names describe content. Levels are situations. Each Noul's `false` criterion is a concrete situation. The five rubric levels come from `commands/issue.md` step 4, rewritten as situations.
 - `decide.py`: median level; split detection (two non-neighbor levels each ≥ 0.25); averaging of the two-order Choice; the urgency table, which never returns 5 and sets a `possible_five` flag; and `sure`/`unsure` per field from `THRESHOLDS` in `questions.py`, every field starting at 0.6.
 - `score_issues.py score`: runs the main and area requests per issue, 8 issues at a time. The result line holds the issue path, a content hash, `QUESTION_SET_VERSION`, the model that answered, both payloads, every answer and the decided fields. It reuses a cached line when the hash, version and model all match.
