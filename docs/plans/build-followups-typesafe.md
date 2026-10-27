@@ -1,6 +1,6 @@
 # typesafe
 
-> **Status: IMPLEMENTATION PLAN — phased, direct-ready; design up for the user's review.** A script that has TypeSafe's Jev score each hanadocs issue field, measured against the values the vault holds now, and then used by `/issue` to propose fields for a new issue.
+> **Status: IMPLEMENTATION PLAN — phased, direct-ready; approved by the user 2026-10-26.** A script that has TypeSafe's Jev score each hanadocs issue field, measured against the values the vault holds now, and then used by `/issue` to propose fields for a new issue.
 
 > **Production: build-followups** — unit `typesafe-unit`; production doc `docs/plans/build-followups-production.md`
 
@@ -119,6 +119,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 2. **Budget: $20.** The user: "i am happy to add $20 to jev". The scorer keeps a running total from each response's `usage.input_tokens` at $0.042 per million. It stops before a request that would pass $20, and asks the user before it spends more.
 3. **Open issues only.** The user: "we only need to score open issues - not closed". `score`, `compare` and `reassess` read open issues only, and closed issues are not labels either.
 4. **Baseline: blind preference.** The user: "blind preference for our teating". In Phase 3, about 20 held-out issues where Jev and the vault disagree are shown to the user. Each issue shows its two values as A and B, in random order, with no label saying which is Jev's. The user picks A, B or same. The share of picks for Jev decides how far the reassessment trusts Jev. This replaces the blind re-rating.
+5. **Plan approved.** The user: "approve" (2026-10-26). `/unit:direct` starts at Phase 1.
 
 ### Resource for other sessions
 
