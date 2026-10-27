@@ -14,6 +14,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from typing import cast, final, override
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, plan_history  # noqa: E402
@@ -289,6 +290,144 @@ class PhaseRepairTests(unittest.TestCase):
             with self.subTest(option=option):
                 self.assertEqual(self.repair(option, "forged").returncode, 2)
                 self.assertFalse((self.directory / phase_reservation.STATE_FILE).exists())
+
+
+HELD_BERTH = r'''#!__PYTHON__
+import json, os, subprocess, sys
+with open(os.environ["HELD_BERTH_LOG"], "a") as log:
+    log.write(json.dumps([os.getcwd(), *sys.argv[1:]]) + "\n")
+board = json.load(open(os.environ["HELD_BOARD"]))
+if sys.argv[1] == "release":
+    if board.get("refuse"):
+        print(json.dumps({"message": "ledger busy"}))
+        sys.exit(6)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    board[sys.argv[2]] = {"status": "outstanding", "protected_tip": head}
+    json.dump(board, open(os.environ["HELD_BOARD"], "w"))
+    print(json.dumps({"payload": {"data": {"status": "checkpointed"}}}))
+else:
+    print(json.dumps({"payload": {"data": {"lifecycle": board.get(sys.argv[3], {"status": "active"})}}}))
+'''
+
+
+@final
+class HeldForTicketTests(unittest.TestCase):
+    """A style ticket's checkpoint keeps its reservation, and `release-held` releases it at the ticket's merge."""
+
+    root: Path = Path()
+    repo: Path = Path()
+    session: Path = Path()
+    checkpoint: str = ""
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.repo = self.root / "unit worktree"
+        self.repo.mkdir()
+        _ = subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
+        self.checkpoint = self.commit("checkpoint")
+        self.session = self.root / "unit session"
+        phase_reservation._write_state(phase_reservation.phase_directory(self.session, "34h"), ACTIVE)  # pyright: ignore[reportPrivateUsage]
+        binary = self.root / "bin"
+        binary.mkdir()
+        berth = binary / "cargo-berth"
+        _ = berth.write_text(HELD_BERTH.replace("__PYTHON__", sys.executable))
+        berth.chmod(0o755)
+        self.board({})
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
+            "HELD_BERTH_LOG": str(self.root / "berth.log"), "HELD_BOARD": str(self.root / "board.json")})))
+
+    def commit(self, message: str) -> str:
+        _ = subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                            "commit", "-q", "--allow-empty", "-m", message], check=True, capture_output=True)
+        return subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def board(self, lifecycles: dict[str, object]) -> None:
+        _ = (self.root / "board.json").write_text(json.dumps(lifecycles))
+
+    def berth_calls(self) -> list[list[str]]:
+        log = self.root / "berth.log"
+        return [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def run_verb(self, *arguments: str) -> tuple[int, str, str]:
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = phase_reservation.main([*arguments, "--session-dir", str(self.session), "--phase", "34h"])
+        return code, output.getvalue(), errors.getvalue()
+
+    def state(self) -> dict[str, object]:
+        return phase_reservation.read_state(phase_reservation.phase_directory(self.session, "34h"))
+
+    def hold(self) -> None:
+        self.assertEqual(self.run_verb("committed", "--commit", self.checkpoint, "--ticket", "names-1", "--repo",
+                                       str(self.repo))[0], 0)
+
+    def test_a_style_checkpoint_keeps_the_reservation_until_its_ticket_merge_releases_it(self) -> None:
+        self.hold()
+        self.assertEqual(self.state(), {"kind": phase_reservation.PENDING, phase_reservation.PENDING_FIELD: {
+            **cast(dict[str, object], ACTIVE["active_phase_reservation"]), "checkpoint_commit": self.checkpoint,
+            "held_for_ticket": "names-1", "worktree": str(self.repo)}})
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual(self.run_verb("release-held", "--ticket", "names-1"), (0, "phase 34h: released reservation r1\n", ""))
+        self.assertIn([str(self.repo), "release", "r1", "--json"], self.berth_calls())
+        self.assertEqual(self.state(), {})
+        phase_dir = phase_reservation.phase_directory(self.session, "34h")
+        self.assertEqual((phase_dir / phase_reservation.RELEASED_FILE).read_text(), self.checkpoint + "\n")
+        calls = self.berth_calls()
+        # A repeated merge finds no held reservation and calls berth no more.
+        self.assertEqual(self.run_verb("release-held", "--ticket", "names-1"),
+                         (0, "phase 34h: no reservation held for ticket names-1\n", ""))
+        self.assertEqual(self.berth_calls(), calls)
+
+    def test_another_tickets_merge_and_a_plain_checkpoint_release_nothing(self) -> None:
+        self.hold()
+        self.assertEqual(self.run_verb("release-held", "--ticket", "names-2")[:2],
+                         (0, "phase 34h: no reservation held for ticket names-2\n"))
+        self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
+        phase_reservation._write_state(phase_reservation.phase_directory(self.session, "34h"), ACTIVE)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.run_verb("committed", "--commit", self.checkpoint), (0, f"phase 34h: {phase_reservation.PENDING}\n", ""))
+        # Every other unit's checkpoint writes the pending state as before, and ticket merge never releases it.
+        self.assertEqual(self.state(), {"kind": phase_reservation.PENDING, phase_reservation.PENDING_FIELD: {
+            **cast(dict[str, object], ACTIVE["active_phase_reservation"]), "checkpoint_commit": self.checkpoint}})
+        self.assertEqual(self.run_verb("release-held", "--ticket", "names-1")[0], 0)
+        self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
+        self.assertEqual(self.berth_calls(), [])
+
+    def test_a_worktree_off_its_checkpoint_keeps_the_reservation_held(self) -> None:
+        self.hold()
+        moved = self.commit("later")
+        code, _, errors = self.run_verb("release-held", "--ticket", "names-1")
+        self.assertEqual(code, 2)
+        self.assertIn(f"is at {moved[:7]}, not checkpoint {self.checkpoint[:7]}; reservation r1 stays held", errors)
+        self.assertNotIn("release", [call[1] for call in self.berth_calls()])
+        self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
+
+    def test_a_release_berth_does_not_confirm_keeps_the_reservation_held(self) -> None:
+        self.hold()
+        self.board({"refuse": True})
+        code, _, errors = self.run_verb("release-held", "--ticket", "names-1")
+        self.assertEqual(code, 2)
+        self.assertIn(f"berth did not release reservation r1 at checkpoint {self.checkpoint[:7]}: ledger busy", errors)
+        self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
+        # A checkpoint berth holds at another tip is another release: this one is not made.
+        self.board({"r1": {"status": "outstanding", "protected_tip": "c" * 40}})
+        code, _, errors = self.run_verb("release-held", "--ticket", "names-1")
+        self.assertEqual(code, 2)
+        self.assertIn(f"berth shows reservation r1 outstanding, not active or released at checkpoint {self.checkpoint[:7]}", errors)
+        self.assertEqual(self.state()["kind"], phase_reservation.PENDING)
+        self.assertEqual([call[1] for call in self.berth_calls()].count("release"), 1)
+
+    def test_a_release_an_earlier_merge_made_is_confirmed_without_another(self) -> None:
+        for status in ("outstanding", "released_after_checkpoint"):
+            with self.subTest(status=status):
+                phase_reservation._write_state(phase_reservation.phase_directory(self.session, "34h"), ACTIVE)  # pyright: ignore[reportPrivateUsage]
+                self.hold()
+                self.board({"r1": {"status": status, "protected_tip": self.checkpoint}})
+                self.assertEqual(self.run_verb("release-held", "--ticket", "names-1")[0], 0)
+                self.assertEqual(self.state(), {})
+        self.assertEqual({call[1] for call in self.berth_calls()}, {"board"})
 
 
 if __name__ == "__main__":

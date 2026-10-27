@@ -21,7 +21,10 @@ so no session writes it by hand: `enroll` writes the first state from the `/sync
 and keeps that answer in the phase's `board_result`, `repair` restores a lost record from
 berth's session map after the recorder confirms the phase is open and its board confirms the reservation is active, `committed` turns
 `Active` into the pending release, and `clear` removes an inactive state, or a pending one once its release names the
-same checkpoint commit and leaves `reservation_released`. Released phases take no part in edit
+same checkpoint commit and leaves `reservation_released`. A style ticket's checkpoint passes
+`committed --ticket`: the pending state then names the ticket and the unit's worktree, step 7 of
+<CheckpointCommit/> releases nothing, and `release-held`, run by `style_ledger.py ticket merge`,
+releases the reservation from that worktree and clears the record. Released phases take no part in edit
 attribution or lost-record repair while their plan review finishes. A recorder-open phase with no
 state file and no berth mapping of its own was never enrolled, as FinalGate's `final` phase, and is
 no lost record: its edits check under the bare session id. The hook reads the recorder's
@@ -66,6 +69,12 @@ AWAITING_FIRST_TOUCH = "enrolled_awaiting_first_touch"
 ACTIVE = "active"
 NOT_ENROLLED = "repository_not_enrolled"
 PENDING = "checkpoint_committed_awaiting_release_confirmation"
+PENDING_FIELD = "checkpoint_release_confirmation_pending"
+# The style ticket whose merge releases a pending reservation, and the worktree that release runs in.
+HELD_FOR_TICKET = "held_for_ticket"
+WORKTREE = "worktree"
+# Lifecycles of a reservation released at a checkpoint; `protected_tip` names that checkpoint.
+CHECKPOINT_RELEASED = frozenset({"outstanding", "released_after_checkpoint"})
 HOLDS_RESERVATION = frozenset({ACTIVE, PENDING})
 # The phase's kept `/sync board` answer, and the first state each answer writes.
 BOARD_RESULT_FILE = "board_result"
@@ -388,13 +397,20 @@ def restore(phase_dir: Path, phase: str) -> str:
     return enroll(phase_dir, phase, board)
 
 
-def committed(phase_dir: Path, commit: str) -> None:
-    """Replace `Active` with the pending release state that names the checkpoint commit."""
+def committed(phase_dir: Path, commit: str, ticket: str = "", worktree: Path | None = None) -> None:
+    """Replace `Active` with the pending release state that names the checkpoint commit.
+
+    With a style ticket, the state also names the ticket and the worktree: the reservation stays held
+    until `release-held` runs at that ticket's merge."""
     state = read_state(phase_dir)
     if _string(state.get("kind")) != ACTIVE:
         raise StateRefused(f"the phase is {_string(state.get('kind')) or 'not open'}, not active")
     pending = {**_object(state.get("active_phase_reservation")), "checkpoint_commit": commit}
-    _write_state(phase_dir, {"kind": PENDING, "checkpoint_release_confirmation_pending": pending})
+    if ticket:
+        if worktree is None:
+            raise StateRefused(f"ticket {ticket} needs the worktree its merge releases from")
+        pending |= {HELD_FOR_TICKET: ticket, WORKTREE: str(worktree)}
+    _write_state(phase_dir, {"kind": PENDING, PENDING_FIELD: pending})
 
 
 def clear(phase_dir: Path, released: str = "") -> bool:
@@ -408,7 +424,7 @@ def clear(phase_dir: Path, released: str = "") -> bool:
     if not kind:
         return False
     if kind == PENDING:
-        commit = _string(_object(state.get("checkpoint_release_confirmation_pending")).get("checkpoint_commit"))
+        commit = _string(_object(state.get(PENDING_FIELD)).get("checkpoint_commit"))
         if not released or released != commit:
             raise StateRefused(f"the pending release names checkpoint {commit}; pass --released {commit} after its release")
     elif kind not in BOARD_STATES.values():
@@ -450,17 +466,63 @@ def _write_active(phase_dir: Path, phase: str, acquisition: Acquisition) -> None
     _write_state(phase_dir, active)
 
 
+def _berth(root: Path, *arguments: str) -> dict[str, object]:
+    """cargo-berth's JSON answer to the command; empty when it cannot run or answers no JSON."""
+    try:
+        result = subprocess.run(["cargo-berth", *arguments, "--json"], cwd=root, capture_output=True, text=True,
+                                check=False, stdin=subprocess.DEVNULL, timeout=CHECK_TIMEOUT_SECONDS)
+        return _object(cast(object, json.loads(result.stdout)))
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return {}
+
+
+def _lifecycle(root: Path, reservation_id: str) -> dict[str, object]:
+    return _object(_object(_object(_berth(root, "board", "--reservation", reservation_id).get("payload")).get("data"))
+                   .get("lifecycle"))
+
+
 def lifecycle(root: Path, reservation_id: str) -> str:
     """The reservation's lifecycle status on berth's live board, such as `active`; empty when the
     board cannot be read."""
-    try:
-        result = subprocess.run(["cargo-berth", "board", "--reservation", reservation_id, "--json"], cwd=root,
-                                capture_output=True, text=True, check=False, stdin=subprocess.DEVNULL,
-                                timeout=CHECK_TIMEOUT_SECONDS)
-        envelope = _object(cast(object, json.loads(result.stdout)))
-    except (OSError, subprocess.TimeoutExpired, ValueError):
+    return _string(_lifecycle(root, reservation_id).get("status"))
+
+
+def _released_at(found: dict[str, object], commit: str) -> bool:
+    """Whether a lifecycle from berth's board shows the reservation released at this checkpoint commit."""
+    return _string(found.get("status")) in CHECKPOINT_RELEASED and _string(found.get("protected_tip")) == commit
+
+
+def release_held(phase_dir: Path, ticket: str) -> str:
+    """Release the reservation the phase's checkpoint kept for this ticket's merge, and clear the record.
+
+    Returns the released reservation id, or '' when the phase holds none for the ticket, so a repeated
+    merge changes nothing. A release an earlier run made is confirmed on the board, not made again;
+    only an `active` reservation is released. berth's release snapshots its worktree's HEAD, so a
+    worktree that moved off the checkpoint keeps the reservation held, as does a board that shows
+    another lifecycle or does not confirm the release."""
+    state = read_state(phase_dir)
+    pending = _object(state.get(PENDING_FIELD))
+    if _string(state.get("kind")) != PENDING or _string(pending.get(HELD_FOR_TICKET)) != ticket:
         return ""
-    return _string(_object(_object(_object(envelope.get("payload")).get("data")).get("lifecycle")).get("status"))
+    reservation = _string(pending.get("reservation_id"))
+    commit = _string(pending.get("checkpoint_commit"))
+    worktree = Path(_string(pending.get(WORKTREE)))
+    found = _lifecycle(worktree, reservation)
+    if not _released_at(found, commit):
+        if _string(found.get("status")) != ACTIVE:
+            raise StateRefused(f"berth shows reservation {reservation} {_string(found.get('status')) or 'unreadable'}, "
+                               + f"not active or released at checkpoint {commit[:7]}; it stays held")
+        head = subprocess.run(["git", "-C", str(worktree), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=False).stdout.strip()
+        if head != commit:
+            raise StateRefused(f"{worktree} is at {head[:7] or 'no commit'}, not checkpoint {commit[:7]}; "
+                               + f"reservation {reservation} stays held")
+        answer = _berth(worktree, "release", reservation)
+        if not _released_at(_lifecycle(worktree, reservation), commit):
+            raise StateRefused(f"berth did not release reservation {reservation} at checkpoint {commit[:7]}: "
+                               + (_string(answer.get("message")) or "no answer") + "; it stays held")
+    _ = clear(phase_dir, commit)
+    return reservation
 
 
 def repair_command(session_dir: Path, phase: str, root: Path) -> str:
@@ -668,14 +730,18 @@ def main(argv: list[str]) -> int:
     _ = enrolled.add_argument("--board", required=True, choices=tuple(BOARD_STATES))
     done = commands.add_parser("committed", help="replace Active with the pending release of a checkpoint commit")
     _ = done.add_argument("--commit", required=True)
+    _ = done.add_argument("--ticket", default="", help="a style ticket whose merge releases the reservation")
+    _ = done.add_argument("--repo", default=".")
     cleared = commands.add_parser("clear", help="delete a phase's state that owns no reservation, or a confirmed release")
     _ = cleared.add_argument("--released", default="")
-    for each in (enrolled, done, cleared):
+    held = commands.add_parser("release-held", help="release the reservation a style ticket's checkpoint kept, at its merge")
+    _ = held.add_argument("--ticket", required=True)
+    for each in (enrolled, done, cleared, held):
         _ = each.add_argument("--session-dir", required=True)
         _ = each.add_argument("--phase", required=True)
     args = parser.parse_args(argv)
     command = cast(str, args.command)
-    if command in ("enroll", "committed", "clear"):
+    if command in ("enroll", "committed", "clear", "release-held"):
         return _state_command(command, args)
     if command == "repair":
         return _repair_command(args)
@@ -689,8 +755,14 @@ def _state_command(command: str, args: argparse.Namespace) -> int:
         if command == "enroll":
             print(f"phase {phase}: {enroll(phase_dir, phase, cast(str, args.board))}")
         elif command == "committed":
-            committed(phase_dir, cast(str, args.commit))
-            print(f"phase {phase}: {PENDING}")
+            ticket = cast(str, args.ticket)
+            committed(phase_dir, cast(str, args.commit), ticket, repository_root(Path(cast(str, args.repo))) if ticket else None)
+            print(f"phase {phase}: {PENDING}" + (f", held for ticket {ticket}" if ticket else ""))
+        elif command == "release-held":
+            ticket = cast(str, args.ticket)
+            reservation = release_held(phase_dir, ticket)
+            print(f"phase {phase}: released reservation {reservation}" if reservation
+                  else f"phase {phase}: no reservation held for ticket {ticket}")
         else:
             print(f"phase {phase}: {'cleared' if clear(phase_dir, cast(str, args.released)) else 'no state to clear'}")
     except StateRefused as refused:

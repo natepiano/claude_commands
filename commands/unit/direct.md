@@ -856,7 +856,8 @@ durable before dispatch. The verbs:
 | Initial state from `/sync board` | `phase_reservation.py enroll --session-dir "${SESSION_DIR}" --phase <id> --board <board_ready\|unconfigured>` |
 | First touch to `Active` | The Codex seat hook, or `phase_reservation.py record-active` at <CheckpointCommit/> step 5 |
 | Lost open phase record | `phase_reservation.py repair --session-dir "${SESSION_DIR}" --phase <id> --repo <repository>` requires a recorder-open phase, validates berth's mapped reservation on its live board and restores `Active` from the phase baseline; no live reservation exits 2 with enroll/claim commands. A finished phase exits 2 with `progress_history.py start-phase` to reopen it; a checkpoint-released phase refuses repair. |
-| `Active` to pending release | `phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <id> --commit <checkpoint commit>` |
+| `Active` to pending release | `phase_reservation.py committed --session-dir "${SESSION_DIR}" --phase <id> --commit <checkpoint commit>`; a style ticket adds `--ticket <ticket>`, and the record then also names the ticket and the worktree, so the reservation stays held until that ticket's merge |
+| Held reservation released at ticket merge | `style_ledger.py ticket merge` runs `phase_reservation.py release-held --session-dir <run> --phase <id> --ticket <ticket>`: it releases an `active` reservation from the recorded worktree at the checkpoint, confirms it on the board and clears the record as `clear --released` does; a record not held for that ticket is a no-op, and a moved worktree or an unconfirmed release exits 2 and keeps it |
 | Pending release confirmed | `phase_reservation.py clear --session-dir "${SESSION_DIR}" --phase <id> --released <checkpoint commit>` leaves `reservation_released` with the commit; the phase leaves edit attribution while its plan review finishes. |
 | Inactive state at phase end | `progress_history.py finish-phase --status completed` |
 | A finished phase reopened | `progress_history.py start-phase` on that phase id restores its enrolled state from the board answer that `enroll` kept |
@@ -869,6 +870,7 @@ leaves that state as it is. The domain states and on-disk shapes are:
 {"kind":"enrolled_awaiting_first_touch","phase":"<phase>"}
 {"kind":"active","active_phase_reservation":{"reservation_id":"<id>","coordination_run_id":"<uuid-v7>","phase":"<phase>","phase_start_head":"<full object id>"}}
 {"kind":"checkpoint_committed_awaiting_release_confirmation","checkpoint_release_confirmation_pending":{"reservation_id":"<id>","coordination_run_id":"<uuid-v7>","phase":"<phase>","phase_start_head":"<full object id>","checkpoint_commit":"<full object id>"}}
+{"kind":"checkpoint_committed_awaiting_release_confirmation","checkpoint_release_confirmation_pending":{"reservation_id":"<id>","coordination_run_id":"<uuid-v7>","phase":"<phase>","phase_start_head":"<full object id>","checkpoint_commit":"<full object id>","held_for_ticket":"<ticket>","worktree":"<unit worktree>"}}
 ```
 
 | State | Created only from | Lifecycle |
@@ -876,7 +878,7 @@ leaves that state as it is. The domain states and on-disk shapes are:
 | `RepositoryNotEnrolled` | `/sync board` returning `unconfigured` | Owns no reservation; supplies no release argument. |
 | `EnrolledAwaitingFirstTouch` | `/sync board` returning `board_ready` | The registered edit hook still owns first-touch acquisition; supplies no release argument. |
 | `Active` | A clear check that acquired or already held the scopes: the Codex seat hook, or the checkpoint backstop for a first touch no hook recorded. A later clear check that names another reservation of the same phase replaces it, as after berth released the recorded one. `repair` may restore it from berth's session map only after the board confirms it is active | Copies the returned reservation and coordination-run ids, phase, and protected phase-start HEAD; supplies a release argument. |
-| `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. |
+| `CheckpointCommittedAwaitingReleaseConfirmation` | <CheckpointCommit/> step 6, atomically replacing `Active` once that step's commit succeeds | Copies the active fields plus the full object id captured immediately from that commit; supplies a release argument, and resumes only at release confirmation. A style ticket's record also names the ticket and the worktree; it supplies no release argument, and only `release-held` at that ticket's merge releases it. |
 
 These are
 `PhaseReservationState::{RepositoryNotEnrolled,
@@ -1646,7 +1648,7 @@ proposal permits only files of its approved findings. Exit 1 prints `review:`,
 retains the reservation and returns to repair. Exit 2 prints `error:` when the
 gate could not run, such as a locked ledger: retain the reservation and rerun
 it; if the same error comes back, stop and report it. Exit 0 permits committing exactly that tree,
-then `style_ledger.py ticket checkpoint --id <ticket> --commit <code commit>`
+then `style_ledger.py ticket checkpoint --id <ticket> --commit <code commit> --session-dir "${SESSION_DIR}" --phase <phase id>`
 before marking the phase done. Both gates run this one command, so they cannot drift.
 </StandingPlanRefill>
 
