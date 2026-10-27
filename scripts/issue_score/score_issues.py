@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 import sys
 from threading import Event
-from typing import TypedDict, cast
+from typing import cast
 from uuid import uuid4
 
 # Support the documented direct script invocation and package imports in tests.
@@ -21,42 +21,20 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.issue_score import client, decide, questions, vault
+from scripts.issue_score.evaluate import Split, compare, in_split
+from scripts.issue_score.records import FailedIssue, RequestPayload, ScoredIssue, ScoreRun, STATE_DIR
 
-STATE_DIR = Path.home() / ".local/state/issue-score"
 WORKERS = 8
 
 
-class RequestPayload(TypedDict):
-    model: str
-    state: questions.IssueState | questions.AreaState
-    questions: dict[str, questions.Question]
-
-
-class ScoredIssue(TypedDict):
-    issue_path: str
-    content_hash: str
-    question_set_version: str
-    model: str
-    payloads: dict[str, RequestPayload]
-    answers: dict[str, client.Response]
-    decided_fields: dict[str, object]
-
-
-class FailedIssue(TypedDict):
-    issue_path: str
-    error: str
-
-
-@dataclass(frozen=True)
-class ScoreRun:
-    result_path: Path
-    failure_count: int
-
-
-class ScoreArguments(argparse.Namespace):
+class CommandArguments(argparse.Namespace):
     command: str = "score"
     only: str = "*"
     limit: int = 0
+    split: Split = "all"
+    fresh: bool = False
+    run_id: str = ""
+    repeat: str = ""
 
 
 def content_hash(issue: vault.Issue, areas: Sequence[str] = ()) -> str:
@@ -120,7 +98,8 @@ def _score_issue(issue: vault.Issue, areas: list[str], model: str, state_dir: Pa
 
 
 def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DIR,
-          state_dir: Path = STATE_DIR, model: str = questions.MODEL) -> ScoreRun:
+          state_dir: Path = STATE_DIR, model: str = questions.MODEL,
+          split: Split = "all", fresh: bool = False) -> ScoreRun:
     if limit < 0:
         raise ValueError("--limit must be nonnegative")
     state_dir = state_dir.expanduser().resolve()
@@ -128,11 +107,11 @@ def score(only: str = "*", limit: int = 0, *, issues_dir: Path = vault.ISSUES_DI
         raise ValueError("Result files must be outside the issue vault")
     issues = vault.load_open_issues(issues_dir)
     areas = vault.area_vocabulary(issues)
-    selected = [issue for issue in issues if (fnmatch.fnmatch(issue.path.name, only)
+    selected = [issue for issue in issues if in_split(issue.path, split) and (fnmatch.fnmatch(issue.path.name, only)
                 or fnmatch.fnmatch(issue.path.stem, only) or fnmatch.fnmatch(str(issue.path), only))]
     if limit:
         selected = selected[:limit]
-    cache = load_cache(state_dir, model)
+    cache = {} if fresh else load_cache(state_dir, model)
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid4().hex[:8]
     runs = state_dir / "runs"
     runs.mkdir(parents=True, exist_ok=True)
@@ -171,9 +150,18 @@ def main(argv: list[str] | None = None) -> int:
     score_command = commands.add_parser("score", help="Score open non-style issues")
     _ = score_command.add_argument("--only", default="*", help="Issue filename or path glob")
     _ = score_command.add_argument("--limit", type=int, default=0, help="Maximum issues; 0 means all")
-    args = parser.parse_args(argv, namespace=ScoreArguments())
+    _ = score_command.add_argument("--split", choices=("tune", "holdout", "all"), default="all")
+    _ = score_command.add_argument("--fresh", action="store_true", help="Skip cached responses for a repeat run")
+    compare_command = commands.add_parser("compare", help="Compare a saved run with current confirmed labels")
+    _ = compare_command.add_argument("run_id")
+    _ = compare_command.add_argument("--split", choices=("tune", "holdout", "all"), default="all")
+    _ = compare_command.add_argument("--repeat", default="", help="Second run ID for the repeat check")
+    args = parser.parse_args(argv, namespace=CommandArguments())
     try:
-        run = score(args.only, args.limit)
+        if args.command == "compare":
+            print(compare(args.run_id, split=args.split, repeat_run_id=args.repeat))
+            return 0
+        run = score(args.only, args.limit, split=args.split, fresh=args.fresh)
     except (client.TypeSafeError, OSError, ValueError) as error:
         print(f"issue-score: {error}", file=sys.stderr)
         return 1
