@@ -107,6 +107,7 @@ class GateArguments(argparse.Namespace):
     memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB
     module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S
     tests_only: bool = False
+    promote_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -579,7 +580,7 @@ def promote(args: GateArguments) -> None:
     print(result.stdout, end="", flush=True)
     statuses = re.findall(r"^ff_rc=(\d+)\s*$", result.stdout, re.MULTILINE)
     if result.returncode or statuses != ["0"]:
-        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {result.stderr.strip()}")
+        raise GateRefused(f"main promoted to {promoted}; Mac fast-forward failed: ssh exit={result.returncode}, ff_rc={statuses}; {result.stderr.strip()}; the claude-sync job on the Mac retries within 15 minutes")
 
 
 def rollback_merge(repo: Path, baseline: str) -> None:
@@ -752,8 +753,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
+    _ = parser.add_argument("--promote-only", action="store_true",
+                            help="only promote origin/<merge-branch> to main and the Mac (needs --merge-branch)")
     args = cast(GateArguments, parser.parse_args(argv))
-    if not args.tests_only:
+    if args.promote_only and not args.merge_branch:
+        parser.error("--promote-only needs --merge-branch")
+    if not args.tests_only and not args.promote_only:
         required = ("merge_branch", "unit_branch", "checkpoint", "previous_checkpoint", "unit", "phase")
         missing = [name.replace("_", "-") for name in required if not getattr(args, name)]
         if missing:
@@ -763,6 +768,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.tests_only:
                 return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
                                        module_time_limit_s=float(args.module_time_limit_s)).passed else 1
+            if args.promote_only:
+                promote(args)
+                return 0
             return merge_checkpoint(args)
     except (GateRefused, OSError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr, flush=True)

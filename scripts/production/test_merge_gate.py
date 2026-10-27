@@ -307,6 +307,13 @@ class MergeGateTests(unittest.TestCase):
             capture_output=True, text=True, check=False, timeout=300,
         )
 
+    def run_promote_only(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--repo", str(self.checkout), "--merge-branch", "integration",
+             "--promote-only", "--settings-blob", self.settings_blob, "--main-repo", str(self.main),
+             "--ssh", str(self.bin / "ssh")], cwd=self.root, env=self.environment, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, check=False, timeout=300)
+
     def calls(self) -> list[ToolCall]:
         path = self.state / "tools.jsonl"
         return [cast(ToolCall, json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
@@ -974,6 +981,13 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(len(ssh_calls), 1)
         self.assertIn("--ff-only", " ".join(ssh_calls[0]["args"]))
         self.assertIn("ff_rc=", " ".join(ssh_calls[0]["args"]))
+
+    def test_promote_only_promotes_the_pushed_merge_branch_without_a_gate(self) -> None:
+        self.assertEqual(self.run_gate("--promote").returncode, 0)
+        result = self.run_promote_only()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.main, "rev-parse", "HEAD"), self.git(self.origin, "rev-parse", "main"))
+        self.assertEqual(len([call for call in self.calls() if call["tool"] == "ssh"]), 2)
 
     def test_promote_refuses_during_release(self) -> None:
         self.write(self.state / "release-running", "python3 build_hold.py release")
