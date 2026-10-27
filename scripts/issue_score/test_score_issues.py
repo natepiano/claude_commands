@@ -12,11 +12,12 @@ import unittest
 from collections.abc import Mapping
 from email.message import Message
 from pathlib import Path
-from typing import TextIO, cast, override
+from typing import Literal, TextIO, cast, override
 from unittest import mock
 from urllib.request import Request
 
 from scripts.issue_score import client, questions, score_issues
+from scripts.issue_score import records as run_records
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
@@ -66,8 +67,8 @@ class ScoreIssuesTests(unittest.TestCase):
     def score(self, *, only: str = "Target*", limit: int = 0, model: str = "jev-1.14.0") -> Path:
         return score_issues.score(only, limit, issues_dir=self.issues, state_dir=self.state, model=model).result_path
 
-    def records(self, path: Path) -> list[score_issues.ScoredIssue]:
-        return [cast(score_issues.ScoredIssue, json.loads(line)) for line in path.read_text().splitlines()]
+    def records(self, path: Path) -> list[run_records.ScoredIssue]:
+        return [cast(run_records.ScoredIssue, json.loads(line)) for line in path.read_text().splitlines()]
 
     def test_score_persists_both_payloads_all_answers_and_decisions_without_editing_vault(self) -> None:
         target = self.issue("Target graph")
@@ -117,6 +118,79 @@ class ScoreIssuesTests(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(self.records(first), self.records(second))
         self.assertEqual((self.state / "spend.jsonl").read_bytes(), ledger_before)
+
+    def test_tune_cli_never_sends_a_holdout_issue(self) -> None:
+        tune = self.issue("Target A")  # SHA1(filename) % 10 == 1.
+        _ = self.issue("Target G", area="tooling")  # Residue 8: holdout.
+        requested_titles: list[str] = []
+        original_score = score_issues.score
+
+        def isolated_score(only: str = "*", limit: int = 0, *,
+                           split: Literal["tune", "holdout", "all"] = "all",
+                           fresh: bool = False) -> run_records.ScoreRun:
+            return original_score(only, limit, split=split, fresh=fresh,
+                                  issues_dir=self.issues, state_dir=self.state)
+
+        def observed_replay(request: Request, timeout: float = 60) -> FixtureHTTPResponse:
+            payload = cast(dict[str, object], json.loads(gzip.decompress(cast(bytes, request.data))))
+            state = cast(questions.IssueState, payload["state"])
+            requested_titles.append(state["issue"]["title"])
+            return self.replay(request, timeout)
+
+        stdout = io.StringIO()
+        with mock.patch.object(score_issues, "score", side_effect=isolated_score), \
+                mock.patch.object(client, "urlopen", side_effect=observed_replay), \
+                contextlib.redirect_stdout(stdout):
+            code = score_issues.main(["score", "--split", "tune"])
+        self.assertEqual(code, 0)
+        self.assertEqual(requested_titles, [tune.stem, tune.stem])
+        self.assertEqual([row["issue_path"] for row in self.records(Path(stdout.getvalue().strip()))], [str(tune)])
+
+    def test_holdout_selection_precedes_the_limit(self) -> None:
+        _ = self.issue("Target A")
+        holdout = self.issue("Target G", area="tooling")
+        _ = self.issue("Target K")
+        with mock.patch.object(client, "urlopen", side_effect=self.replay) as http:
+            run = score_issues.score("Target*", 1, split="holdout",
+                                     issues_dir=self.issues, state_dir=self.state)
+        self.assertEqual(http.call_count, 2)
+        self.assertEqual([row["issue_path"] for row in self.records(run.result_path)], [str(holdout)])
+
+    def test_fresh_cli_reads_new_answers_and_persists_them_for_later_cache_hits(self) -> None:
+        _ = self.issue("Target graph")
+        _ = self.issue("Vocabulary seed", area="tooling")
+        with mock.patch.object(client, "urlopen", side_effect=self.replay):
+            first = self.score()
+        original_score = score_issues.score
+
+        def isolated_score(only: str = "*", limit: int = 0, *,
+                           split: Literal["tune", "holdout", "all"] = "all",
+                           fresh: bool = False) -> run_records.ScoreRun:
+            return original_score(only, limit, split=split, fresh=fresh,
+                                  issues_dir=self.issues, state_dir=self.state)
+
+        def new_answer(request: Request, timeout: float = 60) -> FixtureHTTPResponse:
+            raw = cast(client.Response, json.loads(self.replay(request, timeout).read()))
+            if "impact" in raw["answers"]:
+                answer = raw["answers"]["impact"]
+                if answer["type"] == "score":
+                    answer["probabilities"] = {"0": 0., "1": 0., "2": 0., "3": 0., "4": 1.}
+                    answer["score"], answer["confidence"] = 4., 1.
+            return FixtureHTTPResponse(json.dumps(raw).encode())
+
+        stdout = io.StringIO()
+        with mock.patch.object(score_issues, "score", side_effect=isolated_score), \
+                mock.patch.object(client, "urlopen", side_effect=new_answer) as http, \
+                contextlib.redirect_stdout(stdout):
+            code = score_issues.main(["score", "--only", "Target*", "--fresh"])
+        self.assertEqual(code, 0)
+        self.assertEqual(http.call_count, 2)
+        fresh_rows = self.records(Path(stdout.getvalue().strip()))
+        self.assertEqual(cast(dict[str, object], self.records(first)[0]["decided_fields"]["backlog_impact"])["value"], 3)
+        self.assertEqual(cast(dict[str, object], fresh_rows[0]["decided_fields"]["backlog_impact"])["value"], 5)
+        with mock.patch.object(client, "urlopen", side_effect=AssertionError("Fresh result must be cached")):
+            cached = self.score()
+        self.assertEqual(self.records(cached), fresh_rows)
 
     def test_changed_body_question_version_and_model_each_invalidate_cache(self) -> None:
         target = self.issue("Target graph")
@@ -195,8 +269,11 @@ class ScoreIssuesTests(unittest.TestCase):
         _ = closed.write_text(closed.read_text().replace("status: open", "status: closed"))
         original_score = score_issues.score
 
-        def isolated_score(only: str = "*", limit: int = 0) -> score_issues.ScoreRun:
-            return original_score(only, limit, issues_dir=self.issues, state_dir=self.state)
+        def isolated_score(only: str = "*", limit: int = 0, *,
+                           split: Literal["tune", "holdout", "all"] = "all",
+                           fresh: bool = False) -> run_records.ScoreRun:
+            return original_score(only, limit, split=split, fresh=fresh,
+                                  issues_dir=self.issues, state_dir=self.state)
 
         with mock.patch.object(score_issues, "score", side_effect=isolated_score), \
                 mock.patch.object(client, "urlopen", side_effect=self.replay) as http, \
@@ -224,8 +301,11 @@ class ScoreIssuesTests(unittest.TestCase):
 
         original_score = score_issues.score
 
-        def isolated_score(only: str = "*", limit: int = 0) -> score_issues.ScoreRun:
-            return original_score(only, limit, issues_dir=self.issues, state_dir=self.state)
+        def isolated_score(only: str = "*", limit: int = 0, *,
+                           split: Literal["tune", "holdout", "all"] = "all",
+                           fresh: bool = False) -> run_records.ScoreRun:
+            return original_score(only, limit, split=split, fresh=fresh,
+                                  issues_dir=self.issues, state_dir=self.state)
 
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(score_issues, "score", side_effect=isolated_score), \

@@ -187,7 +187,7 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - 9 style issues pass as labels, because their values differ from the style formula on current counts.
 - A live run of 5 issues cost about $0.0019; the whole vault costs about $0.17.
 
-### Phase 2 — the `compare` report  · status: todo
+### Phase 2 — the `compare` report  · status: done
 
 **Depends on:** Phase 1
 
