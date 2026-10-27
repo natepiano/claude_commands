@@ -8,7 +8,7 @@ import io
 import json
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 import os
 import re
 import shlex
@@ -3120,11 +3120,24 @@ def untrusted_push(label: str, item: FailedSessionRestart, *, machine: str) -> R
         return render("shutdown.restart_untrusted", session=name, machine=machine, account=json.dumps(label),
                       command=item.trust_command)
 
-    push = named_push(item.name)
+    return _session_shortened_to_fit(named_push, item.name)
+
+
+def move_untrusted_push(saved: SessionShutdown, item: FailedSessionRestart, *, machine: str) -> RenderedPush:
+    """The trust step for a failed move: a restart of the record's own account finishes the move on its target."""
+    def named_push(name: str) -> RenderedPush:
+        return render("shutdown.move_untrusted", session=name, machine=machine, account=json.dumps(saved["label"]),
+                      target=saved.get("target", ""), command=item.trust_command)
+
+    return _session_shortened_to_fit(named_push, item.name)
+
+
+def _session_shortened_to_fit(named_push: Callable[[str], RenderedPush], name: str) -> RenderedPush:
+    push = named_push(name)
     excess = len(push.message) - 499
     # The command must stay whole to run, so only the session name is shortened.
-    if excess > 0 and len(item.name) > 1:
-        push = named_push(item.name[:max(1, len(item.name) - excess - 1)] + "…")
+    if excess > 0 and len(name) > 1:
+        push = named_push(name[:max(1, len(name) - excess - 1)] + "…")
     return push
 
 
@@ -3244,15 +3257,18 @@ def restart(
                 # Its retry is this account's restart, which resumes the move on its target.
                 moved = {saved["session"]["name"]: saved for saved in session_records(selected.login)
                          if saved.get("target") and saved["machine"] == local.machine
-                         and saved["session"]["name"] in {item.name for item in failed if not item.trust_command}}
-                for saved in moved.values():
-                    settle.alert_user(move_failed_push(saved))
+                         and saved["session"]["name"] in {item.name for item in failed}}
+                for item in failed:
+                    if item.name in moved and not item.trust_command:
+                        settle.alert_user(move_failed_push(moved[item.name]))
                 retried = [item for item in retried if item.name not in moved]
                 if retried or not_reached or peer_requires_retry:
                     for push in restart_push(selected.label, retried, machine=" and ".join(machines)):
                         settle.alert_user(push)
                 for machine, item in untrusted:
-                    settle.alert_user(untrusted_push(selected.label, item, machine=machine))
+                    move = moved.get(item.name) if machine == local.machine else None
+                    settle.alert_user(move_untrusted_push(move, item, machine=machine) if move is not None
+                                      else untrusted_push(selected.label, item, machine=machine))
                 for item in manual:
                     settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
                 _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})
