@@ -240,6 +240,10 @@
       ]
     },
     {
+      "root": "scripts/issue_score",
+      "extraPaths": [".", "scripts/issue_score"]
+    },
+    {
       "root": "."
     }
   ]

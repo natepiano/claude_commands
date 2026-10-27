@@ -85,8 +85,10 @@
 # outlives the records; /verify_saved reports the time saved.
 #
 # Usage:
-#   verify.sh check <package>              fast compile feedback (workspace
-#                                          lib + bins)
+#   verify.sh check <package> [--keep-going]
+#                                          fast compile feedback (workspace
+#                                          lib + bins); --keep-going reads every
+#                                          crate's result past the first that fails
 #   verify.sh test <package>               the package's unit + integration tests
 #                                          (package targets; workspace libs if any);
 #                                          refuse examples that hold a test
@@ -2195,9 +2197,18 @@ case "$CMD" in
     check)
         PKG="${1:?verify.sh check <package>}"
         shift
-        take_features "$@"
+        KEEP_GOING=()
+        CHECK_ARGS=()
+        for word in "$@"; do
+            if [[ "$word" == --keep-going ]]; then
+                KEEP_GOING=(--keep-going)
+            else
+                CHECK_ARGS+=("$word")
+            fi
+        done
+        take_features "${CHECK_ARGS[@]}"
         require_member "$PKG"
-        run cargo check --workspace --lib --bins "${FEATURE_FLAGS[@]}"
+        run cargo check --workspace --lib --bins "${KEEP_GOING[@]}" "${FEATURE_FLAGS[@]}"
         ;;
     build)
         PKG="${1:?verify.sh build <package> [--bin <name> | --example <name>] [--release] [--features <list>]}"
