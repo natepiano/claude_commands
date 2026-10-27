@@ -72,6 +72,10 @@ if name == "style_sync.py":
                               capture_output=True, text=True, check=True).stdout.split()[0]
     (state / "notified-tip").write_text(observed)
 if name == "verify.sh":
+    fail_rows = state / "fail-rows"
+    if fail_rows.exists() and "--filter" not in args:
+        print(fail_rows.read_text(), end="")
+        raise SystemExit(1)
     key = "_".join(args).replace("/", "_")
     if args[:1] == ["test"]:
         package_key = "test-" + args[1] if len(args) > 1 else "test"
@@ -130,6 +134,7 @@ class MergeCheckpointTests(unittest.TestCase):
         self.push = "git"
         self.promotions = ""
         self.known_flakes = ""
+        self.known_flaky_tests = ""
         self.gate = True
 
     @override
@@ -227,6 +232,8 @@ class MergeCheckpointTests(unittest.TestCase):
             rows.append(f"- **Promote:** {self.promotions}")
         if self.known_flakes:
             rows.append(f"- **Known flakes:** {self.known_flakes}")
+        if self.known_flaky_tests:
+            rows.append(f"- **Known flaky tests:** {self.known_flaky_tests}")
         rows.extend([
             "", "## Units", "",
             "| Unit | Plan | Worktree | Branch | Session | Port | Owns |",
@@ -739,6 +746,33 @@ class MergeCheckpointTests(unittest.TestCase):
         self.assertIn("known flake crate-a", self.log.read_text(encoding="utf-8"))
         self.assertIn("known flake crate-b", self.log.read_text(encoding="utf-8"))
         self.assertEqual(len(self.events("verify.sh")), 4)
+
+    def test_known_flaky_tests_rerun_alone_and_an_unlisted_failure_stays_red(self) -> None:
+        """cargo-liner-style: a whole verify.sh merge test where two known flaky tests failed."""
+        reader = "shim_registration::reader_scenarios::reader_attributes_compiler_cache"
+        locale = "shim_registration::reader_scenarios::reader_accepts_live_writer_under_different_locale"
+        rows = "".join(f"        FAIL [  12.202s] ({count}/1067) cargo-tile::unit_tests {test}\n"
+                       for count, test in ((1012, reader), (1013, locale)))
+        # nextest prints each failure again after its Summary line.
+        _ = (self.state / "fail-rows").write_text(rows + "     Summary [ 80.1s] 1067 tests run\n" + rows)
+        sha = self.checkpoint()
+        self.known_flaky_tests = f"`{reader}`"
+        self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")
+        failed = self.run_checkpoint(sha)
+        self.assertIn("red: failed", failed.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), failed.before)
+        self.assertEqual(self.events("verify.sh"), [["test", "cargo-tile"], ["test", "cargo-tile"]])
+        (self.state / "events.jsonl").unlink()
+        self.known_flaky_tests = f"`{reader}`, `{locale}` — red only under load"
+        self.production_doc(merge_tests_line="- **Merge tests:** `verify.sh test cargo-tile`")
+        passed = self.run_checkpoint(sha)
+        self.assertEqual(passed.process.returncode, 0, passed.process.stderr + passed.process.stdout)
+        self.assertEqual(self.events("verify.sh"), [
+            ["test", "cargo-tile"],
+            ["test", "cargo-tile", "--filter", locale, "--filter", reader],
+        ])
+        self.assertIn(f"known flaky tests {locale}, {reader}: red in merge test 1, green alone",
+                      self.log.read_text(encoding="utf-8"))
 
     def test_rerun_after_origin_main_moves_skips_merge_branch_push_and_promotes_pushed_tip(self) -> None:
         self.promotions = str(self.promote)

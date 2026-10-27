@@ -310,6 +310,18 @@ esac
         self.assertNotIn("PASS (recorded)", result.stdout)
         self.assertEqual(len(list((self.root / "session" / "verify_cache").glob("*.pass"))), 1)
 
+    def test_a_write_to_the_session_folder_in_the_worktree_keeps_the_pass(self) -> None:
+        _ = self.package()
+        _ = (self.root / "session" / "board.log").write_text("")
+        self.environment.update({
+            "TREE_DIRTY": "1", "TREE_DIRTY_PATHS": "src/lib.rs session/board.log",
+            "EDIT_DURING_TEST": "1", "EDIT_DURING_TEST_PATH": "session/board.log",
+        })
+        result = self.verify("test", "sample")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("the tree changed while test ran", result.stdout)
+        self.assertEqual(len(list((self.root / "session" / "verify_cache").glob("*.pass"))), 1)
+
     def side_by_side_phases(self, edited: str) -> subprocess.CompletedProcess[str]:
         """Test alpha, which depends on gamma, while another phase edits `edited`."""
         _ = (self.root / "Cargo.toml").write_text('[workspace]\nmembers = ["alpha", "beta", "gamma"]\nresolver = "2"\n')
