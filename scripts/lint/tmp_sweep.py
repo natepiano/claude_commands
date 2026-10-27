@@ -22,9 +22,10 @@ systemd-tmpfiles-clean moves it each day when it sets the folder's times back. I
 and the Mac's per-user temp folder) only a tempfile folder is an entry, the
 name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
 Python's tempfile), which test runs leave behind, and a lint/invoke.sh log
-file (INVOKE_TEMP_NAME). In /tmp alone (the wide root) every other empty folder
-this user owns is an entry too, whatever its name, and goes after
-WIDE_IDLE_SECONDS instead. A folder a system tool owns (SYSTEM_TEMP_NAMES,
+file (INVOKE_TEMP_NAME). A direct/verify.sh run folder (VERIFY_TEMP_NAME) is an entry
+too: it stays while the run whose pid it names runs, and goes at once after. In /tmp alone (the
+wide root) every other empty folder this user owns, also one that holds only folders, is an entry
+too, whatever its name, and goes after WIDE_IDLE_SECONDS instead. A folder a system tool owns (SYSTEM_TEMP_NAMES,
 SYSTEM_TEMP_PREFIXES; an empty EMPTY_PREFIXES one aside), another root and a
 folder that holds one stay. A folder in /tmp that holds something is
 folder_audit.py's, which checks it for unsaved git work first. Roots are real paths on both machines. An entry is deleted when
@@ -127,6 +128,17 @@ EMPTY_PREFIXES = ("nix-",)
 # 1,438 buildlog files in natedev /tmp on 2026-10-27).
 INVOKE_TEMP_NAME = re.compile(r"lint_invoke\.\d+\.\d+\.log|buildlog\.\d+\.\d+\.(?:log|peak|peak\.cgroup)")
 TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp[a-z0-9_]{8}")
+# direct/verify.sh's run folder (its copy folders sit inside it), named with the run's pid. Its EXIT
+# trap removes it, but a killed run leaves it (47 hold and 6 copy folders in natedev /tmp, 2026-10-27).
+# A named pid that is no verify.sh run started before the folder ends the folder at once; an old name
+# with no pid waits out the 4 h rule.
+VERIFY_TEMP_NAME = re.compile(r"verify-(?:hold|copy)\.(?:(\d+)\.)?[A-Za-z0-9]{6}")
+VERIFY_SCRIPT = "verify.sh"
+# ps prints elapsed time to the second, so a run's start can read up to this late.
+START_SLACK_SECONDS = 2.0
+# A folder in /tmp that holds only folders, however deep, is empty; a tree of more folders than this
+# counts as holding something (155 nix-shell folders of empty folders on natedev, 2026-10-27).
+EMPTY_TREE_FOLDERS = 1000
 DARWIN_TEMP_NAME = "CS_DARWIN_USER_TEMP_DIR"
 DELETED_SUFFIX = " (deleted)"
 STATE_ENV = "LINT_SWEEP_STATE_DIR"
@@ -141,6 +153,7 @@ DIRECTOR_RUNS = "its unit director runs"
 ROW_WAITS = "its change review row waits for a verdict"
 NO_SESSIONS = "a session record cannot be read"
 IN_USE = "a process uses it"
+VERIFY_RUNS = "its verify.sh run is running"
 RECENT = "changed in the last 4 h"
 RECENT_WIDE = "changed in the last 7 days"
 TASK_OPEN = "its task is open and it changed in the last 7 days"
@@ -209,17 +222,28 @@ class Roots:
                 return False
             if entry.is_file():
                 return INVOKE_TEMP_NAME.fullmatch(entry.name) is not None
-            return entry.is_dir() and (TEMPFILE_NAME.fullmatch(entry.name) is not None or self.judged_empty(root, entry))
+            return entry.is_dir() and (TEMPFILE_NAME.fullmatch(entry.name) is not None
+                                       or VERIFY_TEMP_NAME.fullmatch(entry.name) is not None
+                                       or self.judged_empty(root, entry))
         except OSError:
             return False
 
     def is_wide(self, root: str, entry: os.DirEntry[str]) -> bool:
         """Whether entry goes only after WIDE_IDLE_SECONDS: an empty folder in a wide root that is
         no tempfile folder."""
-        return root in self.wide and not TEMPFILE_NAME.fullmatch(entry.name) and not INVOKE_TEMP_NAME.fullmatch(entry.name)
+        name = entry.name
+        return root in self.wide and not any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, VERIFY_TEMP_NAME))
 
-    def limit(self, root: str, entry: os.DirEntry[str], now: float) -> Limit:
+    def limit(self, root: str, entry: os.DirEntry[str], now: float, proc: str = PROC_DIR) -> Limit:
         """How long entry must be idle to go, and how a change in it counts."""
+        verify = VERIFY_TEMP_NAME.fullmatch(entry.name) if root in self.temp else None
+        if verify is not None and verify.group(1):
+            try:
+                made = entry.stat(follow_symlinks=False).st_mtime
+            except OSError:
+                made = now
+            running = verify_running(int(verify.group(1)), made, now, proc)
+            return Limit(float("-inf"), VERIFY_RUNS) if running else Limit(float("inf"), RECENT)
         if root in self.scratch:
             task = scratch.task_of(Path(entry.path))
             if task is not None and scratch.ended(task, now):
@@ -239,7 +263,7 @@ class Roots:
         if root not in self.wide or name in SYSTEM_TEMP_NAMES or (
                 name.startswith(SYSTEM_TEMP_PREFIXES) and not name.startswith(EMPTY_PREFIXES)):
             return False
-        if listing(entry.path):
+        if not holds_no_file(entry.path):
             return False
         inside = os.path.join(entry.path, "")
         if any(other == entry.path or other.startswith(inside) for other in self.all()):
@@ -304,6 +328,72 @@ def temp_folders() -> tuple[str, ...]:
         darwin = ""
     candidates = ("/tmp", os.environ.get("TMPDIR", ""), darwin)
     return tuple(dict.fromkeys(os.path.realpath(path) for path in candidates if path and os.path.isdir(path)))
+
+
+def holds_no_file(folder: str) -> bool:
+    """Whether folder holds only folders, however deep (or nothing). A link, a socket or a tree
+    of more than EMPTY_TREE_FOLDERS folders holds something; links are never followed."""
+    frontier = [folder]
+    walked = 0
+    while frontier:
+        walked += 1
+        if walked > EMPTY_TREE_FOLDERS:
+            return False
+        try:
+            with os.scandir(frontier.pop()) as entries:
+                for entry in entries:
+                    if not entry.is_dir(follow_symlinks=False):
+                        return False
+                    frontier.append(entry.path)
+        except OSError:
+            return False
+    return True
+
+
+def process_start(pid: int, now: float, proc: str = PROC_DIR) -> tuple[float, list[str]] | None:
+    """When pid started and its arguments, from proc, else from ps (the Mac); None when it is gone
+    or cannot be read."""
+    if os.path.isdir(proc):
+        try:
+            with open(os.path.join(proc, str(pid), "cmdline"), "rb") as handle:
+                arguments = handle.read().decode(errors="replace").split("\0")
+            with open(os.path.join(proc, str(pid), "stat"), encoding="utf-8") as handle:
+                fields = handle.read().rpartition(")")[2].split()
+            with open(os.path.join(proc, "stat"), encoding="utf-8") as handle:
+                boot = next(int(line.split()[1]) for line in handle if line.startswith("btime "))
+            return boot + int(fields[19]) / os.sysconf("SC_CLK_TCK"), arguments
+        except (OSError, ValueError, IndexError, StopIteration):
+            return None
+    try:
+        completed = subprocess.run(["ps", "-o", "etime=", "-o", "command=", "-p", str(pid)],
+                                   capture_output=True, text=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    elapsed, _, command = completed.stdout.strip().partition(" ")
+    seconds = elapsed_seconds(elapsed)
+    return None if seconds is None else (now - seconds, command.split())
+
+
+def elapsed_seconds(elapsed: str) -> int | None:
+    """ps etime, [[dd-]hh:]mm:ss, in seconds."""
+    days, _, clock = elapsed.rpartition("-")
+    parts = clock.split(":")
+    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts) or (days and not days.isdigit()):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds + int(days or 0) * 86400
+
+
+def verify_running(pid: int, made: float, now: float, proc: str = PROC_DIR) -> bool:
+    """Whether pid is a verify.sh run that started before made, the folder's mtime: a pid reused by
+    another process, or by a later run, is not the run that made the folder."""
+    started = process_start(pid, now, proc)
+    if started is None:
+        return False
+    start, arguments = started
+    return any(os.path.basename(argument) == VERIFY_SCRIPT for argument in arguments) and start <= made + START_SLACK_SECONDS
 
 
 def listing(directory: str) -> list[os.DirEntry[str]]:
@@ -546,7 +636,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
             if reason is None and entry.path in uses:
                 result.keep(f"{entry.path}: {uses[entry.path]}", IN_USE)
                 continue
-            change = last_change(entry.path, roots.limit(root, entry, now)) if reason is None else reason
+            change = last_change(entry.path, roots.limit(root, entry, now, proc)) if reason is None else reason
             if isinstance(change, str):
                 result.keep(entry.path, change)
                 continue

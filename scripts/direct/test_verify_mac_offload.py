@@ -1983,6 +1983,11 @@ local_release_wait.wait_for_local_release(float(sys.argv[1]), sys.argv[2])
         # The step runs in its own process group, so a kill of verify's group alone misses it.
         self.assertNotEqual(os.getpgid(cargo), process.pid)
         self.assertTrue({cargo, copy} <= processes_carrying(self.child_marker()))
+        # Both folders carry the run's pid, and the copy folder sits in the hold folder, so
+        # tmp_sweep.py can tie a folder a kill leaves behind to its run.
+        holds = list((self.root / "tmp").glob(f"verify-hold.{process.pid}.*"))
+        self.assertEqual(len(holds), 1, list((self.root / "tmp").iterdir()))
+        self.assertEqual(len(list(holds[0].glob(f"verify-copy.{process.pid}.*"))), 1)
         self.stop_verify(process)
         self.assertEqual(processes_carrying(self.child_marker()), set())
 
