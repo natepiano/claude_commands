@@ -623,7 +623,12 @@ def _retry_cleared_hold_notices(now: datetime) -> None:
             notice["recipients"] = list(dict.fromkeys(recipients))
             _atomic_json(path, pending)
         for recipient in list(notice["recipients"]):
-            if quota_alert.deliver_notice([quota_alert.Job("", recipient, notice["text"], "account move")], now.isoformat()):
+            job = quota_alert.Job(key, recipient, notice["text"], "account move")
+            outcomes = quota_alert.deliver_and_record([job], now.isoformat())
+            prefix = f"quota {job.kind} {job.name} -> {job.recipient}: "
+            # A queued message belongs to send.py now; its stable key prevents another copy.
+            if outcomes and all(line == prefix + "sent" or line.startswith(prefix + "not delivered: QUEUED:")
+                                for line in outcomes):
                 notice["recipients"].remove(recipient)
                 if not notice["recipients"]:
                     del pending[key]
@@ -1256,15 +1261,19 @@ def renew_expired_logins(now: datetime, dry_run: bool) -> list[str]:
 
 @role_map.role_map_command
 def run(now: datetime | None = None, *, dry_run: bool = False, proof_group: frozenset[str] = NO_SESSION_FILTER) -> list[str]:
+    from scripts.accounts import unit_watchdog
+
     at = now or datetime.now(timezone.utc)
     if dry_run:
-        return [*renew_expired_logins(at, True), *_run(at, True, proof_group)]
+        return [*renew_expired_logins(at, True), *_run(at, True, proof_group),
+                *(unit_watchdog.run(at, dry_run=True) if not proof_group else [])]
     with _watch_lock():
         _retry_cleared_hold_notices(at)
         renewed = renew_expired_logins(at, False)
         # A probe can save a reading after the pass started.
         after_renewal = max(at, datetime.now(timezone.utc)) if renewed else at
-        return [*renewed, *_run(after_renewal, False, proof_group)]
+        return [*renewed, *_run(after_renewal, False, proof_group),
+                *(unit_watchdog.run(after_renewal, dry_run=False) if not proof_group else [])]
 
 
 class WatchCommandLine(argparse.Namespace):

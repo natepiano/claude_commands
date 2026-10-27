@@ -3927,7 +3927,10 @@ def _summary_table(
         "Project", str(project["percent"]), _format_duration(project["elapsed"]),
         "—", _unchanged_cell(project["unchanged"]),
     ]
-    project_eta, project_low, project_high = _project_chain_eta(state, now)
+    band = plan_history.eta_band_seconds(phase["percent"], phase["elapsed"], phase_spread)
+    phase_swing = (None if isinstance(band, plan_history.EtaProjectionUnavailable)
+                   else (band.remaining - band.earliest, band.latest - band.remaining))
+    project_eta, project_low, project_high = _project_chain_eta(state, now, phase_swing)
     project_row[3] = project_eta
     phase_row = _scope_row(f"Phase {phase_id}", phase, as_of, now)
     if plan_phase_counts.get("available") is True:
@@ -3948,8 +3951,17 @@ def _summary_table(
     )
 
 
-def _project_chain_eta(state: dict[str, object], now: float) -> tuple[str, str, str]:
-    """Render the same plan finish used by the phase table and vault note."""
+def _project_chain_eta(
+    state: dict[str, object], now: float, phase_swing: tuple[int, int] | None,
+) -> tuple[str, str, str]:
+    """Render the same plan finish used by the phase table and vault note.
+
+    The low and high shift the finish by the open phase's swing: its projected
+    band, else the range stated with its ETA, else `phase_swing`, the band of
+    the report's Phase row. So a stated ETA with no range still gets the
+    Phase row's band (user, 2026-10-26). A finished plan's low and high are
+    its recorded finish.
+    """
     from scripts.direct import phase_table
 
     plan_doc = _string(state.get("project_plan_doc")) or _string(state.get("plan_doc"))
@@ -3968,15 +3980,17 @@ def _project_chain_eta(state: dict[str, object], now: float) -> tuple[str, str, 
     target = finish.at.timestamp()
     eta_cell = _arrival_label(target, now)
     current = record.current
-    if not isinstance(current, phase_table.OpenPhase):
-        return eta_cell, "—", "—"
-    eta = current.eta
-    if isinstance(eta, phase_table.ProjectedEta):
+    eta = current.eta if isinstance(current, phase_table.OpenPhase) else None
+    if isinstance(finish, phase_table.FinishedAt):
+        low, high = 0.0, 0.0
+    elif isinstance(eta, phase_table.ProjectedEta):
         low = (eta.time - eta.earliest).total_seconds()
         high = (eta.latest - eta.time).total_seconds()
     elif isinstance(eta, phase_table.StatedEta) and isinstance(eta.range, phase_table.EtaRange):
         low = (eta.time - eta.range.earliest).total_seconds()
         high = (eta.range.latest - eta.time).total_seconds()
+    elif phase_swing is not None:
+        low, high = float(phase_swing[0]), float(phase_swing[1])
     else:
         return eta_cell, "—", "—"
     return (
