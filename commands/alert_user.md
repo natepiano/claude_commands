@@ -6,13 +6,13 @@ Load `/message_style` before the first message to the user in a session.
 
 Send one alert:
 
-`python3 ~/.claude/scripts/message/send.py --to user --need decision|blocked --action "<what the user does>" --summary "<what is at stake, under 45 characters>" --text "<the one action or decision, under 500 characters>"`
+`python3 ~/.claude/scripts/message/send.py --to user --need decision|blocked [--clears-when "<command that exits 0 when fixed>"] --action "<what the user does>" --summary "<what is at stake, under 45 characters>" --text "<the one action or decision, under 500 characters>"`
 
 On the Mac, add `--machine natedev`; the keys exist only on natedev. Never read `~/.config/pushover/env`.
 
 News a terminal already shows, sent only when the user types in no terminal for N minutes (natedev): `python3 ~/.claude/scripts/message/escalate.py hold <key> --need note --no-action --summary "<title>" --text "<news>" [--minutes 15]`, then `close <key>` once it stops being true.
 
-Every message says what the user does with `--action`, or says nothing is needed with `--no-action`. Emergency (`--need blocked`) is only for an action the user must take now.
+Every message says what the user does with `--action`, or says nothing is needed with `--no-action`. Emergency (`--need blocked`) is only for an action the user must take now. A `--need blocked` push also takes `--clears-when "<command that exits 0 when fixed>"`, such as `--clears-when github-warm-status`: send.py cancels the push when that command exits 0. Without it, send.py refuses the push (`REFUSED`, exit 2).
 
 | Need | When |
 |---|---|

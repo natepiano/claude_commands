@@ -290,6 +290,9 @@ The closed list:
   An update to an earlier user push on the same subject reuses that push's `--key`,
   so silence keeps only the newest. A `--need blocked` push with a live earlier one
   on its key is skipped: first `send.py retire --to user --from <sender> --key <key>`.
+  A `--need blocked` push needs `--clears-when "<command that exits 0 when fixed>"`
+  (`--clears-when github-warm-status`); send.py cancels it when the command exits 0,
+  and refuses a blocked push without it. With no such command, send it at its own need.
 - **done** — <RunSummary/> has been emitted.
 
 Nothing else authorizes a turn end, however complete it feels:
