@@ -1593,7 +1593,7 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
     return RepositoryTip(commit, tree, blobs, directories, files, entries)
 
 
-def _blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, bytes]]:
+def blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, bytes]]:
     """Each path of blobs with the bytes of its blob, read by one `git cat-file --batch`."""
     with tempfile.TemporaryFile() as contents:
         result = subprocess.run(
@@ -1616,7 +1616,7 @@ def _blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, 
 
 
 def _export_blobs(repo: Path, tip: RepositoryTip, export: Path) -> None:
-    for path, content in _blob_contents(repo, tip.blobs):
+    for path, content in blob_contents(repo, tip.blobs):
         destination = export / path
         destination.parent.mkdir(parents=True, exist_ok=True)
         _ = destination.write_bytes(content)
@@ -1886,11 +1886,11 @@ class Ledger:
         self._ancestors: dict[tuple[str, str], bool] = {}
         self._branch_tips: dict[str, str] = {}
         # The declaration step's git reads, by commit: what each stored judged commit resolves to, the paths changed
-        # from a read commit to a tip, the `.rs` files at a tip that hold a name as a word, and a file's content and
-        # items at a commit. Rows are read fresh, so a recheck under the write lock sees another writer's changes.
+        # from a read commit to a tip, the files at a tip that hold a name as a word (refill reads them too), and a
+        # file's content and items at a commit. Rows are read fresh, so a recheck under the write lock sees another writer's changes.
         self._resolved_commits: dict[str, JudgedCommit | NoJudgedCommit] = {}
         self._changed_paths: dict[tuple[str, str], frozenset[str]] = {}
-        self._named_files: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._named_files: dict[tuple[str, str, tuple[str, ...]], tuple[str, ...]] = {}
         self._commit_files: dict[tuple[str, str], bytes | Folder | MissingFile] = {}
         self._declared_files: dict[tuple[str, str], DeclaredFile] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
@@ -2333,7 +2333,7 @@ class Ledger:
         """
         reasons: list[str] = []
         blobs = {path: blob for path, blob in tip.blobs.items() if path.endswith(".rs")}
-        for path, content in _blob_contents(self.repo, blobs):
+        for path, content in blob_contents(self.repo, blobs):
             for attribute in _path_attributes(path, content):
                 if isinstance(attribute, UnreadPathAttribute):
                     reasons.append(f"{path} {attribute.reason}")
@@ -3261,11 +3261,11 @@ class Ledger:
             self._changed_paths[key] = frozenset(path for path in changed.split("\0") if path)
         return self._changed_paths[key]
 
-    def _files_naming(self, tip: str, name: str) -> tuple[str, ...]:
-        """The `.rs` files at tip that hold name as a whole word."""
-        key = (tip, name)
+    def files_naming(self, tip: str, name: str, pathspecs: tuple[str, ...] = ("*.rs",)) -> tuple[str, ...]:
+        """The files at tip that match pathspecs and hold name as a whole word, read once for each ledger."""
+        key = (tip, name, pathspecs)
         if key not in self._named_files:
-            result = subprocess.run(["git", "-C", str(self.repo), "grep", "-l", "-z", "-w", "-F", "-e", name, tip, "--", "*.rs"],
+            result = subprocess.run(["git", "-C", str(self.repo), "grep", "-l", "-z", "-w", "-F", "-e", name, tip, "--", *pathspecs],
                                     capture_output=True, text=True, check=False)
             # git grep exits 1 when no file matches.
             if result.returncode not in (0, 1):
@@ -3474,7 +3474,7 @@ class Ledger:
         """Resolve only declared module traits; a missing or ambiguous declaration proves nothing."""
         tip = self._tip(commit)
         crate = tip.crate(path)
-        homes = [candidate for candidate in self._files_naming(commit, trait[-1])
+        homes = [candidate for candidate in self.files_naming(commit, trait[-1])
                  if candidate in tip.rust_files and tip.crate(candidate) == crate
                  for item in self._declared_file(commit, candidate).declared_items
                  if item.declaration.keyword == "trait" and item.declaration.name == trait[-1]
@@ -3815,7 +3815,7 @@ class Ledger:
         if not isinstance(membership, ImplementedTrait):
             return failed
         crate = tip.crate(finding.path)
-        owners = [(path, item) for path in self._files_naming(read, membership.path[-1])
+        owners = [(path, item) for path in self.files_naming(read, membership.path[-1])
                   if self._tip(read).crate(path) == crate
                   for item in self._declared_file(read, path).declared_items
                   if item.declaration.keyword == "trait" and item.declaration.name == membership.path[-1]
@@ -4000,7 +4000,7 @@ class Ledger:
             return DeclarationInPlace(finding)
         # A destination must gain the same member, including its proved trait identity.
         found: dict[str, tuple[DeclaredItem, ...]] = {}
-        for path in self._files_naming(tip.commit, declaration.name):
+        for path in self.files_naming(tip.commit, declaration.name):
             if path == finding.path or path not in rust_files or path not in changed:
                 continue
             prior = self._matching_items(finding, declaration, requirement, read, path)
@@ -4198,7 +4198,7 @@ class Ledger:
                                and item.declaration.keyword in ("struct", "enum", "union", "trait", "type")
                                and not isinstance(item.declaration.owner, ImplOrTraitItem)
                                for item in self._declared_file(read, path).declared_items)
-                       for path in self._files_naming(read, owner.name))
+                       for path in self.files_naming(read, owner.name))
 
         owners = renamed(owner.name, owner_item)
         traits: tuple[str, ...] = ()
@@ -4221,7 +4221,7 @@ class Ledger:
                     declared = any(
                         item.declaration.keyword == "trait" and item.declaration.name == path[-1]
                         and not isinstance(item.declaration.owner, ImplOrTraitItem)
-                        for candidate in self._files_naming(built.before_commit, path[-1])
+                        for candidate in self.files_naming(built.before_commit, path[-1])
                         if candidate in tip.rust_files and tip.crate(candidate) == crate
                         for item in self._declared_file(built.before_commit, candidate).declared_items)
                     if isinstance(resolved, ResolvedTraitPath) and resolved.path == path and not declared:
@@ -4318,7 +4318,7 @@ class Ledger:
                        ) -> dict[str, tuple[DeclaredItem, ...]] | TraitIdentityUncertain:
         """Find gained members; an uncertain source or destination keeps the finding."""
         found: dict[str, tuple[DeclaredItem, ...]] = {}
-        for path in (finding.path, *self._files_naming(tip.commit, renamed.name)):
+        for path in (finding.path, *self.files_naming(tip.commit, renamed.name)):
             if path != finding.path and (path not in rust_files or path not in changed):
                 continue
             prior = self._matching_items(finding, renamed, requirement, read, path)

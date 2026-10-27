@@ -1730,6 +1730,99 @@ def made_before_decisions(ticket_id: str) -> str:
     return f"{ticket_id}: made before decisions; drop it with style_ledger.py ticket drop, then run migrate"
 
 
+class EditedFiles:
+    """The files that each approved finding's change edits, as the gate lets it edit them, read once per refill at the
+    synced tip and at the unit base, so a reference that the unit's branch added after the sync counts. The tip is read
+    on first use, so a refill that needs no footprint reads no tip.
+
+    A file rename edits its own file, its new file and each Rust file whose module sites `renamed_text` renames at
+    either commit; a file that names the old module but that `renamed_text` cannot read counts as edited. A qualified
+    rename edits its own file and each `.rs` and `.md` file that holds its old name as a word at either commit, the
+    files `approved_reference_file` can take. Any other finding edits its own file only.
+    """
+
+    def __init__(self, repo: Path, ledger: style_ledger.Ledger, base: UnitBase) -> None:
+        self.repo: Path = repo
+        self.ledger: style_ledger.Ledger = ledger
+        self.base: UnitBase = base
+        self.tip: str | None = None
+        # The blob of each named path at each commit, and the text of each blob.
+        self.blobs: dict[tuple[str, str], str] = {}
+        self.texts: dict[str, str] = {}
+
+    def of(self, finding: style_ledger.HeldFinding) -> tuple[str, ...]:
+        """The finding's own file first, then each other file its change edits."""
+        moved = file_rename(finding.kind, finding.path, finding.after)
+        if isinstance(moved, FileRename):
+            named = {commit: tuple(path for path in self.ledger.files_naming(commit, moved.old_stem) if path != finding.path)
+                     for commit in self.commits()}
+            self.read(named)
+            # A path with the same blob at both commits is scanned once.
+            versions = dict.fromkeys((path, self.blobs[commit, path]) for commit, paths in named.items() for path in paths)
+            edited = (path for path, blob in versions if self.names_module(path, self.texts[blob], moved))
+            return (finding.path, moved.new, *dict.fromkeys(edited))
+        pair = approved_rename(finding.kind, finding.before, finding.after)
+        if isinstance(pair, ApprovedRename):
+            named_files = (path for commit in self.commits()
+                           for path in self.ledger.files_naming(commit, pair.old, ("*.rs", "*.md")) if path != finding.path)
+            return (finding.path, *dict.fromkeys(named_files))
+        return (finding.path,)
+
+    def of_ticket(self, ticket: style_ledger.TicketRecord) -> tuple[str, ...]:
+        """The ticket's files, and for a proposal ticket its widened paths and each file its findings' changes edit."""
+        origin = self.ledger.ticket_origin(ticket["id"])
+        if isinstance(origin, style_ledger.SelectedByCoverage):
+            return tuple(ticket["files"])
+        findings = (finding for finding in self.ledger.proposal_findings(origin.issue)
+                    if finding.finding_id in origin.finding_ids)
+        return (*ticket["files"], *origin.widened, *(path for finding in findings for path in self.of(finding)))
+
+    def commits(self) -> tuple[str, ...]:
+        """The synced tip, read once, and the unit base when it is another commit."""
+        if self.tip is None:
+            self.tip = synced_tip(self.ledger)
+        if isinstance(self.base, UnitBranchTip) and self.base.commit != self.tip:
+            return (self.tip, self.base.commit)
+        return (self.tip,)
+
+    def read(self, named: Mapping[str, tuple[str, ...]]) -> None:
+        """Find the blob of each path at its commit by one `git ls-tree` for each commit, then read each blob not read
+        yet by one `git cat-file --batch`."""
+        unread: dict[str, str] = {}
+        for commit, paths in named.items():
+            unlisted = [path for path in paths if (commit, path) not in self.blobs]
+            if not unlisted:
+                continue
+            # Each entry reads `<mode> blob <oid>\t<path>`.
+            for entry in git(self.repo, "ls-tree", "-z", commit, "--", *unlisted).split("\0"):
+                if entry:
+                    info, path = entry.split("\t", 1)
+                    self.blobs[commit, path] = info.split()[2]
+            if missing := sorted(path for path in unlisted if (commit, path) not in self.blobs):
+                raise style_ledger.CheckCouldNotRun(f"git ls-tree {commit}: no blob for {', '.join(missing)}")
+            for path in unlisted:
+                blob = self.blobs[commit, path]
+                if blob not in self.texts and blob not in unread.values():
+                    unread[f"{commit}:{path}"] = blob
+        for label, content in style_ledger.blob_contents(self.repo, unread):
+            self.texts[unread[label]] = content.decode(errors="replace")
+
+    def names_module(self, path: str, text: str, moved: FileRename) -> bool:
+        """Whether `renamed_text` finds a module site of moved in text, the file at path, or cannot read it.
+
+        A file outside the crate's root folder names the module only through the library's name or a `path` attribute
+        that names the old file, so a text that holds neither name is not scanned.
+        """
+        root = crate_root(self.repo, moved)
+        if (isinstance(root, PurePosixPath)
+                and isinstance(style_footprint.crate_module(path, root), style_footprint.OutsideCrate)
+                and PurePosixPath(moved.old).name not in text
+                and not (isinstance(library := crate_library(self.repo, root), Library) and library.name in text)):
+            return False
+        renamed = renamed_text(self.repo, path, text, (moved,), ())
+        return not isinstance(renamed, RenamedText) or renamed.module_sites
+
+
 def _unbuilt_findings(ledger: style_ledger.Ledger, issue: Path) -> tuple[style_ledger.HeldFinding, ...]:
     """The decision's filed findings that no build ticket holds."""
     return tuple(finding for finding in ledger.proposal_findings(issue)
@@ -1747,9 +1840,11 @@ def _select_phase(
             print("waiting " + made_before_decisions(ticket["id"]))
         else:
             queued.append(ticket)
+    base = unit_base(repo, branch)
+    edits = EditedFiles(repo, ledger, base)
     for index, ticket in enumerate(queued):
         in_scope = crate_in_scope(scope, ticket["crate"])
-        if index == 0 and in_scope and not any(busy.contains(path) for path in ticket["files"]):
+        if index == 0 and in_scope and not any(busy.contains(path) for path in edits.of_ticket(ticket)):
             ledger.ticket_assign(ticket["id"], branch)
             for extra in queued[1:]:
                 ledger.ticket_drop(extra["id"])
@@ -1775,7 +1870,6 @@ def _select_phase(
         decisions = style_proposals.approved_decisions(folder, unit)
     directories = style_proposals.workspace_directories(ledger) if decisions else ()
     tip = synced_tip(ledger)
-    base = unit_base(repo, branch)
     unsynced = unsynced_changes(repo, base, tip)
     decision_phase: PhaseWritten | NoAvailableWork = NoAvailableWork()
     closed = False
@@ -1865,7 +1959,17 @@ def _select_phase(
         changed = sorted(path for path in set(by_file) - outside - held if path in unsynced)
         for path in changed:
             print(f"waiting {issue.path}: {unsynced[path].line(tip)}")
-        available = tuple(sorted(set(by_file) - outside - held - set(changed)))
+        # A finding whose change edits another busy file waits; the other findings of its file stay available.
+        for path in sorted(set(by_file) - outside - held - set(changed)):
+            free: list[style_ledger.HeldFinding] = []
+            for finding in by_file[path]:
+                edited = next((edited for edited in edits.of(finding) if busy.contains(edited)), None)
+                if edited is None:
+                    free.append(finding)
+                else:
+                    print(f"waiting {issue.path}: {finding.finding_id} edits {edited}, busy")
+            by_file[path] = free
+        available = tuple(sorted(path for path in set(by_file) - outside - held - set(changed) if by_file[path]))
         if not available:
             continue
         limits = (_STRUCTURE_LIMITS if any(style_proposals.proposal_kind(finding, definition) == "restructure"
