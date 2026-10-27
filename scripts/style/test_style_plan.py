@@ -430,6 +430,7 @@ class StylePlanTests(unittest.TestCase):
         self.assertIn(
             f"Record every judged cell with `style_ledger.py record --ticket {ticket_id}`; "
             + "the ledger takes its pinned rule blob.\n"
+            + "Record a cell whose file this ticket deletes with `--verdict removed`; the ledger finds the commit that deleted it.\n"
             + "On a crate or module cell of a Rust source file, a `clean`, `exception` or `held` verdict must have `--input-scope`.\n"
             + "Use `--input-scope file` when the verdict rests on that file alone. It stays current when other files change.\n"
             + "Use `--input-scope rule --reads <files>` when the verdict rests on other files; name each file you read for it. "

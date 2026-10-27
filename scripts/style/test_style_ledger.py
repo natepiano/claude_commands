@@ -29,6 +29,7 @@ from approved_renames import AppliedCheck, AppliedInCode, Folder, NoAppliedCheck
 import style_plan
 import style_rules
 import berth_board
+import coverage_report
 import declarations
 
 
@@ -116,6 +117,9 @@ class StyleLedgerTests(unittest.TestCase):
         path = self.repo / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(content)
+
+    def in_worktree(self, relative: str) -> bool:
+        return os.path.lexists(self.repo / relative)
 
     def commit(self, message: str) -> str:
         _ = self.git("add", "--all")
@@ -4611,7 +4615,7 @@ class StyleLedgerTests(unittest.TestCase):
             ledger.record(rule, self.sources[1], self.initial_tip, "", "clean", ticket="modules-1")
         ledger.record(rule, self.sources[0], self.initial_tip, "", "clean", ticket="modules-1",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
-        self.assertEqual(ledger.unjudged_ticket_cells("modules-1"), ())
+        self.assertEqual(ledger.unjudged_ticket_cells("modules-1", "HEAD", self.in_worktree), ())
         with self.assertRaisesRegex(style_ledger.LedgerError, "different fields"):
             ledger.ticket_add("modules-1", "modules", "structure", "modules", "crates/alpha",
                               list(self.sources[:2]), [rule], cells=((rule, self.sources[1]),))
@@ -4647,7 +4651,7 @@ class StyleLedgerTests(unittest.TestCase):
             connection.commit()
         migrated = self.ledger()
         self.assertEqual(migrated.ticket_open("modules")[0]["cells"], [])
-        self.assertEqual(migrated.unjudged_ticket_cells("modules-1"), (style_ledger.UnjudgedTicketCell(rule, "crates/alpha"),))
+        self.assertEqual(migrated.unjudged_ticket_cells("modules-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, "crates/alpha"),))
         migrated.record(rule, "crates/alpha", self.initial_tip, "", "clean", ticket="modules-1")
         migrated.ticket_checkpoint("modules-1", self.initial_tip)
         self.assertEqual(migrated.ticket_open("modules")[0]["state"], "checkpointed")
@@ -5829,6 +5833,249 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(checkpoint, "main")
         self.assertEqual(self.states(rule)[path], "stale")
 
+    def removed_ticket(self) -> tuple[style_ledger.Ledger, str, str]:
+        """An assigned names-1 read ticket on the first two sources under a crate-scope rule, started at the initial tip."""
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        ledger.ticket_assign("names-1", "main")
+        return ledger, rule, ledger.ticket_base("names-1")
+
+    def record_removed(self, ledger: style_ledger.Ledger, rule: str, path: str, commit: str, ticket: str = "names-1") -> None:
+        ledger.record(rule, path, commit, self.blob(rule), "removed", ticket=ticket, worker="test-worker")
+
+    def cell_rows(self, ledger: style_ledger.Ledger, path: str) -> list[tuple[str, str]]:
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            return cast(list[tuple[str, str]], connection.execute(
+                'SELECT "commit",verdict FROM judgments WHERE path=? ORDER BY id', (path,)).fetchall())
+
+    def test_removed_cell_keeps_the_deleting_commit_and_closes_the_cell_without_a_verdict_on_code(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, removed = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        self.record(rule, removed, self.initial_tip, ticket="earlier-1")
+        (self.repo / removed).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.write("README.md", "Ticket work after the delete\n")
+        checkpoint = self.commit("Ticket checkpoint")
+        self.assertEqual(ledger.unjudged_ticket_cells("names-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, removed),))
+
+        self.record_removed(ledger, rule, removed, checkpoint)
+
+        state = f"removed by ticket names-1 at {deleting[:7]}"
+        expected = style_ledger.RemovedCell(rule=rule, path=removed, commit=deleting, state=state)
+        opened = cast(dict[str, object], json.loads(self.cli("ticket", "open", "--unit", "names").stdout))
+        self.assertEqual(opened["removed"], [dict(expected)])
+        self.assertEqual(ledger.ticket_open("names")[0]["removed"], (expected,))
+        self.assertIn(f"{rule} {removed}: {state}", coverage_report.ticket_line(ledger.ticket_open("names")[0]).splitlines())
+        self.assertEqual(ledger.unjudged_ticket_cells("names-1", "HEAD", self.in_worktree), ())
+
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        ledger.set_tip(checkpoint, "main")
+        # The restamp carries the kept verdict to the checkpoint and leaves the removed row at its deleting commit.
+        self.assertEqual(self.cell_rows(ledger, removed), [(self.initial_tip, "clean"), (deleting, "removed")])
+        self.assertEqual(self.cell_rows(ledger, kept), [(self.initial_tip, "clean"), (checkpoint, "clean")])
+        self.assertEqual(self.states(rule), {kept: "current", self.sources[2]: "open", self.sources[3]: "open"})
+
+        # A file at the same path later is a new cell: the verdict of the file before the delete does not judge it.
+        self.write(removed, "pub fn value() -> u32 { 1 }\n")
+        ledger.set_tip(self.commit("Bring the file back"), "main")
+        self.assertEqual(self.states(rule)[removed], "open")
+
+    def test_checkpoint_names_a_cell_neither_recorded_nor_removed(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        for path in self.sources[:2]:
+            (self.repo / path).unlink()
+        checkpoint = self.commit("Ticket deletes both files")
+        self.record_removed(ledger, rule, self.sources[0], checkpoint)
+        # The style branch holds the delete and the synced tip does not, so the cell awaits merge; it is not current.
+        self.assertEqual({path: self.states(rule)[path] for path in self.sources[:2]},
+                         {self.sources[0]: "awaiting merge", self.sources[1]: "open"})
+        counts = next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule)
+        self.assertEqual((counts.current, counts.awaiting_merge, counts.held), (0, 1, 0))
+        refused = self.cli("ticket", "checkpoint", "--id", "names-1", "--commit", checkpoint, success=False)
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr.strip(), f"style_ledger: names-1: unjudged cells: {rule} {self.sources[1]}")
+        self.record_removed(ledger, rule, self.sources[1], checkpoint)
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertEqual(ledger.ticket_open("names")[0]["state"], "checkpointed")
+
+    def test_a_verdict_recorded_after_a_removal_on_an_older_commit_does_not_judge_the_file_brought_back(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.record_removed(ledger, rule, path, deleting)
+        # The late verdict judges the file before the delete; the order of recording does not move the removal.
+        self.record(rule, path, self.initial_tip, ticket="earlier-1")
+        self.write(path, original)
+        ledger.set_tip(self.commit("Bring the same file back"), "main")
+        self.assertEqual(self.states(rule)[path], "open")
+
+    def test_removed_keeps_the_deleting_commit_and_not_a_later_merge_of_other_work(self) -> None:
+        ledger, rule, base = self.removed_ticket()
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        _ = self.git("checkout", "-q", "-b", "side", base)
+        self.write("README.md", "Side work\n")
+        _ = self.commit("Side work keeps the file")
+        _ = self.git("checkout", "-q", "main")
+        # The merge differs from its second parent at the path, but its diff against its first parent deletes nothing.
+        _ = self.git("merge", "--no-ff", "-q", "side", "-m", "Bring in side work")
+        self.record_removed(ledger, rule, path, "HEAD")
+        self.assertEqual(self.cell_rows(ledger, path), [(deleting, "removed")])
+
+    def test_checkpoint_names_a_removed_cell_whose_file_is_back(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.record_removed(ledger, rule, path, deleting)
+        self.write(path, original)
+        restored = self.commit("Ticket brings the file back")
+        self.assertEqual(ledger.unjudged_ticket_cells("names-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, path),))
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: unjudged cells: {re.escape(rule)} {re.escape(path)}$"):
+            ledger.ticket_checkpoint("names-1", restored)
+        self.record(rule, path, restored, ticket="names-1")
+        ledger.ticket_checkpoint("names-1", restored)
+        self.assertEqual(ledger.ticket_open("names")[0]["state"], "checkpointed")
+
+    def test_checkpoint_does_not_count_a_verdict_of_the_ticket_on_a_commit_before_its_removal(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.record_removed(ledger, rule, path, deleting)
+        # The ticket's newest row judges the file before the delete, so coverage reads the file brought back as open.
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, original)
+        restored = self.commit("Ticket brings the file back")
+        ledger.set_tip(restored, "main")
+        self.assertEqual(self.states(rule)[path], "open")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: unjudged cells: {re.escape(rule)} {re.escape(path)}$"):
+            ledger.ticket_checkpoint("names-1", restored)
+
+    def removed_by_another_ticket(self) -> tuple[style_ledger.Ledger, str, str, str]:
+        """names-1 judges both sources at the initial tip; other-names-1 deletes the second source, and the file comes back."""
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        for source in (kept, path):
+            self.record(rule, source, self.initial_tip, ticket="names-1")
+        ledger.ticket_add("other-names-1", "other-names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("other-names-1", "main")
+        _ = ledger.ticket_base("other-names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        self.record_removed(ledger, rule, path, self.commit("Another ticket deletes the file"), ticket="other-names-1")
+        self.write(path, original)
+        return ledger, rule, path, self.commit("The file comes back")
+
+    def test_checkpoint_counts_a_removal_by_another_ticket(self) -> None:
+        ledger, rule, path, restored = self.removed_by_another_ticket()
+        ledger.set_tip(restored, "main")
+        self.assertEqual(self.states(rule)[path], "open")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: unjudged cells: {re.escape(rule)} {re.escape(path)}$"):
+            ledger.ticket_checkpoint("names-1", restored)
+
+    def test_restamp_does_not_carry_a_verdict_across_a_removal_by_another_ticket(self) -> None:
+        ledger, rule, path, restored = self.removed_by_another_ticket()
+        self.record(rule, path, restored, ticket="names-1")
+        # The ticket's newest row judges the file before the other ticket's delete.
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, "fn edited() {}\n")
+        checkpoint = self.commit("Ticket edits the file brought back")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_removed_refuses_a_file_still_present_outside_the_ticket_or_its_start(self) -> None:
+        self.write("README.md", "Work before the ticket\n")
+        _ = self.commit("Work before the ticket")
+        ledger, rule, base = self.removed_ticket()
+        path = self.sources[1]
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: still in the tree at {base[:7]}$"):
+            self.record_removed(ledger, rule, path, base)
+        self.write(path, "pub fn changed() {}\n")
+        edited = self.commit("Ticket edits the file")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: still in the tree at {edited[:7]}$"):
+            self.record_removed(ledger, rule, path, edited)
+        (self.repo / self.sources[2]).unlink()
+        outside = self.commit("Delete a file outside the ticket")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: {re.escape(rule)} {re.escape(self.sources[2])} is outside ticket cells$"):
+            self.record_removed(ledger, rule, self.sources[2], outside)
+        _ = self.git("checkout", "-q", "-b", "side", self.initial_tip)
+        (self.repo / path).unlink()
+        side = self.commit("Delete on a branch not under the start")
+        _ = self.git("checkout", "-q", "main")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: {side[:7]} is not under the ticket's start {base[:7]}$"):
+            self.record_removed(ledger, rule, path, side)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "^removed: --reads requires clean, exception or held$"):
+            ledger.record(rule, path, side, "", "removed", ticket="names-1", worker="test-worker", reads=(self.sources[0],))
+        ledger.ticket_add("names-2", "names", "read", "names", "crates/alpha", [path], [rule])
+        with self.assertRaisesRegex(style_ledger.LedgerError, "^names-2: no start commit, so its own commits are not known$"):
+            self.record_removed(ledger, rule, path, outside, ticket="names-2")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "^unknown ticket other-1$"):
+            self.record_removed(ledger, rule, path, outside, ticket="other-1")
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
+    def test_removed_refuses_a_file_that_a_merged_in_commit_deleted(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        _ = self.git("checkout", "-q", "-b", "outside")
+        (self.repo / path).unlink()
+        deleting = self.commit("Outside branch deletes the file")
+        _ = self.git("checkout", "-q", "main")
+        self.write("README.md", "Ticket work\n")
+        _ = self.commit("Ticket work")
+        _ = self.git("merge", "--no-ff", "-q", "outside", "-m", "Bring in outside work")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: changed by commits that are not names-1's own: {deleting[:7]}$"):
+            self.record_removed(ledger, rule, path, "HEAD")
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
+    def test_removed_refuses_a_file_deleted_before_the_ticket_start(self) -> None:
+        rule = self.rule("read")
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        base = self.commit("Delete before the ticket starts")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), base)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: not a file at the ticket's start {base[:7]}$"):
+            self.record_removed(ledger, rule, path, base)
+        # A structure ticket's crate cell is a folder, so its removal is out of scope.
+        ledger.ticket_add("modules-1", "modules", "structure", "names", "crates/alpha", [], [rule])
+        ledger.ticket_assign("modules-1", "main")
+        self.assertEqual(ledger.ticket_base("modules-1"), base)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^crates/alpha: not a file at the ticket's start {base[:7]}$"):
+            self.record_removed(ledger, rule, "crates/alpha", base, ticket="modules-1")
+
+    def test_removed_refuses_a_path_yielded_before_the_write_lock(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        original = style_ledger._cell_scope  # pyright: ignore[reportPrivateUsage]
+
+        def yield_then_scope(definition: rules.Rule, cell: str, tip: style_ledger.RepositoryTip) -> style_ledger.CellInputScope:
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", ("names-1", path, "now"))
+            return original(definition, cell, tip)
+
+        with (mock.patch.object(style_ledger, "_cell_scope", side_effect=yield_then_scope),
+              self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: {re.escape(path)} was yielded$")):
+            self.record_removed(ledger, rule, path, deleting)
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
     def test_names_checkpoint_leaves_forbidden_words_judgments_stale_on_the_edited_path(self) -> None:
         names = self.rule("read")
         forbidden = self.rule("forbidden-words", "tier: C\nfamily: values\ninput_scope: file\n")
@@ -5894,7 +6141,7 @@ class StyleLedgerTests(unittest.TestCase):
         for rule, path in complete:
             self.assertNotIn(f"{rule} {path}", refused.stderr)
         self.assertEqual(self.ledger().ticket_open("read")[0]["state"], "assigned")
-        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1"),
+        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1", "HEAD", self.in_worktree),
                          (style_ledger.UnjudgedTicketCell(last, self.sources[1]),))
 
     def test_judgments_without_the_owned_ticket_do_not_complete_its_cells(self) -> None:
@@ -5941,7 +6188,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.cli("ticket", "yield", "--id", "read-1", "--path", self.sources[0])
 
         self.assertEqual({rule: self.states(rule)[self.sources[0]] for rule in (first, last)}, before)
-        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1"), ())
+        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1", "HEAD", self.in_worktree), ())
         _ = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", "HEAD")
         self.assertEqual(self.ledger().ticket_open("read")[0]["state"], "checkpointed")
 
@@ -6214,7 +6461,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(ledger.database)) as connection:
             after = cast(list[tuple[str, str, str]], connection.execute("SELECT * FROM ticket_yields").fetchall())
         self.assertEqual(after, before)
-        self.assertEqual(ledger.unjudged_ticket_cells("listed-1"), (style_ledger.UnjudgedTicketCell(rule, self.sources[1]),))
+        self.assertEqual(ledger.unjudged_ticket_cells("listed-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, self.sources[1]),))
 
     def test_record_under_a_yielded_ticket_is_refused_without_recreating_its_verdict(self) -> None:
         rule = self.rule("read")
