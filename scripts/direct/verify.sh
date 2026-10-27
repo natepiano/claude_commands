@@ -1312,9 +1312,11 @@ route_test() {
 
 # Starts copy_watch.py beside the natedev step run() is about to start: while
 # the step compiles, it may run a copy of the same test on the Mac, and the
-# first result wins (see docs/as-built/mac-test-offload.md).
+# first result wins (see docs/as-built/mac-test-offload.md). Its folder sits in
+# the run's hold folder, so the EXIT trap removes both, and both names carry
+# the run's pid for tmp_sweep.py when a kill skips the trap.
 start_copy_watch() {
-    COPY_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-copy.XXXXXX")"
+    COPY_WATCH_DIR="$(mktemp -d "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/verify-copy.$$.XXXXXX")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
@@ -1606,7 +1608,7 @@ if cache_lookup; then
     exit "${LOOKUP_STATUS}"
 fi
 
-HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.XXXXXX")"
+HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_ADMISSION_FILE="$HOLD_WAIT_DIR/admission"
 export BUILDLOG_HOLD_STARTED_FILE="$HOLD_WAIT_DIR/started"
