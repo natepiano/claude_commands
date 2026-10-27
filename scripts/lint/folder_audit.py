@@ -3,15 +3,15 @@
 idle ones whose removal loses no work, and tell their makers.
 
 The scratch guard refuses most loose folders before they exist, and the hourly tmp sweep removes the
-temp leftovers that cannot hold work (tempfile folders, empty folders, invoke.sh logs). This audit is
+temp leftovers that cannot hold work (tempfile folders, folders that hold only folders, verify.sh run folders, invoke.sh logs). This audit is
 the backstop for the rest: folders that can hold work. A folder is loose when it is none of these:
 
   * in ~/rust: a name in config/rust_roots.txt (one per line, `#` starts a comment), or a scratch
     root (~/rust/repro, ~/rust/scratch);
   * in ~/rust/scratch: nothing; every folder there is loose, since scratch.py never makes one there;
   * in /tmp, /tmp/claude and $TMPDIR: a name the system or a tool owns (KEPT_NAMES, KEPT_PREFIXES),
-    a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, an empty folder or
-    a Rust tempfile folder, which the sweep judges.
+    a session scratchpad (/tmp/claude-<uid>), a run folder root, a scratch root, a folder that holds
+    only folders, a verify.sh run folder or a tempfile folder, which the sweep judges.
 
 Only folders this user owns and idle for MIN_AGE_SECONDS are named. Idle time counts from the newest
 mtime of the folder and of what is in it, down to IDLE_DEPTH folders (target/, node_modules/ and
@@ -117,7 +117,7 @@ def kept_in_temp(entry: Path) -> bool:
     name = entry.name
     if name in KEPT_NAMES or name.startswith(KEPT_PREFIXES) or TEMPFILE_NAME.fullmatch(name):
         return True
-    return not tmp_sweep.listing(str(entry))
+    return tmp_sweep.holds_no_file(str(entry)) or tmp_sweep.VERIFY_TEMP_NAME.fullmatch(name) is not None
 
 
 def candidates(rust: Path, temps: list[Path], expected: frozenset[str] | None) -> list[Path]:
