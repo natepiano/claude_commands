@@ -5929,6 +5929,22 @@ class StyleLedgerTests(unittest.TestCase):
         self.record_removed(ledger, rule, path, "HEAD")
         self.assertEqual(self.cell_rows(ledger, path), [(deleting, "removed")])
 
+    def test_removed_records_an_own_delete_of_a_file_that_merged_in_work_edited_and_prints_its_line(self) -> None:
+        ledger, rule, base = self.removed_ticket()
+        path = self.sources[1]
+        _ = self.git("checkout", "-q", "-b", "outside", base)
+        self.write(path, "pub fn edited_outside() {}\n")
+        _ = self.commit("Outside work edits the file")
+        _ = self.git("checkout", "-q", "main")
+        # The normal sync: a first-parent merge brings the outside edit onto the ticket branch.
+        _ = self.git("merge", "--no-ff", "-q", "outside", "-m", "Bring in outside work")
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        recorded = self.cli("record", "--rule", rule, "--path", path, "--commit", "HEAD", "--rule-blob", self.blob(rule),
+                            "--verdict", "removed", "--ticket", "names-1", "--worker", "test-worker")
+        self.assertEqual(recorded.stdout, f"{rule} {path}: removed by ticket names-1 at {deleting[:7]}\n")
+        self.assertEqual(self.cell_rows(ledger, path), [(deleting, "removed")])
+
     def test_checkpoint_names_a_removed_cell_whose_file_is_back(self) -> None:
         ledger, rule, _ = self.removed_ticket()
         kept, path = self.sources[:2]
@@ -5996,6 +6012,80 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(checkpoint, "main")
         self.assertEqual(self.states(rule)[path], "stale")
 
+    def test_restamp_rechecks_a_removal_recorded_before_the_write_lock(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        ledger.ticket_add("other-names-1", "other-names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("other-names-1", "main")
+        _ = ledger.ticket_base("other-names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Another ticket deletes the file")
+        self.write(path, original)
+        restored = self.commit("The file comes back")
+        self.record(rule, path, restored, ticket="names-1")
+        # The ticket's newest row judges the file before the delete, which no ticket has recorded yet.
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, "fn edited() {}\n")
+        checkpoint = self.commit("Ticket edits the file brought back")
+        prepared = style_ledger.Ledger.checkpoint_restamps
+        other = self.ledger()
+
+        def remove_after_prepare(owner: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                                 commit: str) -> style_ledger.CheckpointRestamps | style_ledger.NoRestamps:
+            restamps = prepared(owner, ticket, commit)
+            if (deleting, "removed") not in self.cell_rows(other, path):
+                self.record_removed(other, rule, path, deleting, ticket="other-names-1")
+            return restamps
+
+        with mock.patch.object(style_ledger.Ledger, "checkpoint_restamps", autospec=True, side_effect=remove_after_prepare):
+            ledger.ticket_checkpoint("names-1", checkpoint)
+        # The checkpoint passes by the verdict on the restored file, and the verdict before the delete does not carry.
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_restamp_rechecks_a_removal_that_takes_the_id_of_a_yielded_one(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        for ticket in ("other-names-1", "third-names-1"):
+            ledger.ticket_add(ticket, ticket.removesuffix("-1"), "read", "names", "crates/alpha", [path], [rule])
+            ledger.ticket_assign(ticket, "main")
+            _ = ledger.ticket_base(ticket)
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        first = self.commit("Another ticket deletes the file")
+        self.write(path, original)
+        restored = self.commit("The file comes back")
+        (self.repo / path).unlink()
+        second = self.commit("A third ticket deletes the file")
+        self.write(path, original)
+        restored_again = self.commit("The file comes back again")
+        self.record(rule, path, restored_again, ticket="names-1")
+        # The ticket's newest row judges the file between the two deletes.
+        self.record(rule, path, restored, ticket="names-1")
+        # The first removal is the newest row, so the next row can take its id once the yield deletes it.
+        self.record_removed(ledger, rule, path, first, ticket="other-names-1")
+        self.write(path, "fn edited() {}\n")
+        checkpoint = self.commit("Ticket edits the file brought back")
+        prepared = style_ledger.Ledger.checkpoint_restamps
+        other = self.ledger()
+
+        def swap_after_prepare(owner: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                               commit: str) -> style_ledger.CheckpointRestamps | style_ledger.NoRestamps:
+            restamps = prepared(owner, ticket, commit)
+            if (second, "removed") not in self.cell_rows(other, path):
+                _ = other.ticket_yield("other-names-1", path)
+                self.record_removed(other, rule, path, second, ticket="third-names-1")
+            return restamps
+
+        with mock.patch.object(style_ledger.Ledger, "checkpoint_restamps", autospec=True, side_effect=swap_after_prepare):
+            ledger.ticket_checkpoint("names-1", checkpoint)
+        # The checkpoint passes by the verdict after the second delete, and the verdict before it does not carry.
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+
     def test_removed_refuses_a_file_still_present_outside_the_ticket_or_its_start(self) -> None:
         self.write("README.md", "Work before the ticket\n")
         _ = self.commit("Work before the ticket")
@@ -6031,12 +6121,14 @@ class StyleLedgerTests(unittest.TestCase):
         path = self.sources[1]
         _ = self.git("checkout", "-q", "-b", "outside")
         (self.repo / path).unlink()
-        deleting = self.commit("Outside branch deletes the file")
+        _ = self.commit("Outside branch deletes the file")
         _ = self.git("checkout", "-q", "main")
         self.write("README.md", "Ticket work\n")
         _ = self.commit("Ticket work")
         _ = self.git("merge", "--no-ff", "-q", "outside", "-m", "Bring in outside work")
-        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: changed by commits that are not names-1's own: {deleting[:7]}$"):
+        merge = self.git("rev-parse", "HEAD")
+        # The merge's diff against its first parent deletes the path, so the delete is not the ticket's.
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: merge {merge[:7]} deletes it, not a commit of names-1's own$"):
             self.record_removed(ledger, rule, path, "HEAD")
         self.assertEqual(self.cell_rows(ledger, path), [])
 
