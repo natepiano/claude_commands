@@ -157,40 +157,39 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 ### Phase 1 — client, state and questions; the `score` command  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `score_issues.py score [--only <glob>] [--limit N]` scores open non-style issues and writes one JSONL result per issue to `~/.local/state/issue-score/runs/<run-id>.jsonl`.
-
-**Spec:**
-- `client.py`: `system_one(state, questions, model) -> Response`. Uses `urllib`, gzip body, and `Authorization: Bearer <key>`. The key comes only from `TYPESAFE_API_KEY`, which `with-typesafe` sets. If it is missing, raise `TypeSafeError("TYPESAFE_API_KEY not set: run under with-typesafe")`. The client never decrypts the key itself, and it never puts the key in a log, a payload record or an error message. Before each request, it checks the spend ledger against `BUDGET_USD` and raises `BudgetExceeded` if the total has reached the cap. After each response, it appends the input tokens and cost to the ledger. It retries 429/529 with exponential backoff, following `retry-after` when present, for at most 5 attempts. Any other non-2xx raises `TypeSafeError` with the status and body. Typed `TypedDict`s describe the Noul, Choice and Score answers, following the response shapes on the API page. No `Any`.
-- `vault.py`: `Issue` dataclass (path, title, project, body, labels), with labels parsed from the frontmatter: goal, the four stars, category, area. `load_open_issues()` skips style issues and directories. `load_rated_issues()` also skips any issue with a `Proposed ranking:` body line, and it keeps a style issue only when its five values differ from the style formula (Review decisions 1). It returns each skipped path with its reason, so the report can show the count. `clean_body()` reduces `[[a|b]]` to `b` and `[[a]]` to `a`, then applies the 24,000-character cap at a heading. `normalize_area()` strips quotes, `[[ ]]` and case. `area_vocabulary()` returns the sorted, deduplicated normalized areas of non-style issues.
-- `questions.py`: `QUESTION_SET_VERSION`; `PROJECT_ABOUT` (one line per project in `/issue`'s mapping table, from each repo's README); and builders for the main request and the area request, exactly as in the Design table. Option names describe content. Levels are situations. Each Noul's `false` criterion is a concrete situation. The five rubric levels come from `commands/issue.md` step 4, rewritten as situations.
-- `decide.py`: median level; split detection (two non-neighbor levels each ≥ 0.25); averaging of the two-order Choice; the urgency table, which never returns 5 and sets a `possible_five` flag; and `sure`/`unsure` per field from `THRESHOLDS` in `questions.py`, every field starting at 0.6.
-- `score_issues.py score`: runs the main and area requests per issue, 8 issues at a time. The result line holds the issue path, a content hash, `QUESTION_SET_VERSION`, the model that answered, both payloads, every answer and the decided fields. It reuses a cached line when the hash, version and model all match.
+- `score_issues.py score [--only glob] [--limit N]` scores open non-style issues, 8 workers at a time. Each issue gets a main request and an area request. The run writes one JSONL line per issue to `~/.local/state/issue-score/runs/<run-id>.jsonl` and prints that path.
+- A result line holds `issue_path`, `content_hash`, `question_set_version`, `model`, both `payloads`, all `answers` and `decided_fields`. A failed issue writes `{"issue_path","error"}`. `score()` returns `ScoreRun(result_path, failure_count)`; `main` exits 1 on any failure.
+- The cache reuses a line when (path, content hash), `QUESTION_SET_VERSION` and model all match. The hash covers title, project, body and the area vocabulary, never labels. A partial last line from a killed run is ignored.
+- `BudgetExceeded` stops the run: no new batch starts, and finished lines stay.
 
 **Files:**
-- `scripts/issue_score/client.py` — the TypeSafe client, budget check and spend ledger
-- `scripts/issue_score/vault.py` — loads open and rated issues and builds the state
-- `scripts/issue_score/questions.py` — all question wording, thresholds and the budget
-- `scripts/issue_score/decide.py` — maps answers to field values
-- `scripts/issue_score/score_issues.py` — the command line, `score` subcommand
-- `scripts/issue_score/test_client.py` — client tests
-- `scripts/issue_score/test_vault.py` — vault tests
-- `scripts/issue_score/test_decide.py` — decision tests
-- `scripts/issue_score/test_score_issues.py` — command tests
-- `scripts/issue_score/fixtures/*.json` — recorded responses for tests
-- `pyrightconfig.json` — one entry for the new folder
-- `scripts/production/merge_gate.py` — `issue_score` added to `TEST_SUITES` so the gate runs the new tests
+- `scripts/issue_score/client.py` — `system_one`, response `TypedDict`s (`NoulAnswer`, `ChoiceAnswer`, `ScoreAnswer`, `Usage`, `Response`), `TypeSafeError`, `BudgetExceeded`, spend ledger and reservations
+- `scripts/issue_score/questions.py` — all question wording, `PROJECT_ABOUT`, constants, `main_questions()`, `area_questions(areas)`
+- `scripts/issue_score/decide.py` — median, split, two-order Choice average, urgency table, `decide_answers`
+- `scripts/issue_score/vault.py` — `Issue`, issue loaders, `clean_body`, `normalize_area`, `area_vocabulary`, `build_state`
+- `scripts/issue_score/score_issues.py` — the command line and `score` subcommand
+- `scripts/issue_score/test_*.py`, `fixtures/*.json` — client, questions, decide, vault and command tests on recorded responses
+- `pyrightconfig.json` — an entry for `scripts/issue_score`
+- `scripts/production/merge_gate.py` — `issue_score` in `TEST_SUITES` (`test_merge_gate` `EXPECTED_SUITES` matches)
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — all `scripts/issue_score/*.py` except the tests, and `pyrightconfig.json`
-- `test` — `test_*.py` and `fixtures/`, written from the Spec: retry on 429 then success; a 500 raises; wikilink cleaning; style issues skipped; median and split cases; the urgency table rows, including "never 5"; the cache hit.
+**Binds later work:**
+- `client.system_one(state, questions, model=MODEL, *, ledger_path=SPEND_LEDGER) -> Response`. The key comes only from `TYPESAFE_API_KEY`; missing gives `TypeSafeError("TYPESAFE_API_KEY not set: run under with-typesafe")`. It retries 429/529 at most 5 times. The budget is the `spend.jsonl` ledger plus byte-bounded reservations in `spend.pending.json` under an fcntl lock. A reservation persists after a killed process (fail closed). Over budget raises `BudgetExceeded`. `score` puts the ledger at `<state_dir>/spend.jsonl`.
+- `questions.py` holds all wording, `QUESTION_SET_VERSION` (`"2"`), `MODEL` (`"jev-1.14.0"`), `BUDGET_USD = 20.0`, `THRESHOLDS` (0.6 each), `EVIDENCE_PRESENT` 0.7 / `EVIDENCE_ABSENT` 0.3, `SPLIT_PROBABILITY` 0.25, `BODY_CHARACTER_LIMIT` (24,000). Production question names are fixed: `goal`/`goal_reverse`, `category`/`category_reverse`, `impact`, `effort`, `pressure`, `alignment_<goal>`, the 4 urgency evidence Nouls (`deadline_named`, `outside_cutoff`, `current_harm`, `blocks_planned_work`), and `area`/`area_reverse`/`area_fits`.
+- `decide.decide_answers(main, area) -> dict[str, FieldDecision]`; `FieldDecision(value, confidence, certainty, split, check, possible_five, probabilities, hint)`. Urgency evidence > 0.7 gives 4 with `possible_five` and probabilities `{"4": confidence}`; urgency never returns 5. `area_fits` < 0.3 gives `unfiled`, keeps the top area as `hint`, and takes certainty from 1 − fits.
+- `vault.load_open_issues()` returns open non-style issues. `vault.load_rated_issues() -> RatedIssues(issues, skipped)` gives each skip a reason (not open, unconfirmed Proposed ranking, missing or invalid ratings, style ratings match proposal formula). `vault.build_state(issue)` raises on an unknown (non-canonical) project. Labels are never in the state.
 
-**Constraints from prior phases:** none.
-
-**Acceptance gate:** the merge gate is green; `basedpyright scripts/issue_score` prints `0 errors, 0 warnings`; and, once the user has given the go, `with-typesafe ~/.claude/scripts/lib/py scripts/issue_score/score_issues.py score --limit 5` writes 5 result lines on the live API, and the unit director reads each one.
+**Gotchas:**
+- `EFFORT_LEVELS` examples name open issues (enum variant index, NonZeroSize) that are in the evaluation set.
+- A version-titled issue (for example "0.20.0 …") fires `deadline_named`, so it gets urgency 4 with `possible_five`.
+- Category leans feature/research where the vault says enhancement.
+- 9 style issues pass as labels, because their values differ from the style formula on current counts.
+- A live run of 5 issues cost about $0.0019; the whole vault costs about $0.17.
 
 ### Phase 2 — the `compare` report  · status: todo
+
+**Depends on:** Phase 1
 
 #### Work Order
 
@@ -204,14 +203,23 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - `scripts/issue_score/evaluate.py` — the metrics
 - `scripts/issue_score/score_issues.py` — the `compare` subcommand
 - `scripts/issue_score/test_evaluate.py` — metric tests
+- `scripts/issue_score/test_score_issues.py` — `--split` and `--fresh` tests
 
-**Workers:** `1 writer + 1 tester` — `impl` owns `evaluate.py` and `score_issues.py`; `test` writes `test_evaluate.py` with hand-computed kappa, ranked probability score and Spearman cases.
+**Workers:** `1 writer + 1 tester` — `impl` owns `evaluate.py` and `score_issues.py`; `test` writes `test_evaluate.py` with hand-computed kappa, ranked probability score and Spearman cases, and the `--split`/`--fresh` cases in `test_score_issues.py`.
 
-**Constraints from prior phases:** set by phase review.
+**Constraints from prior phases:**
+- `score` gains `--split tune|holdout|all` (default `all`), using the same `sha1(filename) % 10 < 7` rule from `evaluate.py`, so a tuning run never sends a holdout issue. Test: a tune run makes no request for a holdout issue.
+- `score` gains `--fresh`: skip the cache read (results are still written), so the repeat check compares two real responses.
+- `score()` returns `ScoreRun(result_path, failure_count)`. A run line is either a result (`issue_path`, `content_hash`, `question_set_version`, `model`, `payloads`, `answers`, `decided_fields`) or a failure (`issue_path`, `error`). `compare` counts scored, failed and unscored issues of the split and prints them at the top; a report with failed or unscored issues says "partial" in its title.
+- Labels come from `vault.load_rated_issues()` at compare time, never from the run. `backlog_score` comes from the issue frontmatter; the composite uses `renumber.calculate_score` and its goal parsing through an import.
+- Excluded from every metric, and counted in the report header: issues named in `questions.EFFORT_LEVELS` examples (the open "reflected enum variant index", "NonZeroSize", "gamepad camera modes", "Bevy migration impact", "color picker widget", "cable auto routing", "network-aware undo", "AI graph builder" issues — match by title), and style issues that `load_rated_issues()` admits (reported as their own list for review).
+- Probability metrics (RPS, Brier, reliability) read the question answers in `answers`, never `decided_fields.probabilities`: urgency's RPS uses the `pressure` Score only for issues whose decision came from pressure; urgency 4 decisions and `unfiled` area decisions get exact-match metrics only.
 
-**Acceptance gate:** the merge gate is green; basedpyright clean; a baseline `score` run on the tuning set, with its `compare` report, exists and the unit director has read it.
+**Acceptance gate:** the merge gate is green; basedpyright clean; a baseline `score --split tune` run, with its `compare` report, exists and the unit director has read it.
 
 ### Phase 3 — tune wordings and thresholds; the user's review  · status: todo
+
+**Depends on:** Phase 2
 
 #### Work Order
 
@@ -234,11 +242,18 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Workers:** `1 writer + 1 tester` — the unit director runs the experiments; `impl` applies the chosen wordings and thresholds and writes `blind`/`blind-score`; `test` writes `test_blind.py` (the seed reproduces the order; the key never appears in the sheet; tallies are correct).
 
-**Constraints from prior phases:** set by phase review.
+**Constraints from prior phases:**
+- Fixed question names: `parse_response` and `decide_answers` read the production names (`goal`, `goal_reverse`, `category`, `category_reverse`, `impact`, `effort`, `pressure`, `alignment_<goal>`, the 4 evidence Nouls, `area`, `area_reverse`, `area_fits`). A wording variant goes in the same request under `<name>__<variant>`; the experiment code maps it back to its production name before it calls `decide`. Every adopted wording increments `QUESTION_SET_VERSION`.
+- The repeat check runs with `--fresh`; a cached answer is not a repeat.
+- `EFFORT_LEVELS` names open issues that are in the evaluation. Replace them with closed issues before the final held-out run, and increment the version.
+- Deadline experiment: compare a version-identifier case (a title such as "Bevy 0.18 migration", the expected answer no) with an explicit completion deadline (the expected answer yes) on the tuning split. Carry the feature/enhancement/research confusion into the per-field recommendation.
+- Thresholds: when no threshold meets the error target, or "sure" coverage is zero, the result is the named outcome `unsupported`, and the field's recommendation is agent-only. Split answers and Choice orders that disagree stay "unsure" at every threshold; a test proves that confidence alone does not make them "sure".
 
 **Acceptance gate:** the merge gate is green; the held-out report exists; the user has filled in the blind sheet and the result is reported; the user's per-field verdict is recorded in `JEV_FIELDS`.
 
 ### Phase 4 — `/issue` proposes with Jev  · status: todo
+
+**Depends on:** Phase 3
 
 #### Work Order
 
@@ -255,11 +270,16 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 
 **Workers:** `1 writer + 1 tester` — `impl` owns `score_issues.py` and `commands/issue.md`; `test` covers the output format, the unsure display and exit 2 on a failed fixture.
 
-**Constraints from prior phases:** set by phase review.
+**Constraints from prior phases:**
+- `propose --project <short>` converts the shorthand to the canonical project name (`hana_diegetic`) before `vault.build_state`, which raises on an unknown project; a test covers each shorthand and an unknown one.
+- Show the derived flags: `split`, `check` (effort), `possible_five` (urgency 4) and an `unfiled` area with its hint.
+- Acceptance: the output for a fixture response is equal to a pinned expected text; the live check confirms only that the output is complete and usable, because a fresh response can differ from an earlier report row.
 
 **Acceptance gate:** the merge gate is green; basedpyright clean; one live `propose` on a held-out issue's title and body prints a line that matches its report row.
 
 ### Phase 5 — reassess every open issue  · status: todo
+
+**Depends on:** Phase 3
 
 #### Work Order
 
@@ -294,11 +314,17 @@ Accept in bulk every value Jev is sure of for the fields the user approved in Ph
 
 **Workers:** `1 writer + 1 tester` — `impl` owns the three modules; `test` covers the style state, the grouping and the sort order.
 
-**Constraints from prior phases:** set by phase review.
+**Constraints from prior phases:**
+- Read open, non-style issues through `vault.load_open_issues`; style issues get the formula state that this phase adds.
+- The pending approval decision goes to the showrunner after Phase 3, with the Phase 3 results.
+- The writer: `proposal_issue.py stars` writes only the five ranking fields. Name the writer for `category` and `area` in this phase, write only the approved fields, and refuse a write when the issue's content hash differs from the scored one. Acceptance proves that only approved values change and that the scorer code stays read-only.
+- A partial run (failed lines or a budget stop) shows the failed and unscored issues in the review files and never presents them as complete.
 
 **Acceptance gate:** the merge gate is green; basedpyright clean; a full reassess run within budget; the user has the review file, and the values the user approved are written.
 
 ### Phase 6 — the TypeSafe guide for other sessions  · status: todo
+
+**Depends on:** Phase 5
 
 #### Work Order
 
@@ -318,6 +344,8 @@ Accept in bulk every value Jev is sure of for the fields the user approved in Ph
 
 **Workers:** `1 writer`.
 
-**Constraints from prior phases:** set by phase review.
+**Constraints from prior phases:**
+- Explain partial runs: a failed line holds `{"issue_path","error"}`, and `score` exits 1.
+- Explain spend: `spend.jsonl` holds recorded spend; `spend.pending.json` holds reservations, which stay after a killed process (fail closed). `BudgetExceeded` can come while recorded spend is below $20; give the steps to tell reserved from recorded spend and to clear a stale reservation. Acceptance checks that an interrupted-run scenario gives the operator these steps.
 
 **Acceptance gate:** the doc exists, every path it names exists, and the merge gate is green.
