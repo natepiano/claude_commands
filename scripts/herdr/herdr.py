@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -1742,6 +1743,37 @@ def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Unt
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableTrustFile(folder, target, type(error).__name__)
     return Trusted(folder, target, granted.project_key)
+
+
+@dataclass(frozen=True)
+class TrustCopied:
+    """The target account lacked trust for the folder, and the account `source` had it."""
+
+    folder: Path
+    account_file: Path
+    source: str
+
+
+def heal_claude_trust(
+    folder: Path, target: Path, sources: Sequence[tuple[str, Path]], *, dry_run: bool,
+) -> Trusted | TrustCopied | Untrusted | UnreadableTrustFile:
+    """Give the target account file the trust the first trusting source already gave this folder.
+
+    `sources` pairs each account's label with its account file, in the order to try. The copy is
+    `copy_claude_trust`'s one key; a dry run copies nothing. With no trusting source, the target's
+    own `Untrusted` comes back, and the user accepts trust once.
+    """
+    present = claude_trust(folder, target)
+    if not isinstance(present, Untrusted):
+        return present
+    for label, source in sources:
+        if not isinstance(claude_trust(folder, source), Trusted):
+            continue
+        if dry_run:
+            return TrustCopied(present.folder, target, label)
+        copied = copy_claude_trust(folder, source, target)
+        return TrustCopied(present.folder, target, label) if isinstance(copied, Trusted) else copied
+    return present
 
 
 def repository_root(directory: Path) -> Path:

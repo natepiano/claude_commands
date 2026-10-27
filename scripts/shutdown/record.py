@@ -386,6 +386,7 @@ class SessionRestartFailed(TypedDict):
     kind: Literal["restart failed"]
     at: str
     reason: str
+    trust_command: NotRequired[str]  # the user's fix when no account on the machine trusts the folder
 
 
 class SessionNeedsManualRestart(TypedDict):
@@ -782,6 +783,8 @@ def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProg
         values["prior"] = prior
     if kind in {"stop failed", "restart failed"}:
         _ = _string(_required(values, "reason", place), f"{place}.reason")
+        if kind == "restart failed" and "trust_command" in values:
+            _ = _string(values["trust_command"], f"{place}.trust_command")
     elif kind == "timers pending":
         timer_values = _items(
             _required(values, "timers", place), f"{place}.timers"
