@@ -101,7 +101,7 @@ class SendGuardTests(ShutdownTestCase):
     def test_account_alert_without_a_fake_fails(self) -> None:
         class UnfakedAlert(ShutdownTestCase):
             def test_alert(self) -> None:
-                settle.alert_user(
+                _ = settle.alert_user(
                     render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
@@ -113,7 +113,7 @@ class SendGuardTests(ShutdownTestCase):
         class SwallowedAlert(ShutdownTestCase):
             def test_alert(self) -> None:
                 try:
-                    settle.alert_user(
+                    _ = settle.alert_user(
                             render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                     )
                 except Exception:
@@ -234,7 +234,7 @@ class SendGuardTests(ShutdownTestCase):
         class AllowedDelivery(ShutdownTestCase):
             def test_alert(self) -> None:
                 self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
-                settle.alert_user(
+                _ = settle.alert_user(
                     render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
@@ -254,7 +254,7 @@ class SendGuardTests(ShutdownTestCase):
                 self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
 
             def test_alert(self) -> None:
-                settle.alert_user(
+                _ = settle.alert_user(
                     render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
@@ -276,7 +276,7 @@ class SendGuardTests(ShutdownTestCase):
         class PatchedDelivery(ShutdownTestCase):
             def test_alert(self) -> None:
                 with patch.object(settle, "_deliver_message", new=fake_delivery):
-                    settle.alert_user(
+                    _ = settle.alert_user(
                             render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                     )
 
