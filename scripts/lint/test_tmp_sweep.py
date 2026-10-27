@@ -7,7 +7,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import socket
 import sys
 import tempfile
 import time
@@ -78,7 +77,7 @@ class TmpSweepCase(unittest.TestCase):
 
     def roots(self) -> tmp_sweep.Roots:
         return tmp_sweep.default_roots(str(self.tmp), (str(self.delegate), str(self.unit)), (str(self.session_root),), (),
-                                       (str(self.tmp / "scratch"),))
+                                       (str(self.tmp / "scratch"),), (), (str(self.tmp / "session"),))
 
     def unreadable_sessions(self) -> None:
         self.live = None
@@ -208,20 +207,62 @@ class ProcessUseTests(TmpSweepCase):
 
 
 class ScratchRootTests(TmpSweepCase):
-    def test_each_task_folder_is_judged_and_a_rows_folder_waits_for_its_verdict(self) -> None:
-        run = write(self.tmp / "scratch" / "run-x-gate-abc123" / "a").parent
-        row = write(self.tmp / "scratch" / "row-natedev-C5-copy-abc123" / "a").parent
-        recent = write(self.tmp / "scratch" / "phase-builds-unit-7-def456" / "a").parent
-        for folder, task in ((run, "run:x"), (row, "row:natedev-C5"), (recent, "phase:builds-unit/7")):
+    def test_a_task_folder_stays_while_its_task_is_open_and_goes_when_its_time_passes(self) -> None:
+        scratch_root = self.tmp / "scratch"
+        run = write(scratch_root / "run-x-gate-abc123" / "a").parent
+        row = write(scratch_root / "row-natedev-C5-copy-abc123" / "a").parent
+        due = write(scratch_root / "until-due-abc123" / "a").parent
+        later = write(scratch_root / "until-later-abc123" / "a").parent
+        loose = write(scratch_root / "loose-abc123" / "a").parent
+        tasks = ((run, "run:x"), (row, "row:natedev-C5"), (due, scratch.until_task(self.now - 60)),
+                 (later, scratch.until_task(self.now + 3 * DAY)))
+        for folder, task in tasks:
             scratch.write_record(folder, task, 0.0)
-            os.utime(folder / scratch.RECORD, (0, 0))
-        self.recent(recent / "a")
+        self.recent(due / "a")
         result = self.sweep()
+        self.assertFalse(due.exists())
+        self.assertFalse(loose.exists())
+        for folder in (run, row, later):
+            self.assertTrue(folder.is_dir(), folder)
+        self.assertEqual(sorted(result.kept[tmp_sweep.TASK_OPEN]), [str(run), str(later)])
+        self.assertEqual(result.kept[tmp_sweep.ROW_WAITS], [str(row)])
+        self.assertIn(str(scratch_root), result.kept[tmp_sweep.ROOT])
+        _ = tmp_sweep.sweep(False, self.roots(), time.time() + 8 * DAY, str(self.proc))
         self.assertFalse(run.exists())
         self.assertTrue(row.is_dir())
-        self.assertTrue(recent.is_dir())
-        self.assertEqual(result.kept[tmp_sweep.ROW_WAITS], [str(row)])
-        self.assertIn(str(self.tmp / "scratch"), result.kept[tmp_sweep.ROOT])
+
+
+class TempParentTests(TmpSweepCase):
+    def test_entries_in_a_live_sessions_temp_root_and_a_run_temp_go_after_4_h(self) -> None:
+        live_root = self.tmp / "session" / LIVE_SESSION
+        idle = write(live_root / ".tmpAb12Cd" / "a").parent
+        fresh = write(live_root / "pymp-x" / "a").parent
+        self.recent(fresh / "a")
+        gone = write(self.tmp / "session" / "ended-session" / "a").parent
+        run_idle = write(self.unit / "run-1" / "tmp" / "tmp.abcdefgh" / "a").parent
+        result = self.sweep()
+        self.assertFalse(idle.exists())
+        self.assertTrue(fresh.is_dir())
+        self.assertTrue(live_root.is_dir())
+        self.assertFalse(gone.exists())
+        self.assertFalse(run_idle.exists())
+        self.assertIn(str(live_root), result.kept[tmp_sweep.SESSION_RUNS])
+
+    def test_a_folders_ctime_is_no_change_in_a_temp_folder(self) -> None:
+        top = self.tmp / "old"
+        deeper = top / "inner" / "deeper"
+        deeper.mkdir(parents=True)
+        for folder in (deeper, deeper.parent):
+            os.utime(folder, (1000, 1000))
+        since = time.time() - 60
+        self.assertEqual(tmp_sweep.last_change(str(top), tmp_sweep.Limit(since, tmp_sweep.RECENT, folder_ctime=False)),
+                         (1000, 0))
+        self.assertEqual(tmp_sweep.last_change(str(top), tmp_sweep.Limit(since, tmp_sweep.RECENT)), tmp_sweep.RECENT)
+        # An empty folder falls back to its own times, and its own ctime is no change either.
+        os.utime(deeper, (1000, 1000))
+        self.assertEqual(tmp_sweep.last_change(str(deeper), tmp_sweep.Limit(since, tmp_sweep.RECENT, folder_ctime=False)),
+                         (1000, 0))
+        self.assertEqual(tmp_sweep.last_change(str(deeper), tmp_sweep.Limit(since, tmp_sweep.RECENT)), tmp_sweep.RECENT)
 
 
 class TempFolderTests(TmpSweepCase):
@@ -251,38 +292,39 @@ class TempFolderTests(TmpSweepCase):
         kept = [path for paths in result.kept.values() for path in paths]
         self.assertFalse([path for path in kept if any(str(other) in path for other in others)])
 
-    def test_any_owned_folder_in_the_wide_root_goes_after_seven_idle_days(self) -> None:
+    def test_only_empty_folders_and_invoke_logs_in_the_wide_root_go(self) -> None:
         wide = self.tmp.parent / "wide"
-        leftover = write(wide / "mend-config-root-test-179035" / "a").parent
+        empty = wide / "mend-config-root-test-179035"
+        nix_empty = wide / "nix-shell.aN6y2p"
+        for folder in (empty, nix_empty):
+            folder.mkdir(parents=True)
+        full = write(wide / "loose-clone" / "a").parent
+        nix_full = write(wide / "nix-build-x" / "a").parent
         tempfile_folder = write(wide / "tmp.johjtSnxbj" / "a").parent
-        used = write(wide / "tui_pane_theme_loader_badparse_0_1" / "a").parent
+        logs = [write(wide / "lint_invoke.1121749.27492.log"), write(wide / "buildlog.35612.67614768.log"),
+                write(wide / "buildlog.35612.676.peak.cgroup")]
+        other_file = write(wide / "notes.log")
+        used = wide / "tui_pane_theme_loader_badparse_0_1"
+        used.mkdir()
         fake_process(self.proc, 11, cwd=str(used))
-        kept = [write(wide / "tmux-1000" / "default").parent, write(wide / ".X11-unix" / "X0").parent,
-                write(wide / "systemd-private-abc" / "tmp" / "a").parent.parent]
-        holder = write(wide / "holder" / "-proj" / "s" / "a").parent.parent.parent
-        listening = wide / "server"
-        listening.mkdir()
-        server = socket.socket(socket.AF_UNIX)
-        self.addCleanup(server.close)
-        server.bind(str(listening / "s"))
-        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (str(holder),), (str(wide),), (),
-                                        (str(wide),))
-        early = tmp_sweep.sweep(False, roots, time.time() + 6 * DAY, str(self.proc))
-        def wide_deleted(result: tmp_sweep.Sweep) -> list[str]:
-            return [entry["path"] for entry in result.deleted if Path(entry["path"]).parent == wide]
+        kept = [write(wide / "tmux-1000" / "default").parent, wide / ".X11-unix", wide / "ssh-empty"]
+        for folder in kept[1:]:
+            folder.mkdir()
+        for path in (used, *kept[1:]):
+            os.utime(path, (1000, 1000))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(wide),), (), (str(wide),))
 
-        self.assertEqual(wide_deleted(early), [str(tempfile_folder)])
-        self.assertEqual(early.kept[tmp_sweep.RECENT_WIDE], [str(leftover)])
-        self.assertEqual(early.kept[tmp_sweep.HOLDS_SOCKET], [str(listening)])
+        def wide_deleted(result: tmp_sweep.Sweep) -> list[str]:
+            return sorted(entry["path"] for entry in result.deleted if Path(entry["path"]).parent == wide)
+
+        early = tmp_sweep.sweep(False, roots, time.time() + 5 * 3600, str(self.proc))
+        self.assertEqual(wide_deleted(early), sorted([str(tempfile_folder), *map(str, logs)]))
+        self.assertEqual(sorted(early.kept[tmp_sweep.RECENT_WIDE]), sorted([str(empty), str(nix_empty)]))
         late = tmp_sweep.sweep(False, roots, time.time() + 8 * DAY, str(self.proc))
-        self.assertEqual(wide_deleted(late), [str(leftover)])
-        self.assertFalse(leftover.exists())
-        self.assertEqual(late.kept[tmp_sweep.HOLDS_SOCKET], [str(listening)])
+        self.assertEqual(wide_deleted(late), sorted([str(empty), str(nix_empty)]))
         self.assertEqual(late.kept[tmp_sweep.IN_USE], [f"{used}: pid 11 works in it"])
-        for folder in [*kept, holder, used, listening]:
-            self.assertTrue(folder.exists(), folder)
-        judged = [path.split(":")[0] for paths in late.kept.values() for path in paths]
-        self.assertFalse([folder for folder in [*kept, holder] if str(folder) in judged])
+        for path in [full, nix_full, other_file, used, *kept]:
+            self.assertTrue(path.exists(), path)
 
     def test_the_wide_root_is_tmp_alone_and_only_when_it_is_a_temp_folder(self) -> None:
         temp = self.tmp.parent / "temp"
