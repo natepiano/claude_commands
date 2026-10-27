@@ -2490,20 +2490,24 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 - Copying the record's `restore_alerted` mark into the watchdog outage fails both ways: an unfinished claim reads as delivered, and an archive before the next pass loses the mark. The ledger must be separate from the record.
 - Reserving all of a report's pushes up front lets a late claim pass its lease behind slow sends; claim per push.
-- Known residual, moved to Phase 90: a slow batch confirm can clear a newer outage's entry and allow a second push.
+- Residual (fixed in Phase 90): a slow batch confirm could clear a newer outage's entry and allow a second push.
 
-### Phase 90 — A slow batch restart does not clear a newer outage's alert  · status: done
+### Phase 90 — A slow batch restart does not clear a newer outage's alert  · status: done (7e92e7b5)
 
 **Depends on:** Phase 89
 
-#### Work Order
+#### As-built
 
-Follow-up from Phase 89's closure review (hard landing, finding F008). `restart._confirm_entries` confirms a batch of restored sessions and then clears each one's outage ledger entry from its earlier `restarted` state. If unit A confirms live, then crashes and the watchdog delivers a push for the new outage while unit B's confirmation is still slow, the batch then clears A's ledger. After the archive the watchdog sends a second push for A's same outage.
+- `outage_alerts.clear(session_id, observed_at)` removes only an alert claimed strictly before `observed_at`; an alert claimed at or after it belongs to a newer outage and stays. A delivered entry keeps its claim time. `clear` returns whether the outage ended, and the record mark `restore_alerted` is cleared only then.
+- Every live clear passes the time its liveness read started (`time.time()`): `_up`'s cached `live_ids`, the shared registry confirmation (`RegistryConfirmation.observed_at`, used by `confirm_entry`, `_confirm_entries` and `settle._confirm_relaunch_pass`), `clear_running_on_target`, the live skips in `launch_entry`/`relaunch_session`, the source fallback and the watchdog's probe.
+- Later timer settlement (`_record_timer_restore_progress`) and record archives (`_confirm_entries`, `settle._archive_finished`) no longer clear the ledger.
 
-- A ledger clear applies only to the outage that the live observation saw: clear only an entry claimed or delivered before that observation (store the claim time, compare with the observation time), or clear at the moment of the live observation instead of at the later archive. Pick the smaller change and state why.
-- Check every clear site from Phase 89's audit (`clear_running_on_target`, `_record_timer_restore_progress`, `confirm_entry`, `_confirm_entries`, `settle._archive_finished`, the live skips in `launch_entry`/`relaunch_session`/`_up`, the watchdog live observation) against the same rule.
-- Tests (real restart, record, watchdog and ledger paths; fake clock and send leaves): A live, A crashes and is alerted while B confirms slowly, batch archives → no second push for A; A live, later new outage → one new push.
+#### Files
 
-**Files:** `scripts/accounts/outage_alerts.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py` (only if `_archive_finished` changes), their tests, `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+`scripts/accounts/outage_alerts.py`, `unit_watchdog.py`, `scripts/shutdown/restart.py`, `settle.py`; tests `test_unit_watchdog.py`, `test_restart.py`, `test_settle.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
 
-**Verification:** `scripts.accounts.test_unit_watchdog scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.accounts.test_launch_accounts scripts.shutdown.test_restart scripts.shutdown.test_record scripts.shutdown.test_shutdown_cli scripts.shutdown.test_settle scripts.lib.test_user_zone`, basedpyright on changed files, then the full merge gate.
+#### Gotchas
+
+- A clear must use the time of the observation it acts on, never the time of the clear: a cached reading is old by the time a slow loop reaches it.
+- Known minor residual: an old alert claimed inside the one registry read that sees the unit live survives the clear; a new crash before the next watchdog live pass (about 2 minutes) then sends no push.
+- `scripts.agents.test_mesh_runs` `test_a_live_supervisor_is_not_ended` failed once under the full parallel gate and passed alone and on the rerun: a load flake outside this unit.
