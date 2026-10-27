@@ -112,7 +112,7 @@ def parse_frontmatter(path: Path) -> dict[str, list[str]]:
         key, _, value = stripped.partition(":")
         key = key.strip()
         value = value.strip()
-        if line == line.lstrip() and key in ("tier", "family", "input_scope", "mechanism", "mode"):
+        if line == line.lstrip() and key in ("tier", "family", "input_scope", "mechanism", "mode", "approval"):
             if len(value) >= 2 and value[0] in ("'", '"') and value[-1] == value[0]:
                 value = value[1:-1]
             metadata[key] = [value]
