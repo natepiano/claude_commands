@@ -2467,24 +2467,30 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 - Run the full merge gate after every origin merge: shutdown 61459ed7 (restore dropped when its folder is gone) turned five watchdog tests red only after the merge; give restored sessions a real scratch folder.
 - `test_launch_accounts` requires every Claude launcher to pick its account through `account_for_group_launch`, and `scripts/lib/test_user_zone` requires `astimezone(user_zone())`; neither is in the accounts suites, so run them.
-- Known residual: a worker can deliver `move_failed` and a later missing-folder retry archives the record, so a second, different `restart_failed` push follows for that outage.
+- Residual (fixed in Phase 89): a worker could deliver `move_failed` and a later missing-folder retry archived the record, so a second, different `restart_failed` push followed for that outage.
 
-### Phase 89 — One outage sends at most one phone push  · status: done
+### Phase 89 — One outage sends at most one phone push  · status: done (936445e3)
 
 **Depends on:** Phase 88
 
-#### Work Order
+#### As-built
 
-The showrunner's go (10-26, after C330): one outage of a unit sends at most one phone push. Today a restart worker can deliver `shutdown.move_failed` (its claim lives in the shutdown record), and a later watchdog retry whose folder is gone archives that record; the watchdog's recordless path then sends a second, different `shutdown.restart_failed` push for the same outage.
+- `scripts/accounts/outage_alerts.py` (new) is a per-session outage ledger in `~/.local/state/accounts/unit_outage_alerts.json`, under a file lock: `claim` → `delivered` or `release`, `reserve` for the sessions of one push, `clear` when the session is live. It survives the shutdown record's archive.
+- Every per-session outage push uses it: `settle.report_stop`, the `shutdown.py restart` CLI, the restart fallback and the watchdog's crash, move and missing-folder alerts (`restart.send_failure_pushes` is shared). A sender claims one push's sessions just before it sends, names only the sessions it holds, marks delivery only after a sent push and releases the claim otherwise.
+- A claim stores its owner pid and time; a dead owner or a claim older than 15 minutes is taken over with a new token, and the old token can no longer deliver or release.
+- The machine that owns a session sends its pushes: the peer's `up --here --json` run sends from its own ledger (unless `--no-alert`, which `shutdown.py` now forwards); the calling CLI only prints the peer's lines.
+- Every place that settles a record because its session is live clears the ledger: `clear_running_on_target`, `_record_timer_restore_progress`, `confirm_entry`, `_confirm_entries`, `settle._archive_finished`, the live skips in `launch_entry`/`relaunch_session`/`_up`, and the watchdog's live observation. `drop_restore_without_folder` keeps it.
+- Not per-session outage pushes, left outside the ledger: `restart_incomplete`, `shutdown.stop_failed`, the holdout notice.
 
-- Make the outage the owner of "a phone push was delivered": every path that delivers an alert for the outage (restart's both-failed fallback through `record.claim_restore_alert`, the watchdog's crash and missing-folder alerts) leaves a mark the watchdog still reads after the record is archived. Simplest: while the record exists, each watchdog pass copies a delivered `restore_alerted` into its outage state; the recordless and missing-folder paths send only when the outage holds no delivered alert. A failed push still leaves the outage unalerted so a later path sends once.
-- A live unit still clears both marks, so a later outage alerts again.
-- Tests (real restart and record paths, fake send leaves): worker delivers `move_failed`, later retry finds the folder gone and archives the record → no second push; worker's push fails → the folder-gone path sends exactly one; unit live, then a new outage → one new push.
-- Update `docs/accounts.md` and the shrink's as-built line.
+#### Files
 
-**Files:** `scripts/accounts/unit_watchdog.py`, `scripts/accounts/test_unit_watchdog.py`; `scripts/shutdown/record.py` and `test_record.py` only if the mark must live there; `docs/accounts.md`.
+`scripts/accounts/outage_alerts.py` (new), `unit_watchdog.py`, `scripts/shutdown/restart.py`, `settle.py`, `shutdown.py`; tests `test_unit_watchdog.py`, `test_restart.py`, `test_settle.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
 
-**Verification:** `scripts.accounts.test_unit_watchdog scripts.accounts.test_refusal_watch scripts.accounts.test_accounts scripts.accounts.test_launch_accounts scripts.shutdown.test_restart scripts.shutdown.test_record scripts.shutdown.test_shutdown_cli scripts.lib.test_user_zone`, basedpyright on changed files, then the full merge gate.
+#### Gotchas
+
+- Copying the record's `restore_alerted` mark into the watchdog outage fails both ways: an unfinished claim reads as delivered, and an archive before the next pass loses the mark. The ledger must be separate from the record.
+- Reserving all of a report's pushes up front lets a late claim pass its lease behind slow sends; claim per push.
+- Known residual, moved to Phase 90: a slow batch confirm can clear a newer outage's entry and allow a second push.
 
 ### Phase 90 — A slow batch restart does not clear a newer outage's alert  · status: todo
 
