@@ -14,9 +14,9 @@ An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
 folder of each /tmp/claude-<uid> this user owns, or the scratch root of scripts/lib/scratch.py
 (/tmp/claude/scratch), where each task's folder is an entry. In a temp folder (/tmp, $TMPDIR
-and the Mac's per-user temp folder) only a tempfile folder is an entry: ".tmp"
-and 6 letters or digits, the name Rust's tempfile crate gives, which test runs
-leave behind. Roots are real paths on both machines. An entry is deleted when
+and the Mac's per-user temp folder) only a tempfile folder is an entry, the
+name a tempfile maker gives (TEMPFILE_NAME: Rust's tempfile crate, mktemp and
+Python's tempfile), which test runs leave behind. Roots are real paths on both machines. An entry is deleted when
 both are true:
 
   * nothing in it changed for IDLE_SECONDS. A change is the newer of mtime and
@@ -93,9 +93,11 @@ LSOF_TIMEOUT_SECONDS = 120
 # lsof's fd names for a working folder and for mapped files (program text, memory maps).
 LSOF_CWD = "cwd"
 LSOF_MAPPED = ("txt", "mem")
-# The folder name Rust's tempfile crate gives by default: ".tmp" and 6 random letters or digits.
-# Test runs leave them behind in the temp folders (3,058 in natedev /tmp since 2026-09-06).
-TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}")
+# The folder names tempfile makers give by default: Rust's tempfile crate ".tmp" and 6 letters or
+# digits, mktemp "tmp." and 8 to 10, Python's tempfile "tmp" and 8 lower-case letters, digits or "_".
+# Test runs leave them behind in the temp folders (3,058 Rust ones in natedev /tmp since 2026-09-06;
+# 3,917 mktemp and Python ones on 2026-10-26).
+TEMPFILE_NAME = re.compile(r"\.tmp[A-Za-z0-9]{6}|tmp\.[A-Za-z0-9]{8,10}|tmp[a-z0-9_]{8}")
 DARWIN_TEMP_NAME = "CS_DARWIN_USER_TEMP_DIR"
 DELETED_SUFFIX = " (deleted)"
 STATE_ENV = "LINT_SWEEP_STATE_DIR"

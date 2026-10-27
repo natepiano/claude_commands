@@ -367,6 +367,10 @@ class ActionTest(unittest.TestCase):
         self.assertIn("| C77 | Fonts redraw | still the old font \\| x |", self.path.read_text(encoding="utf-8"))
         self.assertTrue(change_review.lands("Works: it does"))
         self.assertFalse(change_review.lands("not fine"))
+        for verdict in ("okay c17 works", "ok fine", "yes works", "Works: it does"):
+            self.assertTrue(change_review.lands(verdict), verdict)
+        for verdict in ("still pushes", "it works but still pushes", "no, broken", "doesn't work"):
+            self.assertFalse(change_review.lands(verdict), verdict)
 
     def test_a_verdict_removes_the_rows_scratch_folders_either_way(self) -> None:
         demo = scratch.new("row:natedev-C1", "demo", visible=True)
