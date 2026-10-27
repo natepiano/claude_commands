@@ -539,8 +539,11 @@ half the reported rate whatever the measured error says — a spread wider than
 the percentage itself would otherwise push the pessimistic end to 1% and quote
 an arrival ninety-nine times the elapsed clock. Both cells are blank wherever
 the ETA is. The project row's low and high shift the chain's finish by the
-open phase's own band: its projection's band, or the range of its stated
-promise. With neither, or under a gate with no clear time, both read `—`.
+open phase's own band: its projection's band, else the range of its stated
+promise, else the Phase row's band beside it, so a promise stated with no range
+still gets a low and a high (user, 2026-10-26). A finished plan's low and high
+are its recorded finish. Under a gate with no clear time, or with no band at
+all (the Phase row's cells blank too), both read `—`.
 
 An active phase with no pass or activity open — reviews closed, repair writers
 not started — still gets every section. `progress` (`_print_last_recorded`)

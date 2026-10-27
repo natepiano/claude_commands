@@ -3399,7 +3399,7 @@ class SettleTests(ShutdownTestCase):
         self.assertEqual((push.values["session"], push.values["target"]), ("ups", "claude3"))
         self.assertNotIn("restart", cast(ActionRequired, push.action).text)
 
-    def test_failed_move_into_an_untrusted_folder_pushes_the_trust_step_not_a_move_retry(self) -> None:
+    def test_failed_move_into_an_untrusted_folder_pushes_the_move_trust_step_not_a_move_retry(self) -> None:
         command = "cd /home/natepiano/worktrees/organon && CLAUDE_CONFIG_DIR=/home/natepiano/.claude3 claude"
         saved = session_shutdown(top_level("ups-id", "ups"), then="restart",
             progress={"kind": "restart failed", "at": NOW, "trust_command": command,
@@ -3416,7 +3416,10 @@ class SettleTests(ShutdownTestCase):
             settle.report_stop([saved])
         alert.assert_called_once()
         push = cast(RenderedPush, alert.call_args.args[0])
-        self.assertEqual(push.id, "shutdown.restart_untrusted")
+        self.assertEqual(push.id, "shutdown.move_untrusted")
+        self.assertEqual(push.values["target"], "claude3")
+        self.assertIn("/shutdown restart \"claude2\" in the natedev session. That finishes the move to claude3.",
+                      cast(ActionRequired, push.action).text)
         # The record lives under the source account; restarting it resumes the move on its target.
         self.assertEqual((push.values["session"], push.values["account"], push.values["command"]),
                          ("ups", '"claude2"', command))

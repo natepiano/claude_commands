@@ -730,6 +730,18 @@
       "time": "2026-10-22T08:41:13.031634-04:00"
     }
   },
+  "shutdown.move_untrusted": {
+    "mac": {
+      "reviewer": "opus",
+      "sha256": "2e17d7c3028fdd3491f34b3599cd2af20308e3ca5c7c9170fc6cee6c11086ff6",
+      "time": "2026-10-26T20:42:16.674086-04:00"
+    },
+    "typical": {
+      "reviewer": "opus",
+      "sha256": "2e17d7c3028fdd3491f34b3599cd2af20308e3ca5c7c9170fc6cee6c11086ff6",
+      "time": "2026-10-26T20:42:04.292331-04:00"
+    }
+  },
   "shutdown.restart_failed": {
     "one_long_name": {
       "reviewer": "opus",

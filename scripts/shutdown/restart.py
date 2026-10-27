@@ -8,7 +8,7 @@ import io
 import json
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
-from collections.abc import Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Sequence
 import os
 import re
 import shlex
@@ -39,9 +39,11 @@ from account import (  # noqa: E402
     NAMED_ACCOUNT_VARIABLES,
 )
 import production_units  # noqa: E402
+import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
 import conversation_pause  # noqa: E402
+import quota_alert  # noqa: E402
 import relaunch  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 from inventory import (  # noqa: E402
@@ -663,7 +665,8 @@ def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
                 f"restored {_user_time(restarted_at)}). "
             )
         else:
-            signal = "the machine rebooted" if context["kind"] == "reboot" else "its host was lost"
+            signal = {"reboot": "the machine rebooted", "host gone": "its host was lost",
+                      "agent exited": "its agent exited"}[context["kind"]]
             opening = (
                 f"Restored after a crash: {signal} "
                 f"(last seen {_user_time(context['last_seen'])}, "
@@ -1589,9 +1592,14 @@ def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObserva
             return LiveObservationUnavailable("environment unreadable")
 
 
+def _clear_assumed_refusal(session_id: str) -> None:
+    # The watcher calls restart through the watchdog. Load its cleanup only after launch.
+    clear = cast(Callable[[str], None], import_module("scripts.accounts.refusal_watch").clear_assumed)
+    clear(session_id)
+
+
 def _confirm_move(record: SessionShutdown, outcome: herdr.PromptSubmitOutcome | LaunchPromptProofNotRead = _LAUNCH_PROMPT_PROOF_NOT_READ) -> None:
     from scripts.accounts import moves
-    from scripts.accounts.refusal_watch import clear_assumed
     if not _require_submitted_prompt(record, outcome):
         return
     session = record["session"]
@@ -1601,7 +1609,7 @@ def _confirm_move(record: SessionShutdown, outcome: herdr.PromptSubmitOutcome | 
     moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
         subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"],
         config_dir=str(target.path)))
-    clear_assumed(session["session_id"])
+    _clear_assumed_refusal(session["session_id"])
 
 
 def _prove_move(record: SessionShutdown, outcome: herdr.PromptSubmitOutcome | LaunchPromptProofNotRead = _LAUNCH_PROMPT_PROOF_NOT_READ) -> bool:
@@ -1676,8 +1684,7 @@ def _record_timer_restore_progress(
     record: SessionShutdown,
     failures: tuple[PendingTimer, ...],
 ) -> None:
-    from scripts.accounts.refusal_watch import clear_assumed
-    clear_assumed(record["session"]["session_id"])
+    _clear_assumed_refusal(record["session"]["session_id"])
     if failures:
         _record_pending_timers(record, failures)
         return
@@ -1776,6 +1783,36 @@ def _restart_note_delivered(
 def _launch_recovery_record(
     saved: SessionShutdown, note: str, desktop_state: DesktopLaunchState, *, dry_run: bool,
 ) -> SessionLaunched | ManualRestartRequired:
+    # A crashed unit first tries the group, with its snapshot account as the source.
+    # Record that choice so the same source fallback can handle a refused group launch.
+    if saved["requested_by"]["kind"] == "snapshot" and saved["session"]["kind"] == "unit":
+        from scripts.accounts import accounts
+
+        try:
+            target = accounts.account_for_group_launch("unit", resume=True).label
+        except accounts.AccountsError as error:
+            # A group with no usable login must not prevent a healthy source restore.
+            source = saved.get("source_label", saved["label"])
+            reason = f"units group unavailable ({error}); restoring on {source}"
+            if not dry_run:
+                if source != saved.get("target", saved["label"]):
+                    _retarget_move_claim(saved, source)
+                def remember(current: SessionShutdown) -> None:
+                    if not _same_relaunch_claim(saved, current):
+                        raise OSError("restart claim changed before source restore")
+                    current.setdefault("restart_issues", []).append(reason)
+                _ = update_session(saved["login"], saved["session"]["session_id"], remember)
+            saved.setdefault("restart_issues", []).append(reason)
+            print(reason)
+            # The launcher needs the source override. A same-account restore is no move.
+            source_record: SessionShutdown = {**saved, "target": source}
+            return _launch_session(source_record, note + " " + reason, desktop_state,
+                                   dry_run=dry_run, source_fallback=True)
+        if target != saved.get("target", saved["label"]):
+            if dry_run:
+                saved = {**saved, "target": target}
+            else:
+                _retarget_move_claim(saved, target)
     # Units perform the same admission in add_unit, in its own process/barrier.
     if dry_run or saved["requested_by"]["kind"] != "snapshot" or saved["session"]["kind"] == "unit":
         return _launch_session(saved, note, desktop_state, dry_run=dry_run)
@@ -1895,9 +1932,11 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
         _retarget_move_claim(saved, target)
         both = f"{target} refused ({reason}); {source} also failed ({_error_reason(source_error)})"
         mark_restart_failed(saved, both)
-        # Both move kinds need one retry alert when neither account can start it.
-        settle.alert_user(move_failed_push(saved))
-        settle.mark_not_back_pushed(saved)
+        # Retries belong to this outage until the session is confirmed live.
+        if (saved["requested_by"]["kind"] != "snapshot"
+                and recovery_store.claim_restore_alert(saved, settle.not_back_text(saved))):
+            if not isinstance(quota_alert.tell_user(move_failed_push(saved)), quota_alert.PushSent):
+                recovery_store.clear_restore_alert(saved)
         return SourceFallbackSettled()
     def remember(current: SessionShutdown) -> None:
         if not _same_relaunch_claim(saved, current):
@@ -2178,6 +2217,8 @@ def confirm_entry(
         return
     if not _prove_move(record):
         return
+    recovery_store.clear_restore_alert(record)
+    _ = record.pop("restore_alerted", None)
     if record["session"]["kind"] == "showrunner" and record["requested_by"]["kind"] != "snapshot":
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
@@ -2263,12 +2304,58 @@ def _restore_prior(record: SessionShutdown) -> None:
     _ = _set_entry_progress(record, progress)
 
 
+@dataclass(frozen=True)
+class RecoverySourceAuthorized:
+    request_id: str
+    requested_at: str
+
+
+@dataclass(frozen=True)
+class RecoverySourceChanged:
+    """The queued worker no longer owns this recovery request."""
+
+
+def _watchdog_expected_request(saved: SessionShutdown) -> RecoverySourceAuthorized | RecoverySourceChanged:
+    """Bind a queued recovery to its source; a newer stop never becomes a restart."""
+    if os.environ.get("UNIT_WATCHDOG_SESSION") != saved["session"]["session_id"]:
+        return RecoverySourceAuthorized(saved["request_id"], saved["requested_at"])
+    raw = os.environ.get("UNIT_WATCHDOG_SOURCE")
+    if raw is None:
+        # Older callers can name a session, but cannot authorize a user stop.
+        return RecoverySourceAuthorized(saved["request_id"], saved["requested_at"])
+    value = cast(object, json.loads(raw))
+    if not isinstance(value, dict):
+        return RecoverySourceChanged()
+    expected = cast(dict[str, object], value)
+    if expected.get("kind") == "record":
+        if expected.get("request_id") == saved["request_id"] and expected.get("requested_at") == saved["requested_at"]:
+            return RecoverySourceAuthorized(saved["request_id"], saved["requested_at"])
+        return RecoverySourceChanged()
+    snapshot = recovery_store.read_snapshot(saved["login"])
+    if isinstance(snapshot, recovery_store.NoRecoverySnapshot) or saved["requested_by"]["kind"] != "snapshot":
+        return RecoverySourceChanged()
+    for entry in snapshot["sessions"]:
+        if (entry["session"] == expected.get("session") and entry["last_seen"] == expected.get("last_seen")
+                and saved["requested_at"] == snapshot["taken_at"]):
+            return RecoverySourceAuthorized(saved["request_id"], saved["requested_at"])
+    return RecoverySourceChanged()
+
+
 def _claim_relaunch(record: SessionShutdown) -> tuple[SessionShutdown, bool]:
     claimed = False
     at = settle.record_time()
+    watchdog = os.environ.get("UNIT_WATCHDOG_SESSION") == record["session"]["session_id"]
 
     def claim(current: SessionShutdown) -> None:
         nonlocal claimed
+        if watchdog:
+            match expected:
+                case RecoverySourceChanged():
+                    return
+                case RecoverySourceAuthorized(request_id, requested_at):
+                    if (request_id != current["request_id"] or requested_at != current["requested_at"]
+                            or current["then"] == "stop" or held):
+                        return
         progress = current["progress"]
         if progress["kind"] == "restarting":
             age = (datetime.fromisoformat(at) - datetime.fromisoformat(progress["at"])).total_seconds()
@@ -2280,7 +2367,11 @@ def _claim_relaunch(record: SessionShutdown) -> tuple[SessionShutdown, bool]:
         current["progress"] = {"kind": "restarting", "at": at, "prior": copy.deepcopy(progress)}
         claimed = True
 
-    return update_session(record["login"], record["session"]["session_id"], claim), claimed
+    with restore_permission.launch_barrier():
+        expected = _watchdog_expected_request(record)
+        hold = lookup_account_hold(record["login"]) if watchdog else None
+        held = isinstance(hold, AccountHeld) and hold.hold["then"] == "stop"
+        return update_session(record["login"], record["session"]["session_id"], claim), claimed
 
 
 def _launch_entry_safely(
@@ -2554,12 +2645,42 @@ class CrashNotChecked:
 class CrashConfirmed:
     """A recorded or current boot/host observation proves a crash signal."""
 
-    signal: Literal["reboot", "host gone"]
+    signal: Literal["reboot", "host gone", "agent exited"]
 
 
 @dataclass(frozen=True)
 class NoCrashSignal:
     """The observations do not authorize snapshot recovery."""
+
+
+@dataclass(frozen=True)
+class AgentCrashConfirmed:
+    """A watchdog request names a dead session in a pane without a live agent."""
+
+
+def watchdog_crash_signal(owner: Session) -> AgentCrashConfirmed | NoCrashSignal | CrashEvidenceUnreadable:
+    """Check the named watchdog request against the registry and the recorded pane."""
+    if owner["kind"] != "unit":
+        return NoCrashSignal()
+    observed = _owner_liveness(owner)
+    if isinstance(observed, SessionLivenessUnknown):
+        return CrashEvidenceUnreadable(observed.reason)
+    if isinstance(observed, SessionLive):
+        return NoCrashSignal()
+    host = owner["host"]
+    if host["kind"] != "unit":
+        return NoCrashSignal()
+    try:
+        marked = unit_lookup.marked_unit(host["production"], host["unit"])
+        if marked is None or marked.place.session != host["session_name"]:
+            return NoCrashSignal()
+        agents = herdr.Herdr(marked.place.session).agents()
+        if any(row["pane_id"] == marked.place.pane and row.get("agent")
+               and row["agent_status"] not in {"exited", "stopped", "dead"} for row in agents):
+            return NoCrashSignal()
+    except (OSError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+        return CrashEvidenceUnreadable(_error_reason(error))
+    return AgentCrashConfirmed()
 
 
 @dataclass(frozen=True)
@@ -2653,7 +2774,14 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 print(f"{name}: recovery refused: {liveness.reason}")
                 recovery_failures.append(FailedSessionRestart(name, liveness.reason))
                 continue
-            evidence = crash_check.check(snapshot, entry)
+            if "crash" in entry:
+                evidence = crash_check.check(snapshot, entry)
+            elif os.environ.get("UNIT_WATCHDOG_SESSION") == identity:
+                evidence = watchdog_crash_signal(entry["session"])
+            else:
+                evidence = NoCrashSignal()
+            if isinstance(evidence, NoCrashSignal):
+                evidence = crash_check.check(snapshot, entry)
             if isinstance(evidence, CrashEvidenceUnreadable):
                 print(f"{name}: recovery refused: {evidence.reason}")
                 recovery_failures.append(FailedSessionRestart(name, evidence.reason))
@@ -2661,7 +2789,9 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
             if isinstance(evidence, NoCrashSignal):
                 print(f"{name}: no crash signal; skipped")
                 continue
-            verified_entry: recovery_store.SnapshotClaudeSession = {**entry, "crash": evidence.signal}
+            verified_entry = copy.copy(entry)
+            if isinstance(evidence, CrashConfirmed):
+                verified_entry["crash"] = evidence.signal
             saved = (recovery_store.snapshot_restore_record(snapshot, verified_entry) if dry_run
                      else materialize_snapshot(snapshot, verified_entry))
             saved = _restore_target(saved, decision, dry_run=dry_run)
@@ -3120,11 +3250,24 @@ def untrusted_push(label: str, item: FailedSessionRestart, *, machine: str) -> R
         return render("shutdown.restart_untrusted", session=name, machine=machine, account=json.dumps(label),
                       command=item.trust_command)
 
-    push = named_push(item.name)
+    return _session_shortened_to_fit(named_push, item.name)
+
+
+def move_untrusted_push(saved: SessionShutdown, item: FailedSessionRestart, *, machine: str) -> RenderedPush:
+    """The trust step for a failed move: a restart of the record's own account finishes the move on its target."""
+    def named_push(name: str) -> RenderedPush:
+        return render("shutdown.move_untrusted", session=name, machine=machine, account=json.dumps(saved["label"]),
+                      target=saved.get("target", ""), command=item.trust_command)
+
+    return _session_shortened_to_fit(named_push, item.name)
+
+
+def _session_shortened_to_fit(named_push: Callable[[str], RenderedPush], name: str) -> RenderedPush:
+    push = named_push(name)
     excess = len(push.message) - 499
     # The command must stay whole to run, so only the session name is shortened.
-    if excess > 0 and len(item.name) > 1:
-        push = named_push(item.name[:max(1, len(item.name) - excess - 1)] + "…")
+    if excess > 0 and len(name) > 1:
+        push = named_push(name[:max(1, len(name) - excess - 1)] + "…")
     return push
 
 
@@ -3244,15 +3387,19 @@ def restart(
                 # Its retry is this account's restart, which resumes the move on its target.
                 moved = {saved["session"]["name"]: saved for saved in session_records(selected.login)
                          if saved.get("target") and saved["machine"] == local.machine
-                         and saved["session"]["name"] in {item.name for item in failed if not item.trust_command}}
-                for saved in moved.values():
-                    settle.alert_user(move_failed_push(saved))
+                         and saved["requested_by"]["kind"] != "snapshot"
+                         and saved["session"]["name"] in {item.name for item in failed}}
+                for item in failed:
+                    if item.name in moved and not item.trust_command:
+                        settle.alert_user(move_failed_push(moved[item.name]))
                 retried = [item for item in retried if item.name not in moved]
                 if retried or not_reached or peer_requires_retry:
                     for push in restart_push(selected.label, retried, machine=" and ".join(machines)):
                         settle.alert_user(push)
                 for machine, item in untrusted:
-                    settle.alert_user(untrusted_push(selected.label, item, machine=machine))
+                    move = moved.get(item.name) if machine == local.machine else None
+                    settle.alert_user(move_untrusted_push(move, item, machine=machine) if move is not None
+                                      else untrusted_push(selected.label, item, machine=machine))
                 for item in manual:
                     settle.alert_user(render("shutdown.manual_restart", session=item.name, machine=local.machine))
                 _mark_pushed_not_back(selected.login, ids, {item.name for item in [*failed, *manual]})

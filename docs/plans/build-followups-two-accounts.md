@@ -2446,19 +2446,25 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Restarts launch in a pool: assert launched names with `assertCountEqual`.
 - Carried to Phase 88: F009 (a retried cleared-hold notice after a `QUEUED` result queues again; jobs have no name).
 
-### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: todo
+### Phase 88 — A unit watchdog restarts any unit that is down, and a gate test rebuilds the 10-26 outage  · status: done (4b8cbb3e)
 
-**Depends on:** Phase 87; shutdown-unit's 10-26 19:30 AST checkpoint merged
+**Depends on:** Phase 87
 
-#### Work Order
+#### As-built
 
-**Goal:** Whatever stops a unit (a move, a crash, a stale hold), it comes back with no user step. Showrunner, user go 10-26: a watchdog on a timer restarts a unit whose session is down without a stop the user asked for, on the group account, else the source; a phone alert goes only when both fail. A gate test rebuilds today's case and passes only when every unit runs again with no manual step. User: "Anything you have to use a memory for is not viable."
+- `scripts/accounts/unit_watchdog.py` runs from the two-minute notes timer on natedev. A unit that is down with no user or account stop and no work in progress gets one pass of grace, then a restart on its group account (`accounts.account_for_group_launch`), else its source account. Retired and finished units are skipped.
+- Restarts run detached (`systemd-run --user --no-block`, one 30 s deadline for all submissions per pass); the result is read on a later pass. A job is always consumed before a stale restart claim or a missing record can drop its outage. State: `~/.local/state/accounts/unit_watchdog.json`, results in `unit-watchdog-results`.
+- A crash in a live herdr host (registry not live, pane has no live agent: `restart.watchdog_crash_signal`) is saved as snapshot `crash: "agent exited"` (`record.mark_snapshot_agent_exited`); with an unreadable probe the watchdog keeps its own copy and restores it (`restore_snapshot_agent_exited`) once the exit is confirmed. The store entry always wins over the copy. Restart turns it into `AgentExitRecovery` with `last_seen` and names it in the prompt.
+- A queued restart checks its saved source under the restart claim (`RecoverySourceAuthorized` / `RecoverySourceChanged`); a newer stop or account hold stops the launch.
+- Alerts: the showrunner gets a line for each attempt. The phone gets one delivered alert per outage: `shutdown.move_failed` for a move record (shared `record.claim_restore_alert`; a failed push releases it, a live unit clears it), `shutdown.restart_failed` with a cause for a crash. A restore whose folder is gone (shutdown 61459ed7) ends the outage with one alert.
+- The gate test in `test_unit_watchdog.py` rebuilds 10-26: a stale stop hold on the target and the stopped units all come back.
 
-**Spec (outline; details written at phase start from Phase 87's as-built):**
-1. A watchdog pass in `refusal_watch.run()` (the notes timer, every 2 min on natedev), after the move passes. Units that should run: each registered showrunner's production doc Units rows that are not retired, whose run is in progress (`production/live_units.py`, `unit_lookup.run_state`).
-2. A unit is down when no live session holds it. Skip it when a shutdown record or hold is in progress for it (stopping, waiting, restarting), when a user-asked stop holds it (`then: "stop"` record with a session or terminal origin that is live, or a stopped record of a stop the user asked for), or when it was first seen down less than one pass ago (state file under `~/.local/state/accounts/`).
-3. Restart: on the group account through the same launch path `agents restart` uses (record or recovery snapshot); if that fails, on the source account. Both failing: one `shutdown.restart_failed` user push per outage (not per pass), and the showrunner gets a line each time.
-4. Carried from Phase 87 review (F009, minor): the cleared-hold relay in `refusal_watch.py` builds its `quota_alert` jobs with an empty name, so each retry after a `QUEUED` result appends another copy. Name each job by the pending notice's stable identity and treat `QUEUED` as handed off (drop it from the pending file).
-5. Gate test: a scratch production with units on claude4 and a stale stop hold on claude2 (requesting session gone), then the auto group move claude4 → claude2: every unit runs again, on claude2, with no manual step. A second case with a hold still in use: the move stops nobody, and units whose sessions die are restarted by the watchdog on claude4.
+#### Files
 
-**Files:** `scripts/accounts/refusal_watch.py`, a new `scripts/accounts/unit_watchdog.py` if the pass is over ~100 lines, tests in `scripts/accounts/`, `docs/accounts.md`.
+`scripts/accounts/unit_watchdog.py` (new), `refusal_watch.py`, `scripts/shutdown/restart.py`, `record.py`, `session_types.py`; tests `test_unit_watchdog.py` (new), `test_refusal_watch.py`, `test_restart.py`, `test_record.py`; docs `docs/accounts.md`, `docs/as-built/shutdown-and-restart.md`.
+
+#### Gotchas
+
+- Run the full merge gate after every origin merge: shutdown 61459ed7 (restore dropped when its folder is gone) turned five watchdog tests red only after the merge; give restored sessions a real scratch folder.
+- `test_launch_accounts` requires every Claude launcher to pick its account through `account_for_group_launch`, and `scripts/lib/test_user_zone` requires `astimezone(user_zone())`; neither is in the accounts suites, so run them.
+- Known residual: a worker can deliver `move_failed` and a later missing-folder retry archives the record, so a second, different `restart_failed` push follows for that outage.

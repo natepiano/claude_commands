@@ -536,7 +536,7 @@ Rust workers run only exact prompt lines using
 
 | Intent | Command |
 | --- | --- |
-| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check <package>` |
+| compile feedback | `bash ~/.claude/scripts/direct/verify.sh check <package> [--keep-going]` |
 | package tests | `bash ~/.claude/scripts/direct/verify.sh test <package>` |
 | one integration target alone | `bash ~/.claude/scripts/direct/verify.sh test <package> <test>` |
 | only the tests whose name contains `<name>`, while iterating | `bash ~/.claude/scripts/direct/verify.sh test <package> --filter <name> [--filter <name> …]` |

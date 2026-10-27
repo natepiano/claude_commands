@@ -1487,7 +1487,8 @@ def report_stop(records: list[SessionShutdown]) -> None:
             pushes = ((render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
                            stopped=stopped_sessions_text(len(items))),) if stop_due else
                     (*(restart_work.restart_push(first["label"], retried, machine=machine) if retried else ()),
-                     *(restart_work.untrusted_push(saved["label"], item, machine=machine)
+                     *(restart_work.move_untrusted_push(saved, item, machine=machine) if saved.get("target")
+                       else restart_work.untrusted_push(saved["label"], item, machine=machine)
                        for saved, item in restarted if item.trust_command),
                      *(restart_work.move_failed_push(saved) for saved, item in restarted
                        if saved.get("target") and not item.trust_command)))
