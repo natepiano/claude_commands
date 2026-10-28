@@ -135,7 +135,7 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | # | Item | Decision |
 | --- | --- | --- |
 | PH1 | Goal and plan: measure how a phase and the doc pipeline run, find where time and tokens go, change one step at a time; done 1 (measure); in 2 (recommend); next 3 (build first step), 4 (measure it) || Approved (the user, 2026-10-28). |
-| PH2 | Step 1: tokens first (cheap A) or dispatch time first (C, then cheap A) | |
+| PH2 | Step 1: tokens first (cheap A) or dispatch time first (C, then cheap A) || Tokens first: cheap A, each step reads only its own rule file (the user, 2026-10-28). |
 
 ### hierarchies-unit (moving into sdlc)
 
