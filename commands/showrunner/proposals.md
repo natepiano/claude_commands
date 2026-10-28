@@ -11,10 +11,10 @@ production from this session's update timer and prints one Markdown table,
 `| Proposed by | Proposal | Date | State |`, from three sources in this order:
 
 - **Issues**: each issue directly in the folder that the `Proposals` line
-  names, of the production doc and of each production below it, while its frontmatter's `status` is `open` and its
-  `tags` hold `proposal`, and its `proposed_by` names this production, one of
-  its units, a production below it, or a unit of one (`unit (production)`
-  names the production). Productions share one issues folder, so the others'
+  names, while its frontmatter's `status` is `open` and its `tags` hold
+  `proposal`, and its `proposed_by` names this production or one of its units
+  (`unit (production)` names the production). A production below this one
+  lists its own (user, 2026-10-27). Productions share one issues folder, so the others'
   proposals are left out. The row is the issue's P number and title
   under its `proposed_by`, dated by its `date_created`. A production with no
   `Proposals` line has no issue rows.
@@ -22,8 +22,8 @@ production from this session's update timer and prints one Markdown table,
   Rule candidates are not proposals: `style_proposals.py candidates` lists them,
   and `style_proposals.py drop-candidate --idea "<text>"` drops one.
 - **The plan backlog**: each line ending `proposed` or `deferred` of the
-  ledger that the `Improvement queue` line names, of the production doc and of
-  each production below it, under the proposer its file names. A production
+  ledger that the `Improvement queue` line names, under the proposer its file
+  names. A production
   with no such line has no backlog rows.
 - **Add-ons**: each entry a unit's run holds until it has an answer, under the
   unit's name. Its date is the day the unit last changed its list.

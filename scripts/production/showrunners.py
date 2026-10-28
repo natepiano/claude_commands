@@ -424,26 +424,14 @@ def _root_in(slug: str, tree: dict[str, str]) -> str:
     return slug
 
 
-class Place(NamedTuple):
-    """Where a production sits in its tree, for what its showrunner shows the user."""
-    root: str  # the root it is under; empty when it is a root itself
-    below: list[str]  # for a root, every production below it; empty otherwise
-
-
-def place_of(slug: str) -> Place:
-    """`slug`'s place in its tree, from one reading of the edges."""
-    tree = edges()
-    return Place(_root_in(slug, tree), []) if slug in tree else Place("", _below(slug, tree))
-
-
-def user_facing(slug: str) -> list[str]:
+def user_facing(slug: str, below: bool = False) -> list[str]:
     """The productions whose items for the user `slug`'s showrunner counts and lists.
 
-    Every showrunner answers for its own items and those of every production below it, at any
-    depth, never for one above it or beside it (user, 2026-10-25: /next is scoped to the
-    showrunner that runs it and its children).
+    Each showrunner answers for its own production only: the showrunner above it and the
+    showrunners below it answer for theirs (user, 2026-10-27). `below` adds every production
+    below it, at any depth (`/next all-below`). A production above or beside it never counts.
     """
-    return [slug, *descendants_of(slug)]
+    return [slug, *descendants_of(slug)] if below else [slug]
 
 
 def root_of(slug: str) -> str:

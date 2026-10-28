@@ -122,29 +122,31 @@ class ProposalsTableTests(unittest.TestCase):
             self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines(),
                              ["now important", str(self.root / "issues/now important.md")])
 
-    def test_a_production_reads_its_own_and_lower_folders_and_improvement_queues_only(self) -> None:
+    def test_a_production_reads_its_own_folder_and_queue_and_with_below_each_lower_one_never_above(self) -> None:
         docs: dict[str, Path] = {}
-        for slug in ("top", "kid"):
+        for slug in ("top", "kid", "grand"):
             _ = self.issue(f"{slug} idea", "date_created: 2026-10-01", "status: open", "tags: [issue, proposal]",
-                           f"proposed_by: {slug}-unit", folder=f"{slug}-issues")
+                           f"proposed_by: {slug}", folder=f"{slug}-issues")
             _ = self.write(f"{slug}-backlog/ledger.md", f"- 2026-10-02 {slug} line — proposed\n")
             docs[slug] = self.write(f"trunk/docs/plans/{slug}-production.md",
                                     f"- **Proposals:** `{self.root / f'{slug}-issues'}`\n"
                                     + f"- **Improvement queue:** {self.root / f'{slug}-backlog' / 'ledger.md'}\n")
-        below = {"top": [docs["top"], docs["kid"]], "kid": [docs["kid"]]}
+        below = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"]}
 
         def owner_docs(doc: Path) -> list[Path]:
-            return below[doc.name.removesuffix("-production.md")]
+            return [docs[slug] for slug in below[doc.name.removesuffix("-production.md")]]
 
-        def owners(doc: Path) -> frozenset[str]:
-            return frozenset(f"{each.name.removesuffix('-production.md')}-unit" for each in owner_docs(doc))
+        def waiting(slug: str, below: bool = False) -> list[str]:
+            return [entry.item.proposal for entry in proposals_table.waiting_entries(docs[slug], below)[0]]
 
-        with mock.patch.object(proposals_table, "owner_docs", owner_docs), \
-                mock.patch.object(proposals_table, "owners", owners):
-            self.assertEqual([entry.item.proposal for entry in proposals_table.waiting_entries(docs["top"])[0]],
-                             ["kid idea", "top idea", "top line", "kid line"])
-            self.assertEqual([entry.item.proposal for entry in proposals_table.waiting_entries(docs["kid"])[0]],
-                             ["kid idea", "kid line"])
+        with mock.patch.object(proposals_folder, "owner_docs", owner_docs):
+            # Each showrunner reviews its own production; the ones below review theirs (user, 2026-10-27).
+            self.assertEqual(waiting("top"), ["top idea", "top line"])
+            self.assertEqual(waiting("kid"), ["kid idea", "kid line"])
+            self.assertEqual(waiting("grand"), ["grand idea", "grand line"])
+            self.assertEqual(waiting("top", below=True),
+                             ["grand idea", "kid idea", "top idea", "top line", "kid line", "grand line"])
+            self.assertEqual(waiting("kid", below=True), ["grand idea", "kid idea", "kid line", "grand line"])
 
     def test_closed_untagged_and_subfolder_issues_give_no_rows(self) -> None:
         _ = self.issue("built one", "status: closed", "tags: [issue, proposal]", "as_built: docs/hana/as-built/x.md")

@@ -125,9 +125,12 @@ State:
 - **Nested showrunners.** A showrunner may report to another
   (`/showrunner:attach`). `showrunners.py parent|children|root <slug>` and
   `showrunners.py tree` say where a production sits; look it up each time, as
-  an attachment can change. The top of a tree is its root, the user's one
-  place to see everything below it: its count and its list cover every item that needs the user. The user may still work with any showrunner
-  directly, and one below a root answers them in its own pane as a root does.
+  an attachment can change. The top of a tree is its root. Each showrunner's
+  count and `/next` cover its own production only: the showrunners below it
+  count and show their own, so each level's review is complete for that level
+  (user, 2026-10-27). `/next all-below` adds every production below it. The
+  user may still work with any showrunner directly, and one below a root
+  answers them in its own pane as a root does.
   User, 2026-10-09: "showrunners manage showrunners - ad hoc depth"; and
   2026-10-12: "have them available for direct interaction from me but also
   have a natural home under an L1".
@@ -149,15 +152,12 @@ State:
     That child relays them to its unit or to its own child. One level at a
     time.
   - **An item for the user**, when you are not the root, is asked in your own
-    reply as always and also goes to the root, so the root shows it once:
-    `showrunners.py root <your slug>`, then `showrunners.py address <root>`,
-    and SendMessage beginning `From the showrunner of <your slug>, for the
-    user: `. Set it in your own `open_for_user` as always: the root's count
-    covers it from there. Clear it the moment it is answered or no longer
-    needed, wherever the answer came from, the user typing in your own pane
-    included. The root's count drops by itself: send the root nothing to drop
-    it. A phone alert for it (<Notify/>) is still yours to send, as before. If
-    the root is not running, keep it there and say so in your next reply.
+    reply as always and set in your own `open_for_user`: your own count and
+    `/next` show it. Do not send it to the root, which shows only its own
+    production (user, 2026-10-27). Clear it the moment it is answered or no
+    longer needed, wherever the answer came from, the user typing in your own
+    pane included. A phone alert for it (<Notify/>) is still yours to send, as
+    before.
   - **A question between productions** (a Mac window, the order of two
     promotions) goes to your parent, not to the root.
   - **Who decides a shared resource:**
@@ -181,14 +181,11 @@ State:
     (`showrunners.py detach <child>`). Once it runs, wrap removes your link
     to your parent and every link to you, and tells your parent and each
     production below you, which is a root from then on.
-  - **As a root or a parent**, show the user each item a child sends in the
-    child's words, and relay the answer back to that child.
-  - **As a root**, never copy a lower showrunner's item into your own
-    `open_for_user`. It stays in its owner's list; your count and your
-    dailies' `nothing needed` already cover every list below you. When its
-    owner clears it, your count drops with no message to you and nothing for
-    you to remove (live check, 2026-10-12: an item answered in the lower
-    showrunner's own pane had to be dropped at the root by hand).
+  - **As a root or a parent**, never copy a lower showrunner's item into your own `open_for_user`.
+    It stays in its owner's list, and its owner's count and `/next` show it;
+    yours do not (user, 2026-10-27). When its owner clears it, nothing changes
+    for you. If a child sends you an item for the user, tell the child to keep
+    it in its own list.
   - **Two dailies bullets come from the tree.** Under a root, your dailies'
     closing bullets carry `reports to <root>`. As a root, `<slug>: needs-user list
     unreadable` means that production's list could not be counted: tell its

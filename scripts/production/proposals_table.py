@@ -35,7 +35,7 @@ from production_units import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
 from footer_counts import ledger
-from proposals_folder import open_proposals, owner_docs, owners, slug_of
+from proposals_folder import open_proposals, owners, scope_docs, slug_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -320,29 +320,30 @@ def queue(doc: Path) -> str:
     return f"proposal-{slug_of(doc)}"
 
 
-def scope_issues(doc: Path) -> list[Issue]:
-    """The open proposal issues of the production and every production below it, from each one's folder."""
+def scope_issues(doc: Path, below: bool = False) -> list[Issue]:
+    """The open proposal issues of the production, and with `below` of each one below it, from each one's folder."""
     found: dict[Path, Issue] = {}
-    for each in owner_docs(doc):
-        for issue in open_proposals(each, owners(doc)):
+    names = owners(doc, below)
+    for each in scope_docs(doc, below):
+        for issue in open_proposals(each, names):
             _ = found.setdefault(issue.path, issue)
     return list(found.values())
 
 
-def improvement_ledgers(doc: Path) -> list[Path]:
-    """The Improvement queue ledger of the production and of each production below it, once each."""
-    return list(dict.fromkeys(found for each in owner_docs(doc) if (found := ledger(each)) is not None))
+def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
+    """The Improvement queue ledger of the production, and with `below` of each one below it, once each."""
+    return list(dict.fromkeys(found for each in scope_docs(doc, below) if (found := ledger(each)) is not None))
 
 
-def waiting_entries(doc: Path) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+def waiting_entries(doc: Path, below: bool = False) -> tuple[list[urgency.Entry[Row]], list[Row]]:
     """The proposals waiting for the user's review, to be ordered, then the other issue and backlog rows.
 
-    Only the production's own and those of the productions below it: issues their proposer field
-    gives to one of them, and the lines of the Improvement queue ledgers their docs name.
+    Only the production's own, and with `below` those of each production below it: issues their
+    proposer field gives to one of them, and the lines of the Improvement queue ledgers their docs name.
     """
-    waiting, in_progress = issue_entries(scope_issues(doc))
+    waiting, in_progress = issue_entries(scope_issues(doc, below))
     rest = list(in_progress)
-    for found in improvement_ledgers(doc):
+    for found in improvement_ledgers(doc, below):
         for row in ledger_rows(found):
             if row.state == REVIEW_STATE:
                 waiting.append(urgency.Entry(f"{BACKLOG_KEY}{found}: {row.proposal}", row, since=day(row.date),
