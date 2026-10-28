@@ -1545,7 +1545,9 @@ class MeshCommandTests(unittest.TestCase):
         instructions = (self.session_dir / "review-instructions.txt").read_text(encoding="utf-8")
         self.write_pool_roster({"other": {"thread_id": "other-thread", "status": "done"}})
 
-        code, output, errors = self.run_mesh(arguments)
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, False)) as ensure:
+            code, output, errors = self.run_mesh(arguments)
+        self.assertEqual(ensure.call_args.kwargs.get("cwd"), str(self.session_dir))
 
         self.assertEqual((code, output, errors), (0, f"{THREAD_ID}\n", ""))
         requests = [request for request in self.server.requests if request.get("method") != "initialize"]
@@ -2260,10 +2262,13 @@ class MeshCommandTests(unittest.TestCase):
         for path in images:
             _ = path.write_bytes(b"image fixture")
 
-        code, _output, errors = self.run_mesh(self.follow_cli(
-            "--cwd", str(worktree), "--read-only", "--image", str(images[0]), "--image", str(images[1]),
-            "--model", "gpt-test", "--effort", "high",
-        ))
+        with patch.object(codex_mesh, "ensure_server", return_value=(self.server.port, False)) as ensure:
+            code, _output, errors = self.run_mesh(self.follow_cli(
+                "--cwd", str(worktree), "--read-only", "--image", str(images[0]), "--image", str(images[1]),
+                "--model", "gpt-test", "--effort", "high",
+            ))
+        self.assertTrue(ensure.called)
+        self.assertTrue(all(call.kwargs.get("cwd") == str(worktree) for call in ensure.call_args_list))
 
         self.assertEqual((code, errors), (0, ""))
         starts = self.methods("turn/start")
@@ -8872,6 +8877,11 @@ class SweepTests(unittest.TestCase):
             self.verdict(dataclasses.replace(unowned, age_secs=10.0)), codex_mesh.ServerInUse
         )
 
+    def test_dev_shell_startup_budget_does_not_extend_the_unowned_sweep_grace(self) -> None:
+        unowned = self.facts(ownership=codex_mesh.UnownedServerWithoutLog(), age_secs=45.0)
+        self.assertIsInstance(self.verdict(unowned), codex_mesh.ServerUnused)
+        self.assertIsInstance(self.verdict(unowned, ("thread-1: ThreadLive",)), codex_mesh.ServerInUse)
+
     def test_current_server_without_a_marker_must_clear_every_live_and_idle_signal(self) -> None:
         ended = self.facts(run_lifecycle=codex_mesh.CheckedRunLifecycle(False, ()))
         self.assertIsInstance(self.verdict(ended), codex_mesh.ServerUnused)
@@ -9683,11 +9693,12 @@ class SignInChangeTests(unittest.TestCase):
                 "thread_id": "thread-1", "status": "running", "turn_id": "turn-1", "launcher_pid": os.getpid(),
                 "port": 4001}}))
             old = FakeClient(4001, "worker")
-            args = argparse.Namespace(effort="")
-            with patch.object(codex_mesh, "ensure_server", return_value=(4002, True)), \
+            args = argparse.Namespace(effort="", cwd="/original-worktree", turn_cwd="/turn-worktree")
+            with patch.object(codex_mesh, "ensure_server", return_value=(4002, True)) as ensure, \
                     patch.object(codex_mesh, "Client", FakeClient):
                 moved = codex_mesh._move_resident(  # pyright: ignore[reportPrivateUsage]
                     args, directory, "worker", "thread-1", cast("codex_mesh.Client", cast("object", old)))
+            self.assertEqual(ensure.call_args.kwargs.get("cwd"), "/turn-worktree")
             roster = cast("dict[str, dict[str, object]]", json.loads((Path(directory) / codex_mesh.ROSTER_FILE).read_text()))
             pending = (Path(directory) / "worker.pending.json").read_text()
         self.assertIsInstance(moved, codex_mesh.MovedWorker)
@@ -10361,6 +10372,566 @@ class WorkersHomeTests(unittest.TestCase):
                     log = (self.session_dir / codex_mesh.SERVER_LOG).read_text()
                     self.assertIn("interrupted and resumed on the new account", log)
                     self.assertNotIn("working worker finishes first", log)
+
+
+@final
+class DevShellServerTests(unittest.TestCase):
+    """A unit's shared server owns the dev-shell selected by its turn's cwd."""
+
+    def __init__(self, methodName: str = "runTest") -> None:
+        super().__init__(methodName)
+        self.session_dir = Path()
+        self.worktree = Path()
+        self.workers_home = Path()
+        self.watcher = MagicMock()
+        self.stop = MagicMock()
+        self.which = MagicMock()
+        self.status = MagicMock()
+        self.process = MagicMock(spec=subprocess.Popen)
+        self.launch = MagicMock()
+
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.session_dir = root / "runs" / "unit"
+        self.session_dir.mkdir(parents=True)
+        # Spaces and shell metacharacters must remain one argv element.
+        self.worktree = root / "worktree with spaces;literal"
+        self.worktree.mkdir()
+        _ = (self.worktree / ".envrc").write_text("use flake\n", encoding="utf-8")
+        self.workers_home = root / "workers"
+        self.workers_home.mkdir()
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {
+            "PATH": "/caller/bin", "CODEX_HOME": "/caller/home",
+            "UNIT_RUN_DIR": "/caller/run", "TMPDIR": str(root),
+            "NIX_LDFLAGS": "caller linker flags",
+        }, clear=True)))
+        _ = self.enterContext(patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)))
+        _ = self.enterContext(patch.object(codex_mesh, "_guild_context", return_value={}))
+        _ = self.enterContext(patch.object(codex_mesh, "_holds_old_sign_in", return_value=False))
+        _ = self.enterContext(patch.object(codex_mesh, "_pid_alive", return_value=True))
+        _ = self.enterContext(patch.object(codex_mesh, "_free_port", return_value=4321))
+        _ = self.enterContext(patch.object(codex_mesh, "WebSocket"))
+        self.watcher = cast(MagicMock, self.enterContext(patch.object(codex_mesh, "_start_watcher")))
+        self.stop = cast(MagicMock, self.enterContext(patch.object(codex_mesh, "_stop_unused_with_lock_held", return_value=False)))
+
+        def find_executable(name: str) -> str:
+            return f"/tools/{name}"
+
+        self.which = cast(MagicMock, self.enterContext(patch("shutil.which", side_effect=find_executable)))
+        self.status = cast(MagicMock, self.enterContext(patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+            ["direnv", "status", "--json"], 0,
+            stdout=json.dumps({"state": {"foundRC": {
+                "path": str(self.worktree / ".envrc"), "allowed": 0,
+            }}}), stderr=""))))
+        self.process = MagicMock(spec=subprocess.Popen)
+        self.process.pid = 87654
+        cast(MagicMock, self.process.poll).return_value = None
+        self.launch = cast(MagicMock, self.enterContext(patch.object(subprocess, "Popen", return_value=self.process)))
+        self.addCleanup(codex_mesh._STARTED_SERVERS.discard, (4321, 87654))  # pyright: ignore[reportPrivateUsage]
+
+    def ensure(self) -> tuple[int, bool]:
+        return codex_mesh.ensure_server(str(self.session_dir), self.workers_home, cwd=str(self.worktree))
+
+    def record(self) -> dict[str, object]:
+        return _as_test_dict(cast(object, json.loads((self.session_dir / codex_mesh.SERVER_FILE).read_text(encoding="utf-8"))))
+
+    def live_record(self, **extra: object) -> None:
+        _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(json.dumps({
+            "pid": 76543, "port": 4001, "codex_home": str(self.workers_home),
+            "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS, **extra,
+        }), encoding="utf-8")
+
+    def assert_plain_launch(self) -> None:
+        self.assertEqual(self.ensure(), (4321, True))
+        command = cast(list[str], self.launch.call_args.args[0])
+        self.assertEqual(command, [
+            "codex", "-c", "thread_unload_delay_secs=0", "-c",
+            f"model_auto_compact_token_limit={codex_mesh.AUTO_COMPACT_TOKENS}", "-c",
+            f"background_terminal_max_timeout={codex_mesh.BACKGROUND_TERMINAL_MAX_TIMEOUT_MS}",
+            "app-server", "--listen", "ws://127.0.0.1:4321",
+        ])
+        environment = cast(dict[str, str], self.launch.call_args.kwargs["env"])
+        self.assertEqual(environment["CODEX_HOME"], str(self.workers_home))
+        self.assertEqual(environment["NIX_LDFLAGS"], "caller linker flags")
+        self.assertFalse(self.record().get("dev_shell_worktree"))
+
+    def test_allowed_worktree_launches_one_shared_server_under_direnv_and_records_its_pid(self) -> None:
+        self.assertEqual(self.ensure(), (4321, True))
+        self.launch.assert_called_once()
+        command = cast(list[str], self.launch.call_args.args[0])
+        self.assertEqual(command[:3], ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(command.count("app-server"), 1)
+        self.assertEqual(command[-3:], ["app-server", "--listen", "ws://127.0.0.1:4321"])
+        self.assertTrue(self.launch.call_args.kwargs["start_new_session"])
+        self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+        self.assertEqual(self.record()["pid"], 87654)
+        self.watcher.assert_called_once_with(str(self.session_dir), 87654, 4321)
+        self.assertGreaterEqual(self.status.call_count, 1)
+        for call in self.status.call_args_list:
+            self.assertEqual(cast(list[str], call.args[0])[-2:], ["status", "--json"])
+            self.assertEqual(Path(cast(str, call.kwargs["cwd"])), self.worktree)
+
+    def test_run_owned_values_are_reapplied_after_direnv_without_overwriting_dev_shell_flags(self) -> None:
+        _ = self.ensure()
+        command = cast(list[str], self.launch.call_args.args[0])
+        # direnv replaces its environment before executing this env command. Its assignments
+        # therefore beat conflicting exports in .envrc, while the Nix additions survive.
+        self.assertEqual(command[:3], ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(Path(command[3]).name, "env")
+        codex_index = command.index("codex", 4)
+        overrides = dict(argument.split("=", 1) for argument in command[4:codex_index])
+        self.assertEqual(overrides["CODEX_HOME"], str(self.workers_home))
+        self.assertEqual(overrides["UNIT_RUN_DIR"], str(self.session_dir))
+        self.assertEqual(overrides["TMPDIR"], str(self.session_dir / "tmp"))
+        self.assertNotIn("NIX_LDFLAGS", overrides)
+        self.assertNotIn("PATH", overrides)
+
+    def test_no_direnv_keeps_the_existing_launch(self) -> None:
+        self.which.side_effect = None
+        self.which.return_value = None
+        self.assert_plain_launch()
+        self.status.assert_not_called()
+
+    def test_no_envrc_keeps_the_existing_launch(self) -> None:
+        (self.worktree / ".envrc").unlink()
+        self.assert_plain_launch()
+        self.status.assert_not_called()
+
+    def test_only_direnvs_allowed_found_rc_can_enable_the_dev_shell(self) -> None:
+        cases: tuple[tuple[str, object], ...] = (
+            ("not allowed", {"state": {"foundRC": {"path": str(self.worktree / ".envrc"), "allowed": 1}}}),
+            ("denied", {"state": {"foundRC": {"path": str(self.worktree / ".envrc"), "allowed": 2}}}),
+            ("unrelated rc", {"state": {"foundRC": {"path": str(self.worktree.parent / "other" / ".envrc"), "allowed": 0}}}),
+            ("previously loaded only", {"state": {"loadedRC": {"path": str(self.worktree / ".envrc"), "allowed": 0}}}),
+            ("missing allowance", {"state": {"foundRC": {"path": str(self.worktree / ".envrc")}}}),
+            ("false is not enum zero", {"state": {"foundRC": {"path": str(self.worktree / ".envrc"), "allowed": False}}}),
+            ("string is not enum zero", {"state": {"foundRC": {"path": str(self.worktree / ".envrc"), "allowed": "0"}}}),
+            ("missing rc", {"state": {"foundRC": None}}),
+        )
+        for label, status in cases:
+            with self.subTest(label=label):
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                self.status.return_value = subprocess.CompletedProcess(["direnv"], 0, json.dumps(status), "")
+                self.assert_plain_launch()
+
+    def test_an_unreadable_direnv_status_does_not_execute_the_envrc(self) -> None:
+        for result in ("not json", "null", "[]"):
+            with self.subTest(result=result):
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                self.status.return_value = subprocess.CompletedProcess(["direnv"], 0, result, "")
+                self.assert_plain_launch()
+
+    def test_a_failed_or_timed_out_permission_probe_keeps_the_existing_launch(self) -> None:
+        for failure in (
+            OSError("direnv disappeared"),
+            subprocess.CalledProcessError(1, ["direnv", "status", "--json"]),
+            subprocess.TimeoutExpired(["direnv", "status", "--json"], 5),
+        ):
+            with self.subTest(failure=failure):
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                self.status.side_effect = failure
+                self.assert_plain_launch()
+
+    def test_a_shared_mesh_does_not_load_a_callers_worktree(self) -> None:
+        with patch.object(codex_mesh, "RUN_ROOTS", ()):
+            self.assert_plain_launch()
+        self.status.assert_not_called()
+
+    def test_a_caller_without_cwd_starts_the_existing_plain_server(self) -> None:
+        self.assertEqual(codex_mesh.ensure_server(str(self.session_dir), self.workers_home), (4321, True))
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[0], "codex")
+        self.status.assert_not_called()
+
+    def test_legacy_and_other_worktree_servers_are_retired_before_the_new_shell_is_started(self) -> None:
+        for extra in ({}, {"dev_shell_worktree": str(self.worktree.parent / "old-tree")}):
+            with self.subTest(extra=extra):
+                self.live_record(**extra)
+                self.stop.reset_mock()
+                self.assertEqual(self.ensure(), (4321, True))
+                retired = _as_test_dict(cast(object, json.loads((self.session_dir / codex_mesh.RETIRED_FILE).read_text())))
+                self.assertIn(4001, [_as_test_dict(record).get("port")
+                                     for record in cast(list[object], retired["servers"])])
+                self.stop.assert_called_once_with(None, 76543, 4001)
+                self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+
+    def test_the_same_dev_shell_reuses_the_server(self) -> None:
+        self.live_record(dev_shell_worktree=str(self.worktree))
+        self.assertEqual(self.ensure(), (4001, False))
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_revoked_allowance_replaces_a_server_that_loaded_the_envrc(self) -> None:
+        self.live_record(dev_shell_worktree=str(self.worktree))
+        self.status.return_value = subprocess.CompletedProcess(["direnv"], 0, json.dumps({
+            "state": {"foundRC": {"path": str(self.worktree / ".envrc"), "allowed": 2}},
+        }), "")
+        self.assert_plain_launch()
+        self.stop.assert_called_once_with(None, 76543, 4001)
+
+    def test_no_cwd_never_retires_a_dev_shell_server(self) -> None:
+        self.live_record(dev_shell_worktree=str(self.worktree))
+        self.assertEqual(codex_mesh.ensure_server(str(self.session_dir), self.workers_home), (4001, False))
+        self.status.assert_not_called()
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_a_plain_server_is_reused_when_the_worktree_is_not_allowed(self) -> None:
+        self.live_record()
+        self.which.side_effect = None
+        self.which.return_value = None
+        self.assertEqual(self.ensure(), (4001, False))
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_the_dev_shell_can_finish_loading_after_the_old_thirty_second_deadline(self) -> None:
+        elapsed = [0.0]
+        probes: list[float] = []
+
+        def advance(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        def connect(_port: int) -> SimpleNamespace:
+            probes.append(elapsed[0])
+            if elapsed[0] < 45:
+                raise ConnectionRefusedError("direnv is still evaluating the shell")
+            return SimpleNamespace(close=lambda: None)
+
+        clock = SimpleNamespace(time=lambda: elapsed[0], sleep=advance)
+        with patch.object(codex_mesh, "time", clock), patch.object(codex_mesh, "WebSocket", side_effect=connect):
+            self.assertEqual(self.ensure(), (4321, True))
+        self.assertGreater(probes[-1], 30)
+        self.assertEqual(self.record()["pid"], 87654)
+        cast(MagicMock, self.process.terminate).assert_not_called()
+
+    def test_a_plain_start_still_times_out_after_thirty_seconds(self) -> None:
+        elapsed = [0.0]
+
+        def advance(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        clock = SimpleNamespace(time=lambda: elapsed[0], sleep=advance)
+        with (patch.object(codex_mesh, "time", clock),
+              patch.object(codex_mesh, "WebSocket", side_effect=ConnectionRefusedError),
+              patch.object(os, "killpg")):
+            with self.assertRaisesRegex(SystemExit, "did not accept connections"):
+                _ = codex_mesh.ensure_server(str(self.session_dir), self.workers_home)
+        self.assertGreaterEqual(elapsed[0], 30)
+        self.assertLess(elapsed[0], 31)
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_mac_sweep_keeps_a_slow_dev_shell_server_before_its_current_record_is_written(self) -> None:
+        elapsed = [0.0]
+        recorded_ages: list[float] = []
+        record_started = codex_mesh._record_started_server  # pyright: ignore[reportPrivateUsage]
+
+        def advance(seconds: float) -> None:
+            elapsed[0] += seconds
+
+        def connect(_port: int) -> SimpleNamespace:
+            if elapsed[0] < 45:
+                raise ConnectionRefusedError("direnv is still evaluating")
+            return SimpleNamespace(close=lambda: None)
+
+        def sweep_before_record(session_dir: str, served: codex_mesh.ServerRecord) -> None:
+            recorded_ages.append(elapsed[0])
+            self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+            with (patch.object(sys, "platform", "darwin"),
+                  patch.object(codex_mesh, "_running_servers", return_value=[(87654, 4321, elapsed[0])]),
+                  patch.object(codex_mesh, "_client_counts", return_value={}),
+                  patch.object(codex_mesh, "_server_folder", return_value=codex_mesh.NonMeshServerStderr()),
+                  patch.object(codex_mesh, "_busy_threads", return_value=()) as conversations,
+                  contextlib.redirect_stdout(io.StringIO()) as output):
+                self.assertEqual(codex_mesh.command_sweep(argparse.Namespace(
+                    root=str(self.session_dir.parent), stop=True)), 0)
+            self.assertIn("87654\t4321\tin use\t", output.getvalue())
+            conversations.assert_not_called()
+            self.stop.assert_not_called()
+            record_started(session_dir, served)
+
+        clock = SimpleNamespace(time=lambda: elapsed[0], sleep=advance)
+        with (patch.object(codex_mesh, "time", clock),
+              patch.object(codex_mesh, "WebSocket", side_effect=connect),
+              patch.object(codex_mesh, "_record_started_server", side_effect=sweep_before_record)):
+            self.assertEqual(self.ensure(), (4321, True))
+        self.assertEqual(len(recorded_ages), 1)
+        self.assertGreater(recorded_ages[0], 30)
+        self.assertEqual(self.record()["pid"], 87654)
+
+    def test_failed_direnv_evaluation_falls_back_to_a_plain_server_and_logs_the_failure(self) -> None:
+        self.live_record()
+        failed = MagicMock()
+        failed.pid = 87653
+        cast(MagicMock, failed.poll).return_value = 1
+        self.launch.side_effect = [failed, self.process]
+        with patch.object(os, "killpg") as kill_group:
+            self.assertEqual(self.ensure(), (4321, True))
+        kill_group.assert_any_call(87653, signal.SIGTERM)
+        commands = [cast(list[str], call.args[0]) for call in self.launch.call_args_list]
+        self.assertEqual(len(commands), 2)
+        self.assertEqual(commands[0][:3], ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(commands[1][0], "codex")
+        self.assertFalse(self.record().get("dev_shell_worktree"))
+        self.assertEqual(self.record()["pid"], 87654)
+        self.stop.assert_called_once_with(None, 76543, 4001)
+        self.watcher.assert_any_call(str(self.session_dir), 87654, 4321)
+        log = (self.session_dir / codex_mesh.SERVER_LOG).read_text().lower()
+        self.assertIn("direnv", log)
+        self.assertRegex(log, r"failed|exited")
+        self.assertRegex(log, r"plain|fall(?:ing)? back|fallback")
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.launch.side_effect = None
+        self.launch.reset_mock()
+        self.assertEqual(codex_mesh.ensure_server(str(self.session_dir), self.workers_home), (4321, True))
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[0], "codex")
+
+    def test_direnv_disappearing_between_probe_and_launch_also_falls_back(self) -> None:
+        self.launch.side_effect = [FileNotFoundError("direnv disappeared"), self.process]
+        self.assertEqual(self.ensure(), (4321, True))
+        self.assertEqual(self.launch.call_count, 2)
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[0], "codex")
+        self.assertFalse(self.record().get("dev_shell_worktree"))
+
+    def start_plain_fallback_after_evaluation_failure(self) -> None:
+        failed = MagicMock()
+        failed.pid = 87653
+        cast(MagicMock, failed.poll).return_value = 1
+        self.launch.side_effect = [failed, self.process]
+        with patch.object(os, "killpg"):
+            self.assertEqual(self.ensure(), (4321, True))
+        self.assertEqual(self.launch.call_count, 2)
+        self.assertFalse(self.record().get("dev_shell_worktree"))
+        self.launch.side_effect = None
+        self.launch.reset_mock()
+
+    def test_a_cwd_caller_reuses_the_plain_fallback_for_an_unchanged_failed_shell(self) -> None:
+        with patch("scripts.agents.codex_mesh.time.time", return_value=100_000.0) as wall_clock:
+            self.start_plain_fallback_after_evaluation_failure()
+            self.assertEqual(self.ensure(), (4321, False))
+            wall_clock.return_value = 101_799.0
+            self.assertEqual(self.ensure(), (4321, False))
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+        self.assertFalse(self.record().get("dev_shell_worktree"))
+
+    def test_editing_a_nix_input_retries_the_failed_dev_shell_without_editing_envrc(self) -> None:
+        for name in ("flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
+            with self.subTest(input=name):
+                source = self.worktree / name
+                _ = source.write_text("broken configuration\n", encoding="utf-8")
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                self.launch.reset_mock()
+                self.start_plain_fallback_after_evaluation_failure()
+                envrc_before = (self.worktree / ".envrc").stat()
+                previous = source.stat()
+                _ = source.write_text("repaired configuration\n", encoding="utf-8")
+                os.utime(source, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
+                self.assertEqual(self.ensure(), (4321, True))
+                self.launch.assert_called_once()
+                self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                                 ["/tools/direnv", "exec", str(self.worktree)])
+                self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+                self.assertEqual((self.worktree / ".envrc").stat(), envrc_before)
+
+    def test_creating_a_previously_absent_nix_input_retries_the_failed_dev_shell(self) -> None:
+        for name in ("flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
+            with self.subTest(input=name):
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                self.launch.reset_mock()
+                self.start_plain_fallback_after_evaluation_failure()
+                _ = (self.worktree / name).write_text("new configuration\n", encoding="utf-8")
+                self.assertEqual(self.ensure(), (4321, True))
+                self.launch.assert_called_once()
+                self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                                 ["/tools/direnv", "exec", str(self.worktree)])
+                self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+
+    def test_removing_a_nix_input_retries_the_failed_dev_shell(self) -> None:
+        for name in ("flake.nix", "flake.lock", "shell.nix", "default.nix", "devenv.nix"):
+            with self.subTest(input=name):
+                source = self.worktree / name
+                _ = source.write_text("obsolete configuration\n", encoding="utf-8")
+                (self.session_dir / codex_mesh.SERVER_FILE).unlink(missing_ok=True)
+                self.launch.reset_mock()
+                self.start_plain_fallback_after_evaluation_failure()
+                source.unlink()
+                self.assertEqual(self.ensure(), (4321, True))
+                self.launch.assert_called_once()
+                self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                                 ["/tools/direnv", "exec", str(self.worktree)])
+                self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+
+    def test_a_failure_older_than_thirty_minutes_allows_an_unchanged_dev_shell_to_retry(self) -> None:
+        with patch("scripts.agents.codex_mesh.time.time", return_value=100_000.0) as wall_clock:
+            self.start_plain_fallback_after_evaluation_failure()
+            wall_clock.return_value = 101_801.0
+            self.assertEqual(self.ensure(), (4321, True))
+        self.launch.assert_called_once()
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                         ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+        self.stop.assert_called_once_with(None, 87654, 4321)
+
+    def test_a_failed_shell_is_not_retried_after_the_live_server_record_is_removed(self) -> None:
+        self.start_plain_fallback_after_evaluation_failure()
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.assertEqual(self.ensure(), (4321, True))
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[0], "codex")
+        self.assertFalse(self.record().get("dev_shell_worktree"))
+        self.launch.reset_mock()
+        self.assertEqual(self.ensure(), (4321, False))
+        self.launch.assert_not_called()
+
+    def test_editing_the_failed_envrc_allows_a_new_dev_shell_attempt(self) -> None:
+        self.start_plain_fallback_after_evaluation_failure()
+        envrc = self.worktree / ".envrc"
+        previous = envrc.stat()
+        _ = envrc.write_text("use flake ./fixed\n", encoding="utf-8")
+        os.utime(envrc, ns=(previous.st_atime_ns, previous.st_mtime_ns + 2_000_000_000))
+        self.assertEqual(self.ensure(), (4321, True))
+        self.launch.assert_called_once()
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                         ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+        self.stop.assert_called_once_with(None, 87654, 4321)
+
+    def test_another_worktree_can_load_even_when_its_envrc_has_the_failed_files_mtime(self) -> None:
+        self.start_plain_fallback_after_evaluation_failure()
+        another = self.worktree.parent / "another-worktree"
+        another.mkdir()
+        envrc = another / ".envrc"
+        _ = envrc.write_text("use flake\n", encoding="utf-8")
+        failed_mtime = (self.worktree / ".envrc").stat().st_mtime_ns
+        os.utime(envrc, ns=(failed_mtime, failed_mtime))
+        self.status.return_value = subprocess.CompletedProcess(["direnv"], 0, json.dumps({
+            "state": {"foundRC": {"path": str(envrc), "allowed": 0}},
+        }), "")
+        self.assertEqual(codex_mesh.ensure_server(
+            str(self.session_dir), self.workers_home, cwd=str(another)), (4321, True))
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                         ["/tools/direnv", "exec", str(another)])
+        self.assertEqual(self.record()["dev_shell_worktree"], str(another))
+
+    def test_a_failed_plain_fallback_is_reported_without_retrying_forever(self) -> None:
+        cast(MagicMock, self.process.poll).return_value = 1
+        with patch.object(os, "killpg"):
+            with self.assertRaisesRegex(SystemExit, "exited immediately"):
+                _ = self.ensure()
+        self.assertEqual(self.launch.call_count, 2)
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[0], "codex")
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_unknown_permission_probes_keep_a_healthy_dev_shell_server(self) -> None:
+        for failure in (
+            OSError("direnv disappeared"),
+            subprocess.CalledProcessError(1, ["direnv", "status", "--json"]),
+            subprocess.TimeoutExpired(["direnv", "status", "--json"], 5),
+        ):
+            with self.subTest(failure=failure):
+                self.live_record(dev_shell_worktree=str(self.worktree))
+                self.status.side_effect = failure
+                self.assertEqual(self.ensure(), (4001, False))
+                self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_missing_direnv_keeps_a_healthy_dev_shell_server(self) -> None:
+        self.live_record(dev_shell_worktree=str(self.worktree))
+        self.which.side_effect = None
+        self.which.return_value = None
+        self.assertEqual(self.ensure(), (4001, False))
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_invalid_permission_status_keeps_a_healthy_dev_shell_server(self) -> None:
+        self.live_record(dev_shell_worktree=str(self.worktree))
+        for status in ("not json", "null", "[]", '{"state": {"foundRC": {}}}'):
+            with self.subTest(status=status):
+                self.status.return_value = subprocess.CompletedProcess(["direnv"], 0, status, "")
+                self.assertEqual(self.ensure(), (4001, False))
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_definite_absence_of_an_envrc_retires_a_dev_shell_server(self) -> None:
+        self.live_record(dev_shell_worktree=str(self.worktree))
+        (self.worktree / ".envrc").unlink()
+        self.status.return_value = subprocess.CompletedProcess(
+            ["direnv"], 0, '{"state": {"foundRC": null}}', "")
+        self.assert_plain_launch()
+        self.stop.assert_called_once_with(None, 76543, 4001)
+
+    def test_a_subdirectory_starts_and_reuses_its_nearest_ancestor_dev_shell(self) -> None:
+        subdirectory = self.worktree / "src" / "nested"
+        subdirectory.mkdir(parents=True)
+        self.assertEqual(codex_mesh.ensure_server(
+            str(self.session_dir), self.workers_home, cwd=str(subdirectory)), (4321, True))
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                         ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+        self.launch.reset_mock()
+        self.assertEqual(codex_mesh.ensure_server(
+            str(self.session_dir), self.workers_home, cwd=str(subdirectory)), (4321, False))
+        self.assertEqual(self.ensure(), (4321, False))
+        self.launch.assert_not_called()
+        self.stop.assert_not_called()
+
+    def test_cwd_free_restart_remembers_the_successfully_loaded_dev_shell_after_idle_stop(self) -> None:
+        self.assertEqual(self.ensure(), (4321, True))
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.launch.reset_mock()
+        self.assertEqual(codex_mesh.ensure_server(str(self.session_dir), self.workers_home), (4321, True))
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                         ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(self.record()["dev_shell_worktree"], str(self.worktree))
+        self.assertEqual(self.ensure(), (4321, False))
+        self.launch.assert_called_once()
+
+    def test_reusing_a_dev_shell_record_remembers_it_for_a_later_cwd_free_restart(self) -> None:
+        self.live_record(dev_shell_worktree=str(self.worktree))
+        self.assertEqual(self.ensure(), (4001, False))
+        (self.session_dir / codex_mesh.SERVER_FILE).unlink()
+        self.assertEqual(codex_mesh.ensure_server(str(self.session_dir), self.workers_home), (4321, True))
+        self.assertEqual(cast(list[str], self.launch.call_args.args[0])[:3],
+                         ["/tools/direnv", "exec", str(self.worktree)])
+
+    def test_failed_start_terminates_the_evaluation_process_group_and_escalates(self) -> None:
+        cast(MagicMock, self.process.wait).side_effect = [subprocess.TimeoutExpired("codex", 5), 0]
+        with (patch.object(codex_mesh, "SERVER_START_TIMEOUT_SECS", 0),
+              patch.object(os, "killpg") as kill_group):
+            with self.assertRaises(SystemExit):
+                _ = codex_mesh.ensure_server(str(self.session_dir), self.workers_home)
+        self.assertEqual([call.args for call in kill_group.call_args_list],
+                         [(87654, signal.SIGTERM), (87654, signal.SIGKILL)])
+        self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
+
+    def test_held_design_identity_is_also_applied_after_the_dev_shell(self) -> None:
+        context: dict[str, object] = {
+            "holder_session": "design-holder", "design_id": "design-one", "generation": 7,
+            "binding": {"kind": "DesignBoundToPhase", "run_directory": str(self.session_dir)},
+        }
+        with patch.object(codex_mesh, "_guild_context", return_value=context), patch.object(roles, "refresh_census"):
+            _ = self.ensure()
+        command = cast(list[str], self.launch.call_args.args[0])
+        self.assertEqual(command[:3], ["/tools/direnv", "exec", str(self.worktree)])
+        self.assertEqual(Path(command[3]).name, "env")
+        overrides = dict(argument.split("=", 1) for argument in command[4:command.index("codex", 4)])
+        self.assertEqual(overrides["CLAUDE_CODE_SESSION_ID"], "design-holder")
+        self.assertEqual(overrides["GUILD_DESIGN_ID"], "design-one")
+        self.assertEqual(overrides["GUILD_BINDING_GENERATION"], "7")
+
+    def test_start_forwards_the_worktree_on_the_initial_launch_and_recovery(self) -> None:
+        args = argparse.Namespace(
+            session_dir=str(self.session_dir), name="worker", cwd=str(self.worktree), resident=False,
+            log_file=str(self.session_dir / "worker.log"),
+        )
+        outcomes = [codex_mesh.FailedWithThread(THREAD_ID, STALE_SIGN_IN, 1.0), codex_mesh.RunCompleted()]
+        with (patch.object(codex_mesh, "ensure_server", side_effect=[(4001, False), (4321, True)]) as ensure,
+              patch.object(codex_mesh, "_retire_server", return_value=True),
+              patch.object(codex_mesh, "_run_worker", side_effect=outcomes),
+              contextlib.redirect_stderr(io.StringIO())):
+            self.assertEqual(codex_mesh.command_start(args), 0)
+        self.assertEqual(len(ensure.call_args_list), 2)
+        self.assertEqual([call.kwargs.get("cwd") for call in ensure.call_args_list], [str(self.worktree)] * 2)
 
 
 class ServerRecordTests(unittest.TestCase):
