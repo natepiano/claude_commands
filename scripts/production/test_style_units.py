@@ -17,7 +17,7 @@ import proposal_issue
 import style_units
 import style_ledger
 import unit_lookup
-import units_table
+import unit_table_cells
 from herdr import HerdrPlace
 from scripts.direct import plan_history
 
@@ -88,10 +88,10 @@ class StyleUnitsTests(unittest.TestCase):
                 [(str(proposal), state, ticket, built_at, updated_at)] * count,
             )
 
-    def refill(self, unit: str = "names-unit", *, split_at: str = "2026-10-28T12:30:00+00:00") -> None:
+    def refill(self, unit: str = "names-unit", *, split_at: str = "2026-10-28T11:30:00+00:00") -> None:
         with closing(sqlite3.connect(self.database)) as connection, connection:
             _ = connection.execute("INSERT INTO refill_results VALUES (?,?,?,?,?,?,?,?)", (
-                unit, "2026-10-28T13:45:00+00:00", "waiting for structure: cargo-liner", split_at, 1234, 20, 30, 40,
+                unit, "2026-10-28T13:45:00+00:00", "waiting for structure: cargo-liner", split_at, 1234, 20, 30, 16,
             ))
 
     def render(self, units: list[live_units.LiveUnit] | None = None,
@@ -197,7 +197,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.assertIn("| 4 (2 in 24 h) |", self.render())
         self.assertIn("All families: 5 built", self.render())
 
-    def test_left_is_only_the_approved_total_even_when_reserved_split_columns_are_populated(self) -> None:
+    def test_left_shows_the_approved_total_and_recorded_counts_with_their_age(self) -> None:
         approved = self.decision("approved", "names-unit")
         self.findings(approved, "filed", 1300)
         for state in ("unfiled", "waived", "withdrawn"):
@@ -208,16 +208,32 @@ class StyleUnitsTests(unittest.TestCase):
         self.findings(self.root / "missing.md", "filed", 13)
         self.refill()
         output = self.render()
-        self.assertIn("| 1,300 |", output)
-        self.assertNotIn("ready", output)
-        self.assertNotIn("split", output)
-        self.assertNotIn("08:30", output)
+        self.assertIn("| 1,300: ready 1,234 · changed 20 · structure 30 · other 16 (30 min) |", output)
         self.assertIn("All families: 0 built · 1,311 left", output)
 
     def test_left_with_default_reserved_columns_uses_only_the_approved_total(self) -> None:
         self.findings(self.decision("approved", "names-unit"), "filed", 1234)
         self.refill(split_at="")
         self.assertIn("| 1,234 |", self.render())
+
+    def test_split_age_uses_whole_minutes_hours_and_days_from_its_offset(self) -> None:
+        for measured_at, age in (("2026-10-28T13:59:01+02:00", "0 min"),
+                                 ("2026-10-28T11:01:00+00:00", "59 min"),
+                                 ("2026-10-28T11:00:00+00:00", "1 h"),
+                                 ("2026-10-27T13:00:00+00:00", "23 h"),
+                                 ("2026-10-27T12:00:00+00:00", "1 d"),
+                                 ("2026-10-25T11:59:00+00:00", "3 d")):
+            with self.subTest(measured_at=measured_at):
+                split = style_ledger.RecordedSplit(1000, 2000, 3000, 4000, measured_at)
+                self.assertEqual(style_units.left_cell(10000, split, NOW),
+                                 f"10,000: ready 1,000 · changed 2,000 · structure 3,000 · other 4,000 ({age})")
+
+    def test_a_first_zero_split_is_recorded_and_still_shows_idle_without_a_refill(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            _ = connection.execute("INSERT INTO refill_results(unit,at,outcome,split_at) VALUES (?,'','',?)",
+                                   ("names-unit", "2026-10-28T10:00:00+00:00"))
+        self.assertIn("| names | idle | — | 0 (0 in 24 h) | "
+                      + "0: ready 0 · changed 0 · structure 0 · other 0 (2 h) |", self.render())
 
     def test_a_built_finding_without_a_decision_uses_its_build_ticket_family(self) -> None:
         ticket = self.ticket(unit="types-unit", family="names", state="merged")
@@ -297,16 +313,19 @@ class StyleUnitsTests(unittest.TestCase):
         self.assertEqual(len(opened), 1)
         self.assertEqual(self.database.read_bytes(), before)
 
-    def test_plan_folder_names_the_ledger_and_each_folder_is_resolved_once(self) -> None:
-        plan = self.root / "plans" / "names.md"
-        records: dict[str, object] = {"names-unit": {"plan": str(plan)}, "types-unit": {"plan": str(plan.with_name("types.md"))}}
-        units = [live_unit("names-unit"), live_unit("types-unit")]
-        location = style_ledger.LedgerLocation(self.root, self.database)
-        with (patch.object(style_ledger, "ledger_location", return_value=location) as locate,
-              patch.object(plan_history, "plan_runs", return_value=[])):
-            output = style_units.table(units, records, now=NOW, zone=ZONE)
-        locate.assert_called_once_with(plan.parent)
-        self.assertEqual(output.count("| gone | idle |"), 2)
+    def test_a_caller_must_supply_ledger_paths_even_when_a_phase_record_names_a_plan(self) -> None:
+        records: dict[str, object] = {"names-unit": {"plan": str(self.root / "names.md")}}
+        with (patch.object(style_ledger, "ledger_location", side_effect=AssertionError("no phase-based lookup")),
+              self.assertRaisesRegex(TypeError, "ledger_paths")):
+            _ = style_units.table([live_unit("names-unit")], records)  # pyright: ignore[reportCallIssue, reportUnknownVariableType]
+
+    def test_an_explicit_ledger_path_keeps_ticket_and_counts_when_the_phase_record_is_unavailable(self) -> None:
+        _ = self.ticket(count=3)
+        self.findings(self.decision("approved", "names-unit"), "filed", 7)
+        records: dict[str, object] = {"names-unit": {"unavailable": "plan cannot be read"}}
+        with patch.object(style_ledger, "ledger_location", side_effect=AssertionError("the caller resolved the path")):
+            output = self.render(records=records)
+        self.assertIn("| names | #42 · comments-name-code-constructs · cargo-liner · 3 findings | — | 0 (0 in 24 h) | 7 |", output)
 
     def test_session_cells_and_pipes_keep_the_phase_table_meaning(self) -> None:
         units = [live_unit("names-unit", "names|worker"), live_unit("types-unit")]
@@ -314,7 +333,7 @@ class StyleUnitsTests(unittest.TestCase):
         self.assertIn("| names\\|worker | idle |", output)
         self.assertIn("| gone | idle |", output)
         self.assertNotIn("| names-unit |", output)
-        self.assertEqual(units_table.session_cell(units[0]), "names|worker")
+        self.assertEqual(unit_table_cells.session_cell(units[0]), "names|worker")
 
 
 if __name__ == "__main__":

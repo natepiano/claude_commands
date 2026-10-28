@@ -22,6 +22,7 @@ from scripts.direct import board_json
 from scripts.lib import unit_runs
 from scripts.production import fake_showrunner, showrunners
 from scripts.production.cli_fixture import invoke_cli
+import unit_table_cells
 
 
 CONTRACT = Path(__file__).resolve().parents[2] / "mods/unit-board/types/board.d.ts"
@@ -980,7 +981,7 @@ class BoardJsonTests(unittest.TestCase):
                 self.assertEqual(unit["plan"], str(fixture.plan))
                 self.assertIn(str(active_plan), array_items(document["sources"]))
 
-    def test_activity_stage_and_steps_are_scoped_to_the_open_instance(self) -> None:
+    def test_neutral_run_cells_keep_the_board_activity_and_steps_in_the_open_instance(self) -> None:
         fixture = self.production()
         _ = self.write_run(fixture, [
             *self.delivery_events(),
@@ -994,8 +995,12 @@ class BoardJsonTests(unittest.TestCase):
             self.event("progress_reported", NOW - 100, activity="delivery ready for review"),
         ])
 
-        _, unit = self.unit(fixture)
+        with (patch.object(unit_table_cells, "open_step", wraps=unit_table_cells.open_step) as open_step,
+              patch.object(unit_table_cells, "run_events", wraps=unit_table_cells.run_events) as run_events):
+            _, unit = self.unit(fixture)
 
+        self.assertTrue(open_step.called)
+        self.assertTrue(run_events.called)
         self.assertEqual(unit["stage"], "Final check")
         self.assertEqual(unit["summary"], "delivery ready for review")
         steps = [array_items(step) for step in array_items(unit["steps"])]

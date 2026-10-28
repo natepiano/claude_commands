@@ -507,7 +507,7 @@ Source: the user via the showrunner, 2026-10-20: the two views should "show basi
 
 **Ruled out:** a classify-only pass inside refill (11–40 min per refill on the live ledger, blob reads in `judged_at_current_file` dominate); a `no work` outcome (`next_phase` never returns `NoAvailableWork`); split text in the Left cell.
 
-### Phase 22 — the ticket table shows each unit's split, read by a nightly command  · status: todo
+### Phase 22 — the ticket table shows each unit's split, read by a nightly command  · status: done
 
 **Depends on:** Phase 21
 

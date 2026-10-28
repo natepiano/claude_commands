@@ -34,6 +34,10 @@ For `Kind: style`, the table is `| Unit | Ticket | Step | Built | Left |`:
 - **Built**: `<all time> (<n> in 24 h)` for the unit's family. The 24-hour count
   uses the finding's first build time.
 - **Left**: the family's filed findings with an approved decision: `<total>`.
+  A recorded split adds `: ready <a> · changed <b> · structure <c> · other <d>
+  (<age>)`. Age is whole minutes below 60 (`<n> min`), whole hours below 24
+  (`<n> h`), else whole days (`<n> d`), since the scan started. A split alone
+  leaves the ticket cell as `idle`.
 
 The total line is `All families: <built> built · <left> left · <r> built in the
 last 24 h · ETA at that rate <YYYY-MM-DD>`. The date is now plus `left / r` days.

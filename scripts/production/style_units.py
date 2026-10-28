@@ -18,80 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "style"))
 import live_units
 import rules
 import style_ledger
-import unit_lookup
+import unit_table_cells
 from issues import Issue, frontmatter
 from proposal_issue import ApprovedDecision, decision_answer
 from scripts.direct import plan_history
 from scripts.lib.user_zone import user_zone
 
 DECISION_FOLDER = Path()
-NONE = "—"
-
-
-class OpenStep(NamedTuple):
-    label: str
-    text: str
-
-
-class NoOpenStep(NamedTuple):
-    pass
-
-
-def session_cell(unit: live_units.LiveUnit) -> str:
-    """The unit's session name now, or why there is none."""
-    if unit.session is None:
-        return "gone"
-    claude = unit.session.claude
-    if isinstance(claude, unit_lookup.LiveClaude):
-        return claude.name
-    if isinstance(claude, unit_lookup.ClaudeUnknown):
-        return "unknown"
-    return "not running"
-
-
-def open_step(events: list[dict[str, object]]) -> OpenStep | NoOpenStep:
-    """The step a run has open in its open phase: the newest open activity, else the newest open pass."""
-    passes: dict[str, OpenStep] = {}
-    activities: dict[str, OpenStep] = {}
-    for event in events:
-        kind = event.get("event_type")
-        if kind in ("phase_started", "phase_finished", "run_finished"):
-            passes.clear()
-            activities.clear()
-        elif kind == "pass_started":
-            passes[str(event.get("pass_instance_id"))] = OpenStep(
-                str(event.get("pass_kind", "")), str(event.get("pass_activity", "")))
-        elif kind == "pass_finished":
-            _ = passes.pop(str(event.get("pass_instance_id")), None)
-        elif kind == "activity_started":
-            activities[str(event.get("activity_instance_id"))] = OpenStep(
-                str(event.get("activity_label", "")), str(event.get("activity_text", "")))
-        elif kind == "activity_finished":
-            _ = activities.pop(str(event.get("activity_instance_id")), None)
-    for steps in (activities, passes):
-        if steps:
-            return list(steps.values())[-1]
-    return NoOpenStep()
-
-
-def run_events(path: Path) -> list[dict[str, object]]:
-    events: list[dict[str, object]] = []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
-        return events
-    for line in lines:
-        try:
-            event = cast(object, json.loads(line))
-        except json.JSONDecodeError:
-            continue
-        if isinstance(event, dict):
-            events.append(cast(dict[str, object], event))
-    return events
-
-
-def escaped(cell: str) -> str:
-    return " ".join(cell.split()).replace("|", "\\|")
 
 
 class Ticket(NamedTuple):
@@ -144,6 +77,7 @@ class LedgerSnapshot:
     tickets: dict[str, Ticket] = field(default_factory=dict)
     refills: dict[str, Refill] = field(default_factory=dict)
     counts: dict[str, FamilyCounts] = field(default_factory=dict)
+    splits: dict[str, style_ledger.RecordedSplit] = field(default_factory=dict)
 
 
 def parsed_time(value: str) -> datetime | TimeUnavailable:
@@ -156,7 +90,7 @@ def parsed_time(value: str) -> datetime | TimeUnavailable:
 
 def clock(value: str, zone: tzinfo) -> str:
     at = parsed_time(value)
-    return at.astimezone(zone).strftime("%H:%M") if isinstance(at, datetime) else NONE
+    return at.astimezone(zone).strftime("%H:%M") if isinstance(at, datetime) else unit_table_cells.NONE
 
 
 def decision_family(path: Path) -> DecisionFamily | DecisionFileMissing:
@@ -199,7 +133,13 @@ def read_snapshot(database: Path, now: datetime, decision_folder: Path,
             rows_refill = cast(list[tuple[str, str, str]], connection.execute(
                 "SELECT unit,at,outcome FROM refill_results").fetchall())
             snapshot.refills = {row[0]: Refill(row[1], row[2])
-                                for row in rows_refill}
+                                for row in rows_refill if row[2]}
+            rows_split = cast(list[tuple[str, int, int, int, int, str]], connection.execute(
+                "SELECT unit,ready,changed,structure,other,split_at FROM refill_results "
+                + "WHERE split_at != ''").fetchall())
+            snapshot.splits = {
+                row[0]: style_ledger.RecordedSplit(row[1], row[2], row[3], row[4], row[5]) for row in rows_split
+            }
         if not finding_columns:
             return snapshot
         built_at = "h.built_at" if "built_at" in finding_columns else "''"
@@ -249,7 +189,7 @@ def ticket_cell(ticket: Ticket) -> str:
     rule = Path(ticket.rule).stem
     if not rule:
         stems = [Path(value).stem for value in json_items(ticket.rules) if isinstance(value, str)]
-        rule = stems[0] + (f"+{len(stems) - 1}" if len(stems) > 1 else "") if stems else NONE
+        rule = stems[0] + (f"+{len(stems) - 1}" if len(stems) > 1 else "") if stems else unit_table_cells.NONE
     if ticket.kind == "proposal":
         count, noun = len(json_items(ticket.finding_ids)), "finding"
     elif ticket.kind == "listed":
@@ -264,21 +204,21 @@ def record_fields(record: object) -> dict[str, object]:
     return cast(dict[str, object], record) if isinstance(record, dict) else {}
 
 
-def newest_step(record: object) -> OpenStep | NoOpenStep:
+def newest_step(record: object) -> unit_table_cells.OpenStep | unit_table_cells.NoOpenStep:
     fields = record_fields(record)
     plan = fields.get("plan")
     runs = plan_history.plan_runs(Path(plan)) if isinstance(plan, str) else []
-    return open_step(run_events(runs[-1])) if runs else NoOpenStep()
+    return unit_table_cells.open_step(unit_table_cells.run_events(runs[-1])) if runs else unit_table_cells.NoOpenStep()
 
 
 def format_step(record: object, checkpointed: bool, zone: tzinfo,
-                step: OpenStep | NoOpenStep) -> str:
-    label = step.label if isinstance(step, OpenStep) and step.label else (
-        "checkpoint sent" if checkpointed else NONE)
+                step: unit_table_cells.OpenStep | unit_table_cells.NoOpenStep) -> str:
+    label = step.label if isinstance(step, unit_table_cells.OpenStep) and step.label else (
+        "checkpoint sent" if checkpointed else unit_table_cells.NONE)
     eta = record_fields(record_fields(record_fields(record).get("current")).get("eta")).get("time")
     if isinstance(eta, str):
         eta_text = f"ETA {clock(eta, zone)}"
-        label = eta_text if label == NONE else f"{label} · {eta_text}"
+        label = eta_text if label == unit_table_cells.NONE else f"{label} · {eta_text}"
     return label
 
 
@@ -287,34 +227,34 @@ def step_cell(record: object, checkpointed: bool, zone: tzinfo) -> str:
 
 
 def unit_steps(units: list[live_units.LiveUnit], records: dict[str, object]
-               ) -> dict[str, OpenStep | NoOpenStep]:
+               ) -> dict[str, unit_table_cells.OpenStep | unit_table_cells.NoOpenStep]:
     return {unit.unit: newest_step(records.get(unit.unit)) for unit in units}
 
 
-def ledger_paths_for(units: list[live_units.LiveUnit], records: dict[str, object]) -> dict[str, Path]:
-    paths: dict[str, Path] = {}
-    plans: dict[Path, Path] = {}
-    for unit in units:
-        plan = record_fields(records.get(unit.unit)).get("plan")
-        if not isinstance(plan, str):
-            continue
-        folder = Path(plan).expanduser().parent
-        try:
-            if folder not in plans:
-                plans[folder] = style_ledger.ledger_location(folder).database
-            paths[unit.unit] = plans[folder]
-        except (OSError, ValueError):
-            continue
-    return paths
+def left_cell(total: int, split: style_ledger.RecordedSplit | style_ledger.NoSplitRecorded,
+              now: datetime) -> str:
+    """Show the last measured split and its whole-minute age."""
+    text = f"{total:,}"
+    if isinstance(split, style_ledger.NoSplitRecorded):
+        return text
+    at = parsed_time(split.measured_at)
+    if isinstance(at, TimeUnavailable):
+        return text
+    minutes = max(0, int((now - at).total_seconds() // 60))
+    age = f"{minutes} min" if minutes < 60 else (
+        f"{minutes // 60} h" if minutes < 1440 else f"{minutes // 1440} d")
+    return (f"{text}: ready {split.ready:,} · changed {split.changed:,} · "
+            + f"structure {split.structure:,} · other {split.other:,} ({age})")
 
 
 def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
+          ledger_paths: Mapping[str, Path],
           now: datetime | None = None, zone: tzinfo | None = None,
-          ledger_paths: Mapping[str, Path] | None = None, decision_folder: Path = DECISION_FOLDER) -> str:
+          decision_folder: Path = DECISION_FOLDER) -> str:
     """Render a snapshot; callers can supply fixed time and paths for tests."""
     now = now if now is not None else datetime.now(UTC)
     zone = zone if zone is not None else user_zone()
-    paths = ledger_paths if ledger_paths is not None else ledger_paths_for(units, records)
+    paths = ledger_paths
     decisions: dict[Path, DecisionFamily | DecisionFileMissing] = {}
     snapshots: dict[Path, LedgerSnapshot] = {}
     with ThreadPoolExecutor(max_workers=1) as reads:
@@ -332,12 +272,12 @@ def table(units: list[live_units.LiveUnit], records: dict[str, object], *,
         ticket = snapshot.tickets.get(unit.unit)
         refill = snapshot.refills.get(unit.unit)
         idle = f"idle — {refill.outcome} ({clock(refill.at, zone)})" if refill else "idle"
-        left = f"{counts.left:,}"
-        cells = (session_cell(unit), ticket_cell(ticket) if ticket else idle,
+        left = left_cell(counts.left, snapshot.splits.get(unit.unit, style_ledger.NoSplitRecorded()), now)
+        cells = (unit_table_cells.session_cell(unit), ticket_cell(ticket) if ticket else idle,
                  format_step(records.get(unit.unit), bool(ticket and ticket.state == "checkpointed"), zone,
                              open_steps[unit.unit]),
                  f"{counts.built:,} ({counts.recent:,} in 24 h)", left)
-        lines.append("| " + " | ".join(escaped(cell) for cell in cells) + " |")
+        lines.append("| " + " | ".join(unit_table_cells.escaped(cell) for cell in cells) + " |")
     all_counts = [counts for snapshot in snapshots.values() for counts in snapshot.counts.values()]
     totals = FamilyCounts(sum(counts.built for counts in all_counts), sum(counts.left for counts in all_counts),
                           sum(counts.recent for counts in all_counts))

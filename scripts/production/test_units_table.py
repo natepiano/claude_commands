@@ -4,6 +4,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +19,8 @@ import unit_lookup
 from herdr import HerdrPlace
 import units_table
 import style_units
+import style_ledger
+import unit_table_cells
 
 # Importable once units_table has put scripts/direct on the path.
 import phase_table
@@ -63,10 +68,10 @@ class UnitsTableTests(unittest.TestCase):
             return units_table.task_cell(record)
 
     def test_session_names_the_live_claude_or_says_why_there_is_none(self) -> None:
-        self.assertEqual(units_table.session_cell(unit("a", live("alpha"))), "alpha")
-        self.assertEqual(units_table.session_cell(unit("a", None)), "gone")
-        self.assertEqual(units_table.session_cell(unit("a", unit_lookup.ClaudeNotRunning())), "not running")
-        self.assertEqual(units_table.session_cell(unit("a", unit_lookup.ClaudeUnknown("no records"))), "unknown")
+        self.assertEqual(unit_table_cells.session_cell(unit("a", live("alpha"))), "alpha")
+        self.assertEqual(unit_table_cells.session_cell(unit("a", None)), "gone")
+        self.assertEqual(unit_table_cells.session_cell(unit("a", unit_lookup.ClaudeNotRunning())), "not running")
+        self.assertEqual(unit_table_cells.session_cell(unit("a", unit_lookup.ClaudeUnknown("no records"))), "unknown")
 
     def test_phase_names_the_open_phase_or_where_the_plan_stands(self) -> None:
         cases: list[tuple[object, str]] = [
@@ -190,17 +195,22 @@ class UnitsTableTests(unittest.TestCase):
 
     def test_style_kind_routes_to_the_ticket_table(self) -> None:
         doc = self.root / "style-production.md"
-        _ = doc.write_text("# Production\n- **Kind:** style\n", encoding="utf-8")
+        _ = doc.write_text("# Production\n- **Kind:** style\n\n## Units\n\n"
+                           + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+                           + f"| names-unit | docs/names.md | {self.root} | style-names |\n", encoding="utf-8")
         units = [unit("names-unit", live("names"))]
         records: dict[str, object] = {"names-unit": {"plan": "/tmp/claude/names.md"}}
         output = io.StringIO()
         with (patch.object(live_units, "production_units", return_value=units),
               patch.object(phase_table, "show_production", return_value=json.dumps(records)),
               patch.object(style_units, "table", return_value="ticket table") as tickets,
+              patch.object(style_ledger, "ledger_location", return_value=style_ledger.LedgerLocation(
+                  self.root, self.root / "ledger.sqlite")) as locate,
               patch.object(units_table, "table") as phases,
               contextlib.redirect_stdout(output)):
             self.assertEqual(units_table.main(["--production", str(doc)]), 0)
-        tickets.assert_called_once_with(units, records)
+        tickets.assert_called_once_with(units, records, ledger_paths={"names-unit": self.root / "ledger.sqlite"})
+        locate.assert_called_once_with(self.root)
         phases.assert_not_called()
         self.assertEqual(output.getvalue(), "ticket table\n")
 
@@ -217,6 +227,42 @@ class UnitsTableTests(unittest.TestCase):
                     self.assertEqual(units_table.main(["--production", str(doc)]), 0)
                 tickets.assert_not_called()
                 self.assertEqual(output.getvalue(), "| Unit | Phase | Task |\n| --- | --- | --- |\n| a | — | — |\n")
+
+    def test_a_missing_plan_folder_keeps_ledger_data_and_an_unresolved_worktree_keeps_its_row(self) -> None:
+        _ = subprocess.run(["git", "init", "-q", str(self.root)], check=True, capture_output=True)
+        _ = self.enterContext(patch.dict(os.environ, {"STYLE_LEDGER_STATE_DIR": str(self.root / "state")}))  # pyright: ignore[reportAny]
+        doc = self.root / "style-production.md"
+        _ = doc.write_text("# Production\n- **Kind:** style\n\n## Units\n\n"
+                           + "| Unit | Plan | Worktree | Branch |\n| --- | --- | --- | --- |\n"
+                           + f"| names-unit | retained/names-plan.md | {self.root} | style-names |\n"
+                           + f"| types-unit | gone/types.md | {self.root / 'gone'} | style-types |\n")
+        self.assertFalse((self.root / "retained").exists())
+        decision = self.root / "decision.md"
+        _ = decision.write_text("---\nstatus: open\nunit: names-unit\nplan: approved\n---\n")
+        database = style_ledger.ledger_location(self.root).database
+        database.parent.mkdir(parents=True)
+        with contextlib.closing(sqlite3.connect(database)) as connection, connection:
+            _ = connection.executescript("""
+                CREATE TABLE tickets(id TEXT,unit TEXT,kind TEXT,family TEXT,rule TEXT,crate TEXT,
+                    files TEXT,sites TEXT,rules TEXT,finding_ids TEXT,state TEXT,created_at TEXT);
+                CREATE TABLE held_findings(proposal TEXT,state TEXT,build_ticket TEXT,built_at TEXT);
+                CREATE TABLE refill_results(unit TEXT,at TEXT,outcome TEXT,split_at TEXT,
+                    ready INTEGER,changed INTEGER,structure INTEGER,other INTEGER);
+                INSERT INTO tickets VALUES ('names-unit-12','names-unit','proposal','names',
+                    'global:rust/read.md','alpha','[]','[]','[]','["one"]','assigned','2026-10-01');
+            """)
+            _ = connection.execute("INSERT INTO held_findings VALUES (?,'filed','names-unit-12','')", (str(decision),))
+        output = io.StringIO()
+        with (patch.object(live_units, "production_units", return_value=[unit("names-unit", live("names")),
+                                                                        unit("types-unit", live("types"))]),
+              patch.object(phase_table, "show_production", return_value=json.dumps({
+                  "names-unit": {"unavailable": "plan cannot be read"},
+                  "types-unit": {"unavailable": "worktree cannot be read"}})),
+              contextlib.redirect_stdout(output)):
+            self.assertEqual(units_table.main(["--production", str(doc)]), 0)
+        self.assertIn("| names | #12 · read · alpha · 1 finding | — | 0 (0 in 24 h) | 1 |", output.getvalue())
+        self.assertIn("| types | idle | — | 0 (0 in 24 h) | 0 |", output.getvalue())
+        self.assertFalse((self.root / "retained").exists())
 
     def test_production_of_reads_the_timer_addressed_to_the_session(self) -> None:
         doc = self.root / "show-production.md"

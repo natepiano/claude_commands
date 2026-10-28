@@ -345,6 +345,52 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection:
             self.assertEqual(connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall(), [("existing",)])
 
+    def test_a_first_split_inserts_counts_without_inventing_a_refill(self) -> None:
+        ledger = self.ledger()
+        measured_at = "2026-10-28T10:01:02+00:00"
+        split = style_ledger.RecordedSplit(7, 6, 5, 4, measured_at)
+        with (mock.patch.object(rules, "load_rules", side_effect=AssertionError("no catalog write")),
+              mock.patch.object(style_ledger, "open_ledger", side_effect=AssertionError("no migration"))):
+            style_ledger.record_split(self.repo, "names-unit", split)
+        self.assertEqual(self.refill_result(ledger.database), ("", "", measured_at, 7, 6, 5, 4))
+
+    def test_the_split_blob_cache_reads_each_tree_once_and_keeps_versions_distinct(self) -> None:
+        path = self.sources[0]
+        old = (self.repo / path).read_text()
+        self.write(path, "pub fn changed() -> u64 { 2 }\n")
+        current = self.commit("Change one source")
+        read = style_ledger._git  # pyright: ignore[reportPrivateUsage]
+        trees: list[tuple[str, ...]] = []
+
+        def git(repo: Path, *arguments: str) -> str:
+            if arguments[0] == "ls-tree":
+                trees.append(arguments)
+            return read(repo, *arguments)
+
+        with mock.patch.object(style_ledger, "_git", side_effect=git):
+            cache = style_ledger.GitReadCache(self.repo)
+            for _ in range(2):
+                self.assertEqual(cache.text(self.initial_tip, path), old)
+                self.assertEqual(cache.text(current, path), "pub fn changed() -> u64 { 2 }\n")
+                self.assertEqual(cache.blob(current, self.sources[1]), cache.blob(self.initial_tip, self.sources[1]))
+        self.assertEqual(len(trees), 2)
+        self.assertEqual({arguments[-1] for arguments in trees}, {self.initial_tip, current})
+        self.assertTrue(all(any(option.startswith("-") and "r" in option for option in arguments[1:-1])
+                            for arguments in trees))
+
+    def test_a_later_split_preserves_the_refill_and_a_refill_preserves_the_split(self) -> None:
+        ledger = self.ledger()
+        first_at = "2026-10-27T12:00:00+00:00"
+        later_at = "2026-10-28T10:00:00+00:00"
+        with mock.patch.object(style_ledger, "_now", return_value=first_at):
+            style_ledger.record_refill(self.repo, "names-unit", "phase written")
+        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(1, 2, 3, 4, first_at))
+        style_ledger.record_split(self.repo, "names-unit", style_ledger.RecordedSplit(0, 0, 0, 0, later_at))
+        self.assertEqual(self.refill_result(ledger.database), (first_at, "phase written", later_at, 0, 0, 0, 0))
+        with mock.patch.object(style_ledger, "_now", return_value=later_at):
+            style_ledger.record_refill(self.repo, "names-unit", "waiting for sync")
+        self.assertEqual(self.refill_result(ledger.database), (later_at, "waiting for sync", later_at, 0, 0, 0, 0))
+
     def test_proposal_merge_sets_built_at_once(self) -> None:
         rule, issue, ids = self.decision_findings()
         ledger = self.ledger()
