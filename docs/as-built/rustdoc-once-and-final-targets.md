@@ -104,7 +104,7 @@ One example can get both refusals; the test refusal comes first. Offenders follo
 - The memory gate can hold a doc step for minutes. A one-file crate waited 15 min for a 2.6 s rustdoc run.
 - An example that sets `test = true` makes `final` and `test` refuse until the line is removed. hana main and bevy_hana still have two such lines (fairy_dust and hana_clerestory). hana_clerestory pads the `=`, so a search for `test = true` misses it; search with `test *= *true`.
 - A hana build outside its checkout needs its flake shell (`direnv exec <hana checkout> …`). Without it, mold fails with "library not found: gbm".
-- Measured on hana init/catalyst (84 examples in 27 packages, natedev): the `final` test build fell from 1,051 build units to 942, and its log held no example unit. The time saved is not measured. The load average was 180–220, both runs stopped early on failing tests, and each step waited about 900 s on the memory gate, so the test-profile build times (22 min 21 s before, 26 min 51 s after) are noise. A valid timing needs a quiet natedev under a build hold.
+- Measured on hana init/catalyst (83 examples in 27 packages, natedev): the `final` test build fell from 1,051 build units to 942, and its log held no example unit. Timed 2026-10-28 under a natedev build hold (nothing else compiling): after a touch of `hana_tool_schema` (21 of 27 members and 82 examples depend on it), the test build (`cargo nextest run --no-run`) rebuilt 49 units with examples and 35 without. Two alternated runs each: 124 s and 86 s before, 77 s and 63 s after, a mean of 105 s against 70 s, about 35 s (a third) saved per `final` test build. A first timing without a hold (load 180–220, about 900 s memory-gate waits) was noise.
 
 ## Why
 
