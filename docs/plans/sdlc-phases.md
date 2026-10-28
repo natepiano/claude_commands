@@ -6,7 +6,7 @@
 
 ## Source
 
-2026-10-20 16:47 EDT
+2026-10-20 16:47 AST
 
 I think we do need at least a unit director devoted in Nate Dev to managing the phase process.
 
@@ -14,7 +14,7 @@ how we prepare our documentation and design and how the design and documentation
 
 For active process redesigns, as we are currently undergoing with promotions and unit director renames and responsibility changes and process changes, those should come back to me as questions.
 
-## What exists today (measured 2026-10-20 16:45–16:51 EDT by the plan author)
+## What exists today (measured 2026-10-20 16:45–16:51 AST by the plan author)
 
 - **Phase process files:** `commands/unit/direct.md` (1579 lines), `docs/delegate/*.md` (8 files, 1185 lines), `commands/plan/*.md` (4 files, 1824 lines: `to_phased_plan`, `phase_review`, `shrink`, `to_as_built`), `commands/unit/*.md` helpers (`brief`, `checkpoint`, `ci`, `phase_report`, `eta`, `add_ons`, `report`, `style_review`), `docs/delegate_plan_format.md` (255 lines), `docs/production_format.md` (468 lines).
 - **Before a plan exists:** `commands/team_review.md`, `adversarial.md`, `api_review.md`, `module_review.md`, `astra_review.md`, `adhoc_review.md`, `commands/producer/greenlight.md` and `to_production.md` (319 lines), `commands/showrunner/proposal.md`. No repository holds a `*-design.md` doc today; hierarchies-unit starts the first one.
@@ -88,7 +88,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** a second store of run data (the script reads the same sources as `history.py rounds`); taking the token-versus-dispatch-time question to the user alone (rank candidates both ways side by side, with one question at the end).
 
-### Phase 2 — The design doc recommends changes to the phase process and the doc pipeline, split into steps  · status: todo
+### Phase 2 — The design doc recommends changes to the phase process and the doc pipeline, split into steps  · status: done
 **Depends on:** Phase 1
 
 #### Work Order
