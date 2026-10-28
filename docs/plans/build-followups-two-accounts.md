@@ -2511,3 +2511,23 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A clear must use the time of the observation it acts on, never the time of the clear: a cached reading is old by the time a slow loop reaches it.
 - Known minor residual: an old alert claimed inside the one registry read that sees the unit live survives the clear; a new crash before the next watchdog live pass (about 2 minutes) then sends no push.
 - `scripts.agents.test_mesh_runs` `test_a_live_supervisor_is_not_ended` failed once under the full parallel gate and passed alone and on the rerun: a load flake outside this unit.
+
+### Phase 91 — The account notes cost less CPU  · status: done
+
+**Depends on:** Phase 90
+
+#### Work Order
+
+Showrunner request, 2026-10-28 (builds-unit measured it): `scripts/whoami/agent_notes.py`, which the agent-sessions-snapshot timer runs every 2 minutes, is the largest CPU user on a quiet natedev. Cut that cost where it is written: run less often, skip work when nothing changed, or read less.
+
+Measured on the timer run of 10:54 EDT: `agent_notes.py` used 43.4 s CPU in 39.5 s wall (1.1 cores while it runs, 0.36 cores over the 2-minute cadence). That is about 95% of the service's 42–64 s per run. Its children, by start time: three `codex app-server --listen stdio://` at 0.3 s, `ssh mac … roster.py --here --snapshot` at 1.8 s, `herdr … pane process-info` at 17 s and 28 s; the script ended at 44.5 s.
+
+- Showrunner, 11:5x EDT (builds-unit): nearly all the cost is `live_reports`; the service averages 58 s CPU per run, 0.44 core all day. Read live usage (`live_reports`) at most once per 10 minutes; the passes between reuse the last stored readings. Keep the 2-minute work on the 2-minute timer: the refusal watch, the unit watchdog, the session table and the note sessions sections. A pass that must have a fresh reading (for example a refusal or an exhausted account that a move depends on) still reads at once; name each such case. Then profile `live_reports` and cut its own cost.
+- Find where the CPU goes in the alert pass (`update_alert_pass`, `live_reports`, `codex_alert_pass`, `session_table.live_sessions`, `five_hour.watch`, `quota_alert.alert`, `codex_pacer.tick`, `refusal_watch.run` and the unit watchdog). Profile the Python with fakes in a scratch HOME, and read the code for the subprocess costs. Record what you found per part on the board.
+- Cut the largest costs first. Examples: reuse a recent usage reading instead of starting a Codex server on every pass, start each Codex server once per pass (not once per home or per request), skip a note write or a probe when its input did not change, keep the 11-second gaps between herdr probes out of the pass.
+- Keep every refusal, watchdog and move promise: a refusal, a unit restart and a moved session must not come later than now. A weekly or 5-hour usage alert may come up to 10 minutes later (showrunner). If a cut makes another reading older, give its new maximum age and why that is safe.
+- State each cut and the CPU it saves in your summary. The unit director measures the cores before and after.
+
+**Files:** `scripts/whoami/agent_notes.py`, `agent_accounts.py`, `quota_alert.py`, `five_hour.py`, `session_table.py`, `codex_pacer.py`, `usage_store.py`, `scripts/accounts/refusal_watch.py`, `unit_watchdog.py`, their tests, `docs/accounts.md`.
+
+**Verification:** `scripts.whoami` tests, `scripts.accounts.test_refusal_watch scripts.accounts.test_unit_watchdog scripts.accounts.test_accounts scripts.lib.test_user_zone`, basedpyright on `scripts/whoami scripts/accounts`, then the full merge gate; the director measures one run before and after.

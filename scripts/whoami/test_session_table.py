@@ -144,7 +144,7 @@ class SessionTableTests(unittest.TestCase):
                        quotas=[agent_accounts.Quota("Weekly", 40, OBSERVED_AT + timedelta(days=2))]),)
             first = self.refresh_note(root, [local], peer, reports=reports)
             second = self.refresh_note(root, [local], peer, at=OBSERVED_AT + timedelta(minutes=2), reports=reports)
-            self.assertNotEqual(first.get("weekly_usage_checked_at"), second.get("weekly_usage_checked_at"))
+            self.assertEqual(first.get("weekly_usage_checked_at"), second.get("weekly_usage_checked_at"))
             self.assertEqual(snapshot_changes(first.text, second.text), [])
             self.assertEqual(second.get("sessions"), "2")
             self.assertNotIn("observed-at", second.text)

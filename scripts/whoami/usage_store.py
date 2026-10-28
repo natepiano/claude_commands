@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import sys
 import tempfile
+from dataclasses import dataclass
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -23,7 +25,7 @@ if __name__ == "usage_store":
 elif __name__ == "scripts.whoami.usage_store":
     _ = sys.modules.setdefault("usage_store", sys.modules[__name__])
 
-from scripts.whoami.agent_accounts import ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
+from scripts.whoami.agent_accounts import AccountSourceUnspecified, ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
 from scripts.whoami.note_file import canonical_label
 
 
@@ -108,6 +110,102 @@ class LabelUsage(TypedDict, total=False):
 
 def store_file() -> Path:
     return Path.home() / ".local" / "state" / "agent-notes" / "usage.json"
+
+
+@dataclass(frozen=True)
+class RecentTimerUsage:
+    """The timer's last reports with their original observation time."""
+    reports: list[Report]
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
+class TimerUsageDue:
+    """The timer must read usage before making a decision."""
+
+
+class TimerReport(TypedDict):
+    tool: str
+    login: str
+    directory: str
+    problem: str
+    quota_problem: str
+    usage: StoredUsage
+
+
+def timer_file() -> Path:
+    return store_file().with_name("timer-usage.json")
+
+
+def save_timer_usage(signature: str, reports: list[Report], at: datetime) -> None:
+    """Keep usage only. This file must never contain credentials."""
+    encoded: list[TimerReport] = []
+    for report in reports:
+        usage = StoredUsage()
+        for quota in report.quotas:
+            if quota.label == "Weekly" and (window := _read(quota, at)) is not None:
+                usage["weekly"] = window
+        if report.five_hour is not None and (window := _read(report.five_hour, at)) is not None:
+            usage["five_hour"] = window
+        if report.credit_balance is not None:
+            usage["credits"] = StoredCredits(balance=report.credit_balance, at=at.isoformat())
+        usage["read_outcome"] = report.usage_read_outcome
+        directory = (str(report.source.directory) if isinstance(report.source, ClaudeDirectorySource)
+                     else str(report.source.home) if isinstance(report.source, CodexHomeSource) else "")
+        encoded.append(TimerReport(tool=report.tool, login=report.email or "", directory=directory,
+                                   problem=report.problem or "", quota_problem=report.quota_problem or "", usage=usage))
+    _replace(timer_file(), json.dumps({"signature": signature, "at": at.isoformat(), "reports": encoded}) + "\n")
+
+
+def recent_timer_usage(signature: str, now: datetime) -> RecentTimerUsage | TimerUsageDue:
+    try:
+        decoded = cast(object, json.loads(timer_file().read_text(encoding="utf-8")))
+        if not isinstance(decoded, dict):
+            return TimerUsageDue()
+        saved = cast(dict[str, object], decoded)
+        if saved.get("signature") != signature or not isinstance(saved.get("at"), str):
+            return TimerUsageDue()
+        at = datetime.fromisoformat(cast(str, saved["at"]))
+        if at.tzinfo is None or not timedelta(0) <= now - at < timedelta(minutes=10):
+            return TimerUsageDue()
+        rows = saved.get("reports")
+        if not isinstance(rows, list):
+            return TimerUsageDue()
+        reports: list[Report] = []
+        for raw in cast(list[object], rows):
+            if not isinstance(raw, dict):
+                return TimerUsageDue()
+            row = cast(dict[str, object], raw)
+            if any(not isinstance(row.get(name), str) for name in
+                   ("tool", "login", "directory", "problem", "quota_problem")) or not isinstance(row.get("usage"), dict):
+                return TimerUsageDue()
+            entry = cast(TimerReport, cast(object, raw))
+            source = (CodexHomeSource(Path(entry["directory"])) if entry["tool"] == "Codex" else
+                      ClaudeDirectorySource(Path(entry["directory"]))) if entry["directory"] else AccountSourceUnspecified()
+            report = Report(entry["tool"], email=entry["login"] or None, source=source,
+                            problem=entry["problem"] or None, quota_problem=entry["quota_problem"] or None,
+                            usage_read_outcome=UsageReadOutcome(entry["usage"].get("read_outcome", UsageReadOutcome.ERROR)))
+            for name in ("weekly", "five_hour"):
+                window = _window(entry["usage"].get(name))
+                if window is None:
+                    if name in entry["usage"]:
+                        return TimerUsageDue()
+                    continue
+                reset = datetime.fromisoformat(window["resets"]) if window["resets"] else None
+                if (not math.isfinite(window["left"])
+                        or reset is not None and (reset.tzinfo is None or reset <= now)):
+                    return TimerUsageDue()
+                quota = Quota("Weekly" if name == "weekly" else "5-hour", 100 - window["left"], reset)
+                if name == "weekly":
+                    report.quotas.append(quota)
+                else:
+                    report.five_hour = quota
+            credits = _credits(entry["usage"].get("credits"))
+            report.credit_balance = credits["balance"] if credits is not None else None
+            reports.append(report)
+        return RecentTimerUsage(reports, at)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return TimerUsageDue()
 
 
 @contextmanager

@@ -165,6 +165,61 @@ class SharedUsageReadTests(unittest.TestCase):
         with patch.object(urllib.request, "urlopen", side_effect=unlocked_response):
             self.assertEqual(self.read().usage_read_outcome, agent_accounts.UsageReadOutcome.OK)
 
+    def test_named_live_read_uses_disk_identity_without_starting_claude(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with patch.object(agent_accounts, "claude_credentials", return_value={
+                "claudeAiOauth": {"accessToken": "fixture", "subscriptionType": "max"}}), \
+             patch.object(agent_accounts, "command_json", side_effect=AssertionError("CLI started")) as cli, \
+             patch.object(urllib.request, "urlopen", side_effect=self.response):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        cli.assert_not_called()
+        self.assertEqual(report.email, "shared@example.invalid")
+        self.assertEqual(report.plan, "max")
+        self.assertEqual(report.weekly_remaining, 75)
+
+    def test_missing_disk_subscription_keeps_cli_plan_label(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with (patch.object(agent_accounts, "command_json", return_value={
+                "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai",
+                "subscriptionType": "max"}) as cli,
+              patch.object(urllib.request, "urlopen", side_effect=self.response)):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        cli.assert_called_once()
+        self.assertEqual(report.plan, "max")
+        self.assertEqual(report.weekly_remaining, 75)
+
+    def test_unreadable_disk_credentials_keeps_cli_plan_label(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with (patch.object(agent_accounts, "claude_credentials", side_effect=OSError("fixture")),
+              patch.object(agent_accounts, "command_json", return_value={
+                "loggedIn": True, "email": "shared@example.invalid", "authMethod": "claude.ai",
+                "subscriptionType": "max"}) as cli):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        cli.assert_called_once()
+        self.assertEqual(report.plan, "max")
+
+    def test_named_disk_subscription_reads_credentials_once(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "shared@example.invalid"}}))
+        with (patch.object(agent_accounts, "claude_credentials", return_value={
+                "claudeAiOauth": {"accessToken": "fixture", "subscriptionType": "max"}}) as credentials,
+              patch.object(urllib.request, "urlopen", side_effect=self.response)):
+            report = agent_accounts.claude_live(folder, use_disk_identity=True)
+        credentials.assert_called_once_with(folder)
+        self.assertEqual(report.plan, "max")
+        self.assertEqual(report.weekly_remaining, 75)
+
     def test_threads_share_one_read_then_a_read_after_ninety_seconds_runs(self) -> None:
         start = Barrier(2)
 

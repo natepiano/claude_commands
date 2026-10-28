@@ -253,7 +253,7 @@ class CodexHomesTests(unittest.TestCase):
                 [CodexHomeSource(home) for home in homes])
             self.assertCountEqual(codex.await_args_list, [call(home) for home in homes])
             if selection.multiple_accounts:
-                self.assertCountEqual(claude.call_args_list, [call(named.directory)])
+                self.assertCountEqual(claude.call_args_list, [call(named.directory, use_disk_identity=True)])
             else:
                 claude.assert_not_called()
 

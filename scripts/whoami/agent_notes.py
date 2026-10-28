@@ -18,12 +18,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import hashlib
 import math
 import os
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
@@ -35,11 +37,11 @@ import session_table
 from session_table import SessionsSection, KeepSections, KEEP_SECTIONS
 from note_file import FIELD, Note, reset_time
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.accounts import refusals
+from scripts.accounts import next_moves, refusals, role_map
 from scripts.accounts.role_map import role_map_command
-from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount
+from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount, codex_account
 from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report, UsageReadOutcome,
-                            codex_home_display, codex_homes,
+                            claude_on_disk, codex_email_on_disk, codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown,
@@ -51,6 +53,8 @@ from user_zone import user_zone
 
 # Expand at refresh time so callers can substitute HOME or an absolute test path.
 SESSIONS_SEEN = Path("~/.local/state/agent-notes/sessions_seen.json")
+# Read low accounts every two minutes so exhaustion moves keep their cadence.
+LIVE_USAGE_REMAINING_THRESHOLD = 10
 
 
 def read_sessions_seen() -> dict[str, str]:
@@ -348,10 +352,60 @@ def update_for_selection(selection: ClaudeAccountsInUse, workers_home: Path | No
 class UpdatedAgentNotes:
     messages: tuple[str, ...]
     codex_readings: CodexAlertPassReadings
+    usage_reused: bool = False
+
+
+def timer_usage_signature(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> str:
+    """Invalidate reuse when a login, directory, or account selection changes."""
+    identities = sorted((str(home), codex_email_on_disk(home)) for home in codex_homes(workers_home))
+    # Session order and Python's randomized set order must not change a persistent key.
+    signature = (selection.home_directory_account, workers_home, identities,
+                 sorted((str(account.directory), account.identity.login, account.label)
+                        for account in selection.named_accounts),
+                 sorted(selection.live_logins),
+                 sorted((str(directory), claude_on_disk(directory).email) for directory in selection.live_directories))
+    return hashlib.sha256(repr(signature).encode()).hexdigest()
+
+
+def urgent_usage_read(notes: list[Note], selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> bool:
+    """Moves and accounts near exhaustion keep the two-minute live cadence."""
+    try:
+        pending_moves = role_map.is_role_map_host() and bool(next_moves.read_next_moves())
+    except next_moves.NextMoveError:
+        return True
+    if pending_moves:
+        return True
+    workers = workers_home if isinstance(workers_home, NoWorkersHome) else codex_account(workers_home)
+    for note in notes:
+        in_use = (selection.is_in_use(note.get("login") or "") if note.tool == "claude" else
+                  isinstance(workers, KnownCodexAccount) and note.label == workers.label)
+        if not in_use:
+            continue
+        for field in ("weekly_remaining_usage", "five_hour_remaining_usage"):
+            try:
+                if float(note.get(field) or "nan") <= LIVE_USAGE_REMAINING_THRESHOLD:
+                    return True
+            except ValueError:
+                pass
+    # A fallback can restore workers as soon as its reset passes.
+    import quota_alert
+    try:
+        saved = cast(object, json.loads(quota_alert.STATE.read_text(encoding="utf-8")))
+        return isinstance(saved, dict) and bool(cast(dict[str, object], saved).get("switch"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def claude_note_logins(notes: Iterable[AgentNote]) -> dict[str, str]:
+    return {note.label: login for note in notes
+            if note.tool == "claude" and (login := note.get("login"))}
 
 
 @role_map_command
-def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> UpdatedAgentNotes:
+def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome, *,
+                      force_usage: bool = False) -> UpdatedAgentNotes:
     """Build the alert readings before writing any note."""
     from scripts.accounts import accounts
 
@@ -361,23 +415,43 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
         messages.append(workers_home.reason)
     notes = note_file.read_notes()
     multiple_codex_homes = len(codex_homes(workers_home)) > 1
-    reports = asyncio.run(live_reports(selection, workers_home))
     checked_at = datetime.now(timezone.utc)
-    codex_readings = codex_alert_pass(workers_home, reports, checked_at)
+    signature = timer_usage_signature(selection, workers_home)
+    recent = (usage_store.TimerUsageDue() if force_usage or urgent_usage_read(notes, selection, workers_home)
+              else usage_store.recent_timer_usage(signature, checked_at))
+    if isinstance(recent, usage_store.RecentTimerUsage):
+        for report in recent.reports:
+            in_use = (codex_report_in_use(report, workers_home) if report.tool == "Codex"
+                      else selection.is_in_use(report.email or ""))
+            if in_use and any(quota is not None and quota.remaining_percent is not None
+                              and quota.remaining_percent <= LIVE_USAGE_REMAINING_THRESHOLD
+                              for quota in (*report.quotas, report.five_hour)):
+                recent = usage_store.TimerUsageDue()
+                break
+    fresh = isinstance(recent, usage_store.TimerUsageDue)
+    if isinstance(recent, usage_store.RecentTimerUsage):
+        reports = recent.reports
+        observed_at = recent.observed_at
+    else:
+        reports = asyncio.run(live_reports(selection, workers_home))
+        checked_at = datetime.now(timezone.utc)
+        observed_at = checked_at
+    codex_readings = codex_alert_pass(workers_home, reports, observed_at)
     if not notes:
         messages.append(f"no agent notes in {note_file.notes_dir()}")
     try:
         # Usage history and process labels use the stable account label.
-        logins = {note.label: login for note in notes
-                  if note.tool == "claude" and (login := note.get("login"))}
-        usage_store.save(reports, checked_at, logins)
+        logins = claude_note_logins(notes)
+        if fresh:
+            usage_store.save(reports, checked_at, logins)
+            usage_store.save_timer_usage(signature, reports, observed_at)
     except (OSError, ValueError) as error:
         # The saved readings must never cost the notes or the alerts.
         messages.append(f"usage store: {error}")
     merged: dict[str, dict[str, str | tuple[str, ...]]] = {note.label: {} for note in notes}
     notes_by_label = {note.label: note for note in notes}
     readings: list[StoredReading] = []
-    for account in reports:
+    for account in reports if fresh else []:
         result = apply(notes, account, checked_at, multiple_codex_homes=multiple_codex_homes)
         messages.extend(result.messages)
         readings.extend(result.readings)
@@ -437,7 +511,7 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         # The 5-hour watch must never cost the notes or the weekly alerts.
         messages.append(f"5-hour watch did not run: {error!r}")
-    return UpdatedAgentNotes(tuple(messages), codex_readings)
+    return UpdatedAgentNotes(tuple(messages), codex_readings, usage_reused=not fresh)
 
 
 def mark_tier(plan: codex_pacer.Plan) -> None:
@@ -499,7 +573,7 @@ def main() -> None:
 
     selection = accounts.claude_account_selection()
     workers_home = resolve_workers_home()
-    updated = update_alert_pass(selection, workers_home)
+    updated = update_alert_pass(selection, workers_home, force_usage=bool(sys.argv[1:]))
     for line in updated.messages:
         print(line)
     notes: list[AgentNote] = list(note_file.read_notes())
@@ -515,7 +589,18 @@ def main() -> None:
     if not sys.argv[1:]:
         try:
             from scripts.accounts import refusal_watch
-            for line in refusal_watch.run():
+            def refresh_refusal_usage() -> None:
+                if updated.usage_reused:
+                    # Refusal placement needs current usage, without another roster probe or note pass.
+                    try:
+                        reports = asyncio.run(live_reports(selection, workers_home))
+                        usage_store.save(reports, datetime.now(timezone.utc), claude_note_logins(notes))
+                    except Exception as error:
+                        # Keep placement and the watchdog running with stored readings.
+                        reason = str(error).splitlines()[0] if str(error) else type(error).__name__
+                        print(f"refusal usage refresh: {reason}", file=sys.stderr)
+
+            for line in refusal_watch.run(refresh_usage=refresh_refusal_usage):
                 print(line)
         except Exception as error:
             reason = str(error).splitlines()[0] if str(error) else type(error).__name__
