@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import ast
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from functools import partial
 from io import StringIO
 import json
 from pathlib import Path
@@ -297,10 +299,11 @@ def check_retired(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple
     return tuple(findings)
 
 
-def check_sources(root: Path) -> tuple[str, ...]:
+def check_sources(root: Path, *, full_extraction: bool = False) -> tuple[str, ...]:
     """Read repository sources, without production records, memory or message logs."""
     terms = parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
-    files, issues = read_live_files(root)
+    retired_forms = () if full_extraction else tuple(name for term in terms for name in term.retired)
+    files, issues = read_live_files(root, retired_forms=retired_forms)
     uses = check_retired(terms, files)
     return (*issues, *(f"{use.path}:{use.line}: retired {use.name!r}; use {use.replacement!r}" for use in uses))
 
@@ -404,9 +407,16 @@ def measure_wrong_party(records: tuple[MessageRecord, ...], window: AuditWindow)
                             sum(record.machine == NOT_RECORDED for record in selected))
 
 
-def python_literal_lines(node: ast.Constant, text: str, value: str) -> tuple[int, ...]:
-    """Keep the physical line of each contributing literal in a merged constant."""
-    segment = ast.get_source_segment(text, node)
+def python_literal_lines(node: ast.Constant, source_lines: tuple[bytes, ...], value: str) -> tuple[int, ...]:
+    """Keep each contributing literal's physical line using the file's UTF-8 lines."""
+    if node.end_lineno == node.lineno:
+        return (node.lineno,) * len(value)
+    segment = None
+    if node.end_lineno is not None and node.end_col_offset is not None:
+        first, last = node.lineno - 1, node.end_lineno - 1
+        segment = b"".join((source_lines[first][node.col_offset:],
+                            *source_lines[first + 1:last],
+                            source_lines[last][:node.end_col_offset])).decode()
     parts: list[str] = []
     lines: list[int] = []
     if segment is not None:
@@ -447,6 +457,8 @@ def python_literal_lines(node: ast.Constant, text: str, value: str) -> tuple[int
 
 def python_prose(text: str) -> SourceProse:
     tree = ast.parse(text)
+    # Match the parser's newline rules; form feeds stay within a physical line.
+    encoded_lines = tuple(match.group().encode() for match in re.finditer(r".*?(?:\r\n|\r|\n|$)", text))
     excluded: set[int] = set()
     outputs: set[int] = set()
     scopes: dict[int, ast.AST] = {}
@@ -485,7 +497,8 @@ def python_prose(text: str) -> SourceProse:
             index_scope(child, scope)
 
     index_scope(tree, tree)
-    for node in ast.walk(tree):
+    nodes = tuple(ast.walk(tree))
+    for node in nodes:
         scope = scopes.get(id(node), tree)
         if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.body and isinstance(node.body[0], ast.Expr):
@@ -517,7 +530,7 @@ def python_prose(text: str) -> SourceProse:
                 if keyword.arg in ("help", "description", "epilog"):
                     outputs.update(id(child) for child in ast.walk(keyword.value))
     # Follow lexical bindings. Helper call arguments are not followed into parameters.
-    references = [node for node in ast.walk(tree) if isinstance(node, ast.Name) and id(node) in outputs]
+    references = [node for node in nodes if isinstance(node, ast.Name) and id(node) in outputs]
     visited: set[tuple[int, str]] = set()
     while references:
         reference = references.pop()
@@ -535,7 +548,7 @@ def python_prose(text: str) -> SourceProse:
                     references.append(child)
     strings: list[str] = []
     source_lines: list[int] = []
-    for node in ast.walk(tree):
+    for node in nodes:
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str) or id(node) in excluded:
             continue
         value = node.value
@@ -543,7 +556,7 @@ def python_prose(text: str) -> SourceProse:
             if strings:
                 source_lines.append(node.lineno)
             strings.append(value)
-            source_lines.extend(python_literal_lines(node, text, value))
+            source_lines.extend(python_literal_lines(node, encoded_lines, value))
     return SourceProse("\n".join(strings), tuple(source_lines))
 
 
@@ -594,12 +607,55 @@ def shell_prose(text: str) -> SourceProse:
     return SourceProse("\n".join(strings), tuple(source_lines))
 
 
-def read_live_files(root: Path) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
+def extraction_candidate(text: str, python: bool, retired: re.Pattern[str]) -> bool:
+    """Select raw matches and every Python constant that can decode or join into one.
+
+    Shell extraction only removes quotes or leading tabs and joins with newlines;
+    check_retired matches each line separately. It cannot create a missing form.
+    Python extraction emits string Constant values, including formatted fragments.
+    Parsing the other Python files also preserves their syntax-error diagnostics.
+    """
+    if retired.search(text) is not None:
+        return True
+    if not python:
+        return False
+    pending: list[ast.AST] = [ast.parse(text)]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, str) and retired.search(node.value) is not None:
+                return True
+        elif not isinstance(node, ast.Name):
+            # Constants and identifiers have no contributing child constants.
+            pending.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def read_live_file(root: Path, retired: re.Pattern[str], select_candidates: bool,
+                   path: Path) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
+    """Read and extract one source without changing the order of scan results."""
+    relative = path.relative_to(root)
+    script = relative.parts[0] == "scripts"
+    try:
+        text = path.read_text(encoding="utf-8")
+        python = script and (path.suffix == ".py" or "python" in text.partition("\n")[0])
+        if select_candidates and not extraction_candidate(text, python, retired):
+            return (), ()
+        if script:
+            prose = python_prose(text) if python else shell_prose(text)
+            return (LiveFile(relative.as_posix(), prose.text, prose.source_lines),), ()
+        return (LiveFile(relative.as_posix(), text),), ()
+    except (OSError, UnicodeError, SyntaxError) as error:
+        return (), (f"{relative}: {error}",)
+
+
+def read_live_files(root: Path, *, retired_forms: tuple[str, ...] = ()) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
     paths: set[Path] = {root / "CLAUDE.md"} if (root / "CLAUDE.md").is_file() else set()
     for folder in ("commands", "docs", "skills", "scripts"):
         paths.update(path for path in (root / folder).rglob("*") if path.is_file())
-    files: list[LiveFile] = []
-    issues: list[str] = []
+    selected: list[Path] = []
+    # No word boundaries: even a raw match inside an identifier selects extraction.
+    retired = re.compile("|".join(re.escape(name) for name in retired_forms), re.IGNORECASE)
     for path in sorted(paths):
         relative = path.relative_to(root)
         if any(part.startswith(".") or part in ("__pycache__", "fixtures", "node_modules") for part in relative.parts):
@@ -611,16 +667,17 @@ def read_live_files(root: Path) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
             continue
         if not script and path.suffix not in (".md", ".txt"):
             continue
-        try:
-            text = path.read_text(encoding="utf-8")
-            if script:
-                prose = python_prose(text) if path.suffix == ".py" or "python" in text.partition("\n")[0] else shell_prose(text)
-                files.append(LiveFile(relative.as_posix(), prose.text, prose.source_lines))
-            else:
-                files.append(LiveFile(relative.as_posix(), text))
-        except (OSError, UnicodeError, SyntaxError) as error:
-            issues.append(f"{relative}: {error}")
-    return tuple(files), tuple(issues)
+        selected.append(path)
+    read = partial(read_live_file, root, retired, bool(retired_forms))
+    # Parsing and extraction are CPU-bound. Keep small roots and baseline serial;
+    # map preserves sorted source order even when workers finish out of order.
+    if retired_forms and len(selected) >= 64:
+        with ProcessPoolExecutor(max_workers=8) as pool:
+            results = tuple(pool.map(read, selected, chunksize=4))
+    else:
+        results = tuple(map(read, selected))
+    return (tuple(file for result in results for file in result[0]),
+            tuple(issue for result in results for issue in result[1]))
 
 
 def table(title: str, headings: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:

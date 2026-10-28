@@ -136,30 +136,24 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** extending the global kept-path masking (per-file kept contexts are used instead); a general English plural rule for every term (explicit inflected forms are used instead).
 
-### Phase 4 — The retired-name check runs in a few seconds  · status: todo
-**Depends on:** Phase 3
+### Phase 4 — The retired-name check runs in a few seconds  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `roles_audit.py check` and the repository test it backs finish in a few seconds on the full tree, with the same result as now.
-
-**Spec:**
-- The showrunner's call, 2026-10-28: the scan took 38 s wall (28 s CPU) at load 68 in every merge gate; make it fast. The architect review split this from the role record because it is independent and touches only the audit.
-- Budget: `python3 scripts/production/roles_audit.py --root . check` and `python3 -m unittest discover -s scripts/production -p 'test_roles_audit.py'` each finish in 5 s wall or less on natedev, on the full tree, at 1-minute load under 80. Record both times with the load in the design doc Step log.
-- The result must not change: the same findings, exit status, kept contexts and physical source lines. Source-read errors still report.
-- A raw-text prefilter must be conservative. Python extraction decodes escapes and joins adjacent literals, so `print("se" "at")` and `print("\x73eat")` are findings today; a literal `git grep` for the retired forms misses them. Select a file for full extraction when its raw text holds a retired form or can produce one through decoding or literal joins; never drop such a file. Keep coverage of untracked sources and fixture roots, and keep working outside a Git checkout.
+- `roles_audit.py check` selects candidate files before extraction. A file is a candidate when its raw text holds a retired form. A Python file is also a candidate when any string Constant in its AST holds a form after escape decoding and literal joins. Shell files select on raw text only.
+- `read_live_file(root, retired, select_candidates, path)` returns `(files, issues)` for one path. `read_live_files` runs it in `ProcessPoolExecutor(max_workers=8)` with `chunksize=4` when retired forms are present and 64 or more paths are selected; otherwise it runs serially. `map` keeps sorted order, so output is byte-equal to full extraction.
+- `check_sources(root, *, full_extraction=False)`: `full_extraction=True` extracts every file and runs serially. The parity test uses it.
+- Findings, exit status, kept contexts, physical source lines and source-read errors are the same as before. Untracked sources, fixture roots and non-Git roots stay covered.
+- On natedev at 1-minute load 67-69, `check` takes 1.1-1.3 s wall and the `test_roles_audit.py` suite takes 1.5-1.7 s wall (before: `check` 39.8 s at load 78).
 
 **Files:**
-- `scripts/production/roles_audit.py` — fast candidate selection before extraction
-- `scripts/production/test_roles_audit.py` — fixtures for joined literals, escapes, read errors, a non-Git root, and an unchanged result on the repository
+- `scripts/production/roles_audit.py` — candidate selection and the parallel per-file scan
+- `scripts/production/test_roles_audit.py` — fixtures for joined literals, escapes, read errors, a non-Git root, and parity with full extraction on a bounded repository sample
+- `docs/plans/sdlc-roles-design.md` — Step log section "Retired-name check timing — 2026-10-28"
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `scripts/production/roles_audit.py`
-- `test` — `scripts/production/test_roles_audit.py`
+**Gotchas:** After candidate selection, most of the cost is parsing every Python file, because syntax diagnostics must still report. Only parallel reading removes it. Timings above load 80 do not count against the 5 s budget; record the load with each time.
 
-**Constraints from prior phases:** kept contexts in `scripts/production/role_terms.toml` apply once in their named file; changed or copied kept text is flagged; Names keeps independent counts and only `check` uses the longest phrase.
-
-**Acceptance gate:** the gates in Delegation Context green; both commands within budget with times recorded; every existing test in `test_roles_audit.py` passes unchanged, plus the new fixtures.
+**Ruled out:** a literal `git grep` prefilter, because it misses joined literals and escapes that Python extraction decodes; candidate selection alone, because it reached 8.4 s at load 38-44.
 
 ### Phase 5 — Each session records its role apart from its name  · status: todo
 **Depends on:** Phase 4
@@ -180,8 +174,14 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Files:**
 - `docs/plans/sdlc-roles-design.md` — role record definition
+- `scripts/message/roster.py` — organizational role, worker assignment and shown job types; the shown name
+- `scripts/agents/codex_mesh.py` — Codex thread titles carry the shown name; the roster record keeps its worker assignment
+- `scripts/production/production_tree.py` — reads the role record, not a name suffix
+- `scripts/production/broadcast.py` — selects by organizational role
+- `scripts/message/send.py` — shown sender name
+- `scripts/message/test_roster.py`, `scripts/agents/test_codex_mesh.py`, `scripts/production/test_production_tree.py`, `scripts/production/test_broadcast.py`, `scripts/message/test_send.py` — fixture tests
 
-**Workers:** set at phase start, when Files are named: `1 writer + 1 tester`, with record and renderer code to `impl` and the fixture tests to `test`, disjoint file sets.
+**Workers:** `1 writer + 1 tester`. `impl` holds the five scripts; `test` holds the five test files.
 
 **Constraints from prior phases:** the approved names; Step 1's worker words. Stored fields `seat` and `codex_seats` stay as they are: a role field never renames them, and a retirement that leaves a live key, value or flag adds it to the kept contexts in `scripts/production/role_terms.toml` in the same change.
 
