@@ -32,6 +32,44 @@ A unit id is `<style slug>-<family>-unit`, where the style slug is `<repo>-style
 Old `<family>-unit` ids remain valid. Every partial B rule also has a C read
 in its own family.
 
+## Family rank
+
+`FAMILY_RANKS` in `scripts/style/rules.py` is the one rank table: `types`,
+`values`, `names`, highest first. The planner and filing compare ranks only
+through `rules.ranked_above`. A new family takes its rank in that table.
+`modules` has no rank; structure blocking orders it, as below.
+
+**Hold.** On each file, a family waits while a family ranked above it has open
+work at that file. Only a family with a unit counts, and only in that unit's
+pilot scope. Open work at a file is:
+
+- a cell in state `open`, `stale` or `awaiting merge`;
+- a filed finding, whose decision is unanswered, or approved and not built;
+- an unfiled finding judged at the file that the synced tip has.
+
+A waiting cell gets no ticket, and a waiting approved finding gets no proposal
+ticket. Neither is dropped. A queued ticket that the rank holds is dropped
+(`dropped <id>: <file> has open <higher family> work`), and its cells and
+findings wait as above. Refill prints one line for each waiting file that
+holds the unit's work: `waiting <family>: <file> has open <higher family> work`.
+Filing keeps a waiting finding unfiled and prints the same line, so its decision
+does not go to the user.
+
+**Judge again.** When the higher work lands, the file's blob changes and every
+cell at the file goes `stale`. The higher family judges the file again first,
+then the lower cell gets a ticket. Where a family above has a unit, a
+lower-rank finding judged at an older file is not filed or built: filing prints
+`waiting <finding>: <file> changed since it was judged`, and refill prints
+`waiting <decision>: <finding> <file> changed since it was judged`. A finding
+counts as judged at the file that its holding ticket read, or that its last
+declaration follow read. A ticket that holds the same change again takes the
+finding over, so the finding is judged at the new file and goes on. A judgment
+of the changed file by another ticket that does not hold the finding (for a
+followed finding, any later judgment of its new file) settles
+it: filing withdraws an unfiled finding (`judged again in judgment <id>`), and
+refill waives an approved one (`<file> judged again in judgment <id> without
+it`). The withdrawal applies to every unfiled finding, of any family.
+
 ## Ticket queue
 
 One ticket per phase:
