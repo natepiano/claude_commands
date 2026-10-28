@@ -45,6 +45,20 @@ _PLATFORM = sys.platform
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
 SHARED_SESSION = "agents"
+# The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
+PANE_SLICE = "app-agents.slice"
+# The transient server unit gets CPU first and keeps its memory out of swap under the pane load.
+_SERVER_PROPERTIES = ("-p", "CPUWeight=1000", "-p", "MemoryLow=1G", "-p", "MemorySwapMax=0")
+_PANE_SCOPE_PROBE_SECONDS = 5.0
+# The pane shell wrapper. herdr runs $SHELL for a pane; this puts the real shell in its own scope.
+# The scope runs in place of the wrapper, so the pane's shell pid does not change (the scope is run-p<pid>).
+# SHELL is the real shell again, so a tool that reads SHELL does not start a scope on each command.
+_PANE_SHELL_SCRIPT = f"""#!/bin/sh
+real=${{HERDR_PANE_SHELL:-/bin/sh}}
+unset HERDR_PANE_SHELL
+SHELL=$real; export SHELL
+exec @SYSTEMD_RUN@ --user --scope --quiet --collect --slice={PANE_SLICE} -- "$real" "$@"
+"""
 
 
 def _platform() -> str:
@@ -1944,13 +1958,61 @@ def _installed_server_unit(name: str) -> bool:
     return shown.returncode == 0 and bool(path) and "/transient/" not in path
 
 
+def _pane_shell_path() -> Path:
+    """The pane shell wrapper. One path for every worktree, because a running server keeps it in SHELL."""
+    state = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(state) / "herdr" / "pane-shell"
+
+
+def _pane_shell() -> str:
+    """The shell that panes run: the caller's SHELL when it is an executable file, else /bin/sh.
+
+    A systemd-run service gets the user manager's environment, not the caller's, so the value goes to it explicitly.
+    """
+    shell = os.environ.get("SHELL", "")
+    if (shell and Path(shell).is_absolute() and os.path.isfile(shell) and os.access(shell, os.X_OK)
+            and Path(shell).resolve() != _pane_shell_path().resolve()):
+        return shell
+    return "/bin/sh"
+
+
+def _pane_scopes_unavailable() -> str:
+    """Probe a scope once per server start and write the wrapper; the reason on failure, else ""."""
+    systemd_run = os.environ.get("SYSTEMD_RUN", "systemd-run")
+    try:
+        probe = run_program([systemd_run, "--user", "--scope", "--quiet", "--collect", "--", "true"],
+                            timeout=_PANE_SCOPE_PROBE_SECONDS)
+    except (HerdrFailure, subprocess.TimeoutExpired) as error:
+        return str(error)
+    if probe.returncode != 0:
+        return probe.stderr.strip() or f"exit {probe.returncode}"
+    path = _pane_shell_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        absolute = shutil.which(systemd_run) or systemd_run
+        _ = staged.write_text(_PANE_SHELL_SCRIPT.replace("@SYSTEMD_RUN@", shlex.quote(absolute)), encoding="utf-8")
+        # The mode is set before the replace: a server that runs now never finds a wrapper it cannot run.
+        staged.chmod(0o755)
+        _ = staged.replace(path)
+    except OSError as error:
+        return f"cannot write {path}: {error}"
+    return ""
+
+
 def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
     # The shared session's server has a boot unit; a transient unit of its name cannot start beside it.
     if client.session == shared_session() and _installed_server_unit(client.session):
         return run_program([os.environ.get("SYSTEMCTL", "systemctl"), "--user", "start", server_unit(client.session)])
+    # Each pane shell goes into its own scope under PANE_SLICE, so the unit holds only the server.
+    unavailable = " ".join(_pane_scopes_unavailable().splitlines())
+    if unavailable:
+        print(f"herdr {client.session}: pane scopes unavailable, panes stay in the server unit: {unavailable}",
+              file=sys.stderr)
+    shell = [] if unavailable else [f"--setenv=SHELL={_pane_shell_path()}", f"--setenv=HERDR_PANE_SHELL={_pane_shell()}"]
     return run_program([
         os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(client.session)}",
-        "--collect", *client.argv("server"),
+        "--collect", *_SERVER_PROPERTIES, *shell, *client.argv("server"),
     ])
 
 
@@ -2571,6 +2633,19 @@ def _pane_shell_pids(session: str) -> list[int]:
     return shells
 
 
+def _pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    """The pane scopes under PANE_SLICE that hold a process, from its systemd memberships."""
+    return [(hierarchy, scope) for hierarchy, path in groups
+            for scope in (path, *path.parents) if scope.parent.name == PANE_SLICE]
+
+
+def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int], sessions: dict[int, str]) -> None:
+    """Record the session of each matched process in its pane scope."""
+    for pid in pids:
+        for scope in _pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
+            owners.setdefault(scope, set()).add(sessions[pid])
+
+
 def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[int, str]:
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
@@ -2609,6 +2684,9 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
         # Handoff transfers PTYs without reparenting their processes to the
         # replacement. setsid leaves their dedicated service cgroup unchanged.
         shared_sessions: set[str] = set()
+        # A pane shell in its own scope is not in the unit's cgroup. After a
+        # handoff, its scope is the only membership that it keeps.
+        loose: dict[int, list[tuple[str, Path]]] = {}
         for process in candidates:
             pid = int(process.name)
             if pid in sessions:
@@ -2618,7 +2696,8 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                     continue
             except OSError:
                 continue
-            for hierarchy, path in _systemd_cgroups(process):
+            groups = _systemd_cgroups(process)
+            for hierarchy, path in groups:
                 shared_sessions.update(shared_groups.get((hierarchy, path), set()))
                 for ancestor in (path, *path.parents):
                     session = unit_groups.get((hierarchy, ancestor), "")
@@ -2627,6 +2706,17 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         break
                 if pid in sessions:
                     break
+            if pid not in sessions and (scopes := _pane_scopes(groups)):
+                loose[pid] = scopes
+        # A pane scope holds one pane's processes, as the unit's cgroup held
+        # them before. Only a scope that no matched process explains needs the
+        # unit servers' pane shells.
+        owners: dict[tuple[str, Path], set[str]] = {}
+        if loose:
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions)
+            if any(not any(scope in owners for scope in scopes) for scopes in loose.values()):
+                shared_sessions.update(unit_groups.values())
+        walked = set(sessions)
         # Handoff retains child_pid in each imported PTY runtime. Unlike a
         # shared cgroup or HERDR_SESSION, this identifies the actual pane shell.
         for session in shared_sessions:
@@ -2639,6 +2729,13 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         continue
                     sessions[pid] = owner
                     descendants.extend((child, owner) for child in children.get(pid, []))
+        if loose:
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions)
+            for pid, scopes in loose.items():
+                found = {session for scope in scopes for session in owners.get(scope, set())}
+                # A scope with two owners holds a server started inside a pane; it names neither.
+                if pid not in sessions and len(found) == 1:
+                    sessions[pid] = found.pop()
     return {pid: session for pid, session in sessions.items() if pid not in servers}
 
 
