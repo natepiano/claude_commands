@@ -127,7 +127,7 @@ Model, in the user's words (2026-10-21): the goal of a guild is to help guild me
 | F2 | P1 the director runs unchanged lint and test commands itself | Approved (the user, 2026-10-28). |
 | F3 | P2 from round 4, a missing acceptance item becomes a follow-up | Approved as a 30-exposed-phase trial, from round 4 (the user, 2026-10-28). |
 | F4 | P3 from round 4, an open finding outside the kept kinds becomes a follow-up || Approved as a 30-phase trial (the user, 2026-10-28). Add (the user): at each fix limit, try something different with an Astra review. When a phase reaches repair round 4 with a finding still open, or a kept finding has failed two fixes, the director runs /astra_review on a short note: the finding, the tries so far and why each failed. Astra's new approach goes into the next try, or into the follow-up Work Order when the finding moves out. |
-| F5 | P4 each launch checks the active phase and records planned work apart from repairs | |
+| F5 | P4 each launch checks the active phase and records planned work apart from repairs || Approved as a 30-phase accuracy trial; a stale or missing phase refuses the launch (the user, 2026-10-28). |
 | F6 | P5 each repair prompt carries the accepted checks its edits can break | |
 
 ### phases-unit
