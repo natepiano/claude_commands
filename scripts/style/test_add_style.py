@@ -19,7 +19,7 @@ import add_style
 import add_unit
 import rules
 import style_ledger
-import style_plan
+import unit_plans
 import style_rules
 from add_unit import read_production
 from production_units import production_field
@@ -239,12 +239,12 @@ class AddStyleTests(unittest.TestCase):
             self.assertLess(scope_index, lines.index("## Phases"))
         for unit in ("values", "modules"):
             self.assertNotIn("**Pilot scope:**", launched["plans"][f"sample-style-{unit}-unit.md"])
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-names-unit.md"], self.repo),
-                         style_plan.PilotCrates(frozenset({"crates/handler", "crates/port"})))
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-types-unit.md"], self.repo),
-                         style_plan.PilotCrates(frozenset({"crates/port"})))
-        self.assertEqual(style_plan.parse_pilot_scope(launched["plans"]["sample-style-modules-unit.md"], self.repo),
-                         style_plan.AllCrates())
+        self.assertEqual(unit_plans.parse_pilot_scope(launched["plans"]["sample-style-names-unit.md"], self.repo),
+                         unit_plans.PilotCrates(frozenset({"crates/handler", "crates/port"})))
+        self.assertEqual(unit_plans.parse_pilot_scope(launched["plans"]["sample-style-types-unit.md"], self.repo),
+                         unit_plans.PilotCrates(frozenset({"crates/port"})))
+        self.assertEqual(unit_plans.parse_pilot_scope(launched["plans"]["sample-style-modules-unit.md"], self.repo),
+                         unit_plans.AllCrates())
 
     def test_pilot_is_refused_for_an_existing_production_without_changing_it(self) -> None:
         _ = self.run_bootstrap()

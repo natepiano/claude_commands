@@ -245,9 +245,15 @@ class ExceptionVerdict:
 
 @dataclass(frozen=True)
 class JudgedAgain:
-    """A judgment under the rule's newer text judged the unfiled finding's cell again; that judgment now decides the cell."""
+    """A judgment under the rule's newer text, or another ticket's of a changed file under the same text, judged the
+    finding's cell again and did not hold it; that judgment now decides the cell."""
 
     judgment_id: int
+
+
+@dataclass(frozen=True)
+class NotJudgedAgain:
+    """No newer judgment at the finding's cell settles it."""
 
 
 @dataclass(frozen=True)
@@ -606,7 +612,8 @@ class BareDuplicate:
 @dataclass(frozen=True)
 class SupersedingJudgment:
     """The newest judgment at a finding's cell under the rule's current text, also newer than its own: an exception
-    for a filed finding, any verdict for an unfiled one."""
+    for a filed finding, any verdict for an unfiled one. Under the text the finding was judged under, it is another
+    ticket's judgment of a changed file, which did not hold the finding."""
 
     judgment_id: int
     verdict: Verdict
@@ -2932,7 +2939,12 @@ class Ledger:
             ).fetchall())
             changes = {row[0]: row[1:] for row in rows}
             same = [finding_id for finding_id in finding_ids if changes.get(finding_id) == change]
+            # A ticket that holds an unfiled or filed finding again takes it over, so the finding is judged at that ticket's
+            # file.
+            take_over = ("UPDATE held_findings SET ticket=?,updated_at=? WHERE finding_id=? AND state IN ('unfiled','filed') "
+                         + "AND ticket!=?")
             if same:
+                _ = self._connection.execute(take_over, (ticket, _now(), same[0], ticket))
                 return self._held(same[0])
             # A followed finding keeps the id of its first site. A ticket that reads its new file holds the same change
             # again, so that change returns the followed finding, the one with the nearest line.
@@ -2941,7 +2953,9 @@ class Ledger:
                 + "AND rule_blob=? AND followed_at!='' AND state IN ('unfiled','filed')", (rule, path, text, kind, before, after, rule_blob),
             ).fetchall())
             if followed:
-                return self._held(min(followed, key=lambda row: (abs(row[1] - line), row[0]))[0])
+                nearest = min(followed, key=lambda row: (abs(row[1] - line), row[0]))[0]
+                _ = self._connection.execute(take_over, (ticket, _now(), nearest, ticket))
+                return self._held(nearest)
             free = [finding_id for finding_id in finding_ids if finding_id not in changes]
             if not free:
                 raise LedgerError(f"{rule}: other changes hold both finding ids of {path}:{line}")
@@ -2991,6 +3005,10 @@ class Ledger:
 
     def judged_commit(self, finding: HeldFinding) -> JudgedCommit | NoJudgedCommit:
         return self._judged_from(self._judging_ticket(finding.ticket))
+
+    def judged_again_without(self, finding: HeldFinding, definition: Rule) -> SupersedingJudgment | NotJudgedAgain:
+        """The judgment that read the finding's changed file again and did not hold it, as withdrawal reads it."""
+        return self._judged_again_without(finding, definition, self._synced_tip())
 
     def _judging_ticket(self, ticket_id: str) -> JudgingTicket:
         return tuple(cast(list[tuple[str, str]], self._connection.execute(
@@ -3249,8 +3267,9 @@ class Ledger:
                 raise LedgerError(f"{finding_id}: cannot file finding in state {held_state_name(finding.state)}")
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
 
-    def _changed_rule_findings(self, definitions: Mapping[str, Rule]) -> tuple[tuple[HeldFinding, Rule], ...]:
-        """Each unfiled or filed finding whose rule's current text is not the text it was judged under, with that rule.
+    def _withdrawal_candidates(self, definitions: Mapping[str, Rule]) -> tuple[tuple[HeldFinding, Rule], ...]:
+        """Each unfiled finding, and each filed finding whose rule's current text is not the text it was judged under,
+        with its rule.
 
         An unfiled finding that an open ticket holds is not read. Filing skips an unfiled one that this step leaves.
         """
@@ -3261,31 +3280,71 @@ class Ledger:
             if finding.finding_id in waiting:
                 continue
             definition = definitions.get(finding.rule.removesuffix("#uncovered"))
-            if definition is not None and definition.blob != finding.rule_blob:
+            if definition is not None and (isinstance(finding.state, Unfiled) or definition.blob != finding.rule_blob):
                 changed.append((finding, definition))
         return tuple(changed)
+
+    def _judged_under_changed_text(self, finding: HeldFinding, definition: Rule, tip: RepositoryTip) -> SupersedingJudgment | NotJudgedAgain:
+        """The newest judgment at the cell, when it is under the rule's current text and newer than the finding: an
+        exception for a filed finding, any verdict for an unfiled one."""
+        # followed_at holds a commit. updated_at uses the same UTC clock and format as recorded_at.
+        # After a follow, require a verdict after that row update. This can keep a finding judged before
+        # its move, or before a later row edit; keeping it is safer than closing its decision too soon.
+        # A removed row closes a cell whose file is gone; it is no verdict on code.
+        rows = cast(list[tuple[int, Verdict, str, str, str, str, str]], self._connection.execute(
+            "SELECT j.id,j.verdict,j.rule_blob,j.recorded_at,h.created_at,h.followed_at,h.updated_at FROM judgments j "
+            + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.rule_blob IN (?,?) AND j.verdict!='removed' "
+            + "ORDER BY j.recorded_at DESC,j.id DESC LIMIT 1",
+            (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
+        ).fetchall())
+        withdraws = (rows and rows[0][2] == definition.blob
+                     and (isinstance(finding.state, Unfiled) or rows[0][1] == "exception")
+                     and rows[0][4] < rows[0][3]
+                     and (not rows[0][5] or rows[0][6] < rows[0][3]))
+        return SupersedingJudgment(rows[0][0], rows[0][1], definition.blob) if withdraws else NotJudgedAgain()
+
+    def _judged_again_without(self, finding: HeldFinding, definition: Rule, tip: RepositoryTip) -> SupersedingJudgment | NotJudgedAgain:
+        """The newest judgment at the cell under the finding's rule text, when another ticket recorded it after the
+        finding was held (or followed), reading the cell's inputs at tip, which the holding ticket never judged there;
+        for a followed finding whose holding ticket never judged its new cell, any such judgment of the inputs at tip.
+        A ticket that holds the finding again takes it over, so that judgment read the changed file and did not hold
+        it."""
+        cell = _finding_cell(definition, finding.path, tip)
+        created, followed, updated = cast(tuple[str, str, str], self._connection.execute(
+            "SELECT created_at,followed_at,updated_at FROM held_findings WHERE finding_id=?", (finding.finding_id,)).fetchone())
+        rows = cast(list[tuple[int, Verdict, str, str, str, str, str, str]], self._connection.execute(
+            'SELECT id,verdict,ticket,input_fingerprint,"commit",input_scope,declared_scope,read_files FROM judgments '
+            + "WHERE rule=? AND path=? AND rule_blob=? AND verdict!='removed' AND recorded_at>? ORDER BY recorded_at DESC,id DESC LIMIT 1",
+            (finding.rule, cell, finding.rule_blob, updated if followed else created),
+        ).fetchall())
+        holder = {row[0] for row in cast(list[tuple[str]], self._connection.execute(
+            "SELECT input_fingerprint FROM judgments WHERE rule=? AND path=? AND rule_blob=? AND ticket=?",
+            (finding.rule, cell, finding.rule_blob, finding.ticket),
+        ).fetchall())}
+        if not rows or rows[0][2] == finding.ticket:
+            return NotJudgedAgain()
+        judgment_id, verdict, _, fingerprint, commit, scope, declared, reads = rows[0]
+        # A followed finding's holding ticket judged its old file, so a judgment of its new file after the follow read
+        # that file again.
+        if not ((fingerprint not in holder) if holder else bool(followed)):
+            return NotJudgedAgain()
+        # A judgment of an older file at the cell did not read the file the finding is at now.
+        judgment = Judgment(finding.rule_blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads))
+        try:
+            current = (self._is_ancestor(commit, tip.commit)
+                       and self._judgment_inputs_match(judgment, tip, _cell_scope(definition, cell, tip), cell, definition.family))
+        except LedgerError:
+            current = False
+        return SupersedingJudgment(judgment_id, verdict, finding.rule_blob) if current else NotJudgedAgain()
 
     def _superseded(self, definitions: Mapping[str, Rule], tip: RepositoryTip) -> Withdrawal:
         withdrawn: list[WithdrawnFinding] = []
         kept: list[KeptForBuild] = []
-        for finding, definition in self._changed_rule_findings(definitions):
-            # followed_at holds a commit. updated_at uses the same UTC clock and format as recorded_at.
-            # After a follow, require a verdict after that row update. This can keep a finding judged before
-            # its move, or before a later row edit; keeping it is safer than closing its decision too soon.
-            # A removed row closes a cell whose file is gone; it is no verdict on code.
-            rows = cast(list[tuple[int, Verdict, str, str, str, str, str]], self._connection.execute(
-                "SELECT j.id,j.verdict,j.rule_blob,j.recorded_at,h.created_at,h.followed_at,h.updated_at FROM judgments j "
-                + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.rule_blob IN (?,?) AND j.verdict!='removed' "
-                + "ORDER BY j.recorded_at DESC,j.id DESC LIMIT 1",
-                (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip), definition.blob, finding.rule_blob),
-            ).fetchall())
-            withdraws = (rows and rows[0][2] == definition.blob
-                         and (isinstance(finding.state, Unfiled) or rows[0][1] == "exception")
-                         and rows[0][4] < rows[0][3]
-                         and (not rows[0][5] or rows[0][6] < rows[0][3]))
-            if not withdraws:
+        for finding, definition in self._withdrawal_candidates(definitions):
+            verdict = (self._judged_again_without(finding, definition, tip) if definition.blob == finding.rule_blob
+                       else self._judged_under_changed_text(finding, definition, tip))
+            if isinstance(verdict, NotJudgedAgain):
                 continue
-            verdict = SupersedingJudgment(rows[0][0], rows[0][1], definition.blob)
             if isinstance(finding.build_ticket, BuildTicket):
                 ticket = self._ticket(finding.build_ticket.ticket)
                 if ticket["state"] not in FINAL_TICKET_STATES:
@@ -3297,16 +3356,17 @@ class Ledger:
     def superseded_findings(self, definitions: Mapping[str, Rule]) -> Withdrawal:
         """What withdraw_superseded withdraws and keeps; it writes nothing.
 
-        definitions maps each rule id to its current catalog rule. The synced tip loads only when an unfiled or filed
-        finding's rule text changed.
+        definitions maps each rule id to its current catalog rule. The synced tip loads only when there is an unfiled
+        finding, or a filed one whose rule text changed.
         """
-        if not self._changed_rule_findings(definitions):
+        if not self._withdrawal_candidates(definitions):
             return Withdrawal((), ())
         return self._superseded(definitions, self._synced_tip())
 
     def withdraw_superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
         """Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text,
-        and each unfiled finding whose cell's newest judgment is under that text.
+        and each unfiled finding whose cell's newest judgment is under that text: under a changed text any verdict,
+        under the same text one of another ticket, which did not hold the finding again.
 
         That judgment must come after the finding was created. For a followed finding it must also come after
         its last row update, which is no earlier than its last follow. Judgments at other cells do not affect this check.
@@ -3316,7 +3376,7 @@ class Ledger:
         """
 
         def attempt() -> Withdrawal:
-            if not self._changed_rule_findings(definitions):
+            if not self._withdrawal_candidates(definitions):
                 return Withdrawal((), ())
             tip = self._synced_tip()
             plan = self._superseded(definitions, tip)

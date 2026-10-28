@@ -32,6 +32,170 @@ A unit id is `<style slug>-<family>-unit`, where the style slug is `<repo>-style
 Old `<family>-unit` ids remain valid. Every partial B rule also has a C read
 in its own family.
 
+## Family rank
+
+`FAMILY_RANKS` in `scripts/style/rules.py` is the one rank table: `types`,
+`values`, `names`, highest first. The planner and filing compare ranks only
+through `rules.ranked_above`. A new family takes its rank in that table.
+`modules` has no rank; structure blocking orders it, as below.
+
+**Hold.** On each file, a family waits while a family ranked above it has open
+work at that file. Only a family with a unit counts, and only in that unit's
+pilot scope. Open work at a file is:
+
+- a cell in state `open`, `stale` or `awaiting merge`;
+- a filed finding, whose decision is unanswered, or approved and not built;
+- an unfiled finding judged at the file that the synced tip has.
+
+A waiting cell gets no ticket, and a waiting approved finding gets no proposal
+ticket. Neither is dropped. A queued ticket that the rank holds is dropped
+(`dropped <id>: <file> has open <higher family> work`), and its cells and
+findings wait as above. Refill prints one line for each waiting file that
+holds the unit's work: `waiting <family>: <file> has open <higher family> work`.
+Filing keeps a waiting finding unfiled and prints the same line, so its decision
+does not go to the user.
+
+**Judge again.** When the higher work lands, the file's blob changes and every
+cell at the file goes `stale`. The higher family judges the file again first,
+then the lower cell gets a ticket. Where a family above has a unit, a
+lower-rank finding judged at an older file is not filed or built: filing prints
+`waiting <finding>: <file> changed since it was judged`, and refill prints
+`waiting <decision>: <finding> <file> changed since it was judged`. A finding
+counts as judged at the file that its holding ticket read, or that its last
+declaration follow read. A ticket that holds the same change again takes the
+finding over, so the finding is judged at the new file and goes on. A judgment
+of the changed file by another ticket that does not hold the finding (for a
+followed finding, any later judgment of its new file) settles
+it: filing withdraws an unfiled finding (`judged again in judgment <id>`), and
+refill waives an approved one (`<file> judged again in judgment <id> without
+it`). The withdrawal applies to every unfiled finding, of any family.
+
+## Fix sequencing
+
+Fixes run in the order that makes each fix simplest to write: a rule whose fix
+changes code that another rule reads goes first. The planner enforces only the
+family rank and structure blocking today. The order below is the target. Each
+edge is a hypothesis until pilot data supports it.
+
+**Order.** Tier E (`fix-root-causes-never-workarounds`,
+`public-api-changes-require-explicit-approval`) has no position; it governs
+every fix.
+
+0. Tier A baseline: rustfmt, `clippy --fix`, `mend --fix`.
+1. Dead code and Bevy flow: never-prefix-unused-fields-or-variables-with,
+   prefer-events-over-messages, prefer-observers-over-polling,
+   system-params-carry-their-behavior. These values rules change types and
+   registration, so they go before types.
+2. Types, in this order: dont-create-traits-for-single-implementations,
+   make-invalid-states-unrepresentable, public-failures-return-named-errors,
+   enums-over-bool-for-owned-booleans, enums-over-option-when-none-has-meaning,
+   if-else-chains-signal-missing-types, prefer-from-impl-over-named-constructors,
+   use-bevy_kana-in-all-bevy-crates, bevy-reflection-registration,
+   extract-observer-run-conditions, bevy-plugin-ownership. Then tier A cleanup.
+3. Module placement: types-live-with-their-behavior, when-to-split-a-module,
+   split-by-type-ownership, module-roots-as-table-of-contents. Then `mend --fix`.
+4. Values: tests-live-with-the-type-under-test, no-magic-values,
+   derive-test-values-from-production-constants, import-constants-at-the-top,
+   prefer-functional-patterns, test-module-allow-boilerplate,
+   agent-must-review-allows (last). always-use-nextest takes any position.
+   Then tier A cleanup.
+5. Names: spell-out-names, dont-repeat-enum-domain-in-variant-names,
+   name-submodules-after-anchor-types, prefer-type-named-fields-and-bindings,
+   dont-repeat-type-name-in-fields, avoid-repeated-field-affixes,
+   name-bindings-to-match-parameters, comments-name-code-constructs,
+   forbidden-words.
+6. Layout, sort only: constants-file-organization, module-structure.
+   workspace-dependencies takes any position after use-bevy_kana-in-all-bevy-crates.
+7. Tier A final: rustfmt, clippy, mend.
+
+**Module moves** go after types and before values (layer 3): they read the final
+set of types, and tests and constants read the final file shape.
+name-submodules-after-anchor-types runs with names, after the type renames.
+module-structure runs last, on the final content. A module move changes paths in
+every file that uses the moved items, so it holds its crate.
+
+**Tier A tool fixes** run first, after each layer, and last. They are cheap and
+give the same result when run again. mend runs after layer 3, because a module
+move changes every path and visibility that mend reads. agent-must-review-allows
+deletes an allow and runs clippy, so clippy follows it.
+
+**Pilot data.** `order_waste.py` on the cargo-liner pilot (ledger copy of
+2026-10-27, 1,182 merged tickets, 133 with code changes) counts two kinds of
+waste for a rule pair (A, B). A ticket's change is its net change from its base
+to its checkpoint. Work that its merges brought in is not part of it. A stale
+finding is a finding of B that ended because its file changed: withdrawn as
+judged again, withdrawn as declaration gone, or waived by the ledger, with a
+merged fix of A to its file between its creation and its end. A reworked hunk
+is a hunk of A that changed lines a merged fix of B wrote earlier. Person, unit
+and unrecorded waives, exception withdrawals and bare rename duplicates are
+decisions or bookkeeping, so they do not count.
+
+| A first | then B | stale | reworked | analysis |
+| --- | --- | ---: | ---: | --- |
+| make-invalid-states-unrepresentable | if-else-chains-signal-missing-types | 0 | 67 | position only |
+| make-invalid-states-unrepresentable | names family reads | 0 | 12 | family rank |
+| if-else-chains-signal-missing-types | names family reads | 0 | 7 | family rank |
+| enums-over-bool-for-owned-booleans | if-else-chains-signal-missing-types | 0 | 5 | position only |
+| module-roots-as-table-of-contents | prefer-type-named-fields-and-bindings | 5 | 0 | layer 3 before 5 |
+| make-invalid-states-unrepresentable | comments-name-code-constructs | 0 | 3 | edge |
+| comments-name-code-constructs | forbidden-words | 0 | 1 | edge |
+| dont-repeat-enum-domain-in-variant-names | forbidden-words | 1 | 0 | edge |
+| split-by-type-ownership | comments-name-code-constructs | 1 | 0 | edge |
+
+The data supports these orders. The strongest is new: in layer 2,
+make-invalid-states-unrepresentable and enums-over-bool-for-owned-booleans go
+before if-else-chains-signal-missing-types. The types unit ran if-else-chains
+tickets on cargo-mend files first; make-invalid-states tickets then rewrote
+the enums and matches those tickets wrote, 67 hunks in 12 files. The analysis
+gives this only by list position, not by an edge.
+
+Two pairs go against the order. derive-test-values-from-production-constants
+changed 4 hunks in 2 files that if-else-chains-signal-missing-types wrote
+(types go first): its fix put constants into new test lines, which running it
+first would not have prevented. One module-roots-as-table-of-contents move made one
+make-invalid-states-unrepresentable finding stale (types go first).
+
+Every other edge is logical only. 8 edges have both sides in the pilot data and
+no waste, among them make-invalid-states-unrepresentable before
+enums-over-bool-for-owned-booleans. 53 edges have a side with no merged fix or
+ended finding in the pilot, so the data cannot see them: both user pairs
+(enums-over-option-when-none-has-meaning before prefer-functional-patterns;
+tests-live-with-the-type-under-test before derive-test-values-from-production-constants
+and the test reuse line of no-magic-values), every tier A edge (tier A has no
+tickets), and every edge between two values rules. Names read tickets record
+no rule for most changes, so their waste counts as `names read`.
+
+**Conflicts.**
+
+1. prefer-type-named-fields-and-bindings and name-bindings-to-match-parameters
+   flip a binding passed straight to a parameter. Run type-named first, and
+   skip such bindings in it; name-bindings wins there.
+2. prefer-type-named-fields-and-bindings, dont-repeat-type-name-in-fields and
+   avoid-repeated-field-affixes settle each case by an exception only in that
+   order; another order can change a field twice.
+3. derive-test-values-from-production-constants, or the test reuse line of
+   no-magic-values, before tests-live-with-the-type-under-test loops: the
+   writer widens a constant for a test (forbidden), mend narrows it, the test
+   fails. Only tests-live-with first avoids it.
+4. when-to-split-a-module before types-live-with-their-behavior: a split, then
+   a relocation that empties a submodule, then a collapse. Each fix is undone once.
+5. prefer-functional-patterns before the bool and Option type rules: a
+   combinator hides the state the type rule names, and the type rule undoes it.
+6. public-failures-return-named-errors changes a public signature each time, so
+   each fix needs approval under public-api-changes-require-explicit-approval.
+
+**Each roll-out checks the order.** After the pilot of every new repository,
+run:
+
+```bash
+~/.claude/scripts/lib/py ~/.claude/scripts/style/order_waste.py --ledger <copy of the ledger> --repo <checkout> [--json]
+```
+
+It reads both and writes nothing. It prints one row per rule pair, sorted by
+total waste, with where the analysis puts A, then the analysis edges with no
+observed waste, split into seen and not seen. Add an order only when that
+repository's data supports it, and record the counts here.
+
 ## Ticket queue
 
 One ticket per phase:
