@@ -549,7 +549,7 @@ def delete_tree(path: str) -> None:
 
 class RunKeepReason(Enum):
     ACTIVE_MARKER = "an active-run marker names it"
-    UNENDED_SEAT = "a worker seat has not ended"
+    UNENDED_SEAT = "a worker has not ended"
     SESSION_WORKTREE = "a live or paused session uses its worktree"
     UNREADABLE_RECORD = "a run ownership record cannot be read"
 
@@ -682,7 +682,7 @@ def run_folder_guards(roots: Roots, live: frozenset[str] | None,
             if not isinstance(roster, MissingRecord):
                 for seat in roster.values():
                     if not isinstance(seat, dict) or not isinstance(cast(dict[str, object], seat).get("status"), str):
-                        raise ValueError("worker seat unreadable")
+                        raise ValueError("worker roster entry unreadable")
                     if cast(dict[str, object], seat)["status"] != "ended":
                         kept[folder] = RunKeepReason.UNENDED_SEAT
             # Read even when another reason keeps the folder, so errors are visible.
