@@ -111,7 +111,9 @@ Loop/verbose only:
    the phase done, run
    `~/.claude/scripts/lib/py ~/.claude/scripts/style/style_ledger.py ticket checkpoint --repo . --id <ticket> --commit <captured code commit> --session-dir "${SESSION_DIR}" --phase <phase id>`.
    The ledger keeps the run folder and phase, and `ticket merge` releases the
-   held reservation from them.
+   held reservation from them. berth's release counts when its protected tip
+   is the checkpoint, or a later commit of the unit's branch, such as a merge
+   of style/main, that the style branch tip contains.
    If recording fails, retain the commit and reservation, repair the ticket
    record, and do not create another commit.
 

@@ -1,12 +1,12 @@
 ---
 description: Show the user the one most urgent item waiting for them, or the most urgent of one kind, or the oldest or newest; settle that one item, then stop.
-argument-hint: "[change | proposal | efficiency | question] [oldest | newest]"
+argument-hint: "[change | proposal | efficiency | question] [oldest | newest] [all-below]"
 ---
 
 # Next
 
 **Usage:** `/next` · `/next <kind>` · `/next [<kind>] oldest` · `/next [<kind>] newest` ·
-`/next to the end`
+`/next [<kind>] [oldest|newest] all-below` · `/next to the end`
 
 Kinds: `change`, `proposal`, `efficiency`, `question`. The words "next", "next change", "next
 proposal", "next efficiency proposal", "next question", "next oldest" and "next newest" mean this
@@ -16,6 +16,7 @@ command too.
 - A kind: the most urgent item of that kind.
 - `oldest` or `newest`, alone or with a kind: the oldest or newest item instead (user,
   2026-10-22).
+- `all-below`, with any of the above: also the items of every production below this one.
 
 Any other argument: print the usage line and stop.
 
@@ -25,10 +26,13 @@ when the answer settles it or more items wait: the user asks for the next one
 when they want it (user, 2026-10-20). The user can also move the shown item to
 the end of its list (user, 2026-10-22).
 
-Every kind is scoped to one showrunner: the items of its production and of
-each production below it, at any depth, never of one above it or beside it
-(user, 2026-10-25). The user runs `/next` in the showrunner whose work they
-want. Run it in the showrunner session, or pass that production's doc.
+Every kind is scoped to one showrunner: the items of its own production
+only, from its own unit directors. It never shows the items of the showrunner
+above it, and by default not those of the showrunners below it, which show
+their own. So each showrunner's review is complete for its level (user,
+2026-10-27). `all-below` adds every production below it, at any depth. The
+user runs `/next` in the showrunner whose work they want. Run it in the
+showrunner session, or pass that production's doc.
 
 ## Order
 
@@ -52,7 +56,7 @@ current until it has its answer, also when a more urgent item arrives.
 ## Show
 
 Run `"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/production/next_item.py" show
-[--kind <kind>] [--order oldest|newest]`. Outside the showrunner session add
+[--kind <kind>] [--order oldest|newest] [--all-below]`. Outside the showrunner session add
 `--production <doc>`, for every kind. It prints the item's kind on the first line, then the
 item, or a line that nothing waits. Present the item by its kind's section
 below.
@@ -60,7 +64,7 @@ below.
 ## To the end
 
 When the user says to move the shown item to the end of its list, run
-`next_item.py move-to-end --kind <its kind>`, with the same `--production`. Say it moved, and stop: do not
+`next_item.py move-to-end --kind <its kind>`, with the same `--production` and `--all-below`. Say it moved, and stop: do not
 show the next item.
 
 ## Important
@@ -88,7 +92,7 @@ answer through `/showrunner:proposal`.
 ## efficiency
 
 The open nightly-review proposal: its line in the ledger that the `Efficiency
-ledger` line names, of the production doc and of each production below it. A
+ledger` line names, of the production doc (with `all-below`, also of each production below it). A
 production with no such line has no efficiency items. Each night's reports are
 in `<night>/config.md`, `<night>/rust.md` and `<night>/messages.md` beside the
 ledger. Where a cheap check exists (its measurement script, the line it cites),

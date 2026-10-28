@@ -77,7 +77,7 @@ from user_zone import user_zone  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import issues  # noqa: E402
 from production_units import Refusal, cell_value, production_field, unit_table  # noqa: E402
-from proposals_folder import owner_docs, slug_of  # noqa: E402
+from proposals_folder import owner_docs, scope_docs, slug_of  # noqa: E402
 
 TRAILER = "Change-Review"
 LIST_HEADER = "- **Change review:**"
@@ -553,6 +553,34 @@ def pending(path: Path) -> list[dict[str, str]]:
     lines = read(path).splitlines(keepends=True)
     columns, first, end = _table(path, lines, SECTION)
     return [dict(zip(columns, (_plain(cell) for cell in _cells(line)))) for line in lines[first:end]]
+
+
+def scope_list(doc: Path) -> Path:
+    """The list that takes the production's rows: the one its Change review line names, else its root's."""
+    import showrunners
+
+    slug = slug_of(doc)
+    root = showrunners.root_of(slug)
+    try:
+        return production_list(str(doc))
+    except ChangeReviewError:
+        if slug == root:
+            raise
+        return production_list(str(showrunners.timer_docs().get(root, doc)))
+
+
+def scope_rows(path: Path, doc: Path, below: bool = False) -> list[dict[str, str]]:
+    """The rows still to review on `path`, the production's list (scope_list), that its showrunner shows.
+
+    A row is the production's when its Production cell names the production, and a row without
+    one is its list's root's. Only the production's own rows are shown, and with `below` also the
+    rows of each production below it (user, 2026-10-27).
+    """
+    import showrunners
+
+    root = showrunners.root_of(slug_of(doc))
+    scope = {slug_of(each) for each in scope_docs(doc, below)}
+    return [row for row in pending(path) if (row.get(PRODUCTION) or root) in scope]
 
 
 def row_production(production: Path) -> str:
