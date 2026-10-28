@@ -175,6 +175,7 @@
       "extraPaths": [
         ".",
         "scripts/production",
+        "scripts/style",
         "scripts/bevy_upgrade",
         "scripts/build_hold",
         "scripts/direct",

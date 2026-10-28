@@ -31,7 +31,7 @@ The roster joins records that each name one part of the picture. A session's rol
 
 | Showrunner registrations | notifier timers under `~/.local/state/notifier/showrunner-*` (`NOTIFIER_STATE_DIR`), via `showrunners.registered_showrunners()` | session name, socket, production slug, production doc |
 
-| Units table | the production doc, via `add_unit.live_unit_table` | `Unit` and `Worktree` per row (fallback only) |
+| Units table | the production doc, via `production_units.unit_table` without retired rows (`production_units.unit_is_retired`) | `Unit` and `Worktree` per row (fallback only) |
 
 | Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_RUN_ROOT` replaces both) | first line: the run's session directory |
 
