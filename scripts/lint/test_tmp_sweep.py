@@ -81,6 +81,12 @@ class TmpSweepCase(unittest.TestCase):
         self.state = base / "state"
         for folder in (self.unit, self.delegate, self.project, self.proc):
             folder.mkdir(parents=True)
+        registry = base / "sessions"
+        registry.mkdir()
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "NOTIFIER_SESSIONS_DIR": str(registry), "SHUTDOWN_STATE_DIR": str(base / "shutdown"),
+            "BUILDLOG_DIR": str(base / "buildlog"),
+        })))
         self.now = time.time() + 2 * DAY
         _ = self.enterContext(mock.patch.object(tmp_sweep, "state_dir", return_value=self.state))
         # A private default root exposes callers that fail to set their session roots.
@@ -430,8 +436,9 @@ class OwnerTests(TmpSweepCase):
         _ = write(self.delegate / "active" / ENDED_SESSION, f"{ended}\n")
         result = self.sweep()
         self.assertTrue(marked.is_dir())
-        self.assertFalse(ended.exists())
-        self.assertEqual(result.kept[tmp_sweep.DIRECTOR_RUNS], [str(marked)])
+        self.assertTrue(ended.is_dir())
+        self.assertEqual(sorted(result.kept[tmp_sweep.RunKeepReason.ACTIVE_MARKER.value]),
+                         sorted([str(marked), str(ended)]))
 
     def test_a_run_folder_whose_history_opens_with_a_live_session_stays(self) -> None:
         history = self.tmp.parent / "history"
@@ -532,6 +539,102 @@ class LogTests(TmpSweepCase):
             self.assertEqual(tmp_sweep.run_if_due(False, self.now + 3600), 0)
             self.assertFalse(idle.exists())
         self.assertEqual(len(self.log()), 2)
+
+
+class RunFolderTests(TmpSweepCase):
+    def test_an_active_marker_keeps_a_run_after_its_session_stops(self) -> None:
+        for root in (self.unit, self.delegate):
+            with self.subTest(root=root.name):
+                payload = write(root / "marked" / "tmp" / "old" / "file")
+                _ = write(root / "active" / ENDED_SESSION, f"{payload.parents[2]}\n")
+                _ = self.sweep()
+                self.assertTrue(payload.is_file())
+
+    def test_an_unended_roster_seat_keeps_its_idle_run(self) -> None:
+        for status in ("starting", "running", "done", "failed"):
+            with self.subTest(status=status):
+                payload = write(self.unit / status / "board.log")
+                _ = write(payload.parent / "mesh_roster.json", json.dumps({"impl": {"status": status}}))
+                _ = self.sweep()
+                self.assertTrue(payload.is_file())
+
+    def test_a_paused_roster_seat_keeps_the_run_and_its_temp_entries(self) -> None:
+        payload = write(self.delegate / "paused" / "tmp" / "old" / "file")
+        roster = write(payload.parents[2] / "mesh_roster.json", json.dumps({"fix": {"status": "paused"}}))
+        _ = self.sweep()
+        self.assertTrue(payload.is_file())
+        self.assertTrue(roster.is_file())
+
+    def test_a_paused_unit_keeps_a_run_that_records_its_worktree(self) -> None:
+        worktree = self.tmp.parent / "worktree"
+        payload = write(self.unit / "paused-unit" / "board.log")
+        _ = write(payload.parent / "progress_history_state.json", json.dumps({"working_dir": str(worktree)}))
+        _ = write(Path(os.environ["SHUTDOWN_STATE_DIR"]) / "account" / "sessions" / "unit.json", json.dumps({
+            "session": {"kind": "unit", "cwd": str(worktree), "run_dirs": []},
+            "progress": {"kind": "stopped"},
+        }))
+        other = write(self.delegate / "ended" / "board.log")
+        result = self.sweep()
+        self.assertTrue(payload.is_file())
+        self.assertFalse(other.exists())
+        self.assertIn(str(payload.parent), result.kept[tmp_sweep.RunKeepReason.SESSION_WORKTREE.value])
+
+    def test_a_legacy_paused_unit_keeps_the_worktree_run(self) -> None:
+        worktree = self.tmp.parent / "legacy-worktree"
+        payload = write(self.delegate / "legacy-unit" / "board.log")
+        _ = write(payload.parent / "progress_history_state.json", json.dumps({"working_dir": str(worktree)}))
+        _ = write(Path(os.environ["SHUTDOWN_STATE_DIR"]) / "account" / "record.json", json.dumps({
+            "state": "down", "entries": [{"session": {"kind": "unit", "cwd": str(worktree), "run_dirs": []},
+                                            "progress": {"kind": "stopped"}}],
+        }))
+        _ = self.sweep()
+        self.assertTrue(payload.is_file())
+
+    def test_a_live_units_worktree_keeps_a_run_without_a_director_record(self) -> None:
+        worktree = self.tmp.parent / "worktree"
+        payload = write(self.delegate / "live-unit" / "board.log")
+        _ = write(payload.parent / "progress_history_state.json", json.dumps({"working_dir": str(worktree)}))
+        _ = write(Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / "123.json", json.dumps({
+            "pid": 123, "sessionId": LIVE_SESSION, "name": "unit", "messagingSocketPath": "",
+            "updatedAt": 1, "cwd": str(worktree),
+        }))
+        _ = self.sweep()
+        self.assertTrue(payload.is_file())
+
+    def test_unreadable_ownership_records_keep_the_run(self) -> None:
+        for name in ("mesh_roster.json", "progress_history_state.json", "director", "marker", "pause", "session"):
+            with self.subTest(record=name):
+                payload = write(self.unit / name / "tmp" / "old" / "file")
+                run = payload.parents[2]
+                if name == "marker":
+                    broken = self.unit / "active" / ENDED_SESSION
+                    broken.mkdir(parents=True)
+                elif name == "director":
+                    broken = run / name
+                    broken.mkdir()
+                elif name == "pause":
+                    broken = write(Path(os.environ["SHUTDOWN_STATE_DIR"]) / "account" / "sessions" / "bad.json", "{")
+                elif name == "session":
+                    broken = write(Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / "bad.json", "{")
+                else:
+                    broken = write(run / name, "{")
+                result = self.sweep()
+                self.assertTrue(payload.is_file())
+                self.assertIn(str(run), result.kept[tmp_sweep.RunKeepReason.UNREADABLE_RECORD.value])
+                if broken.is_dir():
+                    broken.rmdir()
+                else:
+                    broken.unlink()
+
+    def test_an_ended_idle_run_is_still_removed(self) -> None:
+        for root in (self.unit, self.delegate):
+            with self.subTest(root=root.name):
+                run = write(root / "ended" / "board.log").parent
+                _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
+                _ = write(run / "director", ENDED_SESSION)
+                result = self.sweep()
+                self.assertFalse(run.exists())
+                self.assertIn(str(run), [entry["path"] for entry in result.deleted])
 
 
 class RunningSessionTests(unittest.TestCase):
