@@ -68,9 +68,9 @@ A step records its width through its argv: `invoke.sh` puts `--test-threads N` b
 
 ### CI-scope lint (`scripts/direct/verify.sh`, `lint` arm)
 
-Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed members, taplo, clippy, rustdoc on changed members.
+Order: `require_taplo`, mend `--fix`, nightly fmt of the package and changed members, taplo, clippy. Workspace rustdoc runs separately through `verify.sh doc` at the checkpoint.
 
-- Clippy: `invoke_clippy --workspace --all-targets --all-features --keep-going` (`-- -D warnings` from `invoke.sh`). The target scope matches CI's `clippy` job and `scripts/release/pre_release_checks.sh`. The lint call sites add `--keep-going`; `invoke.sh` does not add it. Clippy takes no `FEATURE_FLAGS`; a trailing `--features` reaches mend and rustdoc only. CI's Windows-target clippy pass has no local counterpart. `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their own scope.
+- Clippy: `invoke_clippy --workspace --all-targets --all-features --keep-going` (`-- -D warnings` from `invoke.sh`). The target scope matches CI's `clippy` job and `scripts/release/pre_release_checks.sh`. The lint call sites add `--keep-going`; `invoke.sh` does not add it. Lint takes no trailing `--features`; `verify.sh doc --features <list>` selects workspace doc features. CI's Windows-target clippy pass has no local counterpart. `check`, `test`, `example`, `final`, mend, fmt and rustdoc keep their own scope.
 - Before its judgment, the clippy stage runs `cargo clippy --fix` with the judgment's scope and lint levels, then fmt. It repeats while a pass changes the tree, at most three times, then updates the cache key and judges. The fix pass never sets lint's status. See [Lint-step fix](build-followups-mul-add.md#lint-step-fix) for the pass rules.
 - Taplo: `run taplo fmt --check` from `workspace_root` (from `cargo metadata`), so taplo loads the workspace `taplo.toml` whatever directory lint starts in. `config/lint.conf` does not gate it; it gates only the cargo stages. An unformatted `.toml` fails lint, names the file, and is cached like any lint failure.
 - `require_taplo` exits 2 with `taplo is required` before any stage when taplo is not on `PATH`. A taplo panic (exit 101) exits 3 on macOS, with a message to re-run unsandboxed, and 2 elsewhere.

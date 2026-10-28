@@ -38,7 +38,7 @@ The normal `verify.sh lint` path runs mend, fmt and Taplo first. Then the clippy
 2. `fmt_cargo "${FMT_SCOPE[@]}"`, which formats what the fix wrote.
 3. A compare of `tree_key` before and after the pass. A pass that changes nothing ends the loop. So a clean tree costs one fix pass.
 
-After the loop, lint recomputes `VERDICT_KEY` when it records a run. Then it runs the judgment, `cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings`. The judgment's status is lint's status. A pass continues to rustdoc. The `style-lint: clippy start` and `passed` lines stay.
+After the loop, lint recomputes `VERDICT_KEY` when it records a run. Then it runs the judgment, `cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings`. The judgment's status is lint's status. Rustdoc runs separately through `verify.sh doc` at the checkpoint. The `style-lint: clippy start` and `passed` lines stay.
 
 The fix pass never sets lint's status. lint ignores its exit code. A tree with compile errors makes the fix pass fail, and the judgment reports those errors.
 

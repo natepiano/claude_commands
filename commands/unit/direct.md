@@ -562,7 +562,8 @@ Rules:
   `--filter` after every edit, 619 test runs in six hours. After the worker's last edit, run
   `lint` once, naming any one modified package, then `test` for every modified
   package. Lint is never per crate: one run covers the whole workspace (mend
-  and clippy across it, format and rustdoc for every changed member). A failed
+  and clippy across it, format for every changed member; the unit director
+  runs workspace rustdoc with `verify.sh doc` at the checkpoint). A failed
   lint means fix the error it names, wherever it is in the workspace, then lint
   once more; never re-run lint on a tree that has not changed. User,
   2026-10-01: a Work Order that said "for each crate, lint first" cost 13 lint

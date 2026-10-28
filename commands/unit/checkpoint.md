@@ -160,6 +160,29 @@ Loop/verbose only:
    Claude-Session: <session url>
    ```
 
+   **Cargo repositories:** every `checkpoint(...)` commit needs this check:
+   phase checkpoints, the final gate, one-off fix commits, and merges concluded
+   with a checkpoint subject. After staging, run
+   `~/.claude/scripts/direct/verify.sh doc` as its own command and as the last
+   command before `git commit`. Include every
+   untracked or unstaged file in the commit or remove it: the judged working
+   tree must equal the committed tree. On failure, repair through
+   <FixDispatch/>, stage the repairs, then run `doc` again. The checkpoint
+   hook refuses a commit without a passing record for its exact tree;
+   `lint.conf` cannot disable this gate. A rerun after a plan-doc edit compiles
+   nothing new and takes seconds. Workers may run `doc` at any time; their
+   Work Orders do not require it.
+
+   **Every repository:** run the checkpoint commit as the first command in
+   its own Bash call. Put `cd`, `git add`, and all other commands in earlier
+   calls. Commands after the commit, such as a push, are allowed.
+
+   The hook must read the subject literally. Use literal `-m` text, a `-F`
+   file, or the `"$(cat <<'EOF' … EOF)"` heredoc form. A subject it cannot read,
+   such as shell expansion or `$'…'`, counts as a checkpoint and needs the
+   record in a Cargo repository. Commit options `--amend`, `-C`/`-c`, and
+   `--no-edit` use the reused commit's or `MERGE_MSG`'s subject.
+
    Every `checkpoint(...)` commit that changes more than Markdown carries
    `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
    `Change-Review: none — <why nothing visible changes>`. Write each line for a
