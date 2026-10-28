@@ -263,6 +263,15 @@
         ]
       },
       {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/pre-tool-use-checkpoint-doc-gate.py\""
+          }
+        ]
+      },
+      {
         "matcher": "mcp__brp__brp_launch",
         "hooks": [
           {
@@ -292,7 +301,7 @@
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Write|NotebookEdit",
         "hooks": [
           {
             "type": "command",
@@ -309,6 +318,10 @@
           {
             "type": "command",
             "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-pane-record.py\""
+          },
+          {
+            "type": "command",
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-temp-root.py\""
           }
         ]
       },
@@ -341,7 +354,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-delegate-resume.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-direct-resume.py\""
           }
         ]
       },

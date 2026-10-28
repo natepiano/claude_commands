@@ -344,6 +344,34 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             return []
         return [json.loads(line) for line in self.send_log.read_text().splitlines()]
 
+    def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
+        import stall_watch
+        import showrunners
+        import unit_lookup as lookup
+        runners: list[showrunners.Showrunner] = []
+        for slug in ("first", "second"):
+            doc = self.root / f"{slug}-production.md"
+            _ = doc.write_text("\n".join(("# Production", f"- **Production slug:** {slug}", "## Units",
+                               "| Unit | Plan | Worktree |", "| --- | --- | --- |",
+                               f"| alpha | docs/alpha.md | {self.root / 'alpha'} |",
+                               f"| beta | docs/beta.md | {self.root / 'beta'} |", "")))
+            runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
+                            slug=slug, zone="UTC", doc=str(doc)))
+        marked = {name: lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name))
+                  for name in ("alpha", "beta")}
+        with (mock.patch.dict(os.environ, self.environment),
+              mock.patch.object(stall_watch, "processes", return_value=[]),
+              mock.patch.object(showrunners, "load_settings", return_value={}),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
+              mock.patch.object(lookup, "marked_units", return_value=marked),
+              mock.patch.object(lookup, "read_run_states", wraps=lookup.read_run_states) as reads,
+              mock.patch.object(stall_watch, "forget", return_value=None) as forget,
+              mock.patch.object(stall_watch, "send_all") as send):
+            stall_watch.tick(START)
+            reads.assert_called_once_with()
+            self.assertEqual(forget.call_count, 4)
+            send.assert_called_once_with([], START)
+
     def test_a_herdr_unit_is_watched_through_a_joined_400_line_read(self) -> None:
         self.panes["unit-one"]["label"] = "native"
         first = self.tick(START)

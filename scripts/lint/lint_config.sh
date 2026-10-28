@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Reader and editor for config/lint.conf — the on/off switches for each kind of
 # lint check. One key per check; its value applies to every consumer, with no
-# per-consumer override.
+# per-consumer override. verify.sh doc is mandatory and ignores the doc switch.
 #
 # Source it as a library:
 #   source ~/.claude/scripts/lint/lint_config.sh
@@ -27,7 +27,7 @@ LINT_CONFIG_OPS=(
     "mend|cargo mend check pass and its --fix pass|invoke.sh mend (lint CLI, validate_ci mend steps, verify.sh lint)"
     "style_review|style-guide walk and banned-words scan over the caller's diff|/unit:style_review · /unit:direct main phase review"
     "clippy|cargo clippy|invoke.sh clippy (lint CLI, verify.sh lint)"
-    "doc|cargo doc with -D warnings|invoke.sh doc (lint doc, verify.sh lint)"
+    "doc|cargo doc with -D warnings|standalone lint doc only; verify.sh doc ignores this switch"
     "fmt|cargo +nightly fmt|invoke.sh fmt (lint fmt, verify.sh lint)"
     "sweep|target directory size budget, least recently used output first|invoke.sh sweep (lint sweep, cargo-port's last lint command)"
 )
@@ -216,11 +216,12 @@ Usage: lint_config.sh [<op>] | <op> on|off | all on|off | export | enabled <op>
 
 Checks: $(_lint_config_op_names | tr '\n' ' ')
 
-Not gated by this file: nextest, verify.sh check/test/example, the workspace
+Not gated by this file: nextest, verify.sh check/test/example/doc, the workspace
 check and test inside verify.sh final, pre_release_checks.sh, and every
 validate_ci.sh step except its two cargo-mend steps, which the mend switch
 does gate. The gates (validate_ci, pre_release_checks) route through the lint
 CLI too but set LINT_CONFIG_FORCE=1 on the steps they never allow to skip.
+verify.sh doc runs workspace rustdoc before each Cargo checkpoint, even with doc=off.
 
 Examples:
   lint_config.sh

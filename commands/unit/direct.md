@@ -559,18 +559,24 @@ Rules:
   Run `check` after each batch of edits, and `test --filter` once per finished
   change, naming all its tests in one call (repeat `--filter`). Never re-run
   either on a tree that has not changed. User, 2026-10-04: workers ran a
-  `--filter` after every edit, 619 test runs in six hours. After the worker's last edit, run
-  `lint` once, naming any one modified package, then `test` for every modified
-  package. Lint is never per crate: one run covers the whole workspace (mend
-  and clippy across it, format and rustdoc for every changed member). A failed
+  `--filter` after every edit, 619 test runs in six hours.
+- Start `test` for every modified package as soon as the code is ready. Never
+  wait for lint to finish or for a natedev build hold to end before starting
+  tests that can run on the Mac. Run `lint` once after the worker's last edit,
+  naming any one modified package, in either order with `test`. Both must pass
+  before the phase is done. `lint` rewrites the tree (mend fixes, then format),
+  so a `test` run counts only when no later lint changed a file. Read
+  `git diff --stat` before and after lint; when lint changed a file, run `test`
+  once more on the resulting tree. Never re-run lint or test on an unchanged
+  tree. Showrunner, 2026-10-28: tests that waited for lint never reached the
+  free Mac while a natedev build hold held the lint.
+  Lint is never per crate: one run covers the whole workspace (mend
+  and clippy across it, format for every changed member; the unit director
+  runs workspace rustdoc with `verify.sh doc` at the checkpoint). A failed
   lint means fix the error it names, wherever it is in the workspace, then lint
-  once more; never re-run lint on a tree that has not changed. User,
-  2026-10-01: a Work Order that said "for each crate, lint first" cost 13 lint
-  runs of one workspace, all failing on one error. Lint comes before test
-  because `lint` rewrites the tree (mend fixes, then format), so a `test` run
-  before it proves nothing about the tree that gets committed, and a `test`
-  run after it is the one that counts. Never run the suites twice around a
-  lint. Trace changed public APIs,
+  once more. User, 2026-10-01: a Work Order that said "for each crate, lint
+  first" cost 13 lint runs of one workspace, all failing on one error. Trace
+  changed public APIs,
   traits, registration, and plugin wiring to modified callers. Name an integration target explicitly only to re-run it
   alone. Add example lines only when the phase owns them.
 - Tests are the only testing: a passing `test` run proves the package builds.

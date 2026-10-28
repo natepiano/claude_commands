@@ -160,6 +160,37 @@ Loop/verbose only:
    Claude-Session: <session url>
    ```
 
+   **Cargo repositories:** every `checkpoint(...)` commit needs this check:
+   phase checkpoints, the final gate, one-off fix commits, and merges concluded
+   with a checkpoint subject. After staging, run
+   `~/.claude/scripts/direct/verify.sh doc` as its own command and as the last
+   command before `git commit`. Include every
+   untracked or unstaged file in the commit or remove it: the judged working
+   tree must equal the committed tree. On failure, repair through
+   <FixDispatch/>, stage the repairs, then run `doc` again. The checkpoint
+   hook refuses a commit without a passing record for its exact tree;
+   `lint.conf` cannot disable this gate. A rerun after a plan-doc edit compiles
+   nothing new and takes seconds. Workers may run `doc` at any time; their
+   Work Orders do not require it.
+
+   **Every repository:** run the checkpoint commit as the first command in
+   its own Bash call. Put `cd`, `git add`, and all other commands in earlier
+   calls. Commands after the commit, such as a push, are allowed.
+
+   The hook treats every commit in a Bash call as a checkpoint when the call's
+   text contains `checkpoint(` after quote removal: backslash-newline pairs,
+   then quotes and backslashes are removed. A body line or example counts too.
+   Use literal `-m` text, a `-F` file, or the `"$(cat <<'EOF' … EOF)"` heredoc
+   form. A subject it cannot read, such as shell expansion or `$'…'`, counts
+   as a checkpoint and needs the record in a Cargo repository. It also scans
+   message files, reused commit subjects (`--amend`, `-C`/`-c`), and
+   `MERGE_MSG`/`SQUASH_MSG`, including merges concluded with `--no-edit`.
+
+   For these commits, the hook refuses `--git-dir`, `--work-tree`, `GIT_DIR=`,
+   `GIT_INDEX_FILE=`, and `GIT_WORK_TREE=` overrides, and `git -C` directories
+   it cannot resolve, including shell expansions and unquoted globs. Each
+   refusal names the fix: remove overrides or use a literal directory.
+
    Every `checkpoint(...)` commit that changes more than Markdown carries
    `Change-Review: <what changed for you> | <how to try it: where and what to type> | <what you see>`, one line per visible change, or
    `Change-Review: none — <why nothing visible changes>`. Write each line for a

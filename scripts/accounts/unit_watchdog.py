@@ -329,6 +329,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
         before = deepcopy(state)
         sources = _sources(state)
         runners = showrunners.registered_showrunners()
+        runs = unit_lookup.read_run_states()
         retained: dict[str, DownOutage] = {}
         for runner in runners:
             if not runner["doc"]:
@@ -341,7 +342,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                 for row in rows:
                     unit = production_units.cell_value(row.get("Unit", ""))
                     worktree = production_units.cell_value(row.get("Worktree", ""))
-                    if not worktree or unit_lookup.run_state(Path(worktree)) != unit_lookup.UnitState.RUNNING:
+                    if not worktree or runs.state(Path(worktree)) != unit_lookup.UnitState.RUNNING:
                         continue
                     found = observed.get(unit)
                     if found is None:

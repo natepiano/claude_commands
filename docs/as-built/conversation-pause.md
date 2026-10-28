@@ -94,7 +94,7 @@ When the last phase is closed but an activity remains open, `progress` calls `_p
 
 ### Unit status and stall watch
 
-A unit's run state is stored nowhere. `unit_lookup.run_state(worktree) -> UnitState` reads `RUNNING`, `RUN_FINISHED` or `STANDING_BY` from the newest `/unit:direct` run record in the unit's worktree. `scripts/production/stall_watch.py` watches a unit only while that state is `RUNNING`; it skips every other unit and retired production rows, and clears their saved stretch state. It does not inspect a unit row for `run done`. `showrunners.py status` and `showrunners.py ready` parse their arguments and do nothing. The full account is in [showrunner automation](showrunner-automation.md), "Unit status" and "Unit lookup".
+A unit's run state is stored nowhere. `unit_lookup.read_run_states()` reads each record's first line and each worktree's newest record's last JSON object into one snapshot per tick. Its `state(worktree) -> UnitState` gives `RUNNING`, `RUN_FINISHED` or `STANDING_BY`; `run_state(worktree)` remains a one-call wrapper. `scripts/production/stall_watch.py` watches a unit only while that state is `RUNNING`; it skips every other unit and retired production rows, and clears their saved stretch state. It does not inspect a unit row for `run done`. `showrunners.py status` and `showrunners.py ready` parse their arguments and do nothing. The full account is in [showrunner automation](showrunner-automation.md), "Unit status" and "Unit lookup".
 
 ### As-built corrections and phone alerts
 
@@ -125,7 +125,7 @@ A script never writes a literal phone text. It renders a catalog entry from `scr
 - The answer window begins when the question reaches the session. A failed delivery still reaches automatic return five minutes after the question became due.
 - An open review suspends question and return actions. Each pause mechanism restores only what it changed.
 - Both hooks have a five-second budget, print at most one error line, and exit 0 so a prompt or reply cannot fail because the pause failed.
-- `unit_lookup.run_state`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
+- `unit_lookup.read_run_states().state(worktree)`, not prose in a production row, is authoritative for whether the stall watch monitors a unit.
 - Correcting an as-built doc that contradicts the code is always allowed; cross-unit notice rules still apply.
 - Every scripted phone alert enters `scripts/message/send.py --to user`, with `--action` or `--no-action` or with a catalog `--text-id`; channel choice stays inside `send.py`.
 
