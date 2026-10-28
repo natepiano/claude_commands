@@ -26,7 +26,6 @@ from zoneinfo import ZoneInfo
 import build_hold
 import unit_runs
 from sessions import SessionRecord
-from user_zone import user_zone
 
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
@@ -65,7 +64,7 @@ def recorded_hold_events(root: Path, expected: int) -> list[HoldEventRecord]:
     deadline = time.monotonic() + 5
     while True:
         rows = [cast(HoldEventRecord, json.loads(line))
-                for path in root.rglob("*.jsonl") for line in path.read_text().splitlines()]
+                for path in root.rglob("[0-9][0-9][0-9][0-9]-*.jsonl") for line in path.read_text().splitlines()]
         if len(rows) >= expected or time.monotonic() >= deadline:
             return sorted(rows, key=lambda row: (row["at"], row["event"] != "began"))
         time.sleep(0.01)
@@ -79,11 +78,19 @@ class IsolatedBuildHoldTest(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        proc = self.scratch / "proc"
+        proc.mkdir()
+        _ = self.enterContext(mock.patch.object(build_hold, "PROC_ROOT", proc))
         meminfo = self.scratch / "meminfo"
         _ = meminfo.write_text("MemAvailable: 67108864 kB\n")
         lifetime = self.scratch / "child-lifetime"
         lifetime.mkdir()
         _ = (lifetime / "sitecustomize.py").write_text(CHILD_LIFETIME)
+        tools = self.scratch / "tools"
+        tools.mkdir()
+        systemctl = tools / "systemctl"
+        _ = systemctl.write_text("#!/bin/sh\nexit 0\n")
+        systemctl.chmod(0o755)
         fifo = lifetime / "writers"
         os.mkfifo(fifo)
         self.lifetime_reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
@@ -95,9 +102,10 @@ class IsolatedBuildHoldTest(unittest.TestCase):
             "BUILDLOG_DIR": str(self.scratch / "buildlog"),
             "BUILD_HOLD_DIR": str(self.scratch / "holders"),
             "BUILD_HOLD_RELEASE_DIR": str(self.scratch / "release"),
-            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.scratch / "registration"),
-            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+            "BUILD_HOLD_ENFORCER_DIR": str(self.scratch / "enforcer"),
+            "BUILD_HOLD_CGROUP_ROOT": str(self.scratch / "cgroup"),
+            "PATH": str(tools) + os.pathsep + os.environ.get("PATH", ""),
+            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
             "MAC_TEST_STATE_DIR": str(self.scratch / "mac-state"),
             "BUILDLOG_MEMINFO": str(meminfo),
@@ -288,95 +296,6 @@ class OwningSessionTests(IsolatedBuildHoldTest):
                     setattr(owner, "session_id", "changed")
 
 
-class OwningSessionMarkTests(IsolatedBuildHoldTest):
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        active = self.scratch / "active"
-        active.mkdir()
-        run = self.scratch / "run"
-        _ = (active / "run-owner").write_text(str(run) + "\n")
-        self.enterContext(mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": str(run),
-            "CLAUDE_CODE_SESSION_ID": "stale-session",
-        }))
-        now = datetime.now().astimezone()
-        folder = self.scratch / "holders"
-        folder.mkdir()
-        _ = write_holder(folder, "holder", now.isoformat(), "admission test")
-        cycle = build_hold.open_cycle(now)
-        cycle["holders"] = {"holder": {"since": now.isoformat(), "released_at": ""}}
-        cycle["release_started_at"] = now.isoformat()
-        cycle["recipients"] = {"run-owner": "owner", "stale-session": "stale"}
-        cycle["entries"] = [build_hold.new_entry("run-owner", "owner"), build_hold.new_entry("stale-session", "stale")]
-        for entry in cycle["entries"]:
-            build_hold.store_release_state(entry, build_hold.ReleasedAwaitingAdmission(now))
-        build_hold.save_cycle(cycle)
-
-    def entries(self) -> list[build_hold.ReleaseEntry]:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        return cycle["entries"]
-
-    def command(self, *arguments: str) -> tuple[int, str]:
-        output = io.StringIO()
-        with redirect_stdout(output):
-            code = build_hold.main(list(arguments))
-        return code, output.getvalue().strip()
-
-    def test_mark_without_explicit_id_credits_owner_for_wait_and_return(self) -> None:
-        self.assertEqual(self.command("mark", "--state", "WaitingForMemory"),
-                         (0, "run-owner: WaitingForMemory"))
-        self.assertEqual([entry["state"] for entry in self.entries()],
-                         ["WaitingForMemory", "ReleasedAwaitingAdmission"])
-        self.assertEqual(self.command("mark", "--state", "MemoryGateReturned", "--outcome", "Granted"),
-                         (0, "run-owner: MemoryGateReturned"))
-        self.assertEqual([entry["state"] for entry in self.entries()],
-                         ["MemoryGateReturned", "ReleasedAwaitingAdmission"])
-        self.assertEqual(self.entries()[0].get("outcome"), "Granted")
-
-    def test_explicit_mark_id_wins_without_resolving_owner(self) -> None:
-        with mock.patch.object(build_hold, "owning_session", side_effect=AssertionError("Explicit id wins")):
-            self.assertEqual(self.command("mark", "--session-id", "stale-session", "--state", "WaitingForMemory"),
-                             (0, "stale-session: WaitingForMemory"))
-        self.assertEqual([entry["state"] for entry in self.entries()],
-                         ["ReleasedAwaitingAdmission", "WaitingForMemory"])
-
-    def test_explicit_empty_mark_id_does_not_use_owner(self) -> None:
-        self.assertEqual(self.command("mark", "--session-id", "", "--state", "WaitingForMemory"),
-                         (0, "NoSessionId"))
-        self.assertEqual([entry["state"] for entry in self.entries()],
-                         ["ReleasedAwaitingAdmission", "ReleasedAwaitingAdmission"])
-
-    def test_mark_without_owner_prints_no_session_and_keeps_cycle_unchanged(self) -> None:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        path = self.scratch / "release" / cycle["id"] / "cycle.json"
-        before = path.read_bytes()
-        with mock.patch.dict(os.environ, {
-            "UNIT_RUN_DIR": "", "UNIT_SESSION_DIR": "",
-            "CLAUDE_CODE_SESSION_ID": "", "BUILDLOG_CALL_ID": "unowned-call",
-        }):
-            self.assertEqual(self.command("mark", "--state", "MemoryGateReturned", "--outcome", "Granted"),
-                             (0, "NoSessionId"))
-        self.assertEqual(path.read_bytes(), before)
-
-    def test_wait_after_release_admits_shell_session_without_an_entry(self) -> None:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        cycle["entries"] = []
-        build_hold.save_cycle(cycle)
-        code, output = self.command("wait")
-        self.assertEqual(code, 0)
-        self.assertIn("release under way; stale-session builds now", output)
-        self.assertEqual(self.entries(), [])
-
-    def test_nothing_to_build_still_answers_for_shell_session(self) -> None:
-        code, output = self.command("nothing-to-build")
-        self.assertEqual(code, 0)
-        self.assertIn("[stale-session]: NothingToBuild", output)
-        self.assertEqual([entry["state"] for entry in self.entries()],
-                         ["ReleasedAwaitingAdmission", "NothingToBuild"])
 
 
 class HolderTests(IsolatedBuildHoldTest):
@@ -689,7 +608,8 @@ class TargetCommandTests(IsolatedBuildHoldTest):
             return subprocess.CompletedProcess(argv, exit_code, "Mac stand-in result\n", "Mac stand-in detail\n")
 
         output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(subprocess, "run", side_effect=command), redirect_stdout(output), redirect_stderr(errors):
+        with mock.patch.object(build_hold.hold_enforcer(), "start"), \
+             mock.patch.object(subprocess, "run", side_effect=command), redirect_stdout(output), redirect_stderr(errors):
             try:
                 status = build_hold.main(arguments)
             except SystemExit as error:
@@ -851,8 +771,9 @@ class TargetCommandTests(IsolatedBuildHoldTest):
 
 class CommandTests(IsolatedBuildHoldTest):
     def run_cli(self, folder: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        audit_args = ["--proc-root", str(self.scratch / "proc")] if args[0] in {"hold", "status", "audit"} else []
         return subprocess.run(
-            ["python3", str(SCRIPT), *args],
+            ["python3", str(SCRIPT), *args, *audit_args],
             capture_output=True,
             text=True,
             check=False,
@@ -1049,7 +970,7 @@ class CommandTests(IsolatedBuildHoldTest):
     def test_resume_after_earlier_damage_does_not_release_holder(self) -> None:
         path, content = self.damage_record("cycle", self.scratch)
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "waiting-session"}):
-            waited = self.run_cli(self.scratch / "holders", "wait")
+            waited = self.run_cli(self.scratch / "holders", "record-recipient", "--session-id", "waiting-session", "--name", "waiting")
         self.assertEqual(waited.returncode, 0, waited.stderr)
         self.assert_record_set_aside(path, content, waited.stdout, self.scratch)
         resumed = self.run_cli(self.scratch / "holders", "release", "--resume")
@@ -1093,10 +1014,9 @@ class CommandTests(IsolatedBuildHoldTest):
                 self.assertEqual(final.stdout.strip(), "released, builds may resume. No hold cycle: broadcast this release to every session.")
                 self.assertFalse((scratch / "holders" / "second").exists())
 
-    def test_wait_mark_and_recipient_set_aside_damaged_record(self) -> None:
+    def test_sole_holder_wait_ignores_damaged_cycle_and_recipient_can_set_it_aside(self) -> None:
         commands = (
             ("wait",),
-            ("mark", "--session-id", "first", "--state", "MemoryGateReturned", "--outcome", "Granted"),
             ("record-recipient", "--session-id", "first", "--name", "first session"),
         )
         for kind in ("cycle", "current"):
@@ -1110,10 +1030,14 @@ class CommandTests(IsolatedBuildHoldTest):
                 }):
                     path, content = self.damage_record(kind, scratch)
                     result = self.run_cli(scratch / "holders", *command)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assert_record_set_aside(path, content, result.stdout, scratch)
                     if command[0] == "wait":
-                        self.assertIn("no hold cycle: wait for the release broadcast", result.stdout)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(path.read_bytes(), content)
+                        self.assertTrue((scratch / "holders" / "first").is_file())
+                        self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assert_record_set_aside(path, content, result.stdout, scratch)
 
     def test_status_reports_recovery_without_changing_damaged_record(self) -> None:
         for kind in ("cycle", "current"):
@@ -1132,11 +1056,10 @@ class CommandTests(IsolatedBuildHoldTest):
                 self.assertTrue((scratch / "release" / "current").exists())
                 self.assertEqual(list(path.parent.glob(path.name + ".damaged-*")), [])
 
-    def test_idle_mark_wait_and_recipient_record_leave_release_directory_absent(self) -> None:
+    def test_idle_wait_and_recipient_record_leave_release_directory_absent(self) -> None:
         release = self.scratch / "release"
         self.assertFalse(release.exists())
         for arguments in (
-            ("mark", "--session-id", "idle", "--state", "MemoryGateReturned", "--outcome", "Granted"),
             ("wait",),
             ("record-recipient", "--session-id", "idle", "--name", "idle session"),
         ):
@@ -1145,22 +1068,6 @@ class CommandTests(IsolatedBuildHoldTest):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(release.exists())
 
-    def test_idle_memory_gate_mark_does_not_spawn_python(self) -> None:
-        bin_dir = self.scratch / "bin"
-        bin_dir.mkdir()
-        called = self.scratch / "python-called"
-        python = bin_dir / "python3"
-        _ = python.write_text('#!/usr/bin/env bash\ntouch "$PYTHON_CALLED"\n')
-        python.chmod(0o755)
-        result = subprocess.run(
-            ["bash", "-c", 'source "$1"; build_hold_mark MemoryGateReturned Granted', "bash", str(MEMORY_GATE)],
-            capture_output=True, text=True, check=False,
-            env={**os.environ, "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
-                 "CLAUDE_CODE_SESSION_ID": "idle", "PYTHON_CALLED": str(called)},
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(called.exists())
-        self.assertFalse((self.scratch / "release").exists())
 
     def test_hold_writes_unknown_and_status_names_it(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -1185,7 +1092,7 @@ class CommandTests(IsolatedBuildHoldTest):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("verify.sh waits by itself", result.stdout)
             self.assertNotIn("build_hold.py wait", result.stdout)
-            self.assertEqual(len(result.stdout.splitlines()), 1)
+            self.assertIn("tests and builds outside the hold are stopped", result.stdout)
             self.assertEqual(len(recorded_hold_events(self.scratch / "buildlog", 1)), 1)
 
     def test_recipient_wait_command_registers_its_session_id(self) -> None:
@@ -1196,12 +1103,61 @@ class CommandTests(IsolatedBuildHoldTest):
             ["python3", str(SCRIPT), "wait"], capture_output=True, text=True, check=False,
             env={**os.environ, "CLAUDE_CODE_SESSION_ID": "received-session"},
         )
-        self.assertEqual(received.returncode, 0, received.stderr)
-        self.assertIn("registered received-session", received.stdout)
+        self.assertEqual(received.returncode, 10, received.stderr)
+        self.assertIn("natedev is held by holder", received.stdout)
         cycle = build_hold.read_cycle()
         assert cycle is not None
         self.assertEqual([entry["session_id"] for entry in cycle["entries"]], ["received-session"])
-        self.assertEqual(cycle["entries"][0]["state"], "AwaitingRelease")
+        self.assertEqual(cycle["entries"][0]["delivery"], "NotAttempted")
+
+    def test_wait_status_guards_shell_build_until_last_other_holder_releases(self) -> None:
+        folder = self.scratch / "holders"
+        events = self.scratch / "build-events"
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "owner"}):
+            def attempt(phase: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    ["bash", "-c", 'python3 "$1" wait && printf "%s\\n" "$2" >> "$3"',
+                     "wait-and-build", str(SCRIPT), phase, str(events)],
+                    capture_output=True, text=True, check=False,
+                )
+
+            free = attempt("no hold")
+            self.assertEqual(free.returncode, 0, free.stderr)
+            held = self.run_cli(folder, "hold", "--holder", "owner", "--for", "owner test")
+            self.assertEqual(held.returncode, 0, held.stderr)
+            own = attempt("sole holder")
+            self.assertEqual(own.returncode, 0, own.stderr)
+            cycle = build_hold.read_cycle()
+            assert cycle is not None
+            self.assertEqual(cycle["recipients"], {})
+            other = self.run_cli(folder, "hold", "--holder", "other", "--for", "other test")
+            self.assertEqual(other.returncode, 0, other.stderr)
+            shared = attempt("must not build with two holders")
+            self.assertEqual(shared.returncode, 10, shared.stderr)
+            self.assertTrue((folder / "other").is_file())
+            partial = self.run_cli(folder, "release", "--holder", "owner")
+            self.assertEqual(partial.returncode, 0, partial.stderr)
+            self.assertIn("still held by other", partial.stdout)
+            blocked = attempt("must not build before release")
+            self.assertEqual(blocked.returncode, 10, blocked.stderr)
+            self.assertEqual(events.read_text().splitlines(), ["no hold", "sole holder"])
+            released = self.run_cli(folder, "release", "--holder", "other")
+            self.assertEqual(released.returncode, 0, released.stderr)
+            self.assertFalse((folder / "other").exists())
+            after_release = attempt("released")
+            self.assertEqual(after_release.returncode, 0, after_release.stderr)
+            self.assertEqual(events.read_text().splitlines(), ["no hold", "sole holder", "released"])
+
+    def test_wait_without_session_id_refuses_other_holder_until_release(self) -> None:
+        folder = self.scratch / "holders"
+        held = self.run_cli(folder, "hold", "--holder", "other", "--for", "other test")
+        self.assertEqual(held.returncode, 0, held.stderr)
+        blocked = self.run_cli(folder, "wait")
+        self.assertEqual(blocked.returncode, 10, blocked.stderr)
+        self.assertTrue((folder / "other").is_file())
+        released = self.run_cli(folder, "release", "--holder", "other")
+        self.assertEqual(released.returncode, 0, released.stderr)
+        self.assertEqual(self.run_cli(folder, "wait").returncode, 0)
 
     def test_overlapping_holders_share_one_cycle_and_next_hold_starts_another(self) -> None:
         folder = self.scratch / "holders"
@@ -1315,151 +1271,23 @@ class CommandTests(IsolatedBuildHoldTest):
             self.assertFalse((folder / "slot").exists())
 
 
-class ReleaseStateTests(IsolatedBuildHoldTest):
-    def begin(self, *session_ids: str, recipients: tuple[tuple[str, str], ...] = ()) -> datetime:
-        now = datetime.now().astimezone()
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "the test", build_hold.NoReleaseEta(), now)
-        build_hold.record_recipients([("shared name", session_id) for session_id in session_ids])
-        for session_id in session_ids:
-            self.assertIn("registered", build_hold.register_wait(session_id))
-        build_hold.record_recipients(list(recipients))
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        cycle["release_started_at"] = now.isoformat()
-        build_hold.save_cycle(cycle)
-        return now
 
-    def entries(self) -> list[build_hold.ReleaseEntry]:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        return cycle["entries"]
 
-    def advance(self, now: datetime) -> tuple[bool, str]:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        return build_hold.advance_release(cycle, now, clock=lambda: now)
 
-    def test_same_name_sessions_receive_distinct_direct_sends_in_one_pass(self) -> None:
-        now = self.begin("session-a", "session-b")
-        sent: list[tuple[str, str]] = []
 
-        def deliver(entry: build_hold.ReleaseEntry, socket: str) -> build_hold.ReleaseDelivered:
-            sent.append((entry["session_id"], socket))
-            return build_hold.ReleaseDelivered()
 
-        def socket_for(session_id: str) -> build_hold.RecipientLive:
-            return build_hold.RecipientLive(f"/tmp/{session_id}.sock")
 
-        with mock.patch.object(build_hold, "socket_for", side_effect=socket_for), \
-             mock.patch.object(build_hold, "send_release", side_effect=deliver):
-            complete, detail = self.advance(now)
-            self.assertFalse(complete)
-            self.assertEqual(sent, [("session-a", "/tmp/session-a.sock"), ("session-b", "/tmp/session-b.sock")])
-            self.assertEqual([entry["state"] for entry in self.entries()], ["ReleasedAwaitingAdmission"] * 2)
-            self.assertEqual(detail, "shared name [session-a]: ReleasedAwaitingAdmission; "
-                                     + "shared name [session-b]: ReleasedAwaitingAdmission")
-            self.assertIn("MemoryGateReturned", build_hold.mark_gate("session-a", "MemoryGateReturned", "Granted"))
-            status_output = io.StringIO()
-            with redirect_stdout(status_output):
-                self.assertEqual(build_hold.main(["status"]), 0)
-            self.assertIn("shared name [session-a]: MemoryGateReturned(Granted)\n"
-                          + "shared name [session-b]: ReleasedAwaitingAdmission\n", status_output.getvalue())
-            self.assertNotIn("next ", status_output.getvalue())
-            complete, detail = self.advance(now)
-            self.assertFalse(complete)
-            self.assertEqual(detail, "shared name [session-b]: ReleasedAwaitingAdmission")
-            self.assertEqual(len(sent), 2)
+HolderFileContent = TypedDict("HolderFileContent", {"holder": str, "since": str, "for": str, "release_eta": str})
 
-    def test_silent_session_ends_at_its_own_deadline_without_holding_others(self) -> None:
-        now = self.begin("first", "second")
-        sent: list[str] = []
 
-        def deliver(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
-            sent.append(entry["session_id"])
-            return build_hold.ReleaseDelivered()
 
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", side_effect=deliver):
-            _ = self.advance(now)
-            self.assertEqual(sent, ["first", "second"])
-            self.assertIn("MemoryGateReturned", build_hold.mark_gate("second", "MemoryGateReturned", "Granted"))
-            complete, detail = self.advance(now + timedelta(minutes=10))
-            self.assertFalse(complete)
-            self.assertEqual(detail, "shared name [first]: ReleasedAwaitingAdmission")
-            complete, _ = self.advance(now + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S))
-            self.assertTrue(complete)
-            self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.NoAdmissionAck(now))
-            self.assertFalse(self.entries()[0]["session_pending"])
-            self.assertEqual(sent, ["first", "second"])
 
-    def test_a_slow_memory_wait_does_not_hold_other_sessions(self) -> None:
-        now = self.begin("first", "second")
-        sent: list[str] = []
 
-        def deliver(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
-            sent.append(entry["session_id"])
-            return build_hold.ReleaseDelivered()
 
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", side_effect=deliver):
-            _ = self.advance(now)
-            _ = build_hold.mark_gate("first", "WaitingForMemory")
-            self.assertEqual(sent, ["first", "second"])
-            self.assertIn("MemoryGateReturned", build_hold.mark_gate("second", "MemoryGateReturned", "Granted"))
-            waiting = build_hold.aware_instant(self.entries()[0].get("wait_started_at", ""))
-            complete, detail = self.advance(waiting + timedelta(minutes=6))
-            self.assertFalse(complete)
-            self.assertEqual(detail, "shared name [first]: WaitingForMemory")
-            _ = build_hold.mark_gate("first", "MemoryGateReturned", "TimedOut")
-            returned = build_hold.aware_instant(self.entries()[0].get("wait_ended_at", ""))
-            complete, _ = self.advance(returned)
-            self.assertTrue(complete)
-            self.assertEqual(sent, ["first", "second"])
 
-    def test_memory_wait_counts_as_answered_after_its_turn(self) -> None:
-        now = self.begin("first", "second")
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
-            _ = self.advance(now)
-            _ = build_hold.mark_gate("first", "WaitingForMemory")
-            self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
-            waiting = build_hold.aware_instant(self.entries()[0].get("wait_started_at", ""))
-            deadline = waiting + timedelta(seconds=build_hold.MEMORY_WAIT_TURN_S)
-            _ = self.advance(deadline - timedelta(seconds=1))
-            self.assertEqual(self.entries()[0]["state"], "WaitingForMemory")
-            _ = self.advance(deadline)
-            self.assertEqual(self.entries()[0]["state"], "MemoryGateReturned")
 
-    def test_no_admission_ack_is_not_early(self) -> None:
-        now = self.begin("first", "second")
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
-            _ = self.advance(now)
-            released = build_hold.aware_instant(self.entries()[0].get("released_at", ""))
-            _ = self.advance(released + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1))
-            self.assertEqual([entry["state"] for entry in self.entries()], ["ReleasedAwaitingAdmission"] * 2)
-            complete, _ = self.advance(released + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S))
-            self.assertTrue(complete)
-            for entry in self.entries():
-                self.assertEqual(build_hold.read_release_state(entry), build_hold.NoAdmissionAck(released))
 
-    def test_unreadable_session_records_are_a_failed_delivery_not_a_gone_session(self) -> None:
-        now = self.begin("unknown", "next")
-
-        def socket_for(session_id: str) -> build_hold.RecipientLive | build_hold.RecipientLookupFailed:
-            if session_id == "unknown":
-                return build_hold.RecipientLookupFailed("sessions: one or more registry files could not be read")
-            return build_hold.RecipientLive("/tmp/next.sock")
-
-        errors = io.StringIO()
-        with mock.patch.object(build_hold, "socket_for", side_effect=socket_for), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send, redirect_stderr(errors):
-            _ = self.advance(now)
-        self.assertEqual(self.entries()[0]["state"], "DeliveryFailed")
-        self.assertEqual(self.entries()[1]["state"], "ReleasedAwaitingAdmission")
-        self.assertEqual(send.call_count, 1)
-        self.assertIn("one or more registry files could not be read", errors.getvalue())
-
+class ReleaseDeliveryTests(IsolatedBuildHoldTest):
     def test_a_lookup_is_tried_again_before_it_is_called_unavailable(self) -> None:
         def answers(*codes: int) -> list[subprocess.CompletedProcess[str]]:
             return [subprocess.CompletedProcess([], code, "/tmp/late.sock\n" if code == 0 else "",
@@ -1475,325 +1303,6 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             self.assertEqual(build_hold.socket_for("session-a"), build_hold.RecipientGone())
             sleep.assert_not_called()
 
-    def test_delivery_states_and_gone_recipient_advance_immediately(self) -> None:
-        now = self.begin("failed", "gone", "queued")
-        sockets = {"failed": build_hold.RecipientLive("/tmp/failed.sock"), "gone": build_hold.RecipientGone(), "queued": build_hold.RecipientLive("/tmp/queued.sock")}
-        def socket_for(session_id: str) -> build_hold.RecipientLive | build_hold.RecipientGone:
-            return sockets[session_id]
-
-        with mock.patch.object(build_hold, "socket_for", side_effect=socket_for), \
-             mock.patch.object(build_hold, "send_release", side_effect=[build_hold.ReleaseSendFailed("send failed"), build_hold.ReleaseQueued()]) as send:
-            _ = self.advance(now)
-            self.assertEqual(self.entries()[0]["state"], "DeliveryFailed")
-            self.assertEqual(self.entries()[1]["state"], "RecipientGone")
-            self.assertEqual(self.entries()[2]["state"], "DeliveryQueued")
-            self.assertEqual(send.call_count, 2)
-            output = io.StringIO()
-            with redirect_stdout(output):
-                self.assertEqual(build_hold.main(["status"]), 0)
-            for state in ("DeliveryFailed", "RecipientGone", "DeliveryQueued"):
-                self.assertIn(state, output.getvalue())
-            self.assertIn("MemoryGateReturned", build_hold.mark_gate("queued", "MemoryGateReturned", "MeminfoUnavailable"))
-            self.assertEqual(self.entries()[2].get("outcome"), "MeminfoUnavailable")
-
-    def test_registration_after_release_is_admitted_without_an_entry_or_message(self) -> None:
-        now = self.begin("first")
-        sent: list[str] = []
-
-        def deliver(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
-            sent.append(entry["session_id"])
-            return build_hold.ReleaseDelivered()
-
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", side_effect=deliver):
-            _ = self.advance(now)
-            build_hold.record_recipients([("late", "late")])
-            self.assertEqual(build_hold.register_wait("late"), "release under way; late builds now")
-            _ = build_hold.mark_gate("first", "MemoryGateReturned", "Granted")
-            returned = build_hold.aware_instant(self.entries()[0].get("wait_ended_at", ""))
-            complete, _ = self.advance(returned)
-            self.assertTrue(complete)
-            self.assertEqual(sent, ["first"])
-            self.assertEqual([entry["session_id"] for entry in self.entries()], ["first"])
-
-    def test_unregistered_recipient_is_released_with_the_registered_sessions(self) -> None:
-        now = self.begin("first", recipients=(("late name", "late"),))
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
-            _ = self.advance(now)
-            self.assertEqual([entry["session_id"] for entry in self.entries()], ["first", "late"])
-            self.assertEqual([entry["state"] for entry in self.entries()], ["ReleasedAwaitingAdmission"] * 2)
-            self.assertEqual(send.call_count, 2)
-            self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
-            self.assertIn("MemoryGateReturned", build_hold.mark_gate("first", "MemoryGateReturned", "Granted"))
-            complete, _ = self.advance(now)
-            self.assertTrue(complete)
-            self.assertEqual(send.call_count, 2)
-
-    def test_delivery_clock_starts_on_delivery_and_queue_clock_on_attempt(self) -> None:
-        now = self.begin("first")
-        current = now
-        outcome: build_hold.ReleaseDelivered | build_hold.ReleaseQueued | build_hold.ReleaseSendFailed = build_hold.ReleaseDelivered()
-
-        def clock() -> datetime:
-            return current
-
-        def deliver(_entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered | build_hold.ReleaseQueued | build_hold.ReleaseSendFailed:
-            nonlocal current
-            current += timedelta(seconds=40)
-            return outcome
-
-        # The turn clock is under test, so the whole-release limit stays out of its way.
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", side_effect=deliver), \
-             mock.patch.object(build_hold, "RELEASE_LIMIT_S", 2 * build_hold.NO_ADMISSION_ACK_S):
-            cycle = build_hold.read_cycle()
-            assert cycle is not None
-            _ = build_hold.advance_release(cycle, now, clock=clock)
-            self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.ReleasedAwaitingAdmission(now + timedelta(seconds=40)))
-            _ = build_hold.advance_release(cycle, now + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S), clock=clock)
-            self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
-            entry = cycle["entries"][0]
-            build_hold.store_release_state(entry, build_hold.AwaitingRelease())
-            entry["delivery"] = {"generation": 0, "outcome": "NotAttempted"}
-            build_hold.save_cycle(cycle)
-            current = now + timedelta(minutes=1)
-            outcome = build_hold.ReleaseQueued()
-            _ = build_hold.advance_release(cycle, current, clock=clock)
-            self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.DeliveryQueued(now + timedelta(minutes=1)))
-            build_hold.store_release_state(entry, build_hold.AwaitingRelease())
-            entry["delivery"] = {"generation": 0, "outcome": "NotAttempted"}
-            build_hold.save_cycle(cycle)
-            current = now + timedelta(minutes=2)
-            outcome = build_hold.ReleaseSendFailed("send failed")
-            _ = build_hold.advance_release(cycle, current, clock=clock)
-            self.assertEqual(build_hold.read_release_state(self.entries()[0]), build_hold.DeliveryFailed(now + timedelta(minutes=2)))
-
-    def test_malformed_release_instant_is_a_read_error(self) -> None:
-        _ = self.begin("first")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        for fields in ({}, {"released_at": "not an instant"}, {"released_at": datetime.now().isoformat()},
-                       {"released_at": datetime.now().astimezone().isoformat(), "attempted_at": datetime.now().astimezone().isoformat()}):
-            with self.subTest(fields=fields):
-                cycle["entries"][0] = cast(build_hold.ReleaseEntry, cast(object, {"session_id": "first", "name": "first", "state": "ReleasedAwaitingAdmission", **fields}))
-                build_hold.save_cycle(cycle)
-                with self.assertRaises(build_hold.ReleaseRecordReadError):
-                    _ = build_hold.read_cycle()
-
-    def test_status_keeps_holder_and_reports_damaged_release_record(self) -> None:
-        _ = self.begin("first")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        cycle["entries"][0] = build_hold.new_entry("first", "first")
-        cycle["entries"][0].update({"state": "ReleasedAwaitingAdmission", "released_at": "broken"})
-        build_hold.save_cycle(cycle)
-        path = self.scratch / "release" / cycle["id"] / "cycle.json"
-        before = path.read_bytes()
-        output = io.StringIO()
-        errors = io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors):
-            result = build_hold.main(["status"])
-        self.assertEqual(result, 0, errors.getvalue())
-        self.assertEqual(errors.getvalue(), "")
-        self.assertIn("holder since", output.getvalue())
-        self.assertIn("release record could not be read: invalid released_at for first", output.getvalue())
-        self.assertIn("/build:hold release sets it aside and ends the hold", output.getvalue())
-        self.assertEqual(path.read_bytes(), before)
-
-    def test_new_hold_replaces_damaged_cycle_when_no_holder_remains(self) -> None:
-        _ = self.begin("first")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        old_id = cycle["id"]
-        cycle["entries"][0] = build_hold.new_entry("first", "first")
-        cycle["entries"][0].update({"state": "ReleasedAwaitingAdmission", "released_at": "broken"})
-        build_hold.save_cycle(cycle)
-        (self.scratch / "holders" / "holder").unlink()
-        notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
-                                       build_hold.NoReleaseEta(), datetime.now().astimezone())
-        self.assertTrue(notice.startswith("natedev is held for new test."), notice)
-        current = build_hold.read_cycle()
-        assert current is not None
-        self.assertNotEqual(current["id"], old_id)
-        self.assertEqual(current["entries"], [])
-        self.assertTrue((self.scratch / "holders" / "new-holder").exists())
-
-    def test_new_hold_sets_aside_damaged_cycle_while_holder_remains(self) -> None:
-        _ = self.begin("first")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        cycle["entries"][0] = build_hold.new_entry("first", "first")
-        cycle["entries"][0].update({"state": "ReleasedAwaitingAdmission", "released_at": "broken"})
-        build_hold.save_cycle(cycle)
-        output = io.StringIO()
-        with redirect_stdout(output):
-            notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
-                                           build_hold.NoReleaseEta(), datetime.now().astimezone())
-        self.assertTrue(notice.startswith("natedev is held for new test."), notice)
-        self.assertIn("this hold now releases every session at once", output.getvalue() + notice)
-        self.assertIsNone(build_hold.read_cycle())
-        self.assertTrue((self.scratch / "holders" / "holder").exists())
-        self.assertTrue((self.scratch / "holders" / "new-holder").exists())
-
-    def test_resume_sets_aside_damaged_release_record_and_ends_hold(self) -> None:
-        _ = self.begin("first")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        cycle["entries"][0] = build_hold.new_entry("first", "first")
-        cycle["entries"][0].update({"state": "ReleasedAwaitingAdmission", "released_at": "broken"})
-        build_hold.save_cycle(cycle)
-        output = io.StringIO()
-        errors = io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors):
-            result = build_hold.main(["release", "--resume"])
-        self.assertEqual(result, 0, errors.getvalue())
-        self.assertIn("this hold now releases every session at once", output.getvalue())
-        self.assertIn("released, builds may resume.", output.getvalue())
-        self.assertFalse((self.scratch / "holders" / "holder").exists())
-
-    def test_old_cycle_registration_and_mark_do_not_reach_new_hold(self) -> None:
-        _ = self.begin("old-session")
-        old_cycle = build_hold.read_cycle()
-        assert old_cycle is not None
-        (self.scratch / "holders" / "holder").unlink()
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new test",
-                                  build_hold.NoReleaseEta(), datetime.now().astimezone())
-        current = build_hold.read_cycle()
-        assert current is not None
-        self.assertNotEqual(current["id"], old_cycle["id"])
-        self.assertEqual(current["entries"], [])
-        self.assertEqual(build_hold.mark_gate("old-session", "MemoryGateReturned", "Granted"), "mark ignored")
-        self.assertIn("registered", build_hold.register_wait("new-session"))
-        self.assertEqual([entry["session_id"] for entry in self.entries()], ["new-session"])
-
-    def test_empty_roster_waits_for_named_registration_timeout(self) -> None:
-        now = self.begin()
-        complete, detail = self.advance(now + timedelta(seconds=build_hold.NO_REGISTRATION_S - 1))
-        self.assertFalse(complete)
-        self.assertIn("waiting for registrations", detail)
-        complete, detail = self.advance(now + timedelta(seconds=build_hold.NO_REGISTRATION_S))
-        self.assertTrue(complete)
-        self.assertIn("NoRegistration", detail)
-
-    def test_recorded_recipient_without_wait_is_told_and_holds_nothing(self) -> None:
-        now = self.begin(recipients=(("late name", "missing-session"),))
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
-            complete, detail = self.advance(now)
-            self.assertTrue(complete, detail)
-            self.assertIn("late name", detail)
-            self.assertEqual(self.entries()[0]["state"], "ReleasedAwaitingAdmission")
-            self.assertFalse(self.entries()[0]["session_pending"])
-            send.assert_called_once()
-
-    def test_registration_waits_for_release_lock(self) -> None:
-        _ = self.begin()
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        cycle["release_started_at"] = ""
-        build_hold.save_cycle(cycle)
-        started = threading.Event()
-        finished = threading.Event()
-
-        def register() -> None:
-            started.set()
-            _ = build_hold.register_wait("late")
-            finished.set()
-
-        with build_hold.release_lock():
-            worker = threading.Thread(target=register)
-            worker.start()
-            self.assertTrue(started.wait(1))
-            self.assertFalse(finished.wait(0.1))
-            self.assertEqual(self.entries(), [])
-        worker.join(timeout=1)
-        self.assertFalse(worker.is_alive())
-        self.assertTrue(finished.is_set())
-        self.assertEqual([entry["session_id"] for entry in self.entries()], ["late"])
-
-    def test_overlapping_holder_instants_survive_file_removal(self) -> None:
-        folder = self.scratch / "holders"
-        now = datetime.now().astimezone()
-        first_since = now - timedelta(minutes=10)
-        second_since = now - timedelta(minutes=5)
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("first", "first"), "first test", build_hold.NoReleaseEta(), first_since)
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("second", "second"), "second test", build_hold.NoReleaseEta(), second_since)
-        partial = build_hold.release_cycle(folder, "first")
-        self.assertIn("still held by second", partial)
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        self.assertEqual(cycle["holders"]["first"]["since"], first_since.isoformat())
-        self.assertTrue(cycle["holders"]["first"]["released_at"])
-        self.assertEqual(cycle["holders"]["second"]["since"], second_since.isoformat())
-        cycle["release_started_at"] = (now - timedelta(minutes=2)).isoformat()
-        build_hold.save_cycle(cycle)
-        final = build_hold.release_cycle(folder, "second")
-        self.assertIn("builds may resume", final)
-        after = build_hold.read_cycle()
-        assert after is not None
-        self.assertTrue(after["holders"]["second"]["released_at"])
-        self.assertFalse((folder / "second").exists())
-
-    def test_resumed_release_finishes_and_clears_last_holder(self) -> None:
-        now = self.begin("first")
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        cycle["holders"]["holder"]["released_at"] = (now - timedelta(minutes=2)).isoformat()
-        cycle["entries"][0] = build_hold.new_entry("first", "shared name")
-        build_hold.store_release_state(cycle["entries"][0], build_hold.MemoryGateReturned(now, "Granted"))
-        cycle["entries"][0]["session_pending"] = False
-        cycle["entries"][0]["delivery"] = {"generation": cycle.get("holder_generation", 1), "outcome": "Delivered"}
-        build_hold.save_cycle(cycle)
-        output = io.StringIO()
-        with redirect_stdout(output):
-            status = build_hold.main(["release", "--resume"])
-        self.assertEqual(status, 0)
-        self.assertIn("builds may resume", output.getvalue())
-        self.assertFalse((self.scratch / "holders" / "holder").exists())
-
-    def test_lookup_and_send_use_session_id_socket(self) -> None:
-        calls: list[list[str]] = []
-
-        def command(argv: list[str], *, capture_output: bool, text: bool) -> subprocess.CompletedProcess[str]:
-            self.assertTrue(capture_output)
-            self.assertTrue(text)
-            calls.append(argv)
-            if "sessions.py" in argv[1]:
-                return subprocess.CompletedProcess(argv, 0, "/tmp/registered.sock\n", "")
-            return subprocess.CompletedProcess(argv, 0, "sent\n", "")
-
-        entry = build_hold.new_entry("session-a", "shared name")
-        with mock.patch.object(subprocess, "run", side_effect=command):
-            socket = build_hold.socket_for("session-a")
-            self.assertEqual(socket, build_hold.RecipientLive("/tmp/registered.sock"))
-            assert isinstance(socket, build_hold.RecipientLive)
-            self.assertEqual(build_hold.send_release(entry, socket.socket), build_hold.ReleaseDelivered())
-        self.assertEqual(calls[0][-2:], ["socket", "session:session-a"])
-        self.assertIn("--to", calls[1])
-        self.assertEqual(calls[1][calls[1].index("--to") + 1], "uds:/tmp/registered.sock")
-        self.assertNotIn("shared name", calls[1])
-        notice = calls[1][calls[1].index("--text") + 1]
-        self.assertTrue(notice.startswith("/build:hold: your hold has been released."), notice)
-        self.assertIn("build_hold.py nothing-to-build", notice)
-
-    def test_a_session_only_told_gets_a_notice_that_asks_for_no_answer(self) -> None:
-        entry = build_hold.new_entry("session-a", "shared name")
-        notices: list[str] = []
-
-        def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            notices.append(arguments[-1])
-            return subprocess.CompletedProcess(arguments, 0, "", "")
-
-        with mock.patch.object(subprocess, "run", side_effect=run):
-            entry["session_pending"] = False
-            _ = build_hold.send_release(entry, "/test/socket")
-            entry["session_pending"] = True
-            _ = build_hold.send_release(entry, "/test/socket")
-        self.assertIn("may resume", notices[0])
-        self.assertIn("no answer is needed", notices[0])
-        self.assertNotIn("nothing-to-build", notices[0])
-        self.assertIn("build_hold.py nothing-to-build", notices[1])
 
     def test_send_exit_codes_have_named_delivery_results(self) -> None:
         entry = build_hold.new_entry("session-a", "shared name")
@@ -1810,6 +1319,7 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
             self.assertEqual(build_hold.send_release(entry, "/test/socket"),
                              build_hold.ReleaseSendFailed("send unavailable"))
 
+
     def test_empty_or_unavailable_socket_lookup_has_named_results(self) -> None:
         with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             self.assertEqual(build_hold.socket_for("session-a"), build_hold.RecipientGone())
@@ -1817,1120 +1327,14 @@ class ReleaseStateTests(IsolatedBuildHoldTest):
              mock.patch.object(time, "sleep"):
             self.assertEqual(build_hold.socket_for("session-a"), build_hold.RecipientLookupFailed("lookup unavailable"))
 
-    def test_nothing_to_build_ends_only_that_sessions_turn(self) -> None:
-        now = self.begin("first", "second")
-        sent: list[str] = []
 
-        def deliver(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
-            sent.append(entry["session_id"])
-            return build_hold.ReleaseDelivered()
-
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", side_effect=deliver):
-            _ = self.advance(now)
-            self.assertEqual(sent, ["first", "second"])
-            answered = subprocess.run(
-                ["python3", str(SCRIPT), "nothing-to-build"], capture_output=True, text=True, check=False,
-                env={**os.environ, "CLAUDE_CODE_SESSION_ID": "first"},
-            )
-            self.assertEqual(answered.returncode, 0, answered.stderr)
-            self.assertEqual(answered.stdout.strip(),
-                             "shared name [first]: NothingToBuild; the release stops waiting for this session")
-            self.assertEqual(set(self.entries()[0]), {"session_id", "name", "state", "answered_at", "calls", "active_call_id", "active_released_at", "session_pending", "session_admitted_generation", "delivery"})
-            _ = build_hold.aware_instant(self.entries()[0].get("answered_at", ""))
-            complete, detail = self.advance(now)
-            self.assertFalse(complete)
-            self.assertEqual(detail, "shared name [second]: ReleasedAwaitingAdmission")
-            self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("second").text)
-            complete, detail = self.advance(now)
-            self.assertTrue(complete)
-            self.assertEqual(sent, ["first", "second"])
-            self.assertEqual(detail, "shared name [first]: NothingToBuild; shared name [second]: NothingToBuild")
-
-    def test_nothing_to_build_refuses_only_while_the_release_waits_on_something_else(self) -> None:
-        now = self.begin("first", "second")
-        self.assertEqual(build_hold.answer_nothing_to_build("second"), build_hold.AnswerRefused(
-            "nothing-to-build refused: the release notice has not reached this session yet; "
-            + "answer it when it comes: shared name [second]: AwaitingRelease"))
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()):
-            _ = self.advance(now)
-        self.assertEqual(build_hold.answer_nothing_to_build("unregistered"),
-                         build_hold.AnswerTaken("the release does not wait for this session: it is not registered"))
-        self.assertIn("WaitingForMemory", build_hold.mark_gate("first", "WaitingForMemory"))
-        self.assertEqual(build_hold.answer_nothing_to_build("first"), build_hold.AnswerRefused(
-            "nothing-to-build refused: a build of this session is in its memory gate, "
-            + "and the release waits on that gate: shared name [first]: WaitingForMemory"))
-        self.assertEqual([entry["state"] for entry in self.entries()], ["WaitingForMemory", "ReleasedAwaitingAdmission"])
-        self.assertIsInstance(build_hold.answer_nothing_to_build(""), build_hold.AnswerRefused)
-
-    def test_a_queued_release_can_answer_nothing_to_build(self) -> None:
-        now = self.begin("first", "second")
-        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/tmp/socket")), \
-             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseQueued()):
-            _ = self.advance(now)
-            self.assertEqual(self.entries()[0]["state"], "DeliveryQueued")
-            self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("first").text)
-            _ = self.advance(now)
-        self.assertEqual([entry["state"] for entry in self.entries()], ["NothingToBuild", "DeliveryQueued"])
-
-
-class ReleaseTestMocks(TypedDict):
-    lookup: mock.Mock
-    send: mock.Mock
-
-
-class ClosedQueueTests(IsolatedBuildHoldTest):
-    now: datetime = datetime.min
-    release_mocks: ReleaseTestMocks = {"lookup": mock.Mock(), "send": mock.Mock()}
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.now = datetime.now().astimezone() - timedelta(hours=1)
-        self.release_mocks = {
-            "lookup": cast(mock.Mock, self.enterContext(mock.patch.object(
-                build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))),
-            "send": cast(mock.Mock, self.enterContext(mock.patch.object(
-                build_hold, "send_release", return_value=build_hold.ReleaseDelivered()))),
-        }
-
-    def cycle(self) -> build_hold.HoldCycle:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        return cycle
-
-    def begin(self, *keys: str, calls: tuple[tuple[str, str], ...] = (), release: bool = True) -> None:
-        (self.scratch / "holders" / "holder").unlink(missing_ok=True)
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "closed queue test",
-                                  build_hold.NoReleaseEta(), self.now)
-        build_hold.record_recipients([(key, key) for key in keys])
-        for key in keys:
-            _ = build_hold.register_wait(key)
-        for key, call_id in calls:
-            _ = build_hold.register_wait(key, call_id=call_id)
-        if release:
-            self.start_release()
-        self.release_mocks["lookup"].reset_mock()
-        self.release_mocks["send"].reset_mock()
-
-    def start_release(self) -> None:
-        cycle = self.cycle()
-        cycle["release_started_at"] = self.now.isoformat()
-        build_hold.save_cycle(cycle)
-
-    def entry(self, key: str) -> build_hold.ReleaseEntry:
-        return next(entry for entry in self.cycle()["entries"] if entry["session_id"] == key)
-
-    def record_bytes(self) -> bytes:
-        return (self.scratch / "release" / self.cycle()["id"] / "cycle.json").read_bytes()
-
-    def set_state(self, key: str, state: build_hold.ReleaseState, *, pending: bool = False) -> None:
-        cycle = self.cycle()
-        entry = next(entry for entry in cycle["entries"] if entry["session_id"] == key)
-        build_hold.store_release_state(entry, state)
-        entry["session_pending"] = pending
-        build_hold.save_cycle(cycle)
-
-    def mark(self, key: str, state: str, call_id: str = "") -> str:
-        with mock.patch.object(build_hold, "datetime", wraps=datetime) as clock:
-            cast(mock.Mock, clock.now).return_value = self.now
-            return build_hold.mark_gate(key, state, "Granted", call_id=call_id, cycle_id=self.cycle()["id"])
-
-    def advance(self) -> tuple[bool, str]:
-        return build_hold.advance_release(self.cycle(), self.now, clock=lambda: self.now)
-
-    def sent(self) -> list[str]:
-        calls = cast(list[tuple[tuple[build_hold.ReleaseEntry, str], dict[str, object]]],
-                     self.release_mocks["send"].call_args_list)
-        return [arguments[0]["session_id"] for arguments, _keywords in calls]
-
-    def test_calls_arriving_through_a_whole_release_never_extend_it(self) -> None:
-        self.begin("first", "second", "third")
-        started = self.now
-        limit = build_hold.RELEASE_POLL_S
-        complete = False
-        poll = 0
-        while (self.now - started).total_seconds() <= limit:
-            complete, _ = self.advance()
-            for entry in self.cycle()["entries"]:
-                if entry["state"] in ("ReleasedAwaitingAdmission", "DeliveryQueued"):
-                    self.assertIn("MemoryGateReturned", self.mark(entry["session_id"], "MemoryGateReturned"))
-            before = self.cycle()
-            entries = len(before["entries"])
-            calls = sum(len(entry["calls"]) for entry in before["entries"])
-            for key in (f"new-{poll}", "first", "third"):
-                call_id = f"late-{key}-{poll}"
-                _ = build_hold.register_wait(key, call_id=call_id)
-                answer = build_hold.read_admission(key, call_id)
-                self.assertIsInstance(answer, build_hold.AdmittedTurn,
-                                      f"poll {poll}, {key}: {answer}; entries {entries}, calls {calls}")
-            after = self.cycle()
-            self.assertEqual(len(after["entries"]), entries)
-            self.assertEqual(sum(len(entry["calls"]) for entry in after["entries"]), calls)
-            if complete:
-                break
-            poll += 1
-            self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        elapsed = (self.now - started).total_seconds()
-        print(f"Closed release: {elapsed:.1f} seconds, {poll + 1} polls, {len(self.sent())} messages")
-        self.assertTrue(complete, f"Release still open after {elapsed:.1f} seconds")
-        self.assertEqual(self.sent(), ["first", "second", "third"])
-        with mock.patch.object(build_hold, "datetime", wraps=datetime) as clock, \
-             mock.patch.object(time, "sleep", side_effect=AssertionError("Release should be complete")):
-            cast(mock.Mock, clock.now).return_value = self.now
-            _ = build_hold.release_cycle(self.scratch / "holders", "holder")
-        self.assertFalse((self.scratch / "holders" / "holder").exists())
-
-    def test_late_call_from_a_new_key_leaves_the_record_bytes_unchanged(self) -> None:
-        self.begin("owner")
-        before = self.record_bytes()
-        self.assertEqual(build_hold.register_wait("late", call_id="late-call"),
-                         "release under way; late builds now")
-        self.assertIsInstance(build_hold.read_admission("late", "late-call"), build_hold.AdmittedTurn)
-        self.assertEqual(self.record_bytes(), before)
-
-    def test_late_call_is_admitted_after_each_finished_state(self) -> None:
-        states: tuple[build_hold.ReleaseState, ...] = (
-            build_hold.NothingToBuild(self.now), build_hold.MemoryGateReturned(self.now, "Granted"),
-            build_hold.NoAdmissionAck(self.now), build_hold.NoRegistration(), build_hold.NoPendingTurn(),
-            build_hold.RecipientGone(), build_hold.DeliveryFailed(self.now))
-        for state in states:
-            with self.subTest(state=type(state).__name__):
-                self.begin("owner", "peer")
-                self.set_state("owner", state)
-                before = self.cycle()
-                _ = build_hold.register_wait("owner", call_id="late-call")
-                self.assertIsInstance(build_hold.read_admission("owner", "late-call"), build_hold.AdmittedTurn)
-                self.assertEqual(self.cycle(), before)
-
-    def test_second_call_from_a_queued_session_builds_at_once_and_its_turn_stays(self) -> None:
-        self.begin("first", "second", calls=(("second", "waiting-call"),))
-        before = self.record_bytes()
-        _ = build_hold.register_wait("second", call_id="late-call")
-        self.assertIsInstance(build_hold.read_admission("second", "late-call"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("second", "waiting-call"), build_hold.AwaitingTurn)
-        self.assertIsInstance(build_hold.read_admission("second"), build_hold.AwaitingTurn)
-        self.assertEqual(self.record_bytes(), before)
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second"])
-        self.assertEqual(self.entry("second")["active_call_id"], "waiting-call")
-        self.assertIsInstance(build_hold.read_admission("second", "waiting-call"), build_hold.AdmittedTurn)
-
-    def test_second_call_during_a_bound_turn_builds_at_once_and_adds_no_turn(self) -> None:
-        self.begin("owner", "peer", calls=(("owner", "first-call"),))
-        _ = self.advance()
-        before = self.record_bytes()
-        _ = build_hold.register_wait("owner", call_id="second-call")
-        self.assertIsInstance(build_hold.read_admission("owner", "second-call"), build_hold.AdmittedTurn)
-        self.assertEqual(self.record_bytes(), before)
-        self.assertEqual(self.sent(), ["owner", "peer"])
-        _ = self.mark("owner", "MemoryGateReturned", "first-call")
-        self.assertEqual(self.advance(), (False, "peer [peer]: ReleasedAwaitingAdmission"))
-        self.assertEqual(self.sent(), ["owner", "peer"])
-        self.assertNotIn("second-call", [call["call_id"] for call in self.entry("owner")["calls"]])
-
-    def test_call_into_an_open_turn_still_takes_it(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("owner", "peer")
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                          else build_hold.ReleaseDelivered())
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["owner", "peer"])
-                self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AwaitingTurn)
-                self.assertIn("registered", build_hold.register_wait("owner", call_id="new-call"))
-                self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AdmittedTurn)
-                self.assertEqual(self.entry("owner")["active_call_id"], "new-call")
-                _ = self.mark("owner", "MemoryGateReturned", "new-call")
-                _ = self.advance()
-                self.assertEqual(self.entry("owner")["state"], "MemoryGateReturned")
-                self.assertEqual(self.entry("owner")["active_call_id"], "")
-                self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_call_registered_during_the_hold_keeps_its_turn(self) -> None:
-        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
-        _ = self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "first"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AwaitingTurn)
-        _ = self.mark("owner", "MemoryGateReturned", "first")
-        _ = self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
-        _ = self.mark("owner", "MemoryGateReturned", "second")
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.sent(), ["owner"])
-
-    def test_a_silent_session_holds_the_release_one_limit_however_many_calls_it_queued(self) -> None:
-        """Queued calls that never reach their memory gate end with the first lapse, not one lapse each."""
-        self.begin("owner", "peer", calls=(("owner", "first"), ("owner", "second"), ("owner", "third")))
-        started = self.now
-        _ = self.advance()
-        self.assertEqual(self.entry("owner")["active_call_id"], "first")
-        _ = self.mark("peer", "MemoryGateReturned")
-        self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
-        for call_id in ("second", "third"):
-            self.assertIsInstance(build_hold.read_admission("owner", call_id), build_hold.AdmittedTurn)
-        self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_nothing_to_build_ends_a_turn_whose_call_never_started(self) -> None:
-        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
-        _ = self.advance()
-        self.assertEqual(self.entry("owner")["active_call_id"], "first")
-        self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("owner").text)
-        self.assertTrue(self.advance()[0])
-        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
-
-    def test_a_session_build_ends_a_turn_whose_call_never_started(self) -> None:
-        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
-        _ = self.advance()
-        self.assertEqual(self.entry("owner")["active_call_id"], "first")
-        self.assertIn("WaitingForMemory", self.mark("owner", "WaitingForMemory"))
-        self.assertIn("MemoryGateReturned", self.mark("owner", "MemoryGateReturned"))
-        self.assertTrue(self.advance()[0])
-        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
-
-    def test_an_app_launch_leaves_the_turn_a_queued_run_holds(self) -> None:
-        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
-        _ = self.advance()
-        before = self.record_bytes()
-        self.assertEqual(build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", launch=True), "mark ignored")
-        self.assertEqual(self.record_bytes(), before)
-        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AwaitingTurn)
-
-    def test_the_release_ends_at_its_limit_however_many_turns_a_silent_session_gets(self) -> None:
-        """A session gets a new turn, with no new notice, for each run it queued; the release limit bounds them all."""
-        self.begin("owner", "peer", calls=(("owner", "first"), ("owner", "second"), ("owner", "third")))
-        started = self.now
-        _ = self.advance()
-        _ = build_hold.answer_nothing_to_build("peer")
-        self.now += timedelta(minutes=5)
-        _ = self.mark("owner", "MemoryGateReturned", "first")
-        _ = self.advance()
-        self.assertEqual(self.entry("owner")["active_call_id"], "second")
-        self.now = started + timedelta(seconds=build_hold.RELEASE_LIMIT_S - 1)
-        self.assertFalse(self.advance()[0])
-        self.now += timedelta(seconds=1)
-        complete, detail = self.advance()
-        self.assertTrue(complete)
-        self.assertEqual(build_hold.read_release_state(self.entry("owner")),
-                         build_hold.NoAdmissionAck(started + timedelta(minutes=5)))
-        self.assertTrue(detail.endswith(". No answer, counted as released: owner"), detail)
-        self.assertIsInstance(build_hold.read_admission("owner", "third"), build_hold.AdmittedTurn)
-        self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_nothing_to_build_after_a_finished_turn_ends_the_turns_still_queued(self) -> None:
-        self.begin("owner", calls=(("owner", "first"), ("owner", "second")))
-        _ = self.advance()
-        _ = self.mark("owner", "MemoryGateReturned", "first")
-        self.assertEqual(build_hold.answer_nothing_to_build("owner"), build_hold.AnswerTaken(
-            "owner [owner]: NothingToBuild; the release stops waiting for this session"))
-        self.assertTrue(self.advance()[0])
-        self.assertIsInstance(build_hold.read_admission("owner", "second"), build_hold.AdmittedTurn)
-        self.assertEqual(build_hold.answer_nothing_to_build("owner"), build_hold.AnswerTaken(
-            "the release does not wait for this session: owner [owner]: NothingToBuild"))
-
-    def test_a_build_in_its_memory_gate_keeps_its_own_limit_past_the_release_limit(self) -> None:
-        self.begin("owner", "peer")
-        started = self.now
-        _ = self.advance()
-        self.assertIn("WaitingForMemory", self.mark("owner", "WaitingForMemory"))
-        self.now = started + timedelta(seconds=build_hold.RELEASE_LIMIT_S)
-        complete, detail = self.advance()
-        self.assertFalse(complete)
-        self.assertEqual(detail, "owner [owner]: WaitingForMemory")
-        self.assertEqual(build_hold.read_release_state(self.entry("peer")), build_hold.NoAdmissionAck(started))
-        self.assertIn("MemoryGateReturned", self.mark("owner", "MemoryGateReturned"))
-        complete, detail = self.advance()
-        self.assertTrue(complete)
-        self.assertTrue(detail.endswith(". No answer, counted as released: peer"), detail)
-
-    def test_a_refused_nothing_to_build_exits_non_zero(self) -> None:
-        self.begin("owner")
-        environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
-        refused = subprocess.run(["python3", str(SCRIPT), "nothing-to-build"], capture_output=True, text=True,
-                                 check=False, env=environment)
-        self.assertEqual((refused.returncode, refused.stdout), (1, ""))
-        self.assertIn("CLAUDE_CODE_SESSION_ID is not set", refused.stderr)
-
-    def test_session_wait_after_the_release_began_adds_no_entry(self) -> None:
-        self.begin("owner")
-        before = self.record_bytes()
-        self.assertEqual(build_hold.register_wait("late"), "release under way; late builds now")
-        self.assertEqual(self.record_bytes(), before)
-
-    def test_wait_line_agrees_with_the_admission_answer(self) -> None:
-        for case in ("new", "served", "queued-session", "bound-session", "late-call", "listed-call"):
-            with self.subTest(case=case):
-                self.begin("owner", "peer", calls=(("owner", "active"), ("peer", "waiting")))
-                if case not in ("queued-session", "listed-call"):
-                    _ = self.advance()
-                key, call_id = "owner", ""
-                if case == "new":
-                    key = "unknown"
-                elif case == "served":
-                    self.set_state("owner", build_hold.NoAdmissionAck(self.now))
-                    cycle = self.cycle()
-                    cycle["entries"][0]["active_call_id"] = ""
-                    build_hold.save_cycle(cycle)
-                elif case in ("queued-session", "late-call", "listed-call"):
-                    key = "peer"
-                    call_id = "late" if case == "late-call" else "waiting" if case == "listed-call" else ""
-                before = self.cycle()
-                answer = build_hold.read_admission(key, call_id)
-                admitted = case in ("new", "served", "bound-session", "late-call")
-                self.assertIsInstance(answer, build_hold.AdmittedTurn if admitted else build_hold.AwaitingTurn)
-                line = build_hold.register_wait(key, call_id=call_id)
-                ending = "builds now" if admitted else "keeps its queued turn"
-                self.assertEqual(line, f"release under way; {key} {ending}")
-                self.assertEqual(build_hold.read_admission(key, call_id), answer)
-                self.assertEqual(self.cycle(), before)
-
-    def test_launch_from_a_served_or_unknown_session_is_admitted(self) -> None:
-        self.begin("owner", "peer")
-        self.set_state("owner", build_hold.NoAdmissionAck(self.now))
-        for key in ("owner", "unknown"):
-            with self.subTest(key=key):
-                self.assertIsInstance(build_hold.read_admission(key), build_hold.AdmittedTurn)
-
-    def test_launch_from_a_queued_session_waits_for_its_turn(self) -> None:
-        self.begin("owner", "peer")
-        self.assertIsInstance(build_hold.read_admission("peer"), build_hold.AwaitingTurn)
-        before = self.record_bytes()
-        self.assertEqual(build_hold.register_wait("peer"), "release under way; peer keeps its queued turn")
-        self.assertEqual(self.record_bytes(), before)
-        _ = self.advance()
-        self.assertIsInstance(build_hold.read_admission("peer"), build_hold.AdmittedTurn)
-
-    def test_recipient_recorded_after_the_release_began_gets_no_turn(self) -> None:
-        self.begin("owner")
-        before = self.record_bytes()
-        build_hold.record_recipients([("late name", "late")])
-        self.assertEqual(self.record_bytes(), before)
-        _ = self.advance()
-        _ = build_hold.answer_nothing_to_build("owner")
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.sent(), ["owner"])
-
-    def test_holder_joining_during_a_release_reopens_the_queue(self) -> None:
-        self.begin("owner")
-        generation = self.cycle().get("holder_generation", 1)
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "new hold",
-                                  build_hold.NoReleaseEta(), self.now + timedelta(seconds=1))
-        self.assertEqual(self.cycle()["release_started_at"], "")
-        self.assertGreater(self.cycle().get("holder_generation", 1), generation)
-        self.assertIsInstance(build_hold.read_admission("late", "new-call"), build_hold.AwaitingTurn)
-        self.assertIn("registered", build_hold.register_wait("late", call_id="new-call"))
-        self.assertEqual(self.entry("late")["calls"][0]["call_id"], "new-call")
-
-    def test_before_the_release_begins_every_answer_is_unchanged(self) -> None:
-        for case in ("new", "served", "queued", "missing-call", "dead-call", "listed-call", "open", "active",
-                     "admitted-call", "admitted-session", "queued-open", "memory", "active-launch", "dead-open"):
-            with self.subTest(case=case):
-                self.begin("owner", "peer", calls=(("owner", "call"),), release=False)
-                key, call_id = "owner", ""
-                cycle = self.cycle()
-                entry = cycle["entries"][0]
-                if case == "new":
-                    key = "unknown"
-                elif case == "served":
-                    build_hold.store_release_state(entry, build_hold.NoAdmissionAck(self.now))
-                    entry["session_pending"] = False
-                elif case in ("missing-call", "dead-call", "listed-call", "active"):
-                    call_id = "missing" if case == "missing-call" else "call"
-                    if case == "dead-call":
-                        entry["calls"][0]["proc_start"] = "gone-process"
-                    if case == "active":
-                        entry["active_call_id"] = "call"
-                        build_hold.store_release_state(entry, build_hold.ReleasedAwaitingAdmission(self.now))
-                elif case in ("open", "queued-open", "memory", "dead-open"):
-                    entry["delivery"] = {"generation": cycle.get("holder_generation", 1), "outcome": "Delivered"}
-                    if case == "dead-open":
-                        call_id = "call"
-                        entry["calls"][0]["proc_start"] = "gone-process"
-                    else:
-                        entry["calls"] = []
-                    state = (build_hold.WaitingForMemory(self.now, self.now) if case == "memory"
-                             else build_hold.DeliveryQueued(self.now) if case == "queued-open"
-                             else build_hold.ReleasedAwaitingAdmission(self.now))
-                    build_hold.store_release_state(entry, state)
-                elif case == "admitted-call":
-                    call_id = "call"
-                    entry["calls"][0]["admitted_generation"] = cycle.get("holder_generation", 1)
-                elif case == "admitted-session":
-                    entry["session_admitted_generation"] = cycle.get("holder_generation", 1)
-                elif case == "active-launch":
-                    entry["active_call_id"] = "call"
-                    build_hold.store_release_state(entry, build_hold.ReleasedAwaitingAdmission(self.now))
-                build_hold.save_cycle(cycle)
-                expected = (build_hold.AdmittedTurn if case in
-                            ("open", "active", "admitted-call", "admitted-session", "queued-open", "memory")
-                            else build_hold.AwaitingTurn)
-                self.assertIsInstance(build_hold.read_admission(key, call_id), expected)
-
-    def test_marks_from_a_late_call_leave_the_record_unchanged(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("owner")
-                self.set_state("owner", build_hold.NoAdmissionAck(self.now))
-                cycle = self.cycle()
-                cycle["entries"][0]["delivery"] = {
-                    "generation": cycle.get("holder_generation", 1),
-                    "outcome": "QueuedUnconfirmed" if queued else "Delivered"}
-                build_hold.save_cycle(cycle)
-                before = self.record_bytes()
-                expected = self.cycle()
-                for state in ("WaitingForMemory", "MemoryGateReturned"):
-                    self.assertEqual(self.mark("owner", state, "late-call"), "mark ignored")
-                build_hold.remove_call("owner", "late-call")
-                if queued:
-                    expected["entries"][0]["delivery"]["outcome"] = "Delivered"
-                    self.assertEqual(self.cycle(), expected)
-                else:
-                    self.assertEqual(self.record_bytes(), before)
-
-    def test_session_mark_cannot_reopen_a_gone_or_failed_turn(self) -> None:
-        for state in (build_hold.RecipientGone(), build_hold.DeliveryFailed(self.now)):
-            with self.subTest(state=type(state).__name__):
-                self.begin("owner", "peer")
-                self.set_state("owner", state)
-                cycle = self.cycle()
-                cycle["entries"][0]["delivery"] = {
-                    "generation": cycle.get("holder_generation", 1),
-                    "outcome": "RecipientGone" if isinstance(state, build_hold.RecipientGone) else "DeliveryFailed"}
-                build_hold.save_cycle(cycle)
-                for mark in ("WaitingForMemory", "MemoryGateReturned"):
-                    self.assertEqual(self.mark("owner", mark), "mark ignored")
-                    self.assertEqual(build_hold.read_release_state(self.entry("owner")), state)
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["peer"])
-
-    def test_bound_call_mark_still_moves_a_gone_or_failed_turn(self) -> None:
-        for state in (build_hold.RecipientGone(), build_hold.DeliveryFailed(self.now)):
-            with self.subTest(state=type(state).__name__):
-                self.begin("owner", "peer", calls=(("owner", "active"),))
-                cycle = self.cycle()
-                entry = cycle["entries"][0]
-                entry["active_call_id"] = "active"
-                entry["active_released_at"] = self.now.isoformat()
-                entry["delivery"] = {
-                    "generation": cycle.get("holder_generation", 1),
-                    "outcome": "RecipientGone" if isinstance(state, build_hold.RecipientGone) else "DeliveryFailed"}
-                build_hold.store_release_state(entry, state)
-                build_hold.save_cycle(cycle)
-                self.assertIn("WaitingForMemory", self.mark("owner", "WaitingForMemory", "active"))
-                self.assertIn("MemoryGateReturned", self.mark("owner", "MemoryGateReturned", "active"))
-
-    def test_memory_wait_ends_at_the_next_poll_when_its_session_left(self) -> None:
-        self.begin("owner", "peer")
-        _ = self.advance()
-        _ = self.mark("owner", "WaitingForMemory")
-        delivery = self.entry("owner")["delivery"].copy()
-        def lookup(key: str) -> build_hold.RecipientGone | build_hold.RecipientLive:
-            return build_hold.RecipientGone() if key == "owner" else build_hold.RecipientLive("/test/socket")
-
-        self.release_mocks["lookup"].side_effect = lookup
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        _ = self.advance()
-        self.assertEqual(self.entry("owner")["state"], "RecipientGone")
-        self.assertFalse(self.entry("owner")["session_pending"])
-        self.assertEqual(self.entry("owner")["delivery"], delivery)
-        self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_memory_wait_ends_at_the_next_poll_when_its_call_process_is_gone(self) -> None:
-        self.begin("owner", "peer", calls=(("owner", "active"),))
-        _ = self.advance()
-        _ = self.mark("owner", "WaitingForMemory", "active")
-        cycle = self.cycle()
-        cycle["entries"][0]["calls"][0]["proc_start"] = "gone-process"
-        build_hold.save_cycle(cycle)
-        self.release_mocks["lookup"].reset_mock()
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        _ = self.advance()
-        self.assertEqual(self.entry("owner")["calls"], [])
-        self.assertEqual(self.sent(), ["owner", "peer"])
-        self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("peer")])
-
-    def test_live_build_in_the_memory_gate_does_not_hold_other_sessions(self) -> None:
-        for kind in ("call", "live-session", "unknown-session"):
-            with self.subTest(kind=kind):
-                calls = (("owner", "active"),) if kind == "call" else ()
-                self.begin("owner", "peer", calls=calls)
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["owner", "peer"])
-                call_id = "active" if kind == "call" else ""
-                _ = self.mark("owner", "WaitingForMemory", call_id)
-                self.release_mocks["lookup"].reset_mock()
-                self.release_mocks["lookup"].return_value = (
-                    build_hold.RecipientLookupFailed("registry unavailable") if kind == "unknown-session"
-                    else build_hold.RecipientLive("/test/socket"))
-                self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-                _ = self.advance()
-                self.assertEqual(self.entry("owner")["state"], "WaitingForMemory")
-                self.assertEqual(self.entry("peer")["state"], "ReleasedAwaitingAdmission")
-                looked_up = [mock.call("peer")] if kind == "call" else [mock.call("owner"), mock.call("peer")]
-                self.assertEqual(self.release_mocks["lookup"].call_args_list, looked_up)
-                _ = self.mark("owner", "MemoryGateReturned", call_id)
-                self.release_mocks["lookup"].return_value = build_hold.RecipientLive("/test/socket")
-                self.assertEqual(self.advance(), (False, "peer [peer]: ReleasedAwaitingAdmission"))
-                _ = build_hold.answer_nothing_to_build("peer")
-                self.assertTrue(self.advance()[0])
-                self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_holder_joining_after_a_cut_turn_sends_one_message_for_the_new_generation(self) -> None:
-        self.begin("owner", "peer")
-        _ = self.advance()
-        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-        self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
-        self.now += timedelta(seconds=1)
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("new-holder", "new-holder"), "another hold",
-                                  build_hold.NoReleaseEta(), self.now)
-        self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AwaitingTurn)
-        _ = build_hold.register_wait("owner")
-        self.start_release()
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner", "peer", "owner", "peer"])
-        for key in ("owner", "peer"):
-            _ = build_hold.answer_nothing_to_build(key)
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.sent(), ["owner", "peer", "owner", "peer"])
-
-
-HolderFileContent = TypedDict("HolderFileContent", {"holder": str, "since": str, "for": str, "release_eta": str})
-
-
-class ReleaseDriverTests(IsolatedBuildHoldTest):
-    now: datetime = datetime.min
-    replaced_at: datetime = datetime.min
-    sent: list[str] = []
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.now = datetime.now().astimezone() - timedelta(hours=1)
-        self.sent = []
-        _ = self.enterContext(mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))
-        _ = self.enterContext(mock.patch.object(build_hold, "send_release", side_effect=self.deliver))
-        clock = cast(mock.Mock, self.enterContext(mock.patch.object(build_hold, "datetime", wraps=datetime)))
-        cast(mock.Mock, clock.now).side_effect = self.clock_now
-
-    def clock_now(self, *zones: tzinfo) -> datetime:
-        return self.now.astimezone(zones[0]) if zones else self.now
-
-    def deliver(self, entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
-        self.sent.append(entry["session_id"])
-        return build_hold.ReleaseDelivered()
-
-    def cycle(self) -> build_hold.HoldCycle:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        return cycle
-
-    def begin(self, name: str = "holder") -> Path:
-        folder = self.scratch / "holders"
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity(name, name), "first hold", build_hold.NoReleaseEta(), self.now)
-        build_hold.record_recipients([("first", "first"), ("second", "second"), ("third", "third")])
-        _ = build_hold.register_wait("first", call_id="first-call")
-        # Waits keep second and third in the release; a session only told would hold nothing.
-        for key in ("second", "third"):
-            _ = build_hold.register_wait(key)
-        return folder
-
-    def finish_turn(self, _seconds: float) -> None:
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        for entry in self.cycle()["entries"]:
-            if entry["state"] in ("ReleasedAwaitingAdmission", "DeliveryQueued"):
-                _ = build_hold.answer_nothing_to_build(entry["session_id"])
-
-    def test_driver_stops_when_its_holder_places_a_new_hold(self) -> None:
-        folder = self.begin()
-        replaced = False
-
-        def sleep(seconds: float) -> None:
-            nonlocal replaced
-            if not replaced:
-                self.now += timedelta(seconds=seconds)
-                self.replaced_at = self.now
-                _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold", build_hold.NoReleaseEta(), self.now)
-                replaced = True
-            else:
-                self.finish_turn(seconds)
-
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
-            line = build_hold.release_cycle(folder, "holder")
-        self.assertEqual(line, self.stop_line())
-        self.assertEqual(self.sent, ["first", "second", "third"])
-        holder = build_hold.read_holder(folder / "holder")
-        self.assertEqual(holder.since, self.replaced_at)
-        cycle = self.cycle()
-        self.assertEqual(cycle["holders"]["holder"]["released_at"], "")
-        self.assertEqual(cycle["release_started_at"], "")
-        self.assertTrue(all(entry["state"] == "AwaitingRelease" for entry in cycle["entries"]))
-
-    def test_status_and_driver_stop_use_user_zone_when_machine_zone_differs(self) -> None:
-        with mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "America/New_York"}):
-            try:
-                time.tzset()
-                self.test_driver_stops_when_its_holder_places_a_new_hold()
-                self.assertIn(self.replaced_at.astimezone(user_zone()).strftime("%H:%M %Z"), self.stop_line())
-            finally:
-                time.tzset()
-
-    def stop_line(self, name: str = "holder") -> str:
-        return (f"release stopped: {name} placed a new hold at {self.replaced_at.astimezone(user_zone()):%H:%M %Z}; "
-                "that hold's release serves the sessions still waiting.")
+class AtomicWriteTests(IsolatedBuildHoldTest):
+    now: datetime = datetime(2026, 10, 28, tzinfo=timezone.utc)
 
     def record_path(self) -> Path:
-        return self.scratch / "release" / self.cycle()["id"] / "cycle.json"
-
-    def resume_error(self, folder: Path) -> str:
-        state = build_hold.read_holders(folder)
-        assert isinstance(state, build_hold.ActiveHolders)
-        return ("a hold is in force (" + "; ".join(build_hold.holder_text(holder) for holder in state.holders)
-                + "); --resume only continues a release already begun. Release that hold without --resume.")
-
-    def replace_during_sleep(self, folder: Path, *, another: bool = False, release_new: bool = False) -> str:
-        replaced = False
-        saved: list[bytes] = []
-
-        def sleep(seconds: float) -> None:
-            nonlocal replaced
-            if replaced:
-                self.finish_turn(seconds)
-                return
-            replaced = True
-            self.now += timedelta(seconds=seconds)
-            self.replaced_at = self.now
-            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold", build_hold.NoReleaseEta(), self.now)
-            if another:
-                _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
-            if release_new:
-                with mock.patch.object(time, "sleep", side_effect=RuntimeError("Driver paused at its poll")):
-                    with self.assertRaisesRegex(RuntimeError, "Driver paused at its poll"):
-                        _ = build_hold.release_cycle(folder, "holder")
-            saved.append(self.record_path().read_bytes())
-
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
-            line = build_hold.release_cycle(folder, "holder")
-        self.assertEqual(line, self.stop_line())
-        self.assertEqual(self.record_path().read_bytes(), saved[0])
-        self.assertTrue((folder / "holder").is_file())
-        return line
-
-    def test_sessions_left_waiting_get_one_message_from_the_new_holds_release(self) -> None:
-        folder = self.begin()
-        _ = self.replace_during_sleep(folder)
-        expected_error = self.resume_error(folder)
-        before = self.record_path().read_bytes()
-        output, errors = io.StringIO(), io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--resume"]), 1)
-        self.assertEqual(errors.getvalue(), f"build_hold: {expected_error}\n")
-        self.assertEqual(self.record_path().read_bytes(), before)
-        with mock.patch.object(time, "sleep", side_effect=self.finish_turn), redirect_stdout(io.StringIO()):
-            line = build_hold.release_cycle(folder, "holder")
-        self.assertTrue(line.startswith("released, builds may resume."))
-        self.assertEqual(self.sent, ["first", "second", "third"] * 2)
-        self.assertFalse((folder / "holder").exists())
-
-    def test_resume_refuses_a_new_hold_whose_name_uses_a_released_holds_file(self) -> None:
-        folder = self.begin("night run")
-        with mock.patch.object(time, "sleep", side_effect=RuntimeError("Driver paused at its poll")), \
-             redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(RuntimeError, "Driver paused at its poll"):
-                _ = build_hold.release_cycle(folder, "night run")
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        self.replaced_at = self.now
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
-        self.assertEqual([holder.name for holder in build_hold.live_holds(self.cycle(), folder)], ["night-run"])
-        before = self.record_path().read_bytes()
-        for arguments in (["release", "--resume"], ["release", "--resume", "--holder", "night run"],
-                          ["release", "--resume", "--holder", "night-run"]):
-            with self.subTest(arguments=arguments):
-                output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(time, "sleep", side_effect=self.finish_turn), \
-                     redirect_stdout(output), redirect_stderr(errors):
-                    self.assertEqual(build_hold.main(arguments), 1)
-                self.assertEqual(output.getvalue(), "")
-                self.assertEqual(errors.getvalue(), f"build_hold: {self.resume_error(folder)}\n")
-                self.assertEqual(self.record_path().read_bytes(), before)
-                self.assertEqual(build_hold.read_holder(folder / "night-run").since, self.replaced_at)
-                self.assertEqual(self.sent, ["first", "second", "third"])
-
-    def test_release_command_stops_when_another_name_replaces_its_hold_file(self) -> None:
-        folder = self.begin("night run")
-        replaced = False
-        saved: list[bytes] = []
-
-        def sleep(seconds: float) -> None:
-            nonlocal replaced
-            if replaced:
-                self.finish_turn(seconds)
-                return
-            replaced = True
-            self.now += timedelta(seconds=seconds)
-            self.replaced_at = self.now
-            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
-            saved.append(self.record_path().read_bytes())
-
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--holder", "night run"]), 0)
-        self.assertEqual(output.getvalue().splitlines()[-1], self.stop_line("night-run"))
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(self.sent, ["first", "second", "third"])
-        self.assertEqual(build_hold.read_holder(folder / "night-run").since, self.replaced_at)
-        self.assertEqual(self.record_path().read_bytes(), saved[0])
-
-    def test_driver_stops_when_the_new_hold_was_released_within_one_poll(self) -> None:
-        folder = self.begin()
-        _ = self.replace_during_sleep(folder, release_new=True)
-        self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
-        self.assertTrue(self.cycle()["release_started_at"])
-        self.assertEqual(self.sent, ["first", "second", "third"] * 2)
-
-    def pause_release(self, folder: Path, name: str) -> None:
-        with mock.patch.object(time, "sleep", side_effect=RuntimeError("Driver paused at its poll")), \
-             redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(RuntimeError, "Driver paused at its poll"):
-                _ = build_hold.release_cycle(folder, name)
-
-    def test_release_with_a_holder_since_that_is_not_a_time_ends_the_hold(self) -> None:
-        for arguments in (["release", "--holder", "holder"], ["release", "--resume"],
-                          ["release", "--resume", "--holder", "holder"]):
-            with self.subTest(arguments=arguments):
-                folder = self.begin()
-                path = self.record_path()
-                cycle = self.cycle()
-                cycle["holders"]["holder"]["since"] = "not a time"
-                build_hold.save_cycle(cycle)
-                before = path.read_bytes()
-                output, errors = io.StringIO(), io.StringIO()
-                with redirect_stdout(output), redirect_stderr(errors):
-                    self.assertEqual(build_hold.main(arguments), 0, errors.getvalue())
-                self.assertEqual(errors.getvalue(), "")
-                self.assertEqual(output.getvalue().splitlines()[-1],
-                                 "released, builds may resume. No hold cycle: broadcast this release to every session.")
-                self.assertFalse((folder / "holder").exists())
-                copies = list(path.parent.glob("cycle.json.damaged-*"))
-                self.assertEqual(len(copies), 1)
-                self.assertEqual(copies[0].read_bytes(), before)
-                self.assertFalse((self.scratch / "release" / "current").exists())
-                self.assertEqual(self.sent, [])
-
-    def test_resume_for_a_missing_holder_refuses_other_holds_before_held_nothing(self) -> None:
-        folder = self.begin()
-        path = self.record_path()
-        before = path.read_bytes()
-        with self.assertRaises(ValueError) as refused:
-            _ = build_hold.release_cycle(folder, "missing", build_hold.ResumedRelease())
-        self.assertEqual(str(refused.exception), self.resume_error(folder))
-        self.assertEqual(path.read_bytes(), before)
-        self.assertTrue((folder / "holder").is_file())
-        self.assertEqual(self.sent, [])
-        (folder / "holder").unlink()
-        with self.assertRaises(ValueError) as absent:
-            _ = build_hold.release_cycle(folder, "missing", build_hold.ResumedRelease())
-        self.assertEqual(str(absent.exception), "missing held nothing")
-        self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(self.sent, [])
-
-    def test_resume_under_another_name_keeps_the_recorded_release_time(self) -> None:
-        folder = self.begin("night run")
-        self.pause_release(folder, "night run")
-        released_at = self.cycle()["holders"]["night run"]["released_at"].encode()
-        self.assertTrue(released_at)
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(time, "sleep", side_effect=self.finish_turn), \
-             redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--resume", "--holder", "night-run"]), 0)
-        self.assertEqual(self.cycle()["holders"]["night run"]["released_at"].encode(), released_at)
-        self.assertTrue(output.getvalue().splitlines()[-1].startswith("released, builds may resume."))
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(self.sent, ["first", "second", "third"])
-        self.assertFalse((folder / "night-run").exists())
-
-    def test_plain_release_under_the_old_name_releases_the_current_hold_instance(self) -> None:
-        folder = self.begin("night run")
-        self.pause_release(folder, "night run")
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
-        self.pause_release(folder, "night run")
-        holder = build_hold.read_holder(folder / "night-run")
-        matching = [instants for key, instants in self.cycle()["holders"].items()
-                    if build_hold.holder_path(folder, key).name == holder.key
-                    and build_hold.aware_instant(instants["since"]) == holder.since]
-        self.assertTrue(any(instants["released_at"] for instants in matching),
-                        "The current hold instance must have a recorded release")
-        self.assertEqual(build_hold.live_holds(self.cycle(), folder), ())
-
-    def test_release_records_the_files_since_when_its_holder_entry_is_missing(self) -> None:
-        folder = self.begin()
-        holder = build_hold.read_holder(folder / "holder")
-        cycle = self.cycle()
-        del cycle["holders"]["holder"]
-        build_hold.save_cycle(cycle)
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        self.pause_release(folder, "holder")
-        recorded = self.cycle()["holders"]["holder"]
-        self.assertEqual(build_hold.aware_instant(recorded["since"]), holder.since)
-        self.assertTrue(recorded["released_at"])
-        self.assertEqual(build_hold.live_holds(self.cycle(), folder), ())
-
-    def test_resume_lookup_selects_the_released_instance_in_the_holder_file(self) -> None:
-        folder = self.begin("night run")
-        self.pause_release(folder, "night run")
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("night-run", "night-run"), "new hold", build_hold.NoReleaseEta(), self.now)
-        self.pause_release(folder, "night-run")
-        since = build_hold.read_holder(folder / "night-run").since
-        release = build_hold.release_cycle
-        selected: list[str] = []
-
-        def resume(directory: Path, name: str, start: build_hold.FirstRelease | build_hold.ResumedRelease) -> str:
-            selected.append(name)
-            self.assertEqual(build_hold.aware_instant(self.cycle()["holders"][name]["since"]), since)
-            return release(directory, name, start)
-
-        with mock.patch.object(build_hold, "release_cycle", side_effect=resume), \
-             mock.patch.object(time, "sleep", side_effect=self.finish_turn), \
-             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            self.assertEqual(build_hold.main(["release", "--resume"]), 0)
-        self.assertEqual(selected, ["night-run"])
-        self.assertFalse((folder / "night-run").exists())
-
-    def test_replaced_hold_keeps_its_file_when_another_holder_joined(self) -> None:
-        folder = self.begin()
-        _ = self.replace_during_sleep(folder, another=True)
-        self.assertTrue((folder / "other").is_file())
-        self.assertEqual(self.sent, ["first", "second", "third"])
-        self.assertEqual(self.cycle()["holders"]["holder"]["released_at"], "")
-
-    def test_another_holder_joining_ends_the_driver_as_before(self) -> None:
-        folder = self.begin()
-
-        def sleep(seconds: float) -> None:
-            self.now += timedelta(seconds=seconds)
-            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
-
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
-            line = build_hold.release_cycle(folder, "holder")
-        self.assertEqual(line, "released; still held by " + build_hold.holder_text(build_hold.read_holder(folder / "other")))
-        self.assertFalse((folder / "holder").exists())
-        self.assertTrue((folder / "other").exists())
-        self.assertEqual(self.sent, ["first", "second", "third"])
-
-    def test_release_under_a_name_with_a_space_lists_only_the_other_holder(self) -> None:
-        folder = self.begin("night run")
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
-        expected = "released; still held by " + build_hold.holder_text(build_hold.read_holder(folder / "other"))
-        output, errors = io.StringIO(), io.StringIO()
-        with redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--holder", "night run"]), 0)
-        self.assertEqual(output.getvalue(), expected + "\n")
-        self.assertEqual(errors.getvalue(), "")
-        self.assertFalse((folder / "night-run").exists())
-        self.assertTrue((folder / "other").is_file())
-        self.assertEqual(self.sent, [])
-
-    def test_driver_ends_when_another_release_finished_the_queue(self) -> None:
-        folder = self.begin()
-        finished = False
-
-        def sleep(_seconds: float) -> None:
-            nonlocal finished
-            self.assertFalse(finished, "The old driver must end on its next pass")
-            finished = True
-            with mock.patch.object(time, "sleep", side_effect=self.finish_turn):
-                _ = build_hold.release_cycle(folder, "holder")
-
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
-            try:
-                line = build_hold.release_cycle(folder, "holder")
-            except ValueError as error:
-                self.fail(f"A completed release must end with a line, not {error}")
-        self.assertEqual(line, "release ended: another release command finished it; builds may resume.")
-        self.assertFalse((folder / "holder").exists())
-        self.assertEqual(self.sent, ["first", "second", "third"])
-
-    def test_resume_refuses_a_hold_placed_after_its_lookup(self) -> None:
-        folder = self.begin()
-        cycle = self.cycle()
-        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
-        cycle["release_started_at"] = self.now.isoformat()
-        build_hold.save_cycle(cycle)
-        self.now += timedelta(seconds=1)
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold after lookup", build_hold.NoReleaseEta(), self.now)
-        before = self.record_path().read_bytes()
-        with self.assertRaises(ValueError) as refused:
-            _ = build_hold.release_cycle(folder, "holder", build_hold.ResumedRelease())
-        self.assertEqual(str(refused.exception), self.resume_error(folder))
-        self.assertEqual(self.record_path().read_bytes(), before)
-        self.assertTrue((folder / "holder").is_file())
-        self.assertEqual(self.sent, [])
-
-    def test_release_command_ends_and_names_every_remaining_holder(self) -> None:
-        folder = self.begin()
-        finished = False
-
-        def sleep(seconds: float) -> None:
-            nonlocal finished
-            self.assertFalse(finished, "The old driver must end on its next pass")
-            finished = True
-            self.now += timedelta(seconds=seconds)
-            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("other", "other"), "other hold", build_hold.NoReleaseEta(), self.now)
-            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("third-holder", "third-holder"), "third hold", build_hold.NoReleaseEta(), self.now)
-            _ = build_hold.release_cycle(folder, "holder")
-
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--holder", "holder"]), 0)
-        state = build_hold.read_holders(folder)
-        assert isinstance(state, build_hold.ActiveHolders)
-        expected = ("release ended: another release command finished it; still held by "
-                    + "; ".join(build_hold.holder_text(holder) for holder in state.holders))
-        self.assertEqual(output.getvalue().splitlines()[-1], expected)
-        self.assertNotIn("builds may resume", output.getvalue())
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual([holder.name for holder in state.holders], ["other", "third-holder"])
-        self.assertEqual(self.sent, ["first", "second", "third"])
-
-    def test_release_command_ends_with_exit_zero_when_no_holder_remains(self) -> None:
-        folder = self.begin()
-        finished = False
-
-        def sleep(_seconds: float) -> None:
-            nonlocal finished
-            self.assertFalse(finished, "The old driver must end on its next pass")
-            finished = True
-            with mock.patch.object(time, "sleep", side_effect=self.finish_turn):
-                _ = build_hold.release_cycle(folder, "holder")
-
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--holder", "holder"]), 0)
-        self.assertEqual(output.getvalue().splitlines()[-1],
-                         "release ended: another release command finished it; builds may resume.")
-        self.assertEqual(errors.getvalue(), "")
-        self.assertFalse((folder / "holder").exists())
-        self.assertEqual(self.sent, ["first", "second", "third"])
-
-    def test_replacement_hold_stops_the_driver_before_it_reads_a_damaged_record(self) -> None:
-        folder = self.begin()
-        path = self.record_path()
-        current = self.scratch / "release" / "current"
-        cycle_id = self.cycle()["id"]
-        replaced = False
-        files: list[str] = []
-
-        def sleep(seconds: float) -> None:
-            nonlocal replaced
-            self.assertFalse(replaced, "A replacement must stop the next pass")
-            replaced = True
-            self.now += timedelta(seconds=seconds)
-            self.replaced_at = self.now
-            _ = path.write_text("{broken")
-            _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new hold", build_hold.NoReleaseEta(), self.now)
-            _ = path.write_text("{still broken")
-            _ = current.write_text(cycle_id + "\n")
-            files.extend(sorted(file.name for file in path.parent.iterdir()))
-
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
-            line = build_hold.release_cycle(folder, "holder")
-        self.assertEqual(line, self.stop_line())
-        self.assertEqual(build_hold.read_holder(folder / "holder").since, self.replaced_at)
-        self.assertEqual(self.sent, ["first", "second", "third"])
-        self.assertEqual(path.read_text(), "{still broken")
-        self.assertEqual(sorted(file.name for file in path.parent.iterdir()), files)
-        self.assertEqual(current.read_text(), cycle_id + "\n")
-
-    def test_unchanged_hold_with_a_damaged_record_at_a_later_pass_is_released(self) -> None:
-        folder = self.begin()
-        path = self.record_path()
-        original = build_hold.read_holder(folder / "holder").since
-
-        def sleep(_seconds: float) -> None:
-            self.assertEqual(build_hold.read_holder(folder / "holder").since, original)
-            _ = path.write_text("{broken")
-
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
-            line = build_hold.release_cycle(folder, "holder")
-        self.assertEqual(line, "released, builds may resume. No hold cycle: broadcast this release to every session.")
-        self.assertFalse((folder / "holder").exists())
-        copies = list(path.parent.glob("cycle.json.damaged-*"))
-        self.assertEqual(len(copies), 1)
-        self.assertEqual(copies[0].read_text(), "{broken")
-        self.assertEqual(self.sent, ["first", "second", "third"])
-
-    def test_removed_holder_ends_the_driver_without_reading_a_damaged_record(self) -> None:
-        folder = self.begin()
-        path = self.record_path()
-        files: list[str] = []
-
-        def sleep(_seconds: float) -> None:
-            with mock.patch.object(time, "sleep", side_effect=self.finish_turn):
-                _ = build_hold.release_cycle(folder, "holder")
-            _ = path.write_text("{broken")
-            files.extend(sorted(file.name for file in path.parent.iterdir()))
-
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--holder", "holder"]), 0)
-        self.assertEqual(output.getvalue().splitlines()[-1],
-                         "release ended: another release command finished it; builds may resume.")
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(path.read_text(), "{broken")
-        self.assertEqual(sorted(file.name for file in path.parent.iterdir()), files)
-        self.assertEqual(self.sent, ["first", "second", "third"])
-
-    def test_hold_under_a_name_with_a_space_is_in_force_until_released(self) -> None:
-        folder = self.begin("night run")
-        self.assertEqual([holder.name for holder in build_hold.live_holds(self.cycle(), folder)], ["night run"])
-        seen: list[tuple[build_hold.Holder, ...]] = []
-
-        def sleep(seconds: float) -> None:
-            seen.append(build_hold.live_holds(self.cycle(), folder))
-            self.finish_turn(seconds)
-
-        with mock.patch.object(time, "sleep", side_effect=sleep), redirect_stdout(io.StringIO()):
-            _ = build_hold.release_cycle(folder, "night run")
-        self.assertTrue(seen)
-        self.assertTrue(all(not holders for holders in seen))
-        self.assertEqual(build_hold.live_holds(self.cycle(), folder), ())
-        self.assertFalse(build_hold.holder_path(folder, "night run").exists())
-
-    def test_resume_refuses_while_a_hold_is_in_force(self) -> None:
-        folder = self.begin()
-        for arguments in (["release", "--resume"], ["release", "--resume", "--holder", "holder"]):
-            with self.subTest(arguments=arguments):
-                before = self.record_path().read_bytes()
-                expected = self.resume_error(folder)
-                output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(time, "sleep", side_effect=self.finish_turn), redirect_stdout(output), redirect_stderr(errors):
-                    code = build_hold.main(arguments)
-                self.assertEqual(code, 1, output.getvalue())
-                self.assertEqual(errors.getvalue(), f"build_hold: {expected}\n")
-                self.assertEqual(output.getvalue(), "")
-                self.assertEqual(self.record_path().read_bytes(), before)
-                self.assertTrue((folder / "holder").is_file())
-
-    def test_resume_continues_a_release_with_no_hold_in_force(self) -> None:
-        folder = self.begin()
-        cycle = self.cycle()
-        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
-        cycle["release_started_at"] = self.now.isoformat()
-        build_hold.save_cycle(cycle)
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(time, "sleep", side_effect=self.finish_turn), redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_hold.main(["release", "--resume"]), 0)
-        self.assertEqual(errors.getvalue(), "")
-        self.assertTrue(output.getvalue().splitlines()[-1].startswith("released, builds may resume."))
-        self.assertFalse((folder / "holder").exists())
-        self.assertEqual(self.sent, ["first", "second", "third"])
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        return self.scratch / "release" / cycle["id"] / "cycle.json"
 
     def test_cycle_record_is_whole_at_the_moment_it_is_renamed(self) -> None:
         for existing in (False, True):
@@ -2956,6 +1360,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
                     build_hold.save_cycle(cycle)
                 self.assertEqual(seen, [path.with_suffix(".tmp")])
                 self.assertEqual(path.read_bytes(), whole)
+
 
     def test_current_is_whole_at_the_moment_it_is_renamed(self) -> None:
         for existing in (False, True):
@@ -2984,6 +1389,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
                 self.assertEqual(seen, [(cycle["id"] + "\n").encode()])
                 self.assertEqual(path.read_bytes(), seen[0])
 
+
     def test_holder_file_is_whole_at_the_moment_it_is_renamed(self) -> None:
         folder = self.scratch / "holders"
         for existing in (False, True):
@@ -3004,7 +1410,7 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
                     self.assertEqual(list(folder.iterdir()), old_files)
                     self.assertEqual(source, folder.parent / f"{folder.name}.{path.name}.tmp")
                     content = cast(object, json.loads(source.read_text()))
-                    expected: HolderFileContent = {"holder": "holder", "since": self.now.isoformat(), "for": "new purpose", "release_eta": "unknown"}
+                    expected: dict[str, object] = {"holder": "holder", "since": self.now.isoformat(), "for": "new purpose", "release_eta": "unknown", "keep": []}
                     self.assertEqual(content, expected)
                     seen.append(source)
                     replace(source, destination)
@@ -3013,1073 +1419,6 @@ class ReleaseDriverTests(IsolatedBuildHoldTest):
                     _ = build_hold.write_hold(folder, build_hold.HolderIdentity("holder", "holder"), "new purpose", build_hold.NoReleaseEta(), self.now)
                 self.assertEqual(seen, [folder.parent / f"{folder.name}.{path.name}.tmp"])
                 self.assertEqual(build_hold.read_holder(path).purpose, "new purpose")
-
-
-class ToldSessionReleaseTests(IsolatedBuildHoldTest):
-    now: datetime = datetime.min
-    release_mocks: dict[str, mock.Mock] = {}
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.now = datetime.now().astimezone() - timedelta(hours=1)
-        self.release_mocks = {
-            "lookup": cast(mock.Mock, self.enterContext(mock.patch.object(
-                build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))),
-            "send": cast(mock.Mock, self.enterContext(mock.patch.object(
-                build_hold, "send_release", return_value=build_hold.ReleaseDelivered()))),
-        }
-
-    def begin(self, *recipients: str, registered: tuple[str, ...] = (), calls: tuple[tuple[str, str], ...] = (),
-              started_calls: tuple[tuple[str, str], ...] = ()) -> None:
-        folder = self.scratch / "holders"
-        (folder / "holder").unlink(missing_ok=True)
-        _ = build_hold.start_hold(folder, build_hold.HolderIdentity("holder", "holder"), "release coverage", build_hold.NoReleaseEta(), self.now)
-        build_hold.record_recipients([(f"name {key}", key) for key in recipients])
-        for key in registered:
-            _ = build_hold.register_wait(key)
-        for key, call_id in calls:
-            self.call(key, call_id)
-        for key, call_id in started_calls:
-            self.call(key, call_id, started=True)
-        cycle = self.cycle()
-        cycle["release_started_at"] = self.now.isoformat()
-        build_hold.save_cycle(cycle)
-        self.release_mocks["lookup"].reset_mock()
-        self.release_mocks["send"].reset_mock()
-
-    def cycle(self) -> build_hold.HoldCycle:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        return cycle
-
-    def entry(self, key: str) -> build_hold.ReleaseEntry:
-        return next(entry for entry in self.cycle()["entries"] if entry["session_id"] == key)
-
-    def sent(self) -> list[str]:
-        calls = cast(list[tuple[tuple[build_hold.ReleaseEntry, str], dict[str, object]]], self.release_mocks["send"].call_args_list)
-        return [arguments[0]["session_id"] for arguments, _keywords in calls]
-
-    def advance(self) -> tuple[bool, str]:
-        return build_hold.advance_release(self.cycle(), self.now, clock=lambda: self.now)
-
-    def call(self, key: str, call_id: str, *, started: bool = False) -> None:
-        self.assertIn("registered", build_hold.register_wait(key, call_id=call_id, started=started))
-
-    def returned(self, key: str, call_id: str = "") -> datetime:
-        self.assertIn("MemoryGateReturned", build_hold.mark_gate(
-            key, "MemoryGateReturned", "Granted", call_id=call_id, cycle_id=self.cycle()["id"]))
-        return build_hold.aware_instant(self.entry(key).get("wait_ended_at", ""))
-
-    def final_line(self) -> str:
-        # All turns are already over; freeze the driver's wall clock at the injected test time.
-        with mock.patch.object(build_hold, "datetime", wraps=datetime) as clock, \
-             mock.patch.object(time, "sleep", side_effect=AssertionError("Release should be complete")):
-            cast(mock.Mock, clock.now).return_value = self.now
-            return build_hold.release_cycle(self.scratch / "holders", "holder")
-
-    def test_three_told_sessions_are_saved_together_and_released_in_one_pass(self) -> None:
-        keys = ("z-first", "a-second", "m-third")
-        for ending in ("gate", "nothing", "timeout"):
-            with self.subTest(ending=ending):
-                self.begin(*keys, registered=keys)
-                snapshots: list[list[tuple[str, str]]] = []
-
-                def lookup(_key: str) -> build_hold.RecipientLive:
-                    snapshots.append([(entry["session_id"], entry["delivery"]["outcome"]) for entry in self.cycle()["entries"]])
-                    return build_hold.RecipientLive("/test/socket")
-
-                self.release_mocks["lookup"].side_effect = lookup
-                started = self.now
-                complete, detail = self.advance()
-                self.assertFalse(complete)
-                self.assertEqual(detail, "; ".join(f"name {key} [{key}]: ReleasedAwaitingAdmission" for key in keys))
-                self.assertEqual(snapshots, [
-                    [("z-first", "NotAttempted"), ("a-second", "NotAttempted"), ("m-third", "NotAttempted")],
-                    [("z-first", "Delivered"), ("a-second", "NotAttempted"), ("m-third", "NotAttempted")],
-                    [("z-first", "Delivered"), ("a-second", "Delivered"), ("m-third", "NotAttempted")],
-                ])
-                self.assertEqual(self.sent(), list(keys))
-                self.assertEqual(build_hold.cycle_status_lines(self.cycle()), [f"name {key} [{key}]: ReleasedAwaitingAdmission" for key in keys])
-                self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("a-second").text)
-                self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-                complete, detail = self.advance()
-                self.assertFalse(complete)
-                self.assertNotIn("a-second", detail)
-                if ending == "gate":
-                    _ = self.returned("z-first")
-                elif ending == "nothing":
-                    self.assertEqual(build_hold.answer_nothing_to_build("z-first").text,
-                                     "name z-first [z-first]: NothingToBuild; the release stops waiting for this session")
-                else:
-                    self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
-                    self.assertFalse(self.advance()[0])
-                    self.now += timedelta(seconds=1)
-                complete, detail = self.advance()
-                self.assertEqual(complete, ending == "timeout")
-                if ending == "timeout":
-                    self.assertEqual(build_hold.read_release_state(self.entry("z-first")), build_hold.NoAdmissionAck(started))
-                    self.assertEqual(build_hold.read_release_state(self.entry("m-third")), build_hold.NoAdmissionAck(started))
-                else:
-                    self.assertEqual(detail, "name m-third [m-third]: ReleasedAwaitingAdmission")
-                    _ = build_hold.answer_nothing_to_build("m-third")
-                    self.assertTrue(self.advance()[0])
-                self.assertEqual(self.sent(), list(keys))
-
-    def test_departed_session_ends_turn_on_next_poll_without_changing_delivery(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("first", "second", registered=("first", "second"))
-                self.release_mocks["lookup"].side_effect = None
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                           else build_hold.ReleaseDelivered())
-                _ = self.advance()
-                delivery = self.entry("first")["delivery"].copy()
-                self.assertEqual(delivery["outcome"], "QueuedUnconfirmed" if queued else "Delivered")
-
-                def lookup(key: str) -> build_hold.RecipientGone | build_hold.RecipientLive:
-                    return build_hold.RecipientGone() if key == "first" else build_hold.RecipientLive("/test/socket")
-
-                self.release_mocks["lookup"].reset_mock()
-                self.release_mocks["lookup"].side_effect = lookup
-                self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-                self.assertFalse(self.advance()[0])
-                self.assertEqual(self.entry("first")["state"], "RecipientGone")
-                self.assertFalse(self.entry("first")["session_pending"])
-                self.assertEqual(self.entry("first")["delivery"], delivery)
-                self.assertEqual(self.sent(), ["first", "second"])
-                self.assertEqual(self.release_mocks["lookup"].call_args_list,
-                                 [mock.call("first"), mock.call("second")])
-                _ = build_hold.answer_nothing_to_build("second")
-                self.assertTrue(self.advance()[0])
-                line = self.final_line()
-                if queued:
-                    self.assertIn("Not reached, tell them yourself: name first (queued, no answer)", line)
-                    self.assertNotIn("session gone", line)
-                else:
-                    self.assertNotIn("Not reached", line)
-
-    def test_lookup_failure_preserves_silent_turn_until_its_deadline(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("owner", registered=("owner",))
-                self.release_mocks["lookup"].return_value = build_hold.RecipientLive("/test/socket")
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                           else build_hold.ReleaseDelivered())
-                started = self.now
-                _ = self.advance()
-                delivery = self.entry("owner")["delivery"].copy()
-                self.release_mocks["lookup"].reset_mock()
-                self.release_mocks["lookup"].return_value = build_hold.RecipientLookupFailed("registry denied")
-                output, errors = io.StringIO(), io.StringIO()
-                with redirect_stdout(output), redirect_stderr(errors):
-                    for elapsed in (build_hold.RELEASE_POLL_S, build_hold.NO_ADMISSION_ACK_S - 1):
-                        self.now = started + timedelta(seconds=elapsed)
-                        self.assertFalse(self.advance()[0])
-                        self.assertEqual(self.entry("owner")["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
-                        self.assertEqual(self.entry("owner")["delivery"], delivery)
-                self.assertEqual(output.getvalue(), "")
-                self.assertEqual(errors.getvalue(), "")
-                self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("owner")] * 2)
-                self.release_mocks["lookup"].reset_mock()
-                self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-                self.assertTrue(self.advance()[0])
-                self.release_mocks["lookup"].assert_not_called()
-                self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
-                self.assertFalse(self.entry("owner")["session_pending"])
-                self.assertEqual(self.entry("owner")["delivery"], delivery)
-                self.assertEqual(self.sent(), ["owner"])
-
-    def test_silent_delivered_and_queued_turns_end_together_at_the_deadline_without_lookup(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("first", "second", registered=("first", "second"))
-                self.release_mocks["lookup"].side_effect = None
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                           else build_hold.ReleaseDelivered())
-                started = self.now
-                _ = self.advance()
-                self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
-                self.assertFalse(self.advance()[0])
-                for key in ("first", "second"):
-                    self.assertEqual(self.entry(key)["state"], "DeliveryQueued" if queued else "ReleasedAwaitingAdmission")
-                self.assertEqual(self.sent(), ["first", "second"])
-                self.release_mocks["lookup"].reset_mock()
-                self.release_mocks["lookup"].side_effect = AssertionError("An expired turn must end before a session lookup")
-                self.now += timedelta(seconds=1)
-                self.assertTrue(self.advance()[0])
-                for key in ("first", "second"):
-                    self.assertEqual(build_hold.read_release_state(self.entry(key)), build_hold.NoAdmissionAck(started))
-                    self.assertFalse(self.entry(key)["session_pending"])
-                self.assertEqual(self.sent(), ["first", "second"])
-                self.release_mocks["lookup"].assert_not_called()
-
-    def test_late_call_preserves_a_silent_turns_full_timeout(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("owner", registered=("owner",))
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                          else build_hold.ReleaseDelivered())
-                started = self.now
-                _ = self.advance()
-                self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-                self.assertFalse(self.advance()[0])
-                before = self.cycle()
-                self.assertEqual(build_hold.register_wait("late", call_id="waiting-call"),
-                                 "release under way; late builds now")
-                self.assertIsInstance(build_hold.read_admission("late", "waiting-call"), build_hold.AdmittedTurn)
-                self.assertEqual(self.cycle(), before)
-                self.assertFalse(self.advance()[0])
-                self.assertEqual(self.sent(), ["owner"])
-                self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-                self.assertTrue(self.advance()[0])
-                self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
-
-    def test_bound_call_keeps_full_turn_and_skips_session_lookups(self) -> None:
-        for queued in (False, True):
-            for ending in ("gate", "timeout"):
-                with self.subTest(queued=queued, ending=ending):
-                    self.begin("owner", "peer")
-                    self.release_mocks["lookup"].side_effect = None
-                    self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                               else build_hold.ReleaseDelivered())
-                    started = self.now
-                    _ = self.advance()
-                    self.call("owner", "building-call")
-                    self.assertIsInstance(build_hold.read_admission("owner", "building-call"), build_hold.AdmittedTurn)
-                    _ = build_hold.answer_nothing_to_build("peer")
-                    self.release_mocks["lookup"].reset_mock()
-                    self.release_mocks["lookup"].side_effect = AssertionError("A bound call needs no session lookup")
-                    for elapsed in (build_hold.RELEASE_POLL_S, build_hold.NO_ADMISSION_ACK_S - 1):
-                        self.now = started + timedelta(seconds=elapsed)
-                        self.assertFalse(self.advance()[0])
-                        self.assertEqual(self.entry("owner")["active_call_id"], "building-call")
-                    if ending == "gate":
-                        _ = self.returned("owner", "building-call")
-                    else:
-                        self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-                    self.assertTrue(self.advance()[0])
-                    if ending == "timeout":
-                        self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
-                    self.assertEqual(self.entry("owner")["active_call_id"], "")
-                    self.assertEqual(self.sent(), ["owner", "peer"])
-                    self.release_mocks["lookup"].assert_not_called()
-
-    def test_call_after_lapsed_turn_is_admitted_without_a_second_message(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("owner", "peer")
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                          else build_hold.ReleaseDelivered())
-                _ = self.advance()
-                _ = build_hold.answer_nothing_to_build("peer")
-                self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-                self.assertTrue(self.advance()[0])
-                self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-                before = self.cycle()
-                self.assertEqual(build_hold.register_wait("owner", call_id="late-build"),
-                                 "release under way; owner builds now")
-                self.assertIsInstance(build_hold.read_admission("owner", "late-build"), build_hold.AdmittedTurn)
-                self.assertEqual(self.cycle(), before)
-                self.assertTrue(self.advance()[0])
-                self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_late_calls_add_no_turn_while_told_sessions_are_released(self) -> None:
-        keys = ("first", "second", "third")
-        self.begin(*keys, registered=keys)
-        _ = self.advance()
-        self.assertEqual(self.sent(), list(keys))
-        for index in range(6):
-            self.assertIn("builds now", build_hold.register_wait(f"late-{index}", call_id=f"call-{index}"))
-            self.assertIsInstance(build_hold.read_admission(f"late-{index}", f"call-{index}"), build_hold.AdmittedTurn)
-            if index % 2:
-                _ = build_hold.answer_nothing_to_build(keys[index // 2])
-            self.assertEqual(self.advance()[0], index == 5)
-            self.assertEqual(self.sent(), list(keys))
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], list(keys))
-
-    def test_call_registered_by_told_session_uses_its_turn(self) -> None:
-        self.begin("first", "second", "third", registered=("first",), calls=(("second", "second-call"),))
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second", "third"])
-        self.assertEqual(self.entry("second")["active_call_id"], "second-call")
-        self.assertIsInstance(build_hold.read_admission("second", "second-call"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("second"), build_hold.AdmittedTurn)
-        _ = self.returned("second", "second-call")
-        complete, detail = self.advance()
-        self.assertFalse(complete)
-        # third was only told: it holds nothing and owes no nothing-to-build.
-        self.assertEqual(detail, "name first [first]: ReleasedAwaitingAdmission")
-        _ = build_hold.answer_nothing_to_build("first")
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.sent(), ["first", "second", "third"])
-
-    def test_resumed_calls_and_told_sessions_are_released_in_one_pass(self) -> None:
-        # Entries keep their registration order: sessions, then unstarted calls, then started calls.
-        keys = ["second", "third", "resumed", "first"]
-        self.begin("first", "resumed", "second", "third", registered=("second", "third"), calls=(("resumed", "resumed-later"),),
-                   started_calls=(("first", "first-call"), ("resumed", "resumed-call")))
-        _ = self.advance()
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], keys)
-        self.assertEqual(self.sent(), keys)
-        self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call(key) for key in keys])
-        self.assertEqual(self.entry("first")["active_call_id"], "first-call")
-        self.assertEqual(self.entry("resumed")["active_call_id"], "resumed-call")
-        self.assertIsInstance(build_hold.read_admission("resumed", "resumed-call"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("resumed", "resumed-later"), build_hold.AwaitingTurn)
-        for key in ("second", "third"):
-            self.assertEqual(self.entry(key)["state"], "ReleasedAwaitingAdmission")
-        _ = self.returned("resumed", "resumed-call")
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-        self.assertFalse(self.advance()[0])
-        self.assertEqual(self.entry("resumed")["active_call_id"], "resumed-later")
-        self.assertIsInstance(build_hold.read_admission("resumed", "resumed-later"), build_hold.AdmittedTurn)
-        self.assertEqual(self.entry("resumed")["state"], "ReleasedAwaitingAdmission")
-        self.assertEqual(self.sent(), keys)
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], keys)
-
-    def test_call_registering_after_delivery_takes_open_turn_but_not_memory_wait(self) -> None:
-        for turn in ("delivered", "queued", "memory"):
-            with self.subTest(turn=turn):
-                self.begin("owner", "peer", registered=("owner", "peer"))
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if turn == "queued"
-                                                           else build_hold.ReleaseDelivered())
-                _ = self.advance()
-                if turn == "memory":
-                    self.assertEqual(build_hold.mark_gate("owner", "WaitingForMemory"), "owner: WaitingForMemory")
-                original_clock = self.entry("owner")["active_released_at"]
-                self.now += timedelta(seconds=1)
-                if turn == "memory":
-                    self.assertIn("builds now", build_hold.register_wait("owner", call_id="new-call"))
-                else:
-                    self.call("owner", "new-call")
-                self.assertEqual(self.entry("owner")["active_released_at"], original_clock)
-                if turn == "memory":
-                    self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AdmittedTurn)
-                    self.assertEqual(self.entry("owner")["active_call_id"], "")
-                    _ = self.advance()
-                    self.assertEqual(self.sent(), ["owner", "peer"])
-                    self.assertEqual(self.entry("owner")["state"], "WaitingForMemory")
-                    continue
-                self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AdmittedTurn)
-                self.assertEqual(self.entry("owner")["active_call_id"], "new-call")
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["owner", "peer"])
-                _ = self.returned("owner", "new-call")
-                self.assertFalse(self.advance()[0])
-                self.assertEqual(self.entry("owner")["state"], "MemoryGateReturned")
-                self.assertEqual(self.entry("owner")["active_call_id"], "")
-                self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_second_call_during_bound_turn_is_admitted_without_another_turn(self) -> None:
-        self.begin("owner", "peer")
-        _ = self.advance()
-        self.call("owner", "call-a")
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-        before = self.cycle()
-        self.assertIn("builds now", build_hold.register_wait("owner", call_id="call-b"))
-        self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
-        self.assertEqual(self.cycle(), before)
-        _ = self.returned("owner", "call-a")
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner", "peer"])
-        self.assertEqual(self.entry("owner")["active_call_id"], "")
-
-    def test_call_joining_session_turn_keeps_original_admission_deadline(self) -> None:
-        for queued in (False, True):
-            with self.subTest(queued=queued):
-                self.begin("owner", "peer")
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if queued
-                                                           else build_hold.ReleaseDelivered())
-                _ = self.advance()
-                original_state = build_hold.read_release_state(self.entry("owner"))
-                original_clock = self.entry("owner")["active_released_at"]
-                self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
-                self.call("owner", "new-call")
-                self.assertIsInstance(build_hold.read_admission("owner", "new-call"), build_hold.AdmittedTurn)
-                self.assertEqual(build_hold.read_release_state(self.entry("owner")), original_state)
-                self.assertEqual(self.entry("owner")["active_released_at"], original_clock)
-                _ = self.advance()
-                self.assertEqual(self.sent(), ["owner", "peer"])
-                self.now += timedelta(seconds=1)
-                _ = self.advance()
-                self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-                self.assertEqual(self.entry("owner")["active_call_id"], "")
-                self.assertEqual(self.sent(), ["owner", "peer"])
-
-    def test_failed_notification_keeps_started_call_turn_until_mark_or_timeout_without_holding_others(self) -> None:
-        for gone in (False, True):
-            for ending in ("mark", "timeout"):
-                with self.subTest(gone=gone, ending=ending):
-                    self.begin("owner", "resumed", "told", registered=("told",),
-                               started_calls=(("owner", "active-call"), ("resumed", "resumed-call")))
-
-                    def lookup(key: str) -> build_hold.RecipientGone | build_hold.RecipientLive:
-                        return build_hold.RecipientGone() if gone and key == "owner" else build_hold.RecipientLive("/test/socket")
-
-                    def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseSendFailed | build_hold.ReleaseDelivered:
-                        return build_hold.ReleaseSendFailed("send failed") if entry["session_id"] == "owner" else build_hold.ReleaseDelivered()
-
-                    self.release_mocks["lookup"].side_effect = lookup
-                    self.release_mocks["send"].side_effect = send
-                    started = self.now
-                    with redirect_stderr(io.StringIO()):
-                        _ = self.advance()
-                    self.assertEqual(self.entry("owner")["state"], "RecipientGone" if gone else "DeliveryFailed")
-                    self.assertEqual(self.entry("owner")["active_call_id"], "active-call")
-                    self.assertEqual(self.sent(), ["told", "resumed"] if gone else ["told", "owner", "resumed"])
-                    self.assertEqual(self.entry("resumed")["active_call_id"], "resumed-call")
-                    self.assertIsInstance(build_hold.read_admission("resumed", "resumed-call"), build_hold.AdmittedTurn)
-                    self.assertEqual(self.entry("told")["state"], "ReleasedAwaitingAdmission")
-                    _ = self.returned("resumed", "resumed-call")
-                    _ = build_hold.answer_nothing_to_build("told")
-                    self.release_mocks["lookup"].reset_mock()
-                    self.release_mocks["send"].reset_mock()
-                    self.now = started + timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
-                    self.assertEqual(self.advance(), (False, f"name owner [owner]: {'RecipientGone' if gone else 'DeliveryFailed'}"))
-                    self.assertIsInstance(build_hold.read_admission("owner", "active-call"), build_hold.AdmittedTurn)
-                    if ending == "mark":
-                        _ = self.returned("owner", "active-call")
-                    else:
-                        self.now += timedelta(seconds=1)
-                    self.assertTrue(self.advance()[0])
-                    self.assertEqual(self.entry("owner")["active_call_id"], "")
-                    if ending == "timeout":
-                        self.assertEqual(build_hold.read_release_state(self.entry("owner")), build_hold.NoAdmissionAck(started))
-                    self.release_mocks["lookup"].assert_not_called()
-                    self.assertEqual(self.sent(), [])
-
-    def test_pending_call_on_terminal_entry_is_released_with_the_told_session(self) -> None:
-        self.begin("owner", "told", calls=(("owner", "pending"),))
-        cycle = self.cycle()
-        entry = cycle["entries"][0]
-        build_hold.store_release_state(entry, build_hold.DeliveryFailed(self.now))
-        entry["session_pending"] = False
-        build_hold.save_cycle(cycle)
-        self.assertFalse(self.advance()[0])
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], ["owner", "told"])
-        self.assertEqual(self.sent(), ["owner", "told"])
-        self.assertEqual(self.entry("owner")["active_call_id"], "pending")
-
-    def test_final_line_names_unreached_recipients_in_entry_order(self) -> None:
-        self.begin("queued", "lookup", "gone", "failed", registered=("gone", "failed", "lookup", "queued"))
-
-        def lookup(key: str) -> build_hold.RecipientLive | build_hold.RecipientGone | build_hold.RecipientLookupFailed:
-            if key == "gone":
-                return build_hold.RecipientGone()
-            if key == "lookup":
-                return build_hold.RecipientLookupFailed("registry unreadable")
-            return build_hold.RecipientLive("/test/socket")
-
-        self.release_mocks["lookup"].side_effect = lookup
-        self.release_mocks["send"].side_effect = [build_hold.ReleaseSendFailed("send failed"), build_hold.ReleaseQueued()]
-        with redirect_stderr(io.StringIO()):
-            complete, _ = self.advance()
-        self.assertFalse(complete)
-        self.assertEqual([self.entry(key)["delivery"]["outcome"] for key in ("gone", "failed", "lookup", "queued")],
-                         ["RecipientGone", "DeliveryFailed", "DeliveryFailed", "QueuedUnconfirmed"])
-        self.assertEqual(self.sent(), ["failed", "queued"])
-        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.entry("queued")["state"], "NoAdmissionAck")
-        line = self.final_line()
-        self.assertTrue(line.startswith("released, builds may resume. "))
-        self.assertTrue(line.endswith(" Not reached, tell them yourself: name gone (session gone), name failed (send failed), name lookup (send failed), name queued (queued, no answer)"), line)
-
-    def test_each_unavailable_recipient_attempt_ends_without_waiting_for_admission(self) -> None:
-        for failure in ("gone", "lookup", "send"):
-            with self.subTest(failure=failure):
-                self.begin("owner")
-                self.release_mocks["lookup"].return_value = (build_hold.RecipientGone() if failure == "gone" else
-                                            build_hold.RecipientLookupFailed("registry denied") if failure == "lookup" else
-                                            build_hold.RecipientLive("/test/socket"))
-                self.release_mocks["send"].return_value = build_hold.ReleaseSendFailed("send denied")
-                with redirect_stderr(io.StringIO()):
-                    self.assertTrue(self.advance()[0])
-                line = self.final_line()
-                self.assertIn("name owner (session gone)" if failure == "gone" else "name owner (send failed)", line)
-                self.assertEqual(self.release_mocks["send"].call_count, int(failure == "send"))
-
-    def test_queued_answer_confirms_delivery_and_removes_final_warning(self) -> None:
-        for answer in ("WaitingForMemory", "MemoryGateReturned", "nothing"):
-            with self.subTest(answer=answer):
-                self.begin("owner")
-                self.release_mocks["send"].return_value = build_hold.ReleaseQueued()
-                _ = self.advance()
-                self.assertEqual(self.entry("owner")["delivery"]["outcome"], "QueuedUnconfirmed")
-                if answer == "nothing":
-                    _ = build_hold.answer_nothing_to_build("owner")
-                else:
-                    if answer == "WaitingForMemory":
-                        self.assertIn("WaitingForMemory", build_hold.mark_gate("owner", "WaitingForMemory"))
-                        self.assertEqual(self.entry("owner")["delivery"]["outcome"], "Delivered")
-                    _ = self.returned("owner")
-                self.assertEqual(self.entry("owner")["delivery"]["outcome"], "Delivered")
-                self.assertTrue(self.advance()[0])
-                self.assertNotIn("Not reached", self.final_line())
-                self.assertEqual(self.sent(), ["owner"])
-
-    def test_delivered_silent_sessions_are_reached_without_final_warning(self) -> None:
-        self.begin("first", "second", registered=("first", "second"))
-        started = self.now
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second"])
-        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S - 1)
-        self.assertFalse(self.advance()[0])
-        self.assertEqual([entry["state"] for entry in self.cycle()["entries"]], ["ReleasedAwaitingAdmission"] * 2)
-        self.now += timedelta(seconds=1)
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(build_hold.read_release_state(self.entry("first")), build_hold.NoAdmissionAck(started))
-        self.assertEqual([entry["state"] for entry in self.cycle()["entries"]], ["NoAdmissionAck", "NoAdmissionAck"])
-        self.assertEqual(self.sent(), ["first", "second"])
-        self.assertNotIn("Not reached", self.final_line())
-
-    def test_late_nothing_to_build_confirms_queued_delivery_without_reopening_turn(self) -> None:
-        self.begin("owner", "peer")
-        self.release_mocks["send"].side_effect = [build_hold.ReleaseQueued(), build_hold.ReleaseDelivered()]
-        _ = self.advance()
-        _ = build_hold.answer_nothing_to_build("peer")
-        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-        self.assertEqual(self.sent(), ["owner", "peer"])
-        expected = f"the release does not wait for this session: {build_hold.entry_text(self.entry('owner'))}"
-        self.assertEqual(build_hold.answer_nothing_to_build("owner").text, expected)
-        self.assertEqual(self.entry("owner")["delivery"]["outcome"], "Delivered")
-        self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-        self.assertTrue(self.advance()[0])
-        self.assertNotIn("Not reached", self.final_line())
-
-    def test_late_gate_mark_confirms_queued_delivery_only_for_current_generation(self) -> None:
-        for state in ("WaitingForMemory", "MemoryGateReturned"):
-            for current_generation in (False, True):
-                with self.subTest(state=state, current_generation=current_generation):
-                    self.begin("owner", "peer")
-                    self.now += timedelta(seconds=1)
-                    _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "renewed hold",
-                                              build_hold.NoReleaseEta(), self.now)
-                    cycle = self.cycle()
-                    cycle["release_started_at"] = self.now.isoformat()
-                    build_hold.save_cycle(cycle)
-                    self.release_mocks["send"].side_effect = [build_hold.ReleaseQueued(), build_hold.ReleaseDelivered()]
-                    _ = self.advance()
-                    _ = build_hold.answer_nothing_to_build("peer")
-                    self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-                    self.assertTrue(self.advance()[0])
-                    self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-                    cycle = self.cycle()
-                    generation = cycle.get("holder_generation", 1)
-                    self.assertGreater(generation, 1)
-                    mark_generation = generation if current_generation else generation - 1
-                    self.assertEqual(build_hold.mark_gate("owner", "unknown-state", generation=generation), "mark ignored")
-                    self.assertEqual(self.entry("owner")["delivery"]["outcome"], "QueuedUnconfirmed")
-                    self.assertEqual(build_hold.mark_gate("owner", state, "Granted", cycle_id=cycle["id"],
-                                                         generation=mark_generation), "mark ignored")
-                    self.assertEqual(self.entry("owner")["delivery"]["outcome"],
-                                     "Delivered" if current_generation else "QueuedUnconfirmed")
-                    self.assertEqual(self.entry("owner")["state"], "NoAdmissionAck")
-                    self.assertTrue(self.advance()[0])
-                    line = self.final_line()
-                    if current_generation:
-                        self.assertNotIn("Not reached", line)
-                    else:
-                        self.assertIn("Not reached, tell them yourself: name owner (queued, no answer)", line)
-
-    def test_call_gate_marks_preserve_delivery_and_second_call_sends_no_second_release(self) -> None:
-        for outcome in ("delivered", "queued", "failed", "gone"):
-            with self.subTest(outcome=outcome):
-                self.begin("owner", calls=(("owner", "call-a"), ("owner", "call-b")))
-                self.release_mocks["lookup"].return_value = build_hold.RecipientGone() if outcome == "gone" else build_hold.RecipientLive("/test/socket")
-                self.release_mocks["send"].return_value = (build_hold.ReleaseQueued() if outcome == "queued" else
-                                          build_hold.ReleaseSendFailed("send failed") if outcome == "failed" else
-                                          build_hold.ReleaseDelivered())
-                with redirect_stderr(io.StringIO()):
-                    _ = self.advance()
-                self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-                _ = self.returned("owner", "call-a")
-                expected = "RecipientGone" if outcome == "gone" else "DeliveryFailed" if outcome == "failed" else "Delivered"
-                self.assertEqual(self.entry("owner")["delivery"],
-                                 {"generation": self.cycle().get("holder_generation", 1), "outcome": expected})
-                _ = self.advance()
-                self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
-                self.assertEqual(self.release_mocks["lookup"].call_count, 1)
-                self.assertEqual(self.release_mocks["send"].call_count, int(outcome != "gone"))
-                _ = self.returned("owner", "call-b")
-                self.assertTrue(self.advance()[0])
-                line = self.final_line()
-                if outcome in {"failed", "gone"}:
-                    self.assertIn("name owner (session gone)" if outcome == "gone" else "name owner (send failed)", line)
-                else:
-                    self.assertNotIn("Not reached", line)
-
-    def test_a_session_only_told_is_told_again_in_a_new_generation_and_holds_nothing(self) -> None:
-        self.begin("owner", "told", registered=("owner",))
-        self.assertFalse(self.advance()[0])
-        self.assertEqual(self.sent(), ["owner", "told"])
-        _ = build_hold.answer_nothing_to_build("owner")
-        self.assertTrue(self.advance()[0])
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second-holder", "second-holder"), "new hold", build_hold.NoReleaseEta(), self.now)
-        cycle = self.cycle()
-        cycle["release_started_at"] = self.now.isoformat()
-        build_hold.save_cycle(cycle)
-        complete, detail = self.advance()
-        self.assertTrue(complete, detail)
-        self.assertEqual(self.sent(), ["owner", "told", "owner", "told"])
-        self.assertFalse(self.entry("told")["session_pending"])
-
-    def test_a_queued_call_of_a_told_session_holds_the_release_until_its_gate(self) -> None:
-        self.begin("owner", "told", calls=(("owner", "call-a"),))
-        complete, detail = self.advance()
-        self.assertFalse(complete)
-        self.assertEqual(detail, "name owner [owner]: ReleasedAwaitingAdmission")
-        _ = self.returned("owner", "call-a")
-        self.assertTrue(self.advance()[0])
-
-    def test_new_holder_generation_permits_one_new_notification(self) -> None:
-        self.begin("owner", calls=(("owner", "call-a"),))
-        _ = self.advance()
-        _ = self.returned("owner", "call-a")
-        prior = self.entry("owner")["delivery"]["generation"]
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second-holder", "second-holder"), "new hold", build_hold.NoReleaseEta(), self.now)
-        cycle = self.cycle()
-        cycle["release_started_at"] = self.now.isoformat()
-        build_hold.save_cycle(cycle)
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner", "owner"])
-        self.assertGreater(self.entry("owner")["delivery"]["generation"], prior)
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner", "owner"])
-
-    def test_told_session_with_only_interrupted_call_still_receives_its_release(self) -> None:
-        self.begin("owner", calls=(("owner", "interrupted"),))
-        build_hold.remove_call("owner", "interrupted")
-        self.assertEqual(self.entry("owner")["calls"], [])
-        self.assertFalse(self.entry("owner")["session_pending"])
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner"])
-        self.assertEqual(self.entry("owner")["state"], "ReleasedAwaitingAdmission")
-
-    def test_untold_key_with_nothing_pending_is_never_looked_up_or_named(self) -> None:
-        self.begin("told", calls=(("untold", "interrupted"),))
-        build_hold.remove_call("untold", "interrupted")
-        _ = self.advance()
-        self.assertEqual(self.release_mocks["lookup"].call_args_list, [mock.call("told")])
-        self.assertEqual(self.entry("untold")["state"], "NoPendingTurn")
-        _ = build_hold.answer_nothing_to_build("told")
-        self.assertTrue(self.advance()[0])
-        self.assertNotIn("Not reached", self.final_line())
-
-    def test_verify_call_key_is_never_notified_or_named_even_in_recipients(self) -> None:
-        self.begin("verify:call-a", calls=(("verify:call-a", "call-a"),))
-        _ = self.advance()
-        self.release_mocks["lookup"].assert_not_called()
-        self.release_mocks["send"].assert_not_called()
-        self.assertIsInstance(build_hold.read_admission("verify:call-a", "call-a"), build_hold.AdmittedTurn)
-        self.now += timedelta(seconds=build_hold.NO_ADMISSION_ACK_S)
-        self.assertTrue(self.advance()[0])
-        cycle = self.cycle()
-        cycle["entries"][0]["delivery"] = {"generation": cycle.get("holder_generation", 1), "outcome": "RecipientGone"}
-        build_hold.save_cycle(cycle)
-        self.assertNotIn("Not reached", self.final_line())
-
-    def test_legacy_no_registration_entry_is_loaded_and_delivered(self) -> None:
-        self.begin("owner")
-        cycle = self.cycle()
-        entry = build_hold.new_entry("owner", "name owner")
-        build_hold.store_release_state(entry, build_hold.NoRegistration())
-        _ = cast(dict[str, object], cast(object, entry)).pop("delivery")
-        cycle["entries"] = [entry]
-        build_hold.save_cycle(cycle)
-        self.assertTrue(self.entry("owner")["session_pending"])
-        self.assertEqual(self.entry("owner")["delivery"], {"generation": 0, "outcome": "NotAttempted"})
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner"])
-        self.assertEqual(self.entry("owner")["state"], "ReleasedAwaitingAdmission")
-
-    def test_phase_three_record_without_delivery_loads_without_rewriting(self) -> None:
-        self.begin("owner", registered=("owner",))
-        cycle = self.cycle()
-        _ = cast(dict[str, object], cast(object, cycle["entries"][0])).pop("delivery")
-        build_hold.save_cycle(cycle)
-        path = self.scratch / "release" / cycle["id"] / "cycle.json"
-        before = path.read_bytes()
-        self.assertEqual(self.entry("owner")["delivery"], {"generation": 0, "outcome": "NotAttempted"})
-        self.assertEqual(path.read_bytes(), before)
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["owner"])
-
-    def test_told_session_registering_after_queue_insertion_is_delivered_once(self) -> None:
-        self.begin("first", "second")
-        _ = self.advance()
-        _ = build_hold.register_wait("second")
-        self.assertEqual([entry["session_id"] for entry in self.cycle()["entries"]], ["first", "second"])
-        _ = build_hold.answer_nothing_to_build("first")
-        _ = self.advance()
-        _ = build_hold.register_wait("second")
-        _ = self.advance()
-        self.assertEqual(self.sent(), ["first", "second"])
-        _ = build_hold.answer_nothing_to_build("second")
-        self.assertTrue(self.advance()[0])
-        self.assertEqual(self.sent(), ["first", "second"])
-
-    def test_empty_recipient_list_keeps_registration_wait_and_timeout_text(self) -> None:
-        self.begin()
-        self.now += timedelta(seconds=build_hold.NO_REGISTRATION_S - 1)
-        self.assertEqual(self.advance(), (False, "waiting for registrations"))
-        self.now += timedelta(seconds=1)
-        self.assertEqual(self.advance(), (True, "NoRegistration timeout; no recipients registered"))
-        self.release_mocks["lookup"].assert_not_called()
-        self.release_mocks["send"].assert_not_called()
-
-
-class CallAdmissionTests(IsolatedBuildHoldTest):
-    now: datetime = datetime.min
-
-    @override
-    def setUp(self) -> None:
-        super().setUp()
-        self.now = datetime.now().astimezone()
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"), "the test", build_hold.NoReleaseEta(), self.now)
-        _ = self.enterContext(mock.patch.object(build_hold, "process_start_time", return_value="test-process"))
-        _ = self.enterContext(mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))
-        _ = self.enterContext(mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()))
-
-    def cycle(self) -> build_hold.HoldCycle:
-        cycle = build_hold.read_cycle()
-        assert cycle is not None
-        return cycle
-
-    def register(self, key: str, call_id: str) -> None:
-        _ = build_hold.register_wait(key, call_id=call_id, pid=12345, proc_start="test-process")
-
-    def advance(self) -> None:
-        cycle = self.cycle()
-        cycle["release_started_at"] = self.now.isoformat()
-        build_hold.save_cycle(cycle)
-        _ = build_hold.advance_release(cycle, self.now)
-
-    def complete(self, key: str, call_id: str) -> None:
-        _ = build_hold.mark_gate(key, "MemoryGateReturned", "Granted", call_id=call_id, cycle_id=self.cycle()["id"])
-        self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-
-    def write_legacy_completed_session(self) -> str:
-        cycle = self.cycle()
-        cycle["entries"] = [cast(build_hold.ReleaseEntry, cast(object, {
-            "session_id": "owner", "name": "owner", "state": "MemoryGateReturned",
-            "wait_ended_at": self.now.isoformat(), "outcome": "Granted",
-        }))]
-        _ = cycle.pop("holder_generation", 1)
-        _ = cycle.pop("holder_signature", "")
-        build_hold.save_cycle(cycle)
-        return cycle["id"]
-
-    def test_waiter_key_uses_marker_owner_before_shell_id(self) -> None:
-        active = self.scratch / "active"
-        active.mkdir()
-        run = self.scratch / "unit-run"
-        _ = (active / "owner").write_text(str(run) + "\n")
-        with mock.patch.dict(os.environ, {"UNIT_RUN_DIR": str(run), "CLAUDE_CODE_SESSION_ID": "stale"}):
-            self.assertEqual(build_hold.waiter_key("call-a"), "owner")
-
-    def test_unowned_waiter_key_names_the_verification_call(self) -> None:
-        self.assertEqual(build_hold.waiter_key("call-a"), "verify:call-a")
-
-    def test_two_calls_share_owner_and_receive_distinct_turns(self) -> None:
-        self.register("owner", "call-a")
-        self.register("owner", "call-b")
-        self.assertEqual(len(self.cycle()["entries"]), 1)
-        self.assertEqual([call["call_id"] for call in self.cycle()["entries"][0]["calls"]], ["call-a", "call-b"])
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AwaitingTurn)
-        self.complete("owner", "call-a")
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
-
-    def test_session_registration_and_call_share_one_release_beside_the_peers(self) -> None:
-        _ = build_hold.register_wait("owner")
-        self.register("owner", "worker-call")
-        self.register("peer", "peer-call")
-        with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as notification:
-            self.advance()
-            notified = [cast(build_hold.ReleaseEntry, sent.args[0])["session_id"] for sent in notification.call_args_list]
-            self.assertEqual(notified, ["owner", "peer"])
-            self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
-            self.assertIsInstance(build_hold.read_admission("owner"), build_hold.AdmittedTurn)
-            self.assertIsInstance(build_hold.read_admission("peer", "peer-call"), build_hold.AdmittedTurn)
-            entry = self.cycle()["entries"][0]
-            self.assertEqual(entry["active_call_id"], "worker-call")
-            _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="worker-call", cycle_id=self.cycle()["id"])
-            self.assertEqual(self.cycle()["entries"][0]["state"], "MemoryGateReturned")
-            self.now += timedelta(seconds=build_hold.RELEASE_POLL_S)
-            self.advance()
-            self.assertEqual(self.cycle()["entries"][0]["state"], "MemoryGateReturned")
-            self.assertIsInstance(build_hold.read_admission("peer", "peer-call"), build_hold.AdmittedTurn)
-            self.assertEqual(notification.call_count, 2)
-
-    def test_call_after_nothing_to_build_is_admitted_without_record_change(self) -> None:
-        _ = build_hold.register_wait("owner")
-        self.advance()
-        self.assertIn("NothingToBuild", build_hold.answer_nothing_to_build("owner").text)
-        before = self.cycle()
-        self.register("owner", "worker-call")
-        self.assertEqual(self.cycle(), before)
-        self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "worker-call"), build_hold.AdmittedTurn)
-
-    def test_call_after_completed_turn_is_admitted_without_record_change(self) -> None:
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
-        self.register("owner", "call-a")
-        self.advance()
-        self.complete("owner", "call-a")
-        before = self.cycle()
-        self.register("owner", "call-b")
-        self.assertEqual(self.cycle(), before)
-        self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
-
-    def test_registration_rejoins_after_each_terminal_entry_state(self) -> None:
-        states: tuple[build_hold.ReleaseState, ...] = (
-            build_hold.NothingToBuild(self.now), build_hold.MemoryGateReturned(self.now, "Granted"),
-            build_hold.NoAdmissionAck(self.now), build_hold.NoRegistration(),
-            build_hold.RecipientGone(), build_hold.DeliveryFailed(self.now),
-        )
-        for index, state in enumerate(states):
-            with self.subTest(state=type(state).__name__):
-                key = f"owner-{index}"
-                cycle = self.cycle()
-                cycle["release_started_at"] = ""
-                entry = build_hold.new_entry(key, key)
-                entry["session_pending"] = False
-                build_hold.store_release_state(entry, state)
-                cycle["entries"].append(entry)
-                build_hold.save_cycle(cycle)
-                self.register(key, "new-call")
-                self.assertIsInstance(build_hold.read_admission(key, "new-call"), build_hold.AwaitingTurn)
-
-    def test_active_call_admission_for_each_release_state(self) -> None:
-        states: tuple[tuple[build_hold.ReleaseState, bool], ...] = (
-            (build_hold.AwaitingRelease(), False),
-            (build_hold.DeliveryQueued(self.now), True),
-            (build_hold.ReleasedAwaitingAdmission(self.now), True),
-            (build_hold.WaitingForMemory(self.now, self.now), True),
-            (build_hold.MemoryGateReturned(self.now, "Granted"), True),
-            (build_hold.RecipientGone(), True), (build_hold.DeliveryFailed(self.now), True),
-        )
-        self.register("owner", "call-a")
-        for state, admitted in states:
-            with self.subTest(state=type(state).__name__):
-                cycle = self.cycle()
-                entry = cycle["entries"][0]
-                entry["active_call_id"] = "call-a"
-                entry["calls"][0]["admitted_generation"] = cycle.get("holder_generation", 1) if isinstance(state, build_hold.MemoryGateReturned) else 0
-                build_hold.store_release_state(entry, state)
-                build_hold.save_cycle(cycle)
-                expected = build_hold.AdmittedTurn if admitted else build_hold.AwaitingTurn
-                self.assertIsInstance(build_hold.read_admission("owner", "call-a"), expected)
-
-    def test_unowned_turn_is_granted_without_socket_notification(self) -> None:
-        self.register("verify:call-a", "call-a")
-        with mock.patch.object(build_hold, "socket_for", side_effect=AssertionError("No session socket")):
-            with mock.patch.object(build_hold, "send_release", side_effect=AssertionError("No session notification")):
-                self.advance()
-        self.assertIsInstance(build_hold.read_admission("verify:call-a", "call-a"), build_hold.AdmittedTurn)
-
-    def test_notification_failures_still_admit_the_live_call(self) -> None:
-        for gone in (True, False):
-            with self.subTest(gone=gone):
-                key = f"owner-{gone}"
-                cycle = self.cycle()
-                cycle["release_started_at"] = ""
-                build_hold.save_cycle(cycle)
-                self.register(key, "call-a")
-                with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientGone() if gone else build_hold.RecipientLive("/test/socket")):
-                    with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseSendFailed("send failed")):
-                        self.advance()
-                self.assertIsInstance(build_hold.read_admission(key, "call-a"), build_hold.AdmittedTurn)
-                entry = next(entry for entry in self.cycle()["entries"] if entry["session_id"] == key)
-                self.assertEqual(entry["state"], "RecipientGone" if gone else "DeliveryFailed")
-                self.complete(key, "call-a")
-
-    def test_cancel_removes_one_call_and_preserves_its_peer(self) -> None:
-        self.register("owner", "call-a")
-        self.register("owner", "call-b")
-        self.advance()
-        build_hold.remove_call("owner", "call-a")
-        self.assertEqual([call["call_id"] for call in self.cycle()["entries"][0]["calls"]], ["call-b"])
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
-
-    def test_vanished_process_is_dropped_without_removing_live_peer(self) -> None:
-        self.register("owner", "gone")
-        self.register("owner", "live")
-
-        def live(call: build_hold.PendingCall) -> bool:
-            return call["call_id"] == "live"
-
-        with mock.patch.object(build_hold, "call_is_live", side_effect=live):
-            self.advance()
-        self.assertEqual([call["call_id"] for call in self.cycle()["entries"][0]["calls"]], ["live"])
-        self.assertIsInstance(build_hold.read_admission("owner", "live"), build_hold.AdmittedTurn)
-
-    def test_process_identity_rejects_a_reused_pid(self) -> None:
-        call: build_hold.PendingCall = {"call_id": "old", "pid": 12345, "proc_start": "old-start", "started": False, "admitted_generation": 0}
-        with mock.patch.object(build_hold, "process_start_time", return_value="new-start"):
-            self.assertFalse(build_hold.call_is_live(call))
-        with mock.patch.object(build_hold, "process_start_time", return_value=""):
-            self.assertFalse(build_hold.call_is_live(call))
-
-    def test_session_mark_and_nothing_to_build_end_the_turn_and_keep_the_calls_admission(self) -> None:
-        self.register("marks", "worker-call")
-        self.register("answers", "worker-call")
-        self.advance()
-        _ = build_hold.mark_gate("marks", "MemoryGateReturned", "Granted")
-        _ = build_hold.answer_nothing_to_build("answers")
-        for key, state in (("marks", "MemoryGateReturned"), ("answers", "NothingToBuild")):
-            with self.subTest(key=key):
-                entry = next(entry for entry in self.cycle()["entries"] if entry["session_id"] == key)
-                self.assertEqual(entry["active_call_id"], "")
-                self.assertEqual(entry["state"], state)
-                self.assertIsInstance(build_hold.read_admission(key, "worker-call"), build_hold.AdmittedTurn)
-                self.assertIsInstance(build_hold.read_admission(key), build_hold.AdmittedTurn)
-
-    def test_wrong_call_or_cycle_cannot_mark_an_active_turn(self) -> None:
-        self.register("owner", "call-a")
-        self.advance()
-        before = self.cycle()
-        _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="call-b", cycle_id=before["id"])
-        _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="call-a", cycle_id="f" * 32)
-        self.assertEqual(self.cycle(), before)
-
-    def test_admission_survives_completion_of_the_gate_in_same_generation(self) -> None:
-        self.register("owner", "call-a")
-        self.register("owner", "call-b")
-        self.advance()
-        self.complete("owner", "call-a")
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "call-b"), build_hold.AdmittedTurn)
-        self.register("owner", "call-a")
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-
-    def test_new_holder_invalidates_admission_and_releases_resumed_and_new_calls_together(self) -> None:
-        self.register("owner-a", "started")
-        self.advance()
-        self.complete("owner-a", "started")
-        cycle_id = self.cycle()["id"]
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
-        self.assertEqual(self.cycle()["id"], cycle_id)
-        self.assertIsInstance(build_hold.read_admission("owner-a", "started"), build_hold.AwaitingTurn)
-        self.register("owner-b", "pending")
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner-a", "started"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("owner-b", "pending"), build_hold.AdmittedTurn)
-
-    def test_legacy_completed_session_keeps_its_admission_without_rewriting_record(self) -> None:
-        cycle_id = self.write_legacy_completed_session()
-        path = self.scratch / "release" / cycle_id / "cycle.json"
-        before = path.read_bytes()
-        self.assertEqual(build_hold.read_admission("owner"), build_hold.AdmittedTurn(cycle_id, 1))
-        self.assertEqual(path.read_bytes(), before)
-
-    def test_new_holder_invalidates_legacy_completed_session_admission(self) -> None:
-        cycle_id = self.write_legacy_completed_session()
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test",
-                                  build_hold.NoReleaseEta(), self.now + timedelta(seconds=1))
-        self.assertEqual(build_hold.read_admission("owner"), build_hold.AwaitingTurn(cycle_id, 2))
-        _ = build_hold.register_wait("owner")
-        self.advance()
-        self.assertEqual(build_hold.read_admission("owner"), build_hold.AdmittedTurn(cycle_id, 2))
-
-    def test_missing_cycle_has_a_semantic_admission_result(self) -> None:
-        (self.scratch / "release" / "current").unlink()
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.NoCycle)
-
-    def test_changed_cycle_does_not_keep_old_admission(self) -> None:
-        self.register("owner", "call-a")
-        self.advance()
-        old_id = self.cycle()["id"]
-        fresh = build_hold.open_cycle(self.now)
-        self.assertNotEqual(fresh["id"], old_id)
-        decision = build_hold.read_admission("owner", "call-a")
-        self.assertIsInstance(decision, build_hold.AwaitingTurn)
-        assert isinstance(decision, build_hold.AwaitingTurn)
-        self.assertEqual(decision.cycle_id, fresh["id"])
-
-    def test_unreadable_cycle_returns_diagnostic_without_repairing_record(self) -> None:
-        path = self.scratch / "release" / self.cycle()["id"] / "cycle.json"
-        _ = path.write_text("{broken")
-        before = path.read_bytes()
-        decision = build_hold.read_admission("owner", "call-a")
-        self.assertIsInstance(decision, build_hold.AdmissionReadError)
-        assert isinstance(decision, build_hold.AdmissionReadError)
-        self.assertTrue(decision.reason)
-        self.assertEqual(path.read_bytes(), before)
-
-
-    def test_reused_pid_is_dropped_by_driver_before_grant(self) -> None:
-        self.register("owner", "reused")
-        self.register("owner", "live")
-        cycle = self.cycle()
-        cycle["entries"][0]["calls"][0]["proc_start"] = "previous-process"
-        build_hold.save_cycle(cycle)
-        self.advance()
-        self.assertEqual([call["call_id"] for call in self.cycle()["entries"][0]["calls"]], ["live"])
-        self.assertIsInstance(build_hold.read_admission("owner", "live"), build_hold.AdmittedTurn)
-
-    def test_driver_drops_vanished_active_call_and_admits_its_peer(self) -> None:
-        self.register("owner", "gone")
-        self.register("owner", "live")
-        self.advance()
-        self.assertEqual(self.cycle()["entries"][0]["active_call_id"], "gone")
-
-        def live(call: build_hold.PendingCall) -> bool:
-            return call["call_id"] == "live"
-
-        with mock.patch.object(build_hold, "call_is_live", side_effect=live):
-            self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "live"), build_hold.AdmittedTurn)
-
-    def test_resuming_call_precedes_unstarted_peer_under_same_owner(self) -> None:
-        self.register("owner", "started")
-        self.advance()
-        self.complete("owner", "started")
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
-        self.register("owner", "pending")
-        self.advance()
-        self.assertIsInstance(build_hold.read_admission("owner", "started"), build_hold.AdmittedTurn)
-        self.assertIsInstance(build_hold.read_admission("owner", "pending"), build_hold.AwaitingTurn)
-
-    def test_hold_notice_says_verify_waits_and_launch_retries_without_appending_wait(self) -> None:
-        notice = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
-        self.assertEqual(notice, "natedev is held for another test. verify.sh waits by itself; an app launch is refused until the release, so launch again after it. Tests that can run on the Mac keep running there. Stop only cargo you started outside verify.sh. No release after 2 h: ask me.")
-
-
-    def test_queued_notification_authorizes_the_active_call(self) -> None:
-        self.register("owner", "call-a")
-        with mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseQueued()):
-            self.advance()
-        self.assertEqual(self.cycle()["entries"][0]["state"], "DeliveryQueued")
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-        self.assertIn("WaitingForMemory", build_hold.mark_gate("owner", "WaitingForMemory", call_id="call-a", cycle_id=self.cycle()["id"]))
-        self.complete("owner", "call-a")
-        self.assertIsInstance(build_hold.read_admission("owner", "call-a"), build_hold.AdmittedTurn)
-
-
-    def test_old_generation_mark_cannot_complete_a_new_turn_for_same_call(self) -> None:
-        self.register("owner", "call-a")
-        self.advance()
-        before = self.cycle()
-        generation = before.get("holder_generation", 1)
-        _ = build_hold.mark_gate("owner", "WaitingForMemory", call_id="call-a", cycle_id=before["id"], generation=generation)
-        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("second", "second"), "another test", build_hold.NoReleaseEta(), self.now)
-        self.advance()
-        current = self.cycle()
-        self.assertNotEqual(current.get("holder_generation", 1), generation)
-        _ = build_hold.mark_gate("owner", "MemoryGateReturned", "Granted", call_id="call-a", cycle_id=before["id"], generation=generation)
-        self.assertEqual(self.cycle(), current)
-
 
 
 class HoldEventRecord(TypedDict):
@@ -4109,8 +1448,9 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
             fcntl.flock(held_log, fcntl.LOCK_EX)
             try:
                 result = subprocess.run(
-                    ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks"],
-                    env=dict(os.environ), capture_output=True, text=True, timeout=1.5, check=False)
+                    ["python3", str(SCRIPT), "hold", "--holder", "alice", "--for", "render checks",
+                     "--proc-root", str(self.scratch / "proc")],
+                    env=dict(os.environ), capture_output=True, text=True, timeout=10, check=False)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("natedev is held for render checks.", result.stdout)
                 self.assertTrue((self.scratch / "holders" / "alice").is_file())
@@ -4152,7 +1492,7 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
         release.mkdir()
         _ = (release / "current").write_text("damaged")
         with mock.patch.object(build_hold, "read_cycle", side_effect=AssertionError("no files need no cycle")):
-            self.assertEqual(build_hold.natedev_holds(self.scratch / "holders"), build_hold.NatedevHolds((), ()))
+            self.assertEqual(build_hold.natedev_holds(self.scratch / "holders"), build_hold.NatedevHolds(()))
 
     def test_holder_file_without_a_cycle_is_in_force(self) -> None:
         folder = self.scratch / "holders"
@@ -4160,9 +1500,8 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
         _ = write_holder(folder, "session-id", "2026-10-12T10:00:00+00:00", "render checks")
         result = build_hold.natedev_holds(folder)
         self.assertEqual([holder.key for holder in result.in_force], ["session-id"])
-        self.assertEqual(result.releasing, ())
 
-    def test_released_at_with_matching_since_puts_file_in_releasing_and_reads_holders_once(self) -> None:
+    def test_released_at_with_matching_since_does_not_end_a_present_hold(self) -> None:
         folder = self.begin()
         cycle = build_hold.read_cycle()
         assert cycle is not None
@@ -4171,14 +1510,12 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
         with mock.patch.object(build_hold, "read_holders", wraps=build_hold.read_holders) as read:
             result = build_hold.natedev_holds(folder)
         self.assertEqual(read.call_count, 1)
-        self.assertEqual(result.in_force, ())
-        self.assertEqual([holder.key for holder in result.releasing], ["session-id"])
+        self.assertEqual([holder.key for holder in result.in_force], ["session-id"])
 
-    def test_present_holder_and_damaged_cycle_raise_release_record_read_error(self) -> None:
+    def test_present_holder_and_damaged_cycle_stay_in_force(self) -> None:
         folder = self.begin()
         _ = (self.scratch / "release" / "current").write_text("damaged")
-        with self.assertRaises(build_hold.ReleaseRecordReadError):
-            _ = build_hold.natedev_holds(folder)
+        self.assertEqual([holder.key for holder in build_hold.natedev_holds(folder).in_force], ["session-id"])
 
     def test_repeated_hold_and_renamed_release_keep_one_begin_and_the_file_key(self) -> None:
         folder = self.begin("unsafe name", "old name")
@@ -4228,6 +1565,400 @@ class HoldRecordingTests(IsolatedBuildHoldTest):
         with mock.patch.object(subprocess, "Popen", side_effect=OSError("cannot start recorder")):
             folder = self.begin()
         self.assertTrue((folder / "session-id").exists())
+
+class ImmediateReleaseTests(IsolatedBuildHoldTest):
+    now: datetime = datetime(2026, 10, 28, tzinfo=timezone.utc)
+
+    def test_interrupted_old_release_keeps_wait_and_local_checks_held_until_unlink(self) -> None:
+        import build_targets
+        self.begin()
+        cycle = self.cycle()
+        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
+        cycle["release_started_at"] = self.now.isoformat()
+        build_hold.save_cycle(cycle)
+        config = self.scratch / "targets.conf"
+        _ = config.write_text("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        events: list[str] = []
+
+        def remove_on_wait(_seconds: float) -> None:
+            events.append("waited with file")
+            self.assertTrue((self.scratch / "holders/holder").is_file())
+            (self.scratch / "holders/holder").unlink()
+            events.append("file removed")
+
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config), "CLAUDE_CODE_SESSION_ID": "waiter"}), \
+             mock.patch.object(build_hold, "socket_for") as lookup, \
+             mock.patch.object(build_targets, "wait_clock", return_value=self.now), \
+             mock.patch.object(build_targets, "wait_sleep", side_effect=remove_on_wait), \
+             redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            with mock.patch.object(build_hold, "release_hold", side_effect=OSError("interrupted before unlink")):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    _ = build_hold.release_cycle(self.scratch / "holders", "holder", clock=lambda: self.now)
+            self.assertEqual(build_hold.main(["wait"]), 10)
+            self.assertEqual(build_targets.command_check_local(), 10)
+            self.assertEqual(build_targets.command_register_local("call", pid=123), 10)
+            self.assertIn("wait for release", build_hold.register_wait("waiter"))
+            self.assertEqual(build_hold.notify_release(self.cycle()), "")
+            lookup.assert_not_called()
+            self.assertEqual(build_targets.command_wait_local("call", caller="lint"), 0)
+            events.append("wait returned")
+        self.assertEqual(events, ["waited with file", "file removed", "wait returned"])
+
+    def test_release_unlinks_before_saving_release_fields_and_before_notice(self) -> None:
+        self.begin()
+        build_hold.record_recipients([("waiting", "one")])
+        save = build_hold.save_cycle
+        events: list[str] = []
+
+        def saved(cycle: build_hold.HoldCycle) -> None:
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            self.assertEqual(cycle["holders"]["holder"]["released_at"], self.now.isoformat())
+            events.append("started" if cycle["release_started_at"] else "released")
+            save(cycle)
+
+        def send(_entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            self.assertIn("started", events)
+            events.append("notice")
+            return build_hold.ReleaseDelivered()
+
+        with mock.patch.object(build_hold, "save_cycle", side_effect=saved), \
+             mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/fake")), \
+             mock.patch.object(build_hold, "send_release", side_effect=send):
+            _ = build_hold.release_cycle(self.scratch / "holders", "holder", clock=lambda: self.now)
+            _ = build_hold.notify_release(self.cycle())
+        self.assertEqual(events[:2], ["released", "started"])
+        self.assertEqual(events.count("notice"), 1)
+
+    def test_same_session_rehold_resets_release_and_adds_keep_runs(self) -> None:
+        self.begin()
+        cycle = self.cycle()
+        cycle["holders"]["holder"]["released_at"] = self.now.isoformat()
+        cycle["release_started_at"] = self.now.isoformat()
+        build_hold.save_cycle(cycle)
+        for pid in (10, 20):
+            _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity("holder", "holder"),
+                                      "again", build_hold.NoReleaseEta(), self.now,
+                                      (build_hold.ProcessIdentity(pid, str(pid * 10)),))
+        self.assertEqual(self.cycle()["release_started_at"], "")
+        self.assertEqual(self.cycle()["holders"]["holder"]["released_at"], "")
+        self.assertIn("wait for release", build_hold.register_wait("waiter"))
+        holder, = build_hold.natedev_holds(self.scratch / "holders").in_force
+        self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(build_hold.main(["status"]), 0)
+        self.assertIn("kept by holder: pid 10, start 100", output.getvalue())
+        self.assertIn("kept by holder: pid 20, start 200", output.getvalue())
+
+    def begin(self, name: str = "holder") -> None:
+        _ = build_hold.start_hold(self.scratch / "holders", build_hold.HolderIdentity(name, name),
+                                  "tests", build_hold.NoReleaseEta(), self.now)
+
+    def cycle(self) -> build_hold.HoldCycle:
+        cycle = build_hold.read_cycle()
+        assert cycle is not None
+        return cycle
+
+    def test_release_never_waits_on_an_idle_waiter(self) -> None:
+        self.begin()
+        for session in ("idle", "ready"):
+            self.assertIn("wait for release", build_hold.register_wait(session, session))
+        sent: list[str] = []
+
+        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            sent.append(entry["session_id"])
+            # Neither session acknowledges or reports that its turn ended.
+            return build_hold.ReleaseDelivered()
+
+        with mock.patch.object(time, "sleep", side_effect=AssertionError("release must not sleep")), \
+             mock.patch.object(build_hold, "wait_for_quiet", side_effect=AssertionError("release must not wait")), \
+             mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test")), \
+             mock.patch.object(build_hold, "send_release", side_effect=send):
+            result = build_hold.release_cycle(self.scratch / "holders", "holder", clock=lambda: self.now)
+            self.assertEqual(result, "released, builds may resume.")
+            self.assertFalse((self.scratch / "holders/holder").exists())
+            self.assertCountEqual(sent, ["idle", "ready"])
+            self.assertEqual(build_hold.notify_release(self.cycle()), "")
+            self.assertCountEqual(sent, ["idle", "ready"])
+
+    def test_last_release_removes_holder_before_each_notice_and_never_sends_twice(self) -> None:
+        self.begin()
+        build_hold.record_recipients([("same name", "one"), ("same name", "two")])
+        _ = build_hold.register_wait("one")
+        _ = build_hold.register_wait("two")
+        sent: list[str] = []
+
+        def send(entry: build_hold.ReleaseEntry, _socket: str) -> build_hold.ReleaseDelivered:
+            self.assertFalse((self.scratch / "holders" / "holder").exists())
+            self.assertTrue(self.cycle()["holders"]["holder"]["released_at"])
+            sent.append(entry["session_id"])
+            return build_hold.ReleaseDelivered()
+
+        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")), \
+             mock.patch.object(build_hold, "send_release", side_effect=send):
+            self.assertEqual(build_hold.release_cycle(self.scratch / "holders", "holder"), "released, builds may resume.")
+            self.assertEqual(build_hold.notify_release(self.cycle()), "")
+        self.assertEqual(sent, ["one", "two"])
+        self.assertEqual([row["event"] for row in recorded_hold_events(self.scratch / "buildlog", 2)], ["began", "ended"])
+
+    def test_failed_queued_and_gone_notices_are_named_and_not_retried(self) -> None:
+        self.begin()
+        build_hold.record_recipients([("failed", "a"), ("queued", "b"), ("gone", "c"), ("lookup", "d")])
+        with mock.patch.object(build_hold, "socket_for", side_effect=[
+            build_hold.RecipientLive("/a"), build_hold.RecipientLive("/b"), build_hold.RecipientGone(),
+            build_hold.RecipientLookupFailed("unreadable registry"),
+        ]) as lookup, mock.patch.object(build_hold, "send_release", side_effect=[
+            build_hold.ReleaseSendFailed("refused"), build_hold.ReleaseQueued(),
+        ]) as send:
+            result = build_hold.release_cycle(self.scratch / "holders", "holder")
+            self.assertEqual(build_hold.notify_release(self.cycle()), result.removeprefix("released, builds may resume."))
+        self.assertEqual(lookup.call_count, 4)
+        self.assertEqual(send.call_count, 2)
+        self.assertIn("Not reached, tell them yourself: failed (send failed), queued (queued, delivery unconfirmed), gone (session gone), lookup (send failed)", result)
+
+    def test_another_in_force_holder_keeps_hold_until_its_release(self) -> None:
+        self.begin()
+        self.begin("other")
+        build_hold.record_recipients([("waiting", "one")])
+        with mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test")), \
+             mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()) as send:
+            self.assertIn("released; still held by other", build_hold.release_cycle(self.scratch / "holders", "holder"))
+            self.assertTrue((self.scratch / "holders" / "other").is_file())
+            send.assert_not_called()
+            self.assertEqual(build_hold.release_cycle(self.scratch / "holders", "other"), "released, builds may resume.")
+            send.assert_called_once()
+
+    def test_old_turn_fields_read_without_changing_status_or_blocking_a_new_hold(self) -> None:
+        self.begin()
+        cycle = self.cycle()
+        path = self.scratch / "release" / cycle["id"] / "cycle.json"
+        old = cast(dict[str, object], json.loads(path.read_text()))
+        old.update(holder_generation=3, active="one", turn=9)
+        old["entries"] = [{"session_id": "one", "name": "old recipient", "state": "WaitingForMemory",
+                           "calls": [{"call_id": "old", "admitted_generation": 3}], "turn": {"started_at": "old"},
+                           "delivery": {"generation": 3, "outcome": "Delivered"}}]
+        _ = path.write_text(json.dumps(old))
+        self.assertEqual(self.cycle()["entries"][0]["delivery"], "Delivered")
+        self.assertIn("old recipient", " ".join(build_hold.cycle_status_lines(self.cycle())))
+        self.assertEqual(json.loads(path.read_text()), old)
+        self.begin("new-holder")
+        self.assertIn("new-holder", self.cycle()["holders"])
+
+    def test_notice_says_builds_can_start_and_needs_no_answer(self) -> None:
+        with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            _ = build_hold.send_release(build_hold.new_entry("one", "recipient"), "/test")
+        arguments = cast(list[str], run.call_args.args[0])
+        notice = arguments[arguments.index("--text") + 1]
+        self.assertIn("Start your builds", notice)
+        self.assertIn("memory gate orders them", notice)
+        self.assertIn("No answer is needed", notice)
+
+
+class BuildAuditTests(IsolatedBuildHoldTest):
+    proc: Path = Path()
+    holders: Path = Path()
+    log: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.proc = self.scratch / "proc"
+        boot = self.proc / "sys/kernel/random/boot_id"
+        boot.parent.mkdir(parents=True)
+        _ = boot.write_text("boot-one\n")
+        self.holders = self.scratch / "holders"
+        self.holders.mkdir()
+        _ = write_holder(self.holders, "holder", "2026-10-28T12:00:00+00:00", "app test")
+        self.log = self.scratch / "buildlog"
+
+    def process(self, pid: int, command: str, *, parent: int = 1, start: int = 0,
+                environment: dict[str, str] | None = None, argv: tuple[str, ...] = ()) -> Path:
+        directory = self.proc / str(pid)
+        directory.mkdir(exist_ok=True)
+        fields = ["S", str(parent), *(["0"] * 17), str(start or pid * 10), "0"]
+        _ = (directory / "stat").write_text(f"{pid} ({command}) " + " ".join(fields))
+        _ = (directory / "comm").write_text(command + "\n")
+        _ = (directory / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in (argv or (command, "test"))) + b"\0")
+        _ = (directory / "environ").write_bytes(b"\0".join(f"{key}={value}".encode()
+                                                          for key, value in (environment or {}).items()) + b"\0")
+        if not (directory / "cwd").is_symlink():
+            (directory / "cwd").symlink_to(self.scratch)
+        return directory
+
+    def admission(self, pid: int, start: str) -> None:
+        ledger = self.log / "admission"
+        ledger.mkdir(parents=True, exist_ok=True)
+        _ = (ledger / f"{pid}.reservation").write_text(json.dumps({"pid": pid, "start_time": start}))
+
+    def builds(self) -> tuple[build_hold.AuditedBuild, ...]:
+        return build_hold.audit_builds(self.proc, build_hold.natedev_holds(self.holders).in_force, self.log)
+
+    def rows(self) -> list[dict[str, object]]:
+        self.reap_recorders()
+        return [cast(dict[str, object], json.loads(line)) for path in self.log.glob("*/hold-builds-*.jsonl")
+                for line in path.read_text().splitlines()]
+
+    def test_each_class_and_cargo_nextest_compiler_group(self) -> None:
+        _ = self.process(10, "cargo-tile-real", environment={"CLAUDE_CODE_SESSION_ID": "holder"})
+        _ = self.process(20, "bash", argv=("bash", "/scripts/direct/verify.sh"))
+        self.admission(20, "200")
+        _ = self.process(21, "cargo", parent=20, environment={"CLAUDE_CODE_SESSION_ID": "verified"})
+        _ = self.process(22, "cargo-nextest", parent=21)
+        _ = self.process(23, "rustc", parent=22)
+        _ = self.process(24, "rustdoc", parent=22)
+        _ = self.process(30, "cargo-nextest", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = self.process(40, "cargo")
+        builds = self.builds()
+        self.assertEqual([(item.process.identity.pid, item.classification) for item in builds],
+                         [(10, "holder"), (21, "admitted"), (30, "other_session"), (40, "no_session")])
+        self.assertEqual([item.pid for item in builds[1].children], [22, 23, 24])
+
+    def test_nearest_agent_ancestor_with_unreadable_environment(self) -> None:
+        _ = self.process(10, "claude", environment={"CLAUDE_CODE_SESSION_ID": "farther"})
+        _ = self.process(20, "codex", parent=10, environment={"CODEX_THREAD_ID": "nearer"})
+        _ = self.process(25, "python3", parent=20)
+        directory = self.process(30, "cargo", parent=25)
+        (directory / "environ").unlink()
+        (directory / "environ").mkdir()
+        build, = self.builds()
+        self.assertEqual(build.owner, build_hold.OwningSession("nearer"))
+        self.assertEqual(build.classification, "other_session")
+
+    def test_claude_ancestor_without_session_id_has_process_identity(self) -> None:
+        _ = self.process(10, "claude")
+        _ = self.process(20, "cargo", parent=10)
+        build, = self.builds()
+        self.assertEqual(build.owner, build_hold.OwningSession("claude:10:100"))
+
+    def test_worker_run_maps_to_owning_session_without_changing_environment(self) -> None:
+        active = self.scratch / "active"
+        active.mkdir()
+        _ = (active / "holder").write_text("/unit/run\n")
+        _ = self.process(10, "cargo", environment={"UNIT_RUN_DIR": "/unit/run", "UNIT_ACTIVE_DIR": str(active)})
+        build, = self.builds()
+        self.assertEqual(build.owner, build_hold.OwningSession("holder"))
+        self.assertEqual(build.classification, "holder")
+        self.assertEqual(os.environ["UNIT_RUN_DIR"], "")
+
+    def test_session_environment_precedes_worker_mapping(self) -> None:
+        _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "direct", "UNIT_RUN_DIR": "/unit/run"})
+        build, = self.builds()
+        self.assertEqual(build.owner, build_hold.OwningSession("direct"))
+
+    def test_second_holder_means_caller_does_not_hold_only_its_own(self) -> None:
+        _ = write_holder(self.holders, "second", "2026-10-28T12:00:00+00:00", "app test")
+        _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "holder"})
+        build, = self.builds()
+        self.assertEqual(build.classification, "other_session")
+
+    def test_reused_pid_does_not_match_admission_or_new_parent(self) -> None:
+        _ = self.process(10, "claude", start=400, environment={"CLAUDE_CODE_SESSION_ID": "new-parent"})
+        _ = self.process(20, "cargo", parent=10, start=200)
+        self.admission(20, "199")
+        build, = self.builds()
+        self.assertEqual(build.classification, "no_session")
+        self.assertEqual(build.owner, build_hold.NoOwningSession())
+
+    def test_pid_reused_during_environment_read_is_discarded(self) -> None:
+        directory = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "old"})
+        read_bytes = Path.read_bytes
+
+        def read(path: Path) -> bytes:
+            data = read_bytes(path)
+            if path == directory / "environ":
+                _ = (directory / "stat").write_text("10 (cargo) S 1 " + "0 " * 17 + "101 0")
+            return data
+
+        with mock.patch.object(Path, "read_bytes", read):
+            self.assertEqual(self.builds(), ())
+
+    def test_orphan_compilers_are_visible_and_missing_environment_is_no_session(self) -> None:
+        directory = self.process(10, "rustc")
+        (directory / "environ").unlink()
+        _ = self.process(20, "rustdoc", environment={"CLAUDE_CODE_SESSION_ID": "docs"})
+        self.assertEqual([item.classification for item in self.builds()], ["no_session", "other_session"])
+
+    def test_unadmitted_verify_environment_is_not_an_admission(self) -> None:
+        _ = self.process(10, "cargo", environment={"BUILDLOG_CALLER": "verify", "BUILDLOG_CALL_ID": "call",
+                                                   "CLAUDE_CODE_SESSION_ID": "other"})
+        build, = self.builds()
+        self.assertEqual(build.classification, "other_session")
+
+    def test_build_scope_marks_admission_without_memory_reservation(self) -> None:
+        directory = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "verified"})
+        _ = (directory / "cgroup").write_text("0::/user.slice/user-1000.slice/builds.slice/run-123.scope\n")
+        build, = self.builds()
+        self.assertEqual(build.classification, "admitted")
+        _ = (directory / "cgroup").write_text("0::/user.slice/not-builds.slice/run-123.scope\n")
+        build, = self.builds()
+        self.assertEqual(build.classification, "other_session")
+
+    def test_two_passes_record_once_per_build_per_hold_and_new_pid_lifetime(self) -> None:
+        _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "holder"})
+        _ = self.process(20, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "verified"})
+        self.admission(20, "200")
+        _ = self.process(30, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = self.process(40, "cargo")
+        _ = build_hold.audit_hold(self.holders, self.proc)
+        builds = build_hold.audit_hold(self.holders, self.proc)
+        rows = self.rows()
+        self.assertEqual(sorted((row["pid"], row["class"]) for row in rows),
+                         [(30, "other_session"), (40, "no_session")])
+        self.assertTrue(all(row["boot_id"] == "boot-one" for row in rows))
+        self.assertNotIn("pid 40", "\n".join(build_hold.audit_lines(builds)))
+        _ = self.process(30, "cargo", start=301, environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = build_hold.audit_hold(self.holders, self.proc)
+        self.assertEqual(len(self.rows()), 3)
+        _ = write_holder(self.holders, "holder", "2026-10-28T13:00:00+00:00", "new app test")
+        _ = build_hold.audit_hold(self.holders, self.proc)
+        self.assertEqual(len(self.rows()), 5)
+
+    def test_hold_keep_cli_captures_start_time_adds_runs_and_reports_stop_choices(self) -> None:
+        _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = self.process(20, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        output = io.StringIO()
+        with redirect_stdout(output):
+            for pid in (10, 20):
+                self.assertEqual(build_hold.main(["hold", "--holder", "holder", "--for", "app test",
+                                                 "--proc-root", str(self.proc), "--keep", str(pid)]), 0)
+            self.assertEqual(build_hold.main(["hold", "--holder", "holder", "--for", "app test",
+                                             "--proc-root", str(self.proc), "--keep", "999"]), 1)
+        holder, = build_hold.natedev_holds(self.holders).in_force
+        self.assertEqual(holder.keep, (build_hold.ProcessIdentity(10, "100"), build_hold.ProcessIdentity(20, "200")))
+        self.assertIn("kept: other, pid 10", output.getvalue())
+        self.assertIn("--keep 20", output.getvalue())
+
+    def test_hold_status_and_audit_print_builds_and_only_record_no_session(self) -> None:
+        _ = self.process(10, "cargo", environment={"CLAUDE_CODE_SESSION_ID": "other"})
+        _ = self.process(20, "cargo", argv=("cargo", "check", "--package", "unowned"))
+        (self.holders / "holder").unlink()
+        for action in ("hold", "status", "audit"):
+            args = [action, "--proc-root", str(self.proc)]
+            if action == "hold":
+                args.extend(["--holder", "holder", "--for", "app test"])
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(build_hold.main(args), 0)
+            self.assertIn("other_session: other, pid 10: cargo test", output.getvalue())
+            if action == "audit":
+                self.assertNotIn("unowned", output.getvalue())
+            else:
+                self.assertIn("--keep 20", output.getvalue())
+            if action == "hold":
+                self.assertIn("tests and builds outside the hold are stopped", output.getvalue())
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_audit_read_failure_does_not_fail_hold_or_status(self) -> None:
+        missing_proc = self.scratch / "missing-proc"
+        for args in (["hold", "--holder", "holder", "--for", "app test"], ["status"]):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(build_hold.main([*args, "--proc-root", str(missing_proc)]), 0)
+            self.assertIn("Build audit unavailable:", output.getvalue())
+            self.assertTrue((self.holders / "holder").is_file())
+
 
 if __name__ == "__main__":
     _ = unittest.main()
