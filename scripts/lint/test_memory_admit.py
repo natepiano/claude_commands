@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import sqlite3
@@ -17,6 +18,7 @@ from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast, override
+from unittest import mock
 from unittest.mock import patch
 
 import memory_admit as gate
@@ -92,11 +94,20 @@ class HistoryTests(unittest.TestCase):
         self.add_measured(1)
         self.assertEqual(self.peak(), gate.ExpectedPeak(4 * GIB, "measured", 5))
 
-    def test_stale_other_repo_and_other_host_are_excluded(self) -> None:
+    def test_stale_and_other_host_are_excluded(self) -> None:
         self.add_measured(5, at=NOW - timedelta(days=15))
-        self.add_measured(5, repo="other")
         self.add_measured(5, host="other-host")
         self.assertEqual(self.peak(), gate.ExpectedPeak(gate.FALLBACK, "fallback", 0))
+
+    def test_a_repo_with_few_runs_uses_the_step_p90_over_every_repo(self) -> None:
+        self.add_measured(3, repo="other")
+        self.add_measured(4, start_gib=10)
+        self.assertEqual(self.peak(), gate.ExpectedPeak(13 * GIB, "pooled", 7))
+
+    def test_own_buildlog_history_comes_before_the_pooled_p90(self) -> None:
+        self.add_index()
+        self.add_measured(5, repo="other")
+        self.assertEqual(self.peak(), gate.ExpectedPeak(int(5 * GIB * gate.ANON_SHARE), "buildlog", 5))
 
     def test_missing_index_or_history_is_fallback(self) -> None:
         self.assertEqual(self.peak().source, "fallback")
@@ -289,12 +300,23 @@ class LedgerTests(unittest.TestCase):
         self.held_reservation("", NOW - timedelta(hours=1))
         self.assertEqual(self.check(12 * GIB)[0].promised, 12 * GIB)
 
-    def test_forced_admission_still_reserves(self) -> None:
-        decision, path = self.check(0, force=True)
-        self.assertEqual(decision.state, "hold")
-        self.assertIsNotNone(path)
-        assert path is not None
-        self.assertTrue(path.exists())
+    def test_held_step_waits_in_line_and_an_old_waiter_goes_first(self) -> None:
+        _ = self.meminfo.write_text("MemAvailable: 0 kB\n")
+        held = gate.check(self.meminfo, self.pid, "", ["cargo", "check"], NOW.timestamp() - 1000, root=self.root, now=NOW)
+        self.assertEqual((held.decision.state, held.reservation), ("hold", gate.NotReserved("held")))
+        waiting = list((self.root / "admission").glob("*.waiting"))
+        self.assertEqual(len(waiting), 1)
+        older = cast(dict[str, object], json.loads(waiting[0].read_text()))
+        _ = waiting[0].rename(waiting[0].with_name("other.waiting"))
+        _ = self.meminfo.write_text(f"MemAvailable: {20 * GIB // 1024} kB\n")
+        with mock.patch.object(gate, "process_start_time", return_value=str(older["start_time"])):
+            younger = gate.check(self.meminfo, os.getpid() + 1, "", ["cargo", "check"], root=self.root, now=NOW)
+        self.assertEqual(younger.decision.threshold - younger.peak.bytes - younger.decision.reserve, older["need"])
+
+    def test_joint_promise_adds_gaps_within_a_minute_and_combines_groups_by_root_sum_square(self) -> None:
+        running = [gate.RunningMemory(4 * GIB, 0, 0.0), gate.RunningMemory(4 * GIB, 1 * GIB, 30.0),
+                   gate.RunningMemory(4 * GIB, 0, 1000.0)]
+        self.assertEqual(gate.joint_promise(running), math.isqrt((7 * GIB) ** 2 + (4 * GIB) ** 2))
 
     def test_no_argv_reads_live_promise_without_reserving(self) -> None:
         _, path = self.check(12 * GIB)
@@ -348,11 +370,9 @@ class ShellTests(unittest.TestCase):
             environment = {**os.environ,
                            "BUILD_HOLD_DIR": str(root / "holders"),
                            "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                           "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                           "UNIT_ACTIVE_DIR": str(root / "active"),
                            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                           "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                           "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                           "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                           "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                            "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_MEMINFO": str(meminfo),
                            "BUILDLOG_OFF": "1", "BUILDLOG_SCOPE": "0",
                            "LINT_CONFIG_READER": str(config)}
@@ -375,11 +395,9 @@ class ShellTests(unittest.TestCase):
                 env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                      "BUILDLOG_MEMINFO": str(meminfo)},
             )
@@ -410,11 +428,9 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_OFF": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(maximum.read_text().strip(), str(GIB))
@@ -434,11 +450,9 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_DIR": str(root),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_POLL_S": "1",
                                          "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
@@ -446,7 +460,7 @@ class ShellTests(unittest.TestCase):
             self.assertEqual(result.stdout, "\n")
             self.assertEqual(result.stderr.count("waiting for memory since "), 1)
             self.assertIn("(build needs ", result.stderr)
-            self.assertIn("memory wait limit reached after 15 min; starting anyway", result.stderr)
+            self.assertIn("memory wait limit reached after 15 min; starting the launch anyway", result.stderr)
             self.assertFalse((root / "admission").exists())
 
     def test_gate_wait_lines_in_order_without_repeated_prefix(self) -> None:
@@ -464,11 +478,9 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -479,13 +491,14 @@ class ShellTests(unittest.TestCase):
             self.assertRegex(lines[2], r"^memory free after 1 min \d+ s: starting$")
             self.assertEqual(result.stderr.count("waiting for memory since "), 1)
 
-    def test_limit_writes_reservation_for_argv(self) -> None:
+    def test_build_never_starts_at_the_limit_and_waits_first_in_line(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             meminfo = root / "meminfo"
             _ = meminfo.write_text("MemAvailable: 0 kB\n")
             command = (
-                'source "$1"; sleep() { echo slept >&2; }; buildlog_wait_for_memory true; '
+                'source "$1"; n=0; sleep() { n=$((n + 1)); echo slept >&2; ls "$BUILDLOG_DIR/admission" | grep -c "waiting$" >&2; '
+                'if (( n >= 2 )); then echo "MemAvailable: 67108864 kB" > "$BUILDLOG_MEMINFO"; fi; }; buildlog_wait_for_memory true; '
                 'printf "%s|%s|" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"; '
                 'if [[ -n "$BUILDLOG_MEM_RESERVATION" && -f "$BUILDLOG_MEM_RESERVATION" ]]; then echo exists; else echo missing; fi; '
                 'path=$BUILDLOG_MEM_RESERVATION; buildlog_release_memory 0; if [[ -n "$path" && ! -e "$path" ]]; then echo gone; else echo remains; fi'
@@ -495,16 +508,17 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "0"})
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertRegex(result.stdout, r"^TimedOut\|[^|\n]+\|exists\ngone\n$")
-            self.assertNotIn("slept", result.stderr)
+            self.assertRegex(result.stdout, r"^Granted\|[^|\n]+\|exists\ngone\n$")
+            self.assertEqual(result.stderr.count("slept\n1\n"), 2, result.stderr)
+            self.assertEqual(result.stderr.count("this step is now first in line"), 1, result.stderr)
+            self.assertNotIn("starting anyway", result.stderr)
+            self.assertEqual(list((root / "log/admission").glob("*.waiting")), [])
             self.assertEqual(len(list((root / "log/admission").glob("*.reservation"))), 0)
 
     def test_fitting_at_limit_is_granted(self) -> None:
@@ -519,11 +533,9 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -544,11 +556,9 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "MeminfoUnavailable\n")
@@ -569,11 +579,9 @@ class ShellTests(unittest.TestCase):
                         env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                              "BUILDLOG_MEMINFO": str(meminfo)},
                     )
@@ -593,11 +601,9 @@ class ShellTests(unittest.TestCase):
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
-                                         "PLAN_DELEGATE_ACTIVE_DIR": str(root / "active"),
+                                         "UNIT_ACTIVE_DIR": str(root / "active"),
                                          "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                                         "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                                         "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
+                                         "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                                          "MAC_TEST_STATE_DIR": str(root / "mac-state"), "HOME": str(root), "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo)})
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -635,11 +641,9 @@ class QueueLeaveTests(unittest.TestCase):
         self.environment = {**os.environ,
                             "BUILD_HOLD_DIR": str(self.root / "holders"),
                             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-                            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
+                            "UNIT_ACTIVE_DIR": str(self.root / "active"),
                             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-                            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
-                            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
+                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",
@@ -667,15 +671,11 @@ class QueueLeaveTests(unittest.TestCase):
         return list((self.root / "log/admission").glob("*.reservation"))
 
     def test_hook_leaves_a_held_step_before_it_starts(self) -> None:
-        started = self.root / "started"
-        self.environment["BUILDLOG_HOLD_STARTED_FILE"] = str(started)
-        result = self.run_step(f'test -e "{started}"', ":;")
+        result = self.run_step(":", ":;")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[-1], "75|LeftQueue|")
         self.assertFalse(self.ran.exists())
-        # The hook saw the started mark; leaving takes it back.
         self.assertEqual(self.hook_calls(), 1)
-        self.assertFalse(started.exists())
         self.assertEqual(self.reservations(), [])
         self.assertEqual(self.recorder_actions(), ["key"])
         # The wait is measured in whole seconds of SECONDS, so a loaded machine

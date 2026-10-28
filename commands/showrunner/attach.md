@@ -1,5 +1,5 @@
 ---
-description: Put one showrunner under another, or take it out again - the lower one then reports to the higher one, and the top of the tree shows everything below it that needs the user.
+description: Put one showrunner under another, or take it out again - the lower one then reports to the higher one; each one still shows the user only its own production's items (`/next all-below` adds those below).
 argument-hint: "<child> [parent] | detach <child> | tree"
 ---
 
@@ -28,7 +28,9 @@ with the sandbox off, and print its output as it comes:
 - the child or the parent has no update timer, so no showrunner runs it;
 - the child would report to itself;
 - the child already reports to a showrunner: detach it first;
-- the parent already reports to the child, directly or through others.
+- the parent already reports to the child, directly or through others;
+- a running child or parent has a session name that is not its production's
+  slug: rename the production first (`/showrunner:rename`).
 
 A child showrunner is never a unit. It keeps its own production doc, update
 timer, merge branch and units, and gets no row in the parent's Units table.

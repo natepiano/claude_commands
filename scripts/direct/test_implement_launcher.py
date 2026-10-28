@@ -28,13 +28,13 @@ from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid, wait
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
 
 
-DELEGATE_DIR = Path(__file__).parent
-AGENTS_DIR = DELEGATE_DIR.parent / "agents"
+DIRECT_DIR = Path(__file__).parent
+AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
 # The wrapper calls this as: <task> write <working_dir> <prompt> <reply> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
 # branch without a model call; the wrapper copies the reply into the summary
-# file because the stub, like a delegate that skipped its last act, left it
+# file because the stub, like a worker that skipped its last act, left it
 # empty.
 STUB_AGENT_EXEC = """#!/usr/bin/env bash
 set -euo pipefail
@@ -157,9 +157,9 @@ if verb == 'start' and os.environ.get('STUB_LAUNCH_RELEASE'):
 """
 
 CLAUDE_REGISTRY = """[assignments]
-delegate=claude
+direct=claude
 
-[delegate.claude]
+[direct.claude]
 impl=opus:high
 test=opus:high
 
@@ -243,9 +243,9 @@ ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
 AGENTS_REGISTRY = """[assignments]
-delegate=codex
+direct=codex
 
-[delegate.codex]
+[direct.codex]
 impl=gpt-called:xhigh
 test=gpt-called:xhigh
 fix=gpt-called:xhigh
@@ -282,11 +282,11 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.config_file = self.root / "delegate.conf"
+        self.config_file = self.root / "direct.conf"
         _ = self.config_file.write_text(
             "\n".join((
-                "PLAN_DELEGATE_PROGRESS_INTERVAL_SECONDS=180",
-                "PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=100000",
+                "UNIT_PROGRESS_INTERVAL_SECONDS=180",
+                "UNIT_COMPACT_ABOVE_TOKENS=100000",
                 "MAX_FIX_ATTEMPTS=3", "MAX_REOPENS=3", "STALLED_ROUNDS=3",
                 "RUNAWAY_ROUNDS=10", "REPAIR_ROUNDS_PER_FINDING=2",
                 "MIN_REPAIR_BUDGET=2", "MAX_CONSECUTIVE_SAME_KIND_PASSES=6",
@@ -313,29 +313,31 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
 
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
-        delegate = self.root / "scripts" / "direct"
+        direct_dir = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
         lib = self.root / "scripts" / "lib"
-        delegate.mkdir(parents=True)
+        direct_dir.mkdir(parents=True)
         agents.mkdir(parents=True)
         lib.mkdir(parents=True)
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
-        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", lib / "py")
-        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
-        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copy2(DELEGATE_DIR.parent / "lib" / "py", home_lib / "py")
-        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py", "findings.py", "board.sh"):
-            _ = shutil.copy2(DELEGATE_DIR / name, delegate / name)
-        launcher = delegate / "implement.sh"
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", home_lib / "py")
+        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py",
+                     "recorder_state.py", "findings.py", "board.sh"):
+            _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
+        launcher = direct_dir / "implement.sh"
         _ = launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(
                 "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
             ), encoding="utf-8",
         )
-        for name in ("agents_config.sh", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh"):
+        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh"):
             _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
@@ -350,7 +352,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
                 'POLL_SECS="${8:-15}"', 'POLL_SECS="${8:-0.05}"'
             ), encoding="utf-8",
         )
-        return delegate / "implement.sh"
+        return direct_dir / "implement.sh"
 
     def environment(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -358,7 +360,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         environment["AGENT_NOTES_DIR"] = str(self.root / "notes")
         # The copied shell helper uses the real account policy, while identity
         # and configuration stay in this fixture's home.
-        environment["PYTHONPATH"] = str(DELEGATE_DIR.resolve().parents[1])
+        environment["PYTHONPATH"] = str(DIRECT_DIR.resolve().parents[1])
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
                      "CLAUDE_CODE_REMOTE_MEMORY_DIR", "CODEX_HOME"):
             _ = environment.pop(name, None)
@@ -367,17 +369,17 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
         cache.parent.mkdir(parents=True, exist_ok=True)
         _ = cache.write_text(sys.executable + "\n")
         _ = environment.pop("CLAUDE_PYTHON", None)
-        environment["PLAN_DELEGATE_WORKER_POLL_SECS"] = "0.01"
-        environment["PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS"] = "30000"
-        environment["PLAN_DELEGATE_SYNC_WRITES"] = "0"
-        environment["TEST_WAIT_HELPER"] = str(DELEGATE_DIR.resolve() / "wait_for_test_state.py")
+        environment["UNIT_WORKER_POLL_SECS"] = "0.01"
+        environment["UNIT_WORKER_WAIT_ATTEMPTS"] = "30000"
+        environment["UNIT_SYNC_WRITES"] = "0"
+        environment["TEST_WAIT_HELPER"] = str(DIRECT_DIR.resolve() / "wait_for_test_state.py")
         environment["TEST_HEARTBEAT_READY"] = str(self.root / "heartbeat-ready")
-        environment["PLAN_DELEGATE_HISTORY_DIR"] = str(self.history_dir)
-        environment["PLAN_DELEGATE_CONFIG"] = str(self.config_file)
+        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
+        environment["UNIT_CONFIG"] = str(self.config_file)
         environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
         # The plain launcher, so the stub above stands in for the agent. The mesh
         # path would need a live app-server, which is a different test's subject.
-        environment["PLAN_DELEGATE_CODEX_MESH"] = "0"
+        environment["UNIT_CODEX_MESH"] = "0"
         environment["TZ"] = "UTC"
         environment["USER_ZONE"] = "UTC"
         _ = environment.pop("CODEX_THREAD_ID", None)
@@ -386,7 +388,7 @@ class ImplementLauncherWorkerTests(unittest.TestCase):
 
     def recorder(self, *arguments: str) -> None:
         environment = self.environment()
-        environment["PLAN_DELEGATE_PASS_OWNER"] = "launcher"
+        environment["UNIT_PASS_OWNER"] = "launcher"
         result = invoke_recorder(arguments, environment, Path.cwd())
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -535,7 +537,7 @@ printf '%s\\n' '{answer}'
 
     def mesh_environment(self, fail: bool = False) -> dict[str, str]:
         environment = self.environment()
-        environment["PLAN_DELEGATE_CODEX_MESH"] = "1"
+        environment["UNIT_CODEX_MESH"] = "1"
         if fail:
             environment["STUB_FOLLOW_FAIL"] = "1"
         return environment
@@ -575,8 +577,8 @@ printf '%s\\n' '{answer}'
                 release = session / "release"
                 pid_file = session / "agent-pid"
                 environment = self.mesh_environment()
-                for key in ("PLAN_DELEGATE_WORKER_POLL_SECS", "PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS",
-                            "PLAN_DELEGATE_EARLY_POLL_SECS", "PLAN_DELEGATE_TOKEN_CLOCK_FILE"):
+                for key in ("UNIT_WORKER_POLL_SECS", "UNIT_WORKER_WAIT_ATTEMPTS",
+                            "UNIT_EARLY_POLL_SECS", "UNIT_TOKEN_CLOCK_FILE"):
                     _ = environment.pop(key, None)
                 environment.update({"PATH": str(binaries) + os.pathsep + environment["PATH"],
                                     "TEST_PROBES": str(probes), "TEST_PROBES_FINISHED": str(finished),
@@ -656,7 +658,7 @@ printf '%s\\n' '{answer}'
         if compact_still_live:
             environment["STUB_COMPACT_FAIL"] = "3"
         if resolves_round:
-            environment["PLAN_DELEGATE_RESOLVES_ROUND"] = "1"
+            environment["UNIT_RESOLVES_ROUND"] = "1"
         return subprocess.run(
             arguments, check=False, capture_output=True, text=True,
             env=environment, timeout=300,
@@ -674,7 +676,7 @@ printf '%s\\n' '{answer}'
         findings = self.root / "scripts" / "direct" / "findings.py"
         for arguments in (
             ("open", "--severity", "blocker", "--title", "Repair retry",
-             "--caught-by", "delegate"),
+             "--caught-by", "worker"),
             ("dispatch", "--covers", "F001"),
         ):
             result = subprocess.run(
@@ -693,12 +695,12 @@ printf '%s\\n' '{answer}'
 
     def observe_status_at_records(self, *, fail_landed: bool = False) -> None:
         """Record the status each copied helper sees before it updates its ledger."""
-        delegate = self.root / "scripts" / "direct"
+        direct_dir = self.root / "scripts" / "direct"
         for name, commands in (
             ("progress_history.py", ("finish-pass",)),
             ("findings.py", ("landed", "abandon")),
         ):
-            script = delegate / name
+            script = direct_dir / name
             probe = f"""import pathlib as _probe_pathlib
 import sys as _probe_sys
 if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
@@ -1117,7 +1119,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         ))
         name = next(iter(roster))
         self.assertEqual(roster[name]["role"], "impl")
-        self.assertEqual(roster[name]["task"], "delegate.impl")
+        self.assertEqual(roster[name]["task"], "direct.impl")
 
         followed = self.mesh_launch(
             session_dir, to=name, kind="review", subtask="impl"
@@ -1128,11 +1130,11 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             roster_path.read_text(encoding="utf-8")
         ))
         self.assertEqual(roster[name]["role"], "review")
-        self.assertEqual(roster[name]["task"], "delegate.impl")
+        self.assertEqual(roster[name]["task"], "direct.impl")
 
     def test_compaction_threshold_must_be_configured_as_a_positive_integer(self) -> None:
         configured = self.config_file.read_text(encoding="utf-8")
-        key = "PLAN_DELEGATE_COMPACT_ABOVE_TOKENS"
+        key = "UNIT_COMPACT_ABOVE_TOKENS"
         without_key = "\n".join(
             line for line in configured.splitlines() if not line.startswith(f"{key}=")
         ) + "\n"
@@ -1388,7 +1390,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self.assertEqual(status_file.read_text(encoding="utf-8"), "previous\n")
         self.assertEqual(self.open_passes(session_dir), before)
 
-    def test_follow_up_rejects_wrong_slot_and_changed_model(self) -> None:
+    def test_follow_up_rejects_wrong_slot_and_keeps_its_recorded_model(self) -> None:
         session_dir = self.start_phase("identity")
         first = self.mesh_launch(session_dir)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -1408,9 +1410,26 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             AGENTS_REGISTRY.replace("impl=gpt-called:xhigh", "impl=gpt-blind:max"),
             encoding="utf-8",
         )
+        # A registry row changed after the worker opened: the follow-up keeps the worker's model.
         changed_model = self.mesh_launch(session_dir, to=name)
-        self.assertEqual(changed_model.returncode, 2, changed_model.stderr)
-        self.assertEqual(self.open_passes(session_dir), before)
+        self.assertEqual(changed_model.returncode, 0, changed_model.stderr)
+        self.assertIn("agent=gpt-called\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        identity = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
+        self.assertEqual(identity["model"], "gpt-called")
+
+    def test_follow_up_resumes_a_worker_recorded_before_the_rename(self) -> None:
+        # Seats recorded before the delegate -> direct rename stored the model of the user's
+        # rows at that time, which the registry no longer names (rca of 2026-10-23).
+        session_dir = self.start_phase("before-rename")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        path = session_dir / "impl_worker_impl.json"
+        identity = cast("dict[str, object]", json.loads(path.read_text()))
+        _ = path.write_text(json.dumps({**identity, "model": "gpt-blind"}))
+        resumed = self.mesh_launch(session_dir, to=str(identity["name"]))
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertIn("agent=gpt-blind\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertEqual(json.loads(path.read_text()), {**identity, "model": "gpt-blind"})
 
     def test_follow_recovers_missing_claim_unless_the_roster_launcher_is_alive(self) -> None:
         for launcher_pid in (None, 99999999, os.getpid()):

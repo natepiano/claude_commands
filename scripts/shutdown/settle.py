@@ -33,13 +33,14 @@ import note_file
 from inventory import Inventory, Session, inventory, last_tool_call
 from launch_permission import shutdown_state_root
 import record as store
-from record import SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
+from record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunners
 import sessions
 import stop as stop_work
 from user_zone import user_zone
 from scripts.accounts.accounts import HAND_ORIGIN
+from scripts.accounts import outage_alerts
 if TYPE_CHECKING:
     from ..accounts import refusals, accounts
     from . import restart as restart_work
@@ -363,13 +364,14 @@ def stopped_sessions_text(count: int) -> str:
     return "One session" if count == 1 else f"{count} sessions"
 
 
-def alert_user(push: RenderedPush, *, machine: str = "") -> None:
+def alert_user(push: RenderedPush, *, machine: str = "") -> bool:
     """Send a registry action through the shutdown alert path."""
     command = [*_send_command(), *user_send_argv(push, machine=machine)[2:]]
     try:
-        _ = _deliver_message(command, "user", "")
-    except RuntimeError as error:
+        return _deliver_message(command, "user", "")["kind"] == "sent"
+    except (OSError, RuntimeError) as error:
         print(f"shutdown: user alert failed: {error}", file=sys.stderr)
+        return False
 
 
 def _notifier_enabled(instance: str) -> bool:
@@ -726,7 +728,7 @@ def status_record_lines(record: SessionShutdown, owner: stop_work.FreshSession |
     else:
         message = ""
     lines = [f"  {record['session']['name']}: {progress}{message}"]
-    if record["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(record):
+    if store.legacy_tmux_leftovers(record):
         from restart import legacy_resume_command
         lines.append(f"    manual restart: {legacy_resume_command(record)}")
     for step in record.get("trail", []):
@@ -754,7 +756,7 @@ def begin(
     login: str, requested_by: str | None = None, only: Iterable[str] = (), *,
     then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
     request_id: str,
-    target: str = "", why: str = "", move_id: str = "",
+    target: str = "", why: str = "", move_id: str = "", checkout_move: CheckoutMove | None = None,
     report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
 ) -> list[SessionShutdown]:
     """Add independent owners, leaving every existing request intact."""
@@ -791,6 +793,8 @@ def begin(
         )
         if move_id:
             saved["move_id"] = move_id
+        if checkout_move is not None:
+            saved["checkout_move"] = checkout_move
         if target:
             saved["target"] = target
             saved["source_label"] = report["label"]
@@ -1195,10 +1199,9 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
             continue
         if (not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"}
                 and not store.stop_incomplete(saved)
-                and saved["session"]["host"]["kind"] not in {"legacy tmux", "legacy tmux unit"}
                 and not store.legacy_tmux_leftovers(saved)):
             continue
-        if saved["session"]["host"]["kind"] in {"legacy tmux", "legacy tmux unit"} or store.legacy_tmux_leftovers(saved):
+        if store.legacy_tmux_leftovers(saved):
             from restart import legacy_resume_command
             print(f"manual restart {saved['session']['name']}: {legacy_resume_command(saved)}")
             for issue in store.legacy_tmux_leftovers(saved):
@@ -1277,7 +1280,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          then: ShutdownContinuation = "stop", alerts: Literal["user", "none"] = "user",
          requested_by: str | None = None, request_id: str = "", target: str = "", why: str = "",
          report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
-         origin: accounts.MoveOrigin = HAND_ORIGIN, move_id: str = "") -> int:
+         origin: accounts.MoveOrigin = HAND_ORIGIN, move_id: str = "",
+         checkout_move: CheckoutMove | None = None) -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
     from scripts.accounts import accounts
     origin_arguments = accounts.move_origin_arguments(origin)
@@ -1303,7 +1307,8 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
         report = run_inventory(account.login, ids)
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
                  | {session["session_id"] for session in report["sessions"]}) if ids else set()
-    added = begin(account.login, request_origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, move_id=move_id, report=report)
+    added = begin(account.login, request_origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, move_id=move_id,
+                  checkout_move=checkout_move, report=report)
     if target:
         for saved in added:
             _carry_trust(saved, target)
@@ -1376,11 +1381,7 @@ def _stop_retry_pending(saved: SessionShutdown) -> bool:
 
 
 def _done(saved: SessionShutdown) -> bool:
-    if _stop_retry_pending(saved):
-        return False
-    progress = saved["progress"]["kind"]
-    return progress in {"restarted", "stop failed", "restart failed", "manual restart", "timers pending"} or (
-        progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "stop")
+    return store.shutdown_finished(saved)
 
 
 def shutdown_in_progress(saved: SessionShutdown) -> bool:
@@ -1482,20 +1483,28 @@ def report_stop(records: list[SessionShutdown]) -> None:
         due = stop_due or [saved for saved in unpushed if saved["progress"]["kind"] == "restart failed"]
         for machine in dict.fromkeys(saved["machine"] for saved in due):
             items = [saved for saved in due if saved["machine"] == machine]
-            pushes = ((render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
-                           stopped=stopped_sessions_text(len(items))),) if stop_due else
-                    restart_work.restart_push(first["label"], [saved["session"]["name"] for saved in items],
-                                              machine=machine))
-            for push in pushes:
-                alert_user(push, machine=route)
-            if not stop_due:
-                for saved in items:
+            if stop_due:
+                _ = alert_user(render("shutdown.stop_failed", account=json.dumps(first["label"]), machine=machine,
+                                      stopped=stopped_sessions_text(len(items))), machine=route)
+                continue
+            restarted = [restart_work.FailedSessionRestart(saved["session"]["name"], progress["reason"],
+                                                          progress.get("trust_command", ""))
+                         for saved in items if (progress := saved["progress"])["kind"] == "restart failed"]
+            sent = restart_work.send_failure_pushes(first["label"], restarted, machine=machine,
+                identities={saved["session"]["name"]: saved["session"]["session_id"] for saved in items},
+                moved={saved["session"]["name"]: saved for saved in items if saved.get("target")},
+                send=lambda push: alert_user(push, machine=route))
+            for saved in items:
+                if saved["session"]["name"] in sent:
                     mark_not_back_pushed(saved)
         if not stop_due:
             for saved in unpushed:
                 if saved["progress"]["kind"] == "manual restart":
-                    alert_user(render("shutdown.manual_restart", session=saved["session"]["name"], machine=saved["machine"]), machine=route)
-                    mark_not_back_pushed(saved)
+                    with outage_alerts.reserve((saved["session"]["session_id"],)) as claims:
+                        if claims and alert_user(render("shutdown.manual_restart", session=saved["session"]["name"],
+                                                       machine=saved["machine"]), machine=route):
+                            outage_alerts.delivered(claims[saved["session"]["session_id"]])
+                            mark_not_back_pushed(saved)
     finally:
         if not origins:
             print(text)
@@ -1638,7 +1647,8 @@ def _confirm_relaunch_pass(records: list[SessionShutdown]) -> ConfirmedRelaunchP
         claim = saved["progress"]
         if claim["kind"] == "restarting":
             try:
-                restart_work.confirm_entry(saved, claim["at"], saved["session"]["session_id"] in confirmation.live_ids)
+                restart_work.confirm_entry(saved, claim["at"], saved["session"]["session_id"] in confirmation.live_ids,
+                                           observed_at=confirmation.observed_at)
             except store.NoLiveRecord:
                 continue
             except Exception as error:
@@ -1678,7 +1688,7 @@ def _reserve_holdout_alert(saved: SessionShutdown, at: datetime) -> bool:
 def _holdout_host(saved: SessionShutdown) -> str:
     host = saved["session"]["host"]
     if host["kind"] == "legacy tmux" or host["kind"] == "legacy tmux unit":
-        return f"legacy host {host['session_name']}; manual recovery required"
+        return f"legacy host {host['session_name']}"
     if host["kind"] == "unit":
         return f"unit {host['production']}/{host['unit']}"
     if host["kind"] == "ghostty" or host["kind"] == "zed":
@@ -1723,7 +1733,7 @@ def _send_holdout_alert(held: list[tuple[SessionShutdown, str]]) -> None:
         for saved, reason in held:
             hold = HoldoutKind.from_reason(reason)
             command = shutdown_command("now", note_file.canonical_label(saved["label"]), "--here", "--only", saved["session"]["session_id"])
-            alert_user(render(hold.value, session=saved["session"]["name"], machine=saved["machine"], command=command,
+            _ = alert_user(render(hold.value, session=saved["session"]["name"], machine=saved["machine"], command=command,
                               operation="restart" if saved["then"] == "restart" else "shutdown"),
                        machine="natedev" if local_machine().casefold() == "mac" else "")
     finally:
@@ -1764,6 +1774,7 @@ def _record_cut_off(saved: SessionShutdown) -> None:
 
 def _archive_finished(saved: SessionShutdown) -> bool:
     try:
+        # Live confirmation already cleared its outage; archive may follow a new crash.
         store.archive_session(saved["login"], saved["session"]["session_id"])
     except store.NoLiveRecord:
         return False
@@ -1782,13 +1793,8 @@ def _complete_stop_action(saved: SessionShutdown) -> None:
         pass
 
 
-def _clear_finished_hold(login: str, seen: dict[str, SessionShutdown]) -> None:
-    outcome = store.lookup_account_hold(login)
-    if isinstance(outcome, store.AccountHeld) and (outcome.hold["then"] == "restart" or any(
-        saved["request_id"] == outcome.hold["request_id"] and saved["progress"]["kind"] == "restarted"
-        for saved in seen.values()
-    )):
-        store.clear_finished_account_hold(login)
+def _clear_finished_hold(login: str) -> None:
+    _ = store.release_finished_account_hold(login, conducting=True)
 
 
 @dataclass(frozen=True)
@@ -1922,6 +1928,9 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                     archive(result)
 
             def start_launch(saved: SessionShutdown) -> None:
+                saved = restart_work.move_checkout(saved, dry_run=False)
+                if restart_work.drop_restore_without_folder(saved, dry_run=False):
+                    return
                 if restart_work.launches_window(saved["session"]["host"]):
                     try:
                         result = restart_work.relaunch_session(saved, dry_run=False, desktop_state=desktop)
@@ -1998,7 +2007,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
 
                 records = store.session_records(login)
                 handled_requests.update(saved["request_id"] for saved in records if not _done(saved))
-                _clear_finished_hold(login, archived)
+                _clear_finished_hold(login)
                 drained = not pending and not confirmations and not launched and not messages and not sends
                 if drained and (isinstance(reload_state, _ReloadRequested) or not records or all(_done(saved) for saved in records)):
                     for saved in records:
@@ -2069,7 +2078,7 @@ def _conduct_owned(login: str, archived: dict[str, SessionShutdown],
                     _ = wait(futures, timeout=delay, return_when=FIRST_COMPLETED)
                 else:
                     time.sleep(delay)
-        _clear_finished_hold(login, archived)
+        _clear_finished_hold(login)
         return reload_state if isinstance(reload_state, _ReloadRequested) else _ConductorFinished()
     finally:
         desktop.restore(dry_run=False)

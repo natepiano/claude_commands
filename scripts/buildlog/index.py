@@ -30,7 +30,9 @@ from urllib.parse import quote
 
 import store
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 21
+# Step and call fields under a former name, renamed in the file on its next read.
+FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
 BUSY_TIMEOUT_MS = 30_000
@@ -77,8 +79,8 @@ STEP_COLUMNS: list[Column] = [
     ),
     ("tree_changed", "INTEGER", "1 when the files changed during the step (fmt, mend --fix, an edit), 0 when not, NULL when unknown"),
     ("caller", "TEXT", "verify, cargo-port, validate_ci (push gate), brp-launch (build and app start), agent, alias, unknown"),
-    ("worker", "TEXT", "delegate worker (PLAN_DELEGATE_TEAM_ROLE)"),
-    ("delegate_session", "TEXT", "delegate session folder name"),
+    ("worker", "TEXT", "worker role (UNIT_TEAM_ROLE)"),
+    ("unit_session", "TEXT", "unit session folder name"),
     ("session", "TEXT", "Claude Code session id or Codex thread id"),
     ("call_id", "TEXT", "calls.id of the verify.sh call that ran this step"),
     ("tty", "INTEGER", "1 when a terminal watched it; then no log facts are recorded"),
@@ -134,10 +136,11 @@ CALL_COLUMNS: list[Column] = [
         "outcome",
         "TEXT",
         "ran, failed, interrupted, reused (a recorded pass), replayed (a recorded failure),"
-        + " deferred (port-lint: an agent or a cargo was busy in the worktree)",
+        + " deferred (port-lint: an agent or a cargo was busy in the worktree),"
+        + " superseded (a newer call of the same verb from the same worker replaced it in the token queue)",
     ),
     ("status", "INTEGER", "exit status, NULL when unknown or interrupted"),
-    ("cached", "INTEGER", "1 when the call could use a pass record (a delegate session's test or lint)"),
+    ("cached", "INTEGER", "1 when the call could use a pass record (a worker session's test or lint)"),
     ("wait_s", "INTEGER", "seconds from script start until the run began"),
     ("token_wait_s", "INTEGER", "seconds spent acquiring the cargo token, a wait that timed out included; 0 when verify.sh sought none"),
     ("mac", "TEXT", "passed (natedev confirmed it; before 2026-10-16), passed_filter, passed_full (ended the call), failed, lost or declined when Mac offload ran or was considered"),
@@ -174,8 +177,8 @@ CALL_COLUMNS: list[Column] = [
     ("worktree_name", "TEXT", "worktree folder name"),
     ("branch", "TEXT", "branch"),
     ("sha", "TEXT", "short commit"),
-    ("worker", "TEXT", "delegate worker"),
-    ("delegate_session", "TEXT", "delegate session folder name"),
+    ("worker", "TEXT", "worker role"),
+    ("unit_session", "TEXT", "unit session folder name"),
     ("session", "TEXT", "Claude Code session or Codex thread"),
     ("backfilled", "INTEGER", "1 when copied from the old events.jsonl ledger"),
 ]
@@ -272,7 +275,42 @@ HOLD_EVENT_COLUMNS: list[Column] = [
     ("until", "TEXT", "the planned end; empty when none was given"),
 ]
 
+HOLD_BUILD_COLUMNS: list[Column] = [
+    ("action", "TEXT", "audit or stopped; old records read as audit"),
+    ("src", "TEXT", "source file for this hold's audit rows"),
+    ("id", "TEXT", "build identity from boot id, pid and process start time"),
+    ("at", "TEXT", "UTC instant when the audit first recorded this build for this hold"),
+    ("host", "TEXT", "machine that ran the build"),
+    ("hold_key", "TEXT", "holder file key"),
+    ("hold_since", "TEXT", "holder file since instant; a new hold gets new rows"),
+    ("boot_id", "TEXT", "kernel boot id; process start times are relative to this boot"),
+    ("pid", "INTEGER", "top cargo or nextest pid, or a compiler with no cargo ancestor"),
+    ("proc_start", "TEXT", "process start time in clock ticks since boot; guards pid reuse"),
+    ("class", "TEXT", "other_session or no_session; holder and admitted builds are not recorded"),
+    ("session", "TEXT", "owning session id or ancestor identity; empty for no_session"),
+    ("command", "TEXT", "build arguments as shell text"),
+    ("cwd", "TEXT", "build working directory; empty when it cannot be read"),
+]
+
+MAC_IDLE_COLUMNS: list[Column] = [
+    ("id", "TEXT PRIMARY KEY", "host, call and cause identity; one row per cause per call"),
+    ("src", "TEXT", "source file"),
+    ("host", "TEXT", "watch host"),
+    ("at", "TEXT", "UTC instant when the watch acted"),
+    ("call_id", "TEXT", "verify call; joins calls.id after the call ends"),
+    ("pid", "INTEGER", "verify process id"),
+    ("proc_start", "TEXT", "process start ticks; guards pid reuse"),
+    ("session", "TEXT", "live call session"),
+    ("repo", "TEXT", "call repository path"),
+    ("package", "TEXT", "test package"),
+    ("wait", "TEXT", "memory, build_hold, cargo_token or routing; backed by live wait evidence"),
+    ("cause", "TEXT", "missing_temp_root, missing_leave_hook, retry_delayed, call_has_no_marker_hook or idle_with_waiter"),
+    ("action", "TEXT", "created_session_temp_root, retry_marker, message_builds_unit or message_pending (send retried; row stays once)"),
+]
+
 TABLES: dict[str, tuple[list[Column], str, str]] = {
+    "mac_idle": (MAC_IDLE_COLUMNS, "", "one Mac idle case per cause per verify call; actions keep the call as the test owner"),
+    "hold_builds": (HOLD_BUILD_COLUMNS, "", "one row per build, hold and action: audit or stopped"),
     "hold_events": (HOLD_EVENT_COLUMNS, "", "one row per began or ended event; current holds come from coordination files"),
     "steps": (STEP_COLUMNS, "", "one row per step invoke.sh's run() ran: clippy, mend, doc, fmt, nextest, check, sweep"),
     "tests": (
@@ -571,7 +609,15 @@ def add_hold_event(connection: sqlite3.Connection, record: dict[str, object], sr
     insert(connection, "hold_events", pick({**record, "src": src}, HOLD_EVENT_COLUMNS))
 
 
-ADDERS = {"hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
+def add_hold_build(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "hold_builds", pick({"action": "audit", **record, "src": src}, HOLD_BUILD_COLUMNS))
+
+
+def add_mac_idle(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    insert(connection, "mac_idle", pick({**record, "src": src}, MAC_IDLE_COLUMNS))
+
+
+ADDERS = {"mac_idle": add_mac_idle, "hold_build": add_hold_build, "hold_event": add_hold_event, "step": add_step, "call": add_call, "ci_run": add_ci_run, "sample": add_sample,
           "memory_snapshot": add_memory_snapshot}
 
 
@@ -606,9 +652,11 @@ def migrate_worker_fields(path: Path) -> None:
                 continue
             if isinstance(value, dict):
                 fields = cast(dict[str, object], value)
-                if fields.get("kind") in ("step", "call") and "seat" in fields:
-                    _ = fields.setdefault("worker", fields["seat"])
-                    del fields["seat"]
+                renamed = [(old, new) for old, new in FORMER_FIELDS if old in fields]
+                if fields.get("kind") in ("step", "call") and renamed:
+                    for old, new in renamed:
+                        _ = fields.setdefault(new, fields[old])
+                        del fields[old]
                     raw = (json.dumps(fields, ensure_ascii=False) + "\n").encode()
                     changed = True
             lines.append(raw)

@@ -107,7 +107,12 @@ class RegistrationTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"), "NEXT_STATE_DIR": str(self.state / "next"),
-                    "CLAUDE_CODE_SESSION_ID": "current-session-id"}
+                    "CLAUDE_CODE_SESSION_ID": "current-session-id", "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
+        # Register refuses a session not named for its production's slug: both live sessions are named example.
+        (self.state / "sessions").mkdir()
+        for pid, session in ((os.getpid(), "current-session-id"), (os.getppid(), "resume-session-id")):
+            _ = (self.state / "sessions" / f"{pid}.json").write_text(
+                json.dumps({"pid": pid, "sessionId": session, "name": "example"}), encoding="utf-8")
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
@@ -306,6 +311,18 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertFalse(self.config.exists())
         self.assertEqual(self.notifier_calls(), [])
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def test_register_warns_for_a_session_not_named_for_the_production_and_still_registers(self) -> None:
+        record = self.state / "sessions" / f"{os.getpid()}.json"
+        _ = record.write_text(json.dumps({"pid": os.getpid(), "sessionId": "current-session-id", "name": "other"}),
+                              encoding="utf-8")
+        result = self.run_command("register")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("register: warn", result.stdout)
+        self.assertIn("production example has showrunner other", result.stdout)
+        self.assertIn("/showrunner:rename plan example other", result.stdout)
+        self.assertIn("register: ok", result.stdout)
+        self.assertNotEqual(self.notifier_calls(), [])
 
     def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
         for marker in ("The prompt:", "**A tick**"):
@@ -791,7 +808,7 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         return listed.stdout.splitlines()
 
 
-    def test_open_lists_every_item_below_a_root_in_full_oldest_first(self) -> None:
+    def test_open_lists_only_the_productions_own_items_in_full_never_those_below(self) -> None:
         for slug in ("example", "kid", "grandkid", "stranger"):
             self.timer(slug)
         self.attach("kid", "example")
@@ -801,27 +818,22 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today, or after the release?"})
         self.write_open_for("grandkid", {"since": "2026-09-28T10:30", "text": "keep the old key binding?"})
         self.write_open_for("stranger", {"since": "2026-10-01T08:00", "text": "not this tree's"})
-        self.assertEqual(self.open_lines(), [
-            "1. grandkid, since Mon Sep 28 10:30: keep the old key binding?",
-            "2. kid, since Tue Oct 06 08:00: merge today, or after the release?",
-            "3. example, since Tue Oct 06 09:00: choose layout",
-            "deferred until Fri Jan 02 08:00: example: review colors",
-            "open: ok — 3 due, 1 deferred",
-        ])
-
-    def test_open_names_an_unreadable_list_and_still_lists_the_rest(self) -> None:
-        for slug in ("example", "kid"):
-            self.timer(slug)
-        self.attach("kid", "example")
-        self.write_open_for("example", {"since": "2026-10-06T09:00", "text": "choose layout"})
-        _ = self.outstanding().with_name("kid.json").write_text("{bad", encoding="utf-8")
+        # The showrunners below answer for their own items (user, 2026-10-27).
         self.assertEqual(self.open_lines(), [
             "1. example, since Tue Oct 06 09:00: choose layout",
-            "kid: needs-user list unreadable",
-            "open: ok — 1 due, 0 deferred, 1 unreadable",
+            "deferred until Fri Jan 02 08:00: example: review colors",
+            "open: ok — 1 due, 1 deferred",
         ])
 
-    def test_open_below_a_root_lists_only_its_own_items(self) -> None:
+    def test_open_names_an_unreadable_list(self) -> None:
+        self.timer("example")
+        _ = self.outstanding().write_text("{bad", encoding="utf-8")
+        self.assertEqual(self.open_lines(), [
+            "example: needs-user list unreadable",
+            "open: ok — 0 due, 0 deferred, 1 unreadable",
+        ])
+
+    def test_a_middle_showrunner_lists_its_own_items_and_marks_one_below_never_above(self) -> None:
         for slug in ("top", "example", "kid"):
             self.timer(slug)
         self.attach("example", "top")
@@ -833,6 +845,10 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
             "1. example, since Tue Oct 06 09:00: choose layout",
             "open: ok — 1 due, 0 deferred",
         ])
+        # `/next all-below` can show the kid's item, so it can be marked from here; the top's never.
+        marked = self.run_command("mark-important", "--item", "merge today?")
+        self.assertEqual(marked.stdout.strip(), "mark-important: ok — merge today?", marked.stdout + marked.stderr)
+        self.assertNotEqual(self.run_command("mark-important", "--item", "ship it?").returncode, 0)
 
     def test_open_with_nothing_attached_lists_its_own_items_or_none(self) -> None:
         self.assertEqual(self.open_lines(), ["open: ok — 0 due, 0 deferred"])
@@ -892,6 +908,101 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         bad = self.run_command("questions", "--state", str(state))
         self.assertEqual(bad.returncode, 2, bad.stdout + bad.stderr)
 
+
+    def run_ask(self, text: str, question: str, unit: str = "") -> str:
+        with (mock.patch.dict(os.environ, self.env),
+              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"),
+              redirect_stdout(io.StringIO()) as output):
+            registration.ask(read_production(self.doc), text, question, unit, dailies_render.Ranking())
+        return output.getvalue()
+
+    def test_ask_files_a_units_question_with_its_review_and_shows_the_asker(self) -> None:
+        full = "Keep the old key binding? Keep (recommended — users know it) or drop it."
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted(full + " Reviewed.")):
+            printed = self.run_ask("alpha-unit: keep the old key binding?", full, "alpha-unit")
+        self.assertIn("filed question: " + full + " Reviewed.", printed)
+        self.assertNotIn("reviewed question:", printed)
+        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
+        self.assertEqual([(row["text"], row["asked_by"], row["question"]) for row in rows],
+                         [("alpha-unit: keep the old key binding?", "alpha-unit", full)])
+        self.assertEqual(rows[0]["reviewed"], full + " Reviewed.")
+        history = self.outstanding().with_suffix(".history.jsonl").read_text()
+        self.assertIn("alpha-unit: keep the old key binding?", history)
+        listed = self.open_lines()
+        self.assertRegex(listed[0], r"^1\. example, since .*, asked by alpha-unit: " + re.escape(full) + "$")
+
+    def test_ask_refuses_an_unknown_unit_a_duplicate_and_a_held_review_without_writing(self) -> None:
+        with self.assertRaisesRegex(registration.RegistrationFailure, "beta-unit is not a unit of example"):
+            _ = self.run_ask("which?", "Which one?", "beta-unit")
+        held = review.QuestionAwaitingFacts("Retry it?", ("say which build",), ())
+        with (mock.patch.object(review, "review_question", return_value=held),
+              self.assertRaisesRegex(registration.RegistrationFailure, "question held for review: retry\\?: say which build")):
+            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+        self.assertFalse(self.outstanding().exists())
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Retry it?")):
+            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+            with self.assertRaisesRegex(registration.RegistrationFailure, "already open"):
+                _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+
+    def test_a_list_rewrite_keeps_a_filed_question_and_answer_names_the_unit(self) -> None:
+        with mock.patch.object(review, "review_question", return_value=review.QuestionAccepted("Retry it?")):
+            _ = self.run_ask("retry?", "Retry it?", "alpha-unit")
+        state = self.question_state(["Reminder"])
+        kept = self.run_questions(state)
+        self.assertIn("questions: kept — retry?: asked by alpha-unit", kept)
+        rows = cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))
+        self.assertEqual([row["text"] for row in rows], ["Reminder", "retry?"])
+        self.assertEqual(rows[1]["asked_by"], "alpha-unit")
+        # A rewrite that names the item keeps its asker too.
+        _ = self.run_questions(self.question_state(["Reminder", "retry?"]))
+        self.assertEqual(cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))[1]["asked_by"], "alpha-unit")
+        answered = self.run_command("answer", "--item", "retry?")
+        self.assertEqual(answered.stdout.splitlines(), ["relay: to alpha-unit", "answer: ok — example: retry?"],
+                         answered.stdout + answered.stderr)
+        self.assertEqual([row["text"] for row in cast(list[dict[str, str]], json.loads(self.outstanding().read_text()))],
+                         ["Reminder"])
+        reminder = self.run_command("answer", "--item", "Reminder")
+        self.assertEqual(reminder.stdout.splitlines()[0], "relay: none; the item belongs to this production")
+        self.assertEqual(self.run_command("answer", "--item", "retry?").returncode, 2)
+
+    def test_answer_reaches_a_list_below_and_relays_through_its_showrunner_never_above(self) -> None:
+        for slug in ("top", "example", "kid"):
+            self.timer(slug)
+        self.attach("example", "top")
+        self.attach("kid", "example")
+        self.write_open_for("kid", {"since": "2026-10-06T08:00", "text": "merge today?", "question": "Merge today?",
+                                    "asked_by": "kid-unit"})
+        self.write_open_for("top", {"since": "2026-10-06T07:00", "text": "ship it?", "question": "Ship it?",
+                                    "asked_by": "top-unit"})
+        answered = self.run_command("answer", "--item", "merge today?")
+        self.assertEqual(answered.stdout.splitlines(),
+                         ["relay: to the showrunner of kid, for kid-unit", "answer: ok — kid: merge today?"],
+                         answered.stdout + answered.stderr)
+        self.assertEqual(json.loads(self.outstanding().with_name("kid.json").read_text()), [])
+        self.assertEqual(self.run_command("answer", "--item", "ship it?").returncode, 2)
+
+    def test_answer_waits_for_the_lists_lock(self) -> None:
+        self.write_open_for("example", {"since": "2026-10-06T08:00", "text": "retry?", "question": "Retry it?",
+                                        "asked_by": "alpha-unit"})
+        lock = self.outstanding().with_suffix(".lock")
+        holder = subprocess.Popen([sys.executable, "-c", (
+            "import fcntl, sys, time\n"
+            f"handle = open({str(lock)!r}, 'a')\n"
+            "fcntl.flock(handle, fcntl.LOCK_EX)\n"
+            "print('held', flush=True)\n"
+            "time.sleep(2)\n")], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.assertEqual(cast(io.TextIOWrapper, holder.stdout).readline().strip(), "held")
+        began = datetime.now()
+        answered = self.run_command("answer", "--item", "retry?")
+        self.assertEqual(answered.returncode, 0, answered.stdout + answered.stderr)
+        self.assertGreaterEqual((datetime.now() - began).total_seconds(), 1.0)
+        cast(io.TextIOWrapper, holder.stdout).close()
+
+    def test_the_reader_refuses_an_asker_without_a_question(self) -> None:
+        _ = self.outstanding().write_text(json.dumps([{"since": "2026-10-06T08:00", "text": "x", "asked_by": "alpha-unit"}]))
+        with self.assertRaisesRegex(dailies_render.InputError, "question required"):
+            _ = dailies_render.read_outstanding(self.outstanding())
 
 if __name__ == "__main__":
     _ = unittest.main()

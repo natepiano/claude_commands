@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check delegate lint scope with synthetic Cargo metadata and real lint policy."""
+"""Check worker lint scope with synthetic Cargo metadata and real lint policy."""
 
 from __future__ import annotations
 
@@ -216,7 +216,7 @@ class VerifyLintScopeTests(unittest.TestCase):
         }
         self.environment = {
             name: value for name, value in os.environ.items()
-            if not name.startswith(("BUILD", "PLAN_DELEGATE_", "LINT_", "MAC_TEST_",
+            if not name.startswith(("BUILD", "UNIT_", "LINT_", "MAC_TEST_",
                                     "CARGO_", "RUST", "NEXTEST_", "CLAUDE_CODE_", "CODEX_"))
         }
         self.environment.update({
@@ -258,7 +258,7 @@ class VerifyLintScopeTests(unittest.TestCase):
     def enable_cache(self) -> Path:
         session = self.root / "session"
         session.mkdir()
-        self.environment["PLAN_DELEGATE_SESSION_DIR"] = str(session)
+        self.environment["UNIT_SESSION_DIR"] = str(session)
         return session / "verify_cache"
 
     def isolate_path_without_taplo(self) -> None:
@@ -305,6 +305,8 @@ class VerifyLintScopeTests(unittest.TestCase):
         return [args[1:] for args in self.cargo_calls() if args[:1] == [command]]
 
     def cargo_calls(self) -> list[list[str]]:
+        if not self.events.exists():
+            return []
         events = [cast(CargoInvocation, json.loads(line))
                   for line in self.events.read_text(encoding="utf-8").splitlines()]
         return [event["args"] for event in events]
@@ -321,7 +323,7 @@ class VerifyLintScopeTests(unittest.TestCase):
                 if args[0] in ("clippy", "doc") or
                 (args[:2] == ["+nightly", "fmt"] and "--version" not in args)]
 
-    def test_unchanged_tree_runs_one_fix_pass_before_judgment_and_rustdoc(self) -> None:
+    def test_unchanged_tree_runs_one_fix_pass_before_judgment_without_rustdoc(self) -> None:
         result = self.verify("lint", "--workspace")
         self.assert_fix_and_judgment_calls()
         self.assertEqual(self.lint_stages(), [
@@ -329,7 +331,6 @@ class VerifyLintScopeTests(unittest.TestCase):
             ["clippy", *self.calls("clippy")[0]],
             ["+nightly", "fmt", "--all"],
             ["clippy", *self.calls("clippy")[1]],
-            ["doc", "--no-deps", "--jobs", "8", "-p", "sample"],
         ])
         self.assertIn("style-lint: clippy start", result.stdout.splitlines())
         self.assertIn("style-lint: clippy passed", result.stdout.splitlines())
@@ -352,7 +353,7 @@ class VerifyLintScopeTests(unittest.TestCase):
                 # Two passes change the source; the third confirms no change.
                 self.assert_fix_and_judgment_calls(fix_passes=3)
                 self.assertEqual((self.root / "src/lib.rs").read_text(encoding="utf-8"), final_fix)
-                self.assertEqual(len(self.calls("doc")), 1)
+                self.assertEqual(self.calls("doc"), [])
                 self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
                                  [["fmt", "-p", "sample"]] * 4)
 
@@ -401,7 +402,7 @@ class VerifyLintScopeTests(unittest.TestCase):
                     ["+nightly", "fmt", "-p", "sample"],
                     ["clippy", *self.calls("clippy")[1]],
                 ])
-                self.assertEqual(len(self.calls("doc")), 1 if judgment_status == 0 else 0)
+                self.assertEqual(self.calls("doc"), [])
 
     def test_check_lint_only_judges_without_fixes(self) -> None:
         _ = self.verify("lint", "--workspace", "--check")
@@ -439,22 +440,16 @@ class VerifyLintScopeTests(unittest.TestCase):
             ["fmt", "--version"], ["fmt", "-p", "sample"],
             ["fmt", "--version"], ["fmt", "-p", "sample"],
         ])
-        self.assertEqual(self.calls("doc"), [["--no-deps", "--jobs", "8", "-p", "sample"]])
+        self.assertEqual(self.calls("doc"), [])
 
-    def test_features_reach_mend_and_doc_but_do_not_narrow_clippy(self) -> None:
-        _ = self.verify("lint", "sample", "--features", "a")
-        self.assert_workspace_taplo_check()
-        self.assert_fix_and_judgment_calls()
-        self.assertEqual(self.calls("mend"), [[
-            "--all-targets", "--workspace", "--fix", "--features", "sample/a"
-        ]])
-        self.assertEqual(self.calls("doc"), [[
-            "--no-deps", "--jobs", "8", "-p", "sample", "--features", "sample/a"
-        ]])
-        self.assertEqual(self.calls("+nightly"), [
-            ["fmt", "--version"], ["fmt", "-p", "sample"],
-            ["fmt", "--version"], ["fmt", "-p", "sample"],
-        ])
+    def test_lint_rejects_features_now_owned_by_doc(self) -> None:
+        result = self.invoke_verify("lint", "sample", "--features", "a", cwd=self.root)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("--features", result.stdout + result.stderr)
+        self.assertEqual(self.calls("mend"), [])
+        self.assertEqual(self.calls("clippy"), [])
+        self.assertEqual(self.calls("doc"), [])
+        self.assertEqual(self.calls("+nightly"), [])
 
     def test_example_keeps_its_single_target_and_required_features(self) -> None:
         for example, features in (("plain", []), ("featured", ["--features", "sample/a"])):
@@ -470,19 +465,17 @@ class VerifyLintScopeTests(unittest.TestCase):
 
     def test_clippy_off_names_the_full_scope_without_running_it(self) -> None:
         self.write_config(clippy="off")
-        for features in ([], ["--features", "a"]):
-            with self.subTest(features=features):
-                result = self.verify("lint", "sample", *features)
-                skip_lines = [line for line in result.stdout.splitlines()
-                              if line.startswith("SKIPPED:") and "clippy" in line]
-                self.assertEqual(skip_lines, [
-                    "SKIPPED: cargo clippy --workspace --all-targets --all-features"
-                    + f" — clippy=off in {self.config}"
-                ])
-                self.assertEqual(self.calls("clippy"), [])
-                self.assertEqual(len(self.calls("mend")), 1)
-                self.assertEqual(len(self.calls("doc")), 1)
-                self.assert_workspace_taplo_check()
+        result = self.verify("lint", "sample")
+        skip_lines = [line for line in result.stdout.splitlines()
+                      if line.startswith("SKIPPED:") and "clippy" in line]
+        self.assertEqual(skip_lines, [
+            "SKIPPED: cargo clippy --workspace --all-targets --all-features"
+            + f" — clippy=off in {self.config}"
+        ])
+        self.assertEqual(self.calls("clippy"), [])
+        self.assertEqual(len(self.calls("mend")), 1)
+        self.assertEqual(self.calls("doc"), [])
+        self.assert_workspace_taplo_check()
 
     def test_taplo_uses_workspace_config_when_lint_starts_in_a_member_directory(self) -> None:
         result = self.invoke_verify("lint", "sample", cwd=self.root / "src")

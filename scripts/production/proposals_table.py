@@ -34,7 +34,8 @@ import showrunners
 from production_units import Refusal
 from issues import Issue
 from proposal_issue import AwaitingApproval, InProgress, ProposalProgress, proposal_progress
-from proposals_folder import open_proposals, slug_of
+from footer_counts import ledger
+from proposals_folder import open_proposals, owners, scope_docs, slug_of
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
 import phase_table
@@ -48,7 +49,8 @@ from user_zone import user_zone
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "prioritize"))
 from scripts.prioritize import renumber
 
-BACKLOG_DIR = Path(os.environ.get("PLAN_BACKLOG_DIR") or Path.home() / ".local/state/plan-backlog")
+# A backlog line's key: this, its ledger's path, then its title.
+BACKLOG_KEY = "backlog: "
 # A run keeps its pending add-ons in a directory named by its run id, under either run-folder name.
 SESSION_ROOTS = unit_runs.run_roots()
 PENDING_NAME = "next_items_pending.md"
@@ -108,8 +110,15 @@ def by_line(lines: list[str]) -> tuple[str, str]:
 
 
 def backlog_rows(backlog: Path) -> list[Row]:
+    """The rows of the plan backlog folder's ledger.md."""
+    return ledger_rows(backlog / "ledger.md")
+
+
+def ledger_rows(ledger: Path) -> list[Row]:
+    """The rows of one improvement ledger; a file a line names is beside the ledger."""
+    backlog = ledger.parent
     rows: list[Row] = []
-    for line in read_lines(backlog / "ledger.md"):
+    for line in read_lines(ledger):
         found = BACKLOG_LINE.match(line)
         if found is None:
             continue
@@ -311,35 +320,59 @@ def queue(doc: Path) -> str:
     return f"proposal-{slug_of(doc)}"
 
 
-def waiting_entries(doc: Path) -> tuple[list[urgency.Entry[Row]], list[Row]]:
-    """The proposals waiting for the user's review, to be ordered, then the other issue and backlog rows."""
-    waiting, in_progress = issue_entries(open_proposals(doc))
+def scope_issues(doc: Path, below: bool = False) -> list[Issue]:
+    """The open proposal issues of the production, and with `below` of each one below it, from each one's folder."""
+    found: dict[Path, Issue] = {}
+    names = owners(doc, below)
+    for each in scope_docs(doc, below):
+        for issue in open_proposals(each, names):
+            _ = found.setdefault(issue.path, issue)
+    return list(found.values())
+
+
+def improvement_ledgers(doc: Path, below: bool = False) -> list[Path]:
+    """The Improvement queue ledger of the production, and with `below` of each one below it, once each."""
+    return list(dict.fromkeys(found for each in scope_docs(doc, below) if (found := ledger(each)) is not None))
+
+
+def waiting_entries(doc: Path, below: bool = False) -> tuple[list[urgency.Entry[Row]], list[Row]]:
+    """The proposals waiting for the user's review, to be ordered, then the other issue and backlog rows.
+
+    Only the production's own, and with `below` those of each production below it: issues their
+    proposer field gives to one of them, and the lines of the Improvement queue ledgers their docs name.
+    """
+    waiting, in_progress = issue_entries(scope_issues(doc, below))
     rest = list(in_progress)
-    for row in backlog_rows(BACKLOG_DIR):
-        if row.state == REVIEW_STATE:
-            waiting.append(urgency.Entry(f"backlog: {row.proposal}", row, since=day(row.date), value=(UNSCORED,)))
-        else:
-            rest.append(row)
+    for found in improvement_ledgers(doc, below):
+        for row in ledger_rows(found):
+            if row.state == REVIEW_STATE:
+                waiting.append(urgency.Entry(f"{BACKLOG_KEY}{found}: {row.proposal}", row, since=day(row.date),
+                                             value=(UNSCORED,)))
+            else:
+                rest.append(row)
     return waiting, rest
 
 
 def open_rows(doc: Path, records: dict[str, object]) -> list[Row]:
     """The waiting proposals, the one /next shows first; then the rest; then the add-ons."""
     waiting, rows = waiting_entries(doc)
-    rows = [entry.item for entry in urgency.order(waiting, urgency.pinned(queue(doc)))] + rows
+    rows = [entry.item for entry in urgency.queue_order(waiting, queue(doc))] + rows
     for unit, plan in unit_plan_paths(records).items():
         rows.extend(unit_add_on_rows(unit, plan))
     return rows
+
+
+def proposal_text(shown: urgency.Entry[Row]) -> str:
+    """A waiting proposal as /next prints it: its title, then the file to read."""
+    where = Path(shown.key.removeprefix(BACKLOG_KEY).split(": ", 1)[0])
+    return f"{shown.item.proposal}\n{where}"
 
 
 def next_proposal(doc: Path) -> str:
     """The proposal /next shows, and the file to read: the one shown last while it waits, else the first."""
     waiting, _ = waiting_entries(doc)
     shown = urgency.top(waiting, queue(doc))
-    if shown is None:
-        return "no proposal is waiting for your review"
-    where = BACKLOG_DIR / "ledger.md" if shown.key.startswith("backlog: ") else Path(shown.key)
-    return f"{shown.item.proposal}\n{where}"
+    return proposal_text(shown) if shown is not None else "no proposal is waiting for your review"
 
 
 def main(arguments: list[str]) -> int:

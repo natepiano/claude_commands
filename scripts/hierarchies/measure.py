@@ -35,6 +35,7 @@ for directory in ("lib", "production", "message", "direct", "nightly_review"):
 
 from user_zone import user_zone
 from scripts.accounts.role_map import stored_role_map
+from scripts.lib import unit_runs
 from scripts.message import roster
 from scripts.production import showrunners, production_units, issues, change_review, dailies_render
 from scripts.production import unit_lookup
@@ -914,7 +915,7 @@ def load_sources(window: Window) -> BaselineSources:
         builds = read_source("buildlog/index.sqlite", lambda: read_builds(state / "buildlog/index.sqlite"), [], problems)
         hana_prefixes = [Path(unit.worktree).name for unit in units if unit.hana and unit.worktree]
         phases = read_source("progress_history runs",
-                             lambda: read_phases(state / "plan-delegate/runs", problems, hana_prefixes), [], problems)
+                             lambda: read_phases(unit_runs.history_root_in(state) / "runs", problems, hana_prefixes), [], problems)
         pushes = read_source("notify/pushover.jsonl", lambda: json_lines(state / "notify/pushover.jsonl", parse_push), [], problems)
         reviews = read_source("notify/review.jsonl", lambda: read_failed_reviews(state / "notify/review.jsonl"), [], problems)
         messages = read_source("message/log.jsonl", lambda: json_lines(state / "message/log.jsonl", parse_message), [], problems)

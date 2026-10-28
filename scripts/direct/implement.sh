@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# implement.sh — Invoke the configured delegate agent to implement code changes.
+# implement.sh — Invoke the configured worker agent to implement code changes.
 #
 # Usage: implement.sh [--to <worker>] [--phase <id>] <session_dir> [working_dir] [prompt_file] [task]
 #                     [role_description] [pass_kind] [pass_activity] [fix_pass]
@@ -23,11 +23,11 @@
 # Produces:
 #   <session_dir>/impl_status_<role>      — "implementing" while running, "implemented" on success, "error" on failure
 #   <session_dir>/impl_summary_<role>.txt — the implementation summary, written
-#                                     by the delegate itself as its last act
-#   <session_dir>/impl_reply_<role>.txt   — the delegate's chat replies, in order,
+#                                     by the worker itself as its last act
+#   <session_dir>/impl_reply_<role>.txt   — the worker's chat replies, in order,
 #                                     on the codex paths; the summary file is
 #                                     filled from the last one only when the
-#                                     delegate left it empty
+#                                     worker left it empty
 #   <session_dir>/impl_agent_<role>.log   — full agent log
 #   <session_dir>/impl_agent_<role>       — resolved task, family, agent, and effort
 #   <session_dir>/impl_bg_id_<role>       — the background session's short id, on
@@ -50,6 +50,8 @@
 #                                     digest from the agent log)
 
 set -euo pipefail
+UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
+[[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
 
 FOLLOW_TO=""
 # A phase running beside another names itself: start-pass stamps its pass with it, and its
@@ -112,8 +114,8 @@ esac
 # would mark one round landed several times over and hand the next review defects
 # pre-labelled as repaired. So the unit director names exactly one resolver, and
 # the kind goes back to being only a name for the work.
-if [[ -n "${PLAN_DELEGATE_RESOLVES_ROUND+set}" ]]; then
-  RESOLVES_ROUND="${PLAN_DELEGATE_RESOLVES_ROUND}"
+if [[ -n "${UNIT_RESOLVES_ROUND+set}" ]]; then
+  RESOLVES_ROUND="${UNIT_RESOLVES_ROUND}"
 elif [[ "${PASS_KIND}" == "fix" && "${TEAM_ROLE}" == "impl" ]]; then
   # A session that loaded the prompt text before this change sets no signal, and
   # under that text only the impl worker ever carried `fix`. This keeps a run that
@@ -123,7 +125,7 @@ elif [[ "${PASS_KIND}" == "fix" && "${TEAM_ROLE}" == "impl" ]]; then
 else
   RESOLVES_ROUND=0
 fi
-TASK="delegate.${SUBTASK}"
+TASK="direct.${SUBTASK}"
 
 # The role indexes file paths and board fields, so hold it to a character set
 # that can escape neither.
@@ -138,7 +140,7 @@ BOARD_AGENT="${TEAM_ROLE}"
 # start-pass runs well before that point and the recorder reads this to label
 # which team slot owns the one pass a phase records. Set it late and the label
 # is silently empty rather than wrong, which is worse.
-export PLAN_DELEGATE_TEAM_ROLE="${TEAM_ROLE}"
+export UNIT_TEAM_ROLE="${TEAM_ROLE}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -186,15 +188,15 @@ PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 FINDINGS_HELPER="${SCRIPT_DIR}/findings.py"
 FINDINGS_STATE="${SESSION_DIR}/findings_state.json"
 HEARTBEAT_INTERVAL_SECS=60
-DELEGATE_CONFIG="${PLAN_DELEGATE_CONFIG:-${HOME}/.claude/config/delegate.conf}"
+DIRECT_CONFIG="${UNIT_CONFIG:-${HOME}/.claude/config/direct.conf}"
 COMPACT_ABOVE_TOKENS=""
-if [[ -r "${DELEGATE_CONFIG}" ]]; then
+if [[ -r "${DIRECT_CONFIG}" ]]; then
   COMPACT_ABOVE_TOKENS="$(sed -n \
-    's/^PLAN_DELEGATE_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
-    "${DELEGATE_CONFIG}" | tail -n 1)"
+    's/^UNIT_COMPACT_ABOVE_TOKENS=\([0-9][0-9]*\).*$/\1/p' \
+    "${DIRECT_CONFIG}" | tail -n 1)"
 fi
 if [[ ! "${COMPACT_ABOVE_TOKENS}" =~ ^[0-9]+$ ]] || (( COMPACT_ABOVE_TOKENS <= 0 )); then
-  echo "ERROR: PLAN_DELEGATE_COMPACT_ABOVE_TOKENS in ${DELEGATE_CONFIG} must be a positive integer." >&2
+  echo "ERROR: UNIT_COMPACT_ABOVE_TOKENS in ${DIRECT_CONFIG} must be a positive integer." >&2
   exit 2
 fi
 
@@ -202,7 +204,7 @@ source "${SCRIPT_DIR}/../agents/agents_config.sh"
 if ! agents_resolve "${TASK}" 2>"${LOG_FILE}"; then
   exit 1
 fi
-CODEX_MESH="${PLAN_DELEGATE_CODEX_MESH:-$(_agents_registry_get delegate.options codex_mesh)}"
+CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
 if [[ "${AGENT_FAMILY}" == "codex" && "${CODEX_MESH}" == "1" ]]; then
   USE_CODEX_MESH=1
 else
@@ -284,13 +286,19 @@ with worker_claim_lock(root):
         identity = read(identity_file)
         expected = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
         # A run from before the repair worker had its own record lost the fix worker's identity
-        # to the impl worker's, and a reopened seat keeps only its roster thread: record it from there.
+        # to the impl worker's, and a reopened worker keeps only its roster thread: record it from there.
         # A worker recorded under another slot is followed in the wrong role and stays refused.
         if not identity and worker_id and worker_slot(root, name) is None:
             identity_file.write_text(json.dumps(expected))
             identity = expected
+        # A resumed worker keeps the model it was recorded with: the registry row may have
+        # changed since, and the worker is still the same thread (rca of 2026-10-23).
+        stored_model = identity.get("model")
+        if isinstance(stored_model, str) and stored_model:
+            expected["model"] = stored_model
         if identity != expected:
             fail(f"{name} has no matching durable worker identity for slot {slot}")
+        print(expected["model"])
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
@@ -389,18 +397,18 @@ PY
 
 if [[ -n "${FOLLOW_TO}" ]]; then
   export FOLLOW_LAUNCHER_PID="$$"
-  worker_record claim
+  AGENT_MODEL="$(worker_record claim)"
   trap 'worker_record release' EXIT
 fi
 
-# A phase claims its files before any seat edits them, wherever the seat runs
+# A phase claims its files before any worker edits them, wherever the worker runs
 # (phase_reservation.py claim): an unclaimed edit drifts to another reservation.
 if [[ -n "${PHASE_ID}" ]] && ! "$PY" "${SCRIPT_DIR}/phase_reservation.py" claim \
   --session-dir "${SESSION_DIR}" --phase "${PHASE_ID}" --repo "${WORKING_DIR}" >>"${LOG_FILE}" 2>&1; then
-  echo "ERROR: phase ${PHASE_ID} could not claim its files before its seat opens; see ${LOG_FILE}." >&2
+  echo "ERROR: phase ${PHASE_ID} could not claim its files before its worker opens; see ${LOG_FILE}." >&2
   echo "error" > "${STATUS_FILE}"
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" blocked \
-    "launcher: phase ${PHASE_ID} could not claim its files; its seat did not open" || true
+    "launcher: phase ${PHASE_ID} could not claim its files; its worker did not open" || true
   exit 1
 fi
 
@@ -412,7 +420,7 @@ printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
 
 if [[ -f "${PROGRESS_STATE}" ]]; then
-  if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
+  if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" start-pass \
     --session-dir "${SESSION_DIR}" \
     --pass-kind "${PASS_KIND}" \
     --fix-pass "${FIX_PASS}" \
@@ -435,7 +443,7 @@ bash "${HEARTBEAT_HELPER}" "${HEARTBEAT_FILE}" header "${BEAT_TAG} (${AGENT_FAMI
 # Announce the member on the shared board. Peers read the board to learn who is
 # running in which role; the unit director sleeps between progress ticks, so
 # nothing else would tell them.
-# codex delegates run as threads on one app-server instead of as `codex exec`
+# codex workers run as threads on one app-server instead of as `codex exec`
 # processes, which is what makes them addressable. On by default; set the key to
 # 0 for the plain launcher. The registry holds the standing choice; the env var
 # overrides it for one run. A missing key reads as empty, which fails the test
@@ -479,16 +487,20 @@ fi
 bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${BOARD_AGENT}" register \
   "${SUBTASK} ${LAUNCH_NOTE} (${AGENT_FAMILY}/${AGENT_MODEL}:${AGENT_EFFORT:-unset}); ${MESH_FIELD}; ${ROLE_FIELD}status in impl_status${SLOT}" || true
 
-# The delegate's own verify.sh runs inherit these and take the cargo token with
+# The worker's own verify.sh runs inherit these and take the cargo token with
 # them, so serialization does not depend on the agent remembering a prompt rule.
-export PLAN_DELEGATE_BOARD_DIR="${SESSION_DIR}"
+export UNIT_RUN_DIR="${SESSION_DIR}"
+# Test temp folders (mktemp, tempfile, Rust .tmpXXXXXX) land in the run folder and end with it;
+# the hourly tmp sweep judges each entry there with its 4 h rule.
+mkdir -p "${SESSION_DIR}/tmp"
+export TMPDIR="${SESSION_DIR}/tmp"
 
-# A claude-family delegate launches as a NAMED BACKGROUND session so it joins the
+# A claude-family worker launches as a NAMED BACKGROUND session so it joins the
 # machine's session mesh: it can message its peers and the unit director, and both
-# can message it, mid-run. A --print delegate carries the same ListAgents and
+# can message it, mid-run. A --print worker carries the same ListAgents and
 # SendMessage tools but registers nowhere -- two concurrent print sessions in one
 # directory each report "no reachable agents" while the other is live -- so the
-# tools would be there and reach nobody. A codex delegate reaches the same place
+# tools would be there and reach nobody. A codex worker reaches the same place
 # by a different road: `codex exec` really is unreachable from outside its own
 # process, but a thread on a shared `codex app-server` is addressable, so
 # codex_mesh.py launches it there instead. With codex_mesh=0 it falls back to
@@ -519,8 +531,8 @@ elif [[ "${AGENT_FAMILY}" == "claude" ]]; then
     "${LOG_FILE}" "${BG_ID_FILE}" "${AGENT_MODEL}" &
 elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
   # Same foreground behavior as the plain launcher: codex_mesh.py blocks until the
-  # delegate's turn ends, so the wait, heartbeat, and pass recording below are
-  # unchanged. What it adds is an address other delegates can send to.
+  # worker's turn ends, so the wait, heartbeat, and pass recording below are
+  # unchanged. What it adds is an address other workers can send to.
   rm -f "${BG_ID_FILE}"
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
     --session-dir "${SESSION_DIR}" \
@@ -536,7 +548,7 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   rm -f "${BG_ID_FILE}"
-  # The plain launcher writes the delegate's last message to its output file,
+  # The plain launcher writes the worker's last message to its output file,
   # so that file is the reply file, never the summary: see the settle step
   # after the wait below.
   bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
@@ -547,23 +559,23 @@ AGENT_PID=$!
 # interval with enough attempts to bound hangs generously under load.
 if [[ -n "${FOLLOW_TO}" ]]; then
   if [[ "${AGENT_FAMILY}" == "codex" ]]; then
-    for ((turn_wait=0; turn_wait<${PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS:-30}; turn_wait++)); do
+    for ((turn_wait=0; turn_wait<${UNIT_WORKER_WAIT_ATTEMPTS:-30}; turn_wait++)); do
       if [[ -n "$(worker_record turn 2>/dev/null || true)" ]]; then
         break
       fi
       kill -0 "${AGENT_PID}" 2>/dev/null || break
       [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
-      sleep "${PLAN_DELEGATE_WORKER_POLL_SECS:-1}"
+      sleep "${UNIT_WORKER_POLL_SECS:-1}"
     done
   fi
 elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
-  for ((worker_wait=0; worker_wait<${PLAN_DELEGATE_WORKER_WAIT_ATTEMPTS:-30}; worker_wait++)); do
+  for ((worker_wait=0; worker_wait<${UNIT_WORKER_WAIT_ATTEMPTS:-30}; worker_wait++)); do
     if worker_record record 2>/dev/null; then
       break
     fi
     kill -0 "${AGENT_PID}" 2>/dev/null || break
     [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
-    sleep "${PLAN_DELEGATE_WORKER_POLL_SECS:-1}"
+    sleep "${UNIT_WORKER_POLL_SECS:-1}"
   done
 fi
 
@@ -587,9 +599,9 @@ fi
 kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
 
-# The summary file is the delegate's own, written as its last act, and its last
+# The summary file is the worker's own, written as its last act, and its last
 # chat reply lands in REPLY_FILE instead -- a one-line acknowledgement must not
-# replace the summary the reviewers read. A delegate that skipped that act
+# replace the summary the reviewers read. A worker that skipped that act
 # leaves the summary empty, and then the reply is all there is. The mesh path
 # settles this itself; here it is repeated for the plain launcher and is a no-op
 # once the summary has content.
@@ -599,7 +611,7 @@ fi
 
 if [[ "${AGENT_CODE}" -eq 0 ]]; then
   if [[ -f "${PROGRESS_STATE}" ]]; then
-    if ! PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
+    if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status completed; then
       echo "ERROR: unable to record the ${PASS_KIND} pass completion." >&2
       echo "error" > "${STATUS_FILE}"
@@ -637,7 +649,7 @@ if [[ "${AGENT_CODE}" -eq 0 ]]; then
 else
   LEDGER_CODE=0
   if [[ -f "${PROGRESS_STATE}" ]]; then
-    PLAN_DELEGATE_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
+    UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" finish-pass \
       --session-dir "${SESSION_DIR}" --status error \
       || { echo "ERROR: unable to record the ${PASS_KIND} pass error." >&2; LEDGER_CODE=1; }
   fi

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""List, attach, start or resume standalone Claude sessions in herdr."""
+"""List, attach, start or resume standalone Claude sessions, each a tab of the shared herdr session.
+
+A standalone session opens in the shared session's `ad-hoc` workspace; nothing here starts a herdr
+session of its own (user, 2026-10-26).
+"""
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import shlex
 import subprocess
@@ -25,8 +30,9 @@ from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
 
-USAGE = "usage: herdr_sessions.py list [--on <host>] | attach <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
+USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
+ADHOC_SPACE = "ad-hoc"
 
 
 @dataclass(frozen=True)
@@ -58,9 +64,18 @@ def _remote_list(host: RemoteHost) -> int:
     return 0
 
 
-def _attach_remote(host: RemoteHost, name: str) -> None:
+def _attach_remote(host: RemoteHost, name: str) -> int:
+    """Show tab `name` on the host, then attach to the host's shared session."""
+    result = subprocess.run(
+        ["ssh", host.target, "~/.claude/scripts/lib/py", "~/.claude/scripts/herdr/herdr_sessions.py", "focus", name],
+        capture_output=True, text=True, check=False, timeout=REMOTE_LIST_TIMEOUT,
+    )
+    if result.returncode:
+        reason = " ".join(result.stderr.split()) or "no error message"
+        print(f"herdr_sessions: {host.target}: {reason}", file=sys.stderr)
+        return 1
     binary = herdr.herdr_binary()
-    os.execvp(binary, [binary, "--remote", host.target, "--session", name])
+    os.execvp(binary, [binary, "--remote", host.target, "--session", result.stdout.strip()])
 
 
 class LaunchOptions(argparse.Namespace):
@@ -73,9 +88,16 @@ class LaunchOptions(argparse.Namespace):
     attach: bool = False
 
 
-def _attach(name: str) -> None:
+def _tab_pane(name: str) -> str:
+    """The pane of the shared session's tab named `name`; empty when no such tab is open."""
+    return next((pane["pane_id"] for pane in herdr.Herdr(herdr.shared_session()).panes() if pane.get("label") == name), "")
+
+
+def _attach(pane: str) -> None:
+    shared = herdr.shared_session()
+    herdr.Herdr(shared).focus_tab_of(pane)
     binary = herdr.herdr_binary()
-    os.execvp(binary, [binary, "session", "attach", name])
+    os.execvp(binary, [binary, "session", "attach", shared])
 
 
 def _launch_rerun(verb: str, options: LaunchOptions, folder: Path, claude_arguments: list[str]) -> str:
@@ -176,28 +198,26 @@ def _launch(verb: str, arguments: list[str]) -> int:
         if isinstance(permission, launch_permission.ShutdownStateUnreadable):
             print(f"herdr_sessions: shutdown state unreadable: {permission.detail}", file=sys.stderr)
             return 1
-        suffix = 1
-        while True:
-            name = options.name or herdr.generated_session_name(folder.name, str(suffix))
-            try:
-                herdr.start_new_server(name, 90_000, session_kind=session_kind)
-                break
-            except herdr.SessionTaken:
-                if options.name:
-                    raise
-                suffix += 1
-        pane = herdr.open_pane(name, name, str(folder), pane_environment)
-        server_environment = herdr.server_environment(name)
+        shared = herdr.shared_session()
+        _ = herdr.start_server(shared, 90_000, session_kind=session_kind)
+        server_environment = herdr.server_environment(shared)
         for variable in sorted(unset_variables):
             if variable in server_environment:
                 raise herdr.HerdrFailure(
-                    f"herdr server {name} carries {variable} from where it started; "
-                    + f"stop it with herdr --session {name} server stop and try again"
+                    f"herdr server {shared} carries {variable} from where it started, so a new tab would "
+                    + "inherit it; start that server again from a shell without it"
                 )
+        taken = {pane.get("label") for pane in herdr.Herdr(shared).panes()}
+        if options.name in taken:
+            raise herdr.HerdrFailure(f"a tab named {options.name} is already open in herdr session {shared}")
+        name = options.name or next(candidate for candidate in (
+            herdr.generated_session_name(folder.name, str(suffix)) for suffix in itertools.count(1))
+            if candidate not in taken)
+        pane = herdr.open_tab(shared, ADHOC_SPACE, name, str(folder), pane_environment)
         if verb == "resume":
             claude_arguments.extend(["--resume", options.session_id])
         claude_arguments.extend(["-n", name])
-        outcome = herdr.start_agent(name, pane, kind="claude", agent=name, agent_arguments=claude_arguments,
+        outcome = herdr.start_agent(shared, pane, kind="claude", agent=name, agent_arguments=claude_arguments,
                                     opening=opening, timeout_ms=90_000)
         if isinstance(opening, herdr.OpeningPrompt) and not isinstance(outcome, herdr.PromptSubmitted):
             reason = outcome.reason if isinstance(outcome, herdr.PromptNotSubmitted) else "launcher supplied no submit proof"
@@ -206,12 +226,13 @@ def _launch(verb: str, arguments: list[str]) -> int:
     finally:
         _ = barrier.__exit__(None, None, None)
     if verb == "start" or options.attach:
-        _attach(name)
+        _attach(pane)
     return 0
 
 
 def claude_names() -> dict[str, str]:
-    """The newest live Claude name in each herdr session."""
+    """The newest live Claude name in each pane of the shared herdr session."""
+    shared = herdr.shared_session()
     newest: dict[str, SessionRecord] = {}
     directory = sessions_dir()
     if not directory.exists():
@@ -223,21 +244,22 @@ def claude_names() -> dict[str, str]:
         if isinstance(record, UnreadableSessionRecord) or not live_session(record):
             continue
         place = herdr.herdr_place_of(record["pid"])
-        if not isinstance(place, herdr.HerdrPlace):
+        if not isinstance(place, herdr.HerdrPlace) or place.session != shared:
             continue
-        if place.session not in newest or record["updatedAt"] > newest[place.session]["updatedAt"]:
-            newest[place.session] = record
-    return {session: record["name"] for session, record in newest.items()}
+        if place.pane not in newest or record["updatedAt"] > newest[place.pane]["updatedAt"]:
+            newest[place.pane] = record
+    return {pane: record["name"] for pane, record in newest.items()}
 
 
 def unit_roles() -> dict[str, str]:
-    """Unit roles come from the marks inherited by processes in herdr panes."""
+    """Unit roles of the shared session's panes, from the marks inherited by processes in them."""
+    shared = herdr.shared_session()
     roles: dict[str, str] = {}
     for process in herdr.herdr_processes():
         slug = process.marks.get("SHOWRUNNER_UNIT", "")
         unit = process.marks.get("SHOWRUNNER_UNIT_ID", "")
-        if slug and unit:
-            _ = roles.setdefault(process.place.session, f"unit {slug}/{unit}")
+        if process.place.session == shared and herdr.has_unit_marks(process.marks):
+            _ = roles.setdefault(process.place.pane, f"unit {slug}/{unit}")
     return roles
 
 
@@ -258,9 +280,8 @@ def _main(argv: list[str]) -> int:
         if remote_list:
             return _remote_list(host)
         try:
-            _attach_remote(host, argv[3])
-            return 0
-        except (herdr.HerdrFailure, OSError) as error:
+            return _attach_remote(host, argv[3])
+        except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired) as error:
             print(f"herdr_sessions: {host.target}: attach failed: {' '.join(str(error).split())}", file=sys.stderr)
             return 1
     if len(argv) > 1 and argv[1] in ("start", "resume"):
@@ -269,28 +290,42 @@ def _main(argv: list[str]) -> int:
         except (herdr.HerdrFailure, OSError, ValueError) as error:
             print(f"herdr_sessions: {error}", file=sys.stderr)
             return 1
-    if argv[1:] != ["list"] and not (len(argv) == 3 and argv[1] == "attach" and argv[2]):
+    if argv[1:] not in (["list"], ["sort-tabs"]) and not (len(argv) == 3 and argv[1] in ("attach", "focus") and argv[2]):
         print(USAGE, file=sys.stderr)
         return 2
     try:
-        running = herdr.live_sessions()
-        if argv[1] == "attach":
-            name = argv[2]
-            if not any(session["name"] == name for session in running):
-                names = ", ".join(session["name"] for session in running) or "none"
-                print(f"herdr_sessions: {name} is not running; running sessions: {names}", file=sys.stderr)
-                return 1
-            _attach(name)
-        if not running:
+        shared = herdr.shared_session()
+        if not any(session["name"] == shared for session in herdr.live_sessions()):
+            if argv[1] == "list":
+                return 0
+            print(f"herdr_sessions: herdr session {shared} is not running", file=sys.stderr)
+            return 1
+        if argv[1] == "sort-tabs":
+            for label in herdr.Herdr(shared).sort_tabs().labels:
+                print(f"herdr_sessions: {label}: tab with several panes; order kept")
             return 0
+        panes = herdr.Herdr(shared).panes()
+        if argv[1] in ("attach", "focus"):
+            name = argv[2]
+            pane = _tab_pane(name)
+            if not pane:
+                names = ", ".join(sorted({row.get("label") or row["pane_id"] for row in panes})) or "none"
+                print(f"herdr_sessions: no tab named {name} in herdr session {shared}; open tabs: {names}",
+                      file=sys.stderr)
+                return 1
+            if argv[1] == "focus":
+                herdr.Herdr(shared).focus_tab_of(pane)
+                print(shared)
+                return 0
+            _attach(pane)
         names = claude_names()
         roles = unit_roles()
         showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
-        for session in running:
-            name = session["name"]
-            claude = names.get(name, "")
-            role = roles.get(name, "showrunner" if claude and claude in showrunner_names else "standalone")
-            print(f"{name}\t{role}\t{claude}")
+        for row in panes:
+            pane = row["pane_id"]
+            claude = names.get(pane, "")
+            role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
+            print(f"{row.get("label") or pane}\t{role}\t{claude}")
         return 0
     except (herdr.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)

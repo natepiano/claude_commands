@@ -12,12 +12,14 @@ import ast
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from io import StringIO
 import json
 from pathlib import Path
 import re
 import shlex
 import sys
 import tomllib
+import tokenize
 from typing import Literal, cast
 
 import production_units
@@ -33,6 +35,19 @@ ROLE_SOURCE = "scripts/message/roster.py --json --here (current roles, not histo
 
 
 @dataclass(frozen=True)
+class NameInflection:
+    name: str
+    forms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class KeptContext:
+    path: str
+    text: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Term:
     name: str
     kind: TermKind
@@ -40,12 +55,22 @@ class Term:
     other_names: tuple[str, ...]
     kept: tuple[str, ...] = ()
     other_meaning_files: tuple[str, ...] = ()
+    inflected_forms: tuple[NameInflection, ...] = ()
+    retired: tuple[str, ...] = ()
+    kept_contexts: tuple[KeptContext, ...] = ()
 
 
 @dataclass(frozen=True)
 class LiveFile:
     path: str
     text: str
+    source_lines: tuple[int, ...] = ()  # Physical source line for each prose character.
+
+
+@dataclass(frozen=True)
+class SourceProse:
+    text: str
+    source_lines: tuple[int, ...]  # Physical source line for each prose character.
 
 
 @dataclass(frozen=True)
@@ -62,6 +87,14 @@ class DefinitionFinding:
     term: str
     status: str
     files: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RetiredUse:
+    path: str
+    line: int
+    name: str
+    replacement: str
 
 
 @dataclass(frozen=True)
@@ -157,10 +190,35 @@ def parse_terms(text: str) -> tuple[Term, ...]:
         if not isinstance(definition, str) or not definition.strip():
             raise ValueError(f"{name}: defined_in must name a file and section, or none")
         definitions = tuple(part.strip() for part in definition.split(";") if part.strip() != "none")
-        terms.append(Term(name, kind, definitions,
-                          string_list(row.get("other_names"), f"{name}.other_names"),
+        other_names = string_list(row.get("other_names"), f"{name}.other_names")
+        forms = row.get("inflected_forms", {})
+        if not isinstance(forms, dict):
+            raise ValueError(f"{name}.inflected_forms must be a table")
+        inflections: list[NameInflection] = []
+        for base, spellings in cast(dict[str, object], forms).items():
+            if base not in (name, *other_names):
+                raise ValueError(f"{name}: inflected name {base} is not declared")
+            inflections.append(NameInflection(base, string_list(spellings, f"{name}.{base}")))
+        contexts = row.get("kept_contexts", [])
+        if not isinstance(contexts, list):
+            raise ValueError(f"{name}.kept_contexts must be an array of tables")
+        kept_contexts: list[KeptContext] = []
+        for context in cast(list[object], contexts):
+            if not isinstance(context, dict):
+                raise ValueError(f"{name}: kept context must be a table")
+            fields = cast(dict[str, object], context)
+            path, snippet, reason = fields.get("path"), fields.get("text"), fields.get("reason")
+            if not all(isinstance(field, str) and field.strip() for field in (path, snippet, reason)):
+                raise ValueError(f"{name}: kept context needs path, text and reason")
+            kept_contexts.append(KeptContext(cast(str, path), cast(str, snippet), cast(str, reason)))
+        retired = string_list(row.get("retired", []), f"{name}.retired")
+        declared = {name, *other_names, *(form for item in inflections for form in item.forms)}
+        if any(old not in declared for old in retired):
+            raise ValueError(f"{name}: retired names must be declared forms")
+        terms.append(Term(name, kind, definitions, other_names,
                           string_list(row.get("kept", []), f"{name}.kept"),
-                          string_list(row.get("other_meaning_files", []), f"{name}.other_meaning_files")))
+                          string_list(row.get("other_meaning_files", []), f"{name}.other_meaning_files"),
+                          tuple(inflections), retired, tuple(kept_contexts)))
     names = [term.name.casefold() for term in terms]
     if len(set(names)) != len(names):
         raise ValueError("defined term names must be unique")
@@ -171,15 +229,33 @@ def name_pattern(name: str) -> re.Pattern[str]:
     return re.compile(r"(?<![\w-])" + re.escape(name) + r"(?![\w-])", re.IGNORECASE)
 
 
+def term_forms(term: Term) -> tuple[tuple[str, str], ...]:
+    result: list[tuple[str, str]] = []
+    for kind, name in (("defined", term.name), *(("other", other) for other in term.other_names)):
+        result.append((kind, name))
+        for inflection in term.inflected_forms:
+            if inflection.name == name:
+                result.extend((kind, form) for form in inflection.forms)
+    names = [name.casefold() for _, name in result]
+    if len(set(names)) != len(names):
+        raise ValueError(f"{term.name}: forms must be unique")
+    return tuple(result)
+
+
+def forms_pattern(names: tuple[str, ...]) -> re.Pattern[str]:
+    alternatives = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    return re.compile(r"(?<![\w-])(?:" + alternatives + r")(?![\w-])", re.IGNORECASE)
+
+
 def without_paths(text: str, kept: tuple[str, ...]) -> str:
     # Slash commands remain names unless the data marks them kept.
     def mask(match: re.Match[str]) -> str:
         token = match.group()
-        return token if re.fullmatch(r"/[\w-]+:[\w-]+", token) else " "
+        return token if re.fullmatch(r"/[\w-]+:[\w-]+", token) else " " * len(token)
     text = re.sub(r"(?<![\w])(?:~?/|(?:[\w.$~-]+/)+)[\w./:$~{}-]*", mask, text)
-    text = re.sub(r"\b[\w.-]+\.(?:md|py|sh|toml|jsonl?|txt)\b", " ", text)
+    text = re.sub(r"\b[\w.-]+\.(?:md|py|sh|toml|jsonl?|txt)\b", lambda match: " " * len(match.group()), text)
     for name in sorted(kept, key=len, reverse=True):
-        text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
+        text = re.sub(re.escape(name), lambda match: " " * len(match.group()), text, flags=re.IGNORECASE)
     return text
 
 
@@ -188,12 +264,45 @@ def measure_names(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple
     texts = [(file.path, without_paths(file.text, kept)) for file in files]
     result: list[NameCount] = []
     for term in terms:
-        for form, name in (("defined", term.name), *(("other", other) for other in term.other_names)):
+        for form, name in term_forms(term):
             pattern = name_pattern(name)
             counts = [(path, len(pattern.findall(text))) for path, text in texts]
             result.append(NameCount(term.name, name, form, sum(n for _, n in counts),
                                     tuple(path for path, n in counts if n)))
     return tuple(result)
+
+
+def check_retired(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple[RetiredUse, ...]:
+    """Check extracted source prose only; a kept context applies once in its named file."""
+    findings: list[RetiredUse] = []
+    for term in terms:
+        if not term.retired:
+            continue
+        retired = {name.casefold() for name in term.retired}
+        pattern = forms_pattern(tuple(name for _, name in term_forms(term)))
+        for file in files:
+            text = file.text
+            for context in term.kept_contexts:
+                if context.path == file.path:
+                    # Preserve line numbers for the source-only diagnostic.
+                    blank = "".join("\n" if char == "\n" else " " for char in context.text)
+                    text = text.replace(context.text, blank, 1)
+            offset = 0
+            for number, line in enumerate(text.split("\n"), 1):
+                for match in pattern.finditer(without_paths(line, term.kept)):
+                    if match.group().casefold() in retired:
+                        source_line = file.source_lines[offset + match.start()] if file.source_lines else number
+                        findings.append(RetiredUse(file.path, source_line, match.group(), term.name))
+                offset += len(line) + 1
+    return tuple(findings)
+
+
+def check_sources(root: Path) -> tuple[str, ...]:
+    """Read repository sources, without production records, memory or message logs."""
+    terms = parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
+    files, issues = read_live_files(root)
+    uses = check_retired(terms, files)
+    return (*issues, *(f"{use.path}:{use.line}: retired {use.name!r}; use {use.replacement!r}" for use in uses))
 
 
 def measure_definitions(terms: tuple[Term, ...], files: tuple[LiveFile, ...]) -> tuple[DefinitionFinding, ...]:
@@ -295,7 +404,48 @@ def measure_wrong_party(records: tuple[MessageRecord, ...], window: AuditWindow)
                             sum(record.machine == NOT_RECORDED for record in selected))
 
 
-def python_strings(text: str) -> str:
+def python_literal_lines(node: ast.Constant, text: str, value: str) -> tuple[int, ...]:
+    """Keep the physical line of each contributing literal in a merged constant."""
+    segment = ast.get_source_segment(text, node)
+    parts: list[str] = []
+    lines: list[int] = []
+    if segment is not None:
+        # Keep continuation indentation inside parentheses when tokenizing the span.
+        try:
+            tokens = tuple(tokenize.generate_tokens(StringIO("(" + segment + ")").readline))
+        except (tokenize.TokenError, SyntaxError):
+            # Formatted-string constants can span fragments that are not Python alone.
+            tokens = ()
+        for token in tokens:
+            if token.type != tokenize.STRING:
+                continue
+            try:
+                part = cast(object, ast.literal_eval(token.string))
+            except (SyntaxError, ValueError):
+                continue
+            if not isinstance(part, str):
+                continue
+            parts.append(part)
+            line = node.lineno + token.start[0] - 1
+            end_line = node.lineno + token.end[0] - 1
+            for character in part:
+                lines.append(line)
+                if character == "\n":
+                    line = min(line + 1, end_line)
+    if "".join(parts) == value:
+        return tuple(lines)
+    # AST constants inside formatted strings need the enclosing literal's span.
+    line = node.lineno
+    end_line = node.end_lineno if node.end_lineno is not None else line
+    lines = []
+    for character in value:
+        lines.append(line)
+        if character == "\n":
+            line = min(line + 1, end_line)
+    return tuple(lines)
+
+
+def python_prose(text: str) -> SourceProse:
     tree = ast.parse(text)
     excluded: set[int] = set()
     outputs: set[int] = set()
@@ -384,19 +534,24 @@ def python_strings(text: str) -> str:
                 if isinstance(child, ast.Name):
                     references.append(child)
     strings: list[str] = []
+    source_lines: list[int] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str) or id(node) in excluded:
             continue
         value = node.value
         if id(node) in outputs or re.search(r"[A-Za-z][ ,:;!?—]+[A-Za-z]", value):
+            if strings:
+                source_lines.append(node.lineno)
             strings.append(value)
-    return "\n".join(strings)
+            source_lines.extend(python_literal_lines(node, text, value))
+    return SourceProse("\n".join(strings), tuple(source_lines))
 
 
-def shell_strings(text: str) -> str:
+def shell_prose(text: str) -> SourceProse:
     strings: list[str] = []
-    lines = iter(text.splitlines())
-    for line in lines:
+    source_lines: list[int] = []
+    lines = iter(enumerate(text.splitlines(), 1))
+    for number, line in lines:
         if line.lstrip().startswith("#"):
             continue
         lexer = shlex.shlex(line, posix=False, punctuation_chars=";&|()")
@@ -417,20 +572,26 @@ def shell_strings(text: str) -> str:
                 output = token in ("echo", "printf", "warn", "die", "error")
                 command_start = False
             elif output and len(token) >= 2 and token[0] in "'\"" and token[-1] == token[0]:
+                if strings:
+                    source_lines.append(number)
                 strings.append(token[1:-1])
+                source_lines.extend([number] * len(token[1:-1]))
         # Consume input bodies even for non-output commands: their text is not shell code.
         for heredoc in re.finditer(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_]\w*)\2", line):
             prefix = line[:heredoc.start()]
             printed = re.search(r"(?:^|[;&|()])\s*cat\b[^;&|]*$", prefix) is not None
             strip_tabs = heredoc.group(1) == "-"
             delimiter = heredoc.group(3)
-            for body_line in lines:
+            for body_number, body_line in lines:
                 body = body_line.lstrip("\t") if strip_tabs else body_line
                 if body == delimiter:
                     break
                 if printed:
+                    if strings:
+                        source_lines.append(body_number)
                     strings.append(body)
-    return "\n".join(strings)
+                    source_lines.extend([body_number] * len(body))
+    return SourceProse("\n".join(strings), tuple(source_lines))
 
 
 def read_live_files(root: Path) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
@@ -453,8 +614,10 @@ def read_live_files(root: Path) -> tuple[tuple[LiveFile, ...], tuple[str, ...]]:
         try:
             text = path.read_text(encoding="utf-8")
             if script:
-                text = python_strings(text) if path.suffix == ".py" or "python" in text.partition("\n")[0] else shell_strings(text)
-            files.append(LiveFile(relative.as_posix(), text))
+                prose = python_prose(text) if path.suffix == ".py" or "python" in text.partition("\n")[0] else shell_prose(text)
+                files.append(LiveFile(relative.as_posix(), prose.text, prose.source_lines))
+            else:
+                files.append(LiveFile(relative.as_posix(), text))
         except (OSError, UnicodeError, SyntaxError) as error:
             issues.append(f"{relative}: {error}")
     return tuple(files), tuple(issues)
@@ -494,6 +657,8 @@ def report(terms: tuple[Term, ...], files: tuple[LiveFile, ...], productions: tu
         + "Python references use lexical scope; helper call arguments are not followed into parameters.\n"
         + "Names use exact phrases, ignoring case; plurals count only when listed.\n"
         + "Each term/name pair is a separate count; shared other names count for each term.\n"
+        + "Names count overlapping phrases independently; check reports the longest phrase once.\n"
+        + "Kept contexts remain in lexical Names and are excluded only by check.\n"
         + "Production and message sources: natedev only.",
         table("Names", ("Term", "Name", "Form", "Hits (n)", "Files (n)", "File set"), name_rows),
         table("Definitions (declared sources plus explicit **Name** — definitions; other-meaning files excluded)",
@@ -548,12 +713,17 @@ def baseline(root: Path, window: AuditWindow) -> str:
 
 def main(arguments: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("action", choices=("baseline",))
+    _ = parser.add_argument("action", choices=("baseline", "check"))
     _ = parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
     _ = parser.add_argument("--since", default="", help="first local date, YYYY-MM-DD")
     _ = parser.add_argument("--until", default="", help="last local date, inclusive, YYYY-MM-DD")
     args = parser.parse_args(arguments)
     try:
+        if cast(str, args.action) == "check":
+            issues = check_sources(cast(Path, args.root).resolve())
+            for issue in issues:
+                print(issue)
+            return int(bool(issues))
         window = audit_window(cast(str, args.since), cast(str, args.until), datetime.now(timezone.utc))
         print(baseline(cast(Path, args.root).resolve(), window))
     except (OSError, ValueError) as error:

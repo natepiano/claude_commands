@@ -35,6 +35,9 @@ _FILE_COMMAND = re.compile(
     r"apply_patch|git\s+(?:diff|status|show)|(?:cp|mv|touch|mkdir|tee)\b)",
     re.IGNORECASE,
 )
+_BRP_METHOD_NAME = re.compile(
+    r"\b(?:world\.|bevy/|brp_extras/)|(?<![\w/.-])hana/[A-Za-z_][\w-]*(?![\w/.-])"
+)
 
 
 def parsed_tool_event_category(name: str, command: str) -> ParsedToolEventCategory:
@@ -42,7 +45,7 @@ def parsed_tool_event_category(name: str, command: str) -> ParsedToolEventCatego
     lowered_name = name.lower()
     if "brp_launch" in lowered_name or _BUILD_OR_LAUNCH.search(command):
         return "builds_and_app_launches"
-    if "mcp__brp__" in lowered_name or re.search(r"\b(?:world\.|bevy/|hana/|brp_extras/)", command):
+    if "mcp__brp__" in lowered_name or _BRP_METHOD_NAME.search(command):
         return "other_brp"
     if (lowered_name.rsplit("__", 1)[-1] in {"read", "grep", "glob", "write", "edit", "apply_patch"}
             or _FILE_COMMAND.search(command)):
@@ -502,7 +505,7 @@ class CachedScanEvidence:
     timings: dict[tuple[str, str], CachedTimingEvidence]
 
 
-CACHE_FORMAT_VERSION = 6
+CACHE_FORMAT_VERSION = 7
 
 
 def _load_cache(cache: PersistentScanCache, roots: tuple[str, str]) -> CachedScanEvidence:

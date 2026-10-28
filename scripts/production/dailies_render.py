@@ -75,7 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import run_out
 import note_file
 from run_out import READINGS_LOG, Reading
-from build_hold import NO_ADMISSION_ACK_S, ActiveHolders, DeliveryFailed, HoldCycle, HoldState, KnownReleaseEta, MemoryGateReturned, NoAdmissionAck, NoHolders, Holder, NothingToBuild, RecipientGone, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, read_release_state, release_record_error_line
+from build_hold import ActiveHolders, HoldCycle, HoldState, KnownReleaseEta, NoHolders, Holder, ReleaseEntry, ReleaseRecordReadError, holder_directory, read_cycle, read_holders, release_record_error_line
 from mac_test import ActiveMacBlock, NoMacBlock, PendingMacBlock, ci_may_still_be_on, read_block, state_paths
 import urgency
 from urgency import Urgency, UrgencyError
@@ -299,6 +299,8 @@ class OutstandingQuestion:
     question: str
     timing: OutstandingTiming = DueNow()
     rank: Ranking = Ranking()
+    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
+    asked_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -309,6 +311,8 @@ class ReviewedOutstandingQuestion:
     reviewed: str
     timing: OutstandingTiming = DueNow()
     rank: Ranking = Ranking()
+    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
+    asked_by: str = ""
 
 
 @dataclass(frozen=True)
@@ -319,6 +323,8 @@ class ReviewUnavailableOutstandingQuestion:
     reason: str
     timing: OutstandingTiming = DueNow()
     rank: Ranking = Ranking()
+    # The unit (or showrunner) that filed it with `update_registration.py ask`; the answer goes back to it.
+    asked_by: str = ""
 
 
 Outstanding = (OutstandingReminder | OutstandingQuestion | ReviewedOutstandingQuestion
@@ -1022,7 +1028,7 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
             raise InputError(f"{where}: expected an object")
         fields = cast(dict[str, object], entry)
         check_keys(fields, {"since", "text", "after", "question", "reviewed", "review_unavailable", "urgency", "due",
-                            "marked", "follows"}, where)
+                            "marked", "follows", "asked_by"}, where)
         rank = read_ranking(fields, where)
         since, text, after = fields.get("since"), fields.get("text"), fields.get("after")
         if not isinstance(since, str) or not STARTED.match(since):
@@ -1037,9 +1043,12 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         since_at = datetime.fromisoformat(since)
         question = fields.get("question")
         reviewed, unavailable = fields.get("reviewed"), fields.get("review_unavailable")
+        asked_by = fields.get("asked_by", "")
+        if not isinstance(asked_by, str) or "\n" in asked_by or ("asked_by" in fields and not asked_by.strip()):
+            raise InputError(f"{where}.asked_by: expected one non-empty line")
         if "question" not in fields:
-            if "reviewed" in fields or "review_unavailable" in fields:
-                raise InputError(f"{where}: question required for a review result")
+            if "reviewed" in fields or "review_unavailable" in fields or "asked_by" in fields:
+                raise InputError(f"{where}: question required for a review result or an asker")
             items.append(OutstandingReminder(since_at, text, timing, rank))
             continue
         if not isinstance(question, str) or not question.strip():
@@ -1047,13 +1056,13 @@ def read_outstanding(path: Path | None) -> list[Outstanding]:
         if "reviewed" in fields:
             if not isinstance(reviewed, str) or not reviewed.strip() or "review_unavailable" in fields:
                 raise InputError(f"{where}.reviewed: expected completed review without an unavailable result")
-            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank))
+            items.append(ReviewedOutstandingQuestion(since_at, text, question, reviewed, timing, rank, asked_by))
         elif "review_unavailable" in fields:
             if not isinstance(unavailable, str):
                 raise InputError(f"{where}.review_unavailable: expected reason text")
-            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank))
+            items.append(ReviewUnavailableOutstandingQuestion(since_at, text, question, unavailable, timing, rank, asked_by))
         else:
-            items.append(OutstandingQuestion(since_at, text, question, timing, rank))
+            items.append(OutstandingQuestion(since_at, text, question, timing, rank, asked_by))
     return sorted(items, key=lambda item: item.since)
 
 
@@ -1521,16 +1530,9 @@ def release_text(release: KnownReleaseEta, now: datetime, zone: ZoneInfo) -> str
 
 
 def release_progress(cycle: HoldCycle, zone: ZoneInfo) -> str:
-    """Where a started release stands: when it began and how many sessions are free to build again."""
+    """When the hold ended; the memory gate now orders the builds."""
     started = datetime.fromisoformat(cycle["release_started_at"]).astimezone(zone)
-    states = [read_release_state(entry) for entry in cycle["entries"]]
-    # A session that has gone is no longer one to bring back.
-    expected = [state for state in states if not isinstance(state, RecipientGone)]
-    words = f"released {started:%H:%M} {started:%Z}"
-    if not expected:
-        return words
-    free = sum(isinstance(state, (MemoryGateReturned, NothingToBuild)) for state in expected)
-    return f"{words}; {free} of {len(expected)} session{'' if len(expected) == 1 else 's'} free to build again"
+    return f"released {started:%H:%M} {started:%Z}; the memory gate orders builds"
 
 
 def hold_line(holder: Holder, now: datetime, zone: ZoneInfo, cycle: HoldCycle | None = None) -> str:
@@ -1554,11 +1556,7 @@ def hold_action_lines(cycle: HoldCycle) -> list[str]:
     """One line for each session a release could not bring back, so that someone looks at it."""
     lines: list[str] = []
     for entry in cycle["entries"]:
-        state = read_release_state(entry)
-        if isinstance(state, NoAdmissionAck):
-            lines.append(f"{released_session(entry)} has not answered the release for "
-                         + f"{NO_ADMISSION_ACK_S // 60} minutes; check it")
-        elif isinstance(state, DeliveryFailed):
+        if entry["delivery"] in {"DeliveryFailed", "RecipientGone", "QueuedUnconfirmed"}:
             lines.append(f"{released_session(entry)} could not be told builds are released; tell it")
     return lines
 

@@ -19,6 +19,9 @@ script is `scripts/production/transfer_unit.py`, with three actions: `plan`, `ap
 - The stall-watch stretch and its prompt file move to the receiving slug. This pool's reviewers of
   the unit retire (`review_pool.py retire`), so the receiving pool leases its own. The old pane
   entry is forgotten, because the relaunch records a new pane.
+- Each guild design the unit holds (`scripts/guilds/roles.py`) takes the receiving production as
+  holder (`roles.move_holder`), so resume, rebind and end accept the relaunched unit. The role
+  threads, role names, checkout paths and saved prompts stay.
 - The shutdown record's host takes the receiving `production` and `doc`. A herdr session name of
   the form `<giving slug>-<stem>` takes `<receiving slug>-<stem>`. Its `renamed` field holds the
   moved note, which `restart.restart_note` puts first in the relaunched session's prompt. The note
@@ -63,4 +66,5 @@ row commit does (user, 2026-10-08). The unit takes the receiving merge branch at
 verify fails when the receiving doc has no row, the giving doc still has one, a plan header does
 not name the receiving production, the stretch is still under the giving slug, the shutdown record
 does not name the receiving production, the unit is not live under the receiving slug, a session
-still carries the giving marks, or a giving reviewer is still leased to the unit.
+still carries the giving marks, a giving reviewer is still leased to the unit, or a guild design
+still names the giving production as the unit's holder (`roles.holder_failures`).

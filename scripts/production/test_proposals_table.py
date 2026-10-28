@@ -113,8 +113,7 @@ class ProposalsTableTests(unittest.TestCase):
         self.assertEqual(proposals_table.issue_rows(found)[1].state, f"{REVIEW_STATE} · blocks")
         doc = self.write("trunk/docs/plans/demo-production.md", f"- **Proposals:** `{self.root / 'issues'}`\n")
         with mock.patch.dict(os.environ, {"NEXT_STATE_DIR": str(self.root / "next")}), \
-                mock.patch.object(proposals_table, "BACKLOG_DIR", self.root / "backlog"), \
-                mock.patch.object(proposals_folder, "owners", return_value=frozenset({"organon-unit"})):
+                mock.patch.object(proposals_table, "owners", return_value=frozenset({"organon-unit"})):
             self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines()[0], "unscored")
             _ = self.issue("now important", "date_created: 2026-10-05", *common, 'review_urgency: "user"')
             # The shown proposal stays until the user answers it.
@@ -122,6 +121,32 @@ class ProposalsTableTests(unittest.TestCase):
             (self.root / "issues/unscored.md").unlink()
             self.assertEqual(self.run_main(["--production", str(doc), "--next"])[1].splitlines(),
                              ["now important", str(self.root / "issues/now important.md")])
+
+    def test_a_production_reads_its_own_folder_and_queue_and_with_below_each_lower_one_never_above(self) -> None:
+        docs: dict[str, Path] = {}
+        for slug in ("top", "kid", "grand"):
+            _ = self.issue(f"{slug} idea", "date_created: 2026-10-01", "status: open", "tags: [issue, proposal]",
+                           f"proposed_by: {slug}", folder=f"{slug}-issues")
+            _ = self.write(f"{slug}-backlog/ledger.md", f"- 2026-10-02 {slug} line — proposed\n")
+            docs[slug] = self.write(f"trunk/docs/plans/{slug}-production.md",
+                                    f"- **Proposals:** `{self.root / f'{slug}-issues'}`\n"
+                                    + f"- **Improvement queue:** {self.root / f'{slug}-backlog' / 'ledger.md'}\n")
+        below = {"top": ["top", "kid", "grand"], "kid": ["kid", "grand"], "grand": ["grand"]}
+
+        def owner_docs(doc: Path) -> list[Path]:
+            return [docs[slug] for slug in below[doc.name.removesuffix("-production.md")]]
+
+        def waiting(slug: str, below: bool = False) -> list[str]:
+            return [entry.item.proposal for entry in proposals_table.waiting_entries(docs[slug], below)[0]]
+
+        with mock.patch.object(proposals_folder, "owner_docs", owner_docs):
+            # Each showrunner reviews its own production; the ones below review theirs (user, 2026-10-27).
+            self.assertEqual(waiting("top"), ["top idea", "top line"])
+            self.assertEqual(waiting("kid"), ["kid idea", "kid line"])
+            self.assertEqual(waiting("grand"), ["grand idea", "grand line"])
+            self.assertEqual(waiting("top", below=True),
+                             ["grand idea", "kid idea", "top idea", "top line", "kid line", "grand line"])
+            self.assertEqual(waiting("kid", below=True), ["grand idea", "kid idea", "kid line", "grand line"])
 
     def test_closed_untagged_and_subfolder_issues_give_no_rows(self) -> None:
         _ = self.issue("built one", "status: closed", "tags: [issue, proposal]", "as_built: docs/hana/as-built/x.md")
@@ -207,8 +232,8 @@ class ProposalsTableTests(unittest.TestCase):
     def test_add_ons_are_found_under_either_run_folder_name(self) -> None:
         plan = self.root / "unit/docs/plans/footers.md"
         _ = self.write("unit-runs/run-new/next_items_pending.md", "- add: New-folder add-on\n")
-        _ = self.write("delegate-runs/run-old/next_items_pending.md", "- add: Former-folder add-on\n")
-        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "unit-runs", self.root / "delegate-runs")), \
+        _ = self.write("former-runs/run-old/next_items_pending.md", "- add: Former-folder add-on\n")
+        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "unit-runs", self.root / "former-runs")), \
                 self.runs_of({plan: [Path("/history/runs/run-new.jsonl"), Path("/history/runs/run-old.jsonl")]}):
             rows = proposals_table.unit_add_on_rows("footer-unit", plan)
         self.assertEqual(sorted(row.proposal for row in rows), ["Former-folder add-on", "New-folder add-on"])
@@ -237,7 +262,8 @@ class ProposalsTableTests(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_main_prints_the_three_sources_in_order(self) -> None:
-        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n\n"
+        doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n\n- **Proposals:** `issues`\n"
+                         + f"- **Improvement queue:** {self.root / 'backlog' / 'ledger.md'}\n\n"
                          + "## Units\n\n| Unit | Plan |\n| --- | --- |\n| footer-unit | `docs/plans/footers.md` |\n")
         _ = self.issue("footer colours", "date_created: 2026-10-09", "status: open", "tags: [issue, proposal]",
                        "proposed_by: footer-unit", folder="trunk/issues")
@@ -248,8 +274,7 @@ class ProposalsTableTests(unittest.TestCase):
         _ = self.write("backlog/ledger.md", "- 2026-10-11 Codex dots — proposed\n")
         _ = self.write("sessions/run-1/next_items_pending.md", "- add: Keep the old footer\n")
         records = '{"footer-unit": {"plan": "%s"}, "idle-unit": {"unavailable": "no plan"}}' % plan
-        with mock.patch.object(proposals_table, "BACKLOG_DIR", self.root / "backlog"), \
-                mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "sessions",)), \
+        with mock.patch.object(proposals_table, "SESSION_ROOTS", (self.root / "sessions",)), \
                 mock.patch.object(phase_table, "show_production", return_value=records), \
                 self.runs_of({plan: [Path("run-1.jsonl")]}):
             code, out, err = self.run_main(["--production", str(doc)])
@@ -261,8 +286,7 @@ class ProposalsTableTests(unittest.TestCase):
 
     def test_main_says_so_when_nothing_is_open(self) -> None:
         doc = self.write("trunk/docs/plans/footers-production.md", "# Production\n")
-        with mock.patch.object(proposals_table, "BACKLOG_DIR", self.root / "backlog"), \
-                mock.patch.object(phase_table, "show_production", return_value="{}"):
+        with mock.patch.object(phase_table, "show_production", return_value="{}"):
             self.assertEqual(self.run_main(["--production", str(doc)]), (0, "no open proposals\n", ""))
 
     def test_main_refuses_a_session_that_runs_no_production(self) -> None:

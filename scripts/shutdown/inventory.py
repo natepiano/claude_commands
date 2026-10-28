@@ -298,7 +298,7 @@ def _notifier_state_dir() -> Path:
 
 
 def _run_roots() -> tuple[Path, ...]:
-    return unit_runs.run_roots(os.environ.get("SHUTDOWN_DELEGATE_ROOT"))
+    return unit_runs.run_roots(os.environ.get("SHUTDOWN_RUN_ROOT"))
 
 
 def _session_file(record: sessions.SessionRecord) -> SessionFile:
@@ -885,7 +885,7 @@ def _launcher_command(pid: int) -> list[str]:
 
 
 def _left_since_offered(directory: Path, roster: dict[str, dict[str, object]]) -> bool:
-    """An earlier stop paused every seat, and the director has written no board line since.
+    """An earlier stop paused every worker, and the director has written no board line since.
 
     Each stop writes `<seat>.resume-prompt.md`, so the oldest one is the earliest offer
     the restart made. A board older than that offer means the director took none back.

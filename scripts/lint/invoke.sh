@@ -10,7 +10,9 @@
 # Callers own scope (--workspace vs -p <pkg>, target selection); this file
 # owns how each tool always runs once scoped.
 # invoke_clippy_fix applies fixes; fmt_cargo formats them before invoke_clippy
-# judges the result. Delegate verdict keys include this policy file.
+# judges the result. Worker verdict keys include this policy file.
+
+if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR" || return; fi
 
 [[ -n "${LINT_INVOKE_SOURCED:-}" ]] && return 0
 LINT_INVOKE_SOURCED=1
@@ -201,7 +203,7 @@ buildlog_finish_memory() {
 
 # run() returns this when LINT_QUEUE_LEAVE_HOOK (memory_gate.sh) ended the
 # memory wait or natedev's hold wait: the step never started, holds no reservation, leaves no build
-# log row and takes back build_hold_step_started's mark, and BUILDLOG_MEM_WAIT_S
+# log row, and BUILDLOG_MEM_WAIT_S
 # keeps the time it waited. run_nextest passes it through. 75 is EX_TEMPFAIL;
 # neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
@@ -214,17 +216,15 @@ run_once() {
     buildlog_begin "$@" || true
     local sampler_pid="" parent_pid=$BASHPID status=0 memory_wait=0
     if buildlog_step_compiles "$@"; then
-        build_hold_step_started
         while :; do
             buildlog_wait_for_memory "$@"
             memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
             if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
                 buildlog_release_memory 0
-                [[ -z "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || rm -f "$BUILDLOG_HOLD_STARTED_FILE"
                 BUILDLOG_MEM_WAIT_S=$memory_wait BUILDLOG_START="" BUILDLOG_TREE=""
                 return "$LINT_LEFT_QUEUE_STATUS"
             fi
-            if build_hold_check_admission; then
+            if build_hold_check_local; then
                 break
             else
                 status=$?
@@ -238,14 +238,12 @@ run_once() {
                 status=$?
                 BUILDLOG_MEM_WAIT_S=$memory_wait
                 if [[ "$status" == "$LINT_LEFT_QUEUE_STATUS" ]]; then
-                    [[ -z "${BUILDLOG_HOLD_STARTED_FILE:-}" ]] || rm -f "$BUILDLOG_HOLD_STARTED_FILE"
                     BUILDLOG_START="" BUILDLOG_TREE=""
                 fi
                 return "$status"
             }
         done
         BUILDLOG_MEM_WAIT_S=$memory_wait
-        build_hold_mark MemoryGateReturned "$BUILDLOG_MEM_OUTCOME"
     fi
     if [[ -n "${LINT_NEXTEST_SHARE:-}" ]]; then
         nextest_share_claim "$@"
@@ -279,7 +277,7 @@ run_once() {
     # $RANDOM too: a background sweep's run() shares this shell's $$.
     local log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
     # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
-    # prove a delegate is alive, so buffering a long build looks like a hang.
+    # prove a worker is alive, so buffering a long build looks like a hang.
     set +e
     buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
     status=${PIPESTATUS[0]}
@@ -567,18 +565,11 @@ invoke_mend() {
     run env RUSTC_WRAPPER= cargo mend --all-targets "$@"
 }
 
-# Scope comes from the caller, like mend and clippy. --workspace used to be
-# hardcoded here, which made every dev-time doc lint a full-workspace rustdoc
-# run no matter how little changed. Narrowing is safe: rustdoc resolves
-# intra-doc links per crate against that crate's own dependency metadata, so
-# which other members share the invocation never changes a given crate's
-# warnings. The workspace-wide sweep it used to provide incidentally now runs
-# once at the push gate (validate_ci.sh), where it belongs.
-#
-# Features come from the caller too. A hardcoded --all-features made every
-# dev-loop doc run resolve a feature set that no check, clippy or test run
-# shares, and so compile its own copy of the dependency tree. The push gate
-# passes --all-features itself, where full coverage is the point.
+# Scope and features come from the caller, like mend and clippy. Both used to
+# be fixed here. Standalone lint doc can select members and honors doc=off.
+# verify.sh doc checks the workspace before each Cargo checkpoint and ignores
+# that switch. The push gate (validate_ci.sh) also checks the workspace and
+# passes --all-features for full feature coverage.
 #
 # At most LINT_DOC_JOBS (default 8) processes at once, for every caller. cargo
 # defaults to one per core and starts one rustdoc per member at 1 to 5 GB each:

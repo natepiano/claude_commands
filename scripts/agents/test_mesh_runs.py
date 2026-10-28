@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import select
 import socket
 import subprocess
 import sys
@@ -138,10 +139,18 @@ class MeshRunsTests(unittest.TestCase):
         command line names mesh_runs.py supervise and the record, unless pid names another process."""
         path = self.record(command)
         if not pid:
-            stand_in = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "mesh_runs.py",
-                                         "supervise", str(path)], stdin=subprocess.DEVNULL)
+            stand_in = subprocess.Popen([sys.executable, "-c",
+                                         "import sys; print('ready', flush=True); sys.stdin.read()",
+                                         "mesh_runs.py", "supervise", str(path)],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             self.addCleanup(stand_in.wait)
             self.addCleanup(stand_in.kill)
+            assert stand_in.stdin is not None and stand_in.stdout is not None
+            self.addCleanup(stand_in.stdin.close)
+            self.addCleanup(stand_in.stdout.close)
+            # Wait for Python to start before the test reads the child's command line.
+            self.assertTrue(select.select([stand_in.stdout], [], [], 300)[0], "supervisor did not start")
+            self.assertEqual(stand_in.stdout.readline(), "ready\n")
             pid = stand_in.pid
         self.update_record(path, cwd=os.getcwd(), tree_key="key-1", pid=pid)
         return path
@@ -167,7 +176,7 @@ class MeshRunsTests(unittest.TestCase):
     def test_start_detaches_a_supervisor_and_records_the_run(self) -> None:
         popen = MagicMock(return_value=SimpleNamespace(pid=4321))
         environment = {"CODEX_THREAD_ID": "thread-1", "CLAUDE_CODE_SESSION_ID": "director-session",
-                       "PLAN_DELEGATE_TEAM_ROLE": "test"}
+                       "UNIT_TEAM_ROLE": "test"}
         with patch.dict(os.environ, environment), patch.object(subprocess, "Popen", popen), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             code = mesh_runs.main(["start", "--label", "verify.sh check", "--", "bash", "verify.sh", "check"])
@@ -224,6 +233,55 @@ class MeshRunsTests(unittest.TestCase):
             popen, _ = self.start(command)
             popen.assert_called_once()
 
+    # On 2026-10-22 a unit stopped 23 queued runs by their process group: a supervisor that dies
+    # delivers nothing, and its worker waits for a result that never comes.
+    def test_a_start_ends_a_run_whose_supervisor_is_gone_with_a_failure_result(self) -> None:
+        path = self.record(["bash", "verify.sh", "test", "hana"])
+        self.update_record(path, pid=DEAD_PID)
+        popen, _ = self.start(["bash", "verify.sh", "lint", "hana"])
+        popen.assert_called_once()
+        record = cast(mesh_runs.RunRecord, json.loads(path.read_text(encoding="utf-8")))
+        self.assertEqual((record["status"], record.get("ended"), record.get("exit_code")),
+                         ("finished", "supervisor gone", None))
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Run ended with no result: verify.sh check\nResult: FAIL (no exit status)", messages[0])
+        self.assertIn("Start the run again", messages[0])
+        # The new run's supervisor is a mock; drop it, then a second pass finds nothing to end.
+        for started in path.parent.glob("*.json"):
+            if started != path:
+                started.unlink()
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(len(cast(list[str], self.pending()["messages"])), 1)
+
+    def test_a_dead_run_that_a_newer_run_of_its_command_answers_delivers_nothing(self) -> None:
+        command = ["bash", "verify.sh", "lint", "hana"]
+        older = self.record(command)
+        self.update_record(older, pid=DEAD_PID, started_at=time.time() - 600)
+        newer = older.with_name("r2.json")
+        _ = newer.write_text(older.read_text(encoding="utf-8"), encoding="utf-8")
+        self.update_record(newer, run_id="r2", started_at=time.time(), pid=DEAD_PID)
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), ["r1", "r2"])
+        older_record = cast(mesh_runs.RunRecord, json.loads(older.read_text(encoding="utf-8")))
+        self.assertIn("a newer run of the same command answers", older_record.get("delivery", ""))
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1, "only the newest dead run reports")
+
+    def test_the_launcher_gets_a_dead_runs_failure_before_it_closes_its_inbox(self) -> None:
+        session, thread = str(self.session), "thread-1"
+        path = self.record(["bash", "verify.sh", "check"])
+        self.update_record(path, pid=DEAD_PID)
+        codex_mesh._end_dead_runs(session, "unit-other")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.pending(), {}, "another worker's launcher ends nothing of this one")
+        codex_mesh._end_dead_runs(session, WORKER)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("FAIL (no exit status)", cast(list[str], self.pending()["messages"])[0])
+        self.assertFalse(codex_mesh._close_messages_if_empty(session, WORKER, thread))  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_live_supervisor_is_not_ended(self) -> None:
+        path = self.live_run(["bash", "verify.sh", "check"])
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["status"], "running")
+
     def test_start_exits_3_for_a_caller_that_is_not_a_mesh_worker(self) -> None:
         popen = MagicMock()
         for environment in ({"CODEX_THREAD_ID": "thread-unknown"}, {"CODEX_THREAD_ID": ""}):
@@ -236,7 +294,7 @@ class MeshRunsTests(unittest.TestCase):
 
     # Criterion 2: the result is held for the seat, then the record is marked finished.
     def test_supervise_delivers_before_marking_finished(self) -> None:
-        path = self.record([sys.executable, "-c", "import os; print('lint clean', os.environ['PLAN_DELEGATE_TEAM_ROLE'])"])
+        path = self.record([sys.executable, "-c", "import os; print('lint clean', os.environ['UNIT_TEAM_ROLE'])"])
         hold = codex_mesh.hold_message
         statuses: list[object] = []
 
@@ -302,6 +360,17 @@ class MeshRunsTests(unittest.TestCase):
         _ = self.supervise(self.record([sys.executable, "-c", "pass"], done=str(done)))
         self.assertEqual(self.pending()["messages"], ["Stage 2: go"])
 
+    def test_a_superseded_run_delivers_a_result_that_is_not_a_failure(self) -> None:
+        done = self.root / "done.txt"
+        _ = done.write_text("Stage 2: go", encoding="utf-8")
+        record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(76)"], done=str(done)))
+        message = cast(list[str], self.pending()["messages"])[0]
+        self.assertIn("Result: SUPERSEDED (exit 76)", message)
+        self.assertIn("nothing needs a repair", message)
+        self.assertNotIn("FAIL", message)
+        self.assertNotIn("Stage 2: go", message)
+        self.assertEqual(record.get("exit_code"), 76)
+
     def test_a_line_over_codexs_input_limit_delivers_cut_under_the_cap(self) -> None:
         script = "print('x' * 1_100_000)\nfor n in range(30): print(str(n) * 5_000)\nprint('last line')"
         _ = self.supervise(self.record([sys.executable, "-c", script]))
@@ -332,7 +401,9 @@ class MeshRunsTests(unittest.TestCase):
         record = self.supervise(self.record([sys.executable, "-c", "raise SystemExit(2)"]))
         self.assertEqual(len(self.sent), 1)
         self.assertEqual(self.sent[0].session_id, "director-session")
-        for part in (f"Seat: {WORKER}", "Command: ", "FAIL (exit 2)", "Log: "):
+        for part in (f"Worker {WORKER}'s run", f"Worker: {WORKER}",
+                     f"Dispatch the worker (implement.sh --to {WORKER})",
+                     "Command: ", "FAIL (exit 2)", "Log: "):
             self.assertIn(part, self.sent[0].text)
         self.assertEqual(self.pending(), {})
         self.assertIn("sent to director", record.get("delivery", ""))

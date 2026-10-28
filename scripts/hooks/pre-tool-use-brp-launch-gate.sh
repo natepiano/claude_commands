@@ -18,5 +18,4 @@ PY_DENY
     exit 0
 fi
 buildlog_wait_for_memory || true
-build_hold_mark MemoryGateReturned "${BUILDLOG_MEM_OUTCOME:-MeminfoUnavailable}" launch
 exit 0

@@ -129,11 +129,16 @@ class LostHostRecovery(TypedDict):
     last_seen: str
 
 
+class AgentExitRecovery(TypedDict):
+    kind: Literal["agent exited"]
+    last_seen: str
+
+
 class RecoveryEvidenceNotRecorded(TypedDict):
     kind: Literal["not recorded"]
 
 
-RecoveryContext = RebootRecovery | LostHostRecovery | RecoveryEvidenceNotRecorded
+RecoveryContext = RebootRecovery | LostHostRecovery | AgentExitRecovery | RecoveryEvidenceNotRecorded
 
 
 class FromSnapshot(TypedDict):
@@ -386,6 +391,7 @@ class SessionRestartFailed(TypedDict):
     kind: Literal["restart failed"]
     at: str
     reason: str
+    trust_command: NotRequired[str]  # the user's fix when no account on the machine trusts the folder
 
 
 class SessionNeedsManualRestart(TypedDict):
@@ -467,6 +473,11 @@ class PausedSeat(TypedDict):
     launcher_command: list[str]
 
 
+class CheckoutMove(TypedDict):
+    old: str
+    new: str
+
+
 class SessionShutdown(TypedDict):
     move_id: NotRequired[str]
     login: str
@@ -508,6 +519,8 @@ class SessionShutdown(TypedDict):
     renamed: NotRequired[str]
     # A move stopped the session mid-turn; its last tool call, or "" when the transcript showed none.
     cut_off: NotRequired[str]
+    # Set by `rename.py checkout` for a stopped showrunner: the launch moves its checkout first (restart.move_checkout).
+    checkout_move: NotRequired[CheckoutMove]
 
 
 class AccountHold(TypedDict):
@@ -532,6 +545,19 @@ def stop_incomplete(saved: SessionShutdown) -> bool:
     return progress == "stop failed" or bool(saved["stop_issues"] and progress in {
         "stopped", "already gone", "process identity lost",
     })
+
+
+# Progress after which a session's shutdown takes no further step by itself.
+_FINISHED_PROGRESS = frozenset({"restarted", "stop failed", "restart failed", "manual restart", "timers pending"})
+_STOPPED_PROGRESS = frozenset({"stopped", "already gone", "process identity lost"})
+
+
+def shutdown_finished(saved: SessionShutdown) -> bool:
+    """The conductor's done rule: a forced stop still retries, and a restart request restarts its stopped session."""
+    if saved["force"] == "now" and stop_incomplete(saved):
+        return False
+    progress = saved["progress"]["kind"]
+    return progress in _FINISHED_PROGRESS or (progress in _STOPPED_PROGRESS and saved["then"] == "stop")
 
 
 def _legacy_continuation(record: _LegacyShutdownRecord) -> ShutdownContinuation:
@@ -699,7 +725,7 @@ def _request_origin(value: object, place: str) -> RequestOrigin:
         if "recovery" not in values:
             values["recovery"] = RecoveryEvidenceNotRecorded(kind="not recorded")
         context = _mapping(values["recovery"], f"{place}.recovery")
-        signal = _kind(context, f"{place}.recovery", frozenset({"reboot", "host gone", "not recorded"}))
+        signal = _kind(context, f"{place}.recovery", frozenset({"reboot", "host gone", "agent exited", "not recorded"}))
         if signal != "not recorded":
             _ = _utc_time(_required(context, "last_seen", place), f"{place}.recovery.last_seen")
     return cast(RequestOrigin, cast(object, values))
@@ -769,6 +795,8 @@ def _progress(value: object, place: str, *, legacy: bool = False) -> SessionProg
         values["prior"] = prior
     if kind in {"stop failed", "restart failed"}:
         _ = _string(_required(values, "reason", place), f"{place}.reason")
+        if kind == "restart failed" and "trust_command" in values:
+            _ = _string(values["trust_command"], f"{place}.trust_command")
     elif kind == "timers pending":
         timer_values = _items(
             _required(values, "timers", place), f"{place}.timers"
@@ -1153,6 +1181,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     for field in ("source_label", "why", "renamed", "cut_off"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
+    if "checkout_move" in values:
+        move = _mapping(values["checkout_move"], f"{place}.checkout_move")
+        values["checkout_move"] = {key: _string(_required(move, key, f"{place}.checkout_move"), f"{place}.checkout_move.{key}")
+                                   for key in ("old", "new")}
     for field, allowed in (
         ("hold", {"account", "session"}),
         ("force", {"wait for ready", "now"}),
@@ -1481,6 +1513,35 @@ def update_session(
         return checked
 
 
+def claim_restore_alert(saved: SessionShutdown, detail: str) -> bool:
+    """Claim one failure alert for this request under its account lock."""
+    claimed = False
+    def claim(current: SessionShutdown) -> None:
+        nonlocal claimed
+        if (current["request_id"] == saved["request_id"]
+                and current["requested_at"] == saved["requested_at"]
+                and "restore_alerted" not in current):
+            current["restore_alerted"] = detail
+            claimed = True
+    try:
+        _ = update_session(saved["login"], saved["session"]["session_id"], claim)
+    except NoLiveRecord:
+        return False
+    return claimed
+
+
+def clear_restore_alert(saved: SessionShutdown) -> None:
+    """Release this request's alert after failed delivery or a live observation."""
+    def clear(current: SessionShutdown) -> None:
+        if (current["request_id"] == saved["request_id"]
+                and current["requested_at"] == saved["requested_at"]):
+            _ = current.pop("restore_alerted", None)
+    try:
+        _ = update_session(saved["login"], saved["session"]["session_id"], clear)
+    except NoLiveRecord:
+        pass
+
+
 def archive_session(login: str, session_id: str) -> None:
     """Move one session file into history under its request time and name."""
     if _existing_account_directory(login) is None:
@@ -1580,14 +1641,18 @@ def account_hold(login: str) -> AccountHold | None:
             hold = _account_hold(_read_json(path), str(path))
             _check_account(login, hold["login"], path)
             return hold
-        for record in sorted(old, key=lambda item: item["requested_at"]):
-            if record["scope"]["kind"] == "all account sessions" and record["state"] not in {"cancelled", "up"}:
-                return AccountHold(
-                    login=record["login"], label=record["label"], machine=record["machine"],
-                    requested_at=record["requested_at"], requested_by=record["requested_by"],
-                    request_id=f"legacy-{record['machine']}-{record['requested_at']}",
-                    then=_legacy_continuation(record),
-                )
+        return _legacy_hold(old)
+
+
+def _legacy_hold(old: list[_LegacyShutdownRecord]) -> AccountHold | None:
+    for record in sorted(old, key=lambda item: item["requested_at"]):
+        if record["scope"]["kind"] == "all account sessions" and record["state"] not in {"cancelled", "up"}:
+            return AccountHold(
+                login=record["login"], label=record["label"], machine=record["machine"],
+                requested_at=record["requested_at"], requested_by=record["requested_by"],
+                request_id=f"legacy-{record['machine']}-{record['requested_at']}",
+                then=_legacy_continuation(record),
+            )
     return None
 
 
@@ -1964,6 +2029,53 @@ def clear_finished_account_hold(login: str, *, request_ids: tuple[str, ...] = ()
             path.unlink()
 
 
+@dataclass(frozen=True)
+class HoldReleased:
+    """A finished account hold was removed; `hold` is what was on disk."""
+
+    hold: AccountHold
+
+
+@dataclass(frozen=True)
+class HoldInUse:
+    """The account hold still covers work in progress, or is an old record's hold."""
+
+    hold: AccountHold
+
+
+def release_finished_account_hold(login: str, *, conducting: bool = False) -> HoldReleased | HoldInUse | AccountOpen:
+    """Remove the account hold once its request has finished, so no hold outlives its shutdown.
+
+    A hold is finished when its registration is complete and no record of a
+    covered request is still live, waiting or stopping. A running conductor
+    keeps the hold until each covered record meets `shutdown_finished`;
+    `conducting` says the caller is that conductor. An old record's hold is
+    never removed here.
+    """
+    if _existing_account_directory(login) is None:
+        return AccountOpen()
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "hold.json"
+        if not _regular_record(path):
+            legacy = _legacy_hold(_legacy_account_records(directory, login))
+            return AccountOpen() if legacy is None else HoldInUse(legacy)
+        held = _account_hold(_read_json(path), str(path))
+        _check_account(login, held["login"], path)
+        if _registering_request_ids(held):
+            return HoldInUse(held)
+        covered = _hold_request_ids(held)
+        records = [saved for saved in _session_records_in_directory(directory, login) if saved["request_id"] in covered]
+        if conducting:
+            finished = all(shutdown_finished(saved) for saved in records)
+        else:
+            finished = isinstance(conductor_status(login), ConductorNotRunning) and all(
+                saved["progress"]["kind"] in _FINISHED_PROGRESS | _STOPPED_PROGRESS for saved in records)
+        if not finished:
+            return HoldInUse(held)
+        path.unlink()
+        return HoldReleased(held)
+
+
 def conductor_status(login: str) -> ConductorRunning | ConductorNotRunning | ConductorUnavailable:
     """Observe ownership without creating a file or waiting for its owner."""
     try:
@@ -2038,7 +2150,7 @@ def _snapshot_session(value: object, place: str) -> SnapshotSession:
     values["timers"] = [_timer(timer, f"{place}.timers") for timer in
                        _items(_required(values, "timers", place), f"{place}.timers")]
     _ = _utc_time(_required(values, "last_seen", place), f"{place}.last_seen")
-    if "crash" in values and values["crash"] not in {"reboot", "host gone"}:
+    if "crash" in values and values["crash"] not in {"reboot", "host gone", "agent exited"}:
         raise InvalidRecord(f"{place}.crash is invalid")
     if "boot_id" in values:
         if not _string(values["boot_id"], f"{place}.boot_id"):
@@ -2175,6 +2287,47 @@ def write_snapshot(snapshot: RecoverySnapshot) -> None:
         _write_snapshot(checked)
 
 
+def mark_snapshot_agent_exited(login: str, session_id: str, last_seen: str) -> None:
+    """Retain a confirmed agent exit unless a newer observation replaced it."""
+    with _session_store_lock(login, create=True):
+        saved = _read_snapshot(login)
+        if isinstance(saved, NoRecoverySnapshot):
+            return
+        for item in saved["sessions"]:
+            if (item["agent"] == "claude" and item["session"]["session_id"] == session_id
+                    and item["last_seen"] == last_seen):
+                item["crash"] = "agent exited"
+                item["state"] = "unresolved"
+                _write_snapshot(parse_snapshot(saved))
+                return
+
+
+def restore_snapshot_agent_exited(snapshot: RecoverySnapshot, entry: SnapshotClaudeSession) -> bool:
+    """Restore confirmed evidence retained by the watchdog, unless a newer observation owns it."""
+    checked = parse_snapshot(snapshot)
+    candidate = copy.deepcopy(entry)
+    identity = candidate["session"]["session_id"]
+    with _session_store_lock(checked["login"], create=True) as directory:
+        saved = _read_snapshot(checked["login"])
+        if isinstance(saved, NoRecoverySnapshot):
+            saved = checked
+            saved["sessions"] = []
+        for current in saved["sessions"]:
+            if current["session"]["session_id"] == identity:
+                if (current["session"] != candidate["session"]
+                        or datetime.fromisoformat(current["last_seen"]) > datetime.fromisoformat(candidate["last_seen"])):
+                    return False
+        for current_record in _session_records_in_directory(directory, checked["login"]):
+            if (current_record["session"]["session_id"] == identity
+                    and datetime.fromisoformat(current_record["requested_at"]) > datetime.fromisoformat(candidate["last_seen"])):
+                return False
+        candidate["crash"] = "agent exited"
+        candidate["state"] = "unresolved"
+        saved["sessions"] = [item for item in saved["sessions"] if item["session"]["session_id"] != identity] + [candidate]
+        _write_snapshot(parse_snapshot(saved))
+        return True
+
+
 def all_snapshots() -> list[RecoverySnapshot]:
     root = _state_root() / "snapshots"
     if not _record_directory(root):
@@ -2194,7 +2347,7 @@ def all_snapshots() -> list[RecoverySnapshot]:
 
 
 def merge_snapshots(observed: CompleteInventory | PartialInventory, taken_at: str) -> list[RecoverySnapshot]:
-    """Retain missing sessions only with a reboot or host-loss signal."""
+    """Retain missing sessions only with a confirmed crash signal."""
     if isinstance(observed, PartialInventory):
         return []
     _ = _utc_time(taken_at, "snapshot.taken_at")
@@ -2280,6 +2433,8 @@ def snapshot_restore_record(snapshot: RecoverySnapshot, entry: SnapshotClaudeSes
         context = RebootRecovery(kind="reboot", last_seen=item["last_seen"])
     elif item.get("crash") == "host gone":
         context = LostHostRecovery(kind="host gone", last_seen=item["last_seen"])
+    elif item.get("crash") == "agent exited":
+        context = AgentExitRecovery(kind="agent exited", last_seen=item["last_seen"])
     saved = SessionShutdown(
         login=checked["login"], label=checked["label"], machine=checked["machine"],
         requested_at=at, request_id=f"recovery-{at}", requested_by=FromSnapshot(kind="snapshot", taken_at=at, recovery=context),

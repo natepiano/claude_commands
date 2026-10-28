@@ -12,17 +12,23 @@ Inside a level a higher value goes first where the queue has one (a proposal's s
 efficiency gain), then the oldest. An item may name `after`, the key of its prerequisite: while
 that item is open, it moves up to just before the item that needs it.
 
-The item /next showed stays current until it leaves the queue (its verdict or answer), even when a
-more urgent item arrives; a user mark takes the slot after it. `top` holds that pin, one small JSON
-file per queue under NEXT_STATE_DIR (default ~/.local/state/next).
+The order is `urgent` (the levels above), `oldest` or `newest` (by age; the levels break a tie).
+In each order an item the user moved to the end goes after every other item, the first moved
+first, until the user calls it important again.
+
+The item /next showed in the urgent order stays current until it leaves the queue (its verdict or
+answer), even when a more urgent item arrives; a user mark takes the slot after it. The oldest and
+newest orders always show the oldest or newest item, and pin it. `top` holds the pin and the moved
+items, one small JSON file per queue under NEXT_STATE_DIR (default ~/.local/state/next).
+`top_across` gives bare /next its one item from several queues.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Generic, TypeVar, cast
@@ -33,6 +39,10 @@ SOON = "soon"
 NORMAL = "normal"
 LATER = "later"
 LEVELS = (USER, BLOCKS, SOON, NORMAL, LATER)
+URGENT = "urgent"
+OLDEST = "oldest"
+NEWEST = "newest"
+ORDERS = (URGENT, OLDEST, NEWEST)
 # The stored form of a minute: the form every queue already writes its times in.
 MINUTE = "%Y-%m-%dT%H:%M"
 _CELL_DUE = re.compile(r"^due (?P<due>\S+)$")
@@ -160,16 +170,52 @@ def _stamp(when: datetime | None, missing: float) -> float:
     return missing if when is None else when.timestamp()
 
 
-def _key(entry: Entry[Item]) -> tuple[int, float, tuple[float, ...], float]:
+def _level(entry: Entry[Item]) -> tuple[int, float]:
     level = entry.urgency.level
     inside = (-_stamp(entry.urgency.marked, 0.0) if level == USER
               else _stamp(entry.urgency.due, float("inf")) if level == SOON else 0.0)
-    return LEVELS.index(level), inside, tuple(-value for value in entry.value), _stamp(entry.since, float("inf"))
+    return LEVELS.index(level), inside
 
 
-def order(entries: Iterable[Entry[Item]], current: str = "") -> list[Entry[Item]]:
-    """Most useful first; the item named `current` leads while it is still in the queue."""
-    ranked = sorted(entries, key=_key)
+def _key(entry: Entry[Item]) -> tuple[int, float, tuple[float, ...], float]:
+    return *_level(entry), tuple(-value for value in entry.value), _stamp(entry.since, float("inf"))
+
+
+def _checked(by: str) -> str:
+    if by not in ORDERS:
+        raise UrgencyError(f"order {by!r} is not one of {', '.join(ORDERS)}")
+    return by
+
+
+def _moved(entry: Entry[Item], ended: Mapping[str, datetime]) -> datetime | None:
+    """When the user moved this item to the end, unless they called it important since then."""
+    moved = ended.get(entry.key)
+    marked = entry.urgency.marked
+    if moved is None or (marked is not None and marked >= moved.replace(second=0, microsecond=0)):
+        return None
+    return moved
+
+
+def _age(entry: Entry[Item], by: str) -> tuple[bool, float]:
+    """The age part of the key: nothing for `urgent`; an item with no age goes last."""
+    if by == URGENT:
+        return False, 0.0
+    if entry.since is None:
+        return True, 0.0
+    return False, -entry.since.timestamp() if by == NEWEST else entry.since.timestamp()
+
+
+def order(entries: Iterable[Entry[Item]], current: str = "", by: str = URGENT,
+          ended: Mapping[str, datetime] | None = None) -> list[Entry[Item]]:
+    """In the order `by`, an item named in `ended` last; the item named `current` leads while it is in the queue."""
+    _ = _checked(by)
+    ends = ended or {}
+
+    def key(entry: Entry[Item]) -> tuple[bool, float, tuple[bool, float], tuple[int, float, tuple[float, ...], float]]:
+        moved = _moved(entry, ends)
+        return moved is not None, _stamp(moved, 0.0), _age(entry, by), _key(entry)
+
+    ranked = sorted(entries, key=key)
     index = {entry.key: at for at, entry in reversed(list(enumerate(ranked)))}
     placed: set[int] = set()
     out: list[Entry[Item]] = []
@@ -200,30 +246,120 @@ def _pin_file(queue: str) -> Path:
     return state_dir() / f"{_UNSAFE.sub('_', queue)}.json"
 
 
-def pinned(queue: str) -> str:
-    """The key of the item /next last showed from this queue, or the empty string."""
+@dataclass(frozen=True)
+class QueueState:
+    """A queue's file: the item /next showed, the queue it came from (bare /next only) and the moved items."""
+
+    current: str = ""
+    source: str = ""
+    ended: Mapping[str, datetime] = field(default_factory=dict[str, datetime])
+
+
+def _read_state(queue: str) -> QueueState:
     try:
         value = cast(object, json.loads(_pin_file(queue).read_text(encoding="utf-8")))
     except (OSError, ValueError):
-        return ""
-    current = cast(dict[str, object], value).get("current") if isinstance(value, dict) else None
-    return current if isinstance(current, str) else ""
+        return QueueState()
+    fields = cast(dict[str, object], value) if isinstance(value, dict) else {}
+    current, source, stored = fields.get("current"), fields.get("source"), fields.get("ended")
+    ended: dict[str, datetime] = {}
+    for key, when in (cast(dict[str, object], stored) if isinstance(stored, dict) else {}).items():
+        if isinstance(when, str):
+            try:
+                ended[key] = datetime.fromisoformat(when)
+            except ValueError:
+                continue
+    return QueueState(current if isinstance(current, str) else "", source if isinstance(source, str) else "", ended)
 
 
-def pin(queue: str, key: str) -> None:
+def _write_state(queue: str, state: QueueState) -> None:
     path = _pin_file(queue)
     path.parent.mkdir(parents=True, exist_ok=True)
+    stored: dict[str, object] = {"current": state.current}
+    if state.source:
+        stored["source"] = state.source
+    if state.ended:
+        stored["ended"] = {key: when.isoformat(timespec="seconds") for key, when in state.ended.items()}
     temporary = path.with_suffix(".tmp")
-    _ = temporary.write_text(json.dumps({"current": key}) + "\n", encoding="utf-8")
+    _ = temporary.write_text(json.dumps(stored) + "\n", encoding="utf-8")
     _ = temporary.replace(path)
 
 
-def top(entries: Iterable[Entry[Item]], queue: str) -> Entry[Item] | None:
-    """The item /next shows: the pinned one while it is in the queue, else the first; it is then pinned."""
-    current = pinned(queue)
-    ranked = order(entries, current)
+def pinned(queue: str) -> str:
+    """The key of the item /next last showed from this queue, or the empty string."""
+    return _read_state(queue).current
+
+
+def ended(queue: str) -> dict[str, datetime]:
+    """The items the user moved to the end of this queue, with when."""
+    return dict(_read_state(queue).ended)
+
+
+def pin(queue: str, key: str, source: str = "") -> None:
+    state = _read_state(queue)
+    _write_state(queue, QueueState(key, source, state.ended))
+
+
+def queue_order(entries: Iterable[Entry[Item]], queue: str) -> list[Entry[Item]]:
+    """The queue in the urgent order, with its pin and its moved items: the order its table shows."""
+    state = _read_state(queue)
+    return order(entries, state.current, URGENT, state.ended)
+
+
+def _pin_first(queue: str, ranked: Sequence[Entry[Item]], source: str = "") -> None:
+    """Pin the first item and forget a moved item that left the queue; write only on a change."""
+    state = _read_state(queue)
+    present = {entry.key for entry in ranked}
+    kept = {key: when for key, when in state.ended.items() if key in present}
+    if ranked[0].key != state.current or source != state.source or kept != dict(state.ended):
+        _write_state(queue, QueueState(ranked[0].key, source, kept))
+
+
+def top(entries: Iterable[Entry[Item]], queue: str, by: str = URGENT) -> Entry[Item] | None:
+    """The item /next shows, which is then pinned: in the urgent order the pinned one while it is
+    in the queue, else the first; in the oldest or newest order the first."""
+    state = _read_state(queue)
+    ranked = order(entries, state.current if _checked(by) == URGENT else "", by, state.ended)
     if not ranked:
         return None
-    if ranked[0].key != current:
-        pin(queue, ranked[0].key)
+    _pin_first(queue, ranked)
     return ranked[0]
+
+
+def top_across(queues: Mapping[str, Sequence[Entry[Item]]], name: str, by: str = URGENT) -> tuple[str, Entry[Item]] | None:
+    """The one item bare /next shows from several queues, and its queue; it is pinned in both.
+
+    In the urgent order the item it showed last, under `name`, leads while it waits and is not moved.
+    Else each queue's first item in the order `by` competes: one moved to the end last, then by age
+    for oldest or newest, then by level, then the oldest. A value never compares across queues.
+    """
+    state = _read_state(name)
+    firsts: list[tuple[tuple[bool, float, tuple[bool, float], tuple[int, float], float], str, Entry[Item]]] = []
+    for queue, entries in queues.items():
+        ends = ended(queue)
+        ranked = order(entries, "", by, ends)
+        if not ranked:
+            continue
+        if _checked(by) == URGENT and queue == state.source:
+            kept = next((entry for entry in ranked if entry.key == state.current and _moved(entry, ends) is None), None)
+            if kept is not None:
+                _pin_first(queue, [kept, *ranked])
+                return queue, kept
+        first = ranked[0]
+        moved = _moved(first, ends)
+        firsts.append(((moved is not None, _stamp(moved, 0.0), _age(first, by), _level(first),
+                        _stamp(first.since, float("inf"))), queue, first))
+    if not firsts:
+        return None
+    _, queue, shown = min(firsts, key=lambda found: found[0])
+    _pin_first(queue, [shown, *queues[queue]])
+    _write_state(name, QueueState(shown.key, queue))
+    return queue, shown
+
+
+def move_to_end(queue: str, key: str, now: datetime) -> None:
+    """Move the item `key` to the end of its queue; it is no longer current there."""
+    state = _read_state(queue)
+    ends = dict(state.ended)
+    ends[key] = now.replace(microsecond=0)
+    _write_state(queue, QueueState("" if state.current == key else state.current, state.source, ends))

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict, cast, final, override
@@ -173,6 +175,25 @@ class CoverageReportTests(unittest.TestCase):
         output = self.report("--rule", "read").stdout
         self.assertIn("names-unit-1", output)
         self.assertNotIn("Open tickets: none", output)
+
+    def test_report_shows_each_widened_path_of_an_open_ticket_under_its_line(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        self.production_units("names-unit")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                              list(self.sources[:2]), [rule])
+            ledger.ticket_assign("names-unit-1", "main")
+            database = ledger.database
+        # Only a proposal ticket widens; the report shows the rows of any open ticket.
+        with closing(sqlite3.connect(database)) as connection, connection:
+            _ = connection.execute("INSERT INTO ticket_widened_paths VALUES (?,?,?,?,?)",
+                                   ("names-unit-1", "crates/alpha/src/extra.rs", "the move needs a new file",
+                                    "showrunner", "2026-10-25T23:06:34+00:00"))
+        lines = self.report("--rule", "read").stdout.splitlines()
+        opened = next(index for index, line in enumerate(lines) if line.startswith("names-unit-1 · assigned"))
+        self.assertEqual(lines[opened + 1], "widened: crates/alpha/src/extra.rs — the move needs a new file "
+                         + "(showrunner, 2026-10-25T23:06:34+00:00)")
 
     def test_manifest_structure_progress_counts_crates_while_file_structure_counts_files(self) -> None:
         manifest = self.rule("manifests", "tier: D\nfamily: modules\ninput_scope: manifest\n")

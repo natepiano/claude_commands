@@ -52,8 +52,8 @@ effect on the next run of each consumer; nothing needs restarting.
 | `mend` | `cargo mend` check pass and `--fix` | `invoke.sh mend` (lint CLI, validate_ci mend steps, `verify.sh lint`) |
 | `style_review` | style-guide walk and banned-words scan over the caller's diff | `/unit:style_review` · `/unit:direct` main phase review |
 | `clippy` | `cargo clippy` | `invoke.sh clippy` (lint CLI, `verify.sh lint`) |
-| `doc` | `cargo doc -D warnings` | `invoke.sh doc` (`lint doc`, `verify.sh lint`) |
-| `fmt` | `cargo +nightly fmt` | `invoke.sh fmt` (`lint fmt`, `verify.sh lint`/`fmt`) |
+| `doc` | `cargo doc -D warnings` | standalone `lint doc` only; `verify.sh doc` ignores this switch |
+| `fmt` | `cargo +nightly fmt` | `invoke.sh fmt` (`lint fmt`, `verify.sh lint`) |
 
 Consumers: `/unit:style_review` reads the style switch, and
 `scripts/lint/invoke.sh` reads the tool switches for the `lint` CLI
@@ -63,9 +63,10 @@ the phase style review report `Off`.
 
 ## What this file deliberately does not gate
 
-- **`verify.sh check` / `test` / `example`, and the workspace
+- **`verify.sh check` / `test` / `example` / `doc`, and the workspace
   check and test inside `verify.sh final`.** Those are correctness gates, not
-  lints. A `/unit:direct` phase that compiles nothing has verified nothing.
+  lints. `verify.sh doc` checks the workspace before every Cargo checkpoint,
+  even with `doc=off`.
 - **`pre_release_checks.sh` and `validate_ci.sh`.** A release or CI check that
   silently no-ops is worse than a noisy one. Both route through the `lint` CLI
   like everything else, but set `LINT_CONFIG_FORCE=1` on the steps they never
@@ -75,7 +76,7 @@ the phase style review report `Off`.
 
 A check gated off inside `verify.sh` prints
 `SKIPPED: <command> — <key>=off in <config path>` and exits 0. When you see that
-line in a delegate log, report the check as `Off`, never as passed.
+line in a worker log, report the check as `Off`, never as passed.
 
 ## Examples
 

@@ -99,8 +99,8 @@ class UnitRenameTests(unittest.TestCase):
             "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
             "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
-            "PLAN_DELEGATE_ACTIVE_DIR": str(self.root / "active"),
-            "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+            "UNIT_ACTIVE_DIR": str(self.root / "active"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
             "PROGRESS_SESSION_ROOTS": str(self.root / "sessions"),
             "PHASE_TABLE_VAULT": str(self.root / "vault/showrunners"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
@@ -108,7 +108,7 @@ class UnitRenameTests(unittest.TestCase):
             "HERDR_PLATFORM": "linux",
             "FAKE_HERDR_LOG": str(self.root / "herdr.jsonl"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr-responses.json"),
-            "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "PLAN_DELEGATE_SYNC_WRITES": "0",
+            "CLAUDE_CODE_SESSION_ID": "", "USER_ZONE": "UTC", "UNIT_SYNC_WRITES": "0",
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
         })
@@ -794,7 +794,7 @@ class UnitRenameTests(unittest.TestCase):
         _ = self.mark_live("alpha-unit", "sid-alpha")
         planned = self.rename("plan")
         self.assert_ok(planned)
-        self.assertIn("1. stop alpha-unit and its Codex seats at once through the shutdown path", planned.stdout)
+        self.assertIn("1. stop alpha-unit and its Codex workers at once through the shutdown path", planned.stdout)
         applied = self.rename("apply")
         self.assertEqual(applied.returncode, 2, applied.stdout + applied.stderr)
         self.assertIn("alpha-unit is still stopping after 0 s; rerun apply once it has stopped", applied.stderr)
@@ -880,6 +880,34 @@ WATCHER = 'while kill -0 "$1"; do sleep "$5"; "$4" "$0" idle-stop --session-dir 
 STOPPED_RECORD = {"login": "owner@example.com", "then": "stop", "progress": {"kind": "stopped"},
                   "session": {"session_id": "sid-alpha",
                               "host": {"kind": "unit", "production": SLUG, "unit": "alpha-unit"}}}
+
+
+class RunRecordLookupTests(unittest.TestCase):
+    def test_move_lookups_build_once_and_keep_exact_worktree_spelling(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        runs = root / "history/runs"
+        runs.mkdir(parents=True)
+        tree = root / "tree"
+        tree.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(tree, target_is_directory=True)
+        for worktree, at in ((tree, 2), (alias, 1)):
+            events = [{"event_type": "run_started", "working_dir": str(worktree), "run_started_at": at}]
+            _ = (runs / f"{worktree.name}.jsonl").write_text(
+                "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        with (mock.patch.dict(os.environ, {"UNIT_HISTORY_DIR": str(root / "history")}),
+              mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
+            for lookup in (unit_move.newest_run, unit_move.open_run):
+                for worktree in (tree, alias, root / "absent"):
+                    with self.subTest(lookup=lookup.__name__, worktree=worktree):
+                        reads.reset_mock()
+                        expected = runs / f"{worktree.name}.jsonl" if worktree != root / "absent" else None
+                        self.assertEqual(lookup(worktree), expected)
+                        reads.assert_called_once_with()
+            with (runs / "alias.jsonl").open("a", encoding="utf-8") as handle:
+                _ = handle.write('{"event_type": "run_finished"}\n')
+            self.assertIsNone(unit_move.open_run(alias))
+            self.assertEqual(unit_move.newest_run(alias), runs / "alias.jsonl")
 
 
 class FakeProcess(NamedTuple):
