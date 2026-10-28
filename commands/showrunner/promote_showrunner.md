@@ -33,7 +33,7 @@ What it does:
 1. **Checks**, and refuses with the cause, stopping nothing:
    - the unit has no live session under your production;
    - it is mid-turn, or its pane shows a form, prompt or draft;
-   - it has a `/unit:delegate` run open, which keeps its workers, so the run finishes first;
+   - it has a `/unit:direct` run open, which keeps its workers, so the run finishes first;
    - it has uncommitted work, so it checkpoints first;
    - the doc is missing, uncommitted or not a production doc;
    - the new production already has a showrunner;
@@ -53,4 +53,6 @@ What it does:
 The last line says whether the account changed: `moved from <unit account> to
 the showrunner account`, or `same account, no move`. If the restart fails after
 the stop, the output gives the one command that brings the session back as the
-unit it was, and the Units row is unchanged.
+unit it was, and the Units row is unchanged. If the session opens but its
+prompt is not proven to have run, the Units row is retired all the same, and
+the output names the prompt to type into it.

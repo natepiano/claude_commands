@@ -25,9 +25,13 @@ CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
 CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
+# Readers see the committed defaults with this machine's overlay over them, and
+# writers store only the rows that differ in the overlay (agents_overlay.sh).
+# shellcheck source=/dev/null
+source "$AGENTS_CONFIG_DIR/agents_overlay.sh"
 
 # Keep the materialized registry current between periodic launchd runs.
-if [[ -f "$AGENTS_CONFIG_FILE" \
+if [[ "${AGENTS_CONFIG_TIER_ONLY:-}" != 1 && -f "$AGENTS_CONFIG_FILE" \
     && -x "$AGENTS_CONFIG_DIR/sync_codex_catalog.sh" \
     && ( ! -f "$CODEX_CATALOG_SYNC_STATE_FILE" \
         || "$CODEX_CONFIG_FILE" -nt "$CODEX_CATALOG_SYNC_STATE_FILE" \
@@ -45,8 +49,9 @@ agents_config_trim() {
 }
 
 _agents_config_has_section() {
-    local want_section="$1" line stripped section
+    local want_section="$1" line stripped section text
     [[ -f "$AGENTS_CONFIG_FILE" ]] || return 1
+    text="$(agents_registry_text)"
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
         stripped="$(agents_config_trim "$stripped")"
@@ -55,13 +60,14 @@ _agents_config_has_section() {
             section="${BASH_REMATCH[1]}"
             [[ "$section" == "$want_section" ]] && return 0
         fi
-    done < "$AGENTS_CONFIG_FILE"
+    done <<< "$text"
     return 1
 }
 
 _agents_config_section_values() {
-    local want_section="$1" line stripped section
+    local want_section="$1" line stripped section text
     [[ -f "$AGENTS_CONFIG_FILE" ]] || return 0
+    text="$(agents_registry_text)"
     section=""
     while IFS= read -r line || [[ -n "$line" ]]; do
         stripped="${line%%#*}"
@@ -73,7 +79,7 @@ _agents_config_section_values() {
         fi
         [[ "$section" == "$want_section" ]] || continue
         printf '%s\n' "$stripped"
-    done < "$AGENTS_CONFIG_FILE"
+    done <<< "$text"
 }
 
 _agents_section_keys_inline() {
@@ -156,7 +162,10 @@ _agents_pinned_error() {
 _agents_agent_families_inline() {
     local agent="$1" family first=1
     for family in codex claude; do
-        _agents_registry_has_key "$family.agents" "$agent" || continue
+        if ! _agents_registry_has_key "$family.agents" "$agent" \
+            && ! _agents_registry_has_key "$family.families" "$agent"; then
+            continue
+        fi
         if [[ "$first" -eq 1 ]]; then
             printf '%s' "$family"
             first=0
@@ -251,11 +260,46 @@ _agents_effort_allowed() {
     return 1
 }
 
+# Resolve visible model-family versions with known effort rows. Numeric ties
+# use slug order, independent of cache order; a full slug needs no cache.
+_agents_model_slug() {
+    local family="$1" word="$2" model
+    if ! _agents_registry_has_key "$family.families" "$word"; then
+        printf '%s' "$word"
+        return 0
+    fi
+    if [[ "$family" != "codex" ]]; then
+        _agents_registry_get "$family.families" "$word"
+        return 0
+    fi
+    if model="$(jq -er --arg family "$word" \
+        --arg catalog "$(_agents_config_section_values codex.agents)" '
+        ($catalog | split("\n") | map(split("=")[0])) as $known_slugs
+        |
+        [.models[]
+            | select(.visibility == "list")
+            | .slug | select(type == "string") | . as $slug
+            | select($known_slugs | index($slug))
+            | capture("^gpt-(?<version>[0-9]+(?:\\.[0-9]+)*)-(?<family>[a-z][a-z0-9_-]*)$")
+            | select(.family == $family)
+            | . + {slug: $slug, version_numbers: (.version | split(".") | map(tonumber))}]
+        | max_by([.version_numbers, .slug])
+        | select(. != null)
+        | .slug
+    ' "$CODEX_MODELS_CACHE_FILE" 2>/dev/null)" && [[ -n "$model" ]]; then
+        printf '%s' "$model"
+        return 0
+    fi
+    echo "no Codex model for '$word' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug" >&2
+    return 1
+}
+
 _agents_validate_pair() {
     local context="$1" family="$2" pair="$3"
-    local model effort allowed_efforts allowed_agents
+    local word model effort allowed_efforts allowed_agents
 
-    model="${pair%%:*}"
+    word="${pair%%:*}"
+    model="$(_agents_model_slug "$family" "$word")" || return 1
     effort=""
     if [[ "$pair" == *:* ]]; then
         effort="${pair#*:}"
@@ -279,6 +323,7 @@ _agents_validate_pair() {
     fi
 
     AGENT_MODEL="$model"
+    AGENT_WORD="$word"
     AGENT_EFFORT="$effort"
 }
 
@@ -405,6 +450,19 @@ _agents_codex_config_tier() {
     done < "$CODEX_CONFIG_FILE"
 }
 
+# A running Codex turn uses only the registry. An empty setting means default.
+# A task without a row uses only the function's setting.
+agents_turn_service_tier() {
+    local task="${1:-delegate}"
+    if [[ ! -r "$AGENTS_CONFIG_FILE" ]]; then
+        echo "ERROR: cannot read agent registry: $AGENTS_CONFIG_FILE" >&2
+        return 1
+    fi
+    [[ "$task" == *.* ]] || task="$task."
+    _agents_resolve_service_tier "$task" codex || return
+    printf '%s' "${AGENT_SERVICE_TIER:-default}"
+}
+
 # A row's tier as /agent shows it: `-` for claude, which never takes one; the
 # registry tier for codex, `pace(<its current decision>)`, or
 # `inherit(<config.toml tier>)` when there is none.
@@ -423,11 +481,14 @@ _agents_tier_display() {
 }
 
 _agents_print_resolved() {
-    local tier="$AGENT_SERVICE_TIER"
+    local tier="$AGENT_SERVICE_TIER" word_field=""
+    if _agents_registry_has_key "$AGENT_FAMILY.families" "$AGENT_WORD"; then
+        word_field=" word=$AGENT_WORD"
+    fi
     [[ -n "${AGENT_SERVICE_TIER_PACED:-}" ]] && tier="pace"
-    printf 'task=%s family=%s agent=%s effort=%s tier=%s\n' \
+    printf 'task=%s family=%s agent=%s effort=%s tier=%s%s\n' \
         "$1" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" \
-        "$(_agents_tier_display "$AGENT_FAMILY" "$tier")"
+        "$(_agents_tier_display "$AGENT_FAMILY" "$tier")" "$word_field"
 }
 
 agents_resolve_print() {
@@ -499,7 +560,7 @@ agents_list_assignments() {
 # active family (plus any per-subtask assignment overrides).
 agents_list_function() {
     local function="$1" active family line key subtask pair model effort overrides=""
-    local row_active live tier
+    local row_active live tier word_field resolved_model
 
     active="$(_agents_registry_get assignments "$function")"
     if [[ -z "$active" ]]; then
@@ -513,6 +574,15 @@ agents_list_function() {
             subtask="${line%%=*}"
             pair="$(agents_config_trim "${line#*=}")"
             model="${pair%%:*}"
+            word_field=""
+            if _agents_registry_has_key "$family.families" "$model"; then
+                word_field=" word=$model"
+                if resolved_model="$(_agents_model_slug "$family" "$model" 2>&1)"; then
+                    model="$resolved_model"
+                else
+                    model="$model (unresolved: $resolved_model)"
+                fi
+            fi
             effort=""
             [[ "$pair" == *:* ]] && effort="${pair#*:}"
             if [[ "$(_agents_live_family "$function" "$subtask")" == "$family" ]]; then
@@ -523,8 +593,8 @@ agents_list_function() {
             tier=""
             [[ "$family" == "codex" ]] && tier="$(_agents_stored_service_tier "$function" "$subtask")"
             tier="$(_agents_tier_display "$family" "$tier")"
-            printf 'task=%s family=%s agent=%s effort=%s active=%s tier=%s\n' \
-                "$function.$subtask" "$family" "$model" "$effort" "$row_active" "$tier"
+            printf 'task=%s family=%s agent=%s effort=%s active=%s tier=%s%s\n' \
+                "$function.$subtask" "$family" "$model" "$effort" "$row_active" "$tier" "$word_field"
         done < <(_agents_config_section_values "$function.$family")
     done
     while IFS= read -r line; do
@@ -596,12 +666,12 @@ agents_set_assignment() {
         }
         { print }
         END { if (!found) exit 2 }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: no [assignments] entry for '$function'; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
 }
 
 # Switch every [assignments] entry — functions and any exact-task overrides —
@@ -687,12 +757,12 @@ agents_set_all_assignments() {
         }
         { print }
         END { if (!found) exit 2 }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: [assignments] has no entries; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
 }
 
 # Put every function -- or just <function> -- on one agent, keeping each row's
@@ -815,12 +885,12 @@ agents_set_model() {
             }
         }
         { print }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
     AGENT_SWEEP_FAMILY="$family"
 }
 
@@ -905,12 +975,12 @@ agents_set_row() {
         }
         { print }
         END { if (!found) exit 2 }
-    ' "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: no [$section] row '$subtask'; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
 
     AGENT_ROW_FAMILY="$family"
     AGENT_ROW_ASSIGNMENT="$active"
@@ -1061,12 +1131,12 @@ agents_set_service_tier() {
         { print }
         FNR in insert { print insert[FNR] }
         END { printf "%s", tail }
-    ' "$AGENTS_CONFIG_FILE" "$AGENTS_CONFIG_FILE" > "$tmp_file"; then
+    ' <(agents_registry_text) <(agents_registry_text) > "$tmp_file"; then
         rm -f "$tmp_file"
         echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+    agents_registry_store "$tmp_file"
     AGENT_TIER_FUNCTIONS="${fns# }"
 }
 

@@ -33,13 +33,15 @@ The roster joins records that each name one part of the picture. A session's rol
 
 | Units table | the production doc, via `add_unit.live_unit_table` | `Unit` and `Worktree` per row (fallback only) |
 
-| Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_DELEGATE_ROOT` replaces both) | first line: the run's session directory |
+| Run markers | `/tmp/claude/unit/active/<director session id>`, and the same under `/tmp/claude/delegate/` for a run started before the folder rename (`ROSTER_RUN_ROOT` replaces both) | first line: the run's session directory |
 
 | Run heartbeats | `<run>/heartbeat.log` | a run is live if written within `unit_runs.LIVE_HEARTBEAT_SECS` (600 s) |
 
 | Workers ledgers | `<run>/workers`, one `<background id>\t<worker name>` per `agent_bg.sh` launch | Claude workers |
 
 | Mesh roster | `<run>/mesh_roster.json`, `<run>/mesh_server.json` | Codex workers: `thread_id`, `status`, `role`, `lens`, `launcher_pid`, `cwd`; server `pid` |
+
+| Guild role store | `~/.local/state/guilds/roles/<design id>/design.json` and its `mesh/mesh_roster.json` (`roles.state_root()`, `GUILD_ROLES_STATE`) | held Astra designers and reviewers: holder, lifecycle, thread, mesh entry |
 
 | Review state | `<run>/review_status[_<lens>]`, `<run>/review_pid[_<lens>]` | running blind reviewers |
 
@@ -58,17 +60,19 @@ Claude rows come from `sessions.running_sessions()`, one per `sessionId` (newest
 Codex rows:
 
 - **worker** — each mesh entry of a live run whose status is not `ended` and whose server pid or `launcher_pid` is alive. Slot role from the record's `role`: `review (<lens>)` for a `review` role with a lens, `no role` when absent, `role unknown` when unrecognized. Status reads `done` → `idle`, `waiting_capacity` → `waiting for capacity`, `capacity_exhausted` → `out of capacity`, others as stored. cwd from the record, else the agent process's `--cwd`, else the director's cwd. Director and showrunner links come from the run; a heartbeat-only run gives `NoDirector` / `NoShowrunner`.
+- **held Astra role** (`_durable_roles`) — each open held role in the guild role store (`docs/as-built/guilds.md`), skipping a role not opened or ended and a thread fenced by an adoption (`transferring_role`, `role_redirect`, `roles.transfer_route`). Role `astra-designer` or `astra-reviewer`, name the instance name, status the mesh entry's, else the lifecycle name; cwd the design's checkout. A unit holder gives `UnderDirector`; a showrunner holder gives `UnderShowrunner` and `NoDirector`. Its account reads `AccountUnread("serving home not read")`.
 - **blind reviewer** — `review_status[_<lens>]` reads `reviewing` with a live `review_pid[_<lens>]`. Kind is `codex` for a `codex exec` descendant of that pid, else `claude` for a `claude` descendant, else `codex`. Named `<lens> reviewer` or `blind reviewer`, slot role `review (<lens>)` or `review`.
-- **freestanding** — each daemon thread that is not a worker's thread (a worker's thread is listed once, as the worker).
+- **freestanding** — each daemon thread that is not a worker's or held role's thread (such a thread is listed once, as the worker or held role).
 
 ### Domain types (`roster.py`)
 
-- `RosterEntry` (frozen): `machine`, `kind` (`claude` | `codex`), `role` (`showrunner` | `unit director` | `worker` | `freestanding`), `name`, `status`, `reach`, `cwd`, `showrunner`, `director`, `assignment`, `thread`, `session`, `account` (`AccountLabel`, `AccountUnread`, or `AccountAttributionUnavailable`).
+- `RosterEntry` (frozen): `machine`, `kind` (`claude` | `codex`), `role` (`showrunner` | `unit director` | `worker` | `astra-designer` | `astra-reviewer` | `freestanding`), `name`, `status`, `reach`, `cwd`, `showrunner`, `director`, `assignment`, `thread`, `session`, `account` (`AccountLabel`, `AccountUnread`, or `AccountAttributionUnavailable`).
 - `reach: Messageable(address) | CannotReceiveMessages(reason)`.
   - Claude: `session:<id>` with a messaging socket, else `CannotReceiveMessages("no messaging socket")`.
   - Codex worker: `worker:<run id>/<worker name>` (run id = the run directory's name) at mesh status `running` / `waiting_capacity`; otherwise `between turns; its unit director resumes it` or `between turns; no unit director is running`.
   - Daemon session: `codex:<thread id>`.
   - Blind reviewer: `CannotReceiveMessages("blind reviewer")`.
+  - Held Astra role: `CannotReceiveMessages("held role; its holder adds pending messages to an authorized assignment")`.
 - `ShowrunnerRelationship = RunsProduction | UnderShowrunner | ProductionWithoutRunningShowrunner | NoShowrunner`; `DirectorRelationship = DirectsUnit | UnderDirector | NoDirector`; `Assignment = WorkerAssignment | NotAWorker`.
 - `thread: CodexThread | NoCodexThread` (mesh record or daemon thread); `session: ClaudeSession | NoClaudeSession` (the Claude identity, kept even without a socket).
 - Link addresses, text nesting, sort and `--of` use `_session_address(entry)` on `session`, so a socketless unit director still owns its workers.
@@ -304,7 +308,7 @@ Reads the `ThisMachine` roster and runs no ssh. It prints `<name>\tuds:<socket p
 - `refused_at(action, priority) -> ActionAllowed | ActionRefused` refuses `NoActionRequired` above priority 0.
 - `first_line(action, session)`: `Action: <text>` or `No action needed.`, with an optional `Session: <name>` line above it (`SessionLine | NoSessionLine`); `FIX` is the recovery text and `REFUSED_BEFORE_SENDING` the stderr marker.
 
-`scripts/notify/pushover.py [--priority 0|1|2] [--source NAME] (--action TEXT | --no-action) TITLE MESSAGE`, or `--text-id ID --value k=v…` for a catalog text, is the one path to the user's phone, called by `send.py --to user` and directly. Refusals come before the keys file is read, in order: `ActionRefused` from parsing, `ActionUnstated` (`no action stated`), action text over `ACTION_TEXT_MAX` (1015), `refused_at`. A refusal sends nothing, logs `refused before sending: <reason>`, prints `pushover: refused before sending: <reason>. <FIX>` and exits 2. After the refusal checks, `review.review()` checks the push unless the user's `review_off` switch is set. A send opens with `first_line(action, session)`; over `MESSAGE_MAX` (1024) the body is cut, never the action line. Priority 2 repeats every 300 s until acknowledged, for at most 3 h. Every `~/.local/state/notify/pushover.jsonl` line names `--source`, else the parent command line (80 chars). Exit 0 sent; 1 Pushover refused or unreachable; 2 refused before sending, usage, or keys missing; 4 another sender's hold claim is live; 5 replaced; 6 not sent (failed review or withheld). The review and these outcomes are in `docs/as-built/message-clarity.md`.
+`scripts/notify/pushover.py [--priority 0|1|2] [--source NAME] (--action TEXT | --no-action) TITLE MESSAGE`, or `--text-id ID --value k=v…` for a catalog text, is the one path to the user's phone, called by `send.py --to user` and directly. Refusals come before the keys file is read, in order: `ActionRefused` from parsing, `ActionUnstated` (`no action stated`), action text over `ACTION_TEXT_MAX` (1015), `refused_at`. A refusal sends nothing, logs `refused before sending: <reason>`, prints `pushover: refused before sending: <reason>. <FIX>` and exits 2. After the refusal checks, `review.review()` checks the push unless the user's `review_off` switch is set. A send opens with `first_line(action, session)`; it ends with a `Sent by: <sender>` line and a last `Template: <text id>` line (`Template: none (free text)` with no `--text-id`). Over `MESSAGE_MAX` (1024) the body is cut, never the action line or those two lines; an empty sender is refused. Priority 2 repeats every 300 s until acknowledged, for at most 3 h. Every `~/.local/state/notify/pushover.jsonl` line names `--source`, else the parent command line (80 chars). Exit 0 sent; 1 Pushover refused or unreachable; 2 refused before sending, usage, or keys missing; 4 another sender's hold claim is live; 5 replaced; 6 not sent (failed review or withheld). The review and these outcomes are in `docs/as-built/message-clarity.md`.
 
 Senders:
 
@@ -386,7 +390,7 @@ Senders:
 
 - Live checks never message a real session: they use a scratch background Claude session, a scratch mesh thread in a scratch session directory and a scratch daemon thread, all removed afterwards. The postmaster check uses throwaway recipients and leaves only the service session running for the trial. Listing real sessions is allowed.
 
-- `commands/message.md` and `codex/AGENTS-messaging.md` share roster discovery and outcome/recovery rules. Only the Claude receiving rules describe postmaster; Codex recipients bypass it.
+- `commands/message.md` and `codex/AGENTS-messaging.md` share roster discovery, outcome/recovery rules and `<HeldRoleMessages>` (a held Astra role takes no direct message; its text is queued for the holder's next authorized assignment, `docs/as-built/guilds.md`). Only the Claude receiving rules describe postmaster; Codex recipients bypass it.
 
 ## Calibration / gotchas
 

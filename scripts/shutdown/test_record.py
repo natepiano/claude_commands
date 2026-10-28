@@ -642,6 +642,32 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(record.find_session(first["login"], "session-1"), changed)
         self.assertEqual(record.find_session(first["login"], "session-2"), second)
 
+    def test_restore_alert_claim_serializes_callers_and_resets_only_its_request(self) -> None:
+        saved = session_shutdown()
+        self.assertTrue(record.create_session(saved))
+        start = threading.Barrier(2)
+        claims: list[bool] = []
+        def contender() -> None:
+            _ = start.wait(timeout=5)
+            claims.append(record.claim_restore_alert(saved, "move failed"))
+        threads = [threading.Thread(target=contender) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(claims), [False, True])
+        record.clear_restore_alert(saved)
+        self.assertTrue(record.claim_restore_alert(saved, "another outage"))
+        def replace_request(current: record.SessionShutdown) -> None:
+            current["request_id"] = "newer-request"
+        _ = record.update_session(saved["login"], saved["session"]["session_id"], replace_request)
+        record.clear_restore_alert(saved)
+        current = record.find_session(saved["login"], saved["session"]["session_id"])
+        assert current is not None
+        self.assertEqual(current.get("restore_alerted"), "another outage")
+        self.assertFalse(record.claim_restore_alert(saved, "stale request"))
+
     def test_session_records_update_rejects_identity_changes_without_writing(self) -> None:
         saved = session_shutdown()
         self.assertTrue(record.create_session(saved))
@@ -837,6 +863,78 @@ class SessionRecordTests(ShutdownTestCase):
         record.archive_session(saved["login"], saved["session"]["session_id"])
         record.clear_finished_account_hold(held["login"])
         self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountOpen)
+
+    def registered_stop_hold(self) -> record.AccountHold:
+        held = account_hold()
+        held["requested_by"] = record.FromSession(kind="session", session_id="b1f5ca98-45aa-4604-8e2b-33ed0f071bb1")
+        held["request_id"] = "e520bca5-6b79-4c16-874e-512142adfed2"
+        record.register_account_hold_request(held, account_wide=True)
+        record.complete_account_hold_registration(held["login"], held["request_id"])
+        stored = record.account_hold(held["login"])
+        assert stored is not None
+        return stored
+
+    def hold_record(self, held: record.AccountHold, number: int, progress: record.SessionProgress) -> record.SessionShutdown:
+        saved = session_shutdown(number, progress=progress, hold="account")
+        saved["request_id"] = held["request_id"]
+        self.assertTrue(record.create_session(saved))
+        return saved
+
+    def test_a_finished_stop_hold_whose_records_another_path_archived_is_released(self) -> None:
+        """The 10-18 claude2 case: a stop request's sessions ended restarted or restart failed, a later
+        path archived their records, and no conductor saw them finish, so its hold outlived it."""
+        held = self.registered_stop_hold()
+        for number, progress in ((1, record.SessionRestarted(kind="restarted", at=LATER)),
+                                 (2, record.SessionRestartFailed(kind="restart failed", at=LATER, reason="restart prompt not submitted")),
+                                 (3, record.SessionStopped(kind="stopped", at=LATER))):
+            saved = self.hold_record(held, number, progress)
+            record.archive_session(saved["login"], saved["session"]["session_id"])
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldReleased(held))
+        self.assertFalse((self.directory / "hold.json").exists())
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountOpen)
+        self.assertIsInstance(record.release_finished_account_hold(held["login"]), record.AccountOpen)
+
+    def test_a_finished_hold_is_released_while_its_stopped_records_stay_for_restore(self) -> None:
+        held = self.registered_stop_hold()
+        saved = self.hold_record(held, 1, record.SessionStopped(kind="stopped", at=LATER))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldReleased(held))
+        self.assertEqual(record.session_records(held["login"]), [saved])
+
+    def test_a_hold_stays_while_a_session_of_its_request_is_live_or_stopping_or_its_conductor_runs(self) -> None:
+        held = self.registered_stop_hold()
+        saved = self.hold_record(held, 1, record.SessionWaiting(kind="waiting"))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        stopping: record.SessionProgress = record.SessionStopping(kind="stopping", at=LATER)
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(progress=stopping))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        stopped: record.SessionProgress = record.SessionStopped(kind="stopped", at=LATER)
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(progress=stopped))
+        with record.conductor_lock(held["login"]) as conductor:
+            self.assertIsInstance(conductor, record.ConductorAcquired)
+            self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldReleased(held))
+
+    def test_a_conductor_keeps_a_restart_hold_until_it_restarts_its_stopped_sessions(self) -> None:
+        held = self.registered_stop_hold()
+        held["then"] = "restart"
+        record.set_account_hold(held)
+        saved = self.hold_record(held, 1, record.SessionStopped(kind="stopped", at=LATER))
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(then="restart"))
+        self.assertEqual(record.release_finished_account_hold(held["login"], conducting=True), record.HoldInUse(held))
+        restarted: record.SessionProgress = record.SessionRestarted(kind="restarted", at=LATER)
+        _ = record.update_session(held["login"], saved["session"]["session_id"], lambda current: current.update(progress=restarted))
+        self.assertEqual(record.release_finished_account_hold(held["login"], conducting=True), record.HoldReleased(held))
+
+    def test_a_registering_or_old_record_hold_is_never_released(self) -> None:
+        held = account_hold()
+        held["registration"] = "in progress"
+        record.set_account_hold(held)
+        self.assertEqual(record.release_finished_account_hold(held["login"]), record.HoldInUse(held))
+        record.clear_account_hold(held["login"])
+        write_old(shutdown_record(state="down"))
+        outcome = record.release_finished_account_hold(held["login"])
+        self.assertIsInstance(outcome, record.HoldInUse)
+        self.assertIsInstance(record.lookup_account_hold(held["login"]), record.AccountHeld)
 
     def test_all_account_holds_include_explicit_and_empty_old_accounts_in_request_order(self) -> None:
         explicit = account_hold()
@@ -1669,6 +1767,35 @@ class RecoverySnapshotTests(ShutdownTestCase):
         _ = record.merge_snapshots(inventory.PartialInventory(("registry unreadable",)), LATER)
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), (before, stamp))
 
+    def test_agent_exit_mark_survives_missing_inventory_and_clears_when_seen(self) -> None:
+        saved = self.snapshot(1)
+        record.write_snapshot(saved)
+        record.mark_snapshot_agent_exited(saved["login"], "session-1", NOW)
+        merged = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}), LATER)
+        self.assertEqual(merged[0]["sessions"][0].get("crash"), "agent exited")
+        updated = record.merge_snapshots(inventory.CompleteInventory("natedev",
+            {saved["login"]: saved["sessions"]}, {saved["login"]: saved["label"]}), LATER)
+        self.assertNotIn("crash", updated[0]["sessions"][0])
+        record.mark_snapshot_agent_exited(saved["login"], "session-1", NOW)
+        current = record.read_snapshot(saved["login"])
+        assert not isinstance(current, record.NoRecoverySnapshot)
+        self.assertNotIn("crash", current["sessions"][0])
+
+    def test_restoring_cached_agent_exit_refuses_a_newer_observation(self) -> None:
+        saved = self.snapshot(1)
+        candidate = saved["sessions"][0]
+        assert candidate["agent"] == "claude"
+        record.write_snapshot(saved)
+        _ = record.merge_snapshots(inventory.CompleteInventory("natedev", {}, {}), LATER)
+        self.assertTrue(record.restore_snapshot_agent_exited(saved, candidate))
+        restored = record.read_snapshot(saved["login"])
+        assert not isinstance(restored, record.NoRecoverySnapshot)
+        self.assertEqual(restored["sessions"][0].get("crash"), "agent exited")
+        updated = record.merge_snapshots(inventory.CompleteInventory("natedev",
+            {saved["login"]: saved["sessions"]}, {saved["login"]: saved["label"]}), LATER)
+        self.assertFalse(record.restore_snapshot_agent_exited(saved, candidate))
+        self.assertEqual(record.read_snapshot(saved["login"]), updated[0])
+
     def test_reboot_retains_absent_sessions_until_seen_again(self) -> None:
         saved = self.snapshot(1, 2)
         record.write_snapshot(saved)
@@ -1716,7 +1843,7 @@ class RecoverySnapshotTests(ShutdownTestCase):
         item = snapshot["sessions"][0]
         assert item["agent"] == "claude"
         snapshot["taken_at"] = LATER
-        for signal in ("reboot", "host gone"):
+        for signal in ("reboot", "host gone", "agent exited"):
             with self.subTest(signal=signal):
                 item["crash"] = signal
                 saved = record.snapshot_restore_record(snapshot, item)

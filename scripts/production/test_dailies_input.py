@@ -23,6 +23,7 @@ from dailies_render import LENGTHS
 from dailies_input import (Activity, BevyUpgradeUnavailable, Block, ClaudeNotRunning, Decision, FormWaiting,
                            Running, SessionGone, StillWaiting, TicksFailing, UnitRow,
                            bevy_upgrade_watch, status_blocks)
+import unit_lookup
 from unit_lookup import UnitState
 
 
@@ -198,7 +199,7 @@ class DailiesInputTests(unittest.TestCase):
                     "DAILIES_PHASE_TABLE_JSON": str(self.phase_table_json),
                     "DAILIES_PHASE_TABLE_EVENTS": str(self.phase_table_events),
                     "PHASE_TABLE_VAULT": str(self.root / "vault"),
-                    "PLAN_DELEGATE_HISTORY_DIR": str(self.root / "history"),
+                    "UNIT_HISTORY_DIR": str(self.root / "history"),
                     "NOTIFIER_STATE_DIR": str(self.root / "notifier-state"),
                     "SHOWRUNNER_STATE_DIR": str(self.showrunner_state),
                     "STYLE_LEDGER_STATE_DIR": str(self.root / "style-state"),
@@ -408,7 +409,7 @@ class DailiesInputTests(unittest.TestCase):
         return result.stdout + result.stderr
 
     def finished_run(self, worktree: Path) -> None:
-        """Record a /unit:delegate run in `worktree` that has finished, as the recorder would."""
+        """Record a /unit:direct run in `worktree` that has finished, as the recorder would."""
         runs = self.root / "history/runs"
         runs.mkdir(parents=True, exist_ok=True)
         events: list[dict[str, object]] = [
@@ -416,7 +417,7 @@ class DailiesInputTests(unittest.TestCase):
             {"event_type": "run_finished"}]
         _ = (runs / f"{worktree.name}.jsonl").write_text(
             "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
-        self.env["PLAN_DELEGATE_HISTORY_DIR"] = str(self.root / "history")
+        self.env["UNIT_HISTORY_DIR"] = str(self.root / "history")
 
     def test_a_unit_whose_run_is_finished_needs_no_entry_and_is_left_out(self) -> None:
         self.production_doc(beta=True)
@@ -428,6 +429,17 @@ class DailiesInputTests(unittest.TestCase):
         units = cast(list[dict[str, object]], self.report()["units"])
         self.assertEqual([unit["unit"] for unit in units], [ALPHA])
         self.assertIn(f"left out, run finished and nothing waiting on the user: {BETA}", result.stdout)
+
+    def test_units_from_doc_reads_run_records_once_for_several_units(self) -> None:
+        self.production_doc(beta=True)
+        self.finished_run(self.root / "beta")
+        with (mock.patch.dict(os.environ, self.env),
+              mock.patch.object(unit_lookup, "marked_units", return_value={}),
+              mock.patch.object(unit_lookup, "read_run_states", wraps=unit_lookup.read_run_states) as reads):
+            units = dailies_input.units_from_doc(self.doc.read_text(encoding="utf-8").splitlines(), "fixture")
+            reads.assert_called_once_with()
+        self.assertEqual([(unit.name, unit.run) for unit in units],
+                         [(ALPHA, UnitState.STANDING_BY), (BETA, UnitState.RUN_FINISHED)])
 
     def test_a_finished_unit_that_shows_a_form_keeps_its_place_and_needs_its_entry(self) -> None:
         self.production_doc(beta=True)
@@ -533,7 +545,7 @@ class DailiesInputTests(unittest.TestCase):
         del cast(list[dict[str, object]], fields["units"])[0]["started"]
         _ = self.judgment.write_text(json.dumps(fields), encoding="utf-8")
         _ = self.env.pop("DAILIES_PHASE_TABLE")
-        self.env["PLAN_DELEGATE_NOW_EPOCH"] = str(epoch(23, 35))
+        self.env["UNIT_NOW_EPOCH"] = str(epoch(23, 35))
 
         built = self.run_builder()
 
@@ -1570,7 +1582,8 @@ class DailiesInputTests(unittest.TestCase):
         # The report zone is Pacific; 20:55 EDT is 17:55 there, still ahead of 17:00.
         for stated, shown in (("ETA 20:55 EDT", "17:55"), ("Phase ETA: 18:10 PDT", "18:10"),
                               ("ETA 01:30 UTC", "18:30"), ("ETA 20:55 ET (range 20:40-21:10)", "17:55"),
-                              ("ETA 17:40 XYZ", "17:40"), ("ETA 02:10+1 EDT", "23:10")):
+                              ("ETA 17:40 XYZ", "17:40"), ("ETA 02:10+1 EDT", "23:10"),
+                              ("ETA 20:55 AST", "17:55"), ("ETA 21:55 ADT", "17:55")):
             with self.subTest(stated=stated):
                 self.status_lines(f"== {ALPHA}", "● Checking panel labels", stated)
                 self.judgment_file(alpha={"eta": {"percent": 60}})

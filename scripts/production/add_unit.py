@@ -356,7 +356,9 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     return RequestedUnitLaunch(
         production=production,
         requested_name=name,
-        unit=f"{name}-unit",
+        unit=(name if any(cell_value(row["Unit"]) == name
+                          for row in unit_table(production.doc.read_text(encoding="utf-8").splitlines()))
+              else f"{name}-unit"),
         branch=branch,
         worktree=worktree,
         plan=plan,
@@ -682,6 +684,16 @@ def prompt_for(request: UnitLaunch) -> str:
             f"approval before you run /unit:direct {plan}.")
 
 
+def attach_hint(request: UnitLaunch) -> str:
+    """Where the user finds the unit: its tab in the production's workspace of the shared session."""
+    import herdr
+
+    production = request.production
+    tab = (request.launch_kind.session_name if isinstance(request.launch_kind, UnitRestoreLaunch)
+           else request.identity.session)
+    return herdr.attach_hint(showrunners.herdr_space(production.slug, str(production.doc)), tab)
+
+
 def host_session_name(request: UnitLaunch) -> str:
     """The destination name, limited to characters supported by named herdr sessions.
 
@@ -698,7 +710,7 @@ def host_session_name(request: UnitLaunch) -> str:
         if recorded.startswith(f"{slug}-"):
             return recorded
     name = request.identity.session
-    return herdr.generated_session_name(name if name.startswith(f"{slug}-") else f"{slug}-{name}")
+    return herdr.generated_session_name(unit_names.branch(slug, name))
 
 
 def launch_session(
@@ -711,7 +723,7 @@ def launch_session(
     model: str = "",
     autocompact_window: str = "",
 ) -> herdr.PromptSubmitOutcome:
-    """Start Claude in its own herdr session carrying this unit's marks."""
+    """Start Claude in a tab of the shared herdr session, carrying this unit's marks."""
     import herdr
     from scripts.accounts import accounts
     from scripts.whoami.account import named_account_environment
@@ -747,20 +759,14 @@ def launch_session(
     if isinstance(request.launch_kind, UnitRestoreLaunch) and request.launch_kind.probe:
         environment[PROBE_ENV] = "1"
     arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
-    name = host_session_name(request)
     timeout_ms = int(request.timeout * 1000)
     host = herdr.shared_session()
-    if host:
-        _ = herdr.start_server(host, timeout_ms)
-        production = request.production
-        pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
-                              session_name, str(request.session_cwd), environment)
-    else:
-        host = name
-        herdr.start_new_server(host, timeout_ms)
-        pane = herdr.open_pane(host, name, str(request.session_cwd), environment)
+    _ = herdr.start_server(host, timeout_ms)
+    production = request.production
+    pane = herdr.open_tab(host, showrunners.herdr_space(production.slug, str(production.doc)),
+                          session_name, str(request.session_cwd), environment)
     try:
-        outcome = herdr.start_agent(host, pane, kind="claude", agent=name, agent_arguments=arguments,
+        outcome = herdr.start_agent(host, pane, kind="claude", agent=host_session_name(request), agent_arguments=arguments,
             opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)),
             timeout_ms=timeout_ms)
         return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
@@ -864,7 +870,7 @@ def wait_for_remote_control(request: UnitLaunch) -> unit_lookup.MarkedUnit:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             tail = "\n".join(pane.splitlines()[-15:])
-            raise RuntimeError(f"{launched.place.session}: /remote-control did not become active\n{tail}")
+            raise RuntimeError(f"{request.identity.unit} (herdr {launched.place.session}:{launched.place.pane}): /remote-control did not become active\n{tail}")
         time.sleep(min(0.5, remaining))
 
 
@@ -878,12 +884,25 @@ def record(request: UnitLaunch) -> None:
         _ = log.write(f"- {stamp}: {log_line}\n")
 
 
-def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "") -> ClaudeLaunchAccount:
-    """New, standby and resumed work all use the configured units account."""
+def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_dir: str = "",
+                       *, source_fallback: bool = False) -> ClaudeLaunchAccount:
+    """Use the units account, or the recorded source for a failed move."""
     from scripts.accounts import accounts
     try:
+        if source_fallback:
+            from record import all_session_records
+
+            if not isinstance(request.launch_kind, UnitRestoreLaunch):
+                raise Refusal("--source-fallback requires a recorded unit restore")
+            identity = request.launch_kind.session_id
+            matches = [saved for saved in all_session_records()
+                       if saved["session"]["session_id"] == identity
+                       and saved["session"]["kind"] == "unit" and saved.get("target") == target
+                       and saved.get("source_label", saved["label"]) == target]
+            if len(matches) != 1:
+                raise Refusal("--source-fallback must name the shutdown record's source account")
         return accounts.account_for_group_launch("unit", resume=isinstance(request.session, ResumedSession),
-                                                 target=target, config_dir=config_dir)
+                                                 target=target, config_dir=config_dir, source_fallback=source_fallback)
     except accounts.AccountsError as error:
         raise Refusal(str(error)) from error
 
@@ -1005,6 +1024,7 @@ def main(argv: list[str]) -> int:
     _ = parser.add_argument("--timeout", type=float, default=90.0)
     _ = parser.add_argument("--resume")
     _ = parser.add_argument("--account", default="")
+    _ = parser.add_argument("--source-fallback", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--model", default="")
     _ = parser.add_argument("--autocompact", default="", help="auto or 100k-1M; kept for every relaunch of --resume; a listed unit only records it")
     _ = parser.add_argument("--config-dir", default="", help=argparse.SUPPRESS)
@@ -1027,7 +1047,8 @@ def main(argv: list[str]) -> int:
         # Table readers import this module from copied trees without accounts.
         from scripts.accounts import accounts
 
-        unit_account = account_for_launch(request, cast(str, args.account), cast(str, args.config_dir))
+        unit_account = account_for_launch(request, cast(str, args.account), cast(str, args.config_dir),
+                                          source_fallback=cast(bool, args.source_fallback))
         problems = accounts.check(unit_account.label)
         if problems:
             raise Refusal(
@@ -1093,16 +1114,6 @@ def main(argv: list[str]) -> int:
                     except herdr.HerdrFailure as error:
                         raise Refusal(f"cannot end session {unit.place.session}: {error}") from error
                     marked_unit = NoMarkedUnit()
-            name = host_session_name(request)
-            if isinstance(marked_unit, NoMarkedUnit):
-                try:
-                    running = not herdr.shared_session() and any(
-                        entry["name"] == name for entry in herdr.live_sessions())
-                except herdr.HerdrFailure as error:
-                    raise Refusal(str(error)) from error
-                if running:
-                    raise Refusal(f"herdr session {name} is already live and is not marked as "
-                                  + request.identity.unit)
             write_stub(request)
             append_row(request, ready.row)
             commit_unit(request)
@@ -1125,24 +1136,19 @@ def main(argv: list[str]) -> int:
             if isinstance(outcome, herdr.PromptNotSubmitted):
                 raise RuntimeError(f"{request.identity.unit}: restart prompt not submitted: {outcome.reason}")
             record(request)
-            attach = f"herdr session attach {host_session_name(request)}"
-            if isinstance(marked_unit, MarkedUnitFound):
-                unit = marked_unit.unit
-                attach = f"herdr session attach {unit.place.session}"
-            print(f"{request.identity.unit} restore launched: {attach}")
+            print(f"{request.identity.unit} restore launched: {attach_hint(request)}")
             return 0
         if isinstance(outcome, herdr.PromptNotSubmitted) and isinstance(marked_unit, NoMarkedUnit):
             raise RuntimeError(f"{request.identity.unit}: opening prompt not submitted: {outcome.reason}"
                                + close_untyped_session(request, outcome))
-        launched = wait_for_remote_control(request)
+        _ = wait_for_remote_control(request)
         record(request)
-        attach = f"herdr session attach {launched.place.session}"
-        print(f"{request.identity.unit} started: {attach}")
+        print(f"{request.identity.unit} started: {attach_hint(request)}")
         return 0
     except herdr.AgentNotReady as error:
         print(f"add_unit: the session is not ready:\n{error.screen}", file=sys.stderr)
         return 1
-    except (Refusal, herdr.SessionTaken) as error:
+    except Refusal as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
     except (OSError, UnicodeError, subprocess.SubprocessError, RuntimeError, ValueError, herdr.HerdrFailure) as error:

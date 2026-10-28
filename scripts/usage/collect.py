@@ -26,6 +26,7 @@ from typing import BinaryIO, Literal, cast, override
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.lib import unit_runs
 from scripts.usage.activity import (
     RequestActivity, RequestEvidence, activity_name, claude_atoms, codex_atoms, decode_activity, wait_action,
 )
@@ -785,8 +786,7 @@ def known_sessions(db: sqlite3.Connection, machine: str, paths: Iterable[Path]) 
 
 
 def history_root() -> Path:
-    configured = os.environ.get("PLAN_DELEGATE_HISTORY_DIR")
-    return Path(configured).expanduser() if configured else Path.home() / ".local/state/plan-delegate"
+    return unit_runs.history_root()
 
 
 def validate_history_fields(kind: HistoryEventType, fields: dict[str, HistoryField]) -> None:
@@ -1042,7 +1042,7 @@ def collect_local(db: sqlite3.Connection, args: CommandLine) -> None:
 REMOTE_BOOTSTRAP = """
 import json, sys, types
 request = json.load(sys.stdin)
-for name in ('scripts', 'scripts.usage'):
+for name in ('scripts', 'scripts.lib', 'scripts.usage'):
     package = types.ModuleType(name)
     package.__path__ = []
     sys.modules[name] = package
@@ -1456,6 +1456,7 @@ def reader_payload(offsets: dict[str, int]) -> str:
     root = Path(__file__).resolve().parents[2]
     # The bootstrap runs each module in this order, so collect comes after its imports.
     modules = {name: (root / relative).read_text(encoding="utf-8") for name, relative in (
+        ("scripts.lib.unit_runs", "scripts/lib/unit_runs.py"),
         ("scripts.usage.activity", "scripts/usage/activity.py"),
         ("scripts.usage.agents_log", "scripts/usage/agents_log.py"),
         ("scripts.usage.rollouts", "scripts/usage/rollouts.py"),

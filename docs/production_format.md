@@ -20,6 +20,23 @@ must not drift from it:
 
 ## Words
 
+<GuildHeads>
+For Words and <ProductionUnit/> below, production `guilds` has four unit
+directors with the exact IDs `designers`, `reviewers`, `showrunners`, `units`,
+without `-unit`. The guilds showrunner is top-level on natedev; these heads
+are its units, not showrunners, and belong to the units guild. Other unit
+names and worker IDs keep their current rules.
+
+A plan headed `> **Standing:** guild-head` runs its report/evidence/tip/reply
+loop and daily read instead of a phased build. It dispatches no worker, runs
+no phase or gate, and makes no checkpoint or shrink. It may write and publish
+its owned guild tips directly. The production row still gives its identity,
+plan, worktree and ownership. It owns no assignments, acceptance, model
+choices or gates; process proposals go through guilds to sdlc for
+guild-process-unit. Ordinary phased and standing style contracts retain their
+current behavior.
+</GuildHeads>
+
 - **Production** — the whole effort: its units, its merge branch, and its
   production doc.
 - **Executive producer** — the user. Every product, scope and irreversible
@@ -38,7 +55,7 @@ must not drift from it:
   reports. It writes no implementation code.
 - **Worker** — a Codex worker thread the unit director dispatches. Implementation
   workers open once per run, continue across phases and repairs in whatever role
-  is needed, attempt compaction above `PLAN_DELEGATE_COMPACT_ABOVE_TOKENS` but
+  is needed, attempt compaction above `UNIT_COMPACT_ABOVE_TOKENS` but
   continue after a failed attempt, press on after context overflow with
   `Continue where you stopped.`, open anew only when no open worker can take the
   work, and end at `end_session.sh`. Reviews run on the unit's workers, or on the
@@ -251,12 +268,15 @@ A run that stopped, failed, or waits on a decision has no finish in its record, 
    Two kinds stay the user's, and no showrunner message is the user's approval
    for them: an action that cannot be undone, and a choice only the user knows
    the answer to (what the product should do, their priorities, what they
-   intend). End the turn on `— decision:` for these as before; the showrunner
-   shows it to the user, and the answer arrives beginning
-   `From the user (via the showrunner):`.
+   intend). File these with `/unit:question`: it puts the question on the
+   production's open-questions list, where the user finds it when they ask
+   for their next question. Do not send it to the showrunner, which does not
+   put it in front of the user (user, 2026-10-28). Go on with the work that
+   does not wait on it, then end the turn on `— decision:`. The answer arrives
+   beginning `From the user (via the showrunner):`.
 3. **Commit notices.** The checkpoint hash is mergeable at once. Also send a
    notice after each final-gate and as-built commit. Timing:
-   `~/.claude/docs/delegate/phase_end.md` → <PhaseEnd/>.
+   `~/.claude/docs/direct/phase_end.md` → <PhaseEnd/>.
 
    Before sending a checkpoint notice, record its next-phase ETA:
    `~/.claude/scripts/lib/py ~/.claude/scripts/direct/progress_history.py eta --session-dir <SESSION_DIR> --phase-id <next> --time <HH:MM> --basis checkpoint`.

@@ -16,9 +16,10 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import showrunners
-from add_showrunner import herdr_session_running
+from add_showrunner import herdr_tab_open
+import herdr
 from add_unit import Production, read_production
-from production_units import Refusal, production_field
+from production_units import Refusal, cell_value, production_field, unit_table
 
 import rules
 import style_ledger
@@ -61,12 +62,12 @@ def _pilot_units(arguments: list[str], repository: Path) -> AllStyleUnits | Pilo
     seen: set[str] = set()
     for argument in arguments:
         unit, separator, selected = argument.partition("=")
-        family: rules.Family | None = next((family for family in FAMILIES if unit == f"{family}-unit"), None)
-        if family is None:
+        family = rules.style_family(f"{unit}-unit" if unit in FAMILIES else unit)
+        if isinstance(family, rules.NotStyleUnit):
             raise Refusal(f"unknown pilot unit {unit!r}")
-        if unit in seen:
+        if family in seen:
             raise Refusal(f"duplicate pilot unit {unit!r}")
-        seen.add(unit)
+        seen.add(family)
         requested = tuple(package.strip() for package in selected.split(",")) if separator else ()
         for package in requested:
             if package not in packages:
@@ -179,7 +180,7 @@ def _check_existing(style: StyleProduction) -> bool:
 
 def _unit_row(style: StyleProduction, family: rules.Family) -> str:
     return (
-        f"| {family}-unit | {PLAN_DIRECTORY}/{family}-unit.md | {style.repository.parent / (style.slug + '-' + family)} "
+        f"| {style.slug}-{family}-unit | {PLAN_DIRECTORY}/{style.slug}-{family}-unit.md | {style.repository.parent / (style.slug + '-' + family)} "
         + f"| {style.slug}-{family} | — | none — takes what the board leaves free |"
     )
 
@@ -209,7 +210,7 @@ def _plan_text(style: StyleProduction, family: rules.Family, catalog: tuple[rule
     family_rules = [f"  - `{rule.rule_id}` — tier {rule.tier}" for rule in catalog if rule.family == family]
     return "\n".join([
         f"# {style.slug} — {family}", "",
-        f"> **Production: {style.slug}** — unit `{family}-unit`; production doc `{style.doc}`",
+        f"> **Production: {style.slug}** — unit `{style.slug}-{family}-unit`; production doc `{style.doc}`",
         "> **Standing:** style_plan.py", "", "## Delegation Context", "",
         f"- **Project:** {style.repository.name} — standing {family} style coverage",
         f"- **Repository:** {style.repository}",
@@ -242,6 +243,11 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
         if (style.repository.parent / f"{style.slug}-{family}").exists()
     }
     previous = style.doc.read_text()
+    plan_paths: dict[rules.Family, Path] = {}
+    for row in unit_table(previous.splitlines()):
+        family = rules.style_family(cell_value(row["Unit"]))
+        if not isinstance(family, rules.NotStyleUnit):
+            plan_paths[family] = style.checkout / Path(cell_value(row["Plan"]))
     lines = previous.splitlines(keepends=True)
     start = next(index for index, line in enumerate(lines) if line.rstrip() == "## Units") + 1
     end = next((index for index in range(start, len(lines)) if lines[index].startswith("## ")), len(lines))
@@ -249,12 +255,12 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
     present: set[rules.Family] = set()
     for line in lines[start:end]:
         unit = line.split("|")[1].strip() if line.startswith("|") else ""
-        row_family: rules.Family | None = next((family for family in FAMILIES if unit == f"{family}-unit"), None)
-        if row_family is None or row_family in launched:
+        row_family = rules.style_family(unit)
+        if isinstance(row_family, rules.NotStyleUnit) or row_family in launched:
             rows.append(line)
         elif row_family in selected:
-            rows.append(_unit_row(style, row_family) + "\n")
-        if row_family is not None:
+            rows.append(line)
+        if not isinstance(row_family, rules.NotStyleUnit):
             present.add(row_family)
     additions = [_unit_row(style, family) + "\n" for family in FAMILIES
                  if family in selected and family not in launched and family not in present]
@@ -267,7 +273,7 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
     for family in FAMILIES:
         if family in launched:
             continue
-        path = style.checkout / PLAN_DIRECTORY / f"{family}-unit.md"
+        path = plan_paths.get(family, style.checkout / PLAN_DIRECTORY / f"{style.slug}-{family}-unit.md")
         original = path.read_text()
         plan = original.splitlines(keepends=True)
         context = plan.index("## Delegation Context\n") + 1
@@ -285,12 +291,13 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
             _ = path.write_text(text)
 
 
-def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits) -> tuple[str, ...]:
+def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, slug: str) -> tuple[str, ...]:
     if isinstance(pilot, AllStyleUnits):
-        return steps
-    units = "; ".join(f"{unit.family}-unit" for unit in pilot.units)
+        units = ", ".join(f"{slug}-{family}-unit" for family in FAMILIES)
+        return (*steps[:4], steps[4] + f"; units {units}", *steps[5:])
+    units = "; ".join(f"{slug}-{unit.family}-unit" for unit in pilot.units)
     scopes = "; ".join(
-        f"{unit.family}-unit: {', '.join(unit.packages) if unit.packages else 'all crates'}"
+        f"{slug}-{unit.family}-unit: {', '.join(unit.packages) if unit.packages else 'all crates'}"
         for unit in pilot.units
     )
     return (*steps[:3], steps[3] + f"; pilot units {units}",
@@ -313,9 +320,10 @@ def _run_script(script: Path, *arguments: str) -> None:
         raise Refusal(f"{script.name} exited {result.returncode}; rerun add_style to continue")
 
 
-def _open_session_guidance(slug: str, reason: str) -> str:
+def _open_session_guidance(style: StyleProduction, reason: str) -> str:
+    attach = herdr.attach_hint(showrunners.herdr_space(style.slug, str(style.doc)), style.slug)
     return (
-        f"{slug} was left open by add_showrunner.py ({reason}); look at it with herdr session attach {slug}; "
+        f"{style.slug} was left open by add_showrunner.py ({reason}); look at it with {attach}; "
         + "once it has its update timer, rerun add_style, which attaches it; "
         + "if it never gets one, end that session and rerun"
     )
@@ -387,14 +395,17 @@ def main(argv: list[str]) -> int:
         pilot = _pilot_units(pilot_arguments, style.repository)
         catalog = rules.load_rules(style.repository)
         if cast(bool, args.check):
-            for number, step in enumerate(_pilot_steps(_steps(style, existing), pilot), 1):
+            steps = _steps(style, existing)
+            if not existing:
+                steps = _pilot_steps(steps, pilot, style.slug)
+            for number, step in enumerate(steps, 1):
                 print(f"{number}. {step}")
             return 0
         if existing:
             _attach(style)
             return 0
-        if style.slug not in showrunners.timer_slugs() and herdr_session_running(style.slug):
-            raise Refusal(_open_session_guidance(style.slug, "live session without an update timer"))
+        if style.slug not in showrunners.timer_slugs() and herdr_tab_open(style.slug):
+            raise Refusal(_open_session_guidance(style, "live session without an update timer"))
         if not (style.checkout / ".git").exists():
             present = subprocess.run(
                 ["git", "-C", str(style.repository), "show-ref", "--verify", "--quiet", f"refs/heads/{style.merge_branch}"],
@@ -408,7 +419,7 @@ def main(argv: list[str]) -> int:
         _write_missing(style.doc, _production_text(style))
         _update_destination(style)
         for family in FAMILIES:
-            _write_missing(style.checkout / PLAN_DIRECTORY / f"{family}-unit.md", _plan_text(style, family, catalog))
+            _write_missing(style.checkout / PLAN_DIRECTORY / f"{style.slug}-{family}-unit.md", _plan_text(style, family, catalog))
         if isinstance(pilot, PilotUnits):
             _configure_pilot(style, pilot)
         _exclude(style)
@@ -420,7 +431,7 @@ def main(argv: list[str]) -> int:
             "--model", cast(str, args.model), "--effort", cast(str, args.effort),
         ], check=False)
         if result.returncode in (1, 3):
-            print("add_style: " + _open_session_guidance(style.slug, f"exit {result.returncode}"), file=sys.stderr)
+            print("add_style: " + _open_session_guidance(style, f"exit {result.returncode}"), file=sys.stderr)
             return result.returncode
         if result.returncode:
             raise Refusal(f"{LAUNCHER.name} exited {result.returncode}; rerun add_style to continue")

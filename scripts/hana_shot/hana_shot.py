@@ -102,6 +102,10 @@ class Failure(Exception):
     """A request that ran and could not finish; exit 1."""
 
 
+def next_step(action: str) -> str:
+    return f"; next step: {action}"
+
+
 class CaptureTimeout(Exception):
     """A screenshot that never answered; exit 3, and never resend it."""
 
@@ -430,6 +434,9 @@ class FailedInvocation(TypedDict):
     exit_code: int
     failure_reason: FailureReason
     error: str
+    view: NotRequired[str | None]
+    target: NotRequired[str | None]
+    mode: NotRequired[str]
     face: NotRequired[str]
     session: PresentSession | AbsentSession
     attempts: list[SuccessfulAttempt | FailedAttempt]
@@ -440,12 +447,18 @@ class CaptureFailure(NamedTuple):
     error: str
 
 
+@dataclass(frozen=True)
+class UnparsedShotRequest:
+    """No shot has been parsed from this invocation's request yet."""
+
+
 @dataclass
 class InProgressCaptureInvocation:
     kind: Literal["shot", "views_check"] = "shot"
     attempts: list[SuccessfulAttempt | FailedAttempt] = field(default_factory=list)
     successful_timings: list[TimingRecord] = field(default_factory=list)
     failures: list[CaptureFailure] = field(default_factory=list)
+    shot: Shot | UnparsedShotRequest = field(default_factory=UnparsedShotRequest)
     orientation: DefaultAngles | ExplicitAngles | TargetFace | ResolvedTargetFace = field(default_factory=lambda: DefaultAngles())
 
 
@@ -838,7 +851,14 @@ class Session:
             if moved_at is None and current.frame >= first + UNCHANGED_FRAMES + extra_frames:
                 return Settled(current.state, False, current.frame - first)
             if time.monotonic() > deadline:
-                raise Failure(f"the camera did not settle within {limit:.0f} s")
+                raise Failure(
+                    f"the camera did not settle within {limit:.0f} s"
+                    + next_step(
+                        "rerun the same command once; if it fails again, read the pose with `hana_shot.py pose` "
+                        + "and shoot with `--mode pose --focus x,y,z --radius N` using that focus and radius "
+                        + "(no fit move)"
+                    )
+                )
             previous = current
 
     def wait_frames(self, frames: int) -> None:
@@ -1042,6 +1062,16 @@ def resolve(session: Session, text: str) -> list[Target]:
     return [Target(tool.entity, text, tool.has_aabb) for tool in matches]
 
 
+def closest_target_hint(evidence: TargetEvidence, text: str) -> str:
+    selector = parse_selector(text)
+    if selector.kind in ("name", "tool"):
+        candidates = {candidate.lower(): candidate for candidate in evidence.selector_candidates}
+        closest = get_close_matches(selector.value.lower(), sorted(candidates), n=5)
+        if closest:
+            return "; closest: " + ", ".join(f"{selector.kind}:{candidates[name]}" for name in closest)
+    return ""
+
+
 def resolve_one(session: Session, shot: Shot) -> Target | None:
     if shot.target is None:
         return None
@@ -1058,11 +1088,8 @@ def resolve_one(session: Session, shot: Shot) -> Target | None:
             selector = parse_selector(shot.target)
             if selector.kind == "entity":
                 hint = "; entity ids change when Hana restarts; select by name:, tool: or marker: instead"
-            elif selector.kind in ("name", "tool"):
-                candidates = {candidate.lower(): candidate for candidate in evidence.selector_candidates}
-                closest = get_close_matches(selector.value.lower(), sorted(candidates), n=5)
-                if closest:
-                    hint = "; closest: " + ", ".join(f"{selector.kind}:{candidates[name]}" for name in closest)
+            else:
+                hint = closest_target_hint(evidence, shot.target)
         raise Failure(f"{shot.target} must name exactly one entity; found {found}{hint}")
     return targets[0]
 
@@ -1075,7 +1102,11 @@ def run_setup(session: Session, shot: Shot) -> list[Target]:
     targets: list[Target] = []
     while not targets:
         if time.monotonic() > deadline:
-            raise Failure(f"setup {shot.setup} ran but {shot.target} did not appear within {SETUP_LIMIT:.0f} s")
+            raise Failure(
+                f"setup {shot.setup} ran but {shot.target} did not appear within {SETUP_LIMIT:.0f} s"
+                + closest_target_hint(session.brp.target_evidence, shot.target)
+                + next_step("run `hana_shot.py targets` to list the selectors that resolve now")
+            )
         session.wait_frames(1)
         targets = resolve(session, shot.target)
     before = session.read_camera()
@@ -1212,7 +1243,7 @@ def project(clip_from_view: list[float], view: Vec3) -> tuple[float, float] | No
     return clip_x / clip_w, clip_y / clip_w
 
 
-def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int) -> Rect:
+def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int, evidence: TargetEvidence) -> Rect:
     """Pixel rectangle around the visible boxes under root, as the fit measures them."""
     if state.viewport_set:
         raise Failure("the camera has a viewport; the hierarchy crop covers full-window cameras only")
@@ -1239,7 +1270,11 @@ def hierarchy_rect(bounds: Bounds, root: int, state: CameraState, padding: int) 
                     left, right = min(left, px), max(right, px)
                     top, bottom = min(top, py), max(bottom, py)
     if not any_box:
-        raise Failure("the target has no visible mesh bounds to crop to")
+        raise Failure(
+            "the target has no visible mesh bounds to crop to"
+            + evidence.parent_fit_hint(root)
+            + next_step("rerun with --crop none to shoot without a crop")
+        )
     x0 = max(0, math.floor(left) - padding)
     y0 = max(0, math.floor(top) - padding)
     x1 = min(width, math.ceil(right) + padding)
@@ -1420,7 +1455,10 @@ def take(session: Session, shot: Shot, final: Path) -> Result:
             crop_kind = "entity"
         else:
             # Visibility is read after the move: parts culled from the old pose show in the new one.
-            rect = hierarchy_rect(finish_bounds(start_bounds(session)), target.entity, settled.state, shot.padding)
+            rect = hierarchy_rect(
+                finish_bounds(start_bounds(session)), target.entity, settled.state, shot.padding,
+                session.brp.target_evidence,
+            )
             crop_kind = "rect"
 
     start = time.perf_counter()
@@ -1704,6 +1742,10 @@ def append_invocation(invocation: InProgressCaptureInvocation, port: int, remote
     }
     if isinstance(invocation.orientation, (TargetFace, ResolvedTargetFace)):
         failure["face"] = invocation.orientation.axis
+    if isinstance(invocation.shot, Shot):
+        failure["view"] = invocation.shot.view
+        failure["target"] = invocation.shot.target
+        failure["mode"] = invocation.shot.mode
     append_timing(failure)
 
 
@@ -2228,11 +2270,14 @@ def run_shots(
     brp: Brp, shots: list[Shot], out: str | None, remote: str | None, on_result: Callable[[Result], None],
     invocation: InProgressCaptureInvocation,
 ) -> list[Result]:
+    if shots:
+        invocation.shot = shots[0]
     with closing(Session(brp, remote)) as session:
         _ = session.start()
         sha = git_sha(Path.cwd())
         results: list[Result] = []
         for shot, path in zip(shots, output_paths(out, [shot.label for shot in shots]), strict=True):
+            invocation.shot = shot
             invocation.orientation = shot.orientation
             started_ns = time.time_ns()
             try:
@@ -2269,6 +2314,7 @@ def command_shot(args: Arguments, invocation: InProgressCaptureInvocation) -> in
     else:
         shots = [shot_from_arguments(args)]
     invocation.orientation = shots[0].orientation
+    invocation.shot = shots[0]
     with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary) as brp:
         _ = run_shots(brp, shots, args.out, args.remote, report, invocation)
     return 0
@@ -2512,7 +2558,8 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
     missing = [name for name in names if name not in views]
     if missing:
         raise Refused(f"no view named {', '.join(missing)} in {path}")
-    invocation.orientation = with_overrides(shot_from_view(names[0], views[names[0]]), args).orientation
+    invocation.shot = with_overrides(shot_from_view(names[0], views[names[0]]), args)
+    invocation.orientation = invocation.shot.orientation
     out = args.out or tempfile.mkdtemp(prefix="hana-shot-check-")
     failures: list[str] = []
     passed: list[str] = []
@@ -2525,6 +2572,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
         today = datetime.now().strftime("%Y-%m-%d")
         for name, final in zip(names, output_paths(out, names), strict=True):
             shot = with_overrides(shot_from_view(name, views[name]), args)
+            invocation.shot = shot
             invocation.orientation = shot.orientation
             started_ns = time.time_ns()
             try:

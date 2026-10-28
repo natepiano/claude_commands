@@ -2,7 +2,7 @@
 
 ## What it is
 
-The status line's `For you:` row shows how many efficiency proposals wait on the user, as "N efficiency" in its own color. The number comes from the nightly-review ledger at `~/.local/state/nightly-review/ledger.md`. A one-week token-efficiency study (2026-10-12..19, both machines, Claude and Codex) feeds that ledger. The study changed nothing in real work. It mapped where weighted tokens go, priced the fixed cost of every request, measured wasted turn patterns and ran offline replays. It then added twelve ranked proposals to the ledger. Its scripts, data and reports are in `~/.local/state/nightly-review/token-study/`, outside git. The ledger backlog is worked only on demand, with the user, through `/efficiency_next`. A proposal is built only after the user approves it.
+The status line's `For you:` row shows how many efficiency proposals wait on the user, as "N efficiency" in its own color. The number comes from the nightly-review ledger at `~/.local/state/nightly-review/ledger.md`. A one-week token-efficiency study (2026-10-12..19, both machines, Claude and Codex) feeds that ledger. The study changed nothing in real work. It mapped where weighted tokens go, priced the fixed cost of every request, measured wasted turn patterns and ran offline replays. It then added twelve ranked proposals to the ledger. Its scripts, data and reports are in `~/.local/state/nightly-review/token-study/`, outside git. The ledger backlog is worked only on demand, with the user, through `/next efficiency`. A proposal is built only after the user approves it.
 
 ## How it works
 

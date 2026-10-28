@@ -39,6 +39,7 @@ class SessionPaneTests(unittest.TestCase):
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
             "FAKE_HERDR_RESPONSES": str(self.root / "responses.json"),
             "HERDR_PROC": str(self.root / "proc"), "NOTIFIER_SESSIONS_DIR": str(self.records),
+            "CONVERSATION_PAUSE_STATE_DIR": str(self.root / "conversation-pause"),
         }
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.environment)))
         self.responses()

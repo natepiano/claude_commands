@@ -48,7 +48,7 @@ def color($config; $key):
       "bright-green": 92, "bright-yellow": 93, "bright-blue": 94,
       "bright-magenta": 95, "bright-cyan": 96, "bright-white": 97,
       orange: "38;5;208", purple: "38;5;141", pink: "38;5;211",
-      teal: "38;5;30", brown: "38;5;137"}
+      teal: "38;5;30", brown: "38;5;137", mauve: "38;5;139"}
      [($config[$key] // "")]) as $code
   | if $code == null then $text else "\u001b[\($code)m\($text)\u001b[0m" end;
 
@@ -75,7 +75,7 @@ def commas: tostring | explode | reverse | to_entries
 # The part this session plays, from the signals the production scripts use
 # (shutdown's session kinds, docs/as-built/shutdown-and-restart.md), first match wins.
 # showrunner:    its session id is one a showrunner update timer targets.
-# worker:        agent_bg.sh hands a delegate worker PLAN_DELEGATE_TEAM_ROLE through
+# worker:        agent_bg.sh hands a worker UNIT_TEAM_ROLE through
 #                --settings. It comes before unit director because a background
 #                session inherits the daemon's environment, and a daemon a unit
 #                director started carries SHOWRUNNER_UNIT.
@@ -83,7 +83,7 @@ def commas: tostring | explode | reverse | to_entries
 def role:
   (.session_id // "") as $id
   | if $id != "" and ($ARGS.named.showrunners // "" | split(" ") | any(. == $id)) then "showrunner"
-    elif ($ENV.PLAN_DELEGATE_TEAM_ROLE // "") != "" then "worker"
+    elif ($ENV.UNIT_TEAM_ROLE // $ENV.PLAN_DELEGATE_TEAM_ROLE // "") != "" then "worker"
     elif ($ENV.SHOWRUNNER_UNIT // "") != "" then "unit director"
     else "unassigned"
     end;
@@ -96,25 +96,27 @@ def remaining($window):
     else empty
     end;
 
-# 00:00 UTC on the $n-th Sunday of $month (0-based) in $year, as epoch seconds.
-def nth_sunday($year; $month; $n):
-  ([$year, $month, 1, 0, 0, 0, 0, 0] | mktime) as $first
-  | $first + ((7 - ($first | gmtime | .[6])) % 7 + 7 * ($n - 1)) * 86400;
+# Seconds east of UTC that the user's clock shows at this epoch second, and that
+# offset as strftime's %z writes it.
+def offset: (localtime | mktime) - .;
+def as_z: (if . < 0 then "-" else "+" end) + ((fabs / 3600 | floor) + 100 | tostring | .[1:])
+  + ((fabs % 3600 / 60 | floor) + 100 | tostring | .[1:]);
 
 # Epoch seconds as wall-clock time in the user's zone, formatted by strftime
-# $fmt and followed by the zone's abbreviation. The zone is America/New_York,
-# from config/user_zone.conf, written out here: jq cannot read that file unless
-# statusline.sh passes it in, and strflocaltime would use the
-# machine's zone, which is Pacific on the Mac. EDT runs from 02:00 EST on the
-# second Sunday in March (07:00 UTC) to 02:00 EDT on the first Sunday in
-# November (06:00 UTC).
+# $fmt and followed by the zone's abbreviation. statusline.sh sets TZ to the
+# zone in config/user_zone.conf, so strflocaltime does not use the machine's
+# zone (natedev's is EDT, the Mac's Pacific). In the hour a clock repeats when
+# daylight saving ends, jq can label a time with the other pass's name (01:30
+# EDT for 01:30 EST): its label comes from glibc's mktime, whose guess depends on
+# earlier calls. So the name comes from this second or one two hours either
+# side, the first whose own %z, read in the same call, is the offset it shows.
 def user_time($fmt):
   . as $t
-  | ($t | gmtime | .[0]) as $year
-  | ($t >= nth_sunday($year; 2; 2) + 7 * 3600
-     and $t < nth_sunday($year; 10; 1) + 6 * 3600) as $dst
-  | ($t + (if $dst then -4 else -5 end) * 3600 | gmtime | strftime($fmt))
-    + (if $dst then " EDT" else " EST" end);
+  | ($t | offset) as $off
+  | [$t, $t + 7200, $t - 7200]
+  | map(select(offset == $off) | strflocaltime("%z %Z") | split(" ")
+        | select(.[0] == ($off | as_z)) | .[1])
+  | ($t | strflocaltime($fmt)) + " " + (first // ($t | strflocaltime("%Z")));
 
 # The window as agent_notes last read it for this session's account label
 # (~/.local/state/agent-notes/by-label.json), which is the number the quota

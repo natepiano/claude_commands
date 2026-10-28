@@ -4,6 +4,9 @@
 set -euo pipefail
 
 AGENTS_CONFIG_FILE="${AGENTS_CONFIG_FILE:-$HOME/.claude/config/agents.conf}"
+# The catalog is read from, and stored to, the registry with its local overlay.
+# shellcheck source=/dev/null
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agents_overlay.sh"
 CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
@@ -24,32 +27,9 @@ fail() {
     exit 1
 }
 
-# The replacement is built in a `mktemp` file, which is 0600, so the config's own
-# mode has to be read and restored before the `mv` or every reader loses access.
-# GNU and BSD `stat` spell the query differently and neither is quiet about the
-# other's spelling: GNU reads `-f` as --file-system and prints a block of
-# filesystem statistics on *stdout* before failing, so chaining the two forms with
-# `||` and capturing both feeds that block to chmod as if it were a mode. Each
-# form is therefore tried on its own and its answer checked to be an octal mode
-# before it is used.
-config_file_mode() {
-    local mode
-    for mode in \
-        "$(stat -c '%a' "$AGENTS_CONFIG_FILE" 2>/dev/null)" \
-        "$(stat -f '%Lp' "$AGENTS_CONFIG_FILE" 2>/dev/null)"; do
-        if [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
-            printf '%s\n' "$mode"
-            return 0
-        fi
-    done
-    # Neither spelling answered. 0644 keeps the file readable, which is the
-    # failure worth having: a sync that widens nothing and blocks nobody.
-    printf '644\n'
-}
-
 # One writer at a time. The sync is triggered implicitly by anything that sources
 # agents_config.sh, so a stale freshness gate fires it once per caller -- and a
-# delegate phase sources it three times at once. `mv` is atomic, so no reader
+# worker phase sources it three times at once. `mv` is atomic, so no reader
 # ever sees a torn file, but concurrent syncs still do identical work three times
 # over, and the last to finish writes a copy it read before the others started:
 # a row changed by `/agent` inside that window is silently reverted.
@@ -105,7 +85,7 @@ if [[ "$CHECK_ONLY" == false ]]; then
 fi
 
 registry_section_rows() {
-    local section="$1"
+    local section="$1" registry="${2:-$REGISTRY_VIEW}"
     awk -v wanted="$section" '
         /^[[:space:]]*\[/ {
             current = $0
@@ -120,7 +100,7 @@ registry_section_rows() {
             sub(/[[:space:]]*$/, "", row)
             if (row != "") print row
         }
-    ' "$AGENTS_CONFIG_FILE"
+    ' "$registry"
 }
 
 refreshed_catalog_has_agent() {
@@ -170,7 +150,7 @@ warn_missing_claude_aliases() {
     [[ -n "$claude_path" ]] || return 0
     help_text="$("$claude_path" --help 2>/dev/null || true)"
     aliases="$(
-        printf '%s\n' "$help_text" | awk '
+        awk '
             /^[[:space:]]*--model([[:space:]]|$)/ {
                 in_model = 1
             }
@@ -189,7 +169,7 @@ warn_missing_claude_aliases() {
                 }
                 seen = 1
             }
-        '
+        ' <<< "$help_text"
     )"
     [[ -n "$aliases" ]] || return 0
 
@@ -206,6 +186,9 @@ command -v jq >/dev/null || fail "jq is required"
 [[ -f "$AGENTS_CONFIG_FILE" ]] || fail "agent registry not found: $AGENTS_CONFIG_FILE"
 [[ -f "$CODEX_CONFIG_FILE" ]] || fail "Codex config not found: $CODEX_CONFIG_FILE"
 [[ -f "$CODEX_MODELS_CACHE_FILE" ]] || fail "Codex model cache not found: $CODEX_MODELS_CACHE_FILE"
+REGISTRY_VIEW="$(mktemp "${AGENTS_CONFIG_FILE}.view.XXXXXX")"
+agents_registry_text > "$REGISTRY_VIEW"
+trap 'rm -f "$REGISTRY_VIEW"; release_lock' EXIT
 
 codex_model="$({
     awk '
@@ -324,6 +307,24 @@ fi
 [[ "${#catalog_rows[@]}" -gt 0 ]] || fail "visible Codex model catalog has no usable slugs"
 refreshed_catalog_rows=("${catalog_rows[@]}")
 
+# A visible release becomes a family target once its effort row is known.
+# Equal numeric versions use slug order, independent of cache order.
+families_text="$(
+    jq -r --arg catalog "$(printf '%s\n' "${catalog_rows[@]}")" '
+        ($catalog | split("\n") | map(split("=")[0])) as $known_slugs
+        |
+        [.models[]
+            | select(.visibility == "list")
+            | .slug | select(type == "string") | . as $slug
+            | select($known_slugs | index($slug))
+            | capture("^gpt-(?<version>[0-9]+(?:\\.[0-9]+)*)-(?<family>[a-z][a-z0-9_-]*)$")
+            | . + {slug: $slug, version_numbers: (.version | split(".") | map(tonumber))}]
+        | group_by(.family)[]
+        | max_by([.version_numbers, .slug])
+        | "\(.family)=\(.slug)"
+    ' "$CODEX_MODELS_CACHE_FILE"
+)" || fail "invalid Codex model cache: $CODEX_MODELS_CACHE_FILE"
+
 assigned_rows="$(
     awk '
         function trim(value) {
@@ -370,12 +371,23 @@ assigned_rows="$(
                 if (family == "codex") print task "\t" pairs[i]
             }
         }
-    ' "$AGENTS_CONFIG_FILE"
+    ' "$REGISTRY_VIEW"
 )"
 
 while IFS=$'\t' read -r task pair; do
     [[ -n "$task" ]] || continue
     assigned_agent="${pair%%:*}"
+    # A model-family word follows the cache rather than pinning an old slug.
+    # Keep a missing family's failure for the resolver's actionable diagnostic.
+    if printf '%s\n' "$families_text" | awk -F= -v wanted="$assigned_agent" \
+        '$1 == wanted { found = 1 } END { exit !found }'; then
+        continue
+    fi
+    if registry_section_rows codex.families | awk -F= -v wanted="$assigned_agent" \
+        '$1 == wanted { found = 1 } END { exit !found }'; then
+        echo "WARNING: $task has no visible Codex model for family '$assigned_agent'." >&2
+        continue
+    fi
     if refreshed_catalog_has_agent "$assigned_agent" \
         && cache_has_agent "$assigned_agent"; then
         continue
@@ -392,41 +404,59 @@ warn_missing_claude_aliases
 
 tmp_file="$(mktemp "${AGENTS_CONFIG_FILE}.XXXXXX")"
 cleanup() {
-    rm -f "$tmp_file"
+    rm -f "$tmp_file" "$REGISTRY_VIEW"
     release_lock
 }
 trap cleanup EXIT
 
-in_codex_agents=false
+in_generated_section=false
 saw_codex_agents=false
 
 while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^\[([^]]+)\]$ ]]; then
-        if [[ "$in_codex_agents" == true ]]; then
+        section="${BASH_REMATCH[1]}"
+        if [[ "$in_generated_section" == true && "$section" != "codex.families" ]]; then
             printf '\n' >> "$tmp_file"
         fi
 
-        section="${BASH_REMATCH[1]}"
-        in_codex_agents=false
+        in_generated_section=false
         if [[ "$section" == "codex.agents" ]]; then
-            in_codex_agents=true
+            in_generated_section=true
             saw_codex_agents=true
             printf '%s\n' "$line" >> "$tmp_file"
             printf '# Generated by scripts/agents/sync_codex_catalog.sh — do not hand-edit.\n' >> "$tmp_file"
             printf '%s\n' "${catalog_rows[@]}" >> "$tmp_file"
+            printf '\n[codex.families]\n' >> "$tmp_file"
+            printf '# Generated by scripts/agents/sync_codex_catalog.sh — do not hand-edit.\n' >> "$tmp_file"
+            [[ -z "$families_text" ]] || printf '%s\n' "$families_text" >> "$tmp_file"
+            continue
+        elif [[ "$section" == "codex.families" ]]; then
+            # Emitted beside codex.agents, even when absent from the old file.
+            in_generated_section=true
             continue
         fi
     fi
 
-    if [[ "$in_codex_agents" == true ]]; then
+    if [[ "$in_generated_section" == true ]]; then
         continue
     fi
     printf '%s\n' "$line" >> "$tmp_file"
-done < "$AGENTS_CONFIG_FILE"
+done < "$REGISTRY_VIEW"
 
 [[ "$saw_codex_agents" == true ]] || fail "[codex.agents] section not found in $AGENTS_CONFIG_FILE"
 
-if cmp -s "$tmp_file" "$AGENTS_CONFIG_FILE"; then
+# The overlay inserts new rows at a section's end, so its whitespace and row
+# order can differ from the generator after a release. Compare catalog data.
+catalog_current=true
+for section in codex.agents codex.families; do
+    if [[ "$(registry_section_rows "$section" "$tmp_file" | LC_ALL=C sort)" \
+        != "$(registry_section_rows "$section" | LC_ALL=C sort)" ]]; then
+        catalog_current=false
+        break
+    fi
+done
+
+if [[ "$catalog_current" == true ]]; then
     if [[ "$CHECK_ONLY" == false ]]; then
         checkpoint_sync_state
     fi
@@ -439,8 +469,8 @@ if [[ "$CHECK_ONLY" == true ]]; then
     exit 1
 fi
 
-chmod "$(config_file_mode)" "$tmp_file"
-mv "$tmp_file" "$AGENTS_CONFIG_FILE"
+agents_registry_store "$tmp_file"
+rm -f "$REGISTRY_VIEW"
 trap release_lock EXIT
 checkpoint_sync_state
 echo "Updated Codex agent catalog: $AGENTS_CONFIG_FILE"

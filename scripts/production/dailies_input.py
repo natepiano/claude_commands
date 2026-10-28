@@ -242,7 +242,7 @@ class UnitRow(NamedTuple):
     # The unit's session name at this moment, read from its live session; empty when none runs.
     # It addresses the unit and is never a key: every record is kept under the unit's name.
     session: str
-    # Read from the records of the unit's /unit:delegate runs.
+    # Read from the records of the unit's /unit:direct runs.
     run: unit_lookup.UnitState
 
 
@@ -300,6 +300,10 @@ def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
         marked = unit_lookup.marked_units(slug)
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
+    try:
+        runs = unit_lookup.read_run_states()
+    except OSError as error:
+        raise DailiesFailure("production", f"the run records of {slug} could not be read: {error}") from error
     units: list[UnitRow] = []
     for cells in live_rows:
         name = cell_value(cells.get("Unit", ""))
@@ -307,10 +311,7 @@ def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
             raise DailiesFailure("production", f"invalid Units row: {cells}")
         found = marked.get(name)
         claude = found.claude if found is not None else None
-        try:
-            run = unit_lookup.run_state(Path(cell_value(cells.get("Worktree", ""))))
-        except OSError as error:
-            raise DailiesFailure("production", f"the run records of {name} could not be read: {error}") from error
+        run = runs.state(Path(cell_value(cells.get("Worktree", ""))))
         units.append(UnitRow(name, claude.name if isinstance(claude, unit_lookup.LiveClaude) else "", run))
     return tuple(units)
 
@@ -378,7 +379,7 @@ ETA_TIME = re.compile(r"\b(\d{1,2}:\d{2})(\+\d+)?(?: ([A-Z]{2,4})\b)?")
 # Zone words a unit writes after an ETA. An unknown word leaves the time as written.
 ETA_ZONES: dict[str, tzinfo] = {
     **{word: timezone(timedelta(hours=hours)) for word, hours in (
-        ("UTC", 0), ("GMT", 0), ("EDT", -4), ("EST", -5), ("CDT", -5), ("CST", -6),
+        ("UTC", 0), ("GMT", 0), ("ADT", -3), ("AST", -4), ("EDT", -4), ("EST", -5), ("CDT", -5), ("CST", -6),
         ("MDT", -6), ("MST", -7), ("PDT", -7), ("PST", -8))},
     **{word: ZoneInfo(name) for word, name in (
         ("ET", "America/New_York"), ("CT", "America/Chicago"),
@@ -1025,8 +1026,8 @@ def run(args: argparse.Namespace) -> int:
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out,
                        "doc": str(production.doc)}
-    root = showrunners.place_of(production.slug).root
-    if root:
+    root = showrunners.root_of(production.slug)
+    if root != production.slug:
         result["reports_to"] = root
     children = showrunners.children_of(production.slug)
     strangers = [name for name in expand if name != EXPAND_ALL and name not in children]

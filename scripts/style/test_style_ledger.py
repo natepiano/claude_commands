@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -15,22 +16,38 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from contextlib import closing, redirect_stdout
+from contextlib import closing, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from typing import TypedDict, cast, final, override
 from unittest import mock
 
 import rules
 import style_ledger
-from approved_renames import AppliedInCode, Folder, NoAppliedCheck, RenameNotApplied
+from approved_renames import (AppliedCheck, AppliedInCode, BindingRename, Folder, NoAppliedCheck, RenameNotApplied,
+                              binding_rename_check)
 import style_plan
 import style_rules
 import berth_board
+import coverage_report
 import declarations
 
 
 PARENT_FILE = "crates/alpha/src/a.rs"
+# A cargo-berth that logs each call and keeps lifecycles in a file; a release checkpoints the cwd's HEAD.
+RELEASE_BERTH = r'''#!__PYTHON__
+import json, os, subprocess, sys
+with open(os.environ["LEDGER_BERTH_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\n")
+path = os.environ["LEDGER_BOARD"]
+board = json.load(open(path)) if os.path.exists(path) else {}
+if sys.argv[1] == "release":
+    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    board[sys.argv[2]] = {"status": "outstanding", "protected_tip": head}
+    json.dump(board, open(path, "w"))
+print(json.dumps({"payload": {"data": {"lifecycle": board.get(sys.argv[-2], {"status": "active"})}}}))
+'''
 MOVED_FILE = "crates/alpha/src/b.rs"
 TWIN_FILE = "crates/alpha/src/c.rs"
 PARENT = "pub struct Parent {\n    old: u32,\n}\n"
@@ -115,6 +132,9 @@ class StyleLedgerTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         _ = path.write_text(content)
 
+    def in_worktree(self, relative: str) -> bool:
+        return os.path.lexists(self.repo / relative)
+
     def commit(self, message: str) -> str:
         _ = self.git("add", "--all")
         _ = self.git("commit", "-q", "-m", message)
@@ -129,7 +149,7 @@ class StyleLedgerTests(unittest.TestCase):
         return next(rule.blob for rule in rules.load_rules(self.repo) if rule.rule_id == parent_id)
 
     def cli(self, *arguments: str, success: bool = True) -> subprocess.CompletedProcess[str]:
-        prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held") else 1
+        prefix = 2 if arguments[0] in ("ticket", "handoff", "tip", "held", "unit") else 1
         result = subprocess.run(
             [sys.executable, str(Path(style_ledger.__file__)), *arguments[:prefix],
              "--repo", str(self.repo), *arguments[prefix:]],
@@ -157,6 +177,38 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = style_ledger.open_ledger(self.repo)
         self.addCleanup(ledger.close)
         return ledger
+
+    def test_refill_lock_blocks_another_worktree_until_the_body_exits(self) -> None:
+        worktree = self.root / "other-checkout"
+        _ = self.git("worktree", "add", "-q", "-b", "other", str(worktree))
+        lock_path = self.root / "state" / self.repo.name / "refill.lock"
+        self.assertEqual(lock_path.parent, style_ledger.ledger_location(self.repo).database.parent)
+        self.assertFalse(lock_path.parent.exists())
+        attempting, acquired = threading.Event(), threading.Event()
+
+        def take_lock() -> None:
+            attempting.set()
+            with style_ledger.refill_lock(worktree):
+                acquired.set()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with style_ledger.refill_lock(self.repo):
+                self.assertTrue(lock_path.is_file())
+                contender = pool.submit(take_lock)
+                self.assertTrue(attempting.wait(5), "second worktree did not attempt refill")
+                self.assertFalse(acquired.wait(0.2), "second worktree entered a held refill lock")
+            contender.result(timeout=5)
+        self.assertTrue(acquired.is_set(), "refill lock was not released on context exit")
+
+    def record_reads(
+        self, rule: str, path: str, commit: str, reads: tuple[str, ...], *,
+        verdict: str = "clean", ticket: str = "outside",
+    ) -> None:
+        _ = self.cli(
+            "record", "--rule", rule, "--path", path, "--commit", commit,
+            "--rule-blob", self.blob(rule), "--verdict", verdict, "--ticket", ticket,
+            "--worker", "test", "--input-scope", "rule", "--reads", *reads,
+        )
 
     def cells(self, rule_id: str) -> list[style_ledger.Cell]:
         ledger = self.ledger()
@@ -202,6 +254,86 @@ class StyleLedgerTests(unittest.TestCase):
             identities.append(finding.finding_id)
         return rule, issue, tuple(identities)
 
+    def test_record_held_refuses_a_cell_with_no_findings(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        result = self.cli("record", "--rule", rule, "--path", self.sources[0], "--commit", self.initial_tip,
+                          "--rule-blob", self.blob(rule), "--verdict", "held", "--ticket", "outside", "--worker", "test", success=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(rule, result.stderr)
+        self.assertIn(self.sources[0], result.stderr)
+        self.assertIn("held add", result.stderr)
+        self.assertEqual(self.states(rule)[self.sources[0]], "open")
+
+    def test_record_held_names_inactive_findings_and_keeps_the_users_waiver(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        finding = self.hold_finding(rule, 1)
+        _ = self.cli("held", "waive", "--id", finding, "--person", "nate")
+        result = self.cli("record", "--rule", rule, "--path", self.sources[0], "--commit", self.initial_tip,
+                          "--rule-blob", self.blob(rule), "--verdict", "held", "--ticket", "outside", "--worker", "test", success=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        for words in (rule, self.sources[0], finding, "waived", "user's decision", "held add", "record waived"):
+            self.assertIn(words, result.stderr)
+        self.assertIsInstance(self.ledger().named_held((finding,))[0].state, style_ledger.Waived)
+        self.assertEqual(self.states(rule)[self.sources[0]], "open")
+
+    def test_record_held_accepts_unfiled_and_filed_findings_only_on_the_matching_cell(self) -> None:
+        rule = self.rule("read")
+        other = self.rule("other")
+        self.set_tip(self.initial_tip)
+        finding = self.hold_finding(rule, 1)
+        self.record(rule, self.sources[0], self.initial_tip, "held")
+        ledger = self.ledger()
+        ledger.file_held(finding, self.root / "decision.md")
+        self.record(rule, self.sources[0], self.initial_tip, "held", ticket="filed-judge")
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        for wrong_rule, wrong_path in ((rule, self.sources[1]), (other, self.sources[0])):
+            with self.subTest(rule=wrong_rule, path=wrong_path):
+                with self.assertRaises(style_ledger.LedgerError):
+                    ledger.record(wrong_rule, wrong_path, self.initial_tip, self.blob(wrong_rule), "held")
+
+    def test_record_held_reports_built_and_withdrawn_findings_without_counting_them_as_live(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        built, withdrawn = self.hold_finding(rule, 1), self.hold_finding(rule, 2)
+        ledger.file_held(built, self.root / "decision.md")
+        ledger.file_held(withdrawn, self.root / "decision.md")
+        self.record(rule, self.sources[0], self.initial_tip, "exception")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("UPDATE held_findings SET state='built' WHERE finding_id=?", (built,))
+            _ = connection.execute("UPDATE held_findings SET state='withdrawn',withdrawn_by=(SELECT MAX(id) FROM judgments) "
+                                   + "WHERE finding_id=?", (withdrawn,))
+            connection.commit()
+        with self.assertRaises(style_ledger.LedgerError) as refused:
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "held")
+        for words in (built, "built", withdrawn, "withdrawn"):
+            self.assertIn(words, str(refused.exception))
+        self.assertEqual(ledger.latest_held_judgments(), {})
+
+    def test_record_held_maps_manifest_findings_to_their_crate_cell(self) -> None:
+        rule = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        _ = ledger.hold(rule, self.sources[0], 1, "Change manifest", "restructure", "before", "after", self.blob(rule), "outside")
+        ledger.record(rule, "crates/alpha", self.initial_tip, self.blob(rule), "held")
+        self.assertEqual(self.states(rule)["crates/alpha"], "current")
+        with self.assertRaises(style_ledger.LedgerError):
+            ledger.record(rule, "crates/beta", self.initial_tip, self.blob(rule), "held")
+
+    def test_unwaiving_a_finding_restores_a_worker_recorded_waived_verdict_to_held(self) -> None:
+        rule = self.rule("read")
+        self.set_tip(self.initial_tip)
+        finding = self.hold_finding(rule, 1)
+        _ = self.cli("held", "waive", "--id", finding, "--person", "nate")
+        self.record(rule, self.sources[0], self.initial_tip, "waived")
+        ledger = self.ledger()
+        self.assertIsInstance(ledger.newest_held_judgment(rule, self.sources[0]), style_ledger.NoHeldJudgment)
+        self.assertEqual(ledger.unwaive_held((finding,), style_ledger.WaiveUndoneBy("ana")), (finding,))
+        self.assertIsInstance(ledger.named_held((finding,))[0].state, style_ledger.Unfiled)
+        self.assertEqual(ledger.latest_held_judgments(), {(rule, self.sources[0]): self.initial_tip})
+
     def test_preview_ledger_migrates_and_changes_only_a_temporary_copy(self) -> None:
         rule = self.rule("preview")
         database = self.root / "state/sample/ledger.sqlite"
@@ -223,7 +355,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual(finding.before, "old")
             self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
-            ledger.waive_held(finding.finding_id)
+            ledger.waive_held(finding.finding_id, style_ledger.WaiveByPerson("nate"))
             self.assertIsInstance(ledger.proposal_findings(issue)[0].state, style_ledger.Waived)
         self.assertEqual(database.read_bytes(), original)
         self.assertFalse(preview_database.exists())
@@ -291,6 +423,181 @@ class StyleLedgerTests(unittest.TestCase):
                               self.blob(rule), "outside")
         ledger.file_held(finding.finding_id, issue)
         return finding, issue
+
+    def binding_ticket(self, source: str, pairs: tuple[tuple[int, str, str], ...]) -> tuple[style_ledger.Ledger, Path, str]:
+        rule = self.rule("prefer-type-named-fields-and-bindings")
+        path = self.sources[0]
+        self.write(path, source)
+        base = self.commit("Binding declarations before the ticket")
+        ledger = self.ledger()
+        issue = self.root / "bindings.md"
+        ids: list[str] = []
+        for line, old, new in pairs:
+            finding = ledger.hold(rule, path, line, source.splitlines()[line - 1], "rename", old, new, self.blob(rule), "outside")
+            ledger.file_held(finding.finding_id, issue)
+            ids.append(finding.finding_id)
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [path], [rule],
+                          proposal=str(issue), finding_ids=tuple(ids))
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), base)
+        return ledger, issue, base
+
+    def test_binding_carry_restamps_types_and_follows_open_sites_through_reflow(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        path = self.sources[0]
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        # The types read predates the rename ticket but reads exactly the base blob.
+        ledger.ticket_add("types-1", "types", "read", "types", "crates/alpha", [path], [types])
+        ledger.ticket_assign("types-1", "main")
+        _ = ledger.ticket_base("types-1")
+        ledger.ticket_drop("types-1")
+        findings = tuple(ledger.hold(types, path, line, source.splitlines()[line - 1], "type", "u32", "Count",
+                                     self.blob(types), "types-1") for line in (2, 3))
+        ledger.file_held(findings[1].finding_id, self.root / "types.md")
+        ledger.record(types, path, base, self.blob(types), "held", ticket="types-1", worker="judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        crate_types = self.rule("crate-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        reads_types = self.rule("reads-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        for rule in (crate_types, reads_types):
+            ledger.record(rule, path, base, self.blob(rule), "clean", ticket="outside", worker="judge",
+                          input_scope=style_ledger.DeclaredInputScope.RULE,
+                          reads=(self.sources[1],) if rule == reads_types else style_ledger.NO_READ_FILES)
+        self.write(path, source.replace("old", "fresh").replace("    let", "\n    let"))
+        checkpoint = self.commit("Rename and reflow")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertTrue(all(isinstance(f.follow, style_ledger.NotFollowed) for f in ledger.named_held([f.finding_id for f in findings])))
+        _ = ledger.ticket_merge("names-1")
+        moved = tuple(sorted(ledger.named_held([f.finding_id for f in findings]), key=lambda f: f.line))
+        self.assertEqual([f.line for f in moved], [3, 4])
+        self.assertEqual([f.text for f in moved], ["    let fresh = input;", "    consume(fresh);"])
+        self.assertEqual([f.follow for f in moved], [style_ledger.FollowedDeclaration(path, line, checkpoint) for line in (2, 3)])
+        self.assertEqual([style_ledger.held_state_name(f.state) for f in moved], ["unfiled", "filed"])
+        self.assertEqual([f.ticket for f in moved], ["types-1", "types-1"])
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            rows = connection.execute('SELECT "commit",ticket,worker,verdict FROM judgments WHERE rule=? ORDER BY id', (types,)).fetchall()
+        self.assertEqual(rows, [(base, "types-1", "judge", "held"), (checkpoint, "types-1", "judge", "held")])
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            carried_rules = connection.execute('SELECT rule FROM judgments WHERE "commit"=? ORDER BY rule', (checkpoint,)).fetchall()
+        self.assertEqual(carried_rules, [(rule,) for rule in sorted((types, crate_types, reads_types))])
+        self.assertEqual(next(ledger.cells(rule=types)).state, "current")
+        # A repeated merge cannot restamp or follow twice.
+        _ = ledger.ticket_merge("names-1")
+        self.assertEqual(tuple(sorted(ledger.named_held([f.finding_id for f in findings]), key=lambda f: f.line)), moved)
+
+    def test_binding_carry_rejects_a_late_judgment_before_deletion_and_identical_restore(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        path = self.sources[0]
+        types = self.rule("types-read", "tier: C\nfamily: types\ninput_scope: file\n")
+        self.write(path, source)
+        original = self.commit("Original binding before deletion")
+        ledger = self.ledger()
+        ledger.ticket_add("types-1", "types", "read", "types", "crates/alpha", [path], [types])
+        ledger.ticket_assign("types-1", "main")
+        self.assertEqual(ledger.ticket_base("types-1"), original)
+        (self.repo / path).unlink()
+        deleting = self.commit("Delete the types cell")
+        self.record_removed(ledger, types, path, deleting, ticket="types-1")
+        # The rename ticket starts at a byte-identical restoration of the deleted file.
+        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        self.assertEqual(self.git("rev-parse", f"{original}:{path}"), self.git("rev-parse", f"{base}:{path}"))
+        ledger.record(types, path, original, self.blob(types), "clean", ticket="types-1", worker="late-judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        ledger.set_tip(base, "main")
+        self.assertEqual(next(ledger.cells(rule=types)).state, "open")
+        self.write(path, source.replace("old", "fresh"))
+        checkpoint = self.commit("Proven binding rename after restoration")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ticket, = ledger.proposal_tickets()
+        self.assertEqual(ledger.binding_carry_forward(ticket, checkpoint), style_ledger.BindingCarryForward())
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertEqual(self.cell_rows(ledger, path), [(deleting, "removed"), (original, "clean")])
+        self.assertEqual(next(ledger.cells(rule=types)).state, "open")
+
+    def test_binding_carry_requires_whole_file_proof_current_rule_and_unchanged_other_inputs(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ledger, _, base = self.binding_ticket(source, ((2, "old", "fresh"),))
+        path, other = self.sources[:2]
+        carried = self.rule("carried-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        reads = self.rule("reads-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        crate = self.rule("crate-types", "tier: C\nfamily: types\ninput_scope: crate\n")
+        changed = self.rule("changed-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        old_blob = self.rule("older-file-types", "tier: C\nfamily: types\ninput_scope: file\n")
+        ledger.record(old_blob, path, self.initial_tip, self.blob(old_blob), "clean", ticket="types", worker="judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE)
+        for rule in (carried, crate, changed):
+            ledger.record(rule, path, base, self.blob(rule), "clean", ticket="types", worker="judge",
+                          input_scope=style_ledger.DeclaredInputScope.RULE)
+        ledger.record(reads, path, base, self.blob(reads), "clean", ticket="types", worker="judge",
+                      input_scope=style_ledger.DeclaredInputScope.RULE, reads=(other,))
+        _ = self.rule("changed-types", "tier: C\nfamily: types\ninput_scope: file\nmode: propose\n")
+        self.write(path, source.replace("old", "fresh"))
+        self.write(other, "fn another_change() {}\n")
+        checkpoint = self.commit("Rename plus another input changed")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            restamped = connection.execute('SELECT rule FROM judgments WHERE "commit"=?', (checkpoint,)).fetchall()
+        self.assertEqual(restamped, [(carried,)])
+        # A proof that applies one rename but cannot explain another token never carries types work.
+        # Use the same public planning operation on a fresh checkpoint; it must refuse the whole path.
+        self.write(path, source.replace("old", "fresh").replace("input", "different"))
+        unproved = self.commit("Unexplained token change")
+        ticket = ledger.proposal_tickets()[0]
+        self.assertEqual(ledger.binding_carry_forward(ticket, unproved), style_ledger.BindingCarryForward())
+
+    def test_binding_applied_check_groups_the_ticket_path_and_caches_each_commit(self) -> None:
+        source = "fn f() {\n    let old = input;\n    let second = old;\n    consume(second);\n}\n"
+        ledger, issue, base = self.binding_ticket(source, ((2, "old", "fresh"), (3, "second", "next")))
+        findings = ledger.proposal_findings(issue)
+        self.write(self.sources[0], source.replace("old", "fresh").replace("second", "next"))
+        checkpoint = self.commit("Rename both bindings")
+        with mock.patch.object(style_ledger, "binding_rename_check", wraps=binding_rename_check) as proof:
+            self.assertEqual([ledger.applied_check(finding, checkpoint) for finding in findings], [AppliedInCode()] * 2)
+            self.assertEqual(proof.call_count, 1)
+            self.assertEqual(len(cast(tuple[BindingRename, ...], proof.call_args.args[3])), 2)
+            self.assertEqual([ledger.applied_check(finding, base) for finding in findings],
+                             [RenameNotApplied(self.sources[0])] * 2)
+            self.assertEqual(proof.call_count, 2)
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertEqual(ledger.ticket_merge("names-1"), ())
+        self.assertTrue(all(isinstance(f.state, style_ledger.Built) for f in ledger.proposal_findings(issue)))
+        self.assertTrue(all(isinstance(f.reading, style_ledger.NotReadByPerson) for f in ledger.proposal_findings(issue)))
+        # A fresh ledger must group built findings too.
+        fresh = self.ledger()
+        self.assertEqual([fresh.applied_check(f, checkpoint) for f in fresh.proposal_findings(issue)], [AppliedInCode()] * 2)
+
+    def test_binding_merge_keeps_unapplied_and_unproved_findings_filed(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n    let second = input;\n    consume(second);\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "old", "fresh"), (4, "second", "next")))
+        # One declaration changed without its use; the other rename was never attempted.
+        self.write(self.sources[0], source.replace("let old", "let fresh"))
+        checkpoint = self.commit("Incomplete rename")
+        findings = ledger.proposal_findings(issue)
+        by_old = {f.before: ledger.applied_check(f, checkpoint) for f in findings}
+        self.assertEqual(by_old, {"old": NoAppliedCheck("rename"), "second": RenameNotApplied(self.sources[0])})
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        self.assertTrue(all(isinstance(f.state, style_ledger.Filed) for f in ledger.proposal_findings(issue)))
+
+    def test_binding_check_needs_a_build_ticket_with_a_saved_base(self) -> None:
+        source = "fn f() {\n    let old = input;\n    consume(old);\n}\n"
+        ledger, issue, _ = self.binding_ticket(source, ((2, "old", "fresh"),))
+        self.write(self.sources[0], source.replace("old", "fresh"))
+        checkpoint = self.commit("Rename without a saved base")
+        finding, = ledger.proposal_findings(issue)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base='' WHERE id='names-1'")
+        self.assertEqual(ledger.applied_check(finding, checkpoint), NoAppliedCheck("rename"))
+        ledger.ticket_drop("names-1")
+        finding, = ledger.proposal_findings(issue)
+        self.assertIsInstance(finding.build_ticket, style_ledger.NoBuildTicket)
+        self.assertEqual(ledger.applied_check(finding, checkpoint), NoAppliedCheck("rename"))
 
     def test_a_file_rename_check_reads_which_file_is_at_the_commit(self) -> None:
         finding, _ = self.file_rename_finding()
@@ -380,6 +687,336 @@ class StyleLedgerTests(unittest.TestCase):
     def held_rows(self, database: Path) -> list[tuple[object, ...]]:
         with closing(sqlite3.connect(database)) as connection:
             return cast(list[tuple[object, ...]], connection.execute("SELECT * FROM held_findings ORDER BY finding_id").fetchall())
+
+    def test_held_replace_reopens_the_same_finding_and_restores_its_waived_cell(self) -> None:
+        rule = self.rule("replace")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_assign("read-1", "main")
+        finding_id = self.hold_finding(rule, 1, ticket="read-1")
+        ledger.waive_held(finding_id, style_ledger.WaiveByUnit(ledger.named_held((finding_id,))[0].ticket))
+        self.record(rule, self.sources[0], self.initial_tip, "waived", ticket="read-1")
+        before = ledger.named_held((finding_id,))[0]
+        result = self.cli("held", "replace", "--id", finding_id, "--after", "Outcome::Correct")
+        self.assertEqual(result.stdout, finding_id + "\n")
+        finding, = ledger.named_held((finding_id,))
+        self.assertEqual((finding.finding_id, finding.after, finding.state, finding.build_ticket),
+                         (finding_id, "Outcome::Correct", style_ledger.Unfiled(), style_ledger.NoBuildTicket()))
+        self.assertEqual((finding.rule, finding.path, finding.line, finding.text, finding.kind, finding.before,
+                          finding.rule_blob, finding.ticket, finding.waive_undo),
+                         (before.rule, before.path, before.line, before.text, before.kind, before.before,
+                          before.rule_blob, before.ticket, before.waive_undo))
+        self.assertEqual(finding.waive_provenance, style_ledger.WaiveProvenance.UNIT)
+        self.assertEqual(ledger.latest_held_judgments(), {(rule, self.sources[0]): self.initial_tip})
+        self.record(rule, self.sources[0], self.initial_tip, "held", ticket="read-1")
+
+    def test_held_add_keeps_a_waive_until_explicit_replace(self) -> None:
+        rule = self.rule("replace")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        ledger.waive_held(finding_id, style_ledger.WaiveByUnit(ledger.named_held((finding_id,))[0].ticket))
+        before = self.held_rows(ledger.database)
+        self.assertEqual(self.hold_finding(rule, 1), finding_id)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        _ = self.cli("held", "replace", "--id", finding_id, "--after", "corrected")
+        self.assertEqual(ledger.named_held((finding_id,))[0].after, "corrected")
+
+    def test_hold_of_a_different_change_at_a_held_site_gets_its_own_row(self) -> None:
+        rule = self.rule("change-ids")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        blob = self.blob(rule)
+        change: tuple[style_ledger.FindingKind, str, str] = ("rename", "old", "new")
+        others: tuple[tuple[str, tuple[style_ledger.FindingKind, str, str]], ...] = (
+            ("after", ("rename", "old", "other")), ("kind", ("type", "old", "new")),
+            ("before", ("rename", "older", "new")))
+
+        def hold(line: int, held: tuple[style_ledger.FindingKind, str, str]) -> style_ledger.HeldFinding:
+            return ledger.hold(rule, self.sources[0], line, "value", *held, blob, "outside")
+
+        def finding_id(fields: tuple[str | int, ...]) -> str:
+            return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()[:16]
+
+        for line, (name, other) in enumerate(others, 1):
+            with self.subTest(differs=name):
+                site = (rule, self.sources[0], line, "value", blob)
+                # The same change twice is one row at today's id, so a row from before this change keeps its id.
+                today = finding_id(site)
+                self.assertEqual(hold(line, change).finding_id, today)
+                rows = self.held_rows(ledger.database)
+                self.assertEqual(hold(line, change).finding_id, today)
+                self.assertEqual(self.held_rows(ledger.database), rows)
+                second = hold(line, other)
+                self.assertEqual((second.finding_id, second.kind, second.before, second.after),
+                                 (finding_id((*site, *other)), *other))
+                count = len(self.held_rows(ledger.database))
+                self.assertEqual((hold(line, change).finding_id, hold(line, other).finding_id),
+                                 (today, second.finding_id))
+                self.assertEqual(len(self.held_rows(ledger.database)), count)
+                kept, = ledger.named_held((today,))
+                self.assertEqual((kept.kind, kept.before, kept.after), change)
+
+    def test_hold_returns_its_change_when_another_writer_changes_the_row_after_the_commit(self) -> None:
+        rule = self.rule("change-race")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        held = cast(Callable[[style_ledger.Ledger, str], style_ledger.HeldFinding],
+                    getattr(style_ledger.Ledger, "_held"))
+        waiting: list[str] = []
+
+        def held_with_another_writer(self_: style_ledger.Ledger, finding_id: str) -> style_ledger.HeldFinding:
+            # Another writer changes the row now if no lock stops it, else right after the commit.
+            try:
+                with closing(sqlite3.connect(ledger.database, timeout=0)) as connection, connection:
+                    _ = connection.execute("UPDATE held_findings SET after='other' WHERE finding_id=?",
+                                           (finding_id,))
+            except sqlite3.OperationalError:
+                waiting.append(finding_id)
+            return held(self_, finding_id)
+
+        def hold() -> style_ledger.HeldFinding:
+            return ledger.hold(rule, self.sources[0], 1, "value", "rename", "old", "new", self.blob(rule), "outside")
+
+        first = hold()
+        # The second call returns the existing row; the third inserts a row at the second id.
+        for path in ("existing row", "insert"):
+            with self.subTest(path=path):
+                with mock.patch.object(style_ledger.Ledger, "_held", held_with_another_writer):
+                    finding = hold()
+                self.assertEqual(finding.after, "new")
+                self.assertEqual(len(waiting), 1)
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute("UPDATE held_findings SET after='other' WHERE finding_id=?",
+                                           (waiting.pop(),))
+                self.assertEqual(ledger.named_held((finding.finding_id,))[0].after, "other")
+        self.assertEqual(len(self.held_rows(ledger.database)), 2)
+        self.assertEqual(ledger.named_held((first.finding_id,))[0].after, "other")
+
+    def test_held_replace_refuses_an_unknown_id(self) -> None:
+        result = self.cli("held", "replace", "--id", "missing", "--after", "new", success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr.strip(), "style_ledger: unknown held finding missing")
+
+    def test_decline_keeps_a_nonempty_actor_when_it_overrides_a_unit_waive(self) -> None:
+        rule = self.rule("decline-actor")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        finding, = ledger.named_held((finding_id,))
+        ledger.waive_held(finding_id, style_ledger.WaiveByUnit(finding.ticket))
+        _ = ledger.decline_findings((finding_id,), "Keep this name", style_ledger.WaiveByPerson("user"))
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT waive_provenance,waived_by FROM held_findings WHERE finding_id=?",
+                                                (finding_id,)).fetchone(), ("person", "user"))
+        self.assertEqual(ledger.named_held((finding_id,))[0].waive_actor, style_ledger.WaiveByPerson("user"))
+
+    def test_decline_rejects_a_unit_and_keeps_person_and_ledger_waives_protected(self) -> None:
+        rule = self.rule("decline-protection")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        for line, actor in enumerate((style_ledger.WaiveByPerson("ana"), style_ledger.WaiveByLedger()), 1):
+            with self.subTest(actor=actor):
+                finding_id = self.hold_finding(rule, line)
+                finding, = ledger.named_held((finding_id,))
+                ledger.waive_held(finding_id, actor)
+                before = ledger.database.read_bytes()
+                invalid_actor = cast(style_ledger.WaiveByPerson | style_ledger.WaiveByLedger,
+                                     cast(object, style_ledger.WaiveByUnit(finding.ticket)))
+                with self.assertRaisesRegex(style_ledger.LedgerError, "decline requires a person or the ledger"):
+                    _ = ledger.decline_findings((finding_id,), "Keep this name", invalid_actor)
+                self.assertEqual(ledger.database.read_bytes(), before)
+                _ = ledger.decline_findings((finding_id,), "Keep this name", actor)
+                self.assertEqual(ledger.named_held((finding_id,))[0].waive_actor, actor)
+                before = ledger.database.read_bytes()
+                with self.assertRaisesRegex(style_ledger.LedgerError, finding_id):
+                    _ = ledger.replace_held(finding_id, "corrected")
+                self.assertEqual(ledger.database.read_bytes(), before)
+
+    def test_held_replace_refuses_a_ledger_waive_without_writing(self) -> None:
+        rule = self.rule("ledger-waive")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='waived',waive_provenance='ledger',waived_by='ledger' WHERE finding_id=?",
+                                   (finding_id,))
+        for person in ((), ("--person", "ana")):
+            with self.subTest(person=person):
+                before = ledger.database.read_bytes()
+                result = self.cli("held", "replace", "--id", finding_id, "--after", "corrected", *person, success=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(finding_id, result.stderr)
+                self.assertIn("ledger", result.stderr)
+                self.assertEqual(ledger.database.read_bytes(), before)
+
+    def test_held_replace_preserves_person_waives_and_replaces_only_a_unit_waive(self) -> None:
+        rule = self.rule("waive-origin")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        person_id = self.hold_finding(rule, 1)
+        issue = self.root / "declined.md"
+        ledger.file_held(person_id, issue)
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET person_read_by='ana' WHERE finding_id=?", (person_id,))
+        self.record(rule, self.sources[0], self.initial_tip, "held")
+        _ = ledger.decline_findings((person_id,), "Keep the old name", style_ledger.WaiveByPerson("user"))
+        # A declined decision can also waive a new, unfiled finding before any judgment exists.
+        unfiled_id = self.hold_finding(rule, 2)
+        _ = ledger.decline_findings((unfiled_id,), "Keep this name too", style_ledger.WaiveByPerson("user"))
+        for finding_id in (person_id, unfiled_id):
+            with self.subTest(finding_id=finding_id):
+                before = ledger.database.read_bytes()
+                result = self.cli("held", "replace", "--id", finding_id, "--after", "corrected", success=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(finding_id, result.stderr)
+                self.assertIn("person", result.stderr)
+                self.assertEqual(ledger.database.read_bytes(), before)
+        unit_id = self.hold_finding(rule, 3)
+        ledger.waive_held(unit_id, style_ledger.WaiveByUnit("external-1"))
+        result = self.cli("held", "replace", "--id", unit_id, "--after", "corrected")
+        self.assertEqual(result.stdout, unit_id + "\n")
+        unit, = ledger.named_held((unit_id,))
+        self.assertEqual((unit.after, unit.state), ("corrected", style_ledger.Unfiled()))
+
+    def test_held_waive_records_the_caller_and_replace_protects_a_person(self) -> None:
+        rule = self.rule("explicit-waive")
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        person_id = self.hold_finding(rule, 1)
+        _ = self.cli("held", "waive", "--id", person_id, "--person", "ana")
+        person, = ledger.named_held((person_id,))
+        self.assertEqual(person.waive_actor, style_ledger.WaiveByPerson("ana"))
+        for flags in ((), ("--person", "ana")):
+            with self.subTest(flags=flags):
+                before = ledger.database.read_bytes()
+                result = self.cli("held", "replace", "--id", person_id, "--after", "corrected", *flags, success=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn(person_id, result.stderr)
+                self.assertIn("person", result.stderr)
+                self.assertEqual(ledger.database.read_bytes(), before)
+        unit_id = self.hold_finding(rule, 2)
+        # The caller supplies the ticket even when the finding has already been filed.
+        ledger.file_held(unit_id, self.root / "unit-waive.md")
+        _ = self.cli("held", "waive", "--id", unit_id, "--ticket", "external-1")
+        unit, = ledger.named_held((unit_id,))
+        self.assertEqual(unit.waive_actor, style_ledger.WaiveByUnit("external-1"))
+        _ = self.cli("held", "replace", "--id", unit_id, "--after", "corrected")
+        replaced, = ledger.named_held((unit_id,))
+        self.assertEqual((replaced.finding_id, replaced.after, replaced.state),
+                         (unit_id, "corrected", style_ledger.Unfiled()))
+
+    def test_held_waive_requires_exactly_one_nonblank_actor(self) -> None:
+        rule = self.rule("waive-actor")
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        for flags in ((), ("--ticket", "outside", "--person", "ana"),
+                      ("--ticket", " "), ("--person", " "), ("--ticket", "another-ticket")):
+            with self.subTest(flags=flags):
+                before = ledger.database.read_bytes()
+                result = self.cli("held", "waive", "--id", finding_id, *flags, success=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                if not flags:
+                    self.assertIn("one of the arguments --ticket --person is required", result.stderr)
+                elif "--ticket" in flags and "--person" in flags:
+                    self.assertIn("not allowed with argument --ticket", result.stderr)
+                elif flags[-1] == "another-ticket":
+                    self.assertIn("did not judge this finding", result.stderr)
+                else:
+                    self.assertIn("requires a", result.stderr)
+                self.assertEqual(ledger.database.read_bytes(), before)
+
+    def test_a_persons_explicit_waive_protects_an_existing_unit_waive(self) -> None:
+        rule = self.rule("repeat-waive")
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        ledger.waive_held(finding_id, style_ledger.WaiveByUnit("external-1"))
+        ledger.waive_held(finding_id, style_ledger.WaiveByPerson("ana"))
+        before = ledger.database.read_bytes()
+        ledger.waive_held(finding_id, style_ledger.WaiveByUnit("external-1"))
+        self.assertEqual(ledger.database.read_bytes(), before)
+        finding, = ledger.named_held((finding_id,))
+        self.assertEqual(finding.waive_actor, style_ledger.WaiveByPerson("ana"))
+        with self.assertRaisesRegex(style_ledger.LedgerError, finding_id + ".*person"):
+            _ = ledger.replace_held(finding_id, "corrected")
+        self.assertEqual(ledger.database.read_bytes(), before)
+
+    def test_held_replace_requires_and_records_a_person_for_an_unrecorded_waive(self) -> None:
+        rule = self.rule("legacy-replace")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET state='waived',waive_provenance='unrecorded' WHERE finding_id=?",
+                                   (finding_id,))
+        self.record(rule, self.sources[0], self.initial_tip, "waived")
+        for flags in ((), ("--person", " ")):
+            with self.subTest(flags=flags):
+                before = ledger.database.read_bytes()
+                result = self.cli("held", "replace", "--id", finding_id, "--after", "corrected", *flags, success=False)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(ledger.database.read_bytes(), before)
+        result = self.cli("held", "replace", "--id", finding_id, "--after", "corrected", "--person", "ana")
+        self.assertEqual(result.stdout, finding_id + "\n")
+        finding, = ledger.named_held((finding_id,))
+        self.assertEqual((finding.finding_id, finding.after, finding.state, finding.waive_undo),
+                         (finding_id, "corrected", style_ledger.Unfiled(), style_ledger.WaiveUndoneBy("ana")))
+        self.assertEqual(ledger.latest_held_judgments(), {(rule, self.sources[0]): self.initial_tip})
+
+    def test_held_replace_refuses_each_non_waived_state_without_writes(self) -> None:
+        _, _, ids = self.decision_findings()
+        self.set_tip(self.initial_tip)
+        ledger = self.ledger()
+        for state in ("unfiled", "filed", "built", "withdrawn"):
+            with self.subTest(state=state):
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute("UPDATE held_findings SET state=? WHERE finding_id=?", (state, ids[0]))
+                before = self.held_rows(ledger.database)
+                result = self.cli("held", "replace", "--id", ids[0], "--after", "new", success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr.strip(), f"style_ledger: {ids[0]}: cannot replace a {state} finding")
+                self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_held_replace_refuses_legacy_waives_without_unit_provenance(self) -> None:
+        rule = self.rule("legacy-waive")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        ledger.waive_held(finding_id, style_ledger.WaiveByUnit(ledger.named_held((finding_id,))[0].ticket))
+        database = ledger.database
+        ledger.close()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waive_provenance")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waived_by")
+            _ = connection.execute("DROP TABLE ticket_widened_paths")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
+            _ = connection.execute("UPDATE schema_version SET version=18")
+        migrated = self.ledger()
+        finding, = migrated.named_held((finding_id,))
+        self.assertEqual(finding.waive_provenance, style_ledger.WaiveProvenance.UNRECORDED)
+        before = database.read_bytes()
+        with self.assertRaisesRegex(style_ledger.LedgerError, finding_id + ".*unrecorded"):
+            _ = migrated.replace_held(finding_id, "corrected")
+        self.assertEqual(database.read_bytes(), before)
+        migrated.waive_held(finding_id, style_ledger.WaiveByUnit("external-1"))
+        self.assertEqual(migrated.named_held((finding_id,))[0].waive_provenance, style_ledger.WaiveProvenance.UNRECORDED)
+
+    def test_held_replace_does_not_create_or_overwrite_other_cell_verdicts(self) -> None:
+        rule = self.rule("replace")
+        self.set_tip(self.initial_tip)
+        finding_id = self.hold_finding(rule, 1)
+        ledger = self.ledger()
+        for verdict in ("missing", "clean", "exception"):
+            with self.subTest(verdict=verdict):
+                if verdict != "missing":
+                    self.record(rule, self.sources[0], self.initial_tip, verdict)
+                ledger.waive_held(finding_id, style_ledger.WaiveByUnit(ledger.named_held((finding_id,))[0].ticket))
+                _ = self.cli("held", "replace", "--id", finding_id, "--after", "Outcome::Correct")
+                self.assertEqual(ledger.latest_held_judgments(), {})
+                self.assertEqual(self.states(rule)[self.sources[0]], "open" if verdict == "missing" else "current")
 
     def test_held_add_of_a_built_row_names_reopen_only_when_its_rename_is_not_in_the_code(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -553,13 +1190,154 @@ class StyleLedgerTests(unittest.TestCase):
         held = next(item for item in self.ledger().proposal_findings(issue) if item.finding_id == finding.finding_id)
         self.assertEqual((held.state, held.reading), (style_ledger.Built(issue), style_ledger.ReadByPerson("nate")))
 
+    def checkpointed_type_findings(self) -> tuple[style_ledger.Ledger, str, str, str]:
+        """Two filed type findings; names-1 holds the first and merged at a checkpoint after the initial tip."""
+        rule, issue, _ = self.decision_findings()
+        self.write(self.sources[2], "pub fn checkpoint() {}\n")
+        checkpoint = self.commit("Build the type change")
+        ledger = self.ledger()
+        ledger.set_tip(checkpoint, "main")
+        built, other = (ledger.hold(rule, self.sources[2], line, "value", "type", "u32", "u64", self.blob(rule),
+                                    "outside") for line in (1, 2))
+        for finding in (built, other):
+            ledger.file_held(finding.finding_id, issue)
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/beta", [self.sources[2]], [rule],
+                          proposal=str(issue), finding_ids=(built.finding_id,))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET state='merged',checkpoint=? WHERE id='names-1'", (checkpoint,))
+        return ledger, built.finding_id, other.finding_id, checkpoint
+
+    def test_held_built_at_a_merge_refuses_a_merge_without_the_build_ticket_checkpoint(self) -> None:
+        ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET finding_ids='[]' WHERE id='names-1'")
+        before = self.held_rows(ledger.database)
+        result = self.cli("held", "built", "--id", finding_id, "--commit", self.initial_tip, "--by", "nate",
+                          success=False)
+        self.assertEqual((result.returncode, result.stderr.strip()),
+                         (2, f"style_ledger: {finding_id}: {self.initial_tip} does not contain names-1's checkpoint "
+                          + checkpoint[:7]))
+        self.assertEqual(self.held_rows(ledger.database), before)
+        result = self.cli("held", "built", "--id", finding_id, "--commit", checkpoint, "--by", "nate")
+        self.assertEqual(result.stdout, f"built {finding_id} at {checkpoint[:7]}, read by nate\n")
+
+    def test_held_built_at_a_merge_refuses_a_merge_without_a_listing_ticket_checkpoint(self) -> None:
+        ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket='' WHERE finding_id=?", (finding_id,))
+        before = self.held_rows(ledger.database)
+        result = self.cli("held", "built", "--id", finding_id, "--commit", self.initial_tip, "--by", "nate",
+                          success=False)
+        self.assertEqual((result.returncode, result.stderr.strip()),
+                         (2, f"style_ledger: {finding_id}: {self.initial_tip} does not contain names-1's checkpoint "
+                          + checkpoint[:7]))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def assert_refused_after_a_write_during_the_check(self, ledger: style_ledger.Ledger, finding_id: str,
+                                                      update: str, parameters: tuple[str, ...], error: str) -> None:
+        """Another writer runs update during the first applied check; the next attempt refuses and writes nothing."""
+        before = self.held_rows(ledger.database)
+        check = style_ledger.Ledger.applied_check
+        calls = 0
+
+        def check_while_another_writer_runs(self_: style_ledger.Ledger, finding: style_ledger.HeldFinding,
+                                            commit: str) -> AppliedCheck:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute(update, parameters)
+            return check(self_, finding, commit)
+
+        with (mock.patch.object(style_ledger.Ledger, "applied_check", check_while_another_writer_runs),
+              self.assertRaisesRegex(style_ledger.LedgerError, re.escape(error))):
+            _ = ledger.mark_built_at_merge((finding_id,), self.initial_tip, style_ledger.ReadByPerson("nate"))
+        self.assertEqual(calls, 1)
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_held_built_at_a_merge_rereads_the_linked_tickets_under_the_write_lock(self) -> None:
+        ledger, finding_id, _, checkpoint = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET state='assigned',checkpoint='' WHERE id='names-1'")
+            _ = connection.execute("UPDATE held_findings SET build_ticket='' WHERE finding_id=?", (finding_id,))
+        # Another writer checkpoints and merges the linked ticket after the checkpoint check read it.
+        self.assert_refused_after_a_write_during_the_check(
+            ledger, finding_id, "UPDATE tickets SET state='merged',checkpoint=? WHERE id='names-1'", (checkpoint,),
+            f"{finding_id}: {self.initial_tip} does not contain names-1's checkpoint {checkpoint[:7]}",
+        )
+
+    def judged_type_finding(self) -> tuple[style_ledger.Ledger, str, str]:
+        """A filed type finding judged by the read ticket names-1, which starts at the initial tip; and a later tip."""
+        rule, issue, _ = self.decision_findings()
+        self.write(self.sources[2], "pub fn judged() {}\n")
+        judged = self.commit("Judge the finding")
+        ledger = self.ledger()
+        ledger.set_tip(judged, "main")
+        finding = ledger.hold(rule, self.sources[2], 1, "value", "type", "u32", "u64", self.blob(rule), "outside")
+        ledger.file_held(finding.finding_id, issue)
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET base=? WHERE id='names-1'", (self.initial_tip,))
+            _ = connection.execute("UPDATE held_findings SET ticket='names-1' WHERE finding_id=?",
+                                   (finding.finding_id,))
+        return ledger, finding.finding_id, judged
+
+    def test_held_built_at_a_merge_rereads_the_judging_ticket_under_the_write_lock(self) -> None:
+        ledger, finding_id, judged = self.judged_type_finding()
+        # The judging ticket checkpoints at a later commit after the judged-commit check read its start.
+        self.assert_refused_after_a_write_during_the_check(
+            ledger, finding_id, "UPDATE tickets SET checkpoint=? WHERE id='names-1'", (judged,),
+            f"{finding_id}: {self.initial_tip} is older than {judged[:7]}, where the finding was judged",
+        )
+
+    def test_held_built_at_a_merge_decides_from_the_rows_it_read(self) -> None:
+        ledger, finding_id, judged = self.judged_type_finding()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET checkpoint=? WHERE id='names-1'", (judged,))
+        before = self.held_rows(ledger.database)
+        judged_commit = style_ledger.Ledger.judged_commit
+
+        def judged_while_another_writer_flips(self_: style_ledger.Ledger, finding: style_ledger.HeldFinding,
+                                              ) -> style_ledger.JudgedCommit | style_ledger.NoJudgedCommit:
+            # Another writer clears the checkpoint for this one read and puts it back before the write lock.
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE tickets SET checkpoint='' WHERE id='names-1'")
+            try:
+                return judged_commit(self_, finding)
+            finally:
+                with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                    _ = connection.execute("UPDATE tickets SET checkpoint=? WHERE id='names-1'", (judged,))
+
+        with (mock.patch.object(style_ledger.Ledger, "judged_commit", judged_while_another_writer_flips),
+              self.assertRaisesRegex(style_ledger.LedgerError, re.escape(
+                  f"{finding_id}: {self.initial_tip} is older than {judged[:7]}, where the finding was judged"))):
+            _ = ledger.mark_built_at_merge((finding_id,), self.initial_tip, style_ledger.ReadByPerson("nate"))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_held_built_at_a_merge_ignores_the_checkpoint_of_a_dropped_ticket(self) -> None:
+        ledger, finding_id, _, _ = self.checkpointed_type_findings()
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET state='dropped' WHERE id='names-1'")
+        result = self.cli("held", "built", "--id", finding_id, "--commit", self.initial_tip, "--by", "nate")
+        self.assertEqual(result.stdout, f"built {finding_id} at {self.initial_tip[:7]}, read by nate\n")
+
+    def test_held_built_at_a_merge_writes_no_id_when_one_lacks_a_checkpoint(self) -> None:
+        ledger, finding_id, other_id, checkpoint = self.checkpointed_type_findings()
+        before = self.held_rows(ledger.database)
+        result = self.cli("held", "built", "--id", finding_id, "--id", other_id, "--commit", self.initial_tip,
+                          "--by", "nate", success=False)
+        self.assertEqual((result.returncode, result.stderr.strip()),
+                         (2, f"style_ledger: {finding_id}: {self.initial_tip} does not contain names-1's checkpoint "
+                          + checkpoint[:7]))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
     def test_unwaive_moves_waived_findings_to_unfiled_with_no_move_and_the_held_list_shows_who(self) -> None:
         _, issue, ids = self.decision_findings()
         self.set_tip(self.initial_tip)
         ledger = self.ledger()
         ledger.move_issue_findings(issue, {ids[0]: self.root / "moved.md"})
         for finding_id in ids:
-            ledger.waive_held(finding_id)
+            ledger.waive_held(finding_id, style_ledger.WaiveByPerson("nate"))
         person = style_ledger.WaiveUndoneBy("nate")
         self.assertEqual(ledger.unwaive_held((ids[0][:8], ids[1], ids[1][:6]), person), tuple(sorted(ids)))
         unfiled = ledger.held_findings(style_ledger.HeldFindingsInState("unfiled"))
@@ -574,7 +1352,7 @@ class StyleLedgerTests(unittest.TestCase):
         lines = {line.split("\t")[0]: line.split("\t")[3:] for line in self.cli("held", "list").stdout.splitlines()}
         self.assertEqual(lines, {finding_id: ["unfiled", "unwaived by nate"] for finding_id in ids})
         # A new waive keeps the record of who undid the old one.
-        ledger.waive_held(ids[0])
+        ledger.waive_held(ids[0], style_ledger.WaiveByPerson("nate"))
         self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("waived"))[0].waive_undo, person)
 
     def test_unwaive_holds_the_cell_that_a_decline_waived_so_a_second_decline_waives_it_again(self) -> None:
@@ -583,12 +1361,12 @@ class StyleLedgerTests(unittest.TestCase):
         for path in self.sources[:2]:
             self.record(rule, path, self.initial_tip, "held")
         ledger = self.ledger()
-        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name")[ids[0]], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name", style_ledger.WaiveByPerson("user"))[ids[0]], style_ledger.CellWaived)
         self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule).held, 1)
         _ = ledger.unwaive_held(ids[:1], style_ledger.WaiveUndoneBy("nate"))
         self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule).held, 2)
         self.assertIn((rule, self.sources[0]), ledger.latest_held_judgments())
-        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name")[ids[0]], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings(ids[:1], "Keep the name", style_ledger.WaiveByPerson("user"))[ids[0]], style_ledger.CellWaived)
         # The new waive keeps the record of who undid the old one.
         waived, = ledger.held_findings(style_ledger.HeldFindingsInState("waived"))
         self.assertEqual((waived.finding_id, waived.waive_undo), (ids[0], style_ledger.WaiveUndoneBy("nate")))
@@ -597,7 +1375,7 @@ class StyleLedgerTests(unittest.TestCase):
         rule, _, ids = self.decision_findings()
         self.set_tip(self.initial_tip)
         ledger = self.ledger()
-        ledger.waive_held(ids[0])
+        ledger.waive_held(ids[0], style_ledger.WaiveByPerson("nate"))
         definition = self.rule_dir / "decision.md"
         _ = definition.write_text(definition.read_text() + "New rule text.\n")
         self.assertNotEqual(self.blob(rule), ledger.held_findings(style_ledger.HeldFindingsInState("waived"))[0].rule_blob)
@@ -610,21 +1388,21 @@ class StyleLedgerTests(unittest.TestCase):
         rule, issue, ids = self.decision_findings()
         self.set_tip(self.initial_tip)
         ledger = self.ledger()
-        ledger.waive_held(ids[0])
+        ledger.waive_held(ids[0], style_ledger.WaiveByPerson("nate"))
         built = ledger.hold(rule, self.sources[2], 1, "required change", "type", "u32", "u64", self.blob(rule), "outside")
         ledger.file_held(built.finding_id, issue)
         ledger.ticket_add("names-1", "names", "proposal", "names", "crates/beta", [self.sources[2]], [rule],
                           proposal=str(issue), finding_ids=(built.finding_id,))
-        ledger.waive_held(built.finding_id)
+        ledger.waive_held(built.finding_id, style_ledger.WaiveByPerson("nate"))
         ledger.ticket_add("read-1", "read", "read", "names", "crates/beta", [self.sources[3]], [rule])
         ledger.ticket_assign("read-1", "main")
         judged = ledger.hold(rule, self.sources[3], 1, "required change", "type", "u32", "u64", self.blob(rule), "read-1")
-        ledger.waive_held(judged.finding_id)
+        ledger.waive_held(judged.finding_id, style_ledger.WaiveByPerson("nate"))
         twin = ids[1][:8] + "0" * 8
         with closing(sqlite3.connect(ledger.database)) as connection, connection:
             _ = connection.execute("INSERT INTO held_findings SELECT ?,rule,path,line,text,kind,before,after,rule_blob,ticket,"
                                    + "state,proposal,created_at,updated_at,build_ticket,moved_from,withdrawn_by,person_read_by,"
-                                   + "duplicate_of,unwaived_by,followed_from,followed_from_line,followed_at,declaration_gone_at FROM held_findings "
+                                   + "duplicate_of,unwaived_by,followed_from,followed_from_line,followed_at,declaration_gone_at,waive_provenance,waived_by FROM held_findings "
                                    + "WHERE finding_id=?", (twin, ids[1]))
         before = self.held_rows(ledger.database)
         for name, error in (
@@ -644,7 +1422,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
                           proposal=str(issue), finding_ids=ids[:1])
-        ledger.waive_held(ids[0])
+        ledger.waive_held(ids[0], style_ledger.WaiveByPerson("nate"))
         ledger.ticket_drop("names-1")
         with self.assertRaisesRegex(style_ledger.LedgerError, re.escape(f"{ids[0]}: cannot file finding in state waived")):
             ledger.file_held(ids[0], issue)
@@ -672,6 +1450,96 @@ class StyleLedgerTests(unittest.TestCase):
                           proposal=str(issue), finding_ids=ids[:1])
         self.assertEqual(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.BuildTicket("names-2"))
         self.assertEqual(ledger.ticket_origin("names-1"), style_ledger.ApprovedProposal(issue, "names", ids[:1]))
+
+    def widen_ticket(self) -> tuple[style_ledger.Ledger, Path]:
+        """An approved proposal ticket names-1 that builds the finding in the first source, and its ledger."""
+        rule, issue, ids = self.decision_findings()
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nunit: names\nplan: approved\n"
+                             + f"style_rule: {rule}\nstyle_crate: crates/alpha\n"
+                             + f"style_rule_blob: {self.blob(rule)}\n---\n")
+        ledger = self.ledger()
+        ledger.ticket_add("names-1", "names", "proposal", "names", "crates/alpha", [self.sources[0]], [rule],
+                          proposal=str(issue), finding_ids=ids[:1])
+        return ledger, issue
+
+    def widen(self, *paths: str, ticket: str = "names-1", reason: str = "the move needs a new file",
+              by: str = "showrunner") -> tuple[int, str]:
+        output = io.StringIO()
+        with redirect_stdout(output), redirect_stderr(output):
+            result = style_plan.main(["widen", "--repo", str(self.repo), "--ticket", ticket, "--files", *paths,
+                                      "--reason", reason, "--by", by])
+        return result, output.getvalue()
+
+    def widened_rows(self, ledger: style_ledger.Ledger) -> list[tuple[str, ...]]:
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            return cast(list[tuple[str, ...]], connection.execute(
+                "SELECT * FROM ticket_widened_paths ORDER BY ticket,path").fetchall())
+
+    def test_widen_records_each_path_with_its_reason_name_and_time(self) -> None:
+        ledger, issue = self.widen_ticket()
+        extra, more = "crates/alpha/src/extra.rs", "crates/alpha/src/more.rs"
+        result, output = self.widen(extra, more)
+        self.assertEqual(result, 0, output)
+        ledger.ticket_assign("names-1", "main")
+        opened, = (cast(style_ledger.TicketRecord, json.loads(line))
+                   for line in self.cli("ticket", "open", "--unit", "names").stdout.splitlines())
+        widened = opened["widened"]
+        self.assertEqual([(item["path"], item["reason"], item["widened_by"]) for item in widened],
+                         [(path, "the move needs a new file", "showrunner") for path in (extra, more)])
+        at = widened[0]["widened_at"]
+        self.assertEqual(datetime.fromisoformat(at).utcoffset(), timezone.utc.utcoffset(None))
+        self.assertEqual(output, "".join(f"widened: {path} — the move needs a new file (showrunner, {at})\n"
+                                         for path in (extra, more)))
+        self.assertEqual(ledger.ticket_origin("names-1"), style_ledger.ApprovedProposal(
+            issue, "names", tuple(opened["finding_ids"]), (extra, more)))
+        rows = self.widened_rows(ledger)
+        self.assertEqual(self.widen(extra), (0, output))
+        self.assertEqual(self.widened_rows(ledger), rows)
+
+    def test_widen_refuses_tickets_paths_and_reasons_it_cannot_record(self) -> None:
+        ledger, issue = self.widen_ticket()
+        self.add_ticket("read-1", [self.rule("read")])
+        extra, more = "crates/alpha/src/extra.rs", "crates/alpha/src/more.rs"
+        approved = issue.read_text()
+        refusals: tuple[tuple[str, tuple[str, ...], dict[str, str], str], ...] = (
+            ("unknown ticket", (extra,), {"ticket": "names-9"}, "unknown ticket names-9"),
+            ("coverage ticket", (extra,), {"ticket": "read-1"},
+             "read-1: only a proposal ticket widens; this is a read ticket"),
+            ("empty reason", (extra,), {"reason": "  "}, "names-1: widen requires a reason"),
+            ("empty name", (extra,), {"by": " "}, "names-1: widen requires --by"),
+            ("absolute path", ("/etc/hosts",), {}, "path must be relative to the repository: /etc/hosts"),
+            ("parent path", ("crates/../extra.rs",), {}, "path must be relative to the repository: crates/../extra.rs"),
+            ("allowed path", (self.sources[0],), {},
+             f"names-1: {self.sources[0]} is already allowed by the approved findings"),
+        )
+        for name, paths, options, message in refusals:
+            with self.subTest(name):
+                result, output = self.widen(*paths, **options)
+                self.assertEqual((result, output), (2, f"style_plan: {message}\n"))
+                self.assertEqual(self.widened_rows(ledger), [])
+        with self.subTest("decision not approved"):
+            _ = issue.write_text(approved.replace("status: open", "status: closed"))
+            self.assertEqual(self.widen(extra), (2, "style_plan: proposal approval or filed findings changed\n"))
+            self.assertEqual(self.widened_rows(ledger), [])
+            _ = issue.write_text(approved)
+        with self.subTest("another reason"):
+            self.assertEqual(self.widen(extra)[0], 0)
+            rows = self.widened_rows(ledger)
+            self.assertEqual(self.widen(extra, reason="another reason"), (
+                2, f"style_plan: names-1: {extra} is already widened for another reason: the move needs a new file\n"))
+            self.assertEqual(self.widened_rows(ledger), rows)
+        with self.subTest("merged ticket"):
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='names-1'")
+                connection.commit()
+            self.assertEqual(self.widen(more), (2, "style_plan: names-1: cannot widen a merged ticket\n"))
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                _ = connection.execute("UPDATE tickets SET state='queued' WHERE id='names-1'")
+                connection.commit()
+        with self.subTest("dropped ticket"):
+            ledger.ticket_drop("names-1")
+            self.assertEqual(self.widen(more), (2, "style_plan: names-1: cannot widen a dropped ticket\n"))
+        self.assertEqual([row[1] for row in self.widened_rows(ledger)], [extra])
 
     def test_decision_ticket_claim_is_atomic_and_refuses_other_issues_and_live_claims(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -709,7 +1577,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.move_issue_findings(issue, moves)
         self.assertEqual(tuple(finding.finding_id for finding in ledger.proposal_findings(target)), ids)
         self.assertEqual(ledger.proposal_findings(issue), ())
-        ledger.waive_held(ids[1])
+        ledger.waive_held(ids[1], style_ledger.WaiveByPerson("nate"))
         with self.assertRaisesRegex(style_ledger.LedgerError, "not filed"):
             ledger.move_issue_findings(target, {ids[1]: issue})
 
@@ -760,7 +1628,7 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual(finding.state, style_ledger.Filed(issue))
             self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn")), ())
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT withdrawn_by FROM held_findings").fetchone(), (0,))
 
     def test_person_read_migration_fourteen_keeps_version_thirteen_findings_not_read_by_a_person(self) -> None:
@@ -781,7 +1649,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.reading), (style_ledger.Built(issue), style_ledger.NotReadByPerson()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT person_read_by FROM held_findings").fetchone(), ("",))
 
     def test_an_unfiled_finding_withdrawn_by_a_newer_judgment_reads_and_lists_as_judged_again(self) -> None:
@@ -816,7 +1684,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual(finding.state, style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT withdrawn_by,duplicate_of FROM held_findings").fetchone(), (7, ""))
 
     def test_unwaive_migration_sixteen_keeps_version_fifteen_waived_findings_not_unwaived(self) -> None:
@@ -837,7 +1705,7 @@ class StyleLedgerTests(unittest.TestCase):
             finding, = ledger.proposal_findings(issue)
             self.assertEqual((finding.state, finding.waive_undo), (style_ledger.Waived(), style_ledger.NoWaiveUndo()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT unwaived_by FROM held_findings").fetchone(), ("",))
 
     def test_follow_migration_seventeen_keeps_version_sixteen_findings_not_followed(self) -> None:
@@ -859,7 +1727,7 @@ class StyleLedgerTests(unittest.TestCase):
             self.assertEqual((finding.state, finding.follow),
                              (style_ledger.Withdrawn(issue, style_ledger.ExceptionVerdict(7)), style_ledger.NotFollowed()))
         with closing(sqlite3.connect(database)) as connection:
-            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (17,))
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             self.assertEqual(connection.execute("SELECT followed_from,followed_from_line,followed_at,declaration_gone_at "
                                                 + "FROM held_findings").fetchone(), ("", 0, "", ""))
 
@@ -954,6 +1822,69 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual((finding.path, finding.line, finding.follow),
                          (MOVED_FILE, 2, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip)))
 
+    def follow_statement(self, moved: dict[str, str | None]) -> style_ledger.DeclarationOutcome:
+        """A filed finding on the statement `let rgba = convert(2, 16);` of fn check in a.rs, read after moved."""
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn keep() {}\n\nfn check() {\n    let bytes = [0];\n    let rgba = convert(2, 16);\n}\n"})
+        _, (finding,) = self.judge_parent(ledger, ((5, "let rgba = convert(2, 16);"),), kind="restructure")
+        _ = self.commit_tip(ledger, moved)
+        outcome, = self.follow_approved(ledger, [finding])
+        return outcome
+
+    def test_a_statement_follows_its_whole_moved_function_to_the_one_line_that_holds_its_text(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn other() {}\n\nfn check() {\n    let bytes = [0];\n\n    let rgba = convert(2, 16);\n}\n"})
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        self.assertEqual((cast(style_ledger.DeclarationMoved, outcome).path, cast(style_ledger.DeclarationMoved, outcome).line),
+                         (MOVED_FILE, 6))
+
+    def test_a_statement_whose_text_is_twice_in_the_moved_function_is_left(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    let rgba = convert(2, 16);\n    let rgba = convert(2, 16);\n}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE, declarations.StatementRefusal.TEXT_REPEATED))
+
+    def test_a_statement_whose_text_changed_in_the_moved_function_is_left(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    let rgba = convert(WIDTH, STRIDE);\n}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE, declarations.StatementRefusal.TEXT_NOT_FOUND))
+
+    def test_a_statement_whose_text_is_only_in_a_function_nested_in_the_moved_function_is_left(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    fn inner() {\n        let rgba = convert(2, 16);\n    }\n}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE, declarations.StatementRefusal.TEXT_NOT_FOUND))
+
+    def test_a_statement_whose_text_is_only_in_a_comment_or_string_of_the_moved_function_is_left(self) -> None:
+        body = ("    // let rgba = convert(2, 16);\n    /* let rgba = convert(2, 16); */\n"
+                + "    let note = \"let rgba = convert(2, 16);\";\n")
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n", MOVED_FILE: "fn check() {\n" + body + "}\n"})
+        self.assertEqual(outcome, style_ledger.StatementNotFollowed(
+            outcome.finding, declarations.Declaration("fn", "check", declarations.ModuleItem()), MOVED_FILE,
+            declarations.StatementRefusal.TEXT_NOT_FOUND))
+
+    def test_a_statement_follows_to_its_code_line_past_a_commented_copy(self) -> None:
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n",
+                                         MOVED_FILE: "fn check() {\n    // let rgba = convert(2, 16);\n    let rgba = convert(2, 16);\n}\n"})
+        self.assertEqual((type(outcome), cast(style_ledger.DeclarationMoved, outcome).line), (style_ledger.DeclarationMoved, 3))
+
+    def test_a_statement_with_a_trailing_comment_follows_its_unchanged_moved_function(self) -> None:
+        ledger = self.ledger()
+        source = "fn check() {\n    let bytes = [0];\n    let rgba = convert(2, 16); // RGBA stride\n    let alpha = convert(3, 8); /* alpha */\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn keep() {}\n\n" + source})
+        _, ids = self.judge_parent(ledger, ((5, "let rgba = convert(2, 16); // RGBA stride"),
+                                            (6, "let alpha = convert(3, 8); /* alpha */")), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn keep() {}\n", MOVED_FILE: "fn other() {}\n\n" + source})
+        outcomes = self.follow_approved(ledger, list(ids))
+        self.assertEqual([(type(outcome), cast(style_ledger.DeclarationMoved, outcome).line) for outcome in outcomes],
+                         [(style_ledger.DeclarationMoved, 5), (style_ledger.DeclarationMoved, 6)])
+
+    def test_a_statement_whose_function_went_to_two_files_is_left(self) -> None:
+        body = "fn check() {\n    let rgba = convert(2, 16);\n}\n"
+        outcome = self.follow_statement({PARENT_FILE: "pub fn keep() {}\n", MOVED_FILE: body, TWIN_FILE: body})
+        self.assertIsInstance(outcome, style_ledger.DeclaredInSeveralFiles)
+
     def test_the_declaration_step_reads_each_commit_and_file_once_and_its_recheck_sees_another_writer(self) -> None:
         ledger = self.ledger()
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
@@ -1035,41 +1966,43 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(built.state, style_ledger.Built(self.root / "decision.md"))
         self.assertEqual(ledger.applied_check(built, tip), AppliedInCode())
 
-    def test_a_filed_finding_whose_item_was_renamed_otherwise_is_left_and_nothing_is_written(self) -> None:
+    def test_a_filed_finding_follows_a_proved_outside_name_without_changing_its_request(self) -> None:
         ledger = self.ledger()
         finding_id = self.renamed_parent(ledger)
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Other")})
+        followed, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(followed, style_ledger.DeclarationMoved)
+        finding, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((finding.finding_id, finding.before, finding.after, finding.state),
+                         (finding_id, "Parent", "Renamed", style_ledger.Filed(self.root / "decision.md")))
         before = self.held_rows(ledger.database)
-        left, = self.follow_approved(ledger, [finding_id])
-        self.assertEqual((type(left), left.finding.finding_id), (style_ledger.DeclarationGoneFromFile, finding_id))
-        self.assertIsInstance(left, style_ledger.DeclarationLeft)
+        again, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(again, style_ledger.DeclarationInPlace)
         self.assertEqual(self.held_rows(ledger.database), before)
 
-    def test_a_filed_finding_whose_file_is_gone_is_withdrawn(self) -> None:
+    def test_a_filed_finding_with_no_proved_destination_stays_filed_after_its_file_is_deleted(self) -> None:
         ledger = self.ledger()
         finding_id = self.renamed_parent(ledger)
-        # While the file is there, the finding stays filed.
-        _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
-        left, = self.follow_approved(ledger, [finding_id])
-        self.assertEqual(type(left), style_ledger.DeclarationGoneFromFile)
-        tip = self.commit_tip(ledger, {PARENT_FILE: None})
-        removed, = self.follow_approved(ledger, [finding_id])
-        self.assertIsInstance(removed, style_ledger.DeclarationRemoved)
-        finding, = ledger.held_findings(style_ledger.AllHeldFindings())
-        self.assertEqual(finding.state, style_ledger.Withdrawn(self.root / "decision.md", style_ledger.DeclarationGone(tip)))
+        for contents in ("pub fn other() {}\n", None):
+            with self.subTest(contents=contents):
+                _ = self.commit_tip(ledger, {PARENT_FILE: contents})
+                before = self.held_rows(ledger.database)
+                left, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+                self.assertEqual(self.held_rows(ledger.database), before)
+                finding, = ledger.held_findings(style_ledger.AllHeldFindings())
+                self.assertEqual(finding.state, style_ledger.Filed(self.root / "decision.md"))
 
-    def test_an_unfiled_rename_whose_after_name_is_declared_is_withdrawn(self) -> None:
+    def test_an_unfiled_rename_follows_outside_code_while_its_approved_twin_is_built(self) -> None:
         ledger = self.ledger()
         _ = self.commit_tip(ledger, {PARENT_FILE: PARENT})
-        # The same rename judged at the field line reads as struct Parent too; only that one is filed.
         _, (unfiled, filed) = self.hold_parent(ledger, ((1, "pub struct Parent {"), (2, "old: u32,")), before="Parent", after="Renamed")
         ledger.file_held(filed, self.root / "decision.md")
-        tip = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
+        _ = self.commit_tip(ledger, {PARENT_FILE: PARENT.replace("Parent", "Renamed")})
         outcomes = self.follow_approved(ledger, [unfiled, filed])
-        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationRemoved, style_ledger.DeclarationRenamed])
+        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved, style_ledger.DeclarationRenamed])
         states = {finding.finding_id: finding.state for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
-        self.assertEqual(states, {unfiled: style_ledger.Withdrawn(style_ledger.NoDecision(), style_ledger.DeclarationGone(tip)),
-                                  filed: style_ledger.Built(self.root / "decision.md")})
+        self.assertEqual(states, {unfiled: style_ledger.Unfiled(), filed: style_ledger.Built(self.root / "decision.md")})
 
     def test_a_renamed_finding_that_an_open_build_ticket_holds_is_kept(self) -> None:
         ledger = self.ledger()
@@ -1100,17 +2033,21 @@ class StyleLedgerTests(unittest.TestCase):
         _, (finding_id,) = self.judge_parent(ledger, ((1, "pub struct Parent {"),), before="Parent", after="Renamed")
         # Parent is deleted and Renamed stays where it was, so the rename was never applied.
         _ = self.commit_tip(ledger, {PARENT_FILE: "pub struct Renamed;\n"})
-        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
-        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
-            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem())))
+        before = self.held_rows(ledger.database)
+        left, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn("declaration not gained", repr(left))
 
     def test_a_filed_rename_whose_after_name_is_declared_with_another_keyword_is_left(self) -> None:
         ledger = self.ledger()
         finding_id = self.renamed_parent(ledger)
         _ = self.commit_tip(ledger, {PARENT_FILE: "pub enum Renamed {\n    Old,\n}\n"})
-        filed = ledger.held_findings(style_ledger.AllHeldFindings())[0]
-        self.assert_rename_left(ledger, finding_id, style_ledger.DeclarationGoneFromFile(
-            filed, declarations.Declaration("struct", "Parent", declarations.ModuleItem())))
+        before = self.held_rows(ledger.database)
+        left, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn("keyword differs", repr(left))
 
     def test_a_filed_rename_whose_after_name_one_file_in_another_crate_gained_is_left(self) -> None:
         ledger = self.ledger()
@@ -1740,6 +2677,705 @@ class StyleLedgerTests(unittest.TestCase):
         row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
         self.assertIsInstance(row.state, style_ledger.Withdrawn)
 
+    def test_an_unrelated_built_name_in_another_crate_does_not_withdraw_an_outside_rename(self) -> None:
+        ledger = self.ledger()
+        source = "fn original() {\n    first();\n    second();\n}\n"
+        other = "crates/beta/src/other.rs"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, other: source.replace("original", "unrelated")})
+        _, (finding_id,) = self.hold_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+        _ = self.built_finding(ledger, other, "original", "elsewhere")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("original", "renamed")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Unfiled()))
+        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_a_built_rename_in_another_module_does_not_withdraw_an_outside_rename(self) -> None:
+        ledger = self.ledger()
+        source = "fn original() {\n    first();\n    second();\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "fn elsewhere() {}\n"})
+        _, (finding_id,) = self.hold_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+        _ = self.built_finding(ledger, MOVED_FILE, "b::original", "b::elsewhere")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("original", "renamed")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Unfiled()))
+        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_outside_method_renames_require_the_same_resolved_generic_argument(self) -> None:
+        for changed in (False, True):
+            with self.subTest(argument_changed=changed):
+                with style_ledger.Ledger(self.repo, self.root / f"generic-owner-{changed}.db") as ledger:
+                    source = ("use crate::a::one::Arg as A;\nmod one { pub struct Arg; }\n"
+                              + "mod two { pub struct Arg; }\nstruct Holder<T>(T);\n"
+                              + "impl crate::a::Holder<A> {\n    fn original(&self) -> u32 {\n        1\n    }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((6, "fn original(&self) -> u32 {"),), kind="restructure")
+                    target = source.replace("fn original", "fn renamed")
+                    if changed:
+                        target = target.replace("use crate::a::one::Arg", "use crate::a::two::Arg")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if changed:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+                        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Filed(self.root / "decision.md")))
+
+    def test_outside_method_renames_distinguish_external_arguments_from_local_paths(self) -> None:
+        for argument, local in (("crate::a::std::string::String", True),
+                                ("std::string::String", True), ("std::string::String", False)):
+            with self.subTest(argument=argument, local_root_added=local):
+                with style_ledger.Ledger(self.repo, self.root / f"external-owner-{local}-{argument.count('::')}.db") as ledger:
+                    source = ("struct Holder<T>(T);\nimpl Holder<std::string::String> {\n"
+                              + "    fn original(&self) -> u32 {\n        1\n    }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((3, "fn original(&self) -> u32 {"),), kind="restructure")
+                    target = source.replace("fn original", "fn renamed").replace("std::string::String", argument)
+                    if local:
+                        target += "mod std { pub mod string { pub struct String; } }\n"
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if local:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+                        self.assertEqual((row.path, row.state), (PARENT_FILE, style_ledger.Filed(self.root / "decision.md")))
+                        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_outside_method_renames_require_the_same_external_crate_binding(self) -> None:
+        for binding in ("std", "beta"):
+            with self.subTest(destination_crate=binding):
+                with style_ledger.Ledger(self.repo, self.root / f"external-binding-{binding}.db") as ledger:
+                    source = ("extern crate std as external;\npub struct Holder<T>(T);\n"
+                              + "impl crate::a::Holder<external::string::String> {\n"
+                              + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+                    target = (f"extern crate {binding} as external;\n"
+                              + "impl crate::a::Holder<external::string::String> {\n"
+                              + "    fn renamed(&self) -> u32 {\n        7\n    }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "// empty\n",
+                                                 "crates/beta/src/lib.rs": "pub mod string { pub struct String; }\n"})
+                    _, (finding_id,) = self.judge_parent(ledger, ((4, "fn original(&self) -> u32 {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: "pub struct Holder<T>(T);\n", MOVED_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                    self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_crate_root_extern_aliases_do_not_prove_an_outside_method_rename(self) -> None:
+        ledger = self.ledger()
+        source = ("extern crate beta as external;\npub struct Holder<T>(T);\n"
+                  + "impl crate::a::Holder<external::string::String> {\n"
+                  + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+        target = ("impl crate::a::Holder<beta::string::String> {\n"
+                  + "    fn renamed(&self) -> u32 {\n        7\n    }\n}\n")
+        _ = self.commit_tip(ledger, {
+            PARENT_FILE: source, MOVED_FILE: "// empty\n",
+            "crates/alpha/src/lib.rs": "extern crate std as beta;\nmod a; mod b; mod c; mod other;\n",
+            "crates/alpha/Cargo.toml": '[package]\nname="alpha"\nversion="0.1.0"\nedition="2021"\n'
+                + '[dependencies]\nbeta={path="../beta"}\n',
+            "crates/beta/src/lib.rs": "pub mod string { pub struct String; }\n",
+        })
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "fn original(&self) -> u32 {"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: "pub struct Holder<T>(T);\n", MOVED_FILE: target})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_extern_bindings_in_either_revision_keep_outside_method_findings_unchanged(self) -> None:
+        root = "crates/alpha/src/lib.rs"
+        for file in (PARENT_FILE, MOVED_FILE, root):
+            for revision in ("before", "after"):
+                with self.subTest(file=file, revision=revision):
+                    with style_ledger.Ledger(self.repo, self.root / f"extern-{Path(file).stem}-{revision}.db") as ledger:
+                        source = ("pub struct Holder<T>(T);\nimpl crate::a::Holder<std::string::String> {\n"
+                                  + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+                        target = ("impl crate::a::Holder<std::string::String> {\n"
+                                  + "    fn renamed(&self) -> u32 {\n        7\n    }\n}\n")
+                        before_files: dict[str, str | None] = {
+                            PARENT_FILE: source, MOVED_FILE: "// empty\n", root: "mod a; mod b; mod c; mod other;\n",
+                        }
+                        after_files: dict[str, str | None] = {
+                            PARENT_FILE: "pub struct Holder<T>(T);\n", MOVED_FILE: target,
+                            root: "mod a; mod b; mod c; mod other;\n",
+                        }
+                        files = before_files if revision == "before" else after_files
+                        files[file] = "extern crate std as external;\n" + str(files[file])
+                        _ = self.commit_tip(ledger, before_files)
+                        line = 4 if file == PARENT_FILE and revision == "before" else 3
+                        _, (finding_id,) = self.judge_parent(ledger, ((line, "fn original(&self) -> u32 {"),), kind="restructure")
+                        _ = self.commit_tip(ledger, after_files)
+                        before = self.held_rows(ledger.database)
+                        outcome, = self.follow_approved(ledger, [finding_id])
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_local_argument_attributes_only_block_conditional_identity(self) -> None:
+        for attribute in ("#[derive(Clone)]", "#[derive(Clone)]\n", "#[cfg(test)]", "#[cfg_attr(test, derive(Clone))]"):
+            with self.subTest(attribute=attribute):
+                with style_ledger.Ledger(self.repo, self.root / f"argument-attribute-{len(attribute)}.db") as ledger:
+                    source = (f"{attribute} struct Arg;\nstruct Holder<T>(T);\n"
+                              + "impl crate::a::Holder<Arg> {\n"
+                              + "    fn original(&self) -> u32 {\n        7\n    }\n}\n")
+                    line = source.splitlines().index("    fn original(&self) -> u32 {") + 1
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((line, "fn original(&self) -> u32 {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn original", "fn renamed")})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if "cfg" in attribute:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == finding_id)
+                        self.assertEqual((row.path, row.line, row.state),
+                                         (PARENT_FILE, line, style_ledger.Filed(self.root / "decision.md")))
+
+    def test_a_typed_closures_retained_parameter_follows_its_renamed_function_under_lock(self) -> None:
+        ledger = self.ledger()
+        source = ("fn original() {\n    common_one();\n    common_two();\n"
+                  + "    let handler: fn(u32) =\n        move |answers| {\n"
+                  + "            consume(answers);\n        };\n    common_three();\n    common_four();\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((5, "move |answers| {"),), kind="restructure")
+        original, = ledger.held_findings(style_ledger.AllHeldFindings())
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace("fn original", "fn renamed")})
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+        row, = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual((row.finding_id, row.path, row.line, row.state, row.text, row.before, row.after),
+                         (original.finding_id, PARENT_FILE, 5, original.state, original.text, original.before, original.after))
+        self.assertEqual(row.follow, style_ledger.FollowedDeclaration(PARENT_FILE, 5, tip))
+        before = self.held_rows(ledger.database)
+        _ = self.follow_approved(ledger, [finding_id])
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_retained_children_follow_a_renamed_function_with_changed_closure_call_arguments(self) -> None:
+        source = """    fn uncached_completed_rows_arrive_before_hierarchy_discovery_is_released() {
+        struct GatedHierarchy {
+            entered: Sender<()>,
+            release: Mutex<Receiver<()>>,
+        }
+        impl HierarchyRunner for GatedHierarchy {
+            fn run(&self, _: &str, _: Duration) -> Result<HierarchyEdges, HierarchyError> {
+                self.entered.send(()).expect("signal discovery");
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("release discovery");
+                Err(HierarchyError::TimedOut)
+            }
+        }
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let expected = vec![session_row("worker", 2)];
+        let rows = expected.clone();
+        let updates = spawn_with_test_source(
+            HierarchyCommand::new(HierarchySource::Command("fixture".to_string())),
+            Arc::new(GatedHierarchy {
+                entered,
+                release: Mutex::new(released),
+            }),
+            move |answers| {
+                answers
+                    .publish(ScanStage::Completed, rows.clone())
+                    .expect("publish completion");
+            },
+        );
+        waiting
+            .recv_timeout(Duration::from_millis(200))
+            .expect("discovery starts");
+        let early = updates.try_recv();
+        release
+            .send(())
+            .expect("release discovery before assertions");
+        assert_eq!(
+            early.expect("uncached completed rows precede discovery"),
+            CensusUpdate::Local {
+                rows:      expected.clone(),
+                hierarchy: HierarchyEdges::default().into(),
+                stage:     ScanStage::Classified,
+            }
+        );
+        assert_eq!(
+            updates
+                .recv_timeout(Duration::from_millis(200))
+                .expect("failed discovery answers"),
+            noted(expected, HierarchyNotice::Failed(HierarchyError::TimedOut))
+        );
+    }
+"""
+        target = """    fn uncached_first_publication_respects_its_budget_and_holds_claude_rows() {
+        struct GatedHierarchy {
+            entered: Sender<()>,
+            release: Mutex<Receiver<()>>,
+        }
+        impl HierarchyRunner for GatedHierarchy {
+            fn run(&self, _: &str, _: Duration) -> Result<HierarchyEdges, HierarchyError> {
+                self.entered.send(()).expect("signal discovery");
+                self.release
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("release discovery");
+                Err(HierarchyError::TimedOut)
+            }
+        }
+        let (entered, waiting) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let expected = vec![session_row("worker", 2)];
+        let rows = expected.clone();
+        let budget = HIERARCHY_FIRST_PUBLISH_BUDGET / 100;
+        let deadline = budget + HIERARCHY_FIRST_PUBLISH_BUDGET / 5;
+        let (finish, details) = mpsc::channel();
+        let started = Instant::now();
+        let updates = spawn_with_test_source_and_budget(
+            HierarchyCommand::new(HierarchySource::Command("fixture".to_string())),
+            Arc::new(GatedHierarchy {
+                entered,
+                release: Mutex::new(released),
+            }),
+            budget,
+            move |answers| {
+                answers
+                    .publish(ScanStage::Completed, rows.clone())
+                    .expect("publish completion");
+                details
+                    .recv()
+                    .expect("keep the scan open for the late answer");
+            },
+        );
+        waiting
+            .recv_timeout(Duration::from_millis(200))
+            .expect("discovery starts");
+        let early = updates.recv_timeout(deadline);
+        let elapsed = started.elapsed();
+        eprintln!("bounded first publication: {} ms", elapsed.as_millis());
+        release
+            .send(())
+            .expect("release discovery before assertions");
+        assert!(elapsed < deadline, "first publication took {elapsed:?}");
+        assert_eq!(
+            early.expect("safe rows publish inside the startup budget"),
+            CensusUpdate::Local {
+                rows:      Vec::new(),
+                hierarchy: HierarchySnapshot::default(),
+                stage:     ScanStage::Completed,
+            }
+        );
+        let late = updates.recv_timeout(deadline);
+        finish.send(()).expect("release details before assertions");
+        assert_eq!(
+            late.expect("failed discovery answers during detail reads"),
+            noted(expected, HierarchyNotice::Failed(HierarchyError::TimedOut))
+        );
+    }
+"""
+        ledger = self.ledger()
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, findings = self.judge_parent(ledger, ((19, "let rows = expected.clone();"), (27, "move |answers| {")), kind="restructure")
+        before = {row.finding_id: row for row in ledger.held_findings(style_ledger.AllHeldFindings())}
+        _ = self.commit_tip(ledger, {PARENT_FILE: target})
+        outcomes = self.follow_approved(ledger, list(findings))
+        self.assertEqual(len(outcomes), 2)
+        for outcome, line in zip(outcomes, (19, 32), strict=True):
+            self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+            moved = cast(style_ledger.DeclarationMoved, outcome)
+            self.assertEqual((moved.path, moved.line), (PARENT_FILE, line))
+            row = next(row for row in ledger.held_findings(style_ledger.AllHeldFindings()) if row.finding_id == moved.finding.finding_id)
+            original = before[row.finding_id]
+            self.assertEqual((row.state, row.before, row.after, row.text, row.ticket),
+                             (original.state, original.before, original.after, original.text, original.ticket))
+            self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+        again = self.follow_approved(ledger, list(findings))
+        self.assertTrue(all(isinstance(outcome, style_ledger.DeclarationInPlace) for outcome in again))
+
+    def test_an_impl_member_inherits_only_a_proven_outside_trait_rename(self) -> None:
+        for fails in (False, True):
+            with self.subTest(body_fails=fails):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-trait-{fails}.db") as ledger:
+                    source = ("pub struct Type;\ntrait OldTrait {\n    fn child(&self);\n    const ONE: u32 = 1;\n"
+                              + "    const TWO: u32 = 2;\n}\nimpl OldTrait for Type {\n    fn child(&self) { 7 }\n}\n")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((8, "7"),), kind="restructure")
+                    target = source.replace("OldTrait", "NewTrait")
+                    if fails:
+                        target = target.replace("const ONE: u32 = 1", "const THREE: u32 = 3").replace("const TWO: u32 = 2", "const FOUR: u32 = 4")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if fails:
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                        self.assertIn(style_ledger.OutsideFailure.BODY_FAILED, repr(outcome))
+                    else:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        row, = ledger.held_findings(style_ledger.AllHeldFindings())
+                        self.assertEqual((row.line, row.state), (8, style_ledger.Filed(self.root / "decision.md")))
+                        self.assertIsInstance(row.follow, style_ledger.FollowedDeclaration)
+
+    def test_different_qualified_impl_types_do_not_share_an_outside_method_rename(self) -> None:
+        ledger = self.ledger()
+        source = ("mod one { pub struct Type; }\nmod two { pub struct Type; }\nimpl one::Type {\n"
+                  + "    fn original(&self) -> u32 {\n        1\n    }\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "fn original(&self) -> u32 {"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source.replace("impl one::Type", "impl two::Type").replace("fn original", "fn renamed")})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn(style_ledger.OutsideFailure.WRONG_OWNER, repr(outcome))
+
+    def test_removed_parameters_and_fields_do_not_inherit_an_outside_owner_rename(self) -> None:
+        cases = (
+            ("fn original(\n    input: u32,\n) -> u32 {\n    let retained = 1;\n    input + retained\n}\n",
+             "fn renamed(\n    replacement: u32,\n) -> u32 {\n    let retained = 1;\n    replacement + retained\n}\n"),
+            ("struct Original {\n    selected: u32,\n    common_one: u32,\n    common_two: u32,\n}\n",
+             "struct Renamed {\n    replacement: u64,\n    common_one: u32,\n    common_two: u32,\n}\n"),
+        )
+        for index, (source, target) in enumerate(cases):
+            with self.subTest(source=source):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-removed-child-{index}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source})
+                    _, (finding_id,) = self.judge_parent(ledger, ((2, source.splitlines()[1]),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: target})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                    self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
+
+    def test_a_closure_parameter_does_not_follow_into_a_different_closure_under_lock(self) -> None:
+        ledger = self.ledger()
+        source = ("fn original() {\n    common_one();\n    common_two();\n    consume(move |answers| {\n"
+                  + "        first(answers);\n    });\n    consume(move |other| {\n        second(other);\n"
+                  + "    });\n    common_three();\n    common_four();\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "consume(move |answers| {"),), kind="restructure")
+        target = (source.replace("fn original", "fn renamed").replace("|answers|", "|removed|")
+                  .replace("first(answers)", "first(removed)").replace("|other|", "|answers|")
+                  .replace("second(other)", "second(answers)"))
+        _ = self.commit_tip(ledger, {PARENT_FILE: target})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
+
+    def test_a_deleted_closures_parameter_does_not_follow_into_the_surviving_call_under_lock(self) -> None:
+        ledger = self.ledger()
+        source = ("fn original() {\n    common_one();\n    common_two();\n    first(move |answers| {\n"
+                  + "        consume(answers);\n    });\n    second(move |other| {\n        consume(other);\n"
+                  + "    });\n    common_three();\n    common_four();\n}\n")
+        target = ("fn renamed() {\n    common_one();\n    common_two();\n    second(move |answers| {\n"
+                  + "        consume(answers);\n    });\n    common_three();\n    common_four();\n}\n")
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.judge_parent(ledger, ((4, "first(move |answers| {"),), kind="restructure")
+        _ = self.commit_tip(ledger, {PARENT_FILE: target})
+        before = self.held_rows(ledger.database)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+        self.assertIn(style_ledger.OutsideFailure.CHILD_UNPROVED, repr(outcome))
+        self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_a_filed_and_an_unfiled_finding_follow_a_proven_outside_rename(self) -> None:
+        for index, (filed, destination) in enumerate((
+            (False, PARENT_FILE), (True, PARENT_FILE), (False, MOVED_FILE), (True, MOVED_FILE),
+        )):
+            with self.subTest(filed=filed, destination=destination):
+                ledger = style_ledger.Ledger(self.repo, self.root / f"outside-{index}.db")
+                source = "fn original() {\n    first();\n    second();\n    third();\n    fourth();\n}\n"
+                target = source.replace("original", "renamed").replace("third();", "changed_third();").replace("fourth();", "changed_fourth();")
+                _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "// empty\n", TWIN_FILE: target})
+                hold = self.judge_parent if filed else self.hold_parent
+                _, (finding_id,) = hold(ledger, ((1, "fn original() {"),), kind="restructure", before="keep this request", after="use a type")
+                original, = ledger.held_findings(style_ledger.AllHeldFindings())
+                changes: dict[str, str | None] = {PARENT_FILE: "// owner moved\n", destination: target,
+                                                   TWIN_FILE: target + "// changed pre-existing twin\n"}
+                tip = self.commit_tip(ledger, changes)
+                outcome, = self.follow_approved(ledger, [finding_id])
+                self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                database = ledger.database
+                ledger.close()
+                with style_ledger.Ledger(self.repo, database) as reopened:
+                    row, = reopened.held_findings(style_ledger.AllHeldFindings())
+                    self.assertEqual((row.finding_id, row.path, row.line, row.state, row.before, row.after,
+                                      row.rule_blob, row.kind, row.text, row.ticket, row.reading, row.follow),
+                                     (finding_id, destination, 1, original.state, original.before, original.after,
+                                      original.rule_blob, original.kind, original.text, original.ticket, original.reading,
+                                      style_ledger.FollowedDeclaration(PARENT_FILE, 1, tip)))
+                    before = self.held_rows(database)
+                    again, = self.follow_approved(reopened, [finding_id])
+                    self.assertIsInstance(again, style_ledger.DeclarationInPlace)
+                    self.assertEqual(self.held_rows(database), before)
+
+    def test_an_outside_rename_needs_every_check_and_reports_its_mapped_declaration(self) -> None:
+        source = "fn original() {\n    first();\n    second();\n    third();\n}\n"
+        good = source.replace("original", "renamed")
+        cases: tuple[tuple[str, str, dict[str, str | None], bool], ...] = (
+            ("only call uses the old name", source, {PARENT_FILE: good + "fn caller() { original(); }\n"}, True),
+            ("old declaration only in another crate", source, {PARENT_FILE: good, self.sources[2]: source}, True),
+            ("one of three", source, {PARENT_FILE: good.replace("second();", "different();").replace("third();", "other();")}, False),
+            ("changed keyword", "struct Original {\n    first: u32,\n    second: u32,\n}\n", {PARENT_FILE: "enum Renamed {\n    First,\n    Second,\n}\n"}, False),
+            ("wrong impl owner", "impl Type {\n    fn original() {\n        first();\n        second();\n    }\n}\n", {PARENT_FILE: "impl Other {\n    fn renamed() {\n        first();\n        second();\n    }\n}\n"}, False),
+            ("wrong implemented trait", "impl crate::First for Type {\n    fn original() {\n        first();\n        second();\n    }\n}\n", {PARENT_FILE: "impl crate::Second for Type {\n    fn renamed() {\n        first();\n        second();\n    }\n}\n"}, False),
+            ("ambiguous mapped line", source, {PARENT_FILE: "fn renamed() { first(); second(); third(); } fn another() { first(); second(); third(); }\n"}, False),
+            ("empty", "fn original() {}\n", {PARENT_FILE: "fn renamed() {}\n"}, False),
+            ("semicolon has no body", "type Original = u32;\nfn nearby() { first(); }\n", {PARENT_FILE: "type Renamed = u32;\nfn nearby() { first(); }\n"}, False),
+            ("one-line body changed", "fn original() { first(); }\n", {PARENT_FILE: "fn renamed() { other(); }\n"}, False),
+            ("repeated lines count once", "fn original() {\n    same();\n    same();\n    same();\n}\n", {PARENT_FILE: "fn renamed() {\n    same();\n    other();\n    last();\n}\n"}, False),
+            ("deleted site and zero targets", source, {PARENT_FILE: None}, False),
+            ("two passing files", source, {PARENT_FILE: "// removed\n", MOVED_FILE: good, TWIN_FILE: good}, False),
+            ("two items in one gained file", source, {PARENT_FILE: "// removed\n", MOVED_FILE: good + good.replace("renamed", "another")}, False),
+            ("different crate only", source, {PARENT_FILE: "// removed\n", self.sources[2]: good}, False),
+            ("original file counts beside gained file", source, {PARENT_FILE: "// mapped away\nfn unrelated() {}\n" + good, MOVED_FILE: good}, False),
+        )
+        for index, (name, old, changes, follows) in enumerate(cases):
+            with self.subTest(case=name):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-limit-{index}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: old, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n",
+                                               self.sources[2]: source if name == "old declaration only in another crate" else "// empty\n"})
+                    site_line = 2 if name.startswith("wrong ") else 1
+                    _, (finding_id,) = self.hold_parent(ledger, ((site_line, old.splitlines()[site_line - 1]),), kind="restructure")
+                    _ = self.commit_tip(ledger, changes)
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    if follows:
+                        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                        if isinstance(outcome, style_ledger.DeclarationMoved):
+                            self.assertEqual(outcome.path, PARENT_FILE)
+                    else:
+                        self.assertEqual(self.held_rows(ledger.database), before)
+                        self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                        self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Unfiled())
+                        if isinstance(outcome, style_ledger.OutsideRenameUnresolved):
+                            evidence = outcome.evidence
+                            if name == "deleted site and zero targets":
+                                self.assertIsInstance(evidence.mapped, declarations.UnmappedSite)
+                                self.assertIsInstance(evidence.candidates, style_ledger.NoOutsideCandidates)
+                            elif name == "ambiguous mapped line":
+                                self.assertEqual(evidence.mapped, declarations.UnmappedSite(declarations.MappingFailure.AMBIGUOUS))
+                            elif PARENT_FILE in changes and changes[PARENT_FILE] != "// removed\n":
+                                self.assertIsInstance(evidence.mapped, declarations.MappedDeclaration)
+                            if isinstance(evidence.candidates, style_ledger.OutsideCandidates):
+                                paths = [item.path for item in evidence.candidates.items]
+                                self.assertEqual(paths, sorted(paths))
+                                if MOVED_FILE in changes:
+                                    self.assertIn(MOVED_FILE, paths)
+                                if name == "one of three":
+                                    candidate, = evidence.candidates.items
+                                    self.assertEqual((candidate.unchanged, candidate.old_nonblank_count), (1, 3))
+                                    self.assertIn(style_ledger.OutsideFailure.BODY_FAILED, candidate.checks)
+                                if name == "two passing files":
+                                    self.assertEqual({item.path for item in evidence.candidates.items if not item.checks},
+                                                     {MOVED_FILE, TWIN_FILE})
+        for index, old_elsewhere in enumerate((source, "#[cfg(test)] mod tests {\n" + source + "}\n")):
+            with self.subTest(old_elsewhere=old_elsewhere):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-old-{index}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: old_elsewhere, TWIN_FILE: "// empty\n"})
+                    _, (finding_id,) = self.judge_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: good})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+
+        for filed in (False, True):
+            with self.subTest(preexisting_destination=True, filed=filed):
+                with style_ledger.Ledger(self.repo, self.root / f"outside-preexisting-{filed}.db") as ledger:
+                    _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: good, TWIN_FILE: "// empty\n"})
+                    hold = self.judge_parent if filed else self.hold_parent
+                    _, (finding_id,) = hold(ledger, ((1, "fn original() {"),), kind="restructure")
+                    _ = self.commit_tip(ledger, {PARENT_FILE: None, MOVED_FILE: good + "// edited twin\n"})
+                    before = self.held_rows(ledger.database)
+                    outcome, = self.follow_approved(ledger, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertEqual(self.held_rows(ledger.database), before)
+                    self.assertIn(MOVED_FILE, repr(outcome))
+                    self.assertIn("declaration not gained", repr(outcome))
+
+    def test_children_follow_only_when_their_renamed_owner_is_proven(self) -> None:
+        cases = (
+            ("let", "fn original() {\n    let rows = collect();\n    publish(rows);\n    finish();\n}\n", 2, "rows", True),
+            ("closure", "fn original() {\n    serve(move |answers| {\n        publish(answers);\n    });\n    finish();\n}\n", 2, "answers", True),
+            ("method", "struct Original {\n    value: u32,\n}\nimpl Original {\n    fn child(&self) {\n        first();\n        second();\n    }\n}\n", 5, "child", True),
+            ("trait associated item", "trait Original {\n    const CHILD: u32 = 7;\n    fn child() { first(); }\n}\n", 2, "CHILD", True),
+            ("child renamed", "fn original() {\n    let rows = collect();\n    publish(rows);\n    finish();\n}\n", 2, "rows", False),
+            ("owner still declared", "struct Original {\n    value: u32,\n}\nimpl Original {\n    fn child(&self) { first(); }\n}\n", 5, "child", False),
+            ("call belongs to function", "fn original() {\n    rows();\n    finish();\n}\n", 2, "rows", True),
+            ("shadowed binding", "fn original() {\n    let rows = collect();\n    { let rows = other(); publish(rows); }\n    finish();\n}\n", 2, "rows", False),
+        )
+        for index, (name, source, line, child, follows) in enumerate(cases):
+            for moved in (False, True):
+                with self.subTest(case=name, moved=moved):
+                    with style_ledger.Ledger(self.repo, self.root / f"outside-child-{index}-{moved}.db") as ledger:
+                        _ = self.commit_tip(ledger, {PARENT_FILE: source, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n"})
+                        _, (finding_id,) = self.judge_parent(ledger, ((line, source.splitlines()[line - 1].strip()),),
+                                                           before=child, after="a better name", kind="restructure")
+                        target = source.replace("original", "renamed").replace("Original", "Renamed")
+                        if name == "child renamed":
+                            target = target.replace("rows", "entries")
+                        if name == "owner still declared":
+                            target += "struct Original;\n"
+                        destination = MOVED_FILE if moved else PARENT_FILE
+                        changes: dict[str, str | None] = {PARENT_FILE: "// owner moved\n", destination: target}
+                        tip = self.commit_tip(ledger, changes)
+                        before = self.held_rows(ledger.database)
+                        outcome, = self.follow_approved(ledger, [finding_id])
+                        if follows:
+                            self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+                            row, = ledger.held_findings(style_ledger.AllHeldFindings())
+                            self.assertEqual((row.path, row.line, row.state, row.follow),
+                                             (destination, line, style_ledger.Filed(self.root / "decision.md"),
+                                              style_ledger.FollowedDeclaration(PARENT_FILE, line, tip)))
+                        else:
+                            self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+                            self.assertEqual(self.held_rows(ledger.database), before)
+
+    def test_outside_follow_preserves_existing_follow_authority_and_write_rechecks(self) -> None:
+        ledger = self.ledger()
+        source = "fn original() {\n    first();\n    second();\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, (finding_id,) = self.hold_parent(ledger, ((1, "fn original() {"),), kind="restructure")
+        read = ledger.synced_commit()
+        planned = self.commit_tip(ledger, {PARENT_FILE: source.replace("original", "renamed")})
+        before = self.held_rows(ledger.database)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "synced tip moved"):
+            _ = ledger.follow_declarations([finding_id], read, lambda _: True)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        original_read = declarations.read_declarations
+        changed = False
+
+        def read_during_sync(text: str) -> declarations.DeclaredFile:
+            nonlocal changed
+            if not changed:
+                changed = True
+                _ = self.commit_tip(ledger, {MOVED_FILE: "fn helper() {}\n"})
+            return original_read(text)
+
+        with (mock.patch.object(style_ledger, "read_declarations", read_during_sync),
+              self.assertRaisesRegex(style_ledger.LedgerError, "synced tip moved")):
+            _ = ledger.follow_declarations([finding_id], planned, lambda _: True)
+        self.assertEqual(self.held_rows(ledger.database), before)
+        outcome, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+
+        with style_ledger.Ledger(self.repo, self.root / "outside-row-recheck.db") as other:
+            _ = self.commit_tip(other, {PARENT_FILE: source, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n"})
+            _, (finding_id,) = self.hold_parent(other, ((1, "fn original() {"),), kind="restructure")
+            _ = self.commit_tip(other, {PARENT_FILE: source.replace("original", "renamed")})
+            judged = style_ledger.Ledger.judged_commit
+            wrote = False
+
+            def read_during_row_change(reader: style_ledger.Ledger, finding: style_ledger.HeldFinding) -> style_ledger.JudgedCommit | style_ledger.NoJudgedCommit:
+                nonlocal wrote
+                if not wrote:
+                    wrote = True
+                    with closing(sqlite3.connect(other.database)) as connection, connection:
+                        _ = connection.execute("UPDATE held_findings SET text='fresh request' WHERE finding_id=?", (finding_id,))
+                return judged(reader, finding)
+
+            with mock.patch.object(style_ledger.Ledger, "judged_commit", read_during_row_change):
+                outcome, = self.follow_approved(other, [finding_id])
+            self.assertIsInstance(outcome, style_ledger.DeclarationMoved)
+            row, = other.held_findings(style_ledger.AllHeldFindings())
+            self.assertEqual(row.text, "fresh request")
+
+    def test_live_outside_rename_examples_follow_only_the_two_retained_children(self) -> None:
+        ledger = self.ledger()
+        old_body = ["    let rows = collect();", "    serve(move |answers| publish(answers));"]
+        old_body.extend(f"    step_{index}();" for index in range(50))
+        new_body = old_body[:43] + [f"    replacement_{index}();" for index in range(9)]
+        old_name = "uncached_completed_rows_arrive_before_hierarchy_discovery_is_released"
+        new_name = "uncached_first_publication_respects_its_budget_and_holds_claude_rows"
+        source = f"fn {old_name}() {{\n" + "\n".join(old_body) + "\n}\n"
+        _ = self.commit_tip(ledger, {PARENT_FILE: source})
+        _, ids = self.judge_parent(ledger, ((2, old_body[0].strip()), (3, old_body[1].strip())), kind="restructure")
+        target = f"fn {new_name}() {{\n" + "\n".join(new_body) + "\n}\n"
+        tip = self.commit_tip(ledger, {PARENT_FILE: "// relocated\n" + target})
+        outcomes = self.follow_approved(ledger, list(ids))
+        self.assertEqual([type(outcome) for outcome in outcomes], [style_ledger.DeclarationMoved] * 2)
+        rows = ledger.held_findings(style_ledger.AllHeldFindings())
+        self.assertEqual([(row.finding_id, row.line, row.state, row.follow) for row in rows],
+                         [(finding_id, line + 1, style_ledger.Filed(self.root / "decision.md"),
+                           style_ledger.FollowedDeclaration(PARENT_FILE, line, tip)) for finding_id, line in zip(ids, (2, 3))])
+        cases = (
+            ("device", "fn device_line() { Device::new() }\n", "fn total_line() { Total::new() }\n"),
+            ("CPU test", "fn original() {\n" + "\n".join(f"    check_{i}();" for i in range(8)) + "\n}\n",
+             "fn renamed() {\n" + "\n".join([f"    check_{i}();" for i in range(3)] + [f"    changed_{i}();" for i in range(5)]) + "\n}\n"),
+            ("internal docs count", "struct CratesIoInfo {\n    /// old one\n    a: u32,\n    /// old two\n    b: u32,\n    /// old three\n    /// old four\n    c: u32,\n}\n",
+             "struct CratesIoRelease {\n    /// new one\n    a: u32,\n    /// new two\n    b: u32,\n    /// new three\n    /// new four\n    c: u32,\n}\n"),
+            ("changed keyword", "struct CratesIoFields {\n" + "\n".join(f"    field_{i}: u32," for i in range(9)) + "\n}\n",
+             "enum CratesIoSection {\n    Value,\n}\n"),
+        )
+        for index, (name, old, after) in enumerate(cases):
+            with self.subTest(case=name):
+                with style_ledger.Ledger(self.repo, self.root / f"live-limit-{index}.db") as other:
+                    _ = self.commit_tip(other, {PARENT_FILE: old, MOVED_FILE: "// empty\n", TWIN_FILE: "// empty\n"})
+                    _, (finding_id,) = self.judge_parent(other, ((1, old.splitlines()[0]),), kind="restructure")
+                    destination = PARENT_FILE if name == "changed keyword" else MOVED_FILE
+                    changes: dict[str, str | None] = {PARENT_FILE: after} if destination == PARENT_FILE else {PARENT_FILE: "// removed\n", MOVED_FILE: after}
+                    _ = self.commit_tip(other, changes)
+                    before = self.held_rows(other.database)
+                    outcome, = self.follow_approved(other, [finding_id])
+                    self.assertIsInstance(outcome, style_ledger.OutsideRenameUnresolved)
+                    self.assertEqual(self.held_rows(other.database), before)
+                    self.assertIn(destination, repr(outcome))
+                    if isinstance(outcome, style_ledger.OutsideRenameUnresolved):
+                        if name == "changed keyword":
+                            self.assertEqual(outcome.evidence.mapped, declarations.MappedDeclaration(
+                                PARENT_FILE, 1, declarations.Declaration("enum", "CratesIoSection", declarations.ModuleItem()),
+                            ))
+                        candidates = outcome.evidence.candidates
+                        if isinstance(candidates, style_ledger.OutsideCandidates):
+                            counts = {(item.unchanged, item.old_nonblank_count) for item in candidates.items if item.path == destination}
+                            if name == "changed keyword":
+                                self.assertIn((0, 9), counts)
+                            elif name == "internal docs count":
+                                self.assertIn((3, 7), counts)
+                            elif name == "CPU test":
+                                self.assertIn((3, 8), counts)
+                            elif name == "device":
+                                self.assertIn((0, 1), counts)
+
+        for index, name in enumerate(("account name", "LocalAnswers", "renders_primary_marker")):
+            with self.subTest(case=name):
+                with style_ledger.Ledger(self.repo, self.root / f"live-existing-{index}.db") as other:
+                    if name == "renders_primary_marker":
+                        old = "fn renders_primary_marker() {\n    primary();\n    label();\n}\n"
+                        existing = old.replace("renders_primary_marker", "worktree_entry_label")
+                        target = existing + "// absorbed into the old label function\n"
+                    else:
+                        old = f"struct {name.replace(' ', '_')} {{\n    value: u32,\n}}\n"
+                        existing = old
+                        target = old.replace(name.replace(" ", "_"), "Different")
+                    _ = self.commit_tip(other, {PARENT_FILE: old, MOVED_FILE: existing, TWIN_FILE: "// empty\n"})
+                    _, (finding_id,) = self.judge_parent(other, ((1, old.splitlines()[0]),), kind="restructure")
+                    _ = self.commit_tip(other, {PARENT_FILE: target if name != "renders_primary_marker" else "// removed\n",
+                                              MOVED_FILE: target if name == "renders_primary_marker" else existing})
+                    before = self.held_rows(other.database)
+                    outcome, = self.follow_approved(other, [finding_id])
+                    self.assertNotIsInstance(outcome, style_ledger.DeclarationMoved)
+                    self.assertEqual(self.held_rows(other.database), before)
+
     def test_a_test_module_glob_does_not_block_a_file_level_trait_impl(self) -> None:
         for index, destination in enumerate((PARENT_FILE, MOVED_FILE)):
             with self.subTest(destination=destination):
@@ -2323,8 +3959,11 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         finding_id = self.restructured_parent(ledger)
         _ = self.commit_tip(ledger, {PARENT_FILE: "pub fn other() {}\n"})
+        before = self.held_rows(ledger.database)
         with mock.patch.object(ledger, "_followed_rename", side_effect=AssertionError("no built rename to follow")):
-            self.assert_left(ledger, finding_id, declarations.Declaration("struct", "Parent", declarations.ModuleItem()))
+            left, = self.follow_approved(ledger, [finding_id])
+        self.assertIsInstance(left, style_ledger.OutsideRenameUnresolved)
+        self.assertEqual(self.held_rows(ledger.database), before)
 
     def test_withdraw_duplicates_is_idempotent_refuses_an_open_ticket_and_the_held_list_names_the_duplicate(self) -> None:
         rule, issue, ids = self.decision_findings()
@@ -2380,7 +4019,7 @@ class StyleLedgerTests(unittest.TestCase):
         lines = {line.split("\t")[0]: line.split("\t")[4:] for line in self.cli("held", "list").stdout.splitlines()}
         self.assertEqual(lines, {finding: [text] if text else [] for finding, text in shown.items()})
         # A later state change keeps the reading.
-        ledger.waive_held(not_applied)
+        ledger.waive_held(not_applied, style_ledger.WaiveByPerson("nate"))
         self.assertEqual(ledger.proposal_findings(proposal)[0].reading, style_ledger.ReadByPerson("nate"))
 
     def test_decision_migration_eleven_preserves_version_ten_findings_and_tickets(self) -> None:
@@ -2485,6 +4124,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         recorded: list[tuple[str, str, str, str]] = []
         for rule, path in ((read, self.sources[0]), (structure, module_path)):
+            _ = ledger.hold(rule, path, 1, "Required change", "restructure", "before", "after", self.blob(rule), "outside")
             for verdict in style_ledger.SCOPED_VERDICTS:
                 for scope in style_ledger.DeclaredInputScope:
                     ledger.record(rule, path, base, self.blob(rule), verdict, ticket=f"{verdict}-{scope}",
@@ -2514,7 +4154,7 @@ class StyleLedgerTests(unittest.TestCase):
                          {self.sources[0]: "current", self.sources[1]: "stale"})
         self.assertEqual(next(row for row in ledger.rule_counts(style_ledger.WholeRepository())
                               if row.rule_id == rule).held, 1)
-        outcomes = ledger.decline_findings((finding.finding_id for finding in findings.values()), "declined")
+        outcomes = ledger.decline_findings((finding.finding_id for finding in findings.values()), "declined", style_ledger.WaiveByPerson("user"))
         self.assertIsInstance(outcomes[findings[self.sources[0]].finding_id], style_ledger.CellWaived)
         self.assertIsInstance(outcomes[findings[self.sources[1]].finding_id], style_ledger.InputChangedSinceJudged)
 
@@ -2547,6 +4187,7 @@ class StyleLedgerTests(unittest.TestCase):
             (structure, "crates/alpha", "exception"),
             (crate_read, self.sources[0], "fixed"), (crate_read, self.sources[1], "waived"),
         )
+        _ = ledger.hold(manifest, "crates/alpha", 1, "Change manifest", "restructure", "before", "after", self.blob(manifest), "outside")
         for rule, path, verdict in cells:
             ledger.record(rule, path, self.initial_tip, self.blob(rule), verdict)
         with closing(sqlite3.connect(ledger.database)) as connection:
@@ -2621,6 +4262,201 @@ class StyleLedgerTests(unittest.TestCase):
         cell = next(cell for cell in status["cells"] if cell["rule"] == rule and cell["path"] == self.sources[0])
         self.assertEqual(cell["state"], "current")
 
+    def test_rule_reads_stays_current_after_unrelated_crate_and_module_changes(self) -> None:
+        crate_rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        module_rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        module_path, _, _, base = self.structure_module()
+        self.set_tip(base)
+        for rule, path in ((crate_rule, self.sources[0]), (module_rule, module_path)):
+            _ = self.ledger().hold(rule, path, 1, "Required change", "restructure", "before", "after",
+                                   self.blob(rule), "outside")
+        self.write("crates/alpha/src/added.rs", "pub fn added() {}\n")
+        self.write("crates/alpha/src/theme/added.rs", "pub fn added() {}\n")
+        self.set_tip(self.commit("Change unrelated crate and module files"))
+        for rule, path in ((crate_rule, self.sources[0]), (module_rule, module_path)):
+            for verdict in style_ledger.SCOPED_VERDICTS:
+                with self.subTest(rule=rule, verdict=verdict):
+                    self.record_reads(rule, path, base, (self.sources[1],), verdict=verdict, ticket=verdict)
+                    self.assertEqual(self.states(rule)[path], "current")
+
+    def test_rule_reads_becomes_stale_when_own_file_changes(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        self.record_reads(rule, self.sources[0], self.initial_tip, (self.sources[1],))
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.set_tip(self.commit("Change judged file"))
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+
+    def test_rule_reads_becomes_stale_when_read_file_changes(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        self.record_reads(rule, self.sources[0], self.initial_tip, (self.sources[1],))
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.set_tip(self.commit("Change read file"))
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+
+    def test_rule_reads_becomes_stale_when_read_file_is_deleted(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        self.record_reads(rule, self.sources[0], self.initial_tip, (self.sources[1],))
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        (self.repo / self.sources[1]).unlink()
+        self.set_tip(self.commit("Delete read file"))
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+
+    def test_rule_reads_awaiting_merge_uses_only_named_files(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        _ = self.cli("set-tip", "--tip", self.initial_tip, "--style-branch", "style/main")
+        _ = self.git("checkout", "-q", "-b", "style/main")
+        self.write(self.sources[0], "pub fn checked() {}\n")
+        checked = self.commit("Change judged file on style branch")
+        self.record_reads(rule, self.sources[0], checked, (self.sources[1],))
+        self.write("crates/alpha/src/added.rs", "pub fn unrelated() {}\n")
+        style_tip = self.commit("Advance style branch unrelated file")
+        self.assertEqual(self.states(rule)[self.sources[0]], "awaiting merge")
+        self.set_tip(style_tip)
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        _ = self.commit("Advance style branch read file")
+        self.set_tip(self.initial_tip)
+        self.assertEqual(self.states(rule)[self.sources[0]], "stale")
+
+    def test_rule_reads_judged_at_base_uses_only_named_files(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        self.record_reads(rule, self.sources[0], self.initial_tip, (self.sources[1],))
+        self.write("crates/alpha/src/added.rs", "pub fn unrelated() {}\n")
+        base = self.commit("Advance unit base unrelated file")
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        changed = self.commit("Change read file at synced tip")
+        self.set_tip(changed)
+        cell = next(cell for cell in self.cells(rule) if cell.path == self.sources[0])
+        self.assertEqual(cell.state, "stale")
+        ledger = self.ledger()
+        self.assertEqual(ledger.judged_at_base((cell,), base), (cell,))
+        self.assertEqual(ledger.judged_at_base((cell,), changed), ())
+
+    def test_rule_reads_checkpoint_keeps_named_files_for_later_comparisons(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        path = self.sources[0]
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), self.initial_tip)
+        self.record_reads(rule, path, self.initial_tip, (self.sources[1],), ticket="names-1")
+        self.write(path, "pub fn ticket_changed() {}\n")
+        checkpoint = self.commit("Ticket edit")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        self.write("crates/alpha/src/added.rs", "pub fn unrelated() {}\n")
+        ledger.set_tip(self.commit("Unrelated change after checkpoint"), "main")
+        self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[path], "current")
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        ledger.set_tip(self.commit("Read file change after checkpoint"), "main")
+        self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[path], "stale")
+
+    def test_rule_reads_latest_declared_scope_supersedes_old_file_verdict(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        path = self.sources[0]
+        self.set_tip(self.initial_tip)
+        self.record(rule, path, self.initial_tip, input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.record_reads(rule, path, self.initial_tip, (self.sources[1],))
+        self.write(self.sources[1], "pub fn changed() {}\n")
+        self.set_tip(self.commit("Change named read after scope declaration"))
+        self.assertEqual(self.states(rule)[path], "stale")
+        self.record(rule, path, self.initial_tip, input_scope=style_ledger.DeclaredInputScope.FILE)
+        self.assertEqual(self.states(rule)[path], "current")
+
+    def test_rule_reads_requires_rule_scope_and_scoped_verdict(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        for scope, verdict, message in (
+            ((), "clean", "--reads requires --input-scope rule"),
+            (("--input-scope", "file"), "clean", "--reads requires --input-scope rule"),
+            (("--input-scope", "rule"), "fixed", "fixed: --reads requires clean, exception or held"),
+            (("--input-scope", "rule"), "waived", "waived: --reads requires clean, exception or held"),
+        ):
+            with self.subTest(scope=scope, verdict=verdict):
+                result = self.cli(
+                    "record", "--rule", rule, "--path", self.sources[0], "--commit", self.initial_tip,
+                    "--rule-blob", self.blob(rule), "--verdict", verdict, "--ticket", "outside", "--worker", "test",
+                    *scope, "--reads", self.sources[1], success=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stderr.strip(), f"style_ledger: {message}")
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM judgments").fetchone(), (0,))
+
+    def test_rule_reads_rejects_file_manifest_and_crate_cells(self) -> None:
+        file_rule = self.rule("file")
+        manifest_rule = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
+        crate_rule = self.rule("crate", "tier: D\nfamily: modules\ninput_scope: file\n")
+        for rule, path in ((file_rule, self.sources[0]), (manifest_rule, "crates/alpha"), (crate_rule, "crates/alpha")):
+            with self.subTest(rule=rule, path=path):
+                result = self.cli(
+                    "record", "--rule", rule, "--path", path, "--commit", self.initial_tip,
+                    "--rule-blob", self.blob(rule), "--verdict", "clean", "--ticket", "outside", "--worker", "test",
+                    "--input-scope", "rule", "--reads", self.sources[1], success=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    result.stderr.strip(),
+                    f"style_ledger: {rule}: {path}: --reads requires a crate or module cell of an included Rust file",
+                )
+
+    def test_rule_reads_rejects_path_missing_at_recorded_commit(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        missing = "crates/alpha/src/not_committed.rs"
+        self.write(missing, "pub fn uncommitted() {}\n")
+        result = self.cli(
+            "record", "--rule", rule, "--path", self.sources[0], "--commit", self.initial_tip,
+            "--rule-blob", self.blob(rule), "--verdict", "clean", "--ticket", "outside", "--worker", "test",
+            "--input-scope", "rule", "--reads", missing, success=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr.strip(), f"style_ledger: {missing}: no file at {self.initial_tip}")
+
+    def test_rule_reads_normalizes_paths_and_ignores_order_duplicates_and_own_path(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        self.set_tip(self.initial_tip)
+        self.record_reads(rule, self.sources[0], self.initial_tip, (self.sources[1], self.sources[2]), ticket="first")
+        self.record_reads(rule, self.sources[0], self.initial_tip,
+                          (self.sources[2], "./" + self.sources[1], self.sources[1], self.sources[0]),
+                          ticket="second")
+        with closing(sqlite3.connect(self.ledger().database)) as connection:
+            rows = cast(list[tuple[str, str]], connection.execute(
+                "SELECT declared_scope,input_fingerprint FROM judgments ORDER BY id").fetchall())
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], rows[1])
+        self.assertEqual(rows[0][0], "rule")
+        self.assertEqual(self.states(rule)[self.sources[0]], "current")
+
+    def test_rule_reads_migration_eighteen_preserves_schema_seventeen_crate_judgments(self) -> None:
+        rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
+        database = self.root / "version-seventeen.sqlite"
+        with closing(sqlite3.connect(database)) as connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number <= 17:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (17)")
+            _ = connection.execute(
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,'
+                + 'verdict_detail,ticket,worker,recorded_at,declared_scope) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                (rule, self.blob(rule), "crate", self.git("rev-parse", f"{self.initial_tip}:crates/alpha"),
+                 self.sources[0], self.initial_tip, "clean", "old detail", "old-ticket", "test", "2026-01-01", "rule"))
+            connection.commit()
+        with style_ledger.Ledger(self.repo, database) as ledger:
+            with closing(sqlite3.connect(database)) as connection:
+                self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
+            ledger.set_tip(self.initial_tip)
+            self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[self.sources[0]], "current")
+            self.write(self.sources[1], "pub fn changed() {}\n")
+            ledger.set_tip(self.commit("Change old judgment crate inputs"))
+            self.assertEqual({cell.path: cell.state for cell in ledger.cells(rule=rule)}[self.sources[0]], "stale")
+
     def test_file_scope_verdict_migration_ten_keeps_version_nine_rows_unmarked(self) -> None:
         rule = self.rule("read", "tier: C\nfamily: types\ninput_scope: crate\n")
         database = self.root / "version-nine.sqlite3"
@@ -2642,7 +4478,7 @@ class StyleLedgerTests(unittest.TestCase):
                 rows = cast(list[tuple[str, str, str]], connection.execute(
                     "SELECT path,declared_scope,verdict_detail FROM judgments ORDER BY id").fetchall())
                 version = cast(tuple[int], connection.execute("SELECT version FROM schema_version").fetchone())
-            self.assertEqual(version, (17,))
+            self.assertEqual(version, (max(style_ledger.MIGRATIONS),))
             self.assertEqual(rows, [(path, "rule", "original detail") for path in self.sources[:2]])
             self.write(self.sources[1], "pub fn sibling_changed() {}\n")
             ledger.set_tip(self.commit("Change sibling after migration"))
@@ -2709,6 +4545,9 @@ class StyleLedgerTests(unittest.TestCase):
     def test_latest_held_judgments_selects_each_cells_latest_commit_and_excludes_later_non_held_verdicts(self) -> None:
         rule = self.rule("read")
         other_rule = self.rule("other-read")
+        ledger = self.ledger()
+        for held_rule, path in ((rule, self.sources[0]), (rule, self.sources[1]), (other_rule, self.sources[0])):
+            _ = ledger.hold(held_rule, path, 1, "Required rename", "rename", "value", "amount", self.blob(held_rule), "outside")
         self.record(rule, self.sources[0], self.initial_tip, "held")
         self.record(rule, self.sources[1], self.initial_tip, "held")
         self.record(other_rule, self.sources[0], self.initial_tip, "held")
@@ -2767,6 +4606,113 @@ class StyleLedgerTests(unittest.TestCase):
             scopes = cast(list[tuple[str]], connection.execute("SELECT DISTINCT input_scope FROM judgments").fetchall())
         self.assertEqual(scopes, [("module",)])
 
+    def comment_scope_rules(self) -> tuple[str, str, str, str, str]:
+        """A modules rule at file, module and crate scope, a names rule, and the module file they share a crate with."""
+        file_rule = self.rule("file-layout", "tier: C\nfamily: modules\ninput_scope: file\n")
+        module_rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        crate_rule = self.rule("crate-layout", "tier: C\nfamily: modules\ninput_scope: crate\n")
+        names_rule = self.rule("naming", "tier: C\nfamily: names\ninput_scope: file\n")
+        path, _, _, base = self.structure_module()
+        self.set_tip(base)
+        for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0]), (names_rule, self.sources[0])):
+            self.record(rule, judged, base)
+        return file_rule, module_rule, crate_rule, names_rule, path
+
+    def comment_only_change(self, relative: str) -> None:
+        content = (self.repo / relative).read_text()
+        self.write(relative, "// A note.\n/// Returns the value.\n" + content.replace("{ 1 }", "{\n    // One.\n    1\n}"))
+
+    def test_a_modules_cell_stays_current_after_a_comment_only_change_at_each_scope(self) -> None:
+        file_rule, module_rule, crate_rule, _, path = self.comment_scope_rules()
+        for relative in (self.sources[0], self.sources[1], path, "crates/alpha/src/theme/mod.rs", "crates/alpha/src/theme.rs"):
+            self.comment_only_change(relative)
+        self.set_tip(self.commit("Change comments only"))
+        for rule, judged in ((file_rule, self.sources[0]), (module_rule, path), (crate_rule, self.sources[0])):
+            with self.subTest(rule=rule):
+                self.assertEqual(self.states(rule)[judged], "current")
+
+    def test_a_names_cell_goes_stale_after_a_comment_only_change(self) -> None:
+        _, _, _, names_rule, _ = self.comment_scope_rules()
+        self.comment_only_change(self.sources[0])
+        self.set_tip(self.commit("Change comments only"))
+        self.assertEqual(self.states(names_rule)[self.sources[0]], "stale")
+
+    def test_a_modules_cell_goes_stale_after_a_code_inner_doc_file_set_or_manifest_change(self) -> None:
+        file_rule, module_rule, crate_rule, _, path = self.comment_scope_rules()
+        sibling = "crates/alpha/src/theme/mod.rs"
+        library = (self.repo / self.sources[0]).read_text()
+        changes: tuple[tuple[str, str, str, str, str | None], ...] = (
+            ("code", module_rule, path, sibling, "pub fn changed() {}\n"),
+            ("inner line doc", module_rule, path, sibling, "//! Theme values.\npub fn changed() {}\n"),
+            ("inner block doc", file_rule, self.sources[0], self.sources[0], "/*! The alpha crate. */\n" + library),
+            ("added file", module_rule, path, "crates/alpha/src/theme/added.rs", "pub fn added() {}\n"),
+            ("manifest", crate_rule, self.sources[0], "crates/alpha/Cargo.toml",
+             (self.repo / "crates/alpha/Cargo.toml").read_text() + "# A note.\n"),
+            ("removed file", crate_rule, self.sources[0], self.sources[1], None),
+            ("removed module file", module_rule, path, "crates/alpha/src/theme.rs", None),
+        )
+        tip = self.git("rev-parse", "HEAD")
+        for label, rule, judged, relative, content in changes:
+            with self.subTest(change=label):
+                self.record(rule, judged, tip)
+                if content is None:
+                    (self.repo / relative).unlink()
+                else:
+                    self.write(relative, content)
+                tip = self.commit(f"Change {label}")
+                self.set_tip(tip)
+                self.assertEqual(self.states(rule)[judged], "stale")
+
+    def test_a_modules_cell_goes_stale_when_an_inner_doc_moves_to_another_module_block(self) -> None:
+        file_rule, _, _, _, _ = self.comment_scope_rules()
+        blocks = "mod alpha {{\n{}    pub fn a() {{}}\n}}\nmod beta {{\n{}    pub fn b() {{}}\n}}\n"
+        doc = "    //! Alpha facade.\n"
+        self.write(self.sources[0], blocks.format(doc, ""))
+        tip = self.commit("Document the alpha block")
+        self.set_tip(tip)
+        self.record(file_rule, self.sources[0], tip)
+        self.write(self.sources[0], blocks.format("", doc))
+        self.set_tip(self.commit("Move the inner doc to the beta block"))
+        self.assertEqual(self.states(file_rule)[self.sources[0]], "stale")
+
+    def test_a_modules_cell_goes_stale_after_a_mode_or_submodule_change_beside_a_comment_edit(self) -> None:
+        _, _, crate_rule, _, _ = self.comment_scope_rules()
+        submodule = self.repo / "crates/alpha/vendored"
+        submodule.mkdir()
+
+        def submodule_commit(message: str) -> None:
+            _ = subprocess.run(["git", "-C", str(submodule), "-c", "user.name=Ledger tests", "-c",
+                                "user.email=ledger-tests@example.invalid", "commit", "-q", "--allow-empty", "-m", message],
+                               check=True, capture_output=True)
+
+        _ = subprocess.run(["git", "-C", str(submodule), "init", "-q"], check=True, capture_output=True)
+        submodule_commit("First")
+        tip = self.commit("Add a submodule")
+        self.assertIn("160000 commit", self.git("ls-tree", tip, "crates/alpha/vendored"))
+        changes: tuple[tuple[str, Callable[[], None]], ...] = (
+            ("submodule pointer", lambda: submodule_commit("Second")),
+            ("manifest mode", lambda: (self.repo / "crates/alpha/Cargo.toml").chmod(0o755)),
+            ("Rust file mode", lambda: (self.repo / self.sources[1]).chmod(0o755)),
+        )
+        for label, change in changes:
+            with self.subTest(change=label):
+                self.set_tip(tip)
+                self.record(crate_rule, self.sources[0], tip)
+                change()
+                self.comment_only_change(self.sources[0])
+                tip = self.commit(f"Change {label} and a comment")
+                self.set_tip(tip)
+                self.assertEqual(self.states(crate_rule)[self.sources[0]], "stale")
+
+    def test_a_modules_judgment_with_reads_stays_current_after_a_comment_only_change_in_a_read(self) -> None:
+        rule = self.rule("structure", "tier: D\nfamily: modules\n")
+        path, _, _, base = self.structure_module()
+        self.set_tip(base)
+        self.record_reads(rule, path, base, (self.sources[1],))
+        self.comment_only_change(self.sources[1])
+        self.set_tip(self.commit("Change comments in a read file"))
+        self.assertEqual(self.states(rule)[path], "current")
+
     def test_legacy_structure_crate_key_carries_over_without_rewriting_the_row(self) -> None:
         rule = self.rule("structure", "tier: D\nfamily: modules\n")
         path, sibling, _, base = self.structure_module()
@@ -2811,7 +4757,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.insert_legacy_structure_judgment(rule, path, base, "held")
         self.write("crates/alpha/src/unrelated/item.rs", "pub fn unrelated() {}\n")
         self.set_tip(self.commit("Change outside held module"))
-        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined")[finding.finding_id], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[finding.finding_id], style_ledger.CellWaived)
         self.assertEqual(self.states(rule)[path], "current")
 
     def test_structure_row_with_an_unresolvable_commit_counts_as_changed(self) -> None:
@@ -2825,17 +4771,17 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute('UPDATE judgments SET "commit"=?', ("0" * 40,))
             connection.commit()
         self.assertEqual(self.states(rule)[path], "stale")
-        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined")[finding.finding_id], style_ledger.InputChangedSinceJudged)
+        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[finding.finding_id], style_ledger.InputChangedSinceJudged)
 
     def test_structure_crate_and_manifest_cells_retain_their_original_keys(self) -> None:
         crate_rule = self.rule("structure", "tier: D\nfamily: modules\n")
         manifest_rule = self.rule("manifests", "tier: D\nfamily: modules\ninput_scope: manifest\n")
         self.set_tip(self.initial_tip)
-        self.record(crate_rule, "crates/alpha", self.initial_tip, "held")
-        self.record(manifest_rule, "crates/alpha", self.initial_tip)
         ledger = self.ledger()
         finding = ledger.hold(crate_rule, "crates/alpha", 1, "Split crate", "restructure",
                               "before", "after", self.blob(crate_rule), "outside")
+        self.record(crate_rule, "crates/alpha", self.initial_tip, "held")
+        self.record(manifest_rule, "crates/alpha", self.initial_tip)
         self.write(self.sources[1], "pub fn changed() {}\n")
         self.set_tip(self.commit("Change crate source"))
         with closing(sqlite3.connect(ledger.database)) as connection:
@@ -2844,7 +4790,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(stored[0], (crate_rule, "crate", self.git("rev-parse", f"{self.initial_tip}:crates/alpha")))
         self.assertEqual(stored[1][1], "manifest")
         self.assertEqual(self.states(manifest_rule)["crates/alpha"], "current")
-        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined")[finding.finding_id], style_ledger.InputChangedSinceJudged)
+        self.assertIsInstance(ledger.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user"))[finding.finding_id], style_ledger.InputChangedSinceJudged)
         self.write("crates/alpha/Cargo.toml", (self.repo / "crates/alpha/Cargo.toml").read_text() + "\n[features]\nextra = []\n")
         self.set_tip(self.commit("Change workspace manifest"))
         self.assertEqual(self.states(manifest_rule)["crates/alpha"], "stale")
@@ -2861,7 +4807,7 @@ class StyleLedgerTests(unittest.TestCase):
             ledger.record(rule, self.sources[1], self.initial_tip, "", "clean", ticket="modules-1")
         ledger.record(rule, self.sources[0], self.initial_tip, "", "clean", ticket="modules-1",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
-        self.assertEqual(ledger.unjudged_ticket_cells("modules-1"), ())
+        self.assertEqual(ledger.unjudged_ticket_cells("modules-1", "HEAD", self.in_worktree), ())
         with self.assertRaisesRegex(style_ledger.LedgerError, "different fields"):
             ledger.ticket_add("modules-1", "modules", "structure", "modules", "crates/alpha",
                               list(self.sources[:2]), [rule], cells=((rule, self.sources[1]),))
@@ -2877,6 +4823,9 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection:
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN cells")
             _ = connection.execute("ALTER TABLE judgments DROP COLUMN declared_scope")
+            _ = connection.execute("ALTER TABLE judgments DROP COLUMN read_files")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waive_provenance")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waived_by")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN build_ticket")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN moved_from")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN withdrawn_by")
@@ -2889,11 +4838,15 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN declaration_gone_at")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
+            _ = connection.execute("DROP TABLE ticket_widened_paths")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
         self.assertEqual(migrated.ticket_open("modules")[0]["cells"], [])
-        self.assertEqual(migrated.unjudged_ticket_cells("modules-1"), (style_ledger.UnjudgedTicketCell(rule, "crates/alpha"),))
+        self.assertEqual(migrated.unjudged_ticket_cells("modules-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, "crates/alpha"),))
         migrated.record(rule, "crates/alpha", self.initial_tip, "", "clean", ticket="modules-1")
         migrated.ticket_checkpoint("modules-1", self.initial_tip)
         self.assertEqual(migrated.ticket_open("modules")[0]["state"], "checkpointed")
@@ -2907,13 +4860,12 @@ class StyleLedgerTests(unittest.TestCase):
                  for path in self.sources[:2]]
         for path in self.sources[:2]:
             self.record(rule, path, self.initial_tip, "held")
-        self.assertIsInstance(ledger.decline_findings((holds[0].finding_id,), "declined")[holds[0].finding_id], style_ledger.CellWaived)
+        self.assertIsInstance(ledger.decline_findings((holds[0].finding_id,), "declined", style_ledger.WaiveByPerson("user"))[holds[0].finding_id], style_ledger.CellWaived)
         progress = next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule)
         self.assertEqual((progress.current, progress.held), (2, 1))
         self.write(self.sources[0], "pub fn changed() {}\n")
         self.set_tip(self.commit("Change a crate input"))
         self.assertEqual(self.states(rule), {**dict.fromkeys(self.sources[:2], "stale"), **dict.fromkeys(self.sources[2:], "open")})
-
 
     def test_structure_file_scope_keys_rust_modules_and_preserves_non_rust_site_fingerprints(self) -> None:
         rule = self.rule("structure-sites", "tier: D\nfamily: modules\ninput_scope: file\ncandidates:\n"
@@ -2967,10 +4919,12 @@ class StyleLedgerTests(unittest.TestCase):
         process = self.rule("process", "tier: E\n")
         _ = self.rule("legacy", "mechanism: llm\n")
         self.set_tip(self.initial_tip)
+        _ = self.hold_finding(read, 1)
         self.record(read, self.sources[0], self.initial_tip, "held")
         self.record(read, self.sources[1], self.initial_tip)
         for path in self.sources:
             self.record(partial, path, self.initial_tip)
+        _ = self.hold_finding(partial + "#uncovered", 1)
         self.record(partial + "#uncovered", self.sources[0], self.initial_tip, "held")
         self.write(self.sources[1], "pub fn value() -> u32 { 2 }\n")
         main_tip = self.commit("Make judged inputs stale")
@@ -2978,6 +4932,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.git("checkout", "-qb", "style/main")
         self.write(self.sources[2], "pub fn corrected() {}\n")
         pending_tip = self.commit("Judge a pending style correction")
+        _ = self.ledger().hold(read, self.sources[2], 1, "Required rename", "rename", "corrected", "value", self.blob(read), "outside")
         self.record(read, self.sources[2], pending_tip, "held")
         ledger = self.ledger()
 
@@ -3094,6 +5049,7 @@ class StyleLedgerTests(unittest.TestCase):
             + "  kind: regex\n  pattern: value\n  surface: partial\n  uncovered: other sites\n",
         )
         self.set_tip(self.initial_tip)
+        _ = self.hold_finding(partial + "#uncovered", 1)
         for path in self.sources:
             self.record(partial + "#uncovered", path, self.initial_tip,
                         "held" if path == self.sources[0] else "clean")
@@ -3434,7 +5390,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(17,)])
+        self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_file_judgment_becomes_stale_only_for_changed_committed_file(self) -> None:
@@ -3554,6 +5510,7 @@ class StyleLedgerTests(unittest.TestCase):
     def test_exception_held_and_waived_expire_when_their_input_changes(self) -> None:
         rule_id = self.rule("read")
         self.set_tip(self.initial_tip)
+        _ = self.ledger().hold(rule_id, self.sources[1], 1, "Required rename", "rename", "value", "amount", self.blob(rule_id), "outside")
         for path, verdict in zip(self.sources, ("exception", "held", "waived")):
             self.record(rule_id, path, self.initial_tip, verdict, detail="Reviewed decision")
         self.assertEqual(self.states(rule_id), {
@@ -3652,6 +5609,7 @@ class StyleLedgerTests(unittest.TestCase):
     def test_rerecording_older_ticket_selects_its_newest_verdict(self) -> None:
         rule_id = self.rule("read")
         self.set_tip(self.initial_tip)
+        _ = self.hold_finding(rule_id, 1, ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
         self.record(rule_id, self.sources[0], self.initial_tip, "clean", ticket="B")
         self.record(rule_id, self.sources[0], self.initial_tip, "held", ticket="A")
@@ -3864,7 +5822,6 @@ class StyleLedgerTests(unittest.TestCase):
             (local_id, path) for path in self.sources[:2]
         })
 
-
     def test_checkpoint_restamps_own_family_verdicts_after_only_ticket_edits_and_refill_does_not_reissue(self) -> None:
         rule = self.rule("read")
         path = self.sources[0]
@@ -3980,7 +5937,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         finding = ledger.hold(rule, path, 1, "Rename value", "rename", "value", "amount", self.blob(rule), "outside")
         ledger.record(rule, path, self.initial_tip, self.blob(rule), "held", ticket="outside")
-        self.record_while_stalled("_fingerprint", lambda writer: writer.decline_findings((finding.finding_id,), "declined"))
+        self.record_while_stalled("_fingerprint", lambda writer: writer.decline_findings((finding.finding_id,), "declined", style_ledger.WaiveByPerson("user")))
         self.assertIsInstance(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Waived)
         self.assertIsInstance(ledger.newest_held_judgment(rule, path), style_ledger.NoHeldJudgment)
 
@@ -4071,6 +6028,341 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(checkpoint, "main")
         self.assertEqual(self.states(rule)[path], "stale")
 
+    def removed_ticket(self) -> tuple[style_ledger.Ledger, str, str]:
+        """An assigned names-1 read ticket on the first two sources under a crate-scope rule, started at the initial tip."""
+        rule = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", list(self.sources[:2]), [rule])
+        ledger.ticket_assign("names-1", "main")
+        return ledger, rule, ledger.ticket_base("names-1")
+
+    def record_removed(self, ledger: style_ledger.Ledger, rule: str, path: str, commit: str, ticket: str = "names-1") -> None:
+        ledger.record(rule, path, commit, self.blob(rule), "removed", ticket=ticket, worker="test-worker")
+
+    def cell_rows(self, ledger: style_ledger.Ledger, path: str) -> list[tuple[str, str]]:
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            return cast(list[tuple[str, str]], connection.execute(
+                'SELECT "commit",verdict FROM judgments WHERE path=? ORDER BY id', (path,)).fetchall())
+
+    def test_removed_cell_keeps_the_deleting_commit_and_closes_the_cell_without_a_verdict_on_code(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, removed = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        self.record(rule, removed, self.initial_tip, ticket="earlier-1")
+        (self.repo / removed).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.write("README.md", "Ticket work after the delete\n")
+        checkpoint = self.commit("Ticket checkpoint")
+        self.assertEqual(ledger.unjudged_ticket_cells("names-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, removed),))
+
+        self.record_removed(ledger, rule, removed, checkpoint)
+
+        state = f"removed by ticket names-1 at {deleting[:7]}"
+        expected = style_ledger.RemovedCell(rule=rule, path=removed, commit=deleting, state=state)
+        opened = cast(dict[str, object], json.loads(self.cli("ticket", "open", "--unit", "names").stdout))
+        self.assertEqual(opened["removed"], [dict(expected)])
+        self.assertEqual(ledger.ticket_open("names")[0]["removed"], (expected,))
+        self.assertIn(f"{rule} {removed}: {state}", coverage_report.ticket_line(ledger.ticket_open("names")[0]).splitlines())
+        self.assertEqual(ledger.unjudged_ticket_cells("names-1", "HEAD", self.in_worktree), ())
+
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        _ = ledger.ticket_merge("names-1")
+        ledger.set_tip(checkpoint, "main")
+        # The restamp carries the kept verdict to the checkpoint and leaves the removed row at its deleting commit.
+        self.assertEqual(self.cell_rows(ledger, removed), [(self.initial_tip, "clean"), (deleting, "removed")])
+        self.assertEqual(self.cell_rows(ledger, kept), [(self.initial_tip, "clean"), (checkpoint, "clean")])
+        self.assertEqual(self.states(rule), {kept: "current", self.sources[2]: "open", self.sources[3]: "open"})
+
+        # A file at the same path later is a new cell: the verdict of the file before the delete does not judge it.
+        self.write(removed, "pub fn value() -> u32 { 1 }\n")
+        ledger.set_tip(self.commit("Bring the file back"), "main")
+        self.assertEqual(self.states(rule)[removed], "open")
+
+    def test_checkpoint_names_a_cell_neither_recorded_nor_removed(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        for path in self.sources[:2]:
+            (self.repo / path).unlink()
+        checkpoint = self.commit("Ticket deletes both files")
+        self.record_removed(ledger, rule, self.sources[0], checkpoint)
+        # The style branch holds the delete and the synced tip does not, so the cell awaits merge; it is not current.
+        self.assertEqual({path: self.states(rule)[path] for path in self.sources[:2]},
+                         {self.sources[0]: "awaiting merge", self.sources[1]: "open"})
+        counts = next(row for row in ledger.rule_counts(style_ledger.WholeRepository()) if row.rule_id == rule)
+        self.assertEqual((counts.current, counts.awaiting_merge, counts.held), (0, 1, 0))
+        refused = self.cli("ticket", "checkpoint", "--id", "names-1", "--commit", checkpoint, success=False)
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertEqual(refused.stderr.strip(), f"style_ledger: names-1: unjudged cells: {rule} {self.sources[1]}")
+        self.record_removed(ledger, rule, self.sources[1], checkpoint)
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        self.assertEqual(ledger.ticket_open("names")[0]["state"], "checkpointed")
+
+    def test_a_verdict_recorded_after_a_removal_on_an_older_commit_does_not_judge_the_file_brought_back(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.record_removed(ledger, rule, path, deleting)
+        # The late verdict judges the file before the delete; the order of recording does not move the removal.
+        self.record(rule, path, self.initial_tip, ticket="earlier-1")
+        self.write(path, original)
+        ledger.set_tip(self.commit("Bring the same file back"), "main")
+        self.assertEqual(self.states(rule)[path], "open")
+
+    def test_removed_keeps_the_deleting_commit_and_not_a_later_merge_of_other_work(self) -> None:
+        ledger, rule, base = self.removed_ticket()
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        _ = self.git("checkout", "-q", "-b", "side", base)
+        self.write("README.md", "Side work\n")
+        _ = self.commit("Side work keeps the file")
+        _ = self.git("checkout", "-q", "main")
+        # The merge differs from its second parent at the path, but its diff against its first parent deletes nothing.
+        _ = self.git("merge", "--no-ff", "-q", "side", "-m", "Bring in side work")
+        self.record_removed(ledger, rule, path, "HEAD")
+        self.assertEqual(self.cell_rows(ledger, path), [(deleting, "removed")])
+
+    def test_removed_records_an_own_delete_of_a_file_that_merged_in_work_edited_and_prints_its_line(self) -> None:
+        ledger, rule, base = self.removed_ticket()
+        path = self.sources[1]
+        _ = self.git("checkout", "-q", "-b", "outside", base)
+        self.write(path, "pub fn edited_outside() {}\n")
+        _ = self.commit("Outside work edits the file")
+        _ = self.git("checkout", "-q", "main")
+        # The normal sync: a first-parent merge brings the outside edit onto the ticket branch.
+        _ = self.git("merge", "--no-ff", "-q", "outside", "-m", "Bring in outside work")
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        recorded = self.cli("record", "--rule", rule, "--path", path, "--commit", "HEAD", "--rule-blob", self.blob(rule),
+                            "--verdict", "removed", "--ticket", "names-1", "--worker", "test-worker")
+        self.assertEqual(recorded.stdout, f"{rule} {path}: removed by ticket names-1 at {deleting[:7]}\n")
+        self.assertEqual(self.cell_rows(ledger, path), [(deleting, "removed")])
+
+    def test_checkpoint_names_a_removed_cell_whose_file_is_back(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.record_removed(ledger, rule, path, deleting)
+        self.write(path, original)
+        restored = self.commit("Ticket brings the file back")
+        self.assertEqual(ledger.unjudged_ticket_cells("names-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, path),))
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: unjudged cells: {re.escape(rule)} {re.escape(path)}$"):
+            ledger.ticket_checkpoint("names-1", restored)
+        self.record(rule, path, restored, ticket="names-1")
+        ledger.ticket_checkpoint("names-1", restored)
+        self.assertEqual(ledger.ticket_open("names")[0]["state"], "checkpointed")
+
+    def test_checkpoint_does_not_count_a_verdict_of_the_ticket_on_a_commit_before_its_removal(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        self.record_removed(ledger, rule, path, deleting)
+        # The ticket's newest row judges the file before the delete, so coverage reads the file brought back as open.
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, original)
+        restored = self.commit("Ticket brings the file back")
+        ledger.set_tip(restored, "main")
+        self.assertEqual(self.states(rule)[path], "open")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: unjudged cells: {re.escape(rule)} {re.escape(path)}$"):
+            ledger.ticket_checkpoint("names-1", restored)
+
+    def removed_by_another_ticket(self) -> tuple[style_ledger.Ledger, str, str, str]:
+        """names-1 judges both sources at the initial tip; other-names-1 deletes the second source, and the file comes back."""
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        for source in (kept, path):
+            self.record(rule, source, self.initial_tip, ticket="names-1")
+        ledger.ticket_add("other-names-1", "other-names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("other-names-1", "main")
+        _ = ledger.ticket_base("other-names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        self.record_removed(ledger, rule, path, self.commit("Another ticket deletes the file"), ticket="other-names-1")
+        self.write(path, original)
+        return ledger, rule, path, self.commit("The file comes back")
+
+    def test_checkpoint_counts_a_removal_by_another_ticket(self) -> None:
+        ledger, rule, path, restored = self.removed_by_another_ticket()
+        ledger.set_tip(restored, "main")
+        self.assertEqual(self.states(rule)[path], "open")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: unjudged cells: {re.escape(rule)} {re.escape(path)}$"):
+            ledger.ticket_checkpoint("names-1", restored)
+
+    def test_restamp_does_not_carry_a_verdict_across_a_removal_by_another_ticket(self) -> None:
+        ledger, rule, path, restored = self.removed_by_another_ticket()
+        self.record(rule, path, restored, ticket="names-1")
+        # The ticket's newest row judges the file before the other ticket's delete.
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, "fn edited() {}\n")
+        checkpoint = self.commit("Ticket edits the file brought back")
+        ledger.ticket_checkpoint("names-1", checkpoint)
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_restamp_rechecks_a_removal_recorded_before_the_write_lock(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        ledger.ticket_add("other-names-1", "other-names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("other-names-1", "main")
+        _ = ledger.ticket_base("other-names-1")
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        deleting = self.commit("Another ticket deletes the file")
+        self.write(path, original)
+        restored = self.commit("The file comes back")
+        self.record(rule, path, restored, ticket="names-1")
+        # The ticket's newest row judges the file before the delete, which no ticket has recorded yet.
+        self.record(rule, path, self.initial_tip, ticket="names-1")
+        self.write(path, "fn edited() {}\n")
+        checkpoint = self.commit("Ticket edits the file brought back")
+        prepared = style_ledger.Ledger.checkpoint_restamps
+        other = self.ledger()
+
+        def remove_after_prepare(owner: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                                 commit: str) -> style_ledger.CheckpointRestamps | style_ledger.NoRestamps:
+            restamps = prepared(owner, ticket, commit)
+            if (deleting, "removed") not in self.cell_rows(other, path):
+                self.record_removed(other, rule, path, deleting, ticket="other-names-1")
+            return restamps
+
+        with mock.patch.object(style_ledger.Ledger, "checkpoint_restamps", autospec=True, side_effect=remove_after_prepare):
+            ledger.ticket_checkpoint("names-1", checkpoint)
+        # The checkpoint passes by the verdict on the restored file, and the verdict before the delete does not carry.
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_restamp_rechecks_a_removal_that_takes_the_id_of_a_yielded_one(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        kept, path = self.sources[:2]
+        self.record(rule, kept, self.initial_tip, ticket="names-1")
+        for ticket in ("other-names-1", "third-names-1"):
+            ledger.ticket_add(ticket, ticket.removesuffix("-1"), "read", "names", "crates/alpha", [path], [rule])
+            ledger.ticket_assign(ticket, "main")
+            _ = ledger.ticket_base(ticket)
+        original = (self.repo / path).read_text()
+        (self.repo / path).unlink()
+        first = self.commit("Another ticket deletes the file")
+        self.write(path, original)
+        restored = self.commit("The file comes back")
+        (self.repo / path).unlink()
+        second = self.commit("A third ticket deletes the file")
+        self.write(path, original)
+        restored_again = self.commit("The file comes back again")
+        self.record(rule, path, restored_again, ticket="names-1")
+        # The ticket's newest row judges the file between the two deletes.
+        self.record(rule, path, restored, ticket="names-1")
+        # The first removal is the newest row, so the next row can take its id once the yield deletes it.
+        self.record_removed(ledger, rule, path, first, ticket="other-names-1")
+        self.write(path, "fn edited() {}\n")
+        checkpoint = self.commit("Ticket edits the file brought back")
+        prepared = style_ledger.Ledger.checkpoint_restamps
+        other = self.ledger()
+
+        def swap_after_prepare(owner: style_ledger.Ledger, ticket: style_ledger.TicketRecord,
+                               commit: str) -> style_ledger.CheckpointRestamps | style_ledger.NoRestamps:
+            restamps = prepared(owner, ticket, commit)
+            if (second, "removed") not in self.cell_rows(other, path):
+                _ = other.ticket_yield("other-names-1", path)
+                self.record_removed(other, rule, path, second, ticket="third-names-1")
+            return restamps
+
+        with mock.patch.object(style_ledger.Ledger, "checkpoint_restamps", autospec=True, side_effect=swap_after_prepare):
+            ledger.ticket_checkpoint("names-1", checkpoint)
+        # The checkpoint passes by the verdict after the second delete, and the verdict before it does not carry.
+        ledger.set_tip(checkpoint, "main")
+        self.assertEqual(self.states(rule)[path], "stale")
+
+    def test_removed_refuses_a_file_still_present_outside_the_ticket_or_its_start(self) -> None:
+        self.write("README.md", "Work before the ticket\n")
+        _ = self.commit("Work before the ticket")
+        ledger, rule, base = self.removed_ticket()
+        path = self.sources[1]
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: still in the tree at {base[:7]}$"):
+            self.record_removed(ledger, rule, path, base)
+        self.write(path, "pub fn changed() {}\n")
+        edited = self.commit("Ticket edits the file")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: still in the tree at {edited[:7]}$"):
+            self.record_removed(ledger, rule, path, edited)
+        (self.repo / self.sources[2]).unlink()
+        outside = self.commit("Delete a file outside the ticket")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: {re.escape(rule)} {re.escape(self.sources[2])} is outside ticket cells$"):
+            self.record_removed(ledger, rule, self.sources[2], outside)
+        _ = self.git("checkout", "-q", "-b", "side", self.initial_tip)
+        (self.repo / path).unlink()
+        side = self.commit("Delete on a branch not under the start")
+        _ = self.git("checkout", "-q", "main")
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: {side[:7]} is not under the ticket's start {base[:7]}$"):
+            self.record_removed(ledger, rule, path, side)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "^removed: --reads requires clean, exception or held$"):
+            ledger.record(rule, path, side, "", "removed", ticket="names-1", worker="test-worker", reads=(self.sources[0],))
+        ledger.ticket_add("names-2", "names", "read", "names", "crates/alpha", [path], [rule])
+        with self.assertRaisesRegex(style_ledger.LedgerError, "^names-2: no start commit, so its own commits are not known$"):
+            self.record_removed(ledger, rule, path, outside, ticket="names-2")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "^unknown ticket other-1$"):
+            self.record_removed(ledger, rule, path, outside, ticket="other-1")
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
+    def test_removed_refuses_a_file_that_a_merged_in_commit_deleted(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        _ = self.git("checkout", "-q", "-b", "outside")
+        (self.repo / path).unlink()
+        _ = self.commit("Outside branch deletes the file")
+        _ = self.git("checkout", "-q", "main")
+        self.write("README.md", "Ticket work\n")
+        _ = self.commit("Ticket work")
+        _ = self.git("merge", "--no-ff", "-q", "outside", "-m", "Bring in outside work")
+        merge = self.git("rev-parse", "HEAD")
+        # The merge's diff against its first parent deletes the path, so the delete is not the ticket's.
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: merge {merge[:7]} deletes it, not a commit of names-1's own$"):
+            self.record_removed(ledger, rule, path, "HEAD")
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
+    def test_removed_refuses_a_file_deleted_before_the_ticket_start(self) -> None:
+        rule = self.rule("read")
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        base = self.commit("Delete before the ticket starts")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-1", "names", "read", "names", "crates/alpha", [path], [rule])
+        ledger.ticket_assign("names-1", "main")
+        self.assertEqual(ledger.ticket_base("names-1"), base)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^{re.escape(path)}: not a file at the ticket's start {base[:7]}$"):
+            self.record_removed(ledger, rule, path, base)
+        # A structure ticket's crate cell is a folder, so its removal is out of scope.
+        ledger.ticket_add("modules-1", "modules", "structure", "names", "crates/alpha", [], [rule])
+        ledger.ticket_assign("modules-1", "main")
+        self.assertEqual(ledger.ticket_base("modules-1"), base)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"^crates/alpha: not a file at the ticket's start {base[:7]}$"):
+            self.record_removed(ledger, rule, "crates/alpha", base, ticket="modules-1")
+
+    def test_removed_refuses_a_path_yielded_before_the_write_lock(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        original = style_ledger._cell_scope  # pyright: ignore[reportPrivateUsage]
+
+        def yield_then_scope(definition: rules.Rule, cell: str, tip: style_ledger.RepositoryTip) -> style_ledger.CellInputScope:
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("INSERT INTO ticket_yields VALUES (?,?,?)", ("names-1", path, "now"))
+            return original(definition, cell, tip)
+
+        with (mock.patch.object(style_ledger, "_cell_scope", side_effect=yield_then_scope),
+              self.assertRaisesRegex(style_ledger.LedgerError, f"^names-1: {re.escape(path)} was yielded$")):
+            self.record_removed(ledger, rule, path, deleting)
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
     def test_names_checkpoint_leaves_forbidden_words_judgments_stale_on_the_edited_path(self) -> None:
         names = self.rule("read")
         forbidden = self.rule("forbidden-words", "tier: C\nfamily: values\ninput_scope: file\n")
@@ -4102,6 +6394,7 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.set_tip(self.initial_tip, "main")
         ledger.ticket_add("modules-unit-1", "modules-unit", "structure", "modules", "crates/alpha", [], [missing, first])
         ledger.ticket_assign("modules-unit-1", "main")
+        _ = ledger.hold(first, "crates/alpha", 1, "Split crate", "restructure", "before", "after", self.blob(first), "modules-unit-1")
         self.record(first, "crates/alpha", self.initial_tip, "held", ticket="modules-unit-1")
 
         refused = self.cli("ticket", "checkpoint", "--id", "modules-unit-1", "--commit", "HEAD", success=False)
@@ -4120,6 +6413,152 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.cli("ticket", "merge", "--id", "modules-unit-1")
         self.assertEqual(ledger.ticket_open("modules-unit"), ())
 
+    def held_reservation(self, ticket: str) -> Path:
+        """A unit run folder whose phase 7 checkpoint kept reservation r1 for the ticket's merge, and a cargo-berth on PATH."""
+        binary = self.root / "bin"
+        binary.mkdir()
+        berth = binary / "cargo-berth"
+        _ = berth.write_text(RELEASE_BERTH.replace("__PYTHON__", sys.executable))
+        berth.chmod(0o755)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "PATH": str(binary) + os.pathsep + os.environ.get("PATH", ""),
+            "LEDGER_BERTH_LOG": str(self.root / "berth.log"), "LEDGER_BOARD": str(self.root / "board.json")})))
+        session = self.root / "unit run"
+        (session / "phases/7").mkdir(parents=True)
+        _ = (session / "phases/7/delegated_phase_reservation_state.json").write_text(json.dumps({
+            "kind": "checkpoint_committed_awaiting_release_confirmation",
+            "checkpoint_release_confirmation_pending": {
+                "reservation_id": "r1", "coordination_run_id": "c1", "phase": "7", "phase_start_head": self.initial_tip,
+                "checkpoint_commit": self.initial_tip, "held_for_ticket": ticket, "worktree": str(self.repo)}}))
+        return session
+
+    def berth_calls(self) -> list[list[str]]:
+        log = self.root / "berth.log"
+        return [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def assigned_structure_ticket(self, ticket: str) -> None:
+        rule = self.rule(f"structure-{ticket}", "tier: D\nfamily: modules\n")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add(ticket, "modules-unit", "structure", "modules", "crates/alpha", [], [rule])
+        ledger.ticket_assign(ticket, "main")
+        self.record(rule, "crates/alpha", self.initial_tip, "waived", detail="accepted", ticket=ticket)
+
+    def checkpointed_structure_ticket(self, ticket: str, *reservation: str) -> None:
+        self.assigned_structure_ticket(ticket)
+        _ = self.cli("ticket", "checkpoint", "--id", ticket, "--commit", "HEAD", *reservation)
+
+    def ticket_row(self, ticket: str) -> tuple[str, str, str]:
+        with closing(sqlite3.connect(style_ledger.ledger_location(self.repo).database)) as connection:
+            return cast(tuple[str, str, str], connection.execute(
+                "SELECT state,reservation_session_dir,reservation_phase FROM tickets WHERE id=?", (ticket,)).fetchone())
+
+    def test_a_style_checkpoint_keeps_its_reservation_until_ticket_merge_releases_it(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        half = self.cli("ticket", "checkpoint", "--id", "modules-unit-1", "--commit", "HEAD", "--session-dir", str(session),
+                        success=False)
+        self.assertEqual(half.returncode, 2)
+        self.assertIn("ticket checkpoint takes --session-dir and --phase together", half.stderr)
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout,
+                         "ticket modules-unit-1: phase 7: released reservation r1\n")
+        self.assertIn(["release", "r1", "--json"], self.berth_calls())
+        self.assertFalse((session / "phases/7/delegated_phase_reservation_state.json").exists())
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", "", ""))
+        calls = self.berth_calls()
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout, "")
+        self.assertEqual(self.berth_calls(), calls)
+
+    def test_a_checkpoint_stores_its_reservation_in_the_same_write_as_its_state(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.assigned_structure_ticket("modules-unit-1")
+        with closing(sqlite3.connect(style_ledger.ledger_location(self.repo).database)) as connection:
+            _ = connection.execute("CREATE TRIGGER lost_reservation BEFORE UPDATE OF reservation_session_dir ON tickets "
+                                   + "BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+            connection.commit()
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "disk full"):
+            self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "7")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("assigned", "", ""))
+        with closing(sqlite3.connect(style_ledger.ledger_location(self.repo).database)) as connection:
+            _ = connection.execute("DROP TRIGGER lost_reservation")
+            connection.commit()
+        self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "7")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+
+    def test_a_repeat_checkpoint_stores_a_missing_reservation_and_refuses_another(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1")
+        self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "7")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"checkpointed holding the reservation of phase 7 in {re.escape(str(session))}"):
+            self.ledger().ticket_checkpoint("modules-unit-1", "HEAD", str(session), "8")
+        self.ledger().ticket_checkpoint("modules-unit-1", "HEAD")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("checkpointed", str(session), "7"))
+
+    def test_a_checkpoint_that_names_no_reservation_record_merges_as_before(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        state = (session / "phases/7/delegated_phase_reservation_state.json").read_bytes()
+        self.checkpointed_structure_ticket("modules-unit-1")
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout, "")
+        self.assertEqual(self.berth_calls(), [])
+        self.assertEqual((session / "phases/7/delegated_phase_reservation_state.json").read_bytes(), state)
+
+    def test_a_reservation_ticket_merge_cannot_release_stays_held_until_a_rerun(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        self.write("README.md", "moved on\n")
+        moved = self.commit("Move the unit worktree off its checkpoint")
+        refused = self.cli("ticket", "merge", "--id", "modules-unit-1", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn(f"style_ledger: ticket modules-unit-1: phase_reservation: {self.repo} is at {moved[:7]}, not checkpoint "
+                      + f"{self.initial_tip[:7]}; reservation r1 stays held; rerun ticket merge", refused.stderr)
+        self.assertEqual(self.ledger().ticket_open("modules-unit"), ())
+        self.assertNotIn("release", [call[0] for call in self.berth_calls()])
+        # Only a merged ticket releases its reservation.
+        self.checkpointed_structure_ticket("modules-unit-2", "--session-dir", str(session), "--phase", "7")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "released at ticket merge, not in state checkpointed"):
+            _ = self.ledger().release_held_reservation("modules-unit-2")
+        _ = self.git("reset", "-q", "--hard", self.initial_tip)
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout,
+                         "ticket modules-unit-1: phase 7: released reservation r1\n")
+
+    def test_reconcile_retries_a_merged_ticket_reservation_until_its_release_is_confirmed(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        self.write("README.md", "moved on\n")
+        moved = self.commit("Move the unit worktree off its checkpoint")
+        changes = self.ledger().reconcile("main", "main")
+        self.assertIn("ticket modules-unit-1: checkpointed -> merged", changes)
+        self.assertIn(f"ticket modules-unit-1: phase_reservation: {self.repo} is at {moved[:7]}, not checkpoint "
+                      + f"{self.initial_tip[:7]}; reservation r1 stays held", changes)
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", str(session), "7"))
+        _ = self.git("reset", "-q", "--hard", self.initial_tip)
+        self.assertIn("ticket modules-unit-1: phase 7: released reservation r1", self.ledger().reconcile("main", "main"))
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", "", ""))
+        calls = self.berth_calls()
+        self.assertEqual(self.ledger().reconcile("main", "main"), ())
+        self.assertEqual(self.berth_calls(), calls)
+
+    def test_ticket_merge_takes_a_release_at_a_later_merge_once_the_style_branch_contains_it(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        # The unit merges style/main after its checkpoint and berth releases there (cargo-liner ticket 90).
+        _ = self.git("checkout", "-q", "-b", "unit")
+        self.write("README.md", "merged style/main\n")
+        later = self.commit("Merge style/main into the unit")
+        _ = (self.root / "board.json").write_text(json.dumps({"r1": {"status": "released_after_checkpoint", "protected_tip": later}}))
+        refused = self.cli("ticket", "merge", "--id", "modules-unit-1", success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn(f"or at a later commit that {self.initial_tip[:7]} contains; it stays held; rerun ticket merge", refused.stderr)
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", str(session), "7"))
+        _ = self.git("checkout", "-q", "main")
+        _ = self.git("merge", "-q", "--ff-only", "unit")
+        self.assertEqual(self.cli("ticket", "merge", "--id", "modules-unit-1").stdout,
+                         "ticket modules-unit-1: phase 7: released reservation r1\n")
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("merged", "", ""))
+        self.assertEqual({call[0] for call in self.berth_calls()}, {"board"})
+
     def test_read_checkpoint_names_only_the_missing_rule_and_file_pair(self) -> None:
         first, last = self.rule("read-first"), self.rule("read-last")
         self.set_tip(self.initial_tip)
@@ -4135,7 +6574,7 @@ class StyleLedgerTests(unittest.TestCase):
         for rule, path in complete:
             self.assertNotIn(f"{rule} {path}", refused.stderr)
         self.assertEqual(self.ledger().ticket_open("read")[0]["state"], "assigned")
-        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1"),
+        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1", "HEAD", self.in_worktree),
                          (style_ledger.UnjudgedTicketCell(last, self.sources[1]),))
 
     def test_judgments_without_the_owned_ticket_do_not_complete_its_cells(self) -> None:
@@ -4182,7 +6621,7 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.cli("ticket", "yield", "--id", "read-1", "--path", self.sources[0])
 
         self.assertEqual({rule: self.states(rule)[self.sources[0]] for rule in (first, last)}, before)
-        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1"), ())
+        self.assertEqual(self.ledger().unjudged_ticket_cells("read-1", "HEAD", self.in_worktree), ())
         _ = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", "HEAD")
         self.assertEqual(self.ledger().ticket_open("read")[0]["state"], "checkpointed")
 
@@ -4193,16 +6632,16 @@ class StyleLedgerTests(unittest.TestCase):
         self.add_ticket("other-1", [rule], unit="other")
         _ = self.cli("ticket", "assign", "--id", "read-1", "--branch", "main")
         self.record(rule, self.sources[0], self.initial_tip, "waived", ticket="other-1")
+        removed = self.hold_finding(rule, 1, ticket="read-1")
         self.record(rule, self.sources[0], self.initial_tip, "held", ticket="read-1")
         self.record(rule, self.sources[1], self.initial_tip, ticket="read-1")
-        removed = self.hold_finding(rule, 1, ticket="read-1")
         filed = self.hold_finding(rule, 2, ticket="read-1")
         waived = self.hold_finding(rule, 3, ticket="read-1")
         other = self.hold_finding(rule, 4, ticket="other-1")
         ledger = self.ledger()
         proposal = self.root / "issues/filed.md"
         ledger.file_held(filed, proposal)
-        ledger.waive_held(waived)
+        ledger.waive_held(waived, style_ledger.WaiveByPerson("nate"))
         untouched = ledger.hold(rule, self.sources[1], 5, "other file", "rename", "old", "new",
                                 self.blob(rule), "read-1")
 
@@ -4237,7 +6676,8 @@ class StyleLedgerTests(unittest.TestCase):
         ledger.ticket_assign("proposal-1", "main")
         cases = (("read-1", self.sources[0], "cannot yield from queued"),
                  ("modules-1", self.sources[0], "cannot yield a structure ticket"),
-                 ("proposal-1", self.sources[0], "cannot yield a proposal ticket"))
+                 ("proposal-1", self.sources[0], f"{self.sources[0]} holds every finding the ticket has left; "
+                  + "drop the ticket with style_ledger.py ticket drop"))
         for ticket, path, reason in cases:
             with self.subTest(ticket=ticket):
                 refused = self.cli("ticket", "yield", "--id", ticket, "--path", path, success=False)
@@ -4256,6 +6696,189 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(self.states(rule)[self.sources[0]], "current")
         self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Filed(issue))
 
+    def yield_proposal(self, kept: tuple[str, str, str, str], freed: tuple[str, str, str, str],
+                       files: dict[str, str] | None = None) -> tuple[str, str, Path]:
+        """Add an assigned proposal ticket proposal-1 with one finding at each (path, kind, before, after), at a tip
+        that adds files; return the kept finding, the finding to yield and the decision."""
+        rule = self.rule("decision")
+        for path, text in (files or {}).items():
+            self.write(path, text)
+        self.set_tip(self.commit("Write the yield files") if files else self.initial_tip)
+        ledger = self.ledger()
+        issue = self.root / "issues/decision.md"
+        identities: list[str] = []
+        for line, (path, kind, before, after) in enumerate((kept, freed), 1):
+            finding = ledger.hold(rule, path, line, "change", cast(style_ledger.FindingKind, kind), before, after,
+                                  self.blob(rule), "outside")
+            ledger.file_held(finding.finding_id, issue)
+            identities.append(finding.finding_id)
+        ledger.ticket_add("proposal-1", "proposal", "proposal", "names", "crates/alpha", sorted({kept[0], freed[0]}),
+                          [rule], proposal=str(issue), finding_ids=tuple(identities))
+        ledger.ticket_assign("proposal-1", "main")
+        return identities[0], identities[1], issue
+
+    def test_a_proposal_yield_keeps_the_yielded_finding_filed_and_free_for_a_later_ticket(self) -> None:
+        kept, freed, issue = self.yield_proposal((self.sources[3], "rename", "Outcome::Old", "Outcome::New"),
+                                                 (self.sources[1], "rename", "Shape::Round", "Shape::Square"))
+        ledger = self.ledger()
+        refused = self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[0], success=False)
+        self.assertEqual(refused.stderr.strip(), f"style_ledger: proposal-1: no finding of the ticket is at {self.sources[0]}")
+        yielded = self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[1])
+        self.assertEqual(yielded.stdout, f"yielded {freed}: it stays filed for a later ticket\n")
+        findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+        self.assertEqual(findings[freed].state, style_ledger.Filed(issue))
+        self.assertEqual(findings[freed].build_ticket, style_ledger.NoBuildTicket())
+        self.assertEqual(findings[kept].build_ticket, style_ledger.BuildTicket("proposal-1"))
+        ticket = ledger.ticket_open("proposal")[0]
+        self.assertEqual(ticket["finding_ids"], [kept])
+        self.assertEqual([path["path"] for path in ticket["yielded"]], [self.sources[1]])
+        self.assertEqual(self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[1]).stdout, "")
+        self.assertEqual(ledger.ticket_open("proposal")[0], ticket)
+        refused = self.cli("ticket", "yield", "--id", "proposal-1", "--path", self.sources[3], success=False)
+        self.assertIn("holds every finding the ticket has left", refused.stderr)
+        # The merge builds the kept finding and leaves the yielded one filed for a later ticket.
+        self.write(self.sources[3], "enum Outcome { New }\n")
+        checkpoint = self.commit("Build the kept finding")
+        ledger.set_tip(checkpoint, "main")
+        ledger.ticket_checkpoint("proposal-1", checkpoint)
+        self.assertEqual(ledger.ticket_merge("proposal-1"), ())
+        findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
+        self.assertEqual(findings[kept].state, style_ledger.Built(issue))
+        self.assertEqual((findings[freed].state, findings[freed].build_ticket), (style_ledger.Filed(issue), style_ledger.NoBuildTicket()))
+        ledger.ticket_add("proposal-2", "proposal", "proposal", "names", "crates/alpha", [self.sources[1]],
+                          [findings[freed].rule], proposal=str(issue), finding_ids=(freed,))
+        self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings())[1].build_ticket, style_ledger.BuildTicket("proposal-2"))
+
+    # Two module files of crates/alpha that two file renames move; lib.rs declares them.
+    yield_files: dict[str, str] = {
+        "crates/alpha/src/a.rs": "pub fn alpha() {}\n",
+        "crates/alpha/src/b.rs": "pub fn beta() {}\n",
+        "crates/alpha/src/c.rs": "pub const BAR: char = '\\u{2580}';\npub const TAB: u8 = b'\\x7f';\n",
+        "crates/alpha/src/other.rs": "#[cfg(test)]\nmod tests {\n    use super::*;\n    use std::collections::*;\n}\n",
+    }
+    kept_rename: tuple[str, str, str, str] = ("crates/alpha/src/a.rs", "rename", "Alpha", "Rename src/a.rs to src/first.rs")
+    freed_rename: tuple[str, str, str, str] = ("crates/alpha/src/b.rs", "rename", "Beta", "Rename src/b.rs to src/second.rs")
+
+    def test_a_proposal_yield_frees_a_file_rename_beside_an_independent_one_in_its_crate(self) -> None:
+        # Mounts inside alpha, also through an inline module's folder, and one from beta to a file of no finding's
+        # crate, join no finding crate to another.
+        mounts = {"crates/alpha/src/other.rs": self.yield_files["crates/alpha/src/other.rs"] + "#[path = \"c.rs\"]\nmod again;\n"
+                  + "#[path = \".\"]\nmod folded {\n    #[path = \"c.rs\"]\n    mod again;\n}\n",
+                  "crates/beta/src/other.rs": "#[path = \"../../../vendor/third-party/src/lib.rs\"]\nmod third;\n"}
+        kept, freed, _ = self.yield_proposal(self.kept_rename, self.freed_rename, {**self.yield_files, **mounts})
+        self.assertEqual(self.ledger().ticket_yield("proposal-1", self.freed_rename[0]), (freed,))
+        self.assertEqual(self.ledger().ticket_open("proposal")[0]["finding_ids"], [kept])
+
+    def test_a_proposal_yield_refuses_a_kept_finding_that_can_need_the_yielded_one(self) -> None:
+        library = "crates/alpha/src/lib.rs"
+        reexport = {library: "mod producer; mod consumer;\npub use producer::make;\n",
+                    "crates/alpha/src/producer.rs": "pub fn make() -> u32 { 1 }\n",
+                    "crates/alpha/src/consumer.rs": "pub fn take() -> u32 { crate::make() }\n"}
+        qualified = ("crates/alpha/src/b.rs", "rename", "Shape::Round", "Shape::Square")
+        cases: tuple[tuple[str, tuple[str, str, str, str], tuple[str, str, str, str], dict[str, str], str], ...] = (
+            ("a re-export carries the yielded type", ("crates/alpha/src/consumer.rs", "type", "pub fn take() -> u32", "u64"),
+             ("crates/alpha/src/producer.rs", "type", "pub fn make() -> u32", "u64"), reexport,
+             "{kept} is not a file rename, and crates/alpha holds a freed and a kept finding"),
+            ("a qualified rename beside a file rename", self.kept_rename, qualified, {},
+             "{freed} is not a file rename, and crates/alpha holds a freed and a kept finding"),
+            ("the yielded file names the kept old module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/b.rs": "pub fn beta() { crate::a::alpha() }\n"},
+             "crates/alpha/src/b.rs names a, a module that {kept} renames"),
+            ("the yielded file names the kept new module", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/b.rs": "pub fn first() {}\n"}, "crates/alpha/src/b.rs names first, a module that {kept} renames"),
+            ("one new name", self.kept_rename, (*self.freed_rename[:3], "Rename src/b.rs to src/first.rs"), {},
+             "{freed} and {kept} both rename to or from first"),
+            ("the yielded new name is the kept old name", self.kept_rename,
+             (*self.freed_rename[:3], "Rename src/b.rs to src/a.rs"), {}, "{freed} and {kept} both rename to or from a"),
+            ("the kept new name is the yielded old name", (*self.kept_rename[:3], "Rename src/a.rs to src/b.rs"),
+             self.freed_rename, {}, "{freed} and {kept} both rename to or from b"),
+            ("a public use of a renamed module", self.kept_rename, self.freed_rename,
+             {library: "mod a; mod b; mod c; mod other;\npub use a::alpha;\n"}, f"{library} re-exports a"),
+            ("a glob use of the renamed modules' parent", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/other.rs": "use super::*;\n"}, "crates/alpha/src/other.rs glob-imports crate"),
+            ("a macro_rules item", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "macro_rules! made { () => {} }\n"}, "crates/alpha/src/c.rs holds macro_rules"),
+            ("an include call", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "include!(\"made.rs\");\n"}, "crates/alpha/src/c.rs holds include"),
+            ("a path attribute mounts the yielded file into the kept crate",
+             ("crates/alpha/src/consumer.rs", "type", "pub fn take() -> u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "pub fn make() -> u32", "u64"),
+             {library: "#[path = \"../../beta/src/producer.rs\"]\nmod producer;\nmod consumer;\n"},
+             f"{library} mounts crates/beta/src/producer.rs, a file outside crates/alpha"),
+            ("a cfg_attr path attribute mounts the yielded file", ("crates/alpha/src/consumer.rs", "type", "u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[cfg_attr(all(), cfg_attr(test, path = \"../../beta/src/producer.rs\"))]\nmod producer;\n"},
+             f"{library} mounts crates/beta/src/producer.rs, a file outside crates/alpha"),
+            ("another crate mounts the yielded file", self.kept_rename, self.freed_rename,
+             {"crates/beta/src/lib.rs": "#[path = \"../../alpha/src/b.rs\"]\nmod b;\n"},
+             "crates/beta/src/lib.rs mounts crates/alpha/src/b.rs, a file outside crates/beta"),
+            ("a path attribute mounts a file that is not .rs", ("crates/alpha/src/consumer.rs", "type", "u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[path = \"mount.inc\"]\nmod mount;\n",
+              "crates/alpha/src/mount.inc": "#[path = \"../../beta/src/producer.rs\"]\nmod producer;\n"},
+             f"{library} mounts crates/alpha/src/mount.inc, which is not a .rs file"),
+            ("an inline module's folder is in another crate", ("crates/alpha/src/consumer.rs", "type", "u32", "u64"),
+             ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[path = \"../../beta/src\"]\nmod mounted {\n    mod producer;\n}\n"},
+             f"{library} mounts crates/beta/src, a folder outside crates/alpha"),
+            ("a path attribute in an inline module reads from the module's folder",
+             ("crates/alpha/src/consumer.rs", "type", "u32", "u64"), ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {library: "#[path = \"a/b\"]\nmod up {\n    #[path = \"../../../../beta/src/producer.rs\"]\n    mod producer;\n}\n"},
+             f"{library} mounts crates/beta/src/producer.rs, a file outside crates/alpha"),
+            ("an inactive path attribute leaves the module's own folder a reading",
+             ("crates/alpha/src/consumer.rs", "type", "u32", "u64"), ("crates/beta/src/producer.rs", "type", "u32", "u64"),
+             {"Cargo.toml": '[workspace]\nmembers = ["crates/alpha", "crates/beta", "crates/gamma"]\nresolver = "2"\n',
+              "crates/gamma/Cargo.toml": '[package]\nname = "gamma"\nversion = "0.1.0"\nedition = "2021"\n',
+              "crates/gamma/src/lib.rs": "#[cfg_attr(any(), path = \".\")]\npub mod deep {\n"
+              + "    #[path = \"../../../beta/src/producer.rs\"]\n    pub mod producer;\n}\n"},
+             "crates/gamma/src/lib.rs mounts crates/beta/src/producer.rs, a file outside crates/gamma"),
+            ("a path attribute leaves the repository", self.kept_rename, self.freed_rename,
+             {library: "mod a; mod b; mod c; mod other;\n#[path = \"../../../../outside.rs\"]\nmod outside;\n"},
+             f"{library} mounts ../outside.rs, a file outside crates/alpha"),
+            ("a path attribute in a macro of another crate", self.kept_rename, self.freed_rename,
+             {"crates/beta/src/other.rs": "macro_rules! mount { () => { #[path = \"x.rs\"] mod x; } }\n"},
+             "crates/beta/src/other.rs holds a path attribute in a macro"),
+            ("a path attribute that is not a string", self.kept_rename, self.freed_rename,
+             {"crates/beta/src/other.rs": "#[path = concat!(\"x\", \".rs\")]\nmod x;\n"},
+             "crates/beta/src/other.rs holds a path attribute that is not a relative string"),
+            ("a file that does not tokenize", self.kept_rename, self.freed_rename,
+             {"crates/alpha/src/c.rs": "pub fn odd() { \\ }\n"}, "crates/alpha/src/c.rs does not tokenize"),
+        )
+        for name, kept, freed, files, reason in cases:
+            with self.subTest(name):
+                self.setUp()
+                kept_id, freed_id, _ = self.yield_proposal(kept, freed, {**self.yield_files, **files})
+                ledger = self.ledger()
+                with self.assertRaises(style_ledger.LedgerError) as refused:
+                    _ = ledger.ticket_yield("proposal-1", freed[0])
+                self.assertIn(f"proposal-1: a kept finding can need a finding at {freed[0]}", str(refused.exception))
+                self.assertIn(reason.format(kept=kept_id, freed=freed_id), str(refused.exception))
+                ticket = ledger.ticket_open("proposal")[0]
+                self.assertEqual((ticket["finding_ids"], ticket["yielded"]), (sorted([kept_id, freed_id]), ()))
+
+    def test_a_proposal_yield_reads_again_when_the_synced_tip_moves_before_its_lock(self) -> None:
+        _ = self.yield_proposal(self.kept_rename, self.freed_rename, self.yield_files)
+        self.write("crates/alpha/src/c.rs", "macro_rules! made { () => {} }\n")
+        moved = self.commit("Add a macro")
+        ledger = self.ledger()
+        read = style_ledger.Ledger._yielded_findings  # pyright: ignore[reportPrivateUsage]
+        calls: list[str] = []
+
+        def advancing(self: style_ledger.Ledger, ticket: style_ledger.TicketRecord, findings: tuple[style_ledger.HeldFinding, ...],
+                      path: str) -> style_ledger.FileYield | style_ledger.FindingYield:
+            calls.append(self.synced_commit())
+            result = read(self, ticket, findings, path)
+            if len(calls) == 1:
+                self.set_tip(moved)
+            return result
+
+        with mock.patch.object(style_ledger.Ledger, "_yielded_findings", advancing), \
+                self.assertRaises(style_ledger.LedgerError) as refused:
+            _ = ledger.ticket_yield("proposal-1", self.freed_rename[0])
+        self.assertIn("crates/alpha/src/c.rs holds macro_rules", str(refused.exception))
+        self.assertEqual(calls, [self.git("rev-parse", "HEAD~1"), moved])
+        self.assertEqual(ledger.ticket_open("proposal")[0]["yielded"], ())
+
     def test_repeated_listed_yield_preserves_the_recorded_yield_and_remaining_ownership(self) -> None:
         rule = self.rule("listed", "tier: B\nfamily: names\ninput_scope: file\npre_filter: value\n")
         ledger = self.ledger()
@@ -4271,7 +6894,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(ledger.database)) as connection:
             after = cast(list[tuple[str, str, str]], connection.execute("SELECT * FROM ticket_yields").fetchall())
         self.assertEqual(after, before)
-        self.assertEqual(ledger.unjudged_ticket_cells("listed-1"), (style_ledger.UnjudgedTicketCell(rule, self.sources[1]),))
+        self.assertEqual(ledger.unjudged_ticket_cells("listed-1", "HEAD", self.in_worktree), (style_ledger.UnjudgedTicketCell(rule, self.sources[1]),))
 
     def test_record_under_a_yielded_ticket_is_refused_without_recreating_its_verdict(self) -> None:
         rule = self.rule("read")
@@ -4562,6 +7185,21 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.git("commit", "--allow-empty", "-q", "-m", "New tip with same tree")
         self.assertEqual(self.cli("tip", "seen", "--tip", "HEAD").stdout.strip(), "new")
 
+    def test_migration_23_preserves_processed_tips_as_linted(self) -> None:
+        database = self.root / "legacy.sqlite"
+        with closing(sqlite3.connect(database)) as connection, connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number < 23:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (22)")
+            _ = connection.execute("INSERT INTO processed_tips VALUES (?,?)", (self.initial_tip, "2026-10-27"))
+        with style_ledger.Ledger(self.repo, database) as ledger:
+            self.assertEqual(ledger.tip_seen(self.initial_tip), "linted")
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM processed_tips").fetchone(),
+                             (self.initial_tip, "2026-10-27", "linted"))
+
     def test_handoffs_require_ancestry_and_keep_sent_items_pending(self) -> None:
         self.set_tip(self.initial_tip)
         _ = self.git("checkout", "-q", "-b", "style/main")
@@ -4585,6 +7223,27 @@ class StyleLedgerTests(unittest.TestCase):
         backward = self.cli("handoff", "send", "--checkpoint", checkpoint, "--to", "parent", success=False)
         self.assertEqual(backward.returncode, 2)
         self.assertIn("merged", backward.stderr)
+
+    def test_handoff_merged_takes_a_pending_row_once_the_branch_point_contains_it(self) -> None:
+        """A queued notice left the row pending and its merge was refused (cargo-liner, 2026-10-27)."""
+        self.set_tip(self.initial_tip)
+        _ = self.git("checkout", "-q", "-b", "style/main")
+        self.write(self.sources[0], "pub fn corrected() {}\n")
+        checkpoint = self.commit("Style checkpoint")
+        _ = self.cli("reconcile", "--branch-point", "main", "--style-branch", "style/main")
+        _ = self.cli("handoff", "add", "--checkpoint", checkpoint)
+        refused = self.cli("handoff", "merged", "--checkpoint", checkpoint, success=False)
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("hand-off is not merged into main", refused.stderr)
+        _ = self.git("checkout", "-q", "main")
+        _ = self.git("merge", "--no-ff", "-q", "style/main", "-m", "Integrate style")
+        merge_commit = self.git("rev-parse", "HEAD")
+        _ = self.cli("handoff", "merged", "--checkpoint", checkpoint)
+        with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
+            stored = cast(tuple[str, str, str], connection.execute(
+                "SELECT state,merge_commit,sent_to FROM handoffs WHERE checkpoint=?", (checkpoint,),
+            ).fetchone())
+        self.assertEqual(stored, ("merged", merge_commit, ""))
 
     def test_handoff_merged_preserves_supplied_later_merge_evidence(self) -> None:
         self.set_tip(self.initial_tip)
@@ -4800,10 +7459,6 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.git("branch", "style/main")
         _ = self.cli("reconcile", "--branch-point", "main", "--style-branch", "style/main")
         _ = self.cli("handoff", "add", "--checkpoint", self.initial_tip)
-        skipped = self.cli("handoff", "merged", "--checkpoint", self.initial_tip,
-                           "--merge-commit", self.initial_tip, success=False)
-        self.assertEqual(skipped.returncode, 2)
-        self.assertIn("pending", skipped.stderr)
         with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
             created = cast(list[tuple[str]], connection.execute("SELECT created_at FROM handoffs").fetchall())[0][0]
         report = self.summary_report()
@@ -4871,7 +7526,7 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(state_file)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
             sync = cast(list[tuple[str, str]], connection.execute("SELECT tip,style_branch FROM sync").fetchall())
-        self.assertEqual(versions, [(17,)])
+        self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
         self.assertEqual(sync, [(self.initial_tip, "refs/heads/style/main")])
 
     def test_held_findings_keep_two_sites_per_cell_and_preserve_idempotent_state(self) -> None:
@@ -4888,9 +7543,13 @@ class StyleLedgerTests(unittest.TestCase):
         original = next(finding for finding in ledger.held_findings(style_ledger.AllHeldFindings()) if finding.finding_id == first)
         duplicate = ledger.hold(rule_id, self.sources[0], 1, "pub fn old_name_1() {}", "type",
                                 "different before", "different after", self.blob(rule_id), "another-ticket")
-        self.assertEqual(duplicate, original)
+        # A different change at the same site is its own row, and the first row keeps its change.
+        self.assertNotEqual(duplicate.finding_id, first)
+        self.assertEqual((duplicate.kind, duplicate.before, duplicate.after),
+                         ("type", "different before", "different after"))
+        self.assertEqual(ledger.named_held((first,))[0], original)
         proposal = self.root / "issues/rename.md"
-        for finding in (first, second):
+        for finding in (first, second, duplicate.finding_id):
             for _ in range(2):
                 _ = self.cli("held", "file", "--id", finding, "--proposal", str(proposal))
         self.assertEqual(self.summary_report()["proposals"], 1)
@@ -4904,7 +7563,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(refused.returncode, 2)
         self.assertIn("filed", refused.stderr)
         for _ in range(2):
-            _ = self.cli("held", "waive", "--id", first)
+            _ = self.cli("held", "waive", "--id", first, "--person", "nate")
         refused = self.cli("held", "file", "--id", first, "--proposal", str(proposal), success=False)
         self.assertEqual(refused.returncode, 2)
         self.assertIn("waived", refused.stderr)
@@ -4921,7 +7580,7 @@ class StyleLedgerTests(unittest.TestCase):
         blob = self.blob(rule_id)
         finding = self.hold_finding(rule_id, 1, ticket="read-1")
         for _ in range(2):
-            _ = self.cli("held", "waive", "--id", finding)
+            _ = self.cli("held", "waive", "--id", finding, "--person", "nate")
         self.assertIsInstance(self.ledger().held_findings(style_ledger.AllHeldFindings())[0].state, style_ledger.Waived)
         for invalid, supplied in ((legacy, self.blob(legacy)), ("global:rust/missing.md", blob), (rule_id, "wrong-blob")):
             with self.subTest(rule=invalid, blob=supplied):
@@ -4933,7 +7592,6 @@ class StyleLedgerTests(unittest.TestCase):
                 self.assertEqual(refused.returncode, 2)
                 self.assertIn(invalid, refused.stderr)
         self.assertEqual(len(self.ledger().held_findings(style_ledger.AllHeldFindings())), 1)
-
 
     def test_pinned_rule_bytes_survive_edits_reopen_and_pseudo_rules_share_the_parent(self) -> None:
         partial = self.rule(
@@ -5027,6 +7685,173 @@ class StyleLedgerTests(unittest.TestCase):
         with style_ledger.open_ledger(self.repo) as ledger:
             self.assertEqual(ledger.ticket_base("names-unit-1"), self.initial_tip)
         self.assertEqual(self.git("for-each-ref", "refs/style-tickets"), "")
+
+    def test_unit_rename_moves_current_rows_and_keeps_ticket_ids_and_history(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        files = list(self.sources[:2])
+        for number in (8, 9, 1, 2):
+            ledger.ticket_add(f"names-unit-{number}", "names-unit", "read", "names", "crates/alpha", files, [rule])
+        ledger.ticket_assign("names-unit-8", "main")
+        for path in files:
+            self.record(rule, path, self.initial_tip, ticket="names-unit-8")
+        ledger.ticket_checkpoint("names-unit-8", self.initial_tip)
+        _ = ledger.ticket_merge("names-unit-8")
+        ledger.ticket_drop("names-unit-9")
+        ledger.ticket_assign("names-unit-2", "main")
+        _ = ledger.hold(rule, files[0], 1, "pub fn old() {}", "rename", "old", "new",
+                        self.blob(rule), "names-unit-2")
+        ledger.record_candidate("names-unit-2", files[0], 1, "Check names in public APIs.")
+        _ = ledger.ticket_yield("names-unit-2", files[1])
+        ledger.wait_for_sync("names-unit")
+        ledger.wait_for_sync("types-unit")
+        tables = ("tickets", "sync_waits", "rule_candidates", "held_findings", "ticket_yields")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("UPDATE held_findings SET build_ticket='names-unit-2'")
+            connection.commit()
+            before = {table: cast(list[tuple[object, ...]], connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid").fetchall()) for table in tables}
+        new = "sample-style-names-unit"
+
+        self.assertEqual(ledger.rename_unit("names-unit", new), style_ledger.UnitRenamed(2, 1))
+
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            after = {table: cast(list[tuple[object, ...]], connection.execute(
+                f"SELECT * FROM {table} ORDER BY rowid").fetchall()) for table in tables}
+        expected = dict(before)
+        expected["tickets"] = [
+            (row[0], new, *row[2:]) if row[1] == "names-unit" and row[10] in ("queued", "assigned", "checkpointed") else row
+            for row in before["tickets"]
+        ]
+        expected["sync_waits"] = [(new, *row[1:]) if row[0] == "names-unit" else row
+                                  for row in before["sync_waits"]]
+        self.assertEqual(after, expected)
+        self.assertEqual([ticket["id"] for ticket in self.ledger().queued_tickets(new)], ["names-unit-1"])
+        self.assertEqual([ticket["id"] for ticket in self.ledger().ticket_open(new)], ["names-unit-2"])
+        self.assertEqual(ledger.ticket_open("names-unit"), ())
+
+    def test_unit_rename_moves_a_checkpointed_ticket_without_changing_its_merge_evidence(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.ticket_assign("names-unit-1", "main")
+        for path in self.sources[:2]:
+            self.record(rule, path, self.initial_tip, ticket="names-unit-1")
+        ledger.ticket_checkpoint("names-unit-1", self.initial_tip)
+        before = ledger.ticket_open("names-unit")[0]
+
+        _ = ledger.rename_unit("names-unit", "sample-style-names-unit")
+
+        self.assertEqual(ledger.ticket_open("sample-style-names-unit")[0],
+                         {**before, "unit": "sample-style-names-unit"})
+        self.assertEqual(ledger.next_ticket_id("sample-style-names-unit"), "sample-style-names-unit-1")
+
+    def test_unit_rename_refuses_a_target_with_current_tickets_or_a_sync_wait(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.wait_for_sync("names-unit")
+        old_tickets, old_waits = ledger.queued_tickets("names-unit"), ledger.sync_waits()
+        for state in ("queued", "assigned", "checkpointed", "wait"):
+            with self.subTest(state=state):
+                target = f"{state}-style-names-unit"
+                if state == "wait":
+                    ledger.wait_for_sync(target)
+                else:
+                    ledger.ticket_add(f"{target}-1", target, "read", "names", "crates/alpha",
+                                      list(self.sources[:2]), [rule])
+                    with closing(sqlite3.connect(ledger.database)) as connection:
+                        _ = connection.execute("UPDATE tickets SET state=? WHERE unit=?", (state, target))
+                        connection.commit()
+                target_waits = ledger.sync_waits()
+                with self.assertRaises(style_ledger.LedgerError):
+                    _ = ledger.rename_unit("names-unit", target)
+                self.assertEqual(ledger.queued_tickets("names-unit"), old_tickets)
+                self.assertEqual(ledger.sync_waits(), target_waits)
+        self.assertTrue(all(wait in ledger.sync_waits() for wait in old_waits))
+
+    def test_unit_rename_refuses_other_families_and_nonstyle_ids_without_moving_rows(self) -> None:
+        ledger = self.ledger()
+        ledger.wait_for_sync("names-unit")
+        before = ledger.sync_waits()
+        for old, new in (("names-unit", "sample-style-types-unit"),
+                         ("names-unit", "feature-unit"), ("feature-unit", "names-unit")):
+            with self.subTest(old=old, new=new), self.assertRaises(style_ledger.LedgerError):
+                _ = ledger.rename_unit(old, new)
+            self.assertEqual(ledger.sync_waits(), before)
+
+    def test_unit_rename_rolls_back_ticket_updates_when_the_wait_move_fails(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.wait_for_sync("names-unit")
+        tickets, waits = ledger.queued_tickets("names-unit"), ledger.sync_waits()
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            _ = connection.execute("CREATE TRIGGER reject_wait_move BEFORE UPDATE OF unit ON sync_waits "
+                                   + "BEGIN SELECT RAISE(ABORT, 'wait move rejected'); END")
+            connection.commit()
+        with self.assertRaises((sqlite3.Error, style_ledger.LedgerError)):
+            _ = ledger.rename_unit("names-unit", "sample-style-names-unit")
+        self.assertEqual(self.ledger().queued_tickets("names-unit"), tickets)
+        self.assertEqual(self.ledger().sync_waits(), waits)
+        self.assertEqual(ledger.queued_tickets("sample-style-names-unit"), ())
+
+    def test_moved_ticket_can_be_readded_but_new_ids_must_use_the_new_prefix(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        files = list(self.sources[:2])
+        ledger.ticket_add("names-unit-7", "names-unit", "read", "names", "crates/alpha", files, [rule])
+        _ = ledger.rename_unit("names-unit", "sample-style-names-unit")
+        before = ledger.queued_tickets("sample-style-names-unit")
+        ledger.ticket_add("names-unit-7", "sample-style-names-unit", "read", "names", "crates/alpha", files, [rule])
+        self.assertEqual(ledger.queued_tickets("sample-style-names-unit"), before)
+        with self.assertRaises(style_ledger.LedgerError):
+            ledger.ticket_add("names-unit-7", "sample-style-names-unit", "read", "names", "crates/beta", files, [rule])
+        with self.assertRaises(style_ledger.LedgerError):
+            ledger.ticket_add("names-unit-8", "sample-style-names-unit", "read", "names", "crates/alpha", files, [rule])
+        self.assertEqual(ledger.next_ticket_id("sample-style-names-unit"), "sample-style-names-unit-1")
+        ledger.ticket_add("sample-style-names-unit-1", "sample-style-names-unit", "read", "names",
+                          "crates/alpha", files, [rule])
+        self.assertEqual(self.ledger().next_ticket_id("sample-style-names-unit"), "sample-style-names-unit-2")
+        self.assertEqual(ledger.next_ticket_id("names-unit"), "names-unit-8")
+
+    def test_unit_rename_allows_target_history_and_moves_a_wait_without_tickets(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        target = "sample-style-names-unit"
+        ledger.ticket_add(f"{target}-4", target, "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.ticket_drop(f"{target}-4")
+        ledger.wait_for_sync("names-unit")
+        before = ledger.sync_waits()[0]
+
+        self.assertEqual(ledger.rename_unit("names-unit", target), style_ledger.UnitRenamed(0, 1))
+
+        after = self.ledger().sync_waits()[0]
+        self.assertEqual((after.unit, after.since, after.token), (target, before.since, before.token))
+        self.assertEqual(ledger.next_ticket_id(target), f"{target}-5")
+        self.assertEqual(ledger.rename_unit("names-unit", target), style_ledger.UnitRenamed(0, 0))
+
+    def test_unit_rename_cli_reports_counts_and_succeeds_again_without_moves(self) -> None:
+        rule = self.rule("read")
+        ledger = self.ledger()
+        ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
+                          list(self.sources[:2]), [rule])
+        ledger.wait_for_sync("names-unit")
+        moved = self.cli("unit", "rename", "--from", "names-unit", "--to", "sample-style-names-unit")
+        self.assertRegex(moved.stdout, r"1 tickets?")
+        self.assertRegex(moved.stdout, r"1 (?:sync )?waits?")
+        repeated = self.cli("unit", "rename", "--from", "names-unit", "--to", "sample-style-names-unit")
+        self.assertRegex(repeated.stdout, r"0 tickets?")
+        self.assertRegex(repeated.stdout, r"0 (?:sync )?waits?")
+        self.assertEqual([ticket["id"] for ticket in self.ledger().queued_tickets("sample-style-names-unit")],
+                         ["names-unit-1"])
+        self.assertEqual([wait.unit for wait in self.ledger().sync_waits()], ["sample-style-names-unit"])
 
     def test_next_ticket_id_never_reuses_merged_or_dropped_numbers(self) -> None:
         rule = self.rule("read")
@@ -5129,8 +7954,7 @@ class StyleLedgerTests(unittest.TestCase):
         self.assertEqual(ledger.pinned_rule_texts("read-1"), ledger.pinned_rule_texts("read-2"))
         with closing(sqlite3.connect(database)) as connection:
             versions = cast(list[tuple[int]], connection.execute("SELECT version FROM schema_version").fetchall())
-        self.assertEqual(versions, [(17,)])
-
+        self.assertEqual(versions, [(max(style_ledger.MIGRATIONS),)])
 
     def test_handoff_reroute_preserves_creation_and_rejects_invalid_states(self) -> None:
         ledger = self.ledger()
@@ -5189,8 +8013,12 @@ class StyleLedgerTests(unittest.TestCase):
         with closing(sqlite3.connect(database)) as connection:
             _ = connection.execute("DROP TABLE IF EXISTS sync_waits")
             _ = connection.execute("DROP TABLE IF EXISTS ticket_yields")
+            _ = connection.execute("DROP TABLE IF EXISTS ticket_widened_paths")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN cells")
             _ = connection.execute("ALTER TABLE judgments DROP COLUMN declared_scope")
+            _ = connection.execute("ALTER TABLE judgments DROP COLUMN read_files")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waive_provenance")
+            _ = connection.execute("ALTER TABLE held_findings DROP COLUMN waived_by")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN build_ticket")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN moved_from")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN withdrawn_by")
@@ -5203,6 +8031,9 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN declaration_gone_at")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN finding_ids")
             _ = connection.execute("DROP TABLE rule_candidates")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
+            _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:

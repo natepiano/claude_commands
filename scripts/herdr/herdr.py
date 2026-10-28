@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence, Set
 from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -43,6 +44,22 @@ _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+_NO_NEW_UNIT_DIRECTOR_TITLES: frozenset[str] = frozenset()
+SHARED_SESSION = "agents"
+# The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
+PANE_SLICE = "app-agents.slice"
+# The transient server unit gets CPU first and keeps its memory out of swap under the pane load.
+_SERVER_PROPERTIES = ("-p", "CPUWeight=1000", "-p", "MemoryLow=1G", "-p", "MemorySwapMax=0")
+_PANE_SCOPE_PROBE_SECONDS = 5.0
+# The pane shell wrapper. herdr runs $SHELL for a pane; this puts the real shell in its own scope.
+# The scope runs in place of the wrapper, so the pane's shell pid does not change (the scope is run-p<pid>).
+# SHELL is the real shell again, so a tool that reads SHELL does not start a scope on each command.
+_PANE_SHELL_SCRIPT = f"""#!/bin/sh
+real=${{HERDR_PANE_SHELL:-/bin/sh}}
+unset HERDR_PANE_SHELL
+SHELL=$real; export SHELL
+exec @SYSTEMD_RUN@ --user --scope --quiet --collect --slice={PANE_SLICE} -- "$real" "$@"
+"""
 
 
 def _platform() -> str:
@@ -319,6 +336,39 @@ class TranscriptCursor:
             if row.get("type") == "user" and not row.get("isMeta", False) and _prompt_matches(text, _turn_text(row)):
                 return PromptSubmitted(at)
         return PromptNotSubmitted("no matching non-meta user turn after launch")
+
+    def command_rejections(self, text: str) -> int:
+        """How many times Claude answered this prompt's slash command with `Unknown command` since launch."""
+        command = _slash_command(text)
+        if not command:
+            return 0
+        rejected = re.compile(rf"Unknown command: {re.escape(command)}(?![\w:-])")
+        return sum(1 for _, row in self.read_turns()
+                   if row.get("type") == "system" and rejected.match(_turn_text(row)))
+
+
+def _slash_command(text: str) -> str:
+    """The `/name` a prompt starts with, or "" for a plain prompt."""
+    return text.split(maxsplit=1)[0] if text.startswith("/") and len(text) > 1 else ""
+
+
+def command_fallback(text: str, transcript: SessionTranscript) -> str | None:
+    """A plain prompt that runs a slash command from its file, for a session whose command list lacks it.
+
+    None when the prompt is no slash command, or the command has no file under the account's commands.
+    """
+    command = _slash_command(text)
+    name = command.removeprefix("/")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*", name):
+        return None
+    path = (transcript.config_dir / "commands").joinpath(*name.split(":")).with_suffix(".md")
+    if not path.is_file():
+        return None
+    arguments = text[len(command):].strip()
+    given = f"with the arguments: {arguments}" if arguments else "with no arguments"
+    # Plain text: a prompt that starts with the command would be parsed as that command again.
+    return (f"This session's command list does not have {command} yet, so read {path.resolve()} in full "
+            + f"and follow it as {command} {given}")
 
 
 def _turn_text(row: dict[str, object]) -> str:
@@ -809,6 +859,149 @@ def herdr_binary() -> str:
     return binary
 
 
+# A tab or workspace gone from the shared session keeps its saved place this long, so a restart
+# puts it back where it was. A production retired for longer than this loses its place.
+LAYOUT_KEEP_SECONDS = 14 * 24 * 3600
+# A fresh server gets back each workspace seen this long before the last save: a restart cut short
+# by a second reboot still has the places of the sessions it did not reach.
+LAYOUT_RESTORE_SECONDS = 24 * 3600
+# The title of the shell tab a restart opens to hold a saved workspace's place until its first
+# session's tab arrives. herdr 0.9.5 cannot move a workspace, so creation order is the only order.
+LAYOUT_PLACEHOLDER = "restoring"
+
+
+class SavedName(TypedDict):
+    name: str
+    seen: float
+
+
+class SavedSpace(TypedDict):
+    name: str
+    seen: float
+    tabs: list[SavedName]
+
+
+class SavedLayout(TypedDict):
+    at: float
+    workspaces: list[SavedSpace]
+
+
+class WorkspacesKeptForSplitTabs(NamedTuple):
+    labels: list[str]
+
+
+class _LiveSpace(NamedTuple):
+    workspace_id: str
+    label: str
+    tabs: list[str]
+
+
+def layout_path(session: str) -> Path:
+    """The shared session's saved workspace and tab order, under the state directory."""
+    _validate_session_name(session)
+    state = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(state) / "herdr" / f"layout-{session}.json"
+
+
+def saved_layout(session: str) -> SavedLayout:
+    """The last saved layout; an absent or unreadable file is an empty one."""
+    try:
+        data = cast(object, json.loads(layout_path(session).read_text(encoding="utf-8")))
+        root = json_object(data, "herdr layout")
+        at = root.get("at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            raise HerdrFailure("herdr layout at: expected a number")
+        spaces: list[SavedSpace] = []
+        for item in json_items(root.get("workspaces"), "herdr layout workspaces"):
+            space = json_object(item, "herdr layout workspace")
+            spaces.append(SavedSpace(name=json_text(space.get("name"), "herdr layout workspace name"),
+                                     seen=_seen(space.get("seen")),
+                                     tabs=[_saved_name(tab) for tab in json_items(space.get("tabs"), "herdr layout tabs")]))
+        return SavedLayout(at=float(at), workspaces=spaces)
+    except (OSError, ValueError, HerdrFailure):
+        return SavedLayout(at=0.0, workspaces=[])
+
+
+def _seen(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise HerdrFailure("herdr layout seen: expected a number")
+    return float(value)
+
+
+def _saved_name(value: object) -> SavedName:
+    item = json_object(value, "herdr layout tab")
+    return SavedName(name=json_text(item.get("name"), "herdr layout tab name"), seen=_seen(item.get("seen")))
+
+
+def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[SavedName]:
+    """Live names in live order, seen now; a saved name not live stays after the saved name before it.
+
+    A saved name unseen for longer than LAYOUT_KEEP_SECONDS is dropped.
+    """
+    result = [SavedName(name=name, seen=now) for name in live]
+    placed = set(live)
+    for index, entry in enumerate(saved):
+        if entry["name"] in placed or now - entry["seen"] > LAYOUT_KEEP_SECONDS:
+            continue
+        before = next((earlier["name"] for earlier in reversed(saved[:index]) if earlier["name"] in placed), None)
+        at = 0 if before is None else next(place for place, item in enumerate(result) if item["name"] == before) + 1
+        result.insert(at, SavedName(name=entry["name"], seen=entry["seen"]))
+        placed.add(entry["name"])
+    return result
+
+
+def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float) -> SavedLayout:
+    """The saved layout with the live one laid over it: live order wins, gone entries keep their places."""
+    tabs = {space["name"]: space["tabs"] for space in saved["workspaces"]}
+    live_tabs = {space.label: space.tabs for space in live}
+    order = merged_order([SavedName(name=space["name"], seen=space["seen"]) for space in saved["workspaces"]],
+                         [space.label for space in live], now)
+    return SavedLayout(at=now, workspaces=[
+        SavedSpace(name=entry["name"], seen=entry["seen"],
+                   tabs=merged_order(tabs.get(entry["name"], []), live_tabs.get(entry["name"], []), now))
+        for entry in order])
+
+
+def tab_order(space: str, titles: list[str], saved: list[SavedName], unit_director_titles: Set[str]) -> list[int]:
+    """The indexes of `titles` in the order the workspace `space` shows them.
+
+    Saved tabs keep their saved order. For other tabs, the showrunner comes first, then unit
+    directors A-Z, then other tabs A-Z. The first tab stays first. `sort-tabs` ignores saved order.
+    """
+    showrunner_title = space
+    if titles and not saved and space not in titles:
+        showrunner_title = titles[0]
+
+    def rule(title: str) -> tuple[bool, bool, str]:
+        return (title != showrunner_title, title not in unit_director_titles, title)
+
+    places = {entry["name"]: place for place, entry in enumerate(saved)}
+    order = sorted((index for index, title in enumerate(titles) if title in places), key=lambda index: places[titles[index]])
+    for index in sorted((index for index, title in enumerate(titles) if title not in places), key=lambda index: rule(titles[index])):
+        # The first tab stays first: it is the showrunner's, also when its title is not the workspace's name.
+        start = 0 if titles[index] == space or not order else 1
+        at = next((place for place in range(start, len(order)) if rule(titles[order[place]]) > rule(titles[index])), len(order))
+        order.insert(at, index)
+    return order
+
+
+class _LayoutLock:
+    """One launcher at a time changes the shared session's workspaces and tab order."""
+
+    def __init__(self, session: str) -> None:
+        self.path: Path = layout_path(session).with_suffix(".lock")
+        self.handle: int = -1
+
+    def __enter__(self) -> None:
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(self.handle, fcntl.LOCK_EX)
+
+    def __exit__(self, *_: object) -> None:
+        os.close(self.handle)
+
+
 class Herdr:
     def __init__(self, session: str) -> None:
         self.binary: str = herdr_binary()
@@ -873,36 +1066,100 @@ class Herdr:
             raise HerdrFailure(f"several panes ({found.count}) for label {label!r}")
         return found.pane_id
 
-    def open_pane(self, label: str, cwd: str, environment: dict[str, str]) -> str:
-        arguments = ["workspace", "create", "--label", label, "--cwd", cwd]
-        for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
-            arguments.extend(["--env", f"{key}={value}"])
-        result = self.result(*arguments, "--no-focus")
-        root_pane = json_object(result.get("root_pane"), "herdr workspace root pane")
-        pane = json_text(root_pane.get("pane_id"), "herdr workspace root pane id")
-        _ = self.run("pane", "rename", pane, label)
-        return pane
-
     def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
-        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first."""
+        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first.
+
+        A server that holds none of the saved workspaces gets them all first, in their saved order,
+        each holding a placeholder tab until its first session's tab arrives.
+        """
         options = ["--label", title, "--cwd", cwd]
         for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
+        with _LayoutLock(self.session):
+            saved = saved_layout(self.session)
+            workspace = self._workspace_named(space)
+            if workspace is None and self._place_saved_workspaces(saved):
+                workspace = self._workspace_named(space)
+            if workspace is not None:
+                result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
+            else:
+                options[1] = space
+                result = self.result("workspace", "create", *options, "--no-focus")
+                tab = json_text(json_object(result.get("tab"), "herdr workspace tab").get("tab_id"), "herdr tab id")
+                _ = self.run("tab", "rename", tab, title)
+            root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
+            pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
+            _ = self.run("pane", "rename", pane, title)
+            if workspace is not None:
+                self._close_placeholders(workspace)
+                unit_director_titles = {title} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
+                pane = self.order_tabs(workspace, saved, unit_director_titles).get(pane, pane)
+            self.save_layout()
+            return pane
+
+    def _workspace_named(self, space: str) -> str | None:
         workspaces = [json_object(item, "herdr workspace") for item in json_items(
             self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
         found = [item for item in workspaces if item.get("label") == space]
-        workspace = json_text(found[0].get("workspace_id"), "herdr workspace id") if found else None
-        if workspace is not None:
-            result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
-        else:
-            options[1] = space
-            result = self.result("workspace", "create", *options, "--no-focus")
+        return json_text(found[0].get("workspace_id"), "herdr workspace id") if found else None
+
+    def _place_saved_workspaces(self, saved: SavedLayout) -> bool:
+        """Create the recently live workspaces in saved order, when the server holds none of them."""
+        wanted = [space["name"] for space in saved["workspaces"] if space["seen"] >= saved["at"] - LAYOUT_RESTORE_SECONDS]
+        if not wanted or {space.label for space in self.live_layout()} & set(wanted):
+            return False
+        home = str(Path.home())
+        for name in wanted:
+            result = self.result("workspace", "create", "--label", name, "--cwd", home, "--no-focus")
             tab = json_text(json_object(result.get("tab"), "herdr workspace tab").get("tab_id"), "herdr tab id")
-            _ = self.run("tab", "rename", tab, title)
-        root_pane = json_object(result.get("root_pane"), "herdr tab root pane")
-        pane = json_text(root_pane.get("pane_id"), "herdr tab root pane id")
-        _ = self.run("pane", "rename", pane, title)
-        return pane if workspace is None else self.order_tabs(workspace).get(pane, pane)
+            pane = json_text(json_object(result.get("root_pane"), "herdr workspace root pane").get("pane_id"),
+                             "herdr workspace root pane id")
+            _ = self.run("tab", "rename", tab, LAYOUT_PLACEHOLDER)
+            _ = self.run("pane", "rename", pane, LAYOUT_PLACEHOLDER)
+        return True
+
+    def _close_placeholders(self, workspace: str) -> None:
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
+        for tab in tabs:
+            if tab.get("label") == LAYOUT_PLACEHOLDER and tab.get("pane_count") == 1:
+                _ = self.run("tab", "close", json_text(tab.get("tab_id"), "herdr tab id"))
+
+    def live_layout(self) -> list[_LiveSpace]:
+        """The session's workspaces in order, each with its tab titles in order, placeholders left out."""
+        workspaces = [json_object(item, "herdr workspace") for item in json_items(
+            self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
+        tabs = [json_object(item, "herdr tab") for item in json_items(
+            self.result("tab", "list").get("tabs"), "herdr tab list")]
+        spaces: list[_LiveSpace] = []
+        for workspace in workspaces:
+            ident = json_text(workspace.get("workspace_id"), "herdr workspace id")
+            label = workspace.get("label")
+            titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs if tab.get("workspace_id") == ident]
+            if isinstance(label, str) and label:
+                spaces.append(_LiveSpace(ident, label, titles))
+        return spaces
+
+    def save_layout(self) -> None:
+        """`record_layout`, where a failure is a line on stderr: the tab is open, and only its saved place waits."""
+        try:
+            self.record_layout()
+        except (HerdrFailure, OSError) as error:
+            print(f"herdr {self.session}: layout not saved: {error}", file=sys.stderr)
+
+    def record_layout(self) -> None:
+        """Save the live workspace and tab order over the saved one. A server with no session tab saves nothing."""
+        live = [space._replace(tabs=[title for title in space.tabs if title != LAYOUT_PLACEHOLDER])
+                for space in self.live_layout()]
+        live = [space for space in live if space.tabs]
+        if not live:
+            return
+        path = layout_path(self.session)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        _ = staged.write_text(json.dumps(merged_layout(saved_layout(self.session), live, time.time()), indent=1) + "\n",
+                              encoding="utf-8")
+        _ = staged.replace(path)
 
     def retitle(self, pane: str, title: str) -> bool:
         """Give the pane and its tab the name `title`, then order the workspace's tabs again.
@@ -925,38 +1182,52 @@ class Herdr:
             _ = self.run("pane", "rename", pane, title)
         if shown != title:
             _ = self.run("tab", "rename", tab, title)
-            _ = self.order_tabs(workspace)
+            with _LayoutLock(self.session):
+                _ = self.order_tabs(workspace, saved_layout(self.session))
+                self.save_layout()
         return True
 
-    def order_tabs(self, workspace: str) -> dict[str, str]:
-        """Put the workspace's showrunner tab first and its other tabs in alphabetical order.
+    def order_tabs(self, workspace: str, saved: SavedLayout,
+                   new_unit_director_titles: Set[str] = _NO_NEW_UNIT_DIRECTOR_TITLES) -> dict[str, str]:
+        """Keep saved order; sort other tabs by showrunner, unit directors A-Z, then other tabs A-Z.
 
-        The showrunner's tab carries the workspace's own name. herdr 0.9.5 cannot move a tab, but a
+        `sort-tabs` passes an empty saved layout to sort all tabs. The first tab stays first.
+        herdr 0.9.5 cannot move a tab, but a
         pane moved into a new tab puts that tab last: so every tab from the first one out of place
         moves, in order. Each pane keeps its process, and focus goes back where it was. A tab with
-        several panes leaves the order as it is. Returns each moved pane's new id by its old one.
+        several panes stops the sort only when it must move. Returns each moved pane's new id by its old one.
         """
         spaces = [json_object(item, "herdr workspace") for item in json_items(
             self.result("workspace", "list").get("workspaces"), "herdr workspace list")]
         name = next((item.get("label") for item in spaces if item.get("workspace_id") == workspace), None)
         tabs = [json_object(item, "herdr tab") for item in json_items(
             self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
-        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
-        order = sorted(range(len(tabs)), key=lambda index: (titles[index] != name, titles[index]))
-        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
-        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+        if len(tabs) < 2:
             return {}
         rows = [json_object(item, "herdr pane") for item in json_items(
             self.result("pane", "list").get("panes"), "herdr pane list")]
-        pane_of = {json_text(row.get("tab_id"), "herdr pane tab id"): json_text(row.get("pane_id"), "herdr pane id")
-                   for row in rows}
+        panes_of: dict[str, list[str]] = {}
+        for row in rows:
+            tab = json_text(row.get("tab_id"), "herdr pane tab id")
+            panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
+        unit_panes = unit_director_panes(self.session, herdr_processes())
+        unit_director_titles = new_unit_director_titles | {
+            json_text(tab.get("label"), "herdr tab label") for tab in tabs
+            if any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
+        titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
+        unsaved: list[SavedName] = []
+        kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
+        order = tab_order(name if isinstance(name, str) else "", titles, kept, unit_director_titles)
+        start = next((place for place, index in enumerate(order) if index != place), len(tabs))
+        if start == len(tabs) or any(tabs[index].get("pane_count") != 1 for index in order[start:]):
+            return {}
         focused = next((item for item in spaces if item.get("focused") is True), None)
         active = next((item.get("active_tab_id") for item in spaces if item.get("workspace_id") == workspace), None)
         moved: dict[str, str] = {}
         active_tab = active
         for index in order[start:]:
             tab = json_text(tabs[index].get("tab_id"), "herdr tab id")
-            pane = pane_of[tab]
+            pane = panes_of[tab][0]
             result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
                                  .get("move_result"), "herdr pane move")
             created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
@@ -970,6 +1241,20 @@ class Herdr:
             self.focus_workspace(json_text(focused.get("workspace_id"), "herdr workspace id"))
         return moved
 
+    def sort_tabs(self) -> WorkspacesKeptForSplitTabs:
+        """Sort each workspace by showrunner, units A-Z, then other tabs A-Z; save and return split workspaces kept."""
+        kept: list[str] = []
+        with _LayoutLock(self.session):
+            for space in self.live_layout():
+                tabs = [json_object(item, "herdr tab") for item in json_items(
+                    self.result("tab", "list", "--workspace", space.workspace_id).get("tabs"), "herdr tab list")]
+                if any(tab.get("pane_count") != 1 for tab in tabs):
+                    kept.append(space.label)
+                    continue
+                _ = self.order_tabs(space.workspace_id, SavedLayout(at=0.0, workspaces=[]))
+            self.save_layout()
+        return WorkspacesKeptForSplitTabs(kept)
+
     def close_tab_of(self, pane: str) -> None:
         """Close the tab holding `pane`; a pane already gone leaves nothing to close."""
         rows = [json_object(item, "herdr pane") for item in json_items(
@@ -978,6 +1263,17 @@ class Herdr:
             if row.get("pane_id") == pane:
                 _ = self.run("tab", "close", json_text(row.get("tab_id"), "herdr pane tab id"))
                 return
+
+    def focus_tab_of(self, pane: str) -> None:
+        """Show the tab holding `pane`, and its workspace, in the session's attached clients."""
+        rows = [json_object(item, "herdr pane") for item in json_items(
+            self.result("pane", "list").get("panes"), "herdr pane list")]
+        for row in rows:
+            if row.get("pane_id") == pane:
+                self.focus_workspace(json_text(row.get("workspace_id"), "herdr pane workspace id"))
+                _ = self.run("tab", "focus", json_text(row.get("tab_id"), "herdr pane tab id"))
+                return
+        raise HerdrFailure(f"herdr pane {pane} is not open in session {self.session}")
 
     def focus_workspace(self, workspace_id: str) -> None:
         """Show a workspace in the session's attached clients."""
@@ -1213,12 +1509,18 @@ class Herdr:
         cursor = (TranscriptCursor(opening.transcript, launched_at)
                   if isinstance(opening.transcript, SessionTranscript) else UnspecifiedPromptTranscript())
         screen: str | PromptScreenNotRead = PromptScreenNotRead()
-        typings, enters = 0, 0
+        typings, enters, rejections = 0, 0, 0
         recipient: PromptRecipientProcess | PromptRecipientUnavailable = PromptRecipientUnavailable("transcript identity not supplied")
+        # The text typed last: the opening prompt, or the plain fallback once Claude twice called its command unknown.
+        current = opening.text
+        fallback = (command_fallback(opening.text, opening.transcript)
+                    if isinstance(opening.transcript, SessionTranscript) else None)
 
         def failure(reason: str) -> PromptSubmitOutcome:
             if typings and isinstance(cursor, TranscriptCursor):
-                proof = cursor.submitted_prompt(opening.text)
+                proof = cursor.submitted_prompt(current)
+                if not isinstance(proof, PromptSubmitted) and current != opening.text:
+                    proof = cursor.submitted_prompt(opening.text)
                 if isinstance(proof, PromptSubmitted):
                     if (isinstance(recipient, PromptRecipientProcess)
                             and prompt_recipient_process(cursor.transcript.session_id) != recipient):
@@ -1278,11 +1580,11 @@ class Herdr:
             while time.monotonic() < deadline:
                 typings += 1
                 try:
-                    self.prompt(pane, opening.text)
+                    self.prompt(pane, current)
                 except HerdrFailure as error:
                     if error.code != "agent_prompt_stalled":
                         if isinstance(cursor, TranscriptCursor):
-                            proof = cursor.submitted_prompt(opening.text)
+                            proof = cursor.submitted_prompt(current)
                             if isinstance(proof, PromptSubmitted):
                                 return bound_outcome(proof)
                         return failure(str(error))
@@ -1290,9 +1592,25 @@ class Herdr:
                 if not isinstance(cursor, TranscriptCursor):
                     return failure("caller did not identify the transcript; submit is unproven")
                 while True:
-                    result = self._wait_for_submit(cursor, opening.text, min(deadline, time.monotonic() + 5))
+                    result = self._wait_for_submit(cursor, current, min(deadline, time.monotonic() + 5))
                     if isinstance(result, PromptSubmitted):
                         return bound_outcome(result)
+                    rejected = cursor.command_rejections(current) if current == opening.text else rejections
+                    if rejected > rejections:
+                        # A resumed Claude can take a prompt before its command list is complete
+                        # (cbc14765, 2026-10-20): type the command once more, then its file as a plain prompt.
+                        rejections = rejected
+                        if rejections > 1:
+                            if fallback is None:
+                                return failure(f"Claude answered Unknown command: {_slash_command(current)}")
+                            current = fallback
+                        elif (remaining := deadline - time.monotonic()) > 0:
+                            time.sleep(min(PROMPT_SETTLE_SECONDS, remaining))
+                        if time.monotonic() >= deadline:
+                            return deadline_failure()
+                        if not self.prompt_input_empty(pane):
+                            return failure("destination input contains other text")
+                        break
                     raw = self.run("pane", "read", pane, "--source", "visible", "--format", "ansi")
                     screen = _prompt_screen(raw)
                     composer = _composer_input(raw)
@@ -1302,14 +1620,14 @@ class Herdr:
                         continue
                     if isinstance(composer, NoComposer):
                         continue
-                    if composer.contains(opening.text):
+                    if composer.contains(current):
                         if enters == 3:
                             return failure("no user turn after three Enter retries")
                         if (isinstance(recipient, PromptRecipientProcess)
                                 and prompt_recipient_process(cursor.transcript.session_id) != recipient):
                             return failure("prompt recipient changed before Enter retry")
                         # A turn can land during the screen/process reads too.
-                        proof = cursor.submitted_prompt(opening.text)
+                        proof = cursor.submitted_prompt(current)
                         if isinstance(proof, PromptSubmitted):
                             return bound_outcome(proof)
                         if isinstance(cursor.readability, TranscriptUnreadable):
@@ -1346,7 +1664,7 @@ class Herdr:
                         return failure("prompt recipient changed before re-type")
                     # The last guard immediately before another typing: a late
                     # accepted turn wins over every readiness or idle observation.
-                    proof = cursor.submitted_prompt(opening.text)
+                    proof = cursor.submitted_prompt(current)
                     if isinstance(proof, PromptSubmitted):
                         return bound_outcome(proof)
                     if isinstance(cursor.readability, TranscriptUnreadable):
@@ -1357,6 +1675,13 @@ class Herdr:
             return failure(str(error))
 
     def prompt(self, pane: str, text: str) -> None:
+        """Type a prompt, recorded first so that the prompt hook does not count it as the user's."""
+        import script_prompts
+
+        try:
+            script_prompts.record(pane, text)
+        except OSError as error:
+            print(f"herdr: script prompt not recorded: {error}", file=sys.stderr)
         _ = self.run("agent", "prompt", pane, text)
 
     def wait_until(self, pane: str, state: str, timeout_ms: int) -> ObservedAgentState | WaitTimedOut:
@@ -1468,6 +1793,37 @@ def copy_claude_trust(folder: Path, source: Path, target: Path) -> Trusted | Unt
     except (OSError, UnicodeError, ValueError) as error:
         return UnreadableTrustFile(folder, target, type(error).__name__)
     return Trusted(folder, target, granted.project_key)
+
+
+@dataclass(frozen=True)
+class TrustCopied:
+    """The target account lacked trust for the folder, and the account `source` had it."""
+
+    folder: Path
+    account_file: Path
+    source: str
+
+
+def heal_claude_trust(
+    folder: Path, target: Path, sources: Sequence[tuple[str, Path]], *, dry_run: bool,
+) -> Trusted | TrustCopied | Untrusted | UnreadableTrustFile:
+    """Give the target account file the trust the first trusting source already gave this folder.
+
+    `sources` pairs each account's label with its account file, in the order to try. The copy is
+    `copy_claude_trust`'s one key; a dry run copies nothing. With no trusting source, the target's
+    own `Untrusted` comes back, and the user accepts trust once.
+    """
+    present = claude_trust(folder, target)
+    if not isinstance(present, Untrusted):
+        return present
+    for label, source in sources:
+        if not isinstance(claude_trust(folder, source), Trusted):
+            continue
+        if dry_run:
+            return TrustCopied(present.folder, target, label)
+        copied = copy_claude_trust(folder, source, target)
+        return TrustCopied(present.folder, target, label) if isinstance(copied, Trusted) else copied
+    return present
 
 
 def repository_root(directory: Path) -> Path:
@@ -1636,13 +1992,61 @@ def _installed_server_unit(name: str) -> bool:
     return shown.returncode == 0 and bool(path) and "/transient/" not in path
 
 
+def _pane_shell_path() -> Path:
+    """The pane shell wrapper. One path for every worktree, because a running server keeps it in SHELL."""
+    state = os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    return Path(state) / "herdr" / "pane-shell"
+
+
+def _pane_shell() -> str:
+    """The shell that panes run: the caller's SHELL when it is an executable file, else /bin/sh.
+
+    A systemd-run service gets the user manager's environment, not the caller's, so the value goes to it explicitly.
+    """
+    shell = os.environ.get("SHELL", "")
+    if (shell and Path(shell).is_absolute() and os.path.isfile(shell) and os.access(shell, os.X_OK)
+            and Path(shell).resolve() != _pane_shell_path().resolve()):
+        return shell
+    return "/bin/sh"
+
+
+def _pane_scopes_unavailable() -> str:
+    """Probe a scope once per server start and write the wrapper; the reason on failure, else ""."""
+    systemd_run = os.environ.get("SYSTEMD_RUN", "systemd-run")
+    try:
+        probe = run_program([systemd_run, "--user", "--scope", "--quiet", "--collect", "--", "true"],
+                            timeout=_PANE_SCOPE_PROBE_SECONDS)
+    except (HerdrFailure, subprocess.TimeoutExpired) as error:
+        return str(error)
+    if probe.returncode != 0:
+        return probe.stderr.strip() or f"exit {probe.returncode}"
+    path = _pane_shell_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        absolute = shutil.which(systemd_run) or systemd_run
+        _ = staged.write_text(_PANE_SHELL_SCRIPT.replace("@SYSTEMD_RUN@", shlex.quote(absolute)), encoding="utf-8")
+        # The mode is set before the replace: a server that runs now never finds a wrapper it cannot run.
+        staged.chmod(0o755)
+        _ = staged.replace(path)
+    except OSError as error:
+        return f"cannot write {path}: {error}"
+    return ""
+
+
 def _submit_server(client: Herdr) -> subprocess.CompletedProcess[str]:
     # The shared session's server has a boot unit; a transient unit of its name cannot start beside it.
     if client.session == shared_session() and _installed_server_unit(client.session):
         return run_program([os.environ.get("SYSTEMCTL", "systemctl"), "--user", "start", server_unit(client.session)])
+    # Each pane shell goes into its own scope under PANE_SLICE, so the unit holds only the server.
+    unavailable = " ".join(_pane_scopes_unavailable().splitlines())
+    if unavailable:
+        print(f"herdr {client.session}: pane scopes unavailable, panes stay in the server unit: {unavailable}",
+              file=sys.stderr)
+    shell = [] if unavailable else [f"--setenv=SHELL={_pane_shell_path()}", f"--setenv=HERDR_PANE_SHELL={_pane_shell()}"]
     return run_program([
         os.environ.get("SYSTEMD_RUN", "systemd-run"), "--user", f"--unit={server_unit(client.session)}",
-        "--collect", *client.argv("server"),
+        "--collect", *_SERVER_PROPERTIES, *shell, *client.argv("server"),
     ])
 
 
@@ -1654,15 +2058,13 @@ def _server_start_failure(name: str) -> HerdrFailure:
     return HerdrFailure(message)
 
 
-def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
+def _start_darwin_server(client: Herdr, timeout_ms: int, *, session_kind: SecuritySession) -> ServerCreated | ServerAdopted:
     from detached import DiscardOutput, ExplicitEnvironment, DetachedChildExited, DetachedStartFailure, start_detached
 
     deadline = time.monotonic() + min(10.0, timeout_ms / 1000)
     try:
         if server_answering(run_program(client.argv("status", "server"),
                                         timeout=max(0.001, deadline - time.monotonic()))):
-            if exclusive:
-                raise SessionTaken(client.session)
             return ServerAdopted()
     except subprocess.TimeoutExpired:
         pass
@@ -1693,8 +2095,6 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
                              output=DiscardOutput(), environment=ExplicitEnvironment(unmarked_environment()))
     except DetachedChildExited as error:
         if holders and holders != {error.pid}:
-            if exclusive:
-                raise SessionTaken(client.session) from error
             return ServerAdopted()
         raise _server_start_failure(client.session) from error
     except (DetachedStartFailure, HerdrFailure) as error:
@@ -1705,8 +2105,6 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        if exclusive:
-            raise SessionTaken(client.session)
         return ServerAdopted()
     _clear_restored_workspaces(client)
     return ServerCreated()
@@ -1715,10 +2113,11 @@ def _start_darwin_server(client: Herdr, timeout_ms: int, *, exclusive: bool, ses
 def start_server(name: str, timeout_ms: int, *,
                  session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> ServerCreated | ServerAdopted:
     _validate_session_name(name)
+    _require_shared(name)
     _timeout(timeout_ms)
     herdr = Herdr(name)
     if _platform() == "darwin":
-        return _start_darwin_server(herdr, timeout_ms, exclusive=False,
+        return _start_darwin_server(herdr, timeout_ms,
             session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
     deadline = time.monotonic() + timeout_ms / 1000
     try:
@@ -1744,57 +2143,13 @@ def start_server(name: str, timeout_ms: int, *,
             time.sleep(min(0.1, remaining))
 
 
-def start_new_server(name: str, timeout_ms: int, *,
-                     session_kind: SecuritySession | SessionKindNotRead = _SESSION_KIND_NOT_READ) -> None:
-    """Create an exclusive server; never adopt a server another launch started."""
-    _validate_session_name(name)
-    _timeout(timeout_ms)
-    herdr = Herdr(name)
-    if _platform() == "darwin":
-        _ = _start_darwin_server(herdr, timeout_ms, exclusive=True,
-            session_kind=security_session() if isinstance(session_kind, SessionKindNotRead) else session_kind)
-        return
-    deadline = time.monotonic() + timeout_ms / 1000
-    try:
-        if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, timeout_ms / 1000))):
-            raise SessionTaken(name)
-    except subprocess.TimeoutExpired:
-        pass
-    created = _submit_server(herdr)
-    if created.returncode:
-        detail = (created.stdout + created.stderr).lower()
-        if "already exists" in detail or "already loaded" in detail:
-            raise SessionTaken(name)
-        require_success(created, f"start {server_unit(name)}")
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise HerdrFailure(f"server {name} not answering after {timeout_ms} ms")
-        try:
-            if server_answering(run_program(herdr.argv("status", "server"), timeout=max(0.001, remaining))):
-                if not _server_unit_active(name):
-                    raise SessionTaken(name)
-                _clear_restored_workspaces(herdr)
-                return
-        except subprocess.TimeoutExpired:
-            pass
-        remaining = deadline - time.monotonic()
-        if remaining > 0:
-            time.sleep(min(0.1, remaining))
-
-
-def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
-                   exclusive: bool) -> ServerCreated | ServerAdopted | WindowServerCreated:
+def restore_server(name: str, timeout_ms: int, *,
+                   session_kind: SecuritySession) -> ServerCreated | ServerAdopted | WindowServerCreated:
     """Start in Aqua directly, or let a desktop attach window bootstrap its server."""
     _validate_session_name(name)
+    _require_shared(name)
     _timeout(timeout_ms)
     if _platform() != "darwin" or isinstance(session_kind, DesktopSession):
-        if exclusive:
-            if _platform() == "darwin":
-                start_new_server(name, timeout_ms, session_kind=session_kind)
-            else:
-                start_new_server(name, timeout_ms)
-            return ServerCreated()
         if _platform() == "darwin":
             return start_server(name, timeout_ms, session_kind=session_kind)
         return start_server(name, timeout_ms)
@@ -1803,8 +2158,6 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
     try:
         if server_answering(run_program(client.argv("status", "server"),
                                         timeout=max(0.001, deadline - time.monotonic()))):
-            if exclusive:
-                raise SessionTaken(name)
             return ServerAdopted()
         # An existing listener that has not answered yet is also another launch's.
         if any(item.path == _session_socket(name) for item in _darwin_bound_sockets(
@@ -1832,28 +2185,56 @@ def restore_server(name: str, timeout_ms: int, *, session_kind: SecuritySession,
     raise MacDesktopUnavailable()
 
 
-def stop_created_server(name: str, ownership: ServerCreated | ServerAdopted | WindowServerCreated) -> None:
-    """Only directly created servers are ours to stop; desktop windows stay open."""
-    if isinstance(ownership, (ServerAdopted, WindowServerCreated)):
-        return
-    stop_session(name)
-
-
 def shared_session() -> str:
-    """The one herdr session every production lives in, one workspace per production and one tab
-    per Claude session, named in `herdr/shared-session` under the config directory. Empty when the
-    file is absent: each Claude session then gets a herdr session of its own."""
+    """The one herdr session every Claude session lives in, one workspace per production and one tab
+    per Claude session: `agents`, or the name in `herdr/shared-session` under the config directory.
+
+    There is no other herdr session. A launcher opens a tab here and never starts a server of its own
+    (user, 2026-10-26); `_require_shared` refuses any other name.
+    """
     path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "shared-session"
     try:
         name = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
-        return ""
+        return SHARED_SESSION
     _validate_session_name(name)
     return name
 
 
+def attach_hint(space: str, tab: str) -> str:
+    """Where the user finds one Claude session: its tab in a workspace of the shared session."""
+    return f"herdr session attach {shared_session()}, workspace {space}, tab {tab}"
+
+
+def _require_shared(name: str) -> None:
+    shared = shared_session()
+    if name != shared:
+        raise HerdrFailure(f"herdr session {name}: every Claude session runs as a tab in herdr session "
+                           + f"{shared}; open a tab there instead of starting another session")
+
+
 def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
     return Herdr(name).open_tab(space, title, cwd, environment)
+
+
+def save_shared_layout(running: set[str]) -> None:
+    """Save the shared session's workspace and tab order, when that session is among the `running` ones.
+
+    A tab the user renamed in herdr reaches the saved layout here; launchers save after each change.
+    """
+    name = shared_session()
+    if name in running:
+        client = Herdr(name)
+        with _LayoutLock(name):
+            client.save_layout()
+
+
+def reload_agent_rules(name: str) -> None:
+    """Make the running session `name` read its agent detection rules again; a failure is a line on stderr."""
+    try:
+        _ = Herdr(name).run("server", "reload-agent-manifests")
+    except HerdrFailure as error:
+        print(f"herdr {name}: detection rules not reloaded: {error}", file=sys.stderr)
 
 
 def close_agent(session: str, pane: str) -> None:
@@ -1879,10 +2260,6 @@ def stop_session(name: str) -> None:
             command = [os.environ.get("SYSTEMCTL", "systemctl"), "--user", "stop", server_unit(name)]
             require_success(run_program(command), f"stop {server_unit(name)}")
     require_success(result, f"stop herdr session {name}")
-
-
-def open_pane(name: str, label: str, cwd: str, environment: dict[str, str]) -> str:
-    return Herdr(name).open_pane(label, cwd, environment)
 
 
 def _proc_root() -> Path:
@@ -2290,6 +2667,19 @@ def _pane_shell_pids(session: str) -> list[int]:
     return shells
 
 
+def _pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+    """The pane scopes under PANE_SLICE that hold a process, from its systemd memberships."""
+    return [(hierarchy, scope) for hierarchy, path in groups
+            for scope in (path, *path.parents) if scope.parent.name == PANE_SLICE]
+
+
+def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int], sessions: dict[int, str]) -> None:
+    """Record the session of each matched process in its pane scope."""
+    for pid in pids:
+        for scope in _pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
+            owners.setdefault(scope, set()).add(sessions[pid])
+
+
 def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[int, str]:
     """Associate descendants and handoff survivors with socket-owned sessions."""
     if not servers:
@@ -2328,6 +2718,9 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
         # Handoff transfers PTYs without reparenting their processes to the
         # replacement. setsid leaves their dedicated service cgroup unchanged.
         shared_sessions: set[str] = set()
+        # A pane shell in its own scope is not in the unit's cgroup. After a
+        # handoff, its scope is the only membership that it keeps.
+        loose: dict[int, list[tuple[str, Path]]] = {}
         for process in candidates:
             pid = int(process.name)
             if pid in sessions:
@@ -2337,7 +2730,8 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                     continue
             except OSError:
                 continue
-            for hierarchy, path in _systemd_cgroups(process):
+            groups = _systemd_cgroups(process)
+            for hierarchy, path in groups:
                 shared_sessions.update(shared_groups.get((hierarchy, path), set()))
                 for ancestor in (path, *path.parents):
                     session = unit_groups.get((hierarchy, ancestor), "")
@@ -2346,6 +2740,17 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         break
                 if pid in sessions:
                     break
+            if pid not in sessions and (scopes := _pane_scopes(groups)):
+                loose[pid] = scopes
+        # A pane scope holds one pane's processes, as the unit's cgroup held
+        # them before. Only a scope that no matched process explains needs the
+        # unit servers' pane shells.
+        owners: dict[tuple[str, Path], set[str]] = {}
+        if loose:
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in servers], sessions)
+            if any(not any(scope in owners for scope in scopes) for scopes in loose.values()):
+                shared_sessions.update(unit_groups.values())
+        walked = set(sessions)
         # Handoff retains child_pid in each imported PTY runtime. Unlike a
         # shared cgroup or HERDR_SESSION, this identifies the actual pane shell.
         for session in shared_sessions:
@@ -2358,6 +2763,13 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         continue
                     sessions[pid] = owner
                     descendants.extend((child, owner) for child in children.get(pid, []))
+        if loose:
+            _add_scope_owners(owners, [pid for pid in sessions if pid not in walked], sessions)
+            for pid, scopes in loose.items():
+                found = {session for scope in scopes for session in owners.get(scope, set())}
+                # A scope with two owners holds a server started inside a pane; it names neither.
+                if pid not in sessions and len(found) == 1:
+                    sessions[pid] = found.pop()
     return {pid: session for pid, session in sessions.items() if pid not in servers}
 
 
@@ -2511,6 +2923,16 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
         except (HerdrFailure, subprocess.TimeoutExpired):
             continue
     return processes
+
+
+def has_unit_marks(environment: dict[str, str]) -> bool:
+    return all(environment.get(mark) for mark in UNIT_MARKS)
+
+
+def unit_director_panes(session: str, processes: Sequence[HerdrProcess]) -> set[str]:
+    """The session's pane ids whose processes carry both unit marks."""
+    return {process.place.pane for process in processes
+            if process.place.session == session and has_unit_marks(process.marks)}
 
 
 def herdr_processes() -> list[HerdrProcess]:

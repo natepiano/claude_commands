@@ -15,7 +15,7 @@ The nightly Rust release check enables FMA for its Linux clippy build. Buildlog 
 | `scripts/direct/verify.sh` | Runs the clippy fix passes, formatting, cache rekey and the clippy judgment. |
 | `scripts/lint/invoke.sh` | `invoke_clippy_fix` runs the fix pass with the judgment's arguments. |
 | `scripts/buildlog/rust_release.py` | Sets the release trial's Linux clippy FMA flags. |
-| `scripts/buildlog/record.py` | Supplies worker, delegate session and agent session for step and call records. |
+| `scripts/buildlog/record.py` | Supplies worker, worker session and agent session for step and call records. |
 | `scripts/direct/test_verify_lint_scope.py` | Uses fake Cargo to check the fix order, the pass limit, check mode and cache keys. |
 | `scripts/style/test_style_sync.py` | Checks the Cargo calls of a workspace lint, the fix pass and both formats included. |
 | `scripts/buildlog/test_rust_release.py`, `test_record.py` | Check release flags and agent-session precedence with isolated inputs. |
@@ -38,7 +38,7 @@ The normal `verify.sh lint` path runs mend, fmt and Taplo first. Then the clippy
 2. `fmt_cargo "${FMT_SCOPE[@]}"`, which formats what the fix wrote.
 3. A compare of `tree_key` before and after the pass. A pass that changes nothing ends the loop. So a clean tree costs one fix pass.
 
-After the loop, lint recomputes `VERDICT_KEY` when it records a run. Then it runs the judgment, `cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings`. The judgment's status is lint's status. A pass continues to rustdoc. The `style-lint: clippy start` and `passed` lines stay.
+After the loop, lint recomputes `VERDICT_KEY` when it records a run. Then it runs the judgment, `cargo clippy --workspace --all-targets --all-features --keep-going -- -D warnings`. The judgment's status is lint's status. Rustdoc runs separately through `verify.sh doc` at the checkpoint. The `style-lint: clippy start` and `passed` lines stay.
 
 The fix pass never sets lint's status. lint ignores its exit code. A tree with compile errors makes the fix pass fail, and the judgment reports those errors.
 

@@ -23,6 +23,30 @@ RuleOrigin = Literal["global", "local"]
 
 
 @dataclass(frozen=True)
+class NotStyleUnit:
+    """The unit id does not name a style family."""
+
+
+def style_family(unit: str) -> Family | NotStyleUnit:
+    families: tuple[Family, ...] = ("names", "values", "types", "modules")
+    for family in families:
+        suffix = f"{family}-unit"
+        if unit == suffix or unit.endswith("-" + suffix):
+            return family
+    return NotStyleUnit()
+
+
+# The ranked families, highest first. On each file a family's work waits while a family ranked above it has open work
+# there. modules has no rank: structure blocking orders it.
+FAMILY_RANKS: tuple[Family, ...] = ("types", "values", "names")
+
+
+def ranked_above(family: Family) -> tuple[Family, ...]:
+    """The families ranked above family, highest first; none for the top family or an unranked one."""
+    return FAMILY_RANKS[:FAMILY_RANKS.index(family)] if family in FAMILY_RANKS else ()
+
+
+@dataclass(frozen=True)
 class RepoReach:
     """The rule governs the entire repository."""
 
@@ -40,6 +64,20 @@ class WorkspaceMember:
 
 
 @dataclass(frozen=True)
+class UserApproves:
+    """The user answers each decision under the rule."""
+
+
+@dataclass(frozen=True)
+class AlwaysApproved:
+    """The rule says `approval: always`: filing approves each new decision under it for the unit of its family."""
+    family: Family
+
+
+RuleApproval = UserApproves | AlwaysApproved
+
+
+@dataclass(frozen=True)
 class Rule:
     rule_id: str
     reach: RepoReach | MemberReach
@@ -53,6 +91,7 @@ class Rule:
     pre_filter: str | None
     blob: str
     origin: RuleOrigin
+    approval: RuleApproval
 
 
 class RuleValidationError(ValueError):
@@ -111,6 +150,15 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
         if candidates is not None and candidates.surface == "unclassified":
             raise RuleValidationError(path, "classified rule's candidates.surface must be whole or partial")
 
+    approval: RuleApproval = UserApproves()
+    declared_approval = _scalar(metadata, "approval", path)
+    if declared_approval:
+        if declared_approval != "always":
+            raise RuleValidationError(path, "approval must be always")
+        if family is None:
+            raise RuleValidationError(path, "approval always requires a family")
+        approval = AlwaysApproved(family)
+
     pre_filter = style_rules.read_pre_filter(path) or None
     if tier == "B" and candidates is None and pre_filter is None:
         raise RuleValidationError(path, "tier B requires candidates or pre_filter")
@@ -134,6 +182,7 @@ def _load_rule(path: Path, origin: RuleOrigin, rule_root: Path, reach: RepoReach
         pre_filter=pre_filter,
         blob=blob,
         origin=origin,
+        approval=approval,
     )
 
 
@@ -212,6 +261,12 @@ def _member_reach(repo_root: Path, member: str, rule_path: Path) -> MemberReach:
     raise RuleValidationError(rule_path, f"member-local rule names no workspace member {member}")
 
 
+def global_rule_paths() -> tuple[Path, ...]:
+    """The file of each global rule, in name order. A rule's name is its file stem."""
+    global_dir = style_rules.NATE_STYLE_DIR.resolve() / "rust"
+    return tuple(path.resolve() for path in sorted(global_dir.glob("*.md")) if path.is_file())
+
+
 def load_rules(repo_root: Path | None) -> tuple[Rule, ...]:
     """Read every global rule, then root and member rules in a repository.
 
@@ -221,11 +276,7 @@ def load_rules(repo_root: Path | None) -> tuple[Rule, ...]:
     this registry includes tool-enforced and Bevy rules for every repository.
     """
     global_root = style_rules.NATE_STYLE_DIR.resolve()
-    global_dir = global_root / "rust"
-    rules = [
-        _load_rule(path.resolve(), "global", global_root, RepoReach())
-        for path in sorted(global_dir.glob("*.md")) if path.is_file()
-    ]
+    rules = [_load_rule(path, "global", global_root, RepoReach()) for path in global_rule_paths()]
     if repo_root is not None:
         repo_root = repo_root.expanduser().resolve()
         docs = repo_root / "docs"

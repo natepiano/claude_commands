@@ -173,7 +173,7 @@ class WorkerAssignment:
 
 @dataclass(frozen=True)
 class NotAWorker:
-    """This session is not assigned to a delegate worker."""
+    """This session is not assigned to a worker."""
 
 
 Assignment = WorkerAssignment | NotAWorker
@@ -532,6 +532,9 @@ class _MeshWorker(TypedDict, total=False):
     role: str
     lens: str
     cwd: str
+    held_design_id: str
+    transferring_role: dict[str, object]
+    role_redirect: dict[str, object]
 
 
 def _as_string(value: object) -> str:
@@ -775,7 +778,7 @@ def _live_runs(
             if now - heartbeat.stat().st_mtime < unit_runs.LIVE_HEARTBEAT_SECS:
                 _ = by_path.setdefault(heartbeat.parent.resolve(), _NoRunningDirector())
         except OSError as error:
-            _problem(problems, f"delegate heartbeat {heartbeat}", error)
+            _problem(problems, f"worker heartbeat {heartbeat}", error)
     return [
         _LiveRun(path, director)
         for path, director in sorted(by_path.items(), key=lambda item: item[0])
@@ -1147,7 +1150,7 @@ def _review_workers(
     return entries
 
 
-def _delegate_workers(
+def _unit_workers(
     machine: str, runs: list[_LiveRun], claude_entries: Mapping[str, RosterEntry],
     production_places: Mapping[str, _ProductionPlace],
     problems: list[str], *, home_state: account.LegacyHomeLogin | account.ConfigOnlyHome,
@@ -1165,7 +1168,7 @@ def _delegate_workers(
         place = _run_place(run, claude_entries, production_places)
         for name, record in sorted(_mesh_records(run, problems).items()):
             status = _as_string(record.get("status"))
-            if status == "ended":
+            if status == "ended" or record.get("transferring_role") or record.get("role_redirect") or record.get("held_design_id"):
                 continue
             thread_id = _as_string(record.get("thread_id"))
             if thread_id:
@@ -1196,6 +1199,53 @@ def _delegate_workers(
             ))
         entries.extend(_review_workers(machine, run, place, table, problems, home_state=home_state))
     return entries, worker_threads
+
+
+def _durable_roles(machine: str, claude: Mapping[str, RosterEntry], problems: list[str]) -> tuple[list[RosterEntry], set[str]]:
+    from scripts.guilds import roles
+    entries: list[RosterEntry] = []
+    threads: set[str] = set()
+    for path in sorted(roles.state_root().glob('*/design.json')):
+        try:
+            design = roles.read_design(path.parent.name)
+            reach = roles.resolve_holder(design.holder)
+            session = claude.get(reach.session_id) if isinstance(reach, roles.HolderReach) else None
+            director: DirectorRelationship = NoDirector()
+            showrunner: ShowrunnerRelationship = ProductionWithoutRunningShowrunner(design.holder.production_slug)
+            if isinstance(design.holder, roles.UnitHolder):
+                director = UnderDirector(design.holder.unit_name, session.name if session else design.holder.unit_name,
+                                         f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
+                if session:
+                    showrunner = session.showrunner
+            elif session:
+                showrunner = UnderShowrunner(design.holder.production_slug, session.name,
+                                              f'session:{reach.session_id}' if isinstance(reach, roles.HolderReach) else '')
+            mesh = roles.mesh_directory(design.placement.design_id)
+            roster = _read_object(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
+            for instance in design.roles:
+                if isinstance(instance.lifecycle, (roles.RoleNotOpened, roles.RoleEnded)):
+                    continue
+                thread = instance.lifecycle.thread_id
+                if thread in threads:
+                    continue
+                raw_entry = roster.get(instance.name, {})
+                if not isinstance(raw_entry, dict):
+                    raise ValueError('durable roster entry is not an object')
+                entry = cast(dict[str, object], raw_entry)
+                if (entry.get('transferring_role') or entry.get('role_redirect')
+                        or roles.transfer_route(thread, design.placement.design_id)):
+                    continue
+                threads.add(thread)
+                status = _as_string(entry.get('status')) or type(instance.lifecycle).__name__
+                entries.append(RosterEntry(machine=machine, kind='codex', role='astra-' + instance.role,
+                    name=instance.name, status=status, reach=CannotReceiveMessages(
+                        'held role; its holder adds pending messages to an authorized assignment'),
+                    cwd=design.repository, showrunner=showrunner, director=director,
+                    assignment=WorkerAssignment('astra-' + instance.role, str(mesh)), thread=CodexThread(thread),
+                    account=AccountUnread('serving home not read')))
+        except (OSError, ValueError, TypeError) as error:
+            _problem(problems, 'durable role ' + str(path), error)
+    return entries, threads
 
 
 def _herdr_codex_panes(machine: str) -> Roster:
@@ -1248,7 +1298,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     details = _raw_session_details(records, problems)
     registered = _registered_showrunners(environment, problems)
     runner_ids = _showrunner_ids(records, registered)
-    roots = unit_runs.run_roots(environment.get("ROSTER_DELEGATE_ROOT"))
+    roots = unit_runs.run_roots(environment.get("ROSTER_RUN_ROOT"))
     runs = _live_runs(roots, {record["sessionId"] for record in records}, problems)
     workers = _ledger_workers(runs, records, problems)
     production_places = _production_places(
@@ -1257,9 +1307,12 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
     claude = _claude_entries(
         machine, records, details, runner_ids, production_places, runs, workers, home_state=home_state
     )
-    delegate_workers, worker_threads = _delegate_workers(
+    unit_workers, worker_threads = _unit_workers(
         machine, runs, claude, production_places, problems, home_state=home_state
     )
+    durable_roles, durable_threads = _durable_roles(machine, claude, problems)
+    unit_workers.extend(durable_roles)
+    worker_threads.update(durable_threads)
     daemon_socket = codex_daemon.daemon_socket(environment)
     daemon = codex_daemon.loaded_sessions(daemon_socket)
     daemon_home = daemon_socket.parent.parent
@@ -1287,7 +1340,7 @@ def _local_roster(environment: Mapping[str, str]) -> Roster:
         ]
     interactive = _herdr_codex_panes(machine)
     problems.extend(interactive.problems)
-    entries = [*claude.values(), *delegate_workers, *codex_sessions, *interactive.entries]
+    entries = [*claude.values(), *unit_workers, *codex_sessions, *interactive.entries]
     return Roster(entries, problems)
 
 

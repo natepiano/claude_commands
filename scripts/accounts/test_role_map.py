@@ -562,6 +562,10 @@ class RoleMapTests(unittest.TestCase):
                          "accounts: workers has no mapped account; run accounts.py set-role workers <codexN>")
 
     def test_mac_launch_reads_the_map_once_per_command_and_the_next_command_observes_a_change(self) -> None:
+        program = self.home / ".local/bin/claude"
+        program.parent.mkdir(parents=True)
+        _ = program.write_text("#!/bin/sh\nexit 99\n")
+        program.chmod(0o700)
         self.seed(self.server_home, groups={"units": "claude2"})
         self.assertEqual(accounts.setup("claude2"), [])
         self.assertEqual(accounts.setup("claude3"), [])
@@ -620,7 +624,7 @@ class RoleMapTests(unittest.TestCase):
         run = self.home / "scratch-run"
         run.mkdir()
         prompt = run / "prompt.txt"
-        _ = prompt.write_text("Scratch delegate task")
+        _ = prompt.write_text("Scratch worker task")
         output, error = io.StringIO(), io.StringIO()
         with (patch.object(role_map, "ssh_role_map", side_effect=self.remote),
               patch.object(codex_mesh, "_start_server") as start,

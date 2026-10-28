@@ -17,7 +17,8 @@ port_lint.py writes its own call records through write_call() here.
       nothing.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
       From verify.sh, once per call. OUTCOME is ran, failed, interrupted,
-      reused or replayed; CACHED is 1 when the call was eligible for a pass
+      reused, replayed or superseded (a newer call of the same verb from the
+      same worker replaced it in the token queue, status 76); CACHED is 1 when the call was eligible for a pass
       record; WAIT, WALL, BUILD and SAVED are whole seconds, ELAPSED the
       script's $SECONDS at the end. STATUS and BUILD may be empty (unknown).
       BUILDLOG_TOKEN_WAIT_S is the time spent acquiring the cargo token.
@@ -28,6 +29,8 @@ port_lint.py writes its own call records through write_call() here.
       was decided.
   record.py hold-event <began|ended> <target> <hold key> <holder> <reason> <at> [<until>]
       AT is an ISO 8601 UTC instant with offset. UNTIL is empty when no end was planned.
+  record.py hold-build KEY SINCE BOOT PID START CLASS SESSION COMMAND CWD
+      Record an other_session or no_session build once per hold and process lifetime.
   record.py backfill-verify [LEDGER]
       Copy verify.sh's old call ledger (~/.local/state/verify/events.jsonl)
       into call records, once: each line gets an id from its own hash, so a
@@ -40,6 +43,7 @@ exit status is 0. Records are JSON lines (store.py); index.py reads them.
 from __future__ import annotations
 
 import gzip
+import fcntl
 import hashlib
 import json
 import math
@@ -167,10 +171,11 @@ def caller(tty: bool) -> str:
 
 def who() -> dict[str, str | None]:
     env = os.environ
-    board = env.get("PLAN_DELEGATE_BOARD_DIR") or env.get("PLAN_DELEGATE_SESSION_DIR")
+    board = (env.get("UNIT_RUN_DIR") or env.get("PLAN_DELEGATE_BOARD_DIR")
+             or env.get("UNIT_SESSION_DIR") or env.get("PLAN_DELEGATE_SESSION_DIR"))
     return {
-        "worker": env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
-        "delegate_session": Path(board.rstrip("/")).name if board else None,
+        "worker": env.get("UNIT_TEAM_ROLE") or env.get("PLAN_DELEGATE_TEAM_ROLE") or None,
+        "unit_session": Path(board.rstrip("/")).name if board else None,
         "session": env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID") or None,
     }
 
@@ -421,6 +426,34 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
+def hold_build(args: list[str]) -> None:
+    key, since, boot, pid, start, classification, session, command, cwd = args
+    if classification not in {"other_session", "no_session"} or int(pid) <= 0 or not start.isdecimal():
+        raise ValueError("invalid hold-build identity or class")
+    if datetime.fromisoformat(since).utcoffset() is None:
+        raise ValueError("hold-build since needs an offset")
+    hold_id = hashlib.sha256(json.dumps([key, since]).encode()).hexdigest()
+    build_id = hashlib.sha256(json.dumps([boot, pid, start]).encode()).hexdigest()
+    host = store.host_name()
+    path = store.root() / host / f"hold-builds-{hold_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # This file is both the permanent record and the set of builds seen for this hold.
+    with path.open("a+") as log:
+        fcntl.flock(log, fcntl.LOCK_EX)
+        _ = log.seek(0)
+        for line in log:
+            value = cast(object, json.loads(line))
+            if isinstance(value, dict) and cast(dict[str, object], value).get("id") == build_id:
+                return
+        row: dict[str, object] = {
+            "kind": "hold_build", "v": RECORD_VERSION, "id": build_id,
+            "at": store.utc_iso(time.time()), "host": host, "hold_key": key, "hold_since": since,
+            "boot_id": boot, "pid": int(pid), "proc_start": start, "class": classification,
+            "session": session, "command": command, "cwd": cwd,
+        }
+        _ = log.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+
 def backfilled_ids() -> set[str]:
     ids: set[str] = set()
     for path in store.root().glob("*/*.jsonl"):
@@ -485,7 +518,7 @@ def backfill(args: list[str]) -> None:
             "branch": event["branch"] or None,
             "sha": event["commit"] or None,
             "worker": None,
-            "delegate_session": event["session"] or None,
+            "unit_session": event["session"] or None,
             "session": None,
             "backfilled": True,
         }
@@ -513,6 +546,8 @@ def main(argv: list[str]) -> int:
                 print(found)
         elif command == "hold-event":
             hold_event(rest)
+        elif command == "hold-build":
+            hold_build(rest)
         elif command == "call":
             call(rest)
         else:

@@ -15,15 +15,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone_name  # noqa: E402
-
-if TYPE_CHECKING:
-    from showrunners import Place
-
 
 DAILIES = Path(__file__).resolve().parent.parent / "production" / "dailies_render.py"
 STATUS = re.compile(r"Status: PRODUCTION — ([a-z]*)")
@@ -126,28 +122,14 @@ def read_production(instance_dir: Path) -> Production | None:
         return None
 
 
-def place_of(slug: str) -> Place:
-    """Where `slug` sits among the showrunners: the root above it, or the productions below it."""
-    production_scripts = str(DAILIES.parent)
-    if production_scripts not in sys.path:
-        sys.path.insert(0, production_scripts)
-    # The tree lives with the production scripts. They import this module, so this one imports late.
-    import showrunners
-    return showrunners.place_of(slug)
+def open_questions(productions: list[Production]) -> int | None:
+    """How many items now wait on the user in these productions' own lists; None when a list cannot be read.
 
-
-def open_questions(productions: list[Production], below: dict[str, list[str]]) -> int | None:
-    """How many items now wait on the user across these productions; None when a list cannot be read.
-
-    `below` names the productions under each root showrunner. A root's count covers them, since
-    the root is where the user sees everything below it. An item the user deferred is not counted until its `after`
-    time, as the footer's own `nothing needed` is decided.
+    Each showrunner counts its own production only: the showrunners above and below it count
+    theirs (user, 2026-10-27). An item the user deferred is not counted until its `after` time, as
+    the footer's own `nothing needed` is decided.
     """
-    # One user, one zone: a lower production's `after` is judged in the zone of the one that counts it.
-    zones: dict[str, str] = {}
-    for production in productions:
-        for slug in (production.slug, *below.get(production.slug, [])):
-            _ = zones.setdefault(slug, production.zone)
+    zones = {production.slug: production.zone for production in productions}
     count = 0
     for slug, zone in zones.items():
         path = outstanding_path(slug)

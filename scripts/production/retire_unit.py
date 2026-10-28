@@ -300,11 +300,12 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
     """The processes inside the worktree that its runs leave behind once their sessions stop, each named.
 
     A run's detached command (mesh_runs.py supervise) is found by its record, which holds the
-    supervisor's pid and is in the supervisor's arguments; an app-server's idle-stop watcher by the
-    run folder in its arguments. Each leads its own session, so its children go with it.
+    supervisor's pid and is in the supervisor's arguments; an app-server by its run's
+    mesh_server.json; an app-server's idle-stop watcher by the run folder in its arguments. Each
+    leads its own session, so its children go with it.
     """
     runs = runs_of(worktree)
-    leaders: dict[int, str] = {}
+    leaders = {item.pid: f"app-server {item.pid} of run {item.run.name}" for item in mesh_runs(runs)}
     for folder in runs:
         for path in sorted((folder / DETACHED_RUNS).glob("*.json")):
             record = _json(path)
@@ -322,7 +323,7 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
             for pid in inside if (leader := _session_of(pid)) in leaders}
 
 
-def _same_unit(lease: str, unit: str) -> bool:
+def same_unit(lease: str, unit: str) -> bool:
     # review_pool's own rule: some leases name `trunk`, others `trunk-unit`.
     return lease.removesuffix("-unit") == unit.removesuffix("-unit")
 
@@ -334,7 +335,7 @@ def reviewers(unit: Unit) -> tuple[Reviewer, ...]:
     found: list[Reviewer] = []
     for line in listed.stdout.splitlines():
         fields = line.split("\t")
-        if len(fields) >= 4 and fields[2] != "unleased" and _same_unit(fields[2].rsplit(":", 1)[0], unit.name):
+        if len(fields) >= 4 and fields[2] != "unleased" and same_unit(fields[2].rsplit(":", 1)[0], unit.name):
             found.append(Reviewer(fields[0], fields[3] == "busy"))
     return tuple(found)
 
@@ -600,6 +601,12 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     if left:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
+        return 1
+    from scripts.guilds import roles
+    try:
+        roles.end_holder(unit.production.slug, unit.name)
+    except (OSError, ValueError, SystemExit) as error:
+        print(f"{unit.name} is not retired: held role cleanup: {error}")
         return 1
     if not unit.retired:
         mark_retired(unit, session_id)
