@@ -136,7 +136,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Ruled out:** extending the global kept-path masking (per-file kept contexts are used instead); a general English plural rule for every term (explicit inflected forms are used instead).
 
-### Phase 4 — The retired-name check runs in a few seconds  · status: todo
+### Phase 4 — The retired-name check runs in a few seconds  · status: done
 **Depends on:** Phase 3
 
 #### Work Order

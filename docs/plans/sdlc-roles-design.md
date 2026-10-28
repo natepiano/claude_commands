@@ -1201,3 +1201,14 @@ Command: `python3 scripts/production/roles_audit.py --root . --since 2026-10-14 
 | `Codex seats` | 0 | 0 |
 
 Singular n=15 and plural n=7 match the kept target of the opening freeze (n=22 combined). Every remaining use is a kept context with its reason in `role_terms.toml`; eligible uses remaining n=0, `commands/unit/direct.md` included. The before measure on the `2bd53a04` export read `seat` n=69 and `Codex seat` n=9. The `Codex seat` row overlaps the `seat` row and earns no extra count. The repository check `test_repository_sources_have_no_unkept_retired_names` passes on this tree.
+
+### Retired-name check timing — 2026-10-28
+
+The check now selects candidate files before full extraction, splits each Python file's source lines once, and reads and extracts the files of a full-tree scan in 8 processes (results keep the sorted source order). On natedev, on the full tree at merged HEAD `35fb3d20`, with the output byte-for-byte the same as before:
+
+| Command | Before (wall, 1-minute load) | Candidate selection only (wall, 1-minute load) | With 8 processes (wall, 1-minute load; 3 runs) |
+| --- | --- | --- | --- |
+| `python3 scripts/production/roles_audit.py --root . check` | 39.8 s, 78.2 | 2.5 s, 24.0 | 1.28 s, 1.10 s, 1.16 s at 67–69 |
+| `python3 -m unittest discover -s scripts/production -p 'test_roles_audit.py'` (31 tests) | not measured alone (about 38 s for the check inside it) | 4.1 s, 22.7; 8.4 s, 38–44 | 1.68 s, 1.50 s, 1.69 s at 67 |
+
+Times depend on load. With candidate selection only, one suite run took 8.4 s at load 38–44, so the review asked for more margin. With 8 processes, runs at load 87–102 took 2.5–4.4 s for the check and 3.7–5.6 s for the suite. The merge gate cost is measured in real gates later.
