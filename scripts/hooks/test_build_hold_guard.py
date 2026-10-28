@@ -9,10 +9,15 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 from scripts.build_hold.test_hold_applies import REFUSAL, TemporaryHoldTest
+
+if TYPE_CHECKING:
+    from ..build_hold import build_hold
+else:
+    import build_hold
 
 HOOK = Path(__file__).with_name("pre-tool-use-build-hold-guard.py")
 FRONT = HOOK.with_suffix(".sh")
@@ -26,6 +31,14 @@ class TemporaryGuardTest(TemporaryHoldTest):
     def setUp(self) -> None:
         with mock.patch("tempfile.tempdir", str(HOOK.resolve().parents[2])):
             super().setUp()
+
+    @override
+    def releasing(self, *keys: str) -> None:
+        super().releasing(*keys)
+        # A release removes its holder file before it sends any notice.
+        with mock.patch.object(build_hold, "start_recorder"), mock.patch.object(build_hold, "notify_release", return_value=""):
+            for key in keys:
+                _ = build_hold.release_cycle(self.holders, key)
 
 
 class BuildHoldGuardTest(TemporaryGuardTest):
@@ -110,10 +123,10 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         response = self.run_hook("cargo check")
         self.assertIn('"permissionDecision": "deny"', response)
 
-    def test_releasing_hold_allows_builds_with_holder_file_present(self) -> None:
+    def test_release_removes_holder_file_and_allows_builds(self) -> None:
         self.hold()
         self.releasing("other")
-        self.assertTrue((self.holders / "other").is_file())
+        self.assertFalse((self.holders / "other").exists())
         self.assertEqual(self.run_hook("cargo build"), "")
         self.assertEqual(self.run_hook("verify.sh check"), "")
 
