@@ -29,6 +29,8 @@ port_lint.py writes its own call records through write_call() here.
       was decided.
   record.py hold-event <began|ended> <target> <hold key> <holder> <reason> <at> [<until>]
       AT is an ISO 8601 UTC instant with offset. UNTIL is empty when no end was planned.
+  record.py hold-build KEY SINCE BOOT PID START CLASS SESSION COMMAND CWD
+      Record an other_session or no_session build once per hold and process lifetime.
   record.py backfill-verify [LEDGER]
       Copy verify.sh's old call ledger (~/.local/state/verify/events.jsonl)
       into call records, once: each line gets an id from its own hash, so a
@@ -41,6 +43,7 @@ exit status is 0. Records are JSON lines (store.py); index.py reads them.
 from __future__ import annotations
 
 import gzip
+import fcntl
 import hashlib
 import json
 import math
@@ -423,6 +426,34 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
+def hold_build(args: list[str]) -> None:
+    key, since, boot, pid, start, classification, session, command, cwd = args
+    if classification not in {"other_session", "no_session"} or int(pid) <= 0 or not start.isdecimal():
+        raise ValueError("invalid hold-build identity or class")
+    if datetime.fromisoformat(since).utcoffset() is None:
+        raise ValueError("hold-build since needs an offset")
+    hold_id = hashlib.sha256(json.dumps([key, since]).encode()).hexdigest()
+    build_id = hashlib.sha256(json.dumps([boot, pid, start]).encode()).hexdigest()
+    host = store.host_name()
+    path = store.root() / host / f"hold-builds-{hold_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # This file is both the permanent record and the set of builds seen for this hold.
+    with path.open("a+") as log:
+        fcntl.flock(log, fcntl.LOCK_EX)
+        _ = log.seek(0)
+        for line in log:
+            value = cast(object, json.loads(line))
+            if isinstance(value, dict) and cast(dict[str, object], value).get("id") == build_id:
+                return
+        row: dict[str, object] = {
+            "kind": "hold_build", "v": RECORD_VERSION, "id": build_id,
+            "at": store.utc_iso(time.time()), "host": host, "hold_key": key, "hold_since": since,
+            "boot_id": boot, "pid": int(pid), "proc_start": start, "class": classification,
+            "session": session, "command": command, "cwd": cwd,
+        }
+        _ = log.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+
 def backfilled_ids() -> set[str]:
     ids: set[str] = set()
     for path in store.root().glob("*/*.jsonl"):
@@ -515,6 +546,8 @@ def main(argv: list[str]) -> int:
                 print(found)
         elif command == "hold-event":
             hold_event(rest)
+        elif command == "hold-build":
+            hold_build(rest)
         elif command == "call":
             call(rest)
         else:

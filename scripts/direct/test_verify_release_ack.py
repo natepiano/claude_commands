@@ -1,4 +1,4 @@
-"""Compiling steps acknowledge admission after the shared memory gate returns."""
+"""Released build steps use memory admission without changing hold records."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import cast, override
 
 from scripts.direct import test_verify_untested_examples
 from scripts.direct.test_verify_hold_wait import read_cycle_file, release_registered_call
@@ -18,11 +18,6 @@ from scripts.direct.test_verify_hold_wait import read_cycle_file, release_regist
 
 INVOKE = Path(__file__).resolve().parent.parent / "lint" / "invoke.sh"
 CYCLE_ID = "b" * 32
-
-
-class MemoryWaitObservation(TypedDict):
-    state: str
-    wait_started_at: str
 
 
 class VerifyReleaseAckTests(unittest.TestCase):
@@ -56,7 +51,7 @@ python3 - "$CYCLE_FILE" "$STEP_STATE_LOG" <<'PY'
 import json, sys
 entry = json.load(open(sys.argv[1]))["entries"][0]
 with open(sys.argv[2], "a") as output:
-    output.write(entry["state"] + "\n")
+    output.write(entry["delivery"] + "\n")
 PY
 ''')
         recorder.chmod(0o755)
@@ -66,6 +61,7 @@ PY
         sweep = stubs / "sweep.py"
         _ = sweep.write_text('#!/bin/sh\nexit 0\n')
         sweep.chmod(0o755)
+        (holders / "holder").unlink()
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"CODEX_THREAD_ID", "CODEX_SESSION_ID", "UNIT_DETACHED_RUN"}},
@@ -75,9 +71,7 @@ PY
             "XDG_RUNTIME_DIR": str(self.root),
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
-            "BUILDLOG_HOLD_REGISTRATION_FILE": str(self.root / "registration"),
-            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_ADMISSION_FILE": "",
-            "BUILDLOG_HOLD_STARTED_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
             "BUILD_TARGETS_SCRIPT": str(INVOKE.parent.parent / "build_targets" / "build_targets.py"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_RUN_DIR": "",
@@ -104,8 +98,7 @@ PY
             "holders": {"holder": {"since": now, "released_at": ""}},
             "recipients": {"unit-director": "unit"},
             "entries": [{
-                "session_id": "unit-director", "name": "unit", "state": "ReleasedAwaitingAdmission",
-                "released_at": now,
+                "session_id": "unit-director", "name": "unit", "delivery": "Delivered",
             }],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle) + "\n")
@@ -138,102 +131,39 @@ python3 - "$CYCLE_FILE" "$WAIT_STATE_LOG" <<'PY'
 import json, sys
 entry = json.load(open(sys.argv[1]))["entries"][0]
 with open(sys.argv[2], "a") as output:
-    output.write(json.dumps({"state": entry["state"], "wait_started_at": entry.get("wait_started_at")}) + "\n")
+    output.write(json.dumps(entry) + "\n")
 PY
 printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"
 ''')
         sleeper.chmod(0o755)
         self.environment["WAIT_STATE_LOG"] = str(self.root / "wait-states")
 
-    def test_wait_start_and_return_precede_compiling_command(self) -> None:
+
+
+
+
+
+
+
+
+
+    def test_memory_wait_and_compile_leave_release_record_unchanged(self) -> None:
         self.release_memory_after_poll()
-        result = self.invoke(str(self.root / "stubs" / "compile"))
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        waiting = cast(MemoryWaitObservation, json.loads((self.root / "wait-states").read_text()))
-        self.assertEqual(waiting["state"], "WaitingForMemory")
-        self.assertIsNotNone(datetime.fromisoformat(waiting["wait_started_at"]).tzinfo)
-        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
-        self.assertEqual(self.entry()["outcome"], "Granted")
-        self.assertTrue(self.entry()["wait_ended_at"])
-        self.assertNotIn("wait_started_at", self.entry())
-        self.assertNotIn("released_at", self.entry())
-
-    def test_immediate_grant_marks_only_return(self) -> None:
-        result = self.invoke(str(self.root / "stubs" / "compile"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.entry()["state"], "MemoryGateReturned")
-        self.assertEqual(self.entry()["outcome"], "Granted")
-        self.assertNotIn("wait_started_at", self.entry())
-        self.assertNotIn("released_at", self.entry())
-
-    def test_sweep_and_cargo_fmt_write_no_mark(self) -> None:
-        for command in ((self.environment["SWEEP_SCRIPT"],), ("cargo", "+nightly", "fmt")):
-            with self.subTest(command=command):
-                self.reset_cycle()
-                result = self.invoke(*command)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertEqual(self.entry()["state"], "ReleasedAwaitingAdmission")
-
-    def test_worker_with_stale_shell_id_marks_owner_after_memory_grant(self) -> None:
-        self.set_owner_marker()
-        result = self.invoke(str(self.root / "stubs" / "compile"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.entry()["session_id"], "unit-director")
-        self.assertEqual(self.entry()["state"], "MemoryGateReturned")
-        self.assertEqual(self.entry()["outcome"], "Granted")
-        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
-
-    def test_worker_memory_wait_and_return_mark_owner_before_compiling(self) -> None:
-        self.set_owner_marker()
-        self.release_memory_after_poll()
-        result = self.invoke(str(self.root / "stubs" / "compile"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        waiting = cast(MemoryWaitObservation, json.loads((self.root / "wait-states").read_text()))
-        self.assertEqual(waiting["state"], "WaitingForMemory")
-        self.assertEqual(self.entry()["session_id"], "unit-director")
-        self.assertEqual(self.entry()["state"], "MemoryGateReturned")
-        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["MemoryGateReturned"])
-
-    def test_worker_without_shell_id_still_marks_owner(self) -> None:
-        self.set_owner_marker()
-        self.environment["CLAUDE_CODE_SESSION_ID"] = ""
-        result = self.invoke(str(self.root / "stubs" / "compile"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(self.entry()["session_id"], "unit-director")
-        self.assertEqual(self.entry()["state"], "MemoryGateReturned")
-
-    def test_call_without_session_or_run_writes_no_admission_mark(self) -> None:
-        self.environment["CLAUDE_CODE_SESSION_ID"] = ""
-        self.environment["BUILDLOG_CALL_ID"] = "unowned-call"
         before = self.cycle_file.read_bytes()
-        no_id = self.invoke(str(self.root / "stubs" / "compile"))
-        self.assertEqual(no_id.returncode, 0, no_id.stdout + no_id.stderr)
-        self.assertEqual(self.cycle_file.read_bytes(), before)
-        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["ReleasedAwaitingAdmission"])
-
-    def test_unowned_call_with_empty_holder_directory_and_nullglob_returns(self) -> None:
-        (Path(self.environment["BUILD_HOLD_DIR"]) / "holder").unlink()
-        self.environment["CLAUDE_CODE_SESSION_ID"] = ""
-        python_calls = self.root / "python-calls"
-        before = self.cycle_file.read_bytes()
-        result = subprocess.run(
-            ["bash", "-c", r'''set -euo pipefail
-shopt -s nullglob
-source "$INVOKE_SCRIPT"
-python3() { printf 'called\n' > "$PYTHON_CALL_LOG"; return 99; }
-build_hold_mark MemoryGateReturned Granted
-printf 'returned\n'
-'''],
-            cwd=self.root,
-            env={**self.environment, "PYTHON_CALL_LOG": str(python_calls)},
-            capture_output=True, text=True, check=False, timeout=10,
-        )
+        result = self.invoke(str(self.root / "stubs" / "compile"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, "returned\n")
-        self.assertEqual(result.stderr, "")
-        self.assertFalse(python_calls.exists())
+        self.assertIn("waiting for memory", result.stderr)
         self.assertEqual(self.cycle_file.read_bytes(), before)
+        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["Delivered"])
+        self.assertEqual(json.loads((self.root / "wait-states").read_text()), self.entry())
+
+    def test_immediate_memory_grant_leaves_release_record_unchanged(self) -> None:
+        self.set_owner_marker()
+        before = self.cycle_file.read_bytes()
+        result = self.invoke(str(self.root / "stubs" / "compile"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.cycle_file.read_bytes(), before)
+        self.assertEqual((self.root / "step-states").read_text().splitlines(), ["Delivered"])
 
 
 class VerifyRoutingTests(unittest.TestCase):
@@ -266,7 +196,6 @@ class VerifyRoutingTests(unittest.TestCase):
             "CLAUDE_PYTHON": sys.executable,
             "BUILD_HOLD_DIR": str(holders),
             "BUILD_HOLD_RELEASE_DIR": str(release),
-            "BUILDLOG_HOLD_REGISTRATION_FILE": str(root / "registration"),
             "UNIT_ACTIVE_DIR": str(root / "active"),
             "UNIT_RUN_DIR": "",
             "UNIT_TEAM_ROLE": "",
@@ -299,7 +228,7 @@ class VerifyRoutingTests(unittest.TestCase):
             "holders": {"holder": {"since": now, "released_at": ""}},
             "recipients": {"unit-director": "unit"},
             "entries": [{
-                "session_id": "unit-director", "name": "unit", "state": "AwaitingRelease",
+                "session_id": "unit-director", "name": "unit", "delivery": "NotAttempted",
             }],
         }
         _ = self.cycle_file.write_text(json.dumps(cycle) + "\n")
@@ -307,7 +236,7 @@ class VerifyRoutingTests(unittest.TestCase):
     def state(self) -> str:
         cycle = cast(dict[str, object], json.loads(self.cycle_file.read_text()))
         entries = cast(list[dict[str, object]], cycle["entries"])
-        return cast(str, entries[0]["state"])
+        return cast(str, entries[0]["delivery"])
 
     def test_example_gate_refusal_writes_no_admission_mark(self) -> None:
         _ = self.fixture.package()
@@ -317,7 +246,7 @@ class VerifyRoutingTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("examples carry no tests", result.stderr)
-        self.assertEqual(self.state(), "AwaitingRelease")
+        self.assertEqual(self.state(), "NotAttempted")
         self.assertEqual(self.fixture.calls_made(), [])
 
     def test_recorded_pass_writes_no_second_admission_mark(self) -> None:
@@ -326,15 +255,15 @@ class VerifyRoutingTests(unittest.TestCase):
         with release_registered_call(self.cycle_file):
             first = self.fixture.verify("test", "sample")
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(self.state(), "MemoryGateReturned")
+        self.assertEqual(self.state(), "Delivered")
 
         self.reset_cycle()
         second = self.fixture.verify("test", "sample")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertIn("PASS (recorded)", second.stdout)
-        self.assertEqual(self.state(), "AwaitingRelease")
+        self.assertEqual(self.state(), "NotAttempted")
 
-    def test_worker_with_stale_shell_id_marks_marker_owner_through_verify(self) -> None:
+    def test_worker_with_stale_shell_id_builds_after_release(self) -> None:
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
         self.set_owner_marker()
@@ -342,12 +271,12 @@ class VerifyRoutingTests(unittest.TestCase):
             result = self.fixture.verify("test", "sample")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
-        self.assertEqual(self.state(), "MemoryGateReturned")
+        self.assertEqual(self.state(), "Delivered")
         entries = read_cycle_file(self.cycle_file)["entries"]
         self.assertEqual(entries[0]["session_id"], "unit-director")
-        self.assertEqual(entries[0].get("outcome"), "Granted")
+        self.assertNotIn("outcome", entries[0])
 
-    def test_ownerless_call_registers_verification_key_and_runs_after_release(self) -> None:
+    def test_ownerless_call_runs_after_release_without_a_call_record(self) -> None:
         _ = self.fixture.package()
         _ = self.fixture.example(source="fn main() {}\n")
         self.fixture.environment.update({
@@ -363,10 +292,7 @@ class VerifyRoutingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(any(call.startswith("nextest run ") for call in self.fixture.calls_made()))
         entries = read_cycle_file(self.cycle_file)["entries"]
-        verification = [entry for entry in entries if entry["session_id"].startswith("verify:")]
-        self.assertEqual(len(verification), 1)
-        self.assertEqual(verification[0]["state"], "MemoryGateReturned")
-        self.assertEqual(verification[0].get("outcome"), "Granted")
+        self.assertEqual(entries, [])
 
     def test_ownerless_example_refusal_performs_no_admission(self) -> None:
         _ = self.fixture.package()
