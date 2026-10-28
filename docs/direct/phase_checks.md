@@ -15,6 +15,8 @@ Each phase runs these checks once at the points named below:
 | style review | the unit director's main review in <DualReview/>, reading `commands/unit/style_review.md` | the phase's diff from its baseline, untracked files included |
 
 The four lint checks run wherever the phase's workers run `verify.sh lint`.
+Test starts as soon as the code is ready, independently of lint.
+<VerificationContract/> defines when each result counts.
 A phase with no Rust change has no lint run; its style review runs only the
 banned-words scan and marks the checklist `Skip (no Rust change)`.
 

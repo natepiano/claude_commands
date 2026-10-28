@@ -174,6 +174,7 @@ DEFAULT_CONFIG = os.path.join("~", ".claude", "config", "lint.conf")
 GIT_DIR = ".git"
 GITDIR_PREFIX = "gitdir:"
 COMMONDIR_FILE = "commondir"
+ALTERNATES_FILE = os.path.join("objects", "info", "alternates")
 DEFAULT_DOC_INDEX_MIB = 250.0
 DOC_INDEX_ENV = "LINT_SWEEP_DOC_INDEX_MIB"
 DOC_DIR = "doc"
@@ -1614,8 +1615,17 @@ def config_values(path: str) -> dict[str, str]:
 
 def repo_name(directory: str) -> str | None:
     """Name of the directory holding the git common dir of the repo directory is
-    in: every worktree of a repo shares it. Read from the .git files rather than
-    from git, which a bare PATH may not reach."""
+    in: every worktree of a repo shares it, and a scratch clone takes the name of
+    the repo it was cloned from (source_git_dir). Read from the .git files rather
+    than from git, which a bare PATH may not reach."""
+    common = git_common_dir(directory)
+    if common is None:
+        return None
+    return os.path.basename(os.path.dirname(source_git_dir(common))) or None
+
+
+def git_common_dir(directory: str) -> str | None:
+    """The git dir every worktree of directory's repo shares."""
     current = os.path.abspath(directory)
     while not os.path.lexists(os.path.join(current, GIT_DIR)):
         parent = os.path.dirname(current)
@@ -1641,7 +1651,53 @@ def repo_name(directory: str) -> str | None:
             pass
         except OSError:
             return None
-    return os.path.basename(os.path.dirname(os.path.normpath(common))) or None
+    return os.path.normpath(common)
+
+
+def source_git_dir(common: str) -> str:
+    """The git dir a scratch clone came from, followed to its end: a
+    `git clone --shared` copy borrows its objects (alternates), and a plain local
+    clone names its source as a local origin. A merge check's clone of hana is
+    hana for the Mac mirror and the sweep budget. A git dir with neither is its
+    own answer."""
+    seen = {common}
+    while True:
+        source = borrowed_git_dir(common) or local_origin_git_dir(common)
+        if source is None or source in seen:
+            return common
+        seen.add(source)
+        common = source
+
+
+def borrowed_git_dir(common: str) -> str | None:
+    try:
+        with open(os.path.join(common, ALTERNATES_FILE), encoding="utf-8") as handle:
+            objects = handle.readline().strip()
+    except OSError:
+        return None
+    if not objects:
+        return None
+    return os.path.dirname(os.path.normpath(os.path.join(common, "objects", objects)))
+
+
+def local_origin_git_dir(common: str) -> str | None:
+    """The shared git dir of origin when origin is a directory on this machine."""
+    try:
+        with open(os.path.join(common, "config"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    in_origin = False
+    for line in lines:
+        text = line.strip()
+        if text.startswith("["):
+            in_origin = text == '[remote "origin"]'
+        elif in_origin and text.partition("=")[0].strip() == "url":
+            url = text.partition("=")[2].strip().removeprefix("file://")
+            if not os.path.isabs(url) or not os.path.isdir(url):
+                return None
+            return git_common_dir(url)
+    return None
 
 
 def budget_bytes(environ: dict[str, str], config: str, repo: str | None) -> tuple[int | None, str]:

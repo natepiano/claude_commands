@@ -83,6 +83,9 @@ class TmpSweepCase(unittest.TestCase):
             folder.mkdir(parents=True)
         self.now = time.time() + 2 * DAY
         _ = self.enterContext(mock.patch.object(tmp_sweep, "state_dir", return_value=self.state))
+        # A private default root exposes callers that fail to set their session roots.
+        default_session = write(base / "default-session" / ENDED_SESSION / "file").parents[1]
+        _ = self.enterContext(mock.patch.object(tmp_sweep, "SESSION_TEMP_ROOT", str(default_session)))
         self.live = frozenset({LIVE_SESSION})
         _ = self.enterContext(mock.patch.object(tmp_sweep, "running_session_ids", side_effect=lambda: self.live))
 
@@ -289,7 +292,8 @@ class TempFolderTests(TmpSweepCase):
         others = [write(temp / ".tmpAb12Cde" / "a").parent, write(temp / ".tmpXy34Zw"),
                   write(temp / "notes" / "a").parent, write(temp / ".tmp-b12Cd" / "a").parent,
                   write(temp / "tmp.short" / "a").parent, write(temp / "tmpUPPERCASE" / "a").parent]
-        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(temp),), ())
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(temp),), (),
+                                       session_temp_roots=())
         result = tmp_sweep.sweep(False, roots, self.now, str(self.proc))
         for gone in (idle, idle_mktemp, idle_python):
             self.assertFalse(gone.exists(), gone)
@@ -326,7 +330,8 @@ class TempFolderTests(TmpSweepCase):
             folder.mkdir()
         for path in (used, *kept[1:]):
             os.utime(path, (1000, 1000))
-        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(wide),), (), (str(wide),))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(wide),), (), (str(wide),),
+                                       session_temp_roots=())
 
         def wide_deleted(result: tmp_sweep.Sweep) -> list[str]:
             return sorted(entry["path"] for entry in result.deleted if Path(entry["path"]).parent == wide)
@@ -355,7 +360,8 @@ class TempFolderTests(TmpSweepCase):
         fake_start(self.proc, 20, made - 50, "bash", "/home/u/.claude/scripts/delegate/verify.sh", "test")
         fake_start(self.proc, 21, made + 50, "bash", "/home/u/.claude/scripts/delegate/verify.sh", "test")
         fake_start(self.proc, 22, made - 50, "python3", "copy_watch.py")
-        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(wide),), (), (str(wide),))
+        roots = tmp_sweep.default_roots(str(self.tmp.parent / "plain"), (), (), (str(wide),), (), (str(wide),),
+                                       session_temp_roots=())
         soon = tmp_sweep.sweep(False, roots, time.time() + 60, str(self.proc))
         self.assertEqual(sorted(entry["path"] for entry in soon.deleted), sorted(map(str, (reused, other, gone))))
         self.assertEqual(soon.kept[tmp_sweep.VERIFY_RUNS], [str(live)])
@@ -374,15 +380,16 @@ class TempFolderTests(TmpSweepCase):
     def test_the_wide_root_is_tmp_alone_and_only_when_it_is_a_temp_folder(self) -> None:
         temp = self.tmp.parent / "temp"
         temp.mkdir()
-        self.assertEqual(tmp_sweep.default_roots(str(self.tmp), (), (), (str(temp),), ()).wide, ())
-        self.assertEqual(tmp_sweep.default_roots(str(self.tmp), (), (), ("/tmp",), ()).wide,
+        self.assertEqual(tmp_sweep.default_roots(str(self.tmp), (), (), (str(temp),), (), session_temp_roots=()).wide, ())
+        self.assertEqual(tmp_sweep.default_roots(str(self.tmp), (), (), ("/tmp",), (), session_temp_roots=()).wide,
                          (os.path.realpath("/tmp"),))
 
     def test_roots_are_real_paths(self) -> None:
         """The Mac's /tmp is a link to /private/tmp, and lsof prints real paths."""
         link = self.tmp.parent / "link"
         link.symlink_to(self.tmp.parent)
-        roots = tmp_sweep.default_roots(str(link / "claude"), (str(link / "claude" / "unit"),), (), (str(link),), ())
+        roots = tmp_sweep.default_roots(str(link / "claude"), (str(link / "claude" / "unit"),), (), (str(link),), (),
+                                       session_temp_roots=())
         self.assertEqual(roots.plain, (str(self.tmp),))
         self.assertEqual(roots.runs, (str(self.unit),))
         self.assertEqual(roots.temp, (str(self.tmp.parent),))

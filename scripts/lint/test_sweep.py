@@ -1633,6 +1633,21 @@ class RepoNameTests(unittest.TestCase):
         self.assertEqual(sweep.repo_name(str(base / "tool-based-ui-trunk")), "hana")
         self.assertIsNone(sweep.repo_name(str(base)))
 
+    def test_a_shared_clone_names_the_repo_it_borrows_objects_from(self) -> None:
+        base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        repo = base / "hana"
+        repo.mkdir()
+        _ = (repo / "README").write_text("readme\n")
+        git("init", "-q", "-b", "main", cwd=repo)
+        git("add", "-A", cwd=repo)
+        git("commit", "-q", "-m", "first", cwd=repo)
+        git("clone", "-q", "--shared", str(repo), str(base / "land60"), cwd=base)
+        git("clone", "-q", "--shared", str(base / "land60"), str(base / "mergeclone"), cwd=base)
+        self.assertEqual(sweep.repo_name(str(base / "land60")), "hana")
+        self.assertEqual(sweep.repo_name(str(base / "mergeclone")), "hana")
+        git("clone", "-q", str(base / "mergeclone"), str(base / "clone88ci"), cwd=base)
+        self.assertEqual(sweep.repo_name(str(base / "clone88ci")), "hana")
+
 
 if __name__ == "__main__":
     _ = unittest.main()

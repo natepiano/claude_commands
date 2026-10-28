@@ -137,7 +137,8 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
 
 The Verification section carries the applicable command lines and every
 worker-facing rule from <VerificationContract/>, with nothing added around
-them. It must also say: run only its listed commands, never raw Cargo; run each
+them. Command-list order must not make lint a precondition for test. It must
+also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
 output has been read. For a Codex worker, the final report waits for the
 results item 3's runs send. A run that prints `PASS (recorded)` is that gate's result,
