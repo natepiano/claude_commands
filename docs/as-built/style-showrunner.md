@@ -25,6 +25,7 @@ A style production is a standing child production named `<repo>-style`. A repo's
 | `scripts/style/unit_plans.py` | Standing unit plans: `delegation_context`, pilot scope (`PilotScope`, `parse_pilot_scope`, `crate_in_scope`), `family_plan_texts`, `family_pilot_scopes`; read by refill and filing |
 | `scripts/style/unit_files.py` | Live-unit file lookup (`unit_worktrees`, `unit_file_holders`, `changed_files`, `file_text`); breaks the `style_plan`/`style_proposals` import cycle |
 | `scripts/style/coverage_report.py` | The style report CLI |
+| `scripts/style/order_waste.py` | Read-only measure of wasted work by rule pair (`--ledger <sqlite> --repo <git repo> [--json]`): stale findings and reworked hunks, each pair against `rule_order_analysis.md`'s order (`ANALYSIS_LAYERS`, `ANALYSIS_EDGES`); see **Fix sequencing** in `docs/style_production.md` |
 | `scripts/style/fake_fmt.py` | The fake cargo and rustfmt that every test reaching the gate puts first on PATH |
 | `scripts/style/style_admin.py` | Rule rename and delete (`/style_rename`, `/style_delete`) |
 | `scripts/lib/berth_board.py` | `cargo-berth board --json` reader |
