@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import io
 import importlib
 import json
 import os
+import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from collections.abc import Callable
@@ -21,6 +25,7 @@ from typing import TypedDict, cast, final, override
 from unittest import mock
 
 import style_sync
+import scratch
 import style_ledger
 import style_rules
 import showrunners
@@ -130,6 +135,7 @@ class StyleSyncTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
+            "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         sender = self.root / "send.py"
@@ -240,6 +246,45 @@ class StyleSyncTests(unittest.TestCase):
             except SystemExit as error:
                 code = cast(int, error.code)
         return code, output.getvalue(), errors.getvalue()
+
+    def test_own_handoff_syncs_the_merged_tip_without_lint(self) -> None:
+        _ = self.git("checkout", "-qb", "style/main")
+        _ = (self.repo / "src/lib.rs").write_text("fn corrected() {}\n")
+        _ = self.git("commit", "-qam", "Style checkpoint")
+        _ = self.git("checkout", "-q", "main")
+        _ = self.git("merge", "--no-ff", "-qm", "Integrate style", "style/main")
+        tip = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(tip, self.git("rev-parse", "style/main"))
+        with mock.patch.object(style_sync, "lint") as lint, redirect_stdout(io.StringIO()):
+            for branch in ("style/main", "refs/heads/style/main"):
+                self.assertEqual(style_sync.main([
+                    "own-handoff", "--repo", str(self.repo), "--tip", tip, "--style-branch", branch,
+                ]), 0)
+            lint.assert_not_called()
+        with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(ledger.synced_commit(), tip)
+            self.assertEqual(ledger.tip_seen(tip), "own hand-off")
+            ledger.tip_done(tip)
+            self.assertEqual(ledger.tip_seen(tip), "own hand-off")
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM lint_runs").fetchone(), (0,))
+        seen = subprocess.run([
+            str(style_sync.PYTHON), str(style_sync.LEDGER), "tip", "seen", "--repo", str(self.repo), "--tip", tip,
+        ], capture_output=True, text=True, check=True)
+        self.assertEqual(seen.stdout.strip(), "seen (own hand-off: synced with no lint run)")
+
+    def test_own_handoff_leaves_a_different_tree_unprocessed(self) -> None:
+        _ = self.git("branch", "style/main")
+        with style_ledger.open_ledger(self.repo) as ledger:
+            ledger.set_tip(self.tip, "style/main")
+        _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
+        _ = self.git("commit", "-qam", "Other change")
+        tip = self.git("rev-parse", "HEAD")
+        self.assertEqual(style_sync.main([
+            "own-handoff", "--repo", str(self.repo), "--tip", tip, "--style-branch", "style/main",
+        ]), 1)
+        with style_ledger.open_ledger(self.repo) as ledger:
+            self.assertEqual(ledger.synced_commit(), self.tip)
+            self.assertIsInstance(ledger.tip_seen(tip), style_ledger.UnseenTip)
 
     def test_ticket_merge_wakes_two_waiters_once_and_clears_their_rows(self) -> None:
         self.production()
@@ -557,6 +602,102 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             _ = self.git("worktree", "add", "--detach", str(directory / "checkout"), self.tip)
         return directory
 
+    def test_lint_links_a_warm_target_and_cleanup_keeps_it_until_the_production_ends(self) -> None:
+        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / "style-sync-target"
+        code, output = self.run_lint('[[ -L target ]] || exit 2\nprintf warm > target/artifact\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual((target / "artifact").read_text(), "warm")
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+        self.assertEqual(scratch.holds()[str(target)]["task"], "run:sample-style")
+        # A later checkout uses the same artifacts. No Cargo environment variable is overridden.
+        with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "inherited-value"}):
+            code, output = self.run_lint(
+                '[[ -L target && $(cat target/artifact) == warm && $CARGO_TARGET_DIR == inherited-value ]] || exit 2\n'
+            )
+        self.assertEqual(code, 0, output)
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+        self.assertEqual(scratch.end("run:sample-style"), [target])
+        self.assertFalse(target.exists())
+        self.assertEqual(scratch.holds(), {})
+
+    def test_a_missing_or_swept_target_runs_cold(self) -> None:
+        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / "style-sync-target"
+        for state in ("missing", "swept"):
+            with self.subTest(state=state):
+                self.assertFalse(target.exists())
+                code, output = self.run_lint(
+                    '[[ -L target && -d target && ! -e target/artifact ]] || exit 2\nprintf fresh > target/artifact\n'
+                )
+                self.assertEqual(code, 0, output)
+                self.assertEqual((target / "artifact").read_text(), "fresh")
+                self.assertEqual(list(self.lint_temp.iterdir()), [])
+                shutil.rmtree(target)
+
+    def test_a_sync_waits_for_the_target_lock_before_creating_its_checkout(self) -> None:
+        common_dir = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        target = style_sync.lint_target(common_dir)
+        locked, attempted = threading.Event(), threading.Event()
+        real_flock = fcntl.flock
+
+        def first_sync() -> None:
+            with (target / "sync.lock").open("a") as lock:
+                real_flock(lock, fcntl.LOCK_EX)
+                locked.set()
+                _ = attempted.wait(30)
+
+        holder = threading.Thread(target=first_sync)
+        holder.start()
+        self.addCleanup(holder.join, 30)
+        self.addCleanup(attempted.set)
+        self.assertTrue(locked.wait(30))
+
+        def second_sync_lock(fd: int, operation: int) -> None:
+            self.assertEqual(operation, fcntl.LOCK_EX)
+            self.assertEqual(list(self.lint_temp.iterdir()), [])
+            with self.assertRaises(BlockingIOError):
+                real_flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            attempted.set()
+            real_flock(fd, operation)
+            # No thread remains when verify_lint uses preexec_fn.
+            holder.join(30)
+            self.assertFalse(holder.is_alive())
+
+        real_git = style_sync.git
+        real_cleanup = style_sync.remove_lint_dir
+
+        def assert_locked() -> None:
+            with (target / "sync.lock").open("a") as lock, self.assertRaises(BlockingIOError):
+                real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        def git(repo: Path, *arguments: str) -> str:
+            if arguments[:2] == ("worktree", "add"):
+                assert_locked()
+            return real_git(repo, *arguments)
+
+        def cleanup(repo: Path, directory: Path) -> bool:
+            assert_locked()
+            removed = real_cleanup(repo, directory)
+            assert_locked()
+            return removed
+
+        with mock.patch.object(fcntl, "flock", side_effect=second_sync_lock), \
+                mock.patch.object(style_sync, "git", side_effect=git), \
+                mock.patch.object(style_sync, "remove_lint_dir", side_effect=cleanup):
+            code, output = self.run_lint()
+        self.assertEqual(code, 0, output)
+        self.assertTrue(attempted.is_set())
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+        # Cleanup has completed and the next sync can acquire the same lock.
+        with (target / "sync.lock").open("a") as lock:
+            real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_replacing_the_target_link_cannot_grant_successful_lint_coverage(self) -> None:
+        code, output = self.run_lint('rm target\nmkdir target\n')
+        self.assertEqual(code, 1, output)
+        self.assertIn("lint rewrote the checked tree", output)
+        with closing(sqlite3.connect(self.root / "state/sample/ledger.sqlite")) as connection:
+            self.assertEqual(connection.execute("SELECT passed FROM lint_runs").fetchall(), [(0,), (0,), (0,)])
+
     def running_group(self) -> int:
         group = subprocess.Popen(["sleep", "60"], start_new_session=True)
         self.addCleanup(group.wait)
@@ -817,13 +958,17 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertTrue((planted_target / style_sync.OWNER_FILE).exists())
         self.assertEqual(list(self.lint_temp.iterdir()), [planted])
 
-    @unittest.skipUnless(sys.platform == "linux", "reads the signal mask from /proc")
     def test_verify_starts_with_the_stop_signals_unblocked(self) -> None:
         mask = self.root / "sigblk"
-        code, output = self.run_lint(f"grep SigBlk /proc/$$/status | cut -f2 > {mask}\n")
+        # Reading /proc/$$ from a pipeline samples Bash's temporary fork mask, not the
+        # mask inherited by a lint tool. Query the actual tool child's own mask instead.
+        probe = ("import signal; from pathlib import Path; "
+                 "blocked = signal.pthread_sigmask(signal.SIG_BLOCK, set()); "
+                 f"Path({str(mask)!r}).write_text(str(sum(1 << (s - 1) for s in blocked)))")
+        code, output = self.run_lint(shlex.join([sys.executable, "-c", probe]) + "\n")
         self.assertEqual(code, 0, output)
         held = sum(1 << (signum - 1) for signum in style_sync.HELD_SIGNALS)
-        self.assertEqual(int(mask.read_text(), 16) & held, 0)
+        self.assertEqual(int(mask.read_text()) & held, 0)
 
     def handoff_checkpoint(self) -> str:
         _ = self.git("switch", "-qc", "style/main")

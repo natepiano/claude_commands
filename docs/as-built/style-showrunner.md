@@ -17,7 +17,7 @@ A style production is a standing child production named `<repo>-style`. A repo's
 | `scripts/style/style_plan.py` | Refill (`next-phase`), ticket gate (`gate`), `queue`, ticket selection, phase text |
 | `scripts/style/mechanical_classes.toml`, `mechanical_classes.py` | The classes of change a unit applies without the user (`pure-move`, `stale-allow-lint`): name, proof, rules, summary; the loader `classes()` and `explained_files` |
 | `scripts/style/style_footprint.py` | Mechanical-fix filter (`check`), lexical Rust tokenizer, item starts (`item_starts`), module paths (`crate_module`, `resolved_module`, `use_trees`), canonical comparison (`canonical_code`, `comment_gaps`, `sorted_use_groups`) |
-| `scripts/style/style_sync.py` | `notify`, `lint`, `resume`, `send-handoff`, `wake-waiters` |
+| `scripts/style/style_sync.py` | `notify`, `own-handoff`, `lint`, `resume`, `send-handoff`, `wake-waiters` |
 | `scripts/style/add_style.py` | Bootstrap and reattach; `standing_style_production` lookup |
 | `scripts/style/style_proposals.py` | Style decisions: `file`, `follow`, `withdraw`, `complete`, `decline`, `unwaive`, `reopen`, `migrate`, more |
 | `scripts/style/approved_renames.py` | `applied_check`, rename pairs, `FileRename` |
@@ -60,7 +60,7 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 
 **Location.** `~/.local/state/style/<repo>/ledger.sqlite`, where `<repo>` is the main checkout's basename through `--git-common-dir`, so every worktree shares one ledger. `STYLE_LEDGER_STATE_DIR` replaces the root. Only `style_ledger.py` writes it. `open_ledger(repo) -> Ledger` (context manager); `preview_ledger(repo)` migrates a temp copy and leaves the real file unchanged.
 
-**Schema.** `schema_version` drives numbered `MIGRATIONS` 1-21; a newer version than the script knows raises `CheckCouldNotRun`. Current tables:
+**Schema.** `schema_version` drives numbered `MIGRATIONS` 1-23; a newer version than the script knows raises `CheckCouldNotRun`. Current tables:
 
 | Table | Holds |
 | --- | --- |
@@ -71,7 +71,7 @@ Import direction: `declarations → approved_renames → style_footprint`. `styl
 | `tickets` | id `<unit>-<n>`, unit, kind, family, rule, crate, files, sites, rules, rule_blobs, state, branch, checkpoint, base, proposal, cells, finding_ids, timestamps; one `assigned`-or-`checkpointed` ticket per unit (unique index) |
 | `rule_texts` | blob → pinned rule bytes |
 | `handoffs` | checkpoint, state, merge_commit, sent_to, timestamps |
-| `processed_tips` | tips the sync finished |
+| `processed_tips` | tips the sync finished, with `reason` `linted` (`tip done`) or `own hand-off` |
 | `held_findings` | finding_id, rule, path, line, text, kind, before, after, rule_blob, ticket, state, proposal, build_ticket, moved_from, withdrawn_by, person_read_by, duplicate_of, unwaived_by, followed_from, followed_from_line, followed_at, declaration_gone_at, waive_provenance, waived_by, timestamps |
 | `reconciliation` | one row: branch_point |
 | `sync_waits` | unit, since, token: units waiting for sync |
@@ -238,7 +238,9 @@ Verdicts: `clean | fixed | exception | held | waived | removed`. A `removed` row
 
 **Sync trigger.** `merge_checkpoint.notify_style` and `merge_gate.notify_style` (two copies; 30 s subprocess timeout; one-line failure) call `style_sync.py notify --repo-dir <checkout> --branch <b> --tip <sha>` after each successful push, including hand-off merges. It is silent with no style production on `b`; else `send.py --timeout 10` of `From <caller>: branch point <b> moved to <sha7>; sync.` keyed `style-sync:<slug>`, bounded at 35 s. A failure prints one line and exits 0.
 
-**Sync steps** (style showrunner; skipped when `tip seen` prints `seen`): merge the tip into the style branch and gate; `style_sync.py lint --repo R --checkout C --tip T` (`verify.sh lint --workspace --no-cache --check` in a disposable checkout; one `lint-record` per tool; exit 0 clean, 1 diagnostics or a failed tool (continue), 2 error (stop), 128 + signal for SIGTERM or SIGHUP (stop); every exit it can catch stops verify.sh's process group, deletes the checkout and removes its worktree registration with `worktree remove --force --force` (also a locked one); each `style-sync-lint-*` dir holds `owner.json` (owner pid and the repo's git dir) and `verifier.pgid`, which verify.sh's own process writes before it starts verify.sh, and only while the owner runs; the sweep never follows a link; the owner record is deleted last and kept when the registration step fails, and each run first removes the dir and registration of a run whose owner and verify.sh group are both gone, so the dir stays while a killed run's verify.sh still runs); `set-tip --style-branch`, then `status` (report a nonzero unclassified count to the parent with "pull nate_style"); tell unit directors to merge at their next pause and wake sync waiters; `tip done`. The listed-site refresh runs on every read regardless.
+**Sync steps** (style showrunner; skipped when `tip seen` prints `seen`; `style_sync.py own-handoff --repo R --tip T --style-branch B` exits 0 when T's tree is B's tree, after `set-tip` and `tip done` with reason `own hand-off`, so only the tree-neutral merge and the wake remain, and exits 1 otherwise): merge the tip into the style branch and gate; `style_sync.py lint --repo R --checkout C --tip T` (`verify.sh lint --workspace --no-cache --check` in a disposable checkout; one `lint-record` per tool; exit 0 clean, 1 diagnostics or a failed tool (continue), 2 error (stop), 128 + signal for SIGTERM or SIGHUP (stop); every exit it can catch stops verify.sh's process group, deletes the checkout and removes its worktree registration with `worktree remove --force --force` (also a locked one); each `style-sync-lint-*` dir holds `owner.json` (owner pid and the repo's git dir) and `verifier.pgid`, which verify.sh's own process writes before it starts verify.sh, and only while the owner runs; the sweep never follows a link; the owner record is deleted last and kept when the registration step fails, and each run first removes the dir and registration of a run whose owner and verify.sh group are both gone, so the dir stays while a killed run's verify.sh still runs); `set-tip --style-branch`, then `status` (report a nonzero unclassified count to the parent with "pull nate_style"); tell unit directors to merge at their next pause and wake sync waiters; `tip done`. The listed-site refresh runs on every read regardless.
+
+**Warm sync target.** Before verify starts, each disposable checkout's `target` is a symlink to `<main git dir>/style-sync-target` (about 2-3 GiB). `scratch.py hold` records this fixed folder under `run:<repo>-style`, the standing production's task using the main repo's basename, rather than a unit's run or phase. Cleanup unlinks the checkout's symlink and keeps the target; a missing or swept target is recreated for a cold run. Each sync takes a blocking exclusive flock on `style-sync-target/sync.lock` before creating its checkout and holds it through lint and cleanup, so its source timestamps postdate the previous sync's Cargo fingerprints. Cargo's build lock also serializes builds on the shared target; no extra parallel build starts. No `CARGO_TARGET_DIR` is set, preserving sccache's environment key. When the style production itself wraps and its sync processes have finished, run `scratch.py end --task run:<repo>-style` to remove the folder and its hold. A parent's wrap only detaches the style production and keeps its target.
 
 ### Child hand-off merge
 

@@ -816,6 +816,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE ticket_widened_paths")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=18")
         migrated = self.ledger()
         finding, = migrated.named_held((finding_id,))
@@ -4664,6 +4665,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE ticket_widened_paths")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()
@@ -7007,6 +7009,21 @@ class StyleLedgerTests(unittest.TestCase):
         _ = self.git("commit", "--allow-empty", "-q", "-m", "New tip with same tree")
         self.assertEqual(self.cli("tip", "seen", "--tip", "HEAD").stdout.strip(), "new")
 
+    def test_migration_23_preserves_processed_tips_as_linted(self) -> None:
+        database = self.root / "legacy.sqlite"
+        with closing(sqlite3.connect(database)) as connection, connection:
+            for number, migration in sorted(style_ledger.MIGRATIONS.items()):
+                if number < 23:
+                    _ = connection.executescript(migration)
+            _ = connection.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)")
+            _ = connection.execute("INSERT INTO schema_version VALUES (22)")
+            _ = connection.execute("INSERT INTO processed_tips VALUES (?,?)", (self.initial_tip, "2026-10-27"))
+        with style_ledger.Ledger(self.repo, database) as ledger:
+            self.assertEqual(ledger.tip_seen(self.initial_tip), "linted")
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(connection.execute("SELECT * FROM processed_tips").fetchone(),
+                             (self.initial_tip, "2026-10-27", "linted"))
+
     def test_handoffs_require_ancestry_and_keep_sent_items_pending(self) -> None:
         self.set_tip(self.initial_tip)
         _ = self.git("checkout", "-q", "-b", "style/main")
@@ -7840,6 +7857,7 @@ class StyleLedgerTests(unittest.TestCase):
             _ = connection.execute("DROP TABLE rule_candidates")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_session_dir")
             _ = connection.execute("ALTER TABLE tickets DROP COLUMN reservation_phase")
+            _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:
