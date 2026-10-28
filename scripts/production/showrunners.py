@@ -146,6 +146,11 @@ def checked_doc(instance: Path) -> CheckedDoc | NoCheckedDoc:
     return CheckedDoc(path)
 
 
+def session_name(session_id: str) -> str:
+    """The live Claude session's name, or empty when it has none or is not running."""
+    return _session_name(session_id)
+
+
 def _session_name(session_id: str) -> str:
     for path in SESSIONS_DIR.glob("*.json"):
         try:
@@ -481,6 +486,20 @@ def own_slug() -> str:
     return production_slug(str(doc)) if doc is not None else ""
 
 
+def name_refusal(slug: str, name: str) -> str:
+    """Why a showrunner session called `name` cannot run production `slug`; empty when it can.
+
+    One name per production (user, 2026-10-27): the slug is the showrunner's name, so a production
+    whose showrunner has another name is renamed first.
+    """
+    if name == slug:
+        return ""
+    if not name:
+        return f"the showrunner of {slug} has no session name; name the session {slug}"
+    return (f"production {slug} has showrunner {name}, and a production's slug must be its showrunner's name; "
+            + f"rename the production first: `/showrunner:rename plan {slug} {name}`")
+
+
 def attach(child: str, parent: str) -> None:
     """Store that `child` reports to `parent`. Raises ValueError naming why it cannot."""
     child = canonical_slug(child)
@@ -491,6 +510,9 @@ def attach(child: str, parent: str) -> None:
             raise ValueError(f"{slug} has no update timer, so it has no showrunner to attach")
     if child == parent:
         raise ValueError(f"{child} cannot report to itself")
+    for runner in registered_showrunners():
+        if runner["slug"] in (child, parent) and runner["socket"] and (why := name_refusal(runner["slug"], runner["session"])):
+            raise ValueError(why)
     tree = edges(known)
     if child in tree:
         raise ValueError(f"{child} already reports to {tree[child]}; detach it first")

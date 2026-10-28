@@ -107,7 +107,12 @@ class RegistrationTests(unittest.TestCase):
                     "NOTIFIER_STATE_DIR": str(self.state / "notifier"), "SHOWRUNNERS_CONFIG": str(self.config),
                     "USAGE_STATE_DIR": str(self.state / "usage"),
                     "MAC_TEST_STATE_DIR": str(self.state / "mac-test"), "NEXT_STATE_DIR": str(self.state / "next"),
-                    "CLAUDE_CODE_SESSION_ID": "current-session-id"}
+                    "CLAUDE_CODE_SESSION_ID": "current-session-id", "NOTIFIER_SESSIONS_DIR": str(self.state / "sessions")}
+        # Register refuses a session not named for its production's slug: both live sessions are named example.
+        (self.state / "sessions").mkdir()
+        for pid, session in ((os.getpid(), "current-session-id"), (os.getppid(), "resume-session-id")):
+            _ = (self.state / "sessions" / f"{pid}.json").write_text(
+                json.dumps({"pid": pid, "sessionId": session, "name": "example"}), encoding="utf-8")
         _ = self.git("init", "-b", "production", str(self.checkout), cwd=self.root)
         _ = self.git("config", "user.name", "Registration Test")
         _ = self.git("config", "user.email", "registration@example.invalid")
@@ -306,6 +311,18 @@ with patch.object(agents_log, 'append', side_effect=RuntimeError('recording fail
         self.assertFalse(self.config.exists())
         self.assertEqual(self.notifier_calls(), [])
         self.assertEqual(self.git("rev-list", "--count", "HEAD"), "1")
+
+    def test_register_warns_for_a_session_not_named_for_the_production_and_still_registers(self) -> None:
+        record = self.state / "sessions" / f"{os.getpid()}.json"
+        _ = record.write_text(json.dumps({"pid": os.getpid(), "sessionId": "current-session-id", "name": "other"}),
+                              encoding="utf-8")
+        result = self.run_command("register")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("register: warn", result.stdout)
+        self.assertIn("production example has showrunner other", result.stdout)
+        self.assertIn("/showrunner:rename plan example other", result.stdout)
+        self.assertIn("register: ok", result.stdout)
+        self.assertNotEqual(self.notifier_calls(), [])
 
     def test_missing_prompt_markers_fail_before_registration_changes(self) -> None:
         for marker in ("The prompt:", "**A tick**"):

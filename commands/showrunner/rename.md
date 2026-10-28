@@ -19,12 +19,16 @@ Show the output. On a nonzero exit, show the refusal and stop. Use this order:
    start with an ASCII letter or digit and contain only ASCII letters, digits,
    `_` or `-`; reserved state names and current or former production names refuse.
 2. `apply <old> <new>` requires the showrunner checkout clean and on the
-   production's declared merge branch. It renames the production doc, records
+   production's declared merge branch. The production's own log and its
+   `-recovered` copy may stand untracked; a log named `<old>-log.md` moves to
+   `<new>-log.md`. It renames the production doc, records
    Formerly names, updates unit-plan headers, moves the timer and saved state,
-   and commits and pushes the new merge branch. Existing destination paths or
-   local or origin branches refuse. Apply finishing is not the end: unit
-   branches and worktrees still have their old names, and the old merge branch
-   stays until `finish`.
+   and commits and pushes the merge branch. A merge branch named `<old>` takes
+   the name `<new>`; any other merge branch (`main`, `init/catalyst`) is not
+   named for the production and keeps its name. Existing destination paths or,
+   for a renamed merge branch, an existing `<new>` branch refuse. Apply
+   finishing is not the end: unit branches and worktrees still have their old
+   names, and a renamed old merge branch stays until `finish`.
 3. For each non-retired unit, between its runs, run `unit <new> <unit>` with
    its exact Units-row name. Keep it stopped until the command succeeds.
    The command pushes its new branch, moves and repairs its worktree, moves
@@ -34,10 +38,10 @@ Show the output. On a nonzero exit, show the refusal and stop. Use this order:
    the new herdr production mark at the unit's next launch; existing marks may
    still name the old production.
 4. `finish <new>` refuses while any non-retired row names an old-prefixed
-   branch or a unit move is unfinished. It deletes the recorded old merge
-   branch on origin and locally, then marks the rename done. That branch is
-   the one recorded from Production Context, which may differ from `<old>`.
-   Repeating a completed `finish` does nothing.
+   branch or a unit move is unfinished. When apply renamed the merge branch,
+   it deletes the old merge branch on origin and locally; a kept merge branch
+   is not touched. Then it marks the rename done. Repeating a completed
+   `finish` does nothing.
 
 `unit` and `finish` require `apply` to have finished, through its merge-branch
 push. A live Claude, an

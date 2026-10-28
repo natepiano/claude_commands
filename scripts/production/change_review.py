@@ -766,6 +766,30 @@ def backfill(path: Path, tree: Tree, write: bool) -> tuple[dict[str, str], dict[
     return filled, untraced
 
 
+def rename_production(path: Path, production: Path, old: str, new: str) -> list[str]:
+    """Rewrite each Production cell under To review that names `old` to `new`; return the rows changed.
+
+    A production rename keeps its rows on the list (`/showrunner:rename`). `production` is the renamed
+    doc, which stamps the write. A list with no such cell is not written.
+    """
+    if not path.exists() or not any(row.get(PRODUCTION) == old for row in pending(path)):
+        return []
+
+    def rewrite(lines: list[str]) -> list[str]:
+        columns, first, end = _table(path, lines, SECTION)
+        at = columns.index(PRODUCTION)
+        changed: list[str] = []
+        for index in range(first, end):
+            cells = _cells(lines[index])
+            if at < len(cells) and _plain(cells[at]) == old:
+                cells[at] = _cell(new)
+                lines[index] = "| " + " | ".join(cells) + " |\n"
+                changed.append(cells[0])
+        return changed
+
+    return _edit(path, production, today(), rewrite, lambda rows: f"production {old} renamed {new} in {len(rows)} rows")
+
+
 def describe(row: dict[str, str]) -> str:
     """One row in plain lines: its id and change, how to check it, then each other column that has a value."""
     rest = [f"  {column}: {value}" for column, value in row.items() if column not in ("#", "Change", CHECK) and value]

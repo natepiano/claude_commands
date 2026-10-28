@@ -526,6 +526,72 @@ class ProductionRenameTests(unittest.TestCase):
         self.assert_success(self.run_rename("apply"))
         self.assert_applied()
 
+    def test_apply_moves_pins_change_cells_child_parent_line_and_bevy_watch(self) -> None:
+        listed = self.root / "lists/change-review - old.md"
+        self.write(self.doc, self.doc.read_text().replace(
+            "## Production Context\n", f"## Production Context\n\n- **Change review:** `{listed}`\n").replace(
+            "- **Log:** `production.log`", "- **Log:** `docs/plans/old-log.md` — git-excluded"))
+        # A production log is never committed and stands untracked, as in a checkout whose .gitignore re-includes docs/.
+        self.write(self.checkout / "docs/plans/old-log.md", "one line per event\n")
+        self.write(self.checkout / "docs/plans/old-log-recovered.md", "recovered lines\n")
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "Name the change review list")
+        _ = self.git("push", "origin", OLD)
+        rows = ["| # | Change | Merged | How to check | Production |", "| --- | --- | --- | --- | --- |",
+                "| C1 | own | m | try | old |", "| C2 | child's | m | try | child |", "| C3 | root's | m | try |  |"]
+        self.write(listed, "\n".join([
+            "---", "date_created: 2026-10-27", "date_modified: 2026-10-27", "---", "",
+            "# old showrunner: changes to review", "", "## To review", "", *rows, "",
+            "## Reviewed", "", "| # | Change | Verdict | Date |", "| --- | --- | --- | --- |", ""]))
+        pins = self.home / ".local/state/next"
+        question = {"current": "old: first", "ended": {"old: earlier": "2026-10-27T01:00:00"}, "moved": ["oldish: kept"]}
+        self.write(pins / "question-old.json", json.dumps(question))
+        self.write(pins / "next-old-all-below.json", json.dumps({"current": "C1", "source": "change-old"}))
+        child_doc = self.root / "child/docs/child-production.md"
+        self.write(child_doc, f"# Child\n\n## Production Context\n\n- **Parent production:** {self.doc}\n")
+        self.write(self.notifier / "showrunner-child/conf",
+                   "EVERY=15\nTARGET=session:test-child\nCHECK="
+                   + shlex.join(["zsh", "/scripts/production_check.sh", str(child_doc)]) + "\n")
+        bevy = self.home / ".local/state/bevy-upgrade"
+        self.write(bevy / "old.json", json.dumps({"slug": OLD, "production": str(self.doc), "entries": 3}))
+        self.write(bevy / "old.lock", "")
+        self.write(self.notifier / "bevy-upgrade-old/conf", "EVERY=240\nRUN=py bevy_upgrade.py --production "
+                   + shlex.quote(str(self.doc)) + " check --scheduled\nFROM=bevy-upgrade-old\n")
+        board = self.root / "state/unit-board/old.json"
+        self.write(board, "{}\n")
+        planned = self.run_rename("plan")
+        self.assert_success(planned)
+        for expected in ("/next pin", "change review", "in 1 rows", f"Parent production {child_doc}",
+                         "bevy upgrade watch", "remove derived unit board", "production log"):
+            self.assertIn(expected, planned.stdout)
+        self.assert_success(self.run_rename("apply"))
+        self.assertFalse((pins / "question-old.json").exists())
+        self.assertEqual(json.loads((pins / "question-new.json").read_text()),
+                         {"current": "new: first", "ended": {"new: earlier": "2026-10-27T01:00:00"},
+                          "moved": ["oldish: kept"]})
+        self.assertEqual(json.loads((pins / "next-new-all-below.json").read_text()),
+                         {"current": "C1", "source": "change-old"})
+        text = listed.read_text()
+        self.assertIn("| C1 | own | m | try | new |", text)
+        self.assertIn("| C2 | child's | m | try | child |", text)
+        self.assertRegex(text, r"\| C3 \| root's \| m \| try \| *\|")
+        self.assertIn(f"- **Parent production:** {self.new_doc}\n", child_doc.read_text())
+        self.assertFalse((bevy / "old.json").exists())
+        self.assertFalse((bevy / "old.lock").exists())
+        self.assertEqual(json.loads((bevy / "new.json").read_text()),
+                         {"slug": NEW, "production": str(self.new_doc), "entries": 3})
+        self.assertFalse((self.notifier / "bevy-upgrade-old").exists())
+        conf = (self.notifier / "bevy-upgrade-new/conf").read_text()
+        self.assertIn(f"--production {shlex.quote(str(self.new_doc))} check", conf)
+        self.assertIn("FROM=bevy-upgrade-new\n", conf)
+        self.assertFalse(board.exists())
+        self.assertFalse((self.checkout / "docs/plans/old-log.md").exists())
+        self.assertEqual((self.checkout / "docs/plans/new-log.md").read_text(), "one line per event\n")
+        self.assertIn("- **Log:** `docs/plans/new-log.md` — git-excluded", self.new_doc.read_text())
+        self.assertEqual((self.checkout / "docs/plans/new-log-recovered.md").read_text(), "recovered lines\n")
+        self.assertEqual(self.git("status", "--porcelain").splitlines(),
+                         ["?? docs/plans/new-log-recovered.md", "?? docs/plans/new-log.md"])
+
     def test_timer_keeps_a_readable_document_through_doc_and_instance_moves(self) -> None:
         result = subprocess.run([sys.executable, "-c", CHECK_TIMER_HANDOFF, str(SCRIPT), "apply", OLD, NEW],
                                 cwd=self.checkout, env=self.env, capture_output=True, text=True,
@@ -975,7 +1041,7 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertIs(current["done"], False)
         self.assertEqual(current["step"], 7)
 
-    def test_finish_deletes_the_recorded_merge_branch_and_ignores_retired_units(self) -> None:
+    def test_a_merge_branch_not_named_for_the_production_is_kept(self) -> None:
         self.prepare_unit_moves()
         _ = self.git("branch", "-m", "merge-main")
         _ = self.git("branch", OLD)
@@ -988,6 +1054,11 @@ class ProductionRenameTests(unittest.TestCase):
         _ = self.git("push", "origin", "merge-main", OLD)
         preserved = self.git("rev-parse", OLD)
         self.assert_success(self.run_rename("apply"))
+        self.assertEqual(self.git("branch", "--show-current"), "merge-main")
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", f"refs/heads/{NEW}"), "")
+        self.assertEqual(self.git("ls-remote", "origin", f"refs/heads/{NEW}"), "")
+        self.assertEqual(self.git("rev-parse", "merge-main"), self.git("rev-parse", "origin/merge-main"))
+        self.assertIn("- **Merge branch:** `merge-main`", self.new_doc.read_text())
         before = self.snapshot()
         refused = self.run_command("unit", NEW, "retired-unit")
         self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
@@ -995,9 +1066,11 @@ class ProductionRenameTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         for unit in UNITS:
             self.assert_success(self.run_command("unit", NEW, unit))
-        self.assert_success(self.run_command("finish", NEW))
-        self.assertEqual(self.git("for-each-ref", "--format=%(refname)", "refs/heads/merge-main"), "")
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/merge-main"), "")
+        finished = self.run_command("finish", NEW)
+        self.assert_success(finished)
+        self.assertIn("kept merge branch merge-main", finished.stdout)
+        tip = self.git("rev-parse", "merge-main")
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/merge-main"), f"{tip}\trefs/heads/merge-main")
         self.assertEqual(self.git("rev-parse", OLD), preserved)
         self.assertEqual(self.git("ls-remote", "origin", "refs/heads/old"), f"{preserved}\trefs/heads/old")
         self.assertIn(retired, self.new_doc.read_text())
