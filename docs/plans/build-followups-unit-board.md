@@ -509,68 +509,61 @@ Source: the user via the showrunner, 2026-10-20: the two views should "show basi
 
 ### Phase 22 — the ticket table shows each unit's split, read by a nightly command  · status: done
 
-**Depends on:** Phase 21
+#### As-built
+
+- `style_plan.py split --unit <u> --repo <worktree> [--timeout-minutes <n>]` (default 90) partitions the unit's Left total (filed, approved findings of its family) into `ready`, `changed`, `structure` and `other`. The four counts always add up to the total. Each finding takes the first category that holds it, in the order of the decision loop (`_select_phase`): changed since judged or unsynced file change; rank wait not exempt; available or held by an open build ticket; every other case.
+- The scan is read-only. It reads through `style_ledger.preview_ledger`, holds no refill lock, and batches blob reads through a `GitReadCache` (one `git ls-tree -r` per commit) passed to `style_proposals.ProposalGitReader`. Refill and split share one set of rules. The only write is `record_split` at the end, inside the time limit.
+- At the time limit, on any error, or when the ledger schema is below 25 (`require_split_table` checks it read-only first), `split` writes nothing, keeps the last split, prints `split <unit>: <cause>` to stderr and exits 1.
+- `style_plan.py split-all --production <doc>` runs `split` for each live unit from `production_units.live_unit_table`, one at a time, at nice 19 in `builds.slice`. It prints `<unit>: <ready>/<changed>/<structure>/<other> in <m> min` or `<unit>: failed: <cause>` per unit, prints `no style units` and exits 0 when none exist, and exits 1 when any unit failed.
+- `style_ledger.record_split(repo, unit, split)` sets the four counts and `split_at` (scan start, UTC ISO with offset) in `refill_results`. It inserts a row with `at=''` and `outcome=''` when none exists; such a row reads as no refill record. A split reads as `RecordedSplit(ready, changed, structure, other, measured_at)` or `NoSplitRecorded()`. `record_refill` keeps the split columns.
+- The Left cell shows `<total>: ready <a> · changed <b> · structure <c> · other <d> (<age>)` with age as `<n> min`, `<n> h` or `<n> d`, else `<total>`. A unit with no refill record and no open ticket shows `idle`, also with a split. `units_table.main` resolves each style unit's ledger folder from the Units row worktree and `unit_plans.unit_plan_path`, not from the phase record.
+- The nightly timer (02:00 EDT, `Nice=19`, `builds.slice`, skipped during a build hold) is not in this repository; it belongs in `/etc/nixos`.
+
+**Files:**
+- `scripts/style/style_plan.py` — `split`, `split-all`, `classify_split`, `split_time_limit`
+- `scripts/style/style_ledger.py` — `record_split`, `RecordedSplit`, `NoSplitRecorded`, `GitReadCache`, `require_split_table`
+- `scripts/style/style_proposals.py` — `ProposalGitReader`, `GitProposalReader`
+- `scripts/production/style_units.py` — `left_cell` and the split read
+- `scripts/production/units_table.py` — `style_ledger_paths` from Units rows
+- `scripts/production/unit_table_cells.py` — `OpenStep`, `NoOpenStep`, `session_cell`, `open_step`, `run_events`, `escaped`, `NONE`; `units_table.py`, `style_units.py` and `scripts/direct/board_json.py` import them here, with no re-exports
+- `docs/as-built/style-showrunner.md`, `docs/as-built/showrunner-automation.md`, `commands/showrunner/units.md` — split commands, categories and the Left cell
+
+**Gotchas:** The SQLite busy wait delays SIGALRM, so a timed-out write can run up to 30 s past the limit before it rolls back; nothing is written. One split of the types unit took 8.98 min on a copy of the live data. Tests patch the shared cells in `unit_table_cells`, not in `style_units`.
+
+**Ruled out:** Classifying inside refill (11–40 min per unit); wrapping or replacing another module's functions at run time to cache git reads.
+
+### Phase 23 — a timed-out split writes nothing past its limit  · status: todo
+
+**Depends on:** Phase 22
 
 #### Work Order
 
-**Goal:** the Left cell of the style ticket table shows how the findings left split into `ready`, `changed`, `structure` and `other`, with the age of that split. A separate read-only command measures the split, so refill does not get slower.
+**Goal:** `style_plan.py split` never writes after its time limit. Today the limit's alarm cannot fire while SQLite waits on a busy ledger, so the final write can run up to 30 s past the limit.
 
-**Source:** showrunner ruling, 2026-10-28 11:3x EDT (option A): "a read-only `style_plan.py split --unit <u>` that writes its refill_results row with its time, run from a nightly timer, and the table shows the split with its age." Review findings moved here from phase 21 under the landing call: F008 and F009.
+**Source:** phase 22 review finding F005 (minor, open at the phase 22 checkpoint), moved here under the landing rule.
 
 **Spec:**
 
-1. **Split command.** `style_plan.py split --unit <u> --repo <unit worktree> [--timeout-minutes <n>]` (default 90).
-   - **Population.** The split partitions the unit's Left total from the ticket table: every finding of the unit's family with `state='filed'` whose decision is approved (`proposal_issue.decision_answer` returns `ApprovedDecision`). The four counts always add up to that total.
-   - **Order.** Each finding takes the first category that holds it, in the decision loop's own order (`_select_phase` in `style_plan.py`):
-     - `changed`: it waits because "changed since it was judged" (`style_proposals.judged_at_current_file` is false), or its file has an unsynced change on the unit base.
-     - `structure`: its file has a rank wait (a family ranked above it has open work there) and `RankExemptions` does not exempt it.
-     - `ready`: it reaches `available`, or an open build ticket already holds it.
-     - `other`: every other case. That covers a decision that `style_proposals.approved_decisions` does not select, a rule not in the catalog, a declaration wait, outside pilot scope, a busy file, an uncertain path attribute, edits a busy file, and a finding that refill would waive.
-   - **Read only.** It reads through `style_ledger.preview_ledger(repo)` (a backup copy; the stored ledger never changes) and holds no refill lock while it scans. It makes no ticket, waive, close, declaration follow, `proposal_command`, phase write or renumber. Its only write is item 4's, at the end.
-   - **Cost.** Batch and cache the git blob reads: one `git ls-tree -r` per commit, held in an explicit cache object passed in. Never wrap or replace another module's functions at run time.
-   - **Time limit.** At the limit, or on any error, it writes nothing, keeps the last split, prints `split <unit>: <cause>` to stderr and exits 1.
-2. **Split for a production.** `style_plan.py split-all --production <production doc>` runs `split` for each live unit of the production, one unit at a time, never in parallel. Each child runs at nice 19 in `builds.slice` (the `systemd-run --user --scope --slice=builds.slice` prefix and probe of `merge_gate.suite_scope_prefix`, skipped when already in that slice). The worktree of each unit comes from the production's Units row (`production_units.unit_table`) and its plan from `unit_plans.unit_plan_path`. A unit that fails does not stop the others. A production with no style units prints `no style units` and exits 0. The command exits 1 when any unit failed and prints one line per unit: `<unit>: <ready>/<changed>/<structure>/<other> in <m> min` or `<unit>: failed: <cause>`.
-3. **Measure once.** Run `split` once for one unit on a copy of the live ledger under `/tmp/claude/` (`STYLE_LEDGER_STATE_DIR` pointed at it), at nice 19, and delete the copy. Report the minutes in the summary.
-4. **Record.** `style_ledger.record_split(repo, unit, split)` opens one short connection with the busy timeout, like `record_refill`. It sets the four counts and `split_at` only. When the unit has no row, it inserts one with `at=''` and `outcome=''`. `record_refill` keeps the split columns as they are. `split_at` is the time the scan started (UTC ISO with offset). Use domain types: `RecordedSplit(ready, changed, structure, other, measured_at)` or `NoSplitRecorded()`, and a refill row with `outcome=''` reads as no refill record. Never use a bare `None` or all-zero counts to mean "no split".
-5. **Table.** Left shows `<total>: ready <a> · changed <b> · structure <c> · other <d> (<age>)` with a recorded split, else `<total>`. `<age>` is the time since `split_at`: `<n> min`, `<n> h` or `<n> d`. A unit with no refill record and no open ticket still shows `idle`, also when it has a split.
-6. **F008.** A unit whose phase record is unavailable still reads its ledger. `units_table.main` resolves each style unit's ledger folder from the production's Units row and `unit_plans.unit_plan_path`, and passes that explicit path map to `style_units.table`; it does not take the folder from the phase record.
-7. **F009.** Move `OpenStep`, `NoOpenStep`, `session_cell`, `open_step`, `run_events`, `escaped` and `NONE` from `style_units.py` to a new neutral module `scripts/production/unit_table_cells.py`. `units_table.py`, `style_units.py` and `scripts/direct/board_json.py` import them from there. Remove the re-exports from `units_table.py`.
-8. **Nightly timer (another repository).** The showrunner adds the timer in `/etc/nixos` once this phase merges: `split-all` for each style production at 02:00 EDT, `Nice=19`, in `builds.slice`, skipped on a night when a build hold is in force. This phase does not write it. The 2026-10-16 "No new process" rule in Delegation Context covers the board mod only (showrunner, 2026-10-28).
-9. **Docs** in the same commit: `docs/as-built/style-showrunner.md` (`split`, `split-all`, `record_split`, the categories), `commands/showrunner/units.md` and `docs/as-built/showrunner-automation.md` (the Left cell with its split and age).
+1. **Deadline.** `split_time_limit` gives the code inside it the deadline (a `time.monotonic()` value) as a domain type, for example `SplitDeadline(at: float)` with `remaining_seconds()`. Do not use a bare float or `None`.
+2. **Bounded write.** `style_ledger.record_split(repo, unit, split, *, busy_timeout_seconds: float)` uses that value as the connection's busy timeout in place of `BUSY_TIMEOUT_SECONDS`. `split` passes `min(BUSY_TIMEOUT_SECONDS, deadline.remaining_seconds())`. When no time remains, `split` raises the same `TimeoutError` as the alarm and writes nothing.
+3. **Behavior kept.** A busy ledger that stays locked past the deadline makes `split` exit 1 with `split <unit>: <cause>` on stderr and keep the last split. `record_refill` and every other caller keep `BUSY_TIMEOUT_SECONDS`.
 
 **Files:**
 - `scripts/style/style_plan.py`
 - `scripts/style/style_ledger.py`
-- `scripts/production/units_table.py`
-- `scripts/production/style_units.py`
-- `scripts/production/unit_table_cells.py`
-- `scripts/direct/board_json.py`
-- `docs/as-built/style-showrunner.md`
-- `commands/showrunner/units.md`
-- `docs/as-built/showrunner-automation.md`
 - `scripts/style/test_style_plan.py`
 - `scripts/style/test_style_ledger.py`
-- `scripts/production/test_units_table.py`
-- `scripts/production/test_style_units.py`
-- `scripts/direct/test_board_json.py`
 
-**Workers:** 2 writers + 1 tester.
-- `impl` writes `style_plan.py` and `style_ledger.py`: items 1–4, and `docs/as-built/style-showrunner.md`.
-- `impl2` writes `units_table.py`, `style_units.py`, `unit_table_cells.py` and `board_json.py`: items 5–7, `commands/showrunner/units.md` and `docs/as-built/showrunner-automation.md`.
-- `test` writes the five test files from this Spec alone.
+**Workers:** 1 writer.
+- `impl` writes items 1–3 and the regression tests: a ledger held by a second connection's open write transaction past a short limit makes `split` fail within about one second of the limit and leaves the last split unchanged; `record_split` with a small busy timeout fails fast on a locked ledger.
 
 **Constraints from prior phases:**
-- Phase 21 shipped migration 25 (`refill_results`, `held_findings.built_at`) and `record_refill(repo, unit, outcome)`, which writes only `unit`, `at` and `outcome`. The split columns exist and stay at their defaults until this phase.
-- The phase 21 classify pass was removed: no classification code is in the tree. On the live ledger it cost 11–40 min per unit (names 2,393 s, types 665 s with a blob cache), which is why it runs nightly.
-- `style_units.py` opens every ledger read-only (`?mode=ro`), never through `Ledger` or `open_ledger`. The live table must stay under 3 s; it was 1.5–2.1 s after phase 21.
-- Tests patch `style_units.table` and the helpers by module name; after item 7 they patch `unit_table_cells`.
-- The style ledger is shared with four live style units. Never write to `~/.local/state/style/` or to any plan or decision under `~/rust/`. Read live data only through a copy or a read-only connection. Never run refill, `next_phase`, `split` or `split-all` against live data.
+- Phase 22 shipped `split`, `split-all`, `split_time_limit` (SIGALRM) and `record_split`; `record_split` already runs inside the time limit.
+- The style ledger is shared with four live style units. Never write to `~/.local/state/style/` or to any plan or decision under `~/rust/`. Never run refill, `next_phase`, `split` or `split-all` against live data; tests use temporary ledgers only.
 - The worktree has no `.venv`; basedpyright needs a temporary venv under `/tmp/claude` (`--venvpath`).
 
 **Acceptance gate:**
-- basedpyright on each slot's touched files, footer `0 errors, 0 warnings, 0 notes`
-- `scripts/style`: `test_style_plan`, `test_style_ledger`; `scripts/production`: `test_units_table`, `test_style_units`; `scripts/direct`: `test_board_json`
-- tests show: the four counts add up to the Left total; only `refill_results` changes after `split`; a timeout or error keeps the last split; the first split creates a row that reads as idle; refill output is unchanged
-- `python3 scripts/production/units_table.py --production ~/rust/cargo-liner-style/docs/cargo-liner-style-production.md` on the live production, read-only, in under 3 s
-- the one `split` measurement on a copy (item 3)
+- basedpyright on the four files, footer `0 errors, 0 warnings, 0 notes`
+- `scripts/style`: `test_style_plan`, `test_style_ledger`
+- tests show: a split blocked on a locked ledger ends within about one second of its limit and writes nothing; the last split is kept
 - the full merge gate
