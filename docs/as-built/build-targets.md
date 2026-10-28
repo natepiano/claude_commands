@@ -131,7 +131,7 @@ Each command shows its script's output unchanged; each script answers in about a
 
 ## Invariants
 
-- Linux stays the gate. A full `verify.sh test` that passed on the Mac still confirms on natedev, and that confirmation waits out a natedev hold. `check`, `lint`, `example` and `final` never leave natedev.
+- A Mac pass or failure ends a `verify.sh test` call (`passed_full`, `passed_filter`, `failed`; since 2026-10-16 natedev does not confirm it). CI's Linux jobs catch a Linux-only failure. `check`, `lint`, `example` and `final` never leave natedev.
 - natedev's own limits are unchanged: the memory gate, the cargo token, build-folder turns.
 - A job never runs on a held target and never falls back to one. When every eligible target is held or full it waits and says what it is waiting on.
 - Code that picks a target counts `StateUnreadable` and `Held(end=AwaitingBlockRemoval)` as not free, and every reader of `TargetState` handles all five cases.
