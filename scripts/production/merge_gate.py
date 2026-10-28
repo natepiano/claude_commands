@@ -378,6 +378,12 @@ def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
+def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float]) -> list[tuple[str, Path]]:
+    """`modules` in start order: modules with no recorded time first, then the slowest recorded first."""
+    return sorted(modules, key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
+                                             -timings.get(f"{item[0]}/{item[1].name}", 0)))
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S) -> GateRun:
     if memory_cap_mib <= 0:
@@ -407,9 +413,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     slow_modules: list[str] = []
     history_path = gate_state_dir() / "module_history.json"
     history = read_history(history_path)
-    modules.sort(key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
-                                  -timings.get(f"{item[0]}/{item[1].name}", 0)))
-    pending = deque(modules)
+    pending = deque(module_order(modules, timings))
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
     types_python = typecheck_python() if type_dirs else ""
