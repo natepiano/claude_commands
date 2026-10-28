@@ -341,7 +341,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-delegate-resume.py\""
+            "command": "\"$HOME/.claude/scripts/lib/py\" \"$HOME/.claude/scripts/hooks/session-start-direct-resume.py\""
           }
         ]
       },
