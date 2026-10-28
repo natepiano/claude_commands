@@ -19,6 +19,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from scripts.production import change_review, merge_gate
+from scripts.direct.wait_for_test_state import wait_for_file
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -130,6 +131,13 @@ class FixtureTest(unittest.TestCase):
             self.assertEqual(os.environ.get("PYTHONPATH"), os.environ.get("MERGE_GATE_TEST_PYTHONPATH"))
         record({"suite": suite, "module": module.name, "pid": os.getpid(),
                 "event": "start", "tmpdir": str(tmp)})
+        if (state / "concurrency-barrier").exists():
+            (state / (str(os.getpid()) + ".started")).touch()
+            deadline = time.monotonic() + 300
+            while not (state / (str(os.getpid()) + ".released")).exists():
+                if time.monotonic() >= deadline:
+                    self.fail("runner never released the module")
+                time.sleep(0.01)
         attempt = state / (suite + "-" + module.name + ".attempt")
         first_run = not attempt.exists()
         attempt.write_text("ran")
@@ -613,6 +621,54 @@ class MergeGateTests(unittest.TestCase):
         self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), self.base)
         self.assert_not_pushed()
         self.assertFalse(any(call["tool"] in ("basedpyright", "ssh") for call in self.calls()))
+
+    def test_running_job_limit_bounds_overlap_without_dropping_modules(self) -> None:
+        self.write(self.state / "concurrency-barrier", "held")
+        started: list[merge_gate.RunningGateJob] = []
+        start = merge_gate.start_gate_job
+        sample = merge_gate.process_memory_mib
+
+        def start_blocked(suite: str, path: Path, argv: list[str], repo: Path,
+                          environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log)
+            started.append(job)
+            wait_for_file(self.state / f"{job.process.pid}.started")
+            return job
+
+        def release_at_sample(roots: set[int]) -> dict[int, float]:
+            # No job can finish during the start loop. Without the job limit,
+            # memory admission would start more than two before this sample.
+            for job in started:
+                (self.state / f"{job.process.pid}.released").touch()
+            return sample(roots)
+
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(merge_gate, "start_gate_job", side_effect=start_blocked), \
+                mock.patch.object(merge_gate, "process_memory_mib", side_effect=release_at_sample), \
+                redirect_stdout(output):
+            run = merge_gate.run_suites(self.checkout, max_running_jobs=2)
+        self.assertTrue(run.passed, output.getvalue())
+        expected = {(suite, "test_first.py") for suite in EXPECTED_SUITES}
+        expected.add(("lib", "test_second.py"))
+        self.assertEqual({(job.suite, job.module) for job in run.jobs}, expected)
+        self.assertEqual(len(run.jobs), MODULES)
+        active: set[int] = set()
+        peak = 0
+        events = self.module_events()
+        for event in events:
+            if event["event"] == "start":
+                self.assertNotIn(event["pid"], active)
+                active.add(event["pid"])
+            else:
+                active.remove(event["pid"])
+            peak = max(peak, len(active))
+            self.assertLessEqual(len(active), 2, events)
+        self.assertEqual(peak, 2)
+        self.assertEqual(active, set())
+        self.assertEqual(len(events), 2 * MODULES)
+        self.assertRegex(output.getvalue(), r"(?m)^Gate tests: [\d.]+s; at most 2 modules at once; peak memory:")
+        self.assertEqual(output.getvalue().count("at most 2 modules at once"), 1)
 
     def test_smaller_memory_cap_serializes_modules_without_dropping_any(self) -> None:
         # Two jobs need two 96 MiB reservations, so a cap under 192 MiB runs one module at a time;
